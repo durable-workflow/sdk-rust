@@ -11,30 +11,33 @@ JSON-native payloads through the platform's generic Avro wrapper.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.0 --exact
+cargo add durable-workflow@0.1.1 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.0"
+durable-workflow = "=0.1.1"
 ```
 
-Version `0.1.0` requires Rust `1.86` or newer. Query APIs described below are
-available from the direct-successor `0.1.1` release.
+Version `0.1.1` requires Rust `1.86` or newer. Snapshot query transport is
+available from `0.1.1`; replayed workflow-instance state queries are the
+direct-successor `0.1.2` surface.
 
 ## Compatibility
 
 | SDK releases | Durable Workflow server | Worker protocol | Control plane |
 | --- | --- | --- | --- |
 | `0.1.0` | `>=0.2,<0.3` | `1.2` | `2` |
-| `0.1.1+` | `>=0.2,<0.3` | `1.2` (queries require `1.8`) | `2` |
+| `0.1.1` | `>=0.2,<0.3` | `1.2` (snapshot queries require `1.8`) | `2` |
+| `0.1.2+` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
 `control-plane-version`. Query-capable releases also publish `query-tasks`,
-`query-task-minimum-worker-protocol-version`, and `payload-codecs`. Existing
+`query-task-minimum-worker-protocol-version`, `replayed-instance-state-queries`,
+`query-state-model`, `snapshot-inspection-queries`, and `payload-codecs`. Existing
 worker operations retain the `1.2` baseline; only query-task poll, complete,
 and fail requests use the additive `1.8` feature floor. The server's advertised
 protocol manifests remain authoritative when checking compatibility during
@@ -44,6 +47,11 @@ deployment.
 
 ```rust
 use durable_workflow::{json, Client, Result, Worker};
+
+#[derive(Clone, Default)]
+struct HelloState {
+    started_by: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,21 +68,16 @@ async fn main() -> Result<()> {
         Ok(json!(format!("hello, {name}")))
     });
 
-    worker.register_workflow("hello.workflow", |ctx, _input| async move {
+    worker.register_replayed_workflow("hello.workflow", HelloState::default, |ctx, _input, state| async move {
         let signal = ctx.wait_signal("start").await?;
         let name = signal.first().and_then(|value| value.as_str()).unwrap_or("world");
+        state.update(|current| current.started_by = Some(name.to_string()))?;
         let greeting = ctx.activity("hello.activity", json!([name])).await?;
         Ok(json!({"greeting": greeting}))
     });
 
-    worker.register_query("hello.workflow", "started-by", |ctx, _args| async move {
-        let name = ctx
-            .signals("start")
-            .last()
-            .and_then(|args| args.first())
-            .cloned()
-            .unwrap_or(json!(null));
-        Ok(name)
+    worker.register_replayed_query::<HelloState, _, _>("hello.workflow", "started-by", |_ctx, state, _args| async move {
+        Ok(json!(state.started_by))
     });
 
     worker.run().await
@@ -105,34 +108,41 @@ let output = handle.result(Default::default()).await?;
 
 ## Queries
 
-`Worker::register_query` associates a public query name with a workflow type.
-The handler receives an immutable `QueryContext` containing the normalized
-workflow input, committed history, and decoded signals in workflow order. It
-has no command-emission API, and completing or failing a query task does not
-append history or advance workflow execution.
+`Worker::register_replayed_workflow` gives ordinary workflow execution a typed
+`WorkflowInstance<S>`. Put transitions after activity and signal resolution in
+that workflow closure. `Worker::register_replayed_query` re-runs the same
+closure over committed durable history, then invokes the named query with an
+immutable, detached `Arc<S>`. This is the recommended workflow-instance query
+API: query code does not parse history or duplicate transition logic.
 
-Query handlers must remain read-only: do not mutate captured application state
-or perform side effects. Rebuild the answer from the supplied snapshot. The
-same handler serves running workflows and successfully completed workflows:
+Replay-generated commands are discarded. A query handler has no command API,
+and its detached state is never retained, so successful and failed queries do
+not append history, advance execution, or change a later query. The same query
+serves running, restarted, and successfully completed workflows:
 
 ```rust
 # use durable_workflow::{json, Client, Worker};
+# #[derive(Clone, Default)]
+# struct CounterState { count: i64 }
 # fn configure(client: Client) {
 let mut worker = Worker::new(client, "counter-workers");
-worker.register_workflow("counter", |ctx, _input| async move {
-    let _ = ctx.wait_signal("increment").await?;
-    Ok(json!(null))
+worker.register_replayed_workflow("counter", CounterState::default, |ctx, _input, state| async move {
+    let signal = ctx.wait_signal("increment").await?;
+    let amount = signal.first().and_then(|value| value.as_i64()).unwrap_or_default();
+    state.update(|current| current.count += amount)?;
+    state.read(|current| Ok(json!(current.count)))?
 });
-worker.register_query("counter", "current", |ctx, _args| async move {
-    let count: i64 = ctx
-        .signals("increment")
-        .iter()
-        .filter_map(|args| args.first().and_then(|value| value.as_i64()))
-        .sum();
-    Ok(json!(count))
+worker.register_replayed_query::<CounterState, _, _>("counter", "current", |_ctx, state, _args| async move {
+    Ok(json!(state.count))
 });
 # }
 ```
+
+`Worker::register_query` remains the lower-level snapshot-inspection API. Its
+`QueryContext` exposes normalized workflow input, raw committed history, and
+decoded signals. Use it for transport-level inspection when replayed typed
+state is not appropriate; snapshot handlers must reduce history themselves and
+are not workflow-instance query parity.
 
 Client-side rejections are `Error::QueryFailed(QueryFailure)`. Match the
 public `reason` and `status` fields for automation; the original response is

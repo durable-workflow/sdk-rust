@@ -2,11 +2,13 @@
 //!
 //! The crate covers the v1 Rust round-trip: start, signal, and query workflows,
 //! register a Rust worker, poll workflow, activity, and read-only query tasks,
+//! reconstruct typed workflow-instance state through deterministic replay,
 //! heartbeat worker and activity liveness, and exchange JSON-native payloads
 //! through the same `avro` generic wrapper used by the existing first-party
 //! SDKs.
 
 use std::{
+    any::{Any, TypeId},
     collections::HashMap,
     future::Future,
     pin::Pin,
@@ -1387,11 +1389,41 @@ fn default_attempt_number() -> u64 {
 
 type WorkflowFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
 type WorkflowHandler = Arc<dyn Fn(WorkflowContext, Value) -> WorkflowFuture + Send + Sync>;
+type ErasedWorkflowState = Arc<dyn Any + Send + Sync>;
+type WorkflowStateSnapshot = Arc<dyn Fn() -> Result<ErasedWorkflowState> + Send + Sync>;
+type ReplayedWorkflowHandler =
+    Arc<dyn Fn(WorkflowContext, Value) -> ReplayedWorkflowInvocation + Send + Sync>;
 type ActivityFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
 type ActivityHandler = Arc<dyn Fn(ActivityContext, Value) -> ActivityFuture + Send + Sync>;
 type QueryFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
 type QueryHandler = Arc<dyn Fn(QueryContext, Value) -> QueryFuture + Send + Sync>;
+type ReplayedQueryHandler = Arc<
+    dyn Fn(QueryContext, ErasedWorkflowState, Value) -> std::result::Result<QueryFuture, String>
+        + Send
+        + Sync,
+>;
 type WorkerHeartbeatObserver = Arc<dyn Fn(&WorkerHeartbeatObservation) + Send + Sync>;
+
+struct ReplayedWorkflowInvocation {
+    future: WorkflowFuture,
+    snapshot: WorkflowStateSnapshot,
+}
+
+#[derive(Clone)]
+struct RegisteredWorkflow {
+    execute: WorkflowHandler,
+    replay: Option<ReplayedWorkflowHandler>,
+    state_type: Option<TypeId>,
+}
+
+#[derive(Clone)]
+enum RegisteredQuery {
+    Snapshot(QueryHandler),
+    Replayed {
+        state_type: TypeId,
+        handler: ReplayedQueryHandler,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub struct WorkerHeartbeatObservation {
@@ -1406,9 +1438,9 @@ pub struct Worker {
     client: Client,
     worker_id: String,
     task_queue: String,
-    workflows: HashMap<String, WorkflowHandler>,
+    workflows: HashMap<String, RegisteredWorkflow>,
     activities: HashMap<String, ActivityHandler>,
-    queries: HashMap<String, HashMap<String, QueryHandler>>,
+    queries: HashMap<String, HashMap<String, RegisteredQuery>>,
     max_concurrent_workflow_tasks: usize,
     max_concurrent_activity_tasks: usize,
     poll_timeout: Duration,
@@ -1473,7 +1505,62 @@ impl Worker {
     {
         self.workflows.insert(
             workflow_type.into(),
-            Arc::new(move |ctx, input| Box::pin(handler(ctx, input))),
+            RegisteredWorkflow {
+                execute: Arc::new(move |ctx, input| Box::pin(handler(ctx, input))),
+                replay: None,
+                state_type: None,
+            },
+        );
+    }
+
+    /// Register a workflow whose typed instance state can be reconstructed for queries.
+    ///
+    /// `state_factory` creates a fresh instance for every normal workflow task and
+    /// query replay. The workflow handler is the single source of truth for state
+    /// transitions: it updates [`WorkflowInstance`] after activities and signals
+    /// resolve. Query replay runs this same handler over committed history and
+    /// discards any commands it would emit.
+    pub fn register_replayed_workflow<S, Factory, F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        state_factory: Factory,
+        handler: F,
+    ) where
+        S: Clone + Send + Sync + 'static,
+        Factory: Fn() -> S + Send + Sync + 'static,
+        F: Fn(WorkflowContext, Value, WorkflowInstance<S>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        let state_factory = Arc::new(state_factory);
+        let handler = Arc::new(handler);
+
+        let execute_factory = Arc::clone(&state_factory);
+        let execute_handler = Arc::clone(&handler);
+        let execute = Arc::new(move |ctx: WorkflowContext, input: Value| {
+            let state = WorkflowInstance::new(execute_factory());
+            let future = execute_handler(ctx, input, state);
+            Box::pin(future) as WorkflowFuture
+        });
+
+        let replay = Arc::new(move |ctx: WorkflowContext, input: Value| {
+            let state = WorkflowInstance::new(state_factory());
+            let snapshot_state = state.clone();
+            let snapshot: WorkflowStateSnapshot =
+                Arc::new(move || Ok(Arc::new(snapshot_state.snapshot()?) as ErasedWorkflowState));
+            let future = handler(ctx, input, state);
+            ReplayedWorkflowInvocation {
+                future: Box::pin(future),
+                snapshot,
+            }
+        });
+
+        self.workflows.insert(
+            workflow_type.into(),
+            RegisteredWorkflow {
+                execute,
+                replay: Some(replay),
+                state_type: Some(TypeId::of::<S>()),
+            },
         );
     }
 
@@ -1507,7 +1594,43 @@ impl Worker {
             .or_default()
             .insert(
                 query_name.into(),
-                Arc::new(move |ctx, args| Box::pin(handler(ctx, args))),
+                RegisteredQuery::Snapshot(Arc::new(move |ctx, args| Box::pin(handler(ctx, args)))),
+            );
+    }
+
+    /// Register a named query against deterministically replayed instance state.
+    ///
+    /// The workflow type must use [`Worker::register_replayed_workflow`] with the
+    /// same state type `S`. The handler receives an immutable, detached state
+    /// clone, so successful and failed queries cannot affect workflow execution
+    /// or the state reconstructed by a later query.
+    pub fn register_replayed_query<S, F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        query_name: impl Into<String>,
+        handler: F,
+    ) where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(QueryContext, Arc<S>, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        let erased_handler: ReplayedQueryHandler = Arc::new(move |ctx, state, args| {
+            let state = state.downcast::<S>().map_err(|_| {
+                "registered query state type does not match the replayed workflow state".to_string()
+            })?;
+            Ok(Box::pin(handler(ctx, state, args)))
+        });
+
+        self.queries
+            .entry(workflow_type.into())
+            .or_default()
+            .insert(
+                query_name.into(),
+                RegisteredQuery::Replayed {
+                    state_type: TypeId::of::<S>(),
+                    handler: erased_handler,
+                },
             );
     }
 
@@ -1874,7 +1997,7 @@ impl Worker {
                 "QueryHandlerUnavailable",
             ));
         };
-        let Some(handler) = handlers.get(&task.query_name) else {
+        let Some(query) = handlers.get(&task.query_name) else {
             return Err(QueryTaskExecutionFailure::new(
                 "rejected_unknown_query",
                 format!("unknown query {:?}", task.query_name),
@@ -1907,6 +2030,13 @@ impl Worker {
                 "QueryWorkflowStateUnavailable",
             )
         })?;
+        enrich_query_history_from_export(&mut task).map_err(|error| {
+            QueryTaskExecutionFailure::new(
+                "query_workflow_state_unavailable",
+                format!("cannot restore compact query history payloads: {error}"),
+                "QueryWorkflowStateUnavailable",
+            )
+        })?;
         let signal_events = query_signal_events(&task).map_err(|error| {
             QueryTaskExecutionFailure::new(
                 "query_workflow_state_unavailable",
@@ -1914,23 +2044,109 @@ impl Worker {
                 "QueryWorkflowStateUnavailable",
             )
         })?;
+        let history_events = Arc::new(std::mem::take(&mut task.history_events));
         let context = QueryContext {
             workflow_id: task.workflow_id,
             run_id: task.run_id,
-            workflow_type: task.workflow_type,
+            workflow_type: task.workflow_type.clone(),
             run_status: task.run_status,
             workflow_input,
-            history_events: Arc::new(task.history_events),
+            history_events: Arc::clone(&history_events),
             signal_events: Arc::new(signal_events),
         };
 
-        handler(context, args).await.map_err(|error| {
+        let future = match query {
+            RegisteredQuery::Snapshot(handler) => handler(context, args),
+            RegisteredQuery::Replayed {
+                state_type,
+                handler,
+            } => {
+                let workflow = self
+                    .workflows
+                    .get(&task.workflow_type)
+                    .expect("workflow registration was checked above");
+                if workflow.state_type != Some(*state_type) {
+                    return Err(QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        "replayed query state type does not match its workflow registration",
+                        "QueryWorkflowStateUnavailable",
+                    ));
+                }
+                let replay = workflow.replay.as_ref().ok_or_else(|| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        format!(
+                            "workflow type {:?} is not registered for instance-state replay",
+                            task.workflow_type
+                        ),
+                        "QueryWorkflowStateUnavailable",
+                    )
+                })?;
+                let workflow_state = Arc::new(Mutex::new(WorkflowState {
+                    history: history_events.as_ref().clone(),
+                    task_queue: self.task_queue.clone(),
+                    payload_codec: task.payload_codec,
+                    resume_signal: None,
+                    activity_cursor: 0,
+                    signal_cursors: HashMap::new(),
+                    commands: Vec::new(),
+                }));
+                let workflow_context = WorkflowContext {
+                    state: workflow_state,
+                };
+                let mut invocation =
+                    replay(workflow_context.clone(), context.workflow_input.clone());
+                let mut cx = TaskContext::from_waker(noop_waker_ref());
+                match invocation.future.as_mut().poll(&mut cx) {
+                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Err(error)) => {
+                        return Err(QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            format!("workflow replay failed before query: {error}"),
+                            "QueryWorkflowStateUnavailable",
+                        ));
+                    }
+                    Poll::Pending => {
+                        let commands = workflow_context.take_commands().map_err(|error| {
+                            QueryTaskExecutionFailure::new(
+                                "query_workflow_state_unavailable",
+                                format!("workflow replay failed before query: {error}"),
+                                "QueryWorkflowStateUnavailable",
+                            )
+                        })?;
+                        if commands.is_empty() {
+                            return Err(QueryTaskExecutionFailure::new(
+                                "query_workflow_state_unavailable",
+                                "workflow replay yielded without a durable command",
+                                "QueryWorkflowStateUnavailable",
+                            ));
+                        }
+                    }
+                }
+                let state = (invocation.snapshot)().map_err(|error| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        format!("cannot snapshot replayed workflow state: {error}"),
+                        "QueryWorkflowStateUnavailable",
+                    )
+                })?;
+                handler(context, state, args).map_err(|message| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        message,
+                        "QueryWorkflowStateUnavailable",
+                    )
+                })?
+            }
+        };
+
+        future.await.map_err(|error| {
             QueryTaskExecutionFailure::new("query_rejected", error.to_string(), "QueryFailed")
         })
     }
 
     fn execute_workflow_task(&self, task: WorkflowTask) -> Result<Vec<Value>> {
-        let handler = self
+        let workflow = self
             .workflows
             .get(&task.workflow_type)
             .ok_or_else(|| Error::WorkflowNotRegistered(task.workflow_type.clone()))?;
@@ -1946,7 +2162,7 @@ impl Worker {
             commands: Vec::new(),
         }));
         let ctx = WorkflowContext { state };
-        let mut future = handler(ctx.clone(), input);
+        let mut future = (workflow.execute)(ctx.clone(), input);
         let mut cx = TaskContext::from_waker(noop_waker_ref());
 
         match future.as_mut().poll(&mut cx) {
@@ -2087,6 +2303,48 @@ impl QueryTaskExecutionFailure {
             message: message.into(),
             failure_type: failure_type.into(),
         }
+    }
+}
+
+/// Typed local state owned by one deterministic workflow invocation.
+///
+/// Use [`WorkflowInstance::update`] for the same state transitions during
+/// ordinary execution and replay. A replayed query receives a detached
+/// immutable `Arc<S>` rather than this mutation-capable handle.
+#[derive(Clone, Debug)]
+pub struct WorkflowInstance<S> {
+    state: Arc<Mutex<S>>,
+}
+
+impl<S> WorkflowInstance<S> {
+    fn new(state: S) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    /// Read the current workflow-instance state without changing it.
+    pub fn read<R>(&self, reader: impl FnOnce(&S) -> R) -> Result<R> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(reader(&state))
+    }
+
+    /// Apply one deterministic workflow-instance state transition.
+    pub fn update<R>(&self, transition: impl FnOnce(&mut S) -> R) -> Result<R> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(transition(&mut state))
+    }
+}
+
+impl<S: Clone> WorkflowInstance<S> {
+    fn snapshot(&self) -> Result<S> {
+        self.read(Clone::clone)
     }
 }
 
@@ -2406,6 +2664,150 @@ fn hydrate_query_history_from_export(task: &mut QueryTask) -> Result<()> {
     Ok(())
 }
 
+fn enrich_query_history_from_export(task: &mut QueryTask) -> Result<()> {
+    let Some(export) = task.history_export.as_ref() else {
+        return Ok(());
+    };
+    let signals = export
+        .get("signals")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let activities = export
+        .get("activities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let export_codec = export
+        .get("payloads")
+        .and_then(|payloads| payloads.get("codec"))
+        .and_then(Value::as_str)
+        .unwrap_or(&task.payload_codec)
+        .to_string();
+    let mut signal_name_offsets: HashMap<String, usize> = HashMap::new();
+
+    for event in &mut task.history_events {
+        if event.event_type == "ActivityCompleted" {
+            let sequence = event
+                .payload
+                .get("sequence")
+                .or_else(|| event.payload.get("workflow_sequence"))
+                .and_then(value_as_u64);
+            let Some(activity) = sequence.and_then(|sequence| {
+                activities.iter().find(|activity| {
+                    activity.get("sequence").and_then(value_as_u64) == Some(sequence)
+                })
+            }) else {
+                continue;
+            };
+            let Some(payload) = event.payload.as_object_mut() else {
+                continue;
+            };
+            if missing_payload(payload.get("result")) {
+                if let Some(result) = activity
+                    .get("result")
+                    .filter(|value| !missing_payload(Some(value)))
+                {
+                    payload.insert("result".to_string(), result.clone());
+                }
+            }
+            for field in ["payload_codec", "activity_type"] {
+                if payload
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    if let Some(value) = activity.get(field) {
+                        payload.insert(field.to_string(), value.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
+        if event.event_type != "SignalReceived" && event.event_type != "SignalApplied" {
+            continue;
+        }
+        let signal_id = event.payload.get("signal_id").and_then(Value::as_str);
+        let command_id = event
+            .payload
+            .get("workflow_command_id")
+            .or_else(|| event.raw.get("workflow_command_id"))
+            .and_then(Value::as_str);
+        let signal_name = event
+            .payload
+            .get("signal_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let matched = signals
+            .iter()
+            .find(|signal| {
+                signal_id.is_some() && signal.get("id").and_then(Value::as_str) == signal_id
+            })
+            .or_else(|| {
+                signals.iter().find(|signal| {
+                    command_id.is_some()
+                        && signal.get("command_id").and_then(Value::as_str) == command_id
+                })
+            })
+            .or_else(|| {
+                let offset = signal_name_offsets.entry(signal_name.clone()).or_default();
+                let signal = signals
+                    .iter()
+                    .filter(|signal| {
+                        signal.get("name").and_then(Value::as_str) == Some(signal_name.as_str())
+                    })
+                    .nth(*offset);
+                if signal.is_some() {
+                    *offset += 1;
+                }
+                signal
+            });
+        let Some(signal) = matched else {
+            continue;
+        };
+        let signal_codec = signal
+            .get("payload_codec")
+            .and_then(Value::as_str)
+            .unwrap_or(&export_codec);
+        let Some(payload) = event.payload.as_object_mut() else {
+            continue;
+        };
+        if missing_payload(payload.get("arguments")) {
+            if let Some(arguments) = signal
+                .get("arguments")
+                .filter(|value| !missing_payload(Some(value)))
+            {
+                let envelope = match arguments {
+                    Value::String(blob) => json!({"codec": signal_codec, "blob": blob}),
+                    other => other.clone(),
+                };
+                payload.insert("arguments".to_string(), envelope);
+            }
+        }
+        if payload
+            .get("payload_codec")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            payload.insert("payload_codec".to_string(), json!(signal_codec));
+        }
+    }
+
+    Ok(())
+}
+
+fn missing_payload(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.is_empty(),
+        Some(_) => false,
+    }
+}
+
 fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
     let export_signals = task
         .history_export
@@ -2575,6 +2977,83 @@ mod tests {
         net::{SocketAddr, TcpListener, TcpStream},
         thread,
     };
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct ReplayCounterState {
+        loaded: Option<String>,
+        count: i64,
+        finished: bool,
+    }
+
+    fn replay_counter_worker() -> Worker {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_replayed_workflow(
+            "replay-counter",
+            ReplayCounterState::default,
+            |ctx, _input, state| async move {
+                let loaded = ctx.activity("load-counter", json!([])).await?;
+                state.update(|current| {
+                    current.loaded = loaded.as_str().map(str::to_string);
+                })?;
+                for _ in 0..2 {
+                    let signal = ctx.wait_signal("increment").await?;
+                    let amount = signal.first().and_then(Value::as_i64).unwrap_or_default();
+                    state.update(|current| current.count += amount)?;
+                }
+                state.update(|current| current.finished = true)?;
+                state.read(|current| Ok(json!(current.count)))?
+            },
+        );
+        worker.register_replayed_query::<ReplayCounterState, _, _>(
+            "replay-counter",
+            "current",
+            |_ctx, state, _args| async move {
+                Ok(json!({
+                    "loaded": state.loaded,
+                    "count": state.count,
+                    "finished": state.finished,
+                }))
+            },
+        );
+        worker.register_replayed_query::<ReplayCounterState, _, _>(
+            "replay-counter",
+            "detached-mutation",
+            |_ctx, state, _args| async move {
+                let mut detached = (*state).clone();
+                detached.count = 999;
+                Ok(json!(detached.count))
+            },
+        );
+        worker.register_replayed_query::<ReplayCounterState, _, _>(
+            "replay-counter",
+            "failed-mutation",
+            |_ctx, state, _args| async move {
+                let mut detached = (*state).clone();
+                detached.count = 999;
+                Err(Error::WorkerLoop("query refused".to_string()))
+            },
+        );
+        worker
+    }
+
+    fn replay_counter_query(
+        query_name: &str,
+        history_events: Value,
+        run_status: &str,
+    ) -> QueryTask {
+        serde_json::from_value(json!({
+            "query_task_id": format!("query-{query_name}"),
+            "workflow_type": "replay-counter",
+            "query_name": query_name,
+            "payload_codec": "json",
+            "workflow_arguments": {"codec": "json", "blob": "[]"},
+            "query_arguments": {"codec": "json", "blob": "[]"},
+            "history_events": history_events,
+            "run_status": run_status,
+        }))
+        .expect("query task")
+    }
 
     #[test]
     fn avro_generic_wrapper_round_trips_json_values() {
@@ -2821,6 +3300,156 @@ mod tests {
 
         let result = worker.execute_query_task(task).await.expect("query result");
         assert_eq!(result, json!(0));
+    }
+
+    #[tokio::test]
+    async fn replayed_queries_read_running_completed_and_cold_restarted_instance_state() {
+        let worker = replay_counter_worker();
+        let running_history = json!([
+            {
+                "type": "ActivityCompleted",
+                "payload": {
+                    "sequence": 1,
+                    "activity_type": "load-counter",
+                    "payload_codec": "json",
+                    "result": {"codec": "json", "blob": "\"loaded\""}
+                }
+            },
+            {
+                "type": "SignalReceived",
+                "payload": {
+                    "signal_id": "signal-3",
+                    "signal_name": "increment",
+                    "payload_codec": "json",
+                    "arguments": {"codec": "json", "blob": "[3]"}
+                }
+            }
+        ]);
+
+        let running = worker
+            .execute_query_task(replay_counter_query(
+                "current",
+                running_history.clone(),
+                "running",
+            ))
+            .await
+            .expect("running replay query");
+        assert_eq!(
+            running,
+            json!({"loaded": "loaded", "count": 3, "finished": false})
+        );
+
+        let detached = worker
+            .execute_query_task(replay_counter_query(
+                "detached-mutation",
+                running_history.clone(),
+                "running",
+            ))
+            .await
+            .expect("query mutates only its detached state clone");
+        assert_eq!(detached, json!(999));
+        let failed = worker
+            .execute_query_task(replay_counter_query(
+                "failed-mutation",
+                running_history.clone(),
+                "running",
+            ))
+            .await
+            .expect_err("failed query");
+        assert_eq!(failed.reason, "query_rejected");
+        let unchanged = worker
+            .execute_query_task(replay_counter_query("current", running_history, "running"))
+            .await
+            .expect("later query reconstructs unchanged state");
+        assert_eq!(unchanged, running);
+
+        let restarted_worker = replay_counter_worker();
+        let restarted_task: QueryTask = serde_json::from_value(json!({
+            "query_task_id": "query-after-restart",
+            "workflow_id": "counter-1",
+            "run_id": "run-counter-1",
+            "workflow_type": "replay-counter",
+            "query_name": "current",
+            "payload_codec": "json",
+            "workflow_arguments": {"codec": "json", "blob": "[]"},
+            "query_arguments": {"codec": "json", "blob": "[]"},
+            "history_events": [],
+            "history_export": {
+                "payloads": {"codec": "json"},
+                "history_events": [
+                    {
+                        "type": "ActivityCompleted",
+                        "payload": {
+                            "sequence": 1,
+                            "activity_type": "load-counter",
+                            "payload_codec": "json",
+                            "result": null
+                        }
+                    },
+                    {
+                        "type": "SignalReceived",
+                        "payload": {"signal_id": "signal-3", "signal_name": "increment"}
+                    },
+                    {
+                        "type": "SignalReceived",
+                        "payload": {"signal_id": "signal-5", "signal_name": "increment"}
+                    }
+                ],
+                "activities": [{
+                    "sequence": 1,
+                    "activity_type": "load-counter",
+                    "payload_codec": "json",
+                    "result": {"codec": "json", "blob": "\"loaded\""}
+                }],
+                "signals": [
+                    {
+                        "id": "signal-3",
+                        "name": "increment",
+                        "payload_codec": "json",
+                        "arguments": "[3]"
+                    },
+                    {
+                        "id": "signal-5",
+                        "name": "increment",
+                        "payload_codec": "json",
+                        "arguments": "[5]"
+                    }
+                ]
+            },
+            "run_status": "completed"
+        }))
+        .expect("cold replay query task");
+        let completed = restarted_worker
+            .execute_query_task(restarted_task)
+            .await
+            .expect("completed cold replay query");
+        assert_eq!(
+            completed,
+            json!({"loaded": "loaded", "count": 8, "finished": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_query_replay_failures_are_machine_readable() {
+        let worker = replay_counter_worker();
+        let task = replay_counter_query(
+            "current",
+            json!([{
+                "type": "ActivityCompleted",
+                "payload": {
+                    "sequence": 1,
+                    "payload_codec": "json",
+                    "result": {"codec": "json", "blob": "{"}
+                }
+            }]),
+            "running",
+        );
+        let failure = worker
+            .execute_query_task(task)
+            .await
+            .expect_err("invalid replay history payload");
+        assert_eq!(failure.reason, "query_workflow_state_unavailable");
+        assert_eq!(failure.failure_type, "QueryWorkflowStateUnavailable");
     }
 
     #[tokio::test]

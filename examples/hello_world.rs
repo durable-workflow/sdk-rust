@@ -2,6 +2,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use durable_workflow::{json, Client, Result, Worker, WorkflowResultOptions};
 
+#[derive(Clone, Default)]
+struct HelloState {
+    started_by: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let server_url = std::env::var("DURABLE_WORKFLOW_SERVER_URL")
@@ -27,31 +32,28 @@ async fn main() -> Result<()> {
         Ok(json!(format!("hello, {name}")))
     });
 
-    worker.register_workflow("rust.hello_workflow", |ctx, _input| async move {
-        let signal = ctx.wait_signal("start").await?;
-        let name = signal
-            .first()
-            .and_then(|value| value.as_str())
-            .unwrap_or("world");
-        let greeting = ctx.activity("rust.hello_activity", json!([name])).await?;
-        Ok(json!({
-            "greeting": greeting,
-            "language": "rust"
-        }))
-    });
+    worker.register_replayed_workflow(
+        "rust.hello_workflow",
+        HelloState::default,
+        |ctx, _input, state| async move {
+            let signal = ctx.wait_signal("start").await?;
+            let name = signal
+                .first()
+                .and_then(|value| value.as_str())
+                .unwrap_or("world");
+            state.update(|current| current.started_by = Some(name.to_string()))?;
+            let greeting = ctx.activity("rust.hello_activity", json!([name])).await?;
+            Ok(json!({
+                "greeting": greeting,
+                "language": "rust"
+            }))
+        },
+    );
 
-    worker.register_query(
+    worker.register_replayed_query::<HelloState, _, _>(
         "rust.hello_workflow",
         "started_by",
-        |ctx, _args| async move {
-            let name = ctx
-                .signals("start")
-                .last()
-                .and_then(|args| args.first())
-                .cloned()
-                .unwrap_or(json!(null));
-            Ok(name)
-        },
+        |_ctx, state, _args| async move { Ok(json!(state.started_by)) },
     );
 
     worker.register().await?;

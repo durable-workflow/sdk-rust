@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -19,6 +19,9 @@ worker-protocol-version = "1.2"
 control-plane-version = "2"
 query-tasks = true
 query-task-minimum-worker-protocol-version = "1.8"
+replayed-instance-state-queries = true
+query-state-model = "deterministic-workflow-replay"
+snapshot-inspection-queries = true
 payload-codecs = ["avro", "json"]
 
 [lib]
