@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify crate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Test all targets
+        run: cargo test --all-targets
+
+      - name: Build warning-free API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --all-features --no-deps
+
+      - name: Verify publishable package
+        run: cargo package
+
+      - name: Validate release tooling
+        run: bash -n scripts/ci/publish-rust-sdk.sh

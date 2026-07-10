@@ -1,0 +1,10 @@
+/.local-bin/
+/.npm/
+/.zig/
+/zig.tar.xz
+/target/
+/Cargo.lock
+/.cargo/
+/.rustup/
+/rustup-init
+/rust-sdk-release-evidence.json

@@ -1,0 +1,55 @@
+name: API Documentation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: api-documentation
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/configure-pages@v5
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Build complete API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --all-features --no-deps
+
+      - name: Prepare Pages artifact
+        run: |
+          printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
+          touch target/doc/.nojekyll
+          printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=durable_workflow/"><link rel="canonical" href="durable_workflow/"><title>Durable Workflow Rust SDK</title><p><a href="durable_workflow/">Open the Durable Workflow Rust SDK API reference</a>.</p>' > target/doc/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: target/doc
+
+  deploy:
+    name: Deploy rustdoc
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
