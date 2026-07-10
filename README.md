@@ -11,19 +11,19 @@ JSON-native payloads through the platform's generic Avro wrapper.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.1 --exact
+cargo add durable-workflow@0.1.2 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.1"
+durable-workflow = "=0.1.2"
 ```
 
-Version `0.1.1` requires Rust `1.86` or newer. Snapshot query transport is
-available from `0.1.1`; replayed workflow-instance state queries are the
-direct-successor `0.1.2` surface.
+Version `0.1.2` requires Rust `1.86` or newer. Snapshot inspection queries were
+introduced in `0.1.1`; replayed workflow-instance state queries are available
+from `0.1.2`.
 
 ## Compatibility
 
