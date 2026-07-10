@@ -1,0 +1,28 @@
+{
+  "schema": "{\"type\":\"record\",\"name\":\"Payload\",\"namespace\":\"durable_workflow\",\"fields\":[{\"name\":\"json\",\"type\":\"string\"},{\"name\":\"version\",\"type\":\"int\",\"default\":1}]}",
+  "json": "{\"boolean_false\":false,\"boolean_true\":true,\"float\":3.141592653589793,\"integer\":-42,\"nested\":{\"list\":[null,true,7,2.5,{\"unicode\":\"Zażółć gęślą jaźń 🌍\"}],\"object\":{\"enabled\":false,\"nothing\":null}},\"null\":null,\"unicode\":\"こんにちは, 世界 👋\"}",
+  "value": {
+    "boolean_false": false,
+    "boolean_true": true,
+    "float": 3.141592653589793,
+    "integer": -42,
+    "nested": {
+      "list": [null, true, 7, 2.5, {"unicode": "Zażółć gęślą jaźń 🌍"}],
+      "object": {"enabled": false, "nothing": null}
+    },
+    "null": null,
+    "unicode": "こんにちは, 世界 👋"
+  },
+  "producers": [
+    {
+      "runtime": "Python",
+      "library": "avro 1.12.1",
+      "blob": "AIgEeyJib29sZWFuX2ZhbHNlIjpmYWxzZSwiYm9vbGVhbl90cnVlIjp0cnVlLCJmbG9hdCI6My4xNDE1OTI2NTM1ODk3OTMsImludGVnZXIiOi00MiwibmVzdGVkIjp7Imxpc3QiOltudWxsLHRydWUsNywyLjUseyJ1bmljb2RlIjoiWmHFvMOzxYLEhyBnxJnFm2zEhSBqYcW6xYQg8J+MjSJ9XSwib2JqZWN0Ijp7ImVuYWJsZWQiOmZhbHNlLCJub3RoaW5nIjpudWxsfX0sIm51bGwiOm51bGwsInVuaWNvZGUiOiLjgZPjgpPjgavjgaHjga8sIOS4lueVjCDwn5GLIn0C"
+    },
+    {
+      "runtime": "PHP",
+      "library": "apache/avro 1.12.1",
+      "blob": "AIgEeyJib29sZWFuX2ZhbHNlIjpmYWxzZSwiYm9vbGVhbl90cnVlIjp0cnVlLCJmbG9hdCI6My4xNDE1OTI2NTM1ODk3OTMsImludGVnZXIiOi00MiwibmVzdGVkIjp7Imxpc3QiOltudWxsLHRydWUsNywyLjUseyJ1bmljb2RlIjoiWmHFvMOzxYLEhyBnxJnFm2zEhSBqYcW6xYQg8J+MjSJ9XSwib2JqZWN0Ijp7ImVuYWJsZWQiOmZhbHNlLCJub3RoaW5nIjpudWxsfX0sIm51bGwiOm51bGwsInVuaWNvZGUiOiLjgZPjgpPjgavjgaHjga8sIOS4lueVjCDwn5GLIn0C"
+    }
+  ]
+}

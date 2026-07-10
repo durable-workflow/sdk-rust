@@ -11,12 +11,13 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -28,6 +29,11 @@ pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const JSON_CODEC: &str = "json";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
+
+const AVRO_PAYLOAD_SCHEMA_JSON: &str = r#"{"type":"record","name":"Payload","namespace":"durable_workflow","fields":[{"name":"json","type":"string"},{"name":"version","type":"int","default":1}]}"#;
+const AVRO_PAYLOAD_VERSION: i32 = 1;
+
+static AVRO_PAYLOAD_SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -132,11 +138,17 @@ fn decode_blob(blob: &str, codec: &str) -> Result<Value> {
 
 fn encode_avro_generic(value: &Value) -> Result<String> {
     let json = serde_json::to_string(value)?;
-    let mut bytes = Vec::with_capacity(json.len() + 8);
+    let datum = to_value(AvroPayload {
+        json,
+        version: AVRO_PAYLOAD_VERSION,
+    })
+    .map_err(|err| Error::Codec(format!("could not convert avro generic wrapper: {err}")))?;
+    let datum = to_avro_datum(avro_payload_schema()?, datum)
+        .map_err(|err| Error::Codec(format!("could not encode avro generic wrapper: {err}")))?;
+
+    let mut bytes = Vec::with_capacity(datum.len() + 1);
     bytes.push(0x00);
-    write_avro_long(json.len() as i64, &mut bytes);
-    bytes.extend_from_slice(json.as_bytes());
-    write_avro_int(1, &mut bytes);
+    bytes.extend_from_slice(&datum);
     Ok(BASE64.encode(bytes))
 }
 
@@ -164,83 +176,35 @@ fn decode_avro_generic(blob: &str) -> Result<Value> {
         }
     }
 
-    let mut cursor = 1;
-    let len = read_avro_long(&bytes, &mut cursor)?;
-    if len < 0 {
-        return Err(Error::Codec("avro string length was negative".to_string()));
-    }
+    let mut datum = &bytes[1..];
+    let datum = from_avro_datum(avro_payload_schema()?, &mut datum, None)
+        .map_err(|err| Error::Codec(format!("could not decode avro generic wrapper: {err}")))?;
+    let payload: AvroPayload = from_value(&datum)
+        .map_err(|err| Error::Codec(format!("invalid avro generic wrapper record: {err}")))?;
 
-    let len = len as usize;
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| Error::Codec("avro string length overflowed".to_string()))?;
-    if end > bytes.len() {
-        return Err(Error::Codec(
-            "avro string extends beyond payload".to_string(),
-        ));
-    }
-
-    let json = std::str::from_utf8(&bytes[cursor..end])
-        .map_err(|err| Error::Codec(format!("avro json field is not utf-8: {err}")))?;
-    cursor = end;
-
-    let version = read_avro_int(&bytes, &mut cursor)?;
-    if version != 1 {
+    if payload.version != AVRO_PAYLOAD_VERSION {
         return Err(Error::Codec(format!(
-            "unsupported avro generic wrapper version {version}"
+            "unsupported avro generic wrapper version {}",
+            payload.version
         )));
     }
 
-    Ok(serde_json::from_str(json)?)
+    Ok(serde_json::from_str(&payload.json)?)
 }
 
-fn write_avro_int(value: i32, bytes: &mut Vec<u8>) {
-    write_unsigned_varint(((value << 1) ^ (value >> 31)) as u64, bytes);
+#[derive(Debug, Serialize, Deserialize)]
+struct AvroPayload {
+    json: String,
+    version: i32,
 }
 
-fn write_avro_long(value: i64, bytes: &mut Vec<u8>) {
-    write_unsigned_varint(((value << 1) ^ (value >> 63)) as u64, bytes);
-}
-
-fn write_unsigned_varint(mut value: u64, bytes: &mut Vec<u8>) {
-    while (value & !0x7f) != 0 {
-        bytes.push(((value & 0x7f) as u8) | 0x80);
-        value >>= 7;
-    }
-    bytes.push(value as u8);
-}
-
-fn read_avro_int(bytes: &[u8], cursor: &mut usize) -> Result<i32> {
-    let value = read_unsigned_varint(bytes, cursor)?;
-    Ok(((value >> 1) as i32) ^ (-((value & 1) as i32)))
-}
-
-fn read_avro_long(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
-    let value = read_unsigned_varint(bytes, cursor)?;
-    Ok(((value >> 1) as i64) ^ (-((value & 1) as i64)))
-}
-
-fn read_unsigned_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-
-    loop {
-        if *cursor >= bytes.len() {
-            return Err(Error::Codec("truncated avro varint".to_string()));
-        }
-
-        let byte = bytes[*cursor];
-        *cursor += 1;
-        value |= ((byte & 0x7f) as u64) << shift;
-
-        if (byte & 0x80) == 0 {
-            return Ok(value);
-        }
-
-        shift += 7;
-        if shift >= 64 {
-            return Err(Error::Codec("avro varint is too large".to_string()));
-        }
+fn avro_payload_schema() -> Result<&'static Schema> {
+    match AVRO_PAYLOAD_SCHEMA.get_or_init(|| {
+        Schema::parse_str(AVRO_PAYLOAD_SCHEMA_JSON)
+            .map_err(|err| format!("could not parse avro payload schema: {err}"))
+    }) {
+        Ok(schema) => Ok(schema),
+        Err(message) => Err(Error::Codec(message.clone())),
     }
 }
 
@@ -1749,6 +1713,30 @@ mod tests {
         let envelope = PayloadEnvelope::avro(&value).expect("encode");
         assert_eq!(envelope.codec, DEFAULT_CODEC);
         assert_eq!(decode_payload::<Value>(&envelope).expect("decode"), value);
+    }
+
+    #[test]
+    fn json_codec_remains_plain_json() {
+        let value = json!({"greeting": "hello", "count": 3, "ok": true});
+        let envelope = PayloadEnvelope::json(&value).expect("encode");
+
+        assert_eq!(envelope.codec, JSON_CODEC);
+        assert_eq!(envelope.blob, serde_json::to_string(&value).expect("json"));
+        assert_eq!(decode_payload::<Value>(&envelope).expect("decode"), value);
+    }
+
+    #[test]
+    fn typed_avro_payload_without_schema_context_keeps_diagnostic() {
+        let envelope = PayloadEnvelope {
+            codec: DEFAULT_CODEC.to_string(),
+            blob: BASE64.encode([0x01]),
+        };
+
+        let error = decode_payload::<Value>(&envelope).expect_err("typed payload must fail");
+        assert_eq!(
+            error.to_string(),
+            "codec error: typed avro payloads require a schema context; v1 supports the generic wrapper"
+        );
     }
 
     #[test]

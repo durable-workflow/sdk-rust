@@ -23,7 +23,10 @@ name = "durable_workflow"
 path = "src/lib.rs"
 
 [dependencies]
+apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
+# Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
+bon = { version = "=3.8.1", default-features = false }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
