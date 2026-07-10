@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -17,6 +17,9 @@ include = ["/src/**", "/examples/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 supported-server-versions = ">=0.2,<0.3"
 worker-protocol-version = "1.2"
 control-plane-version = "2"
+query-tasks = true
+query-task-minimum-worker-protocol-version = "1.8"
+payload-codecs = ["avro", "json"]
 
 [lib]
 name = "durable_workflow"

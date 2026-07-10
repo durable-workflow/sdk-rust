@@ -35,6 +35,8 @@ target_directory="$(jq -er '.target_directory' <<<"$metadata")"
 server_compatibility="$(jq -er '.packages[0].metadata["durable-workflow"]["supported-server-versions"]' <<<"$metadata")"
 worker_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["worker-protocol-version"]' <<<"$metadata")"
 control_plane="$(jq -er '.packages[0].metadata["durable-workflow"]["control-plane-version"]' <<<"$metadata")"
+query_tasks="$(jq -er '.packages[0].metadata["durable-workflow"]["query-tasks"]' <<<"$metadata")"
+query_task_minimum_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["query-task-minimum-worker-protocol-version"]' <<<"$metadata")"
 
 if [[ "$package_name" != "durable-workflow" ]]; then
     printf 'unexpected Rust SDK package name: %s\n' "$package_name" >&2
@@ -56,7 +58,7 @@ if [[ "$package_documentation" != "https://rust.durable-workflow.com/" ]]; then
     printf 'unexpected Rust SDK documentation metadata: %s\n' "$package_documentation" >&2
     exit 1
 fi
-if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" ]]; then
+if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi
@@ -121,6 +123,8 @@ write_evidence() {
         --arg server_compatibility "$server_compatibility" \
         --arg worker_protocol "$worker_protocol" \
         --arg control_plane "$control_plane" \
+        --arg query_tasks "$query_tasks" \
+        --arg query_task_minimum_protocol "$query_task_minimum_protocol" \
         --arg release_tag "$release_tag" \
         --arg release_commit "$release_commit" \
         --arg release_run_id "$release_run_id" \
@@ -152,7 +156,9 @@ write_evidence() {
             supported_server_versions: $server_compatibility,
             protocol_compatibility: {
                 worker_protocol: $worker_protocol,
-                control_plane: $control_plane
+                control_plane: $control_plane,
+                query_tasks: ($query_tasks == "true"),
+                query_task_minimum_worker_protocol: $query_task_minimum_protocol
             },
             release: {
                 sdk_tag: $release_tag,

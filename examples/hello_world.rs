@@ -40,6 +40,20 @@ async fn main() -> Result<()> {
         }))
     });
 
+    worker.register_query(
+        "rust.hello_workflow",
+        "started_by",
+        |ctx, _args| async move {
+            let name = ctx
+                .signals("start")
+                .last()
+                .and_then(|args| args.first())
+                .cloned()
+                .unwrap_or(json!(null));
+            Ok(name)
+        },
+    );
+
     worker.register().await?;
 
     let workflow_id = format!("rust-hello-{}", unique_suffix());

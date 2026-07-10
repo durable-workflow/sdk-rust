@@ -1,9 +1,10 @@
 //! Minimal Rust SDK for the Durable Workflow worker protocol.
 //!
-//! The crate covers the v1 Rust round-trip: start and signal workflows,
-//! register a Rust worker, poll workflow and activity tasks, heartbeat worker
-//! and activity liveness, and exchange JSON-native payloads through the same
-//! `avro` generic wrapper used by the existing first-party SDKs.
+//! The crate covers the v1 Rust round-trip: start, signal, and query workflows,
+//! register a Rust worker, poll workflow, activity, and read-only query tasks,
+//! heartbeat worker and activity liveness, and exchange JSON-native payloads
+//! through the same `avro` generic wrapper used by the existing first-party
+//! SDKs.
 
 use std::{
     collections::HashMap,
@@ -29,11 +30,34 @@ pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const JSON_CODEC: &str = "json";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
+/// Worker-registration capability for server-routed read-only queries.
+pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
+/// First additive worker protocol that defines query-task transport.
+pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
+
+const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
+    "lease_expired",
+    "query_task_not_found",
+    "query_task_not_leased",
+    "query_task_timed_out",
+];
 
 const AVRO_PAYLOAD_SCHEMA_JSON: &str = r#"{"type":"record","name":"Payload","namespace":"durable_workflow","fields":[{"name":"json","type":"string"},{"name":"version","type":"int","default":1}]}"#;
 const AVRO_PAYLOAD_VERSION: i32 = 1;
 
 static AVRO_PAYLOAD_SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum RequestProtocol {
+    ControlPlane,
+    Worker(&'static str),
+}
+
+impl RequestProtocol {
+    fn is_worker(self) -> bool {
+        matches!(self, Self::Worker(_))
+    }
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -50,6 +74,10 @@ pub enum Error {
     },
     #[error("codec error: {0}")]
     Codec(String),
+    #[error(transparent)]
+    QueryFailed(QueryFailure),
+    #[error(transparent)]
+    Protocol(ProtocolFailure),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
@@ -62,6 +90,28 @@ pub enum Error {
     Timeout,
     #[error("worker loop error: {0}")]
     WorkerLoop(String),
+}
+
+/// A stable, machine-readable workflow query or query-task settlement failure.
+#[derive(Clone, Debug, Error)]
+#[error("query failed ({reason}, HTTP {status}): {message}")]
+pub struct QueryFailure {
+    pub status: u16,
+    pub reason: String,
+    pub message: String,
+    pub body: Value,
+}
+
+/// A stable failure returned when a server rejects an SDK protocol version.
+#[derive(Clone, Debug, Error)]
+#[error("protocol rejected ({reason}, HTTP {status}): {message}")]
+pub struct ProtocolFailure {
+    pub status: u16,
+    pub reason: String,
+    pub message: String,
+    pub supported_version: Option<String>,
+    pub requested_version: Option<String>,
+    pub body: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,7 +288,7 @@ impl Client {
         self.request_json(
             reqwest::Method::GET,
             "/health",
-            false,
+            RequestProtocol::ControlPlane,
             Option::<&Value>::None,
         )
         .await
@@ -248,7 +298,7 @@ impl Client {
         self.request_json(
             reqwest::Method::GET,
             "/cluster/info",
-            false,
+            RequestProtocol::ControlPlane,
             Option::<&Value>::None,
         )
         .await
@@ -273,7 +323,12 @@ impl Client {
         });
 
         let data: Value = self
-            .request_json(reqwest::Method::POST, "/workflows", false, Some(&body))
+            .request_json(
+                reqwest::Method::POST,
+                "/workflows",
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
             .await?;
 
         Ok(WorkflowHandle {
@@ -307,14 +362,67 @@ impl Client {
             "input": input_envelope
         });
         let path = format!("/workflows/{workflow_id}/signal/{signal_name}");
-        self.request_json(reqwest::Method::POST, &path, false, Some(&body))
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::ControlPlane,
+            Some(&body),
+        )
+        .await
+    }
+
+    /// Execute a named, read-only query against a running or completed workflow.
+    ///
+    /// Arguments and results use the platform payload envelope. Server and
+    /// worker rejections are returned as [`Error::QueryFailed`] with a stable
+    /// reason, HTTP status, and original response body.
+    pub async fn query_workflow<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        query_name: &str,
+        input: T,
+    ) -> Result<Value> {
+        let input = serde_json::to_value(input)?;
+        let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
+        let body = json!({
+            "input": input_envelope
+        });
+        let path = format!("/workflows/{workflow_id}/query/{query_name}");
+        let response: Value = match self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
             .await
+        {
+            Ok(response) => response,
+            Err(Error::Http { status, body }) => {
+                return Err(Error::QueryFailed(query_failure(status, body)));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(envelope) = response
+            .get("result_envelope")
+            .filter(|envelope| !envelope.is_null())
+        {
+            return decode_wire_value(envelope, DEFAULT_CODEC);
+        }
+
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
     pub async fn describe_workflow(&self, workflow_id: &str) -> Result<WorkflowDescription> {
         let path = format!("/workflows/{workflow_id}");
         let mut data: WorkflowDescription = self
-            .request_json(reqwest::Method::GET, &path, false, Option::<&Value>::None)
+            .request_json(
+                reqwest::Method::GET,
+                &path,
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+            )
             .await?;
         data.decode_payloads()?;
         Ok(data)
@@ -329,6 +437,29 @@ impl Client {
         max_concurrent_workflow_tasks: usize,
         max_concurrent_activity_tasks: usize,
     ) -> Result<RegisterWorkerResponse> {
+        self.register_worker_with_capabilities(
+            worker_id,
+            task_queue,
+            supported_workflow_types,
+            supported_activity_types,
+            max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Register a worker and explicitly advertise additive worker capabilities.
+    pub async fn register_worker_with_capabilities(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        supported_workflow_types: Vec<String>,
+        supported_activity_types: Vec<String>,
+        max_concurrent_workflow_tasks: usize,
+        max_concurrent_activity_tasks: usize,
+        capabilities: Vec<String>,
+    ) -> Result<RegisterWorkerResponse> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
@@ -336,12 +467,124 @@ impl Client {
             "sdk_version": SDK_VERSION,
             "supported_workflow_types": supported_workflow_types,
             "supported_activity_types": supported_activity_types,
+            "capabilities": capabilities,
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
 
-        self.request_json(reqwest::Method::POST, "/worker/register", true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            "/worker/register",
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
+    }
+
+    /// Long-poll for an ephemeral, read-only workflow query task.
+    pub async fn poll_query_task(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+    ) -> Result<Option<QueryTask>> {
+        let timeout_seconds = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+            .min(60);
+        let body = json!({
+            "worker_id": worker_id,
+            "task_queue": task_queue,
+            "poll_request_id": unique_request_id("rust-query-poll"),
+            "timeout_seconds": timeout_seconds,
+        });
+        let data: PollQueryTaskResponse = self
+            .request_json_with_timeout(
+                reqwest::Method::POST,
+                "/worker/query-tasks/poll",
+                RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                Some(&body),
+                timeout + Duration::from_secs(5),
+            )
+            .await?;
+        Ok(data.task)
+    }
+
+    /// Complete a query task without appending workflow history.
+    pub async fn complete_query_task(
+        &self,
+        query_task_id: &str,
+        lease_owner: &str,
+        query_task_attempt: u64,
+        result: Value,
+        codec: &str,
+    ) -> Result<Value> {
+        let result_envelope = encode_value_envelope(&result, codec)?;
+        self.complete_query_task_with_envelope(
+            query_task_id,
+            lease_owner,
+            query_task_attempt,
+            result,
+            result_envelope,
+        )
+        .await
+    }
+
+    async fn complete_query_task_with_envelope(
+        &self,
+        query_task_id: &str,
+        lease_owner: &str,
+        query_task_attempt: u64,
+        result: Value,
+        result_envelope: Value,
+    ) -> Result<Value> {
+        let body = json!({
+            "lease_owner": lease_owner,
+            "query_task_attempt": query_task_attempt,
+            "result": result,
+            "result_envelope": result_envelope,
+        });
+        let path = format!("/worker/query-tasks/{query_task_id}/complete");
+        let response = self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await;
+        query_task_response(response)
+    }
+
+    /// Report a stable machine-readable query-task failure.
+    pub async fn fail_query_task(
+        &self,
+        query_task_id: &str,
+        lease_owner: &str,
+        query_task_attempt: u64,
+        message: impl Into<String>,
+        reason: impl Into<String>,
+        failure_type: impl Into<String>,
+    ) -> Result<Value> {
+        let body = json!({
+            "lease_owner": lease_owner,
+            "query_task_attempt": query_task_attempt,
+            "failure": {
+                "message": message.into(),
+                "reason": reason.into(),
+                "type": failure_type.into(),
+            }
+        });
+        let path = format!("/worker/query-tasks/{query_task_id}/fail");
+        let response = self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await;
+        query_task_response(response)
     }
 
     pub async fn heartbeat_worker(
@@ -365,7 +608,7 @@ impl Client {
         self.request_json(
             reqwest::Method::POST,
             "/worker/heartbeat",
-            true,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
             Some(&body),
         )
         .await
@@ -397,7 +640,7 @@ impl Client {
             .request_json_with_timeout(
                 reqwest::Method::POST,
                 "/worker/workflow-tasks/poll",
-                true,
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
                 Some(&body),
                 timeout + Duration::from_secs(5),
             )
@@ -460,8 +703,13 @@ impl Client {
         });
         let path = format!("/worker/workflow-tasks/{task_id}/history");
 
-        self.request_json(reqwest::Method::POST, &path, true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
     }
 
     pub async fn complete_workflow_task(
@@ -477,8 +725,13 @@ impl Client {
             "commands": commands
         });
         let path = format!("/worker/workflow-tasks/{task_id}/complete");
-        self.request_json(reqwest::Method::POST, &path, true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
     }
 
     pub async fn fail_workflow_task(
@@ -497,8 +750,13 @@ impl Client {
             }
         });
         let path = format!("/worker/workflow-tasks/{task_id}/fail");
-        self.request_json(reqwest::Method::POST, &path, true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
     }
 
     pub async fn poll_activity_task(
@@ -515,7 +773,7 @@ impl Client {
             .request_json_with_timeout(
                 reqwest::Method::POST,
                 "/worker/activity-tasks/poll",
-                true,
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
                 Some(&body),
                 timeout + Duration::from_secs(5),
             )
@@ -538,8 +796,13 @@ impl Client {
             "result": result
         });
         let path = format!("/worker/activity-tasks/{task_id}/complete");
-        self.request_json(reqwest::Method::POST, &path, true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
     }
 
     pub async fn fail_activity_task(
@@ -560,8 +823,13 @@ impl Client {
             }
         });
         let path = format!("/worker/activity-tasks/{task_id}/fail");
-        self.request_json(reqwest::Method::POST, &path, true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
     }
 
     pub async fn heartbeat_activity_task(
@@ -577,18 +845,23 @@ impl Client {
             "details": details
         });
         let path = format!("/worker/activity-tasks/{task_id}/heartbeat");
-        self.request_json(reqwest::Method::POST, &path, true, Some(&body))
-            .await
+        self.request_json(
+            reqwest::Method::POST,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Some(&body),
+        )
+        .await
     }
 
     async fn request_json<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: reqwest::Method,
         path: &str,
-        worker: bool,
+        protocol: RequestProtocol,
         body: Option<&B>,
     ) -> Result<T> {
-        self.request_json_with_timeout(method, path, worker, body, Duration::from_secs(60))
+        self.request_json_with_timeout(method, path, protocol, body, Duration::from_secs(60))
             .await
     }
 
@@ -596,7 +869,7 @@ impl Client {
         &self,
         method: reqwest::Method,
         path: &str,
-        worker: bool,
+        protocol: RequestProtocol,
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
@@ -608,19 +881,19 @@ impl Client {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header("X-Namespace", &self.namespace);
 
-        if worker {
-            request = request.header(
-                "X-Durable-Workflow-Protocol-Version",
-                WORKER_PROTOCOL_VERSION,
-            );
-        } else {
-            request = request.header(
-                "X-Durable-Workflow-Control-Plane-Version",
-                CONTROL_PLANE_VERSION,
-            );
+        match protocol {
+            RequestProtocol::Worker(version) => {
+                request = request.header("X-Durable-Workflow-Protocol-Version", version);
+            }
+            RequestProtocol::ControlPlane => {
+                request = request.header(
+                    "X-Durable-Workflow-Control-Plane-Version",
+                    CONTROL_PLANE_VERSION,
+                );
+            }
         }
 
-        if let Some(token) = self.auth_token(worker) {
+        if let Some(token) = self.auth_token(protocol.is_worker()) {
             request = request.bearer_auth(token);
         }
 
@@ -634,6 +907,9 @@ impl Client {
 
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes).to_string();
+            if let Some(protocol) = protocol_failure(status, &body) {
+                return Err(Error::Protocol(protocol));
+            }
             return Err(Error::Http { status, body });
         }
 
@@ -657,6 +933,77 @@ impl Client {
                 .or(self.worker_token.as_deref())
         }
     }
+}
+
+fn query_failure(status: reqwest::StatusCode, raw_body: String) -> QueryFailure {
+    let body = serde_json::from_str(&raw_body).unwrap_or_else(|_| json!({"message": raw_body}));
+    let reason = body
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("query_rejected")
+        .to_string();
+    let message = body
+        .get("message")
+        .or_else(|| body.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or("workflow query was rejected")
+        .to_string();
+
+    QueryFailure {
+        status: status.as_u16(),
+        reason,
+        message,
+        body,
+    }
+}
+
+fn query_task_response(response: Result<Value>) -> Result<Value> {
+    match response {
+        Err(Error::Http { status, body }) => Err(Error::QueryFailed(query_failure(status, body))),
+        response => response,
+    }
+}
+
+fn query_task_rejection_is_final(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::QueryFailed(failure)
+            if QUERY_TASK_FINAL_REJECTION_REASONS.contains(&failure.reason.as_str())
+    )
+}
+
+fn protocol_failure(status: reqwest::StatusCode, raw_body: &str) -> Option<ProtocolFailure> {
+    let body: Value = serde_json::from_str(raw_body).ok()?;
+    let reason = body.get("reason")?.as_str()?;
+    if !matches!(
+        reason,
+        "missing_protocol_version"
+            | "unsupported_protocol_version"
+            | "missing_control_plane_version"
+            | "unsupported_control_plane_version"
+    ) {
+        return None;
+    }
+
+    Some(ProtocolFailure {
+        status: status.as_u16(),
+        reason: reason.to_string(),
+        message: body
+            .get("message")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("protocol version rejected")
+            .to_string(),
+        supported_version: body
+            .get("supported_version")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        requested_version: body
+            .get("requested_version")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        body,
+    })
 }
 
 #[derive(Debug)]
@@ -723,6 +1070,13 @@ impl WorkflowHandle {
     pub async fn signal<T: Serialize>(&self, signal_name: &str, input: T) -> Result<Value> {
         self.client
             .signal_workflow(&self.workflow_id, signal_name, input)
+            .await
+    }
+
+    /// Execute a named, read-only query against this workflow.
+    pub async fn query<T: Serialize>(&self, query_name: &str, input: T) -> Result<Value> {
+        self.client
+            .query_workflow(&self.workflow_id, query_name, input)
             .await
     }
 
@@ -845,6 +1199,40 @@ struct PollActivityTaskResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct PollQueryTaskResponse {
+    #[serde(default)]
+    task: Option<QueryTask>,
+}
+
+/// An ephemeral server-routed query task.
+#[derive(Clone, Debug, Deserialize)]
+pub struct QueryTask {
+    pub query_task_id: String,
+    #[serde(default = "default_workflow_task_attempt")]
+    pub query_task_attempt: u64,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub workflow_type: String,
+    pub query_name: String,
+    #[serde(default = "default_payload_codec")]
+    pub payload_codec: String,
+    #[serde(default)]
+    pub workflow_arguments: Option<Value>,
+    #[serde(default)]
+    pub query_arguments: Option<Value>,
+    #[serde(default)]
+    pub history_events: Vec<HistoryEvent>,
+    #[serde(default)]
+    pub history_export: Option<Value>,
+    #[serde(default)]
+    pub run_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct WorkflowTask {
     pub task_id: String,
     #[serde(default)]
@@ -918,11 +1306,63 @@ pub struct ActivityTask {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct HistoryEvent {
+    #[serde(alias = "type")]
     pub event_type: String,
     #[serde(default)]
     pub payload: Value,
     #[serde(flatten)]
     pub raw: HashMap<String, Value>,
+}
+
+/// One decoded signal in the committed workflow-history snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuerySignal {
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: Vec<Value>,
+    pub workflow_sequence: Option<u64>,
+}
+
+/// Immutable state supplied to a registered query handler.
+///
+/// This context intentionally exposes no activity, signal-wait, or command
+/// APIs. Query handlers inspect committed history and return a value; query
+/// completion does not append an event or advance deterministic execution.
+#[derive(Clone, Debug)]
+pub struct QueryContext {
+    pub workflow_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workflow_type: String,
+    pub run_status: Option<String>,
+    workflow_input: Value,
+    history_events: Arc<Vec<HistoryEvent>>,
+    signal_events: Arc<Vec<QuerySignal>>,
+}
+
+impl QueryContext {
+    /// The normalized argument list used to start the workflow.
+    pub fn workflow_input(&self) -> &Value {
+        &self.workflow_input
+    }
+
+    /// The immutable committed history used for this query snapshot.
+    pub fn history_events(&self) -> &[HistoryEvent] {
+        self.history_events.as_slice()
+    }
+
+    /// All decoded signals in committed workflow order.
+    pub fn signal_events(&self) -> &[QuerySignal] {
+        self.signal_events.as_slice()
+    }
+
+    /// Decoded argument lists for each committed signal with `signal_name`.
+    pub fn signals(&self, signal_name: &str) -> Vec<Vec<Value>> {
+        self.signal_events
+            .iter()
+            .filter(|signal| signal.name == signal_name)
+            .map(|signal| signal.arguments.clone())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -949,6 +1389,8 @@ type WorkflowFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'stati
 type WorkflowHandler = Arc<dyn Fn(WorkflowContext, Value) -> WorkflowFuture + Send + Sync>;
 type ActivityFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
 type ActivityHandler = Arc<dyn Fn(ActivityContext, Value) -> ActivityFuture + Send + Sync>;
+type QueryFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
+type QueryHandler = Arc<dyn Fn(QueryContext, Value) -> QueryFuture + Send + Sync>;
 type WorkerHeartbeatObserver = Arc<dyn Fn(&WorkerHeartbeatObservation) + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -966,6 +1408,7 @@ pub struct Worker {
     task_queue: String,
     workflows: HashMap<String, WorkflowHandler>,
     activities: HashMap<String, ActivityHandler>,
+    queries: HashMap<String, HashMap<String, QueryHandler>>,
     max_concurrent_workflow_tasks: usize,
     max_concurrent_activity_tasks: usize,
     poll_timeout: Duration,
@@ -981,6 +1424,7 @@ impl Worker {
             task_queue: task_queue.into(),
             workflows: HashMap::new(),
             activities: HashMap::new(),
+            queries: HashMap::new(),
             max_concurrent_workflow_tasks: 10,
             max_concurrent_activity_tasks: 10,
             poll_timeout: Duration::from_secs(30),
@@ -1044,15 +1488,42 @@ impl Worker {
         );
     }
 
+    /// Register a named, read-only query handler for a workflow type.
+    ///
+    /// The workflow type must also be registered with [`Worker::register_workflow`]
+    /// before the worker runs. The handler receives only an immutable committed
+    /// state snapshot and normalized query arguments.
+    pub fn register_query<F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        query_name: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(QueryContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.queries
+            .entry(workflow_type.into())
+            .or_default()
+            .insert(
+                query_name.into(),
+                Arc::new(move |ctx, args| Box::pin(handler(ctx, args))),
+            );
+    }
+
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
         self.client
-            .register_worker(
+            .register_worker_with_capabilities(
                 &self.worker_id,
                 &self.task_queue,
                 self.workflows.keys().cloned().collect(),
                 self.activities.keys().cloned().collect(),
                 self.max_concurrent_workflow_tasks,
                 self.max_concurrent_activity_tasks,
+                (!self.queries.is_empty())
+                    .then(|| QUERY_TASKS_CAPABILITY.to_string())
+                    .into_iter()
+                    .collect(),
             )
             .await
     }
@@ -1085,6 +1556,11 @@ impl Worker {
             let worker = self.clone();
             let stop = Arc::clone(&stop);
             tokio::spawn(async move { worker.poll_activities_until_stopped(stop).await })
+        });
+        let mut query_poller = (!self.queries.is_empty()).then(|| {
+            let worker = self.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move { worker.poll_queries_until_stopped(stop).await })
         });
 
         loop {
@@ -1119,7 +1595,7 @@ impl Worker {
                         }
                         Err(error) => {
                             stop.store(true, Ordering::SeqCst);
-                            join_pollers(workflow_poller.take(), activity_poller.take()).await?;
+                            join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await?;
                             return Err(error);
                         }
                     }
@@ -1129,7 +1605,7 @@ impl Worker {
                     stop.store(true, Ordering::SeqCst);
                     let poller_result = optional_poller_result("workflow", result);
                     let join_result =
-                        join_pollers(workflow_poller.take(), activity_poller.take()).await;
+                        join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await;
                     poller_result?;
                     join_result?;
                     return Err(Error::WorkerLoop(
@@ -1141,17 +1617,34 @@ impl Worker {
                     stop.store(true, Ordering::SeqCst);
                     let poller_result = optional_poller_result("activity", result);
                     let join_result =
-                        join_pollers(workflow_poller.take(), activity_poller.take()).await;
+                        join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await;
                     poller_result?;
                     join_result?;
                     return Err(Error::WorkerLoop(
                         "activity poller stopped unexpectedly".to_string(),
                     ));
                 }
+                result = OptionFuture::from(query_poller.as_mut()), if query_poller.is_some() => {
+                    query_poller = None;
+                    stop.store(true, Ordering::SeqCst);
+                    let poller_result = optional_poller_result("query", result);
+                    let join_result =
+                        join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await;
+                    poller_result?;
+                    join_result?;
+                    return Err(Error::WorkerLoop(
+                        "query poller stopped unexpectedly".to_string(),
+                    ));
+                }
             }
         }
 
-        join_pollers(workflow_poller.take(), activity_poller.take()).await
+        join_pollers(
+            workflow_poller.take(),
+            activity_poller.take(),
+            query_poller.take(),
+        )
+        .await
     }
 
     pub async fn run_once(&self) -> Result<usize> {
@@ -1160,6 +1653,9 @@ impl Worker {
             handled += 1;
         }
         if self.poll_activity_once().await? {
+            handled += 1;
+        }
+        if !self.queries.is_empty() && self.poll_query_once().await? {
             handled += 1;
         }
         Ok(handled)
@@ -1254,6 +1750,183 @@ impl Worker {
         }
 
         Ok(())
+    }
+
+    async fn poll_query_once(&self) -> Result<bool> {
+        let Some(task) = self
+            .client
+            .poll_query_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let query_task_id = task.query_task_id.clone();
+        let attempt = task.query_task_attempt;
+        let lease_owner = task
+            .lease_owner
+            .clone()
+            .unwrap_or_else(|| self.worker_id.clone());
+        let codec = task.payload_codec.clone();
+
+        match self.execute_query_task(task).await {
+            Ok(value) => {
+                let result_envelope = match encode_value_envelope(&value, &codec) {
+                    Ok(result_envelope) => result_envelope,
+                    Err(error) => {
+                        let failure = self
+                            .client
+                            .fail_query_task(
+                                &query_task_id,
+                                &lease_owner,
+                                attempt,
+                                error.to_string(),
+                                "query_result_encode_failed",
+                                "QueryResultEncodeFailed",
+                            )
+                            .await;
+                        if let Err(error) = failure {
+                            if !query_task_rejection_is_final(&error) {
+                                return Err(error);
+                            }
+                        }
+                        return Ok(true);
+                    }
+                };
+
+                if let Err(error) = self
+                    .client
+                    .complete_query_task_with_envelope(
+                        &query_task_id,
+                        &lease_owner,
+                        attempt,
+                        value,
+                        result_envelope,
+                    )
+                    .await
+                {
+                    if !query_task_rejection_is_final(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(failure) => {
+                let result = self
+                    .client
+                    .fail_query_task(
+                        &query_task_id,
+                        &lease_owner,
+                        attempt,
+                        failure.message,
+                        failure.reason,
+                        failure.failure_type,
+                    )
+                    .await;
+                if let Err(error) = result {
+                    if !query_task_rejection_is_final(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn poll_queries_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
+        while !stop.load(Ordering::SeqCst) {
+            self.poll_query_once().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn execute_query_task(
+        &self,
+        mut task: QueryTask,
+    ) -> std::result::Result<Value, QueryTaskExecutionFailure> {
+        if !matches!(task.payload_codec.as_str(), DEFAULT_CODEC | JSON_CODEC) {
+            return Err(QueryTaskExecutionFailure::new(
+                "query_payload_decode_failed",
+                format!(
+                    "cannot decode query payload with unsupported codec {:?}",
+                    task.payload_codec
+                ),
+                "QueryPayloadDecodeFailed",
+            ));
+        }
+
+        if !self.workflows.contains_key(&task.workflow_type) {
+            return Err(QueryTaskExecutionFailure::new(
+                "query_workflow_type_not_registered",
+                format!("no workflow registered for type {:?}", task.workflow_type),
+                "WorkflowTypeNotRegistered",
+            ));
+        }
+
+        let Some(handlers) = self.queries.get(&task.workflow_type) else {
+            return Err(QueryTaskExecutionFailure::new(
+                "query_handler_unavailable",
+                format!(
+                    "query handlers are unavailable for workflow type {:?}",
+                    task.workflow_type
+                ),
+                "QueryHandlerUnavailable",
+            ));
+        };
+        let Some(handler) = handlers.get(&task.query_name) else {
+            return Err(QueryTaskExecutionFailure::new(
+                "rejected_unknown_query",
+                format!("unknown query {:?}", task.query_name),
+                "QueryFailed",
+            ));
+        };
+
+        let args = decode_task_arguments(task.query_arguments.as_ref(), &task.payload_codec)
+            .map_err(|error| {
+                QueryTaskExecutionFailure::new(
+                    "query_payload_decode_failed",
+                    format!("cannot decode query arguments: {error}"),
+                    "QueryPayloadDecodeFailed",
+                )
+            })?;
+        let workflow_input =
+            decode_task_arguments(task.workflow_arguments.as_ref(), &task.payload_codec).map_err(
+                |error| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        format!("cannot decode workflow start input: {error}"),
+                        "QueryWorkflowStateUnavailable",
+                    )
+                },
+            )?;
+        hydrate_query_history_from_export(&mut task).map_err(|error| {
+            QueryTaskExecutionFailure::new(
+                "query_workflow_state_unavailable",
+                format!("cannot restore query history snapshot: {error}"),
+                "QueryWorkflowStateUnavailable",
+            )
+        })?;
+        let signal_events = query_signal_events(&task).map_err(|error| {
+            QueryTaskExecutionFailure::new(
+                "query_workflow_state_unavailable",
+                format!("cannot decode committed workflow signals: {error}"),
+                "QueryWorkflowStateUnavailable",
+            )
+        })?;
+        let context = QueryContext {
+            workflow_id: task.workflow_id,
+            run_id: task.run_id,
+            workflow_type: task.workflow_type,
+            run_status: task.run_status,
+            workflow_input,
+            history_events: Arc::new(task.history_events),
+            signal_events: Arc::new(signal_events),
+        };
+
+        handler(context, args).await.map_err(|error| {
+            QueryTaskExecutionFailure::new("query_rejected", error.to_string(), "QueryFailed")
+        })
     }
 
     fn execute_workflow_task(&self, task: WorkflowTask) -> Result<Vec<Value>> {
@@ -1351,6 +2024,7 @@ fn optional_poller_result(
 async fn join_pollers(
     workflow_poller: Option<tokio::task::JoinHandle<Result<()>>>,
     activity_poller: Option<tokio::task::JoinHandle<Result<()>>>,
+    query_poller: Option<tokio::task::JoinHandle<Result<()>>>,
 ) -> Result<()> {
     let mut first_error = None;
 
@@ -1362,6 +2036,12 @@ async fn join_pollers(
 
     if let Some(handle) = activity_poller {
         if let Err(error) = poller_result("activity", handle.await) {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    if let Some(handle) = query_poller {
+        if let Err(error) = poller_result("query", handle.await) {
             first_error.get_or_insert(error);
         }
     }
@@ -1379,6 +2059,35 @@ fn default_worker_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("rust-worker-{}-{millis}", std::process::id())
+}
+
+fn unique_request_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
+#[derive(Debug)]
+struct QueryTaskExecutionFailure {
+    reason: String,
+    message: String,
+    failure_type: String,
+}
+
+impl QueryTaskExecutionFailure {
+    fn new(
+        reason: impl Into<String>,
+        message: impl Into<String>,
+        failure_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            reason: reason.into(),
+            message: message.into(),
+            failure_type: failure_type.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1680,6 +2389,166 @@ fn signal_values(
     Ok(signals)
 }
 
+fn hydrate_query_history_from_export(task: &mut QueryTask) -> Result<()> {
+    let Some(export_events) = task
+        .history_export
+        .as_ref()
+        .and_then(|export| export.get("history_events"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+
+    if export_events.len() > task.history_events.len() {
+        task.history_events = serde_json::from_value(Value::Array(export_events.clone()))?;
+    }
+
+    Ok(())
+}
+
+fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
+    let export_signals = task
+        .history_export
+        .as_ref()
+        .and_then(|export| export.get("signals"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let export_codec = task
+        .history_export
+        .as_ref()
+        .and_then(|export| export.get("payloads"))
+        .and_then(|payloads| payloads.get("codec"))
+        .and_then(Value::as_str)
+        .unwrap_or(&task.payload_codec);
+    let mut name_offsets: HashMap<String, usize> = HashMap::new();
+    let mut signals = Vec::new();
+
+    for event in &task.history_events {
+        if event.event_type != "SignalApplied" && event.event_type != "SignalReceived" {
+            continue;
+        }
+
+        let name = event
+            .payload
+            .get("signal_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let signal_id = event.payload.get("signal_id").and_then(Value::as_str);
+        let command_id = event
+            .payload
+            .get("workflow_command_id")
+            .or_else(|| event.raw.get("workflow_command_id"))
+            .and_then(Value::as_str);
+        let matched_export = export_signals
+            .iter()
+            .find(|candidate| {
+                signal_id.is_some() && candidate.get("id").and_then(Value::as_str) == signal_id
+            })
+            .or_else(|| {
+                export_signals.iter().find(|candidate| {
+                    command_id.is_some()
+                        && candidate.get("command_id").and_then(Value::as_str) == command_id
+                })
+            })
+            .or_else(|| {
+                let offset = name_offsets.entry(name.to_string()).or_default();
+                let candidate = export_signals
+                    .iter()
+                    .filter(|candidate| candidate.get("name").and_then(Value::as_str) == Some(name))
+                    .nth(*offset);
+                if candidate.is_some() {
+                    *offset += 1;
+                }
+                candidate
+            });
+        let codec = event
+            .payload
+            .get("payload_codec")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                matched_export
+                    .and_then(|signal| signal.get("payload_codec"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or(export_codec);
+        let raw_arguments = event
+            .payload
+            .get("value")
+            .or_else(|| event.payload.get("input"))
+            .or_else(|| event.payload.get("arguments"))
+            .filter(|value| !value.is_null())
+            .or_else(|| matched_export.and_then(|signal| signal.get("arguments")));
+        let arguments = decode_query_signal_arguments(raw_arguments, codec)?;
+        let workflow_sequence = event
+            .payload
+            .get("workflow_sequence")
+            .and_then(value_as_u64)
+            .or_else(|| {
+                matched_export
+                    .and_then(|signal| signal.get("workflow_sequence"))
+                    .and_then(value_as_u64)
+            });
+
+        signals.push(QuerySignal {
+            id: signal_id.map(str::to_string).or_else(|| {
+                matched_export
+                    .and_then(|signal| signal.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+            name: name.to_string(),
+            arguments,
+            workflow_sequence,
+        });
+    }
+
+    if signals.is_empty() {
+        for signal in export_signals {
+            if signal.get("status").and_then(Value::as_str) == Some("rejected") {
+                continue;
+            }
+            let Some(name) = signal.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let codec = signal
+                .get("payload_codec")
+                .and_then(Value::as_str)
+                .unwrap_or(export_codec);
+            let arguments = decode_query_signal_arguments(signal.get("arguments"), codec)?;
+            signals.push(QuerySignal {
+                id: signal.get("id").and_then(Value::as_str).map(str::to_string),
+                name: name.to_string(),
+                arguments,
+                workflow_sequence: signal.get("workflow_sequence").and_then(value_as_u64),
+            });
+        }
+        signals.sort_by_key(|signal| signal.workflow_sequence.unwrap_or(u64::MAX));
+    }
+
+    Ok(signals)
+}
+
+fn decode_query_signal_arguments(raw: Option<&Value>, codec: &str) -> Result<Vec<Value>> {
+    let decoded = match raw.filter(|value| !value.is_null()) {
+        Some(value) => decode_wire_value(value, codec)?,
+        None => Value::Array(Vec::new()),
+    };
+    let Value::Array(arguments) = normalize_arguments(decoded) else {
+        unreachable!("normalize_arguments always returns an array");
+    };
+    Ok(arguments)
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
 fn resume_signal_matches_event(
     resume_signal: &ResumeSignal,
     event: &HistoryEvent,
@@ -1875,6 +2744,398 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_handler_reads_ordered_cross_codec_signals_without_commands() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        worker.register_query("counter", "current", |ctx, _args| async move {
+            let mut count = 0_i64;
+            for signal in ctx.signal_events() {
+                let value = signal
+                    .arguments
+                    .first()
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                match signal.name.as_str() {
+                    "increment" => count += value,
+                    "set" => count = value,
+                    _ => {}
+                }
+            }
+            Ok(json!(count))
+        });
+
+        let task = QueryTask {
+            query_task_id: "query-rust-counter".to_string(),
+            query_task_attempt: 1,
+            lease_owner: Some("rust-worker".to_string()),
+            workflow_id: Some("counter-1".to_string()),
+            run_id: Some("run-counter-1".to_string()),
+            workflow_type: "counter".to_string(),
+            query_name: "current".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            workflow_arguments: Some(
+                encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
+            ),
+            query_arguments: Some(
+                encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("query arguments"),
+            ),
+            history_events: vec![
+                HistoryEvent {
+                    event_type: "SignalReceived".to_string(),
+                    payload: json!({
+                        "signal_id": "php-signal-1",
+                        "signal_name": "increment",
+                        "workflow_sequence": 1,
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": encode_value_envelope(&json!([3]), DEFAULT_CODEC).expect("php avro signal")
+                    }),
+                    raw: HashMap::new(),
+                },
+                HistoryEvent {
+                    event_type: "SignalReceived".to_string(),
+                    payload: json!({
+                        "signal_id": "python-signal-2",
+                        "signal_name": "increment",
+                        "workflow_sequence": 2,
+                        "payload_codec": JSON_CODEC,
+                        "arguments": encode_value_envelope(&json!([5]), JSON_CODEC).expect("python json signal")
+                    }),
+                    raw: HashMap::new(),
+                },
+                HistoryEvent {
+                    event_type: "SignalReceived".to_string(),
+                    payload: json!({
+                        "signal_id": "rust-signal-3",
+                        "signal_name": "set",
+                        "workflow_sequence": 3,
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": encode_value_envelope(&json!([0]), DEFAULT_CODEC).expect("rust avro signal")
+                    }),
+                    raw: HashMap::new(),
+                },
+            ],
+            history_export: None,
+            run_status: Some("completed".to_string()),
+        };
+
+        let result = worker.execute_query_task(task).await.expect("query result");
+        assert_eq!(result, json!(0));
+    }
+
+    #[tokio::test]
+    async fn query_task_restores_compact_history_from_export() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        worker.register_query("counter", "current", |ctx, _args| async move {
+            Ok(json!(ctx.signals("increment")[0][0]))
+        });
+        let task: QueryTask = serde_json::from_value(json!({
+            "query_task_id": "query-export",
+            "workflow_type": "counter",
+            "query_name": "current",
+            "payload_codec": "json",
+            "workflow_arguments": {"codec": "json", "blob": "[]"},
+            "query_arguments": {"codec": "json", "blob": "[]"},
+            "history_events": [],
+            "history_export": {
+                "payloads": {"codec": "json"},
+                "history_events": [{
+                    "type": "SignalReceived",
+                    "payload": {"signal_id": "signal-export", "signal_name": "increment"}
+                }],
+                "signals": [{
+                    "id": "signal-export",
+                    "name": "increment",
+                    "status": "applied",
+                    "workflow_sequence": 1,
+                    "payload_codec": "json",
+                    "arguments": "[9]"
+                }]
+            }
+        }))
+        .expect("query task");
+
+        let result = worker.execute_query_task(task).await.expect("query result");
+        assert_eq!(result, json!(9));
+    }
+
+    #[tokio::test]
+    async fn query_task_failures_have_stable_reasons() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        worker.register_query(
+            "counter",
+            "current",
+            |_ctx, _args| async move { Ok(json!(0)) },
+        );
+
+        let base_task = QueryTask {
+            query_task_id: "query-errors".to_string(),
+            query_task_attempt: 1,
+            lease_owner: None,
+            workflow_id: Some("counter-errors".to_string()),
+            run_id: Some("run-errors".to_string()),
+            workflow_type: "counter".to_string(),
+            query_name: "missing".to_string(),
+            payload_codec: JSON_CODEC.to_string(),
+            workflow_arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            query_arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            history_events: Vec::new(),
+            history_export: None,
+            run_status: Some("running".to_string()),
+        };
+
+        let unknown = worker
+            .execute_query_task(base_task.clone())
+            .await
+            .expect_err("unknown query");
+        assert_eq!(unknown.reason, "rejected_unknown_query");
+
+        let mut malformed = base_task;
+        malformed.query_name = "current".to_string();
+        malformed.query_arguments = Some(json!({"codec": "json", "blob": "{"}));
+        let malformed = worker
+            .execute_query_task(malformed)
+            .await
+            .expect_err("malformed payload");
+        assert_eq!(malformed.reason, "query_payload_decode_failed");
+
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut unavailable_worker = Worker::new(client, "rust-workers");
+        unavailable_worker
+            .register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        let unavailable_task: QueryTask = serde_json::from_value(json!({
+            "query_task_id": "query-unavailable",
+            "workflow_type": "counter",
+            "query_name": "current",
+            "payload_codec": "json",
+            "workflow_arguments": {"codec": "json", "blob": "[]"},
+            "query_arguments": {"codec": "json", "blob": "[]"}
+        }))
+        .expect("query task");
+        let unavailable = unavailable_worker
+            .execute_query_task(unavailable_task)
+            .await
+            .expect_err("query handler unavailable");
+        assert_eq!(unavailable.reason, "query_handler_unavailable");
+    }
+
+    #[tokio::test]
+    async fn client_query_decodes_result_and_typed_failure() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let result = client
+            .query_workflow("counter-1", "current", json!([]))
+            .await
+            .expect("query result");
+        assert_eq!(result, json!({"count": 8}));
+
+        let error = client
+            .query_workflow("counter-1", "missing", json!([]))
+            .await
+            .expect_err("unknown query");
+        let Error::QueryFailed(failure) = error else {
+            panic!("expected typed query failure");
+        };
+        assert_eq!(failure.status, 404);
+        assert_eq!(failure.reason, "rejected_unknown_query");
+    }
+
+    #[tokio::test]
+    async fn baseline_worker_endpoints_send_the_baseline_protocol() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        client
+            .register_worker("capture-worker", "capture", vec![], vec![], 1, 1)
+            .await
+            .expect("register");
+        client
+            .heartbeat_worker("capture-worker", 1, 1)
+            .await
+            .expect("heartbeat");
+        client
+            .poll_workflow_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("workflow poll");
+        client
+            .poll_activity_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("activity poll");
+
+        for path in [
+            "/api/worker/register",
+            "/api/worker/heartbeat",
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+        ] {
+            assert_eq!(
+                server.worker_protocol_for(path).as_deref(),
+                Some(WORKER_PROTOCOL_VERSION),
+                "unexpected protocol for {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_task_endpoints_send_the_query_feature_protocol() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        client
+            .poll_query_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("query poll");
+        client
+            .complete_query_task("query-capture", "capture-worker", 1, json!(8), JSON_CODEC)
+            .await
+            .expect("query complete");
+        client
+            .fail_query_task(
+                "query-capture",
+                "capture-worker",
+                1,
+                "failed",
+                "query_rejected",
+                "QueryFailed",
+            )
+            .await
+            .expect("query fail");
+
+        for path in [
+            "/api/worker/query-tasks/poll",
+            "/api/worker/query-tasks/query-capture/complete",
+            "/api/worker/query-tasks/query-capture/fail",
+        ] {
+            assert_eq!(
+                server.worker_protocol_for(path).as_deref(),
+                Some(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                "unexpected protocol for {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_protocol_rejection_from_older_server_is_typed() {
+        let server = MockWorkerServer::reject_query_protocol();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let error = client
+            .poll_query_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect_err("server below query protocol floor must reject");
+        let Error::Protocol(failure) = error else {
+            panic!("expected typed protocol failure");
+        };
+
+        assert_eq!(failure.status, 400);
+        assert_eq!(failure.reason, "unsupported_protocol_version");
+        assert_eq!(failure.supported_version.as_deref(), Some("1.7"));
+        assert_eq!(
+            failure.requested_version.as_deref(),
+            Some(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            server
+                .worker_protocol_for("/api/worker/query-tasks/poll")
+                .as_deref(),
+            Some(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_once_without_query_handlers_keeps_pre_query_server_compatibility() {
+        let server = MockWorkerServer::reject_query_protocol();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("baseline-worker")
+            .poll_timeout(Duration::from_millis(10));
+
+        worker.register_workflow("baseline.workflow", |_ctx, _input| async move {
+            Ok(Value::Null)
+        });
+
+        assert_eq!(worker.run_once().await.expect("baseline run once"), 0);
+        assert_eq!(
+            server
+                .worker_protocol_for("/api/worker/workflow-tasks/poll")
+                .as_deref(),
+            Some(WORKER_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            server.worker_protocol_for("/api/worker/query-tasks/poll"),
+            None,
+            "a worker without query handlers must not use the query-task endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_time_query_rejection_is_typed_without_stopping_worker() {
+        let server = MockWorkerServer::reject_query_completion();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let error = client
+            .complete_query_task("query-late", "late-worker", 1, json!(8), JSON_CODEC)
+            .await
+            .expect_err("expired completion must be rejected");
+        let Error::QueryFailed(failure) = error else {
+            panic!("expected typed query failure");
+        };
+        assert_eq!(failure.status, 409);
+        assert_eq!(failure.reason, "query_task_timed_out");
+
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("late-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        worker.register_query(
+            "counter",
+            "current",
+            |_ctx, _args| async move { Ok(json!(8)) },
+        );
+
+        assert_eq!(worker.run_once().await.expect("late task is handled"), 1);
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("worker continues after late completion"),
+            0
+        );
+        assert_eq!(
+            server.request_count("/api/worker/query-tasks/query-late/complete"),
+            2
+        );
+        assert_eq!(
+            server.request_count("/api/worker/query-tasks/query-late/fail"),
+            0,
+            "a server completion rejection must not be reported as an encoding failure"
+        );
+    }
+
+    #[tokio::test]
     async fn activity_only_worker_can_shutdown_without_workflow_poller() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -1947,14 +3208,45 @@ mod tests {
         assert_eq!(first.acknowledgement, json!({}));
     }
 
+    #[derive(Clone, Debug)]
+    struct CapturedRequest {
+        path: String,
+        worker_protocol: Option<String>,
+    }
+
     struct MockWorkerServer {
         addr: SocketAddr,
         stop: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
         thread: Option<thread::JoinHandle<()>>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct MockWorkerBehavior {
+        reject_query_protocol: bool,
+        reject_query_completion: bool,
     }
 
     impl MockWorkerServer {
         fn start() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior::default())
+        }
+
+        fn reject_query_protocol() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                reject_query_protocol: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn reject_query_completion() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                reject_query_completion: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn start_with_behavior(behavior: MockWorkerBehavior) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
             listener
                 .set_nonblocking(true)
@@ -1962,10 +3254,14 @@ mod tests {
             let addr = listener.local_addr().expect("mock server address");
             let stop = Arc::new(AtomicBool::new(false));
             let server_stop = Arc::clone(&stop);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
             let thread = thread::spawn(move || {
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((mut stream, _)) => handle_mock_worker_request(&mut stream),
+                        Ok((mut stream, _)) => {
+                            handle_mock_worker_request(&mut stream, &server_requests, behavior)
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -1977,12 +3273,31 @@ mod tests {
             Self {
                 addr,
                 stop,
+                requests,
                 thread: Some(thread),
             }
         }
 
         fn base_url(&self) -> String {
             format!("http://{}", self.addr)
+        }
+
+        fn worker_protocol_for(&self, path: &str) -> Option<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .find(|request| request.path == path)
+                .and_then(|request| request.worker_protocol.clone())
+        }
+
+        fn request_count(&self, path: &str) -> usize {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .filter(|request| request.path == path)
+                .count()
         }
     }
 
@@ -1997,7 +3312,11 @@ mod tests {
         }
     }
 
-    fn handle_mock_worker_request(stream: &mut TcpStream) {
+    fn handle_mock_worker_request(
+        stream: &mut TcpStream,
+        requests: &Arc<Mutex<Vec<CapturedRequest>>>,
+        behavior: MockWorkerBehavior,
+    ) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
         let mut buffer = [0_u8; 8192];
         let mut request = Vec::new();
@@ -2029,6 +3348,42 @@ mod tests {
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or_default();
+        let worker_protocol = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("X-Durable-Workflow-Protocol-Version")
+                .then(|| value.trim().to_string())
+        });
+        let query_poll_number = {
+            let mut requests = requests.lock().expect("captured requests");
+            requests.push(CapturedRequest {
+                path: path.to_string(),
+                worker_protocol: worker_protocol.clone(),
+            });
+            requests
+                .iter()
+                .filter(|request| request.path == "/api/worker/query-tasks/poll")
+                .count()
+        };
+
+        if behavior.reject_query_protocol && path.starts_with("/api/worker/query-tasks/") {
+            let requested_version = worker_protocol.as_deref().unwrap_or("missing");
+            let body = format!(
+                r#"{{"reason":"unsupported_protocol_version","message":"Query tasks require worker protocol 1.8 or newer.","supported_version":"1.7","requested_version":"{requested_version}"}}"#
+            );
+            write_mock_response(stream, "400 Bad Request", &body);
+            return;
+        }
+
+        if behavior.reject_query_completion && path == "/api/worker/query-tasks/query-late/complete"
+        {
+            write_mock_response(
+                stream,
+                "409 Conflict",
+                r#"{"reason":"query_task_timed_out","message":"query task timed out before completion"}"#,
+            );
+            return;
+        }
+
         let (status, body) = match path {
             "/api/worker/register" => (
                 "200 OK",
@@ -2038,8 +3393,31 @@ mod tests {
             "/api/worker/activity-tasks/poll" | "/api/worker/workflow-tasks/poll" => {
                 ("200 OK", r#"{"task":null}"#)
             }
+            "/api/worker/query-tasks/poll"
+                if behavior.reject_query_completion && query_poll_number == 1 =>
+            {
+                (
+                    "200 OK",
+                    r#"{"task":{"query_task_id":"query-late","query_task_attempt":1,"lease_owner":"late-worker","workflow_id":"counter-late","run_id":"run-late","workflow_type":"counter","query_name":"current","payload_codec":"json","workflow_arguments":{"codec":"json","blob":"[]"},"query_arguments":{"codec":"json","blob":"[]"},"history_events":[],"run_status":"running"}}"#,
+                )
+            }
+            "/api/worker/query-tasks/poll" => ("200 OK", r#"{"task":null}"#),
+            "/api/worker/query-tasks/query-capture/complete"
+            | "/api/worker/query-tasks/query-capture/fail" => ("200 OK", "{}"),
+            "/api/workflows/counter-1/query/current" => (
+                "200 OK",
+                r#"{"workflow_id":"counter-1","query_name":"current","result":{"count":8},"result_envelope":{"codec":"json","blob":"{\"count\":8}"}}"#,
+            ),
+            "/api/workflows/counter-1/query/missing" => (
+                "404 Not Found",
+                r#"{"workflow_id":"counter-1","query_name":"missing","reason":"rejected_unknown_query","message":"unknown query"}"#,
+            ),
             _ => ("404 Not Found", r#"{"message":"not found"}"#),
         };
+        write_mock_response(stream, status, body);
+    }
+
+    fn write_mock_response(stream: &mut TcpStream, status: &str, body: &str) {
         let response = format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
