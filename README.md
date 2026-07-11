@@ -11,17 +11,17 @@ JSON-native payloads through the platform's generic Avro wrapper.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.2 --exact
+cargo add durable-workflow@0.1.3 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.2"
+durable-workflow = "=0.1.3"
 ```
 
-Version `0.1.2` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.3` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`.
 
@@ -184,6 +184,27 @@ worker.register_activity("batch.process", |ctx, _args| async move {
 
 Lower-level integrations can call `Client::heartbeat_worker` and
 `Client::heartbeat_activity_task` directly.
+
+## Worker liveness and errors
+
+Workflow, activity, and query polls advertise the configured poll timeout to
+the server. An empty response at that boundary is normal: `Worker::run` and
+`Worker::run_until` keep every poller and worker heartbeats running, so the same
+worker can accept work after an idle period.
+
+Poll acquisition and worker-heartbeat transport failures, HTTP 408/429
+responses, and server errors use capped exponential backoff. Configure the
+bound with `Worker::retry_policy`; the default retries five times from 100 ms
+up to 5 seconds. Retries wrap only acquisition and heartbeat requests, never a
+leased task's handler or settlement request, so an ambiguous completion is not
+re-executed by the retry loop. Once the retry bound is exhausted, the transport
+or HTTP error is returned.
+
+Authentication failures remain `Error::Http` with their status and response
+body, and protocol incompatibilities remain
+`Error::Protocol(ProtocolFailure)` with stable reason and version fields.
+Codec, handler, and other non-retryable failures are returned immediately and
+are never retried indefinitely.
 
 ## Example
 

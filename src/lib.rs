@@ -37,6 +37,8 @@ pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
 /// First additive worker protocol that defines query-task transport.
 pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
 
+const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
+
 const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "lease_expired",
     "query_task_not_found",
@@ -490,10 +492,7 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<Option<QueryTask>> {
-        let timeout_seconds = timeout
-            .as_secs()
-            .saturating_add(u64::from(timeout.subsec_nanos() > 0))
-            .min(60);
+        let timeout_seconds = long_poll_timeout_seconds(timeout);
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
@@ -637,6 +636,7 @@ impl Client {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
+            "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
         let mut data: PollWorkflowTaskResponse = self
             .request_json_with_timeout(
@@ -770,6 +770,7 @@ impl Client {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
+            "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
         let data: PollActivityTaskResponse = self
             .request_json_with_timeout(
@@ -1006,6 +1007,36 @@ fn protocol_failure(status: reqwest::StatusCode, raw_body: &str) -> Option<Proto
             .map(str::to_string),
         body,
     })
+}
+
+fn long_poll_timeout_seconds(timeout: Duration) -> u64 {
+    timeout
+        .as_secs()
+        .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+        .min(MAX_LONG_POLL_TIMEOUT_SECONDS)
+}
+
+fn worker_operation_is_retryable(error: &Error) -> bool {
+    match error {
+        Error::Transport(error) => {
+            error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+        }
+        Error::Http { status, .. } => {
+            matches!(
+                *status,
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            ) || status.is_server_error()
+        }
+        _ => false,
+    }
+}
+
+fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
+    let exponent = retry.saturating_sub(1).min(31) as u32;
+    policy
+        .initial_backoff
+        .saturating_mul(1_u32 << exponent)
+        .min(policy.max_backoff)
 }
 
 #[derive(Debug)]
@@ -1433,6 +1464,32 @@ pub struct WorkerHeartbeatObservation {
     pub acknowledgement: Value,
 }
 
+/// Bounded retry policy for worker poll acquisition and worker heartbeats.
+///
+/// Expected empty long polls are normal successful responses. Transport
+/// failures, HTTP 408/429 responses, and server errors are retried with capped
+/// exponential backoff. Authentication, protocol, codec, and handler failures
+/// are never retried by the worker.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkerRetryPolicy {
+    /// Number of retries after the initial request fails.
+    pub max_retries: usize,
+    /// Delay before the first retry.
+    pub initial_backoff: Duration,
+    /// Maximum delay between retries.
+    pub max_backoff: Duration,
+}
+
+impl Default for WorkerRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Worker {
     client: Client,
@@ -1445,6 +1502,7 @@ pub struct Worker {
     max_concurrent_activity_tasks: usize,
     poll_timeout: Duration,
     heartbeat_interval: Duration,
+    retry_policy: WorkerRetryPolicy,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
 }
 
@@ -1461,6 +1519,7 @@ impl Worker {
             max_concurrent_activity_tasks: 10,
             poll_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            retry_policy: WorkerRetryPolicy::default(),
             heartbeat_observer: None,
         }
     }
@@ -1477,6 +1536,12 @@ impl Worker {
 
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Configure bounded retries for task-poll acquisition and worker heartbeats.
+    pub fn retry_policy(mut self, policy: WorkerRetryPolicy) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -1651,10 +1716,18 @@ impl Worker {
             .await
     }
 
+    /// Run until shutdown or a terminal worker error occurs.
+    ///
+    /// Empty long-poll expirations do not stop the worker. Retryable poll and
+    /// heartbeat failures use [`WorkerRetryPolicy`] independently, while
+    /// authentication, protocol, and other non-retryable failures are returned.
     pub async fn run(&self) -> Result<()> {
         self.run_until(std::future::pending::<()>()).await
     }
 
+    /// Run until `shutdown` resolves or a terminal worker error occurs.
+    ///
+    /// This has the same liveness and terminal-error contract as [`Worker::run`].
     pub async fn run_until<F>(&self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
@@ -1693,13 +1766,13 @@ impl Worker {
                     break;
                 }
                 _ = heartbeat.tick() => {
-                    match self.client
-                        .heartbeat_worker(
+                    match self.retry_worker_operation(|| {
+                        self.client.heartbeat_worker(
                             &self.worker_id,
                             self.max_concurrent_workflow_tasks,
                             self.max_concurrent_activity_tasks,
                         )
-                        .await
+                    }).await
                     {
                         Ok(acknowledgement) => {
                             if let Some(observer) = &self.heartbeat_observer {
@@ -1786,8 +1859,10 @@ impl Worker {
 
     async fn poll_workflow_once(&self) -> Result<bool> {
         let Some(task) = self
-            .client
-            .poll_workflow_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            .retry_worker_operation(|| {
+                self.client
+                    .poll_workflow_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            })
             .await?
         else {
             return Ok(false);
@@ -1826,8 +1901,10 @@ impl Worker {
 
     async fn poll_activity_once(&self) -> Result<bool> {
         let Some(task) = self
-            .client
-            .poll_activity_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            .retry_worker_operation(|| {
+                self.client
+                    .poll_activity_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            })
             .await?
         else {
             return Ok(false);
@@ -1877,8 +1954,10 @@ impl Worker {
 
     async fn poll_query_once(&self) -> Result<bool> {
         let Some(task) = self
-            .client
-            .poll_query_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            .retry_worker_operation(|| {
+                self.client
+                    .poll_query_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+            })
             .await?
         else {
             return Ok(false);
@@ -1962,6 +2041,27 @@ impl Worker {
         }
 
         Ok(())
+    }
+
+    async fn retry_worker_operation<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let mut retries = 0;
+
+        loop {
+            match operation().await {
+                Err(error)
+                    if worker_operation_is_retryable(&error)
+                        && retries < self.retry_policy.max_retries =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(worker_retry_delay(self.retry_policy, retries)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn execute_query_task(
@@ -3614,6 +3714,15 @@ mod tests {
                 "unexpected protocol for {path}"
             );
         }
+
+        assert_eq!(
+            server.request_body("/api/worker/workflow-tasks/poll")["timeout_seconds"],
+            1
+        );
+        assert_eq!(
+            server.request_body("/api/worker/activity-tasks/poll")["timeout_seconds"],
+            1
+        );
     }
 
     #[tokio::test]
@@ -3655,6 +3764,11 @@ mod tests {
                 "unexpected protocol for {path}"
             );
         }
+
+        assert_eq!(
+            server.request_body("/api/worker/query-tasks/poll")["timeout_seconds"],
+            1
+        );
     }
 
     #[tokio::test]
@@ -3837,10 +3951,109 @@ mod tests {
         assert_eq!(first.acknowledgement, json!({}));
     }
 
+    #[tokio::test]
+    async fn worker_retries_poll_and_heartbeat_transport_failures_independently() {
+        let server = MockWorkerServer::transient_worker_failures();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("retry-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        worker.register_activity(
+            "counter.activity",
+            |_ctx, _input| async move { Ok(Value::Null) },
+        );
+        worker.register_query(
+            "counter",
+            "current",
+            |_ctx, _args| async move { Ok(json!(8)) },
+        );
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(75)))
+            .await
+            .expect("transient failures must not stop the worker");
+
+        for path in [
+            "/api/worker/heartbeat",
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            assert!(
+                server.request_count(path) >= 2,
+                "{path} must continue after its transient failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_bounds_transport_retries() {
+        let server = MockWorkerServer::unavailable_polls();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("bounded-retry-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+
+        let error = worker.run().await.expect_err("retry bound must terminate");
+        assert!(matches!(error, Error::Transport(_)));
+        assert_eq!(
+            server.request_count("/api/worker/workflow-tasks/poll"),
+            3,
+            "one initial request plus two retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_retry_authentication_failures() {
+        let server = MockWorkerServer::unauthorized_polls();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("unauthorized-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+
+        let error = worker
+            .run()
+            .await
+            .expect_err("authentication must terminate");
+        let Error::Http { status, body } = error else {
+            panic!("expected stable HTTP authentication error");
+        };
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert!(body.contains("authentication_failed"));
+        assert_eq!(
+            server.request_count("/api/worker/workflow-tasks/poll"),
+            1,
+            "authentication failures must not be retried"
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct CapturedRequest {
         path: String,
         worker_protocol: Option<String>,
+        body: String,
     }
 
     struct MockWorkerServer {
@@ -3854,6 +4067,9 @@ mod tests {
     struct MockWorkerBehavior {
         reject_query_protocol: bool,
         reject_query_completion: bool,
+        poll_failures_per_path: usize,
+        heartbeat_failures: usize,
+        unauthorized_polls: bool,
     }
 
     impl MockWorkerServer {
@@ -3871,6 +4087,28 @@ mod tests {
         fn reject_query_completion() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 reject_query_completion: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn transient_worker_failures() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                poll_failures_per_path: 1,
+                heartbeat_failures: 1,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn unavailable_polls() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                poll_failures_per_path: usize::MAX,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn unauthorized_polls() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                unauthorized_polls: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -3928,6 +4166,18 @@ mod tests {
                 .filter(|request| request.path == path)
                 .count()
         }
+
+        fn request_body(&self, path: &str) -> Value {
+            let requests = self.requests.lock().expect("captured requests");
+            let body = &requests
+                .iter()
+                .find(|request| request.path == path)
+                .unwrap_or_else(|| panic!("missing request for {path}"))
+                .body;
+            serde_json::from_str(body).unwrap_or_else(|error| {
+                panic!("invalid JSON request body for {path}: {error}: {body:?}")
+            })
+        }
     }
 
     impl Drop for MockWorkerServer {
@@ -3955,7 +4205,7 @@ mod tests {
                 Ok(0) => break,
                 Ok(read) => {
                     request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    if mock_request_is_complete(&request) {
                         break;
                     }
                 }
@@ -3972,6 +4222,10 @@ mod tests {
         }
 
         let request = String::from_utf8_lossy(&request);
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
         let path = request
             .lines()
             .next()
@@ -3982,17 +4236,39 @@ mod tests {
             name.eq_ignore_ascii_case("X-Durable-Workflow-Protocol-Version")
                 .then(|| value.trim().to_string())
         });
-        let query_poll_number = {
+        let request_number = {
             let mut requests = requests.lock().expect("captured requests");
             requests.push(CapturedRequest {
                 path: path.to_string(),
                 worker_protocol: worker_protocol.clone(),
+                body: body.to_string(),
             });
             requests
                 .iter()
-                .filter(|request| request.path == "/api/worker/query-tasks/poll")
+                .filter(|request| request.path == path)
                 .count()
         };
+
+        let is_poll = matches!(
+            path,
+            "/api/worker/workflow-tasks/poll"
+                | "/api/worker/activity-tasks/poll"
+                | "/api/worker/query-tasks/poll"
+        );
+        if is_poll && request_number <= behavior.poll_failures_per_path {
+            return;
+        }
+        if path == "/api/worker/heartbeat" && request_number <= behavior.heartbeat_failures {
+            return;
+        }
+        if behavior.unauthorized_polls && is_poll {
+            write_mock_response(
+                stream,
+                "401 Unauthorized",
+                r#"{"reason":"authentication_failed","message":"invalid worker token"}"#,
+            );
+            return;
+        }
 
         if behavior.reject_query_protocol && path.starts_with("/api/worker/query-tasks/") {
             let requested_version = worker_protocol.as_deref().unwrap_or("missing");
@@ -4023,7 +4299,7 @@ mod tests {
                 ("200 OK", r#"{"task":null}"#)
             }
             "/api/worker/query-tasks/poll"
-                if behavior.reject_query_completion && query_poll_number == 1 =>
+                if behavior.reject_query_completion && request_number == 1 =>
             {
                 (
                     "200 OK",
@@ -4044,6 +4320,25 @@ mod tests {
             _ => ("404 Not Found", r#"{"message":"not found"}"#),
         };
         write_mock_response(stream, status, body);
+    }
+
+    fn mock_request_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+
+        request.len() >= header_end + content_length.unwrap_or(0)
     }
 
     fn write_mock_response(stream: &mut TcpStream, status: &str, body: &str) {
