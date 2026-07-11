@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=crates-io-publish-lib.sh
+source "$script_dir/crates-io-publish-lib.sh"
+
 manifest_path="${RUST_SDK_MANIFEST_PATH:-Cargo.toml}"
 evidence_path="${RUST_SDK_RELEASE_EVIDENCE_PATH:-rust-sdk-release-evidence.json}"
 release_tag="${RELEASE_TAG:-}"
@@ -210,54 +214,41 @@ fi
 
 write_evidence "pending" "checking_public_registry"
 
-if ! http_status="$(curl --silent --show-error --location \
-    --header "User-Agent: ${user_agent}" \
-    --output "$version_response" \
-    --write-out '%{http_code}' \
-    "$version_api")"; then
-    write_evidence "failed" "registry_version_lookup_transport_failure"
-    printf 'could not reach crates.io version API\n' >&2
+if ! http_status="$(crates_io_version_lookup "$version_api" "$version_response" "$user_agent")"; then
+    write_evidence "failed" "registry_version_lookup_transient_failure_exhausted"
+    printf 'could not reach a conclusive crates.io version API response\n' >&2
     exit 1
 fi
 
-case "$http_status" in
-    200)
-        publish_outcome="already_published"
-        publish_reason="exact_public_version_already_exists"
-        ;;
-    404)
-        if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            write_evidence "failed" "registry_token_missing"
+if ! publish_exact_crate_if_absent "$http_status" "$manifest_path"; then
+    write_evidence "failed" "$publish_error"
+    case "$publish_error" in
+        registry_token_missing)
             printf 'CARGO_REGISTRY_TOKEN is required to publish %s %s\n' "$package_name" "$package_version" >&2
-            exit 1
-        fi
-        if ! cargo publish --manifest-path "$manifest_path" --registry crates-io; then
-            write_evidence "failed" "cargo_publish_failed"
-            exit 1
-        fi
-        publish_outcome="published"
-        publish_reason="exact_public_version_published"
-        for _attempt in $(seq 1 24); do
-            http_status="$(curl --silent --show-error --location \
-                --header "User-Agent: ${user_agent}" \
-                --output "$version_response" \
-                --write-out '%{http_code}' \
-                "$version_api" || true)"
-            [[ "$http_status" == "200" ]] && break
-            sleep 5
-        done
-        if [[ "$http_status" != "200" ]]; then
-            write_evidence "failed" "published_version_not_visible_after_registry_deadline"
-            printf 'published Rust SDK version did not become visible at %s\n' "$version_api" >&2
-            exit 1
-        fi
-        ;;
-    *)
-        write_evidence "failed" "registry_version_lookup_http_${http_status}"
-        printf 'crates.io version lookup failed with HTTP %s\n' "$http_status" >&2
+            ;;
+        registry_version_lookup_http_*)
+            printf 'crates.io version lookup failed with HTTP %s\n' "$http_status" >&2
+            ;;
+    esac
+    exit 1
+fi
+
+if [[ "$publish_outcome" == "published" ]]; then
+    for _attempt in $(seq 1 24); do
+        http_status="$(curl --silent --show-error --location \
+            --header "User-Agent: ${user_agent}" \
+            --output "$version_response" \
+            --write-out '%{http_code}' \
+            "$version_api" || true)"
+        [[ "$http_status" == "200" ]] && break
+        sleep 5
+    done
+    if [[ "$http_status" != "200" ]]; then
+        write_evidence "failed" "published_version_not_visible_after_registry_deadline"
+        printf 'published Rust SDK version did not become visible at %s\n' "$version_api" >&2
         exit 1
-        ;;
-esac
+    fi
+fi
 
 if ! curl --fail --silent --show-error --location \
     --header "User-Agent: ${user_agent}" \
