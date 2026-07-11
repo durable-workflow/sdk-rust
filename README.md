@@ -2,30 +2,31 @@
 
 `durable-workflow` is the first-party Rust SDK for Durable Workflow workers
 and clients. It can register workflow and activity handlers, long-poll the
-worker protocol, start, signal, and query workflow executions, expose named
-read-only query handlers, heartbeat workers and activities, and exchange
-JSON-native payloads through the platform's generic Avro wrapper. Workflow
-code can also wait on server-backed durable time without blocking a Rust
-executor thread.
+worker protocol, start, signal, and query workflow executions, start and await
+durable child workflows, expose named read-only query handlers, heartbeat
+workers and activities, and exchange JSON-native payloads through the
+platform's generic Avro wrapper. Workflow code can also wait on server-backed
+durable time without blocking a Rust executor thread.
 
 ## Install
 
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.4 --exact
+cargo add durable-workflow@0.1.5 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.4"
+durable-workflow = "=0.1.5"
 ```
 
-Version `0.1.4` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.5` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
-from `0.1.2`, and deterministic durable timers are available from `0.1.4`.
+from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
+durable child workflows are available from `0.1.5`.
 
 ## Compatibility
 
@@ -34,7 +35,8 @@ from `0.1.2`, and deterministic durable timers are available from `0.1.4`.
 | `0.1.0` | `>=0.2,<0.3` | `1.2` | `2` |
 | `0.1.1` | `>=0.2,<0.3` | `1.2` (snapshot queries require `1.8`) | `2` |
 | `0.1.2`–`0.1.3` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
-| `0.1.4+` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
+| `0.1.4` | `>=0.2,<0.3` | `1.2` (timers; replayed queries require `1.8`) | `2` |
+| `0.1.5+` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -42,7 +44,9 @@ The machine-readable values live in `[package.metadata.durable-workflow]` in
 `query-task-minimum-worker-protocol-version`, `replayed-instance-state-queries`,
 `query-state-model`, `snapshot-inspection-queries`, and `payload-codecs`.
 Timer-capable releases additionally publish `durable-timers`, `timer-command`,
-and `timer-replay-validation`. Existing worker operations retain the `1.2`
+and `timer-replay-validation`. Child-capable releases additionally publish
+`child-workflows`, `child-workflow-command`, and
+`child-workflow-failure-reasons`. Existing worker operations retain the `1.2`
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor. The server's advertised protocol manifests remain
 authoritative when checking compatibility during deployment.
@@ -89,6 +93,48 @@ Running and completed executions remain available through `WorkflowHandle`'s
 remain `Error::Protocol(ProtocolFailure)`, including stable `reason`, `status`,
 and requested/supported version fields; other rejected worker requests remain
 typed `Error::Http` values with the response status and body.
+
+## Child workflows
+
+`WorkflowContext::start_child_workflow` records a named child on a mandatory,
+explicit task queue and waits for a terminal `ChildRun*` history event. The
+same history is replayed after a Rust worker restart: a committed result is
+decoded using its recorded payload codec and no second child command is
+emitted. A recorded child that has not settled remains pending without another
+start command on redelivery. This also permits a Rust parent to call a PHP or
+Python child (or the reverse) without changing payload shape.
+
+```rust
+# use durable_workflow::{json, ChildWorkflowOptions, ParentClosePolicy, Result, WorkflowContext};
+# async fn parent(ctx: WorkflowContext) -> Result<durable_workflow::Value> {
+let child = ctx
+    .start_child_workflow(
+        "python.fulfil-order",
+        ChildWorkflowOptions::new("python-workers")
+            .parent_close_policy(ParentClosePolicy::RequestCancel)
+            .execution_timeout_seconds(600)
+            .run_timeout_seconds(120),
+        json!([{"order_id": "order-42"}]),
+    )
+    .await?;
+
+assert_eq!(child.parent, ctx.workflow_identity()?);
+println!("child workflow={:?} run={:?}", child.child.workflow_id, child.child.run_id);
+Ok(child.result)
+# }
+```
+
+Success returns `ChildWorkflowResult`, including parent and child workflow/run
+identities. Failure, cancellation, and termination return
+`Error::ChildWorkflowFailed(ChildWorkflowFailure)` inside workflow code. Match
+its `kind` or stable `reason` (`child_workflow`, `cancelled`, or `terminated`),
+not its message. An uncaught error becomes a durable `fail_workflow` command
+whose structured exception retains those fields.
+
+`ParentClosePolicy::Abandon` leaves an open child running when the parent
+closes. `RequestCancel` requests child cancellation, and `Terminate` closes it
+immediately. Retry and timeout options are recorded server-side with the child
+call; they are not SDK HTTP retry limits.
 
 ## Worker
 

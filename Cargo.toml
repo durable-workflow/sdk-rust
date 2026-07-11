@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -22,6 +22,9 @@ query-task-minimum-worker-protocol-version = "1.8"
 replayed-instance-state-queries = true
 query-state-model = "deterministic-workflow-replay"
 snapshot-inspection-queries = true
+child-workflows = true
+child-workflow-command = "start_child_workflow"
+child-workflow-failure-reasons = ["child_workflow", "cancelled", "terminated"]
 payload-codecs = ["avro", "json"]
 durable-timers = true
 timer-command = "start_timer"

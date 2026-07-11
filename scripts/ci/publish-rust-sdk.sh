@@ -44,6 +44,9 @@ query_task_minimum_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]
 replayed_instance_state_queries="$(jq -er '.packages[0].metadata["durable-workflow"]["replayed-instance-state-queries"]' <<<"$metadata")"
 query_state_model="$(jq -er '.packages[0].metadata["durable-workflow"]["query-state-model"]' <<<"$metadata")"
 snapshot_inspection_queries="$(jq -er '.packages[0].metadata["durable-workflow"]["snapshot-inspection-queries"]' <<<"$metadata")"
+child_workflows="$(jq -er '.packages[0].metadata["durable-workflow"]["child-workflows"]' <<<"$metadata")"
+child_workflow_command="$(jq -er '.packages[0].metadata["durable-workflow"]["child-workflow-command"]' <<<"$metadata")"
+child_workflow_failure_reasons="$(jq -cer '.packages[0].metadata["durable-workflow"]["child-workflow-failure-reasons"]' <<<"$metadata")"
 
 if [[ "$package_name" != "durable-workflow" ]]; then
     printf 'unexpected Rust SDK package name: %s\n' "$package_name" >&2
@@ -65,7 +68,7 @@ if [[ "$package_documentation" != "https://rust.durable-workflow.com/" ]]; then
     printf 'unexpected Rust SDK documentation metadata: %s\n' "$package_documentation" >&2
     exit 1
 fi
-if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" ]]; then
+if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi
@@ -135,6 +138,9 @@ write_evidence() {
         --arg replayed_instance_state_queries "$replayed_instance_state_queries" \
         --arg query_state_model "$query_state_model" \
         --arg snapshot_inspection_queries "$snapshot_inspection_queries" \
+        --arg child_workflows "$child_workflows" \
+        --arg child_workflow_command "$child_workflow_command" \
+        --argjson child_workflow_failure_reasons "$child_workflow_failure_reasons" \
         --arg release_tag "$release_tag" \
         --arg release_commit "$release_commit" \
         --arg release_run_id "$release_run_id" \
@@ -171,7 +177,10 @@ write_evidence() {
                 query_task_minimum_worker_protocol: $query_task_minimum_protocol,
                 replayed_instance_state_queries: ($replayed_instance_state_queries == "true"),
                 query_state_model: $query_state_model,
-                snapshot_inspection_queries: ($snapshot_inspection_queries == "true")
+                snapshot_inspection_queries: ($snapshot_inspection_queries == "true"),
+                child_workflows: ($child_workflows == "true"),
+                child_workflow_command: $child_workflow_command,
+                child_workflow_failure_reasons: $child_workflow_failure_reasons
             },
             release: {
                 sdk_tag: $release_tag,

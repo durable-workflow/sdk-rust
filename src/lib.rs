@@ -1,11 +1,11 @@
 //! Minimal Rust SDK for the Durable Workflow worker protocol.
 //!
-//! The crate covers the v1 Rust round-trip: start, signal, query, and durably
-//! sleep in workflows; register a Rust worker; poll workflow, activity, and
-//! read-only query tasks; reconstruct typed workflow-instance state through
-//! deterministic replay; heartbeat worker and activity liveness; and exchange
-//! JSON-native payloads through the same `avro` generic wrapper used by the
-//! existing first-party SDKs.
+//! The crate covers the v1 Rust round-trip: start, signal, query, durably sleep,
+//! and start and await child workflows; register a Rust worker; poll workflow,
+//! activity, and read-only query tasks; reconstruct typed workflow-instance
+//! state through deterministic replay; heartbeat worker and activity liveness;
+//! and exchange JSON-native payloads through the same `avro` generic wrapper
+//! used by the existing first-party SDKs.
 
 use std::{
     any::{Any, TypeId},
@@ -84,6 +84,8 @@ pub enum Error {
     Protocol(ProtocolFailure),
     #[error(transparent)]
     NonDeterministicReplay(ReplayFailure),
+    #[error(transparent)]
+    ChildWorkflowFailed(ChildWorkflowFailure),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
@@ -98,6 +100,128 @@ pub enum Error {
     Timeout,
     #[error("worker loop error: {0}")]
     WorkerLoop(String),
+    #[error("invalid child workflow options: {0}")]
+    InvalidChildWorkflowOptions(String),
+}
+
+/// Stable terminal categories returned when an awaited child does not succeed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildWorkflowFailureKind {
+    Failed,
+    Cancelled,
+    Terminated,
+}
+
+/// A stable, machine-readable child workflow failure delivered to its parent.
+///
+/// Match [`Error::ChildWorkflowFailed`] and inspect `reason` or `kind` instead
+/// of parsing the display message. Child and parent identifiers retain the
+/// relationship recorded in durable history across worker restarts.
+#[derive(Clone, Debug, Error)]
+#[error("child workflow failed ({reason}): {message}")]
+pub struct ChildWorkflowFailure {
+    pub kind: ChildWorkflowFailureKind,
+    pub reason: String,
+    pub message: String,
+    pub parent_workflow_id: Option<String>,
+    pub parent_workflow_run_id: Option<String>,
+    pub child_workflow_id: Option<String>,
+    pub child_workflow_run_id: Option<String>,
+    pub child_workflow_type: Option<String>,
+    pub failure_id: Option<String>,
+    pub failure_category: Option<String>,
+    pub exception_type: Option<String>,
+    pub exception_class: Option<String>,
+    pub non_retryable: bool,
+    pub code: Option<Value>,
+    pub exception: Option<Value>,
+}
+
+/// The identity of one durable workflow execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowIdentity {
+    pub workflow_id: Option<String>,
+    pub run_id: Option<String>,
+}
+
+/// A successful child result together with its durable parent-child identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildWorkflowResult {
+    pub parent: WorkflowIdentity,
+    pub child: WorkflowIdentity,
+    pub child_workflow_type: Option<String>,
+    pub result: Value,
+}
+
+/// Server behavior when a parent closes while its child is still open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParentClosePolicy {
+    #[default]
+    Abandon,
+    RequestCancel,
+    Terminate,
+}
+
+impl ParentClosePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Abandon => "abandon",
+            Self::RequestCancel => "request_cancel",
+            Self::Terminate => "terminate",
+        }
+    }
+}
+
+/// Durable retry policy for one child workflow invocation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChildWorkflowRetryPolicy {
+    pub max_attempts: Option<u32>,
+    pub backoff_seconds: Vec<u64>,
+    pub non_retryable_error_types: Vec<String>,
+}
+
+/// Options recorded with a child-workflow command.
+///
+/// The task queue is mandatory so routing is explicit and replay-stable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildWorkflowOptions {
+    pub task_queue: String,
+    pub parent_close_policy: ParentClosePolicy,
+    pub retry_policy: Option<ChildWorkflowRetryPolicy>,
+    pub execution_timeout_seconds: Option<u64>,
+    pub run_timeout_seconds: Option<u64>,
+}
+
+impl ChildWorkflowOptions {
+    pub fn new(task_queue: impl Into<String>) -> Self {
+        Self {
+            task_queue: task_queue.into(),
+            parent_close_policy: ParentClosePolicy::Abandon,
+            retry_policy: None,
+            execution_timeout_seconds: None,
+            run_timeout_seconds: None,
+        }
+    }
+
+    pub fn parent_close_policy(mut self, policy: ParentClosePolicy) -> Self {
+        self.parent_close_policy = policy;
+        self
+    }
+
+    pub fn retry_policy(mut self, policy: ChildWorkflowRetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    pub fn execution_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.execution_timeout_seconds = Some(seconds);
+        self
+    }
+
+    pub fn run_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.run_timeout_seconds = Some(seconds);
+        self
+    }
 }
 
 /// A stable, machine-readable failure raised when workflow code no longer
@@ -2217,8 +2341,10 @@ impl Worker {
                     )
                 })?;
                 let workflow_state = Arc::new(Mutex::new(
-                    WorkflowState::new(
+                    WorkflowState::new_with_identity(
                         history_events.as_ref().clone(),
+                        context.workflow_id.clone(),
+                        context.run_id.clone(),
                         self.task_queue.clone(),
                         task.payload_codec,
                         None,
@@ -2312,8 +2438,10 @@ impl Worker {
             .ok_or_else(|| Error::WorkflowNotRegistered(task.workflow_type.clone()))?;
         let input = decode_task_arguments(task.arguments.as_ref(), &task.payload_codec)?;
         let resume_signal = decode_resume_signal(&task)?;
-        let state = Arc::new(Mutex::new(WorkflowState::new(
+        let state = Arc::new(Mutex::new(WorkflowState::new_with_identity(
             task.history_events,
+            task.workflow_id,
+            task.run_id,
             self.task_queue.clone(),
             task.payload_codec.clone(),
             resume_signal,
@@ -2330,6 +2458,9 @@ impl Worker {
                     "type": "complete_workflow",
                     "result": result
                 })])
+            }
+            Poll::Ready(Err(error @ Error::ChildWorkflowFailed(_))) => {
+                Ok(vec![workflow_failure_command(&error)])
             }
             Poll::Ready(Err(error)) => Err(error),
             Poll::Pending => {
@@ -2512,6 +2643,18 @@ pub struct WorkflowContext {
 }
 
 impl WorkflowContext {
+    /// Identity of the parent workflow currently being replayed.
+    pub fn workflow_identity(&self) -> Result<WorkflowIdentity> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(WorkflowIdentity {
+            workflow_id: state.workflow_id.clone(),
+            run_id: state.run_id.clone(),
+        })
+    }
+
     pub fn activity<T: Serialize>(
         &self,
         activity_type: impl Into<String>,
@@ -2585,6 +2728,48 @@ impl WorkflowContext {
         self.sleep(duration)
     }
 
+    /// Start a named durable child on an explicit queue and await its result.
+    ///
+    /// The command is recorded in the parent's sequence-ordered durable command
+    /// stream. Replay keeps a scheduled child pending without emitting another
+    /// start, or consumes its matching terminal `ChildRun*` outcome. Successful
+    /// values preserve the history payload codec and include both sides of the
+    /// durable relationship; failures are returned as
+    /// [`Error::ChildWorkflowFailed`].
+    ///
+    /// ```no_run
+    /// # use durable_workflow::{json, ChildWorkflowOptions, Client, ParentClosePolicy, Worker};
+    /// # fn configure(client: Client) {
+    /// let mut worker = Worker::new(client, "parent-workers");
+    /// worker.register_workflow("order-parent", |ctx, _input| async move {
+    ///     let child = ctx
+    ///         .start_child_workflow(
+    ///             "fulfil-order",
+    ///             ChildWorkflowOptions::new("fulfilment-workers")
+    ///                 .parent_close_policy(ParentClosePolicy::RequestCancel),
+    ///             json!([{"order_id": "order-42"}]),
+    ///         )
+    ///         .await?;
+    ///     Ok(child.result)
+    /// });
+    /// # }
+    /// ```
+    pub fn start_child_workflow<T: Serialize>(
+        &self,
+        workflow_type: impl Into<String>,
+        options: ChildWorkflowOptions,
+        args: T,
+    ) -> ChildWorkflowCall {
+        ChildWorkflowCall {
+            ctx: self.clone(),
+            workflow_type: workflow_type.into(),
+            options,
+            args: Some(serde_json::to_value(args).map_err(Error::from)),
+            scheduled: false,
+            matched_pending: false,
+        }
+    }
+
     fn take_commands(&self) -> Result<Vec<Value>> {
         let mut state = self
             .state
@@ -2622,6 +2807,8 @@ impl WorkflowContext {
 #[derive(Debug)]
 struct WorkflowState {
     history: Vec<HistoryEvent>,
+    workflow_id: Option<String>,
+    run_id: Option<String>,
     task_queue: String,
     payload_codec: String,
     resume_signal: Option<ResumeSignal>,
@@ -2633,15 +2820,43 @@ struct WorkflowState {
 }
 
 impl WorkflowState {
+    #[cfg(test)]
     fn new(
         history: Vec<HistoryEvent>,
         task_queue: String,
         payload_codec: String,
         resume_signal: Option<ResumeSignal>,
     ) -> Result<Self> {
-        let recorded_commands = recorded_commands(&history, &payload_codec)?;
+        Self::new_with_identity(
+            history,
+            None,
+            None,
+            task_queue,
+            payload_codec,
+            resume_signal,
+        )
+    }
+
+    fn new_with_identity(
+        history: Vec<HistoryEvent>,
+        workflow_id: Option<String>,
+        run_id: Option<String>,
+        task_queue: String,
+        payload_codec: String,
+        resume_signal: Option<ResumeSignal>,
+    ) -> Result<Self> {
+        let recorded_commands = recorded_commands(
+            &history,
+            &payload_codec,
+            WorkflowIdentity {
+                workflow_id: workflow_id.clone(),
+                run_id: run_id.clone(),
+            },
+        )?;
         Ok(Self {
             history,
+            workflow_id,
+            run_id,
             task_queue,
             payload_codec,
             resume_signal,
@@ -2666,6 +2881,11 @@ enum RecordedCommand {
         delay_seconds: u64,
         fired: bool,
     },
+    ChildWorkflow {
+        sequence: u64,
+        workflow_type: Option<String>,
+        outcome: Option<ChildWorkflowOutcome>,
+    },
     SignalWait {
         sequence: u64,
         signal_name: Option<String>,
@@ -2677,6 +2897,7 @@ impl RecordedCommand {
         match self {
             Self::Activity { sequence, .. }
             | Self::Timer { sequence, .. }
+            | Self::ChildWorkflow { sequence, .. }
             | Self::SignalWait { sequence, .. } => *sequence,
         }
     }
@@ -2685,6 +2906,7 @@ impl RecordedCommand {
         match self {
             Self::Activity { .. } => "activity",
             Self::Timer { .. } => "timer",
+            Self::ChildWorkflow { .. } => "child workflow",
             Self::SignalWait { .. } => "signal wait",
         }
     }
@@ -2847,6 +3069,149 @@ impl Future for TimerCall {
                 "type": "start_timer",
                 "delay_seconds": requested_delay,
             }));
+            self.scheduled = true;
+        }
+
+        Poll::Pending
+    }
+}
+
+/// Future returned by [`WorkflowContext::start_child_workflow`].
+pub struct ChildWorkflowCall {
+    ctx: WorkflowContext,
+    workflow_type: String,
+    options: ChildWorkflowOptions,
+    args: Option<Result<Value>>,
+    scheduled: bool,
+    matched_pending: bool,
+}
+
+impl Future for ChildWorkflowCall {
+    type Output = Result<ChildWorkflowResult>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if self.matched_pending {
+            return Poll::Pending;
+        }
+
+        let ctx = self.ctx.clone();
+        let mut state = match ctx.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+        };
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            let sequence = recorded.sequence();
+            match recorded {
+                RecordedCommand::ChildWorkflow {
+                    workflow_type,
+                    outcome,
+                    ..
+                } => {
+                    if let Some(recorded_type) = workflow_type {
+                        if recorded_type != self.workflow_type {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(
+                                ReplayFailure::new(
+                                    "recorded_command_detail_mismatch",
+                                    Some(sequence),
+                                    Some(format!("child workflow:{recorded_type}")),
+                                    Some(format!("child workflow:{}", self.workflow_type)),
+                                    "recorded child workflow type differs from the current workflow command",
+                                ),
+                            )));
+                        }
+                    }
+                    state.command_cursor += 1;
+                    if let Some(outcome) = outcome {
+                        return Poll::Ready(outcome.map_err(Error::ChildWorkflowFailed));
+                    }
+                    state.matched_recorded_pending = true;
+                    self.scheduled = true;
+                    self.matched_pending = true;
+                    return Poll::Pending;
+                }
+                other => {
+                    return Poll::Ready(Err(command_mismatch(
+                        &other,
+                        format!("child workflow:{}", self.workflow_type),
+                    )));
+                }
+            }
+        }
+
+        if !self.scheduled {
+            if self.options.task_queue.trim().is_empty() {
+                return Poll::Ready(Err(Error::InvalidChildWorkflowOptions(
+                    "task_queue must not be empty".to_string(),
+                )));
+            }
+            for (name, value) in [
+                (
+                    "execution_timeout_seconds",
+                    self.options.execution_timeout_seconds,
+                ),
+                ("run_timeout_seconds", self.options.run_timeout_seconds),
+            ] {
+                if value == Some(0) {
+                    return Poll::Ready(Err(Error::InvalidChildWorkflowOptions(format!(
+                        "{name} must be at least 1"
+                    ))));
+                }
+            }
+
+            let args = match self.args.take().unwrap_or(Ok(Value::Null)) {
+                Ok(args) => args,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let arguments =
+                match encode_value_envelope(&normalize_arguments(args), &state.payload_codec) {
+                    Ok(arguments) => arguments,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+            let mut command = json!({
+                "type": "start_child_workflow",
+                "workflow_type": self.workflow_type,
+                "queue": self.options.task_queue,
+                "parent_close_policy": self.options.parent_close_policy.as_str(),
+                "arguments": arguments,
+            });
+            let object = command
+                .as_object_mut()
+                .expect("child workflow command is always an object");
+            if let Some(policy) = &self.options.retry_policy {
+                let mut retry_policy = serde_json::Map::new();
+                if let Some(max_attempts) = policy.max_attempts {
+                    if max_attempts == 0 {
+                        return Poll::Ready(Err(Error::InvalidChildWorkflowOptions(
+                            "retry_policy.max_attempts must be at least 1".to_string(),
+                        )));
+                    }
+                    retry_policy.insert("max_attempts".to_string(), json!(max_attempts));
+                }
+                if !policy.backoff_seconds.is_empty() {
+                    retry_policy
+                        .insert("backoff_seconds".to_string(), json!(policy.backoff_seconds));
+                }
+                if !policy.non_retryable_error_types.is_empty() {
+                    retry_policy.insert(
+                        "non_retryable_error_types".to_string(),
+                        json!(policy.non_retryable_error_types),
+                    );
+                }
+                if retry_policy.is_empty() {
+                    return Poll::Ready(Err(Error::InvalidChildWorkflowOptions(
+                        "retry_policy must configure at least one field".to_string(),
+                    )));
+                }
+                object.insert("retry_policy".to_string(), Value::Object(retry_policy));
+            }
+            if let Some(seconds) = self.options.execution_timeout_seconds {
+                object.insert("execution_timeout_seconds".to_string(), json!(seconds));
+            }
+            if let Some(seconds) = self.options.run_timeout_seconds {
+                object.insert("run_timeout_seconds".to_string(), json!(seconds));
+            }
+            state.commands.push(command);
             self.scheduled = true;
         }
 
@@ -3024,6 +3389,7 @@ fn normalize_arguments(value: Value) -> Value {
 fn recorded_commands(
     events: &[HistoryEvent],
     fallback_codec: &str,
+    parent: WorkflowIdentity,
 ) -> Result<Vec<RecordedCommand>> {
     let mut events_by_sequence: BTreeMap<u64, Vec<&HistoryEvent>> = BTreeMap::new();
 
@@ -3043,8 +3409,16 @@ fn recorded_commands(
             event.event_type.as_str(),
             "TimerScheduled" | "TimerCancelled" | "TimerFired"
         ) && !is_internal_timer_event(event);
+        let is_child_workflow = matches!(
+            event.event_type.as_str(),
+            "ChildWorkflowScheduled"
+                | "ChildRunCompleted"
+                | "ChildRunFailed"
+                | "ChildRunCancelled"
+                | "ChildRunTerminated"
+        );
         let is_signal_wait = is_recorded_signal_wait_event(event);
-        if !is_activity && !is_workflow_timer && !is_signal_wait {
+        if !is_activity && !is_workflow_timer && !is_child_workflow && !is_signal_wait {
             continue;
         }
 
@@ -3082,6 +3456,14 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| event.event_type.starts_with("Timer"))
                 .collect();
+            let child_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| {
+                    event.event_type == "ChildWorkflowScheduled"
+                        || event.event_type.starts_with("ChildRun")
+                })
+                .collect();
             let signal_wait_events: Vec<_> = sequence_events
                 .iter()
                 .copied()
@@ -3090,11 +3472,13 @@ fn recorded_commands(
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
+                + usize::from(!child_events.is_empty())
                 + usize::from(!signal_wait_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
                     (!timer_events.is_empty()).then_some("timer"),
+                    (!child_events.is_empty()).then_some("child workflow"),
                     (!signal_wait_events.is_empty()).then_some("signal wait"),
                 ]
                 .into_iter()
@@ -3179,6 +3563,72 @@ fn recorded_commands(
                     sequence,
                     activity_type,
                     result,
+                });
+            }
+
+            if !child_events.is_empty() {
+                let scheduled: Vec<_> = child_events
+                    .iter()
+                    .copied()
+                    .filter(|event| event.event_type == "ChildWorkflowScheduled")
+                    .collect();
+                if scheduled.len() != 1 {
+                    return Err(invalid_recorded_history(
+                        "child_workflow_schedule_missing_or_duplicate",
+                        sequence,
+                        "one ChildWorkflowScheduled event",
+                        &format!("{} ChildWorkflowScheduled events", scheduled.len()),
+                        "child workflow replay requires exactly one recorded schedule event",
+                    ));
+                }
+                let workflow_type = child_events.iter().find_map(|event| {
+                    event
+                        .payload
+                        .get("child_workflow_type")
+                        .or_else(|| event.payload.get("workflow_type"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                });
+                if child_events
+                    .iter()
+                    .filter_map(|event| {
+                        event
+                            .payload
+                            .get("child_workflow_type")
+                            .or_else(|| event.payload.get("workflow_type"))
+                            .and_then(Value::as_str)
+                    })
+                    .any(|candidate| Some(candidate) != workflow_type.as_deref())
+                {
+                    return Err(invalid_recorded_history(
+                        "child_workflow_identity_mismatch",
+                        sequence,
+                        workflow_type
+                            .as_deref()
+                            .unwrap_or("one child workflow type"),
+                        "conflicting child workflow types",
+                        "child workflow lifecycle events at one sequence disagree on type",
+                    ));
+                }
+                let mut outcomes = child_workflow_outcomes(
+                    &child_events.iter().map(|event| (*event).clone()).collect::<Vec<_>>(),
+                    fallback_codec,
+                    parent.clone(),
+                )?;
+                if outcomes.len() > 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_child_workflow_terminal_event",
+                        sequence,
+                        "at most one terminal child event",
+                        "multiple terminal child events",
+                        "child workflow history settles one command more than once",
+                    ));
+                }
+                return Ok(RecordedCommand::ChildWorkflow {
+                    sequence,
+                    workflow_type,
+                    outcome: outcomes.pop(),
                 });
             }
 
@@ -3391,6 +3841,171 @@ fn invalid_recorded_history(
         Some(actual.to_string()),
         message,
     ))
+}
+
+type ChildWorkflowOutcome = std::result::Result<ChildWorkflowResult, ChildWorkflowFailure>;
+
+fn child_workflow_outcomes(
+    events: &[HistoryEvent],
+    fallback_codec: &str,
+    parent: WorkflowIdentity,
+) -> Result<Vec<ChildWorkflowOutcome>> {
+    let mut outcomes = Vec::new();
+
+    for event in events {
+        let kind = match event.event_type.as_str() {
+            "ChildRunCompleted" => None,
+            "ChildRunFailed" => Some((
+                ChildWorkflowFailureKind::Failed,
+                "child_workflow",
+                "child workflow failed",
+            )),
+            "ChildRunCancelled" => Some((
+                ChildWorkflowFailureKind::Cancelled,
+                "cancelled",
+                "child workflow was cancelled",
+            )),
+            "ChildRunTerminated" => Some((
+                ChildWorkflowFailureKind::Terminated,
+                "terminated",
+                "child workflow was terminated",
+            )),
+            _ => continue,
+        };
+        let payload = &event.payload;
+        let child_workflow_id = payload_string(payload, "child_workflow_instance_id");
+        let child_workflow_run_id = payload_string(payload, "child_workflow_run_id");
+        let child_workflow_type = payload_string(payload, "child_workflow_type");
+
+        if let Some((kind, reason, fallback_message)) = kind {
+            let exception = payload
+                .get("exception")
+                .filter(|value| !value.is_null())
+                .cloned();
+            let message = payload_string(payload, "message")
+                .or_else(|| {
+                    exception
+                        .as_ref()
+                        .and_then(|value| payload_string(value, "message"))
+                })
+                .unwrap_or_else(|| fallback_message.to_string());
+            let exception_type = payload_string(payload, "exception_type").or_else(|| {
+                exception
+                    .as_ref()
+                    .and_then(|value| payload_string(value, "type"))
+            });
+            let exception_class = payload_string(payload, "exception_class").or_else(|| {
+                exception
+                    .as_ref()
+                    .and_then(|value| payload_string(value, "class"))
+            });
+            outcomes.push(Err(ChildWorkflowFailure {
+                kind,
+                reason: reason.to_string(),
+                message,
+                parent_workflow_id: parent.workflow_id.clone(),
+                parent_workflow_run_id: parent.run_id.clone(),
+                child_workflow_id,
+                child_workflow_run_id,
+                child_workflow_type,
+                failure_id: payload_string(payload, "failure_id"),
+                failure_category: payload_string(payload, "failure_category"),
+                exception_type,
+                exception_class,
+                non_retryable: payload
+                    .get("non_retryable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                code: payload
+                    .get("code")
+                    .filter(|value| !value.is_null())
+                    .cloned(),
+                exception,
+            }));
+            continue;
+        }
+
+        let codec = payload
+            .get("payload_codec")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_codec);
+        let result = payload
+            .get("result")
+            .or_else(|| payload.get("output"))
+            .unwrap_or(&Value::Null);
+        outcomes.push(Ok(ChildWorkflowResult {
+            parent: parent.clone(),
+            child: WorkflowIdentity {
+                workflow_id: child_workflow_id,
+                run_id: child_workflow_run_id,
+            },
+            child_workflow_type,
+            result: decode_wire_value(result, codec)?,
+        }));
+    }
+
+    Ok(outcomes)
+}
+
+fn payload_string(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn workflow_failure_command(error: &Error) -> Value {
+    let (exception_type, exception_class, properties) = match error {
+        Error::ChildWorkflowFailed(failure) => (
+            match failure.kind {
+                ChildWorkflowFailureKind::Failed => "ChildWorkflowFailed",
+                ChildWorkflowFailureKind::Cancelled => "ChildWorkflowCancelled",
+                ChildWorkflowFailureKind::Terminated => "ChildWorkflowTerminated",
+            },
+            "durable_workflow::ChildWorkflowFailure",
+            json!({
+                "reason": failure.reason,
+                "parent_workflow_id": failure.parent_workflow_id,
+                "parent_workflow_run_id": failure.parent_workflow_run_id,
+                "child_workflow_id": failure.child_workflow_id,
+                "child_workflow_run_id": failure.child_workflow_run_id,
+                "child_workflow_type": failure.child_workflow_type,
+                "failure_id": failure.failure_id,
+                "failure_category": failure.failure_category,
+                "child_exception_type": failure.exception_type,
+                "child_exception_class": failure.exception_class,
+                "child_non_retryable": failure.non_retryable,
+                "child_code": failure.code,
+                "child_exception": failure.exception,
+            }),
+        ),
+        Error::NonDeterministicReplay(_) => (
+            "NonDeterministicReplay",
+            "durable_workflow::Error",
+            Value::Null,
+        ),
+        _ => ("RustWorkflowError", "durable_workflow::Error", Value::Null),
+    };
+    let non_retryable = match error {
+        Error::ChildWorkflowFailed(failure) => failure.non_retryable,
+        Error::NonDeterministicReplay(_) => true,
+        _ => false,
+    };
+
+    json!({
+        "type": "fail_workflow",
+        "message": error.to_string(),
+        "exception_type": exception_type,
+        "exception_class": exception_class,
+        "non_retryable": non_retryable,
+        "exception": {
+            "type": exception_type,
+            "class": exception_class,
+            "message": error.to_string(),
+            "properties": properties,
+        }
+    })
 }
 
 fn signal_values(
@@ -3848,8 +4463,10 @@ mod tests {
     fn workflow_context(history: Vec<HistoryEvent>) -> WorkflowContext {
         WorkflowContext {
             state: Arc::new(Mutex::new(
-                WorkflowState::new(
+                WorkflowState::new_with_identity(
                     history,
+                    None,
+                    None,
                     "rust-workers".to_string(),
                     JSON_CODEC.to_string(),
                     None,
@@ -3903,8 +4520,10 @@ mod tests {
     fn workflow_context_schedules_activity_until_completion_is_in_history() {
         let ctx = WorkflowContext {
             state: Arc::new(Mutex::new(
-                WorkflowState::new(
+                WorkflowState::new_with_identity(
                     Vec::new(),
+                    Some("wf-parent".to_string()),
+                    Some("run-parent".to_string()),
                     "rust-workers".to_string(),
                     DEFAULT_CODEC.to_string(),
                     None,
@@ -4440,6 +5059,255 @@ mod tests {
         };
         assert_eq!(failure.reason, "recorded_commands_unconsumed");
         assert_eq!(failure.sequence, Some(1));
+    }
+
+    #[test]
+    fn workflow_context_emits_explicit_child_workflow_contract() {
+        let ctx = WorkflowContext {
+            state: Arc::new(Mutex::new(
+                WorkflowState::new_with_identity(
+                    Vec::new(),
+                    Some("wf-parent".to_string()),
+                    Some("run-parent".to_string()),
+                    "parent-workers".to_string(),
+                    JSON_CODEC.to_string(),
+                    None,
+                )
+                .expect("workflow state"),
+            )),
+        };
+        let options = ChildWorkflowOptions::new("python-workers")
+            .parent_close_policy(ParentClosePolicy::RequestCancel)
+            .retry_policy(ChildWorkflowRetryPolicy {
+                max_attempts: Some(3),
+                backoff_seconds: vec![1, 5],
+                non_retryable_error_types: vec!["ValidationError".to_string()],
+            })
+            .execution_timeout_seconds(600)
+            .run_timeout_seconds(120);
+        let mut call = Box::pin(ctx.start_child_workflow(
+            "python.fulfil-order",
+            options,
+            json!([{"order_id": "order-42"}]),
+        ));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("commands");
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        assert_eq!(command["type"], "start_child_workflow");
+        assert_eq!(command["workflow_type"], "python.fulfil-order");
+        assert_eq!(command["queue"], "python-workers");
+        assert_eq!(command["parent_close_policy"], "request_cancel");
+        assert_eq!(command["retry_policy"]["max_attempts"], 3);
+        assert_eq!(command["execution_timeout_seconds"], 600);
+        assert_eq!(command["run_timeout_seconds"], 120);
+        assert_eq!(
+            decode_wire_value(&command["arguments"], JSON_CODEC).expect("child args"),
+            json!([{"order_id": "order-42"}])
+        );
+    }
+
+    fn child_parent_worker() -> Worker {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-parent-workers");
+        worker.register_workflow("rust.parent", |ctx, _input| async move {
+            let child = ctx
+                .start_child_workflow(
+                    "python.child",
+                    ChildWorkflowOptions::new("python-child-workers")
+                        .parent_close_policy(ParentClosePolicy::Terminate),
+                    json!([{"codec_probe": [1, true, "rust"]}]),
+                )
+                .await?;
+            Ok(json!({
+                "parent_workflow_id": child.parent.workflow_id,
+                "parent_run_id": child.parent.run_id,
+                "child_workflow_id": child.child.workflow_id,
+                "child_run_id": child.child.run_id,
+                "child_workflow_type": child.child_workflow_type,
+                "result": child.result,
+            }))
+        });
+        worker
+    }
+
+    fn child_parent_task(event_type: &str, payload: Value) -> WorkflowTask {
+        WorkflowTask {
+            task_id: "wft-child-parent".to_string(),
+            workflow_id: Some("wf-parent".to_string()),
+            run_id: Some("run-parent".to_string()),
+            workflow_type: "rust.parent".to_string(),
+            payload_codec: JSON_CODEC.to_string(),
+            arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("input")),
+            history_events: vec![
+                HistoryEvent {
+                    event_type: "ChildWorkflowScheduled".to_string(),
+                    payload: json!({
+                        "sequence": 1,
+                        "child_call_id": "call-child",
+                        "child_workflow_instance_id": "wf-child",
+                        "child_workflow_run_id": "run-child",
+                        "child_workflow_type": "python.child",
+                    }),
+                    raw: HashMap::new(),
+                },
+                HistoryEvent {
+                    event_type: event_type.to_string(),
+                    payload,
+                    raw: HashMap::new(),
+                },
+            ],
+            total_history_events: Some(2),
+            next_history_page_token: None,
+            workflow_task_attempt: 1,
+            workflow_signal_id: None,
+            signal_name: None,
+            signal_arguments: None,
+            lease_owner: Some("rust-worker".to_string()),
+        }
+    }
+
+    #[test]
+    fn committed_child_result_replays_without_starting_a_duplicate() {
+        let worker = child_parent_worker();
+        let task = child_parent_task(
+            "ChildRunCompleted",
+            json!({
+                "sequence": 1,
+                "child_call_id": "call-child",
+                "child_workflow_instance_id": "wf-child",
+                "child_workflow_run_id": "run-child",
+                "child_workflow_type": "python.child",
+                "payload_codec": "json",
+                "result": {"codec": "json", "blob": "{\"from\":\"python\",\"ok\":true}"},
+            }),
+        );
+
+        for _restart in 0..2 {
+            let commands = worker
+                .execute_workflow_task(task.clone())
+                .expect("replayed parent task");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["type"], "complete_workflow");
+            assert!(!commands
+                .iter()
+                .any(|command| command["type"] == "start_child_workflow"));
+            let output =
+                decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("parent output");
+            assert_eq!(output["parent_workflow_id"], "wf-parent");
+            assert_eq!(output["parent_run_id"], "run-parent");
+            assert_eq!(output["child_workflow_id"], "wf-child");
+            assert_eq!(output["child_run_id"], "run-child");
+            assert_eq!(output["result"], json!({"from": "python", "ok": true}));
+        }
+    }
+
+    #[test]
+    fn pending_child_replays_after_restart_without_starting_a_duplicate() {
+        let worker = child_parent_worker();
+        let mut task = child_parent_task("unused", Value::Null);
+        task.history_events.truncate(1);
+        task.total_history_events = Some(1);
+
+        for _redelivery_or_restart in 0..2 {
+            let commands = worker
+                .execute_workflow_task(task.clone())
+                .expect("recorded child remains pending");
+            assert!(
+                commands.is_empty(),
+                "recorded pending child must not be started again"
+            );
+        }
+    }
+
+    #[test]
+    fn child_cancellation_becomes_stable_parent_failure_command() {
+        let worker = child_parent_worker();
+        let task = child_parent_task(
+            "ChildRunCancelled",
+            json!({
+                "sequence": 1,
+                "child_workflow_instance_id": "wf-child",
+                "child_workflow_run_id": "run-child",
+                "child_workflow_type": "python.child",
+                "failure_id": "failure-child",
+                "failure_category": "cancelled",
+                "message": "cancelled by parent-close policy",
+            }),
+        );
+
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("parent settlement");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], "fail_workflow");
+        assert_eq!(commands[0]["exception_type"], "ChildWorkflowCancelled");
+        assert_eq!(
+            commands[0]["exception"]["properties"]["reason"],
+            "cancelled"
+        );
+        assert_eq!(
+            commands[0]["exception"]["properties"]["child_workflow_run_id"],
+            "run-child"
+        );
+    }
+
+    #[test]
+    fn workflow_can_handle_typed_child_failure() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-parent-workers");
+        worker.register_workflow("rust.handled-parent", |ctx, _input| async move {
+            match ctx
+                .start_child_workflow(
+                    "python.child",
+                    ChildWorkflowOptions::new("python-child-workers"),
+                    json!([]),
+                )
+                .await
+            {
+                Err(Error::ChildWorkflowFailed(failure)) => Ok(json!({
+                    "reason": failure.reason,
+                    "failure_id": failure.failure_id,
+                    "exception_class": failure.exception_class,
+                    "child_run_id": failure.child_workflow_run_id,
+                })),
+                Err(error) => Err(error),
+                Ok(_) => Err(Error::WorkerLoop(
+                    "child unexpectedly succeeded".to_string(),
+                )),
+            }
+        });
+        let mut task = child_parent_task(
+            "ChildRunFailed",
+            json!({
+                "sequence": 1,
+                "child_workflow_instance_id": "wf-child",
+                "child_workflow_run_id": "run-child",
+                "child_workflow_type": "python.child",
+                "failure_id": "failure-child",
+                "failure_category": "child_workflow",
+                "message": "payment rejected",
+                "exception": {
+                    "type": "PaymentRejected",
+                    "class": "payments.PaymentRejected",
+                    "message": "payment rejected"
+                }
+            }),
+        );
+        task.workflow_type = "rust.handled-parent".to_string();
+
+        let commands = worker.execute_workflow_task(task).expect("handled failure");
+        assert_eq!(commands[0]["type"], "complete_workflow");
+        let output = decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("parent output");
+        assert_eq!(output["reason"], "child_workflow");
+        assert_eq!(output["failure_id"], "failure-child");
+        assert_eq!(output["exception_class"], "payments.PaymentRejected");
+        assert_eq!(output["child_run_id"], "run-child");
     }
 
     #[test]
