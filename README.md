@@ -4,26 +4,28 @@
 and clients. It can register workflow and activity handlers, long-poll the
 worker protocol, start, signal, and query workflow executions, expose named
 read-only query handlers, heartbeat workers and activities, and exchange
-JSON-native payloads through the platform's generic Avro wrapper.
+JSON-native payloads through the platform's generic Avro wrapper. Workflow
+code can also wait on server-backed durable time without blocking a Rust
+executor thread.
 
 ## Install
 
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.3 --exact
+cargo add durable-workflow@0.1.4 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.3"
+durable-workflow = "=0.1.4"
 ```
 
-Version `0.1.3` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.4` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
-from `0.1.2`.
+from `0.1.2`, and deterministic durable timers are available from `0.1.4`.
 
 ## Compatibility
 
@@ -31,17 +33,62 @@ from `0.1.2`.
 | --- | --- | --- | --- |
 | `0.1.0` | `>=0.2,<0.3` | `1.2` | `2` |
 | `0.1.1` | `>=0.2,<0.3` | `1.2` (snapshot queries require `1.8`) | `2` |
-| `0.1.2+` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
+| `0.1.2`–`0.1.3` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
+| `0.1.4+` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
 `control-plane-version`. Query-capable releases also publish `query-tasks`,
 `query-task-minimum-worker-protocol-version`, `replayed-instance-state-queries`,
-`query-state-model`, `snapshot-inspection-queries`, and `payload-codecs`. Existing
-worker operations retain the `1.2` baseline; only query-task poll, complete,
-and fail requests use the additive `1.8` feature floor. The server's advertised
-protocol manifests remain authoritative when checking compatibility during
-deployment.
+`query-state-model`, `snapshot-inspection-queries`, and `payload-codecs`.
+Timer-capable releases additionally publish `durable-timers`, `timer-command`,
+and `timer-replay-validation`. Existing worker operations retain the `1.2`
+baseline; only query-task poll, complete, and fail requests use the additive
+`1.8` feature floor. The server's advertised protocol manifests remain
+authoritative when checking compatibility during deployment.
+
+## Durable timers
+
+`WorkflowContext::sleep` waits on server-backed durable wall time. It emits a
+`start_timer` workflow command and yields the workflow future; it never calls
+`tokio::time::sleep` or keeps a process-local deadline. Durations are rounded
+up to whole seconds, so a timer cannot be scheduled earlier than requested.
+
+`WorkflowContext::start_timer` is an alias for `sleep`. On every workflow task,
+the SDK reconstructs one shared sequence-ordered command stream for activities,
+timers, and signal waits. A replayed timer must have a matching
+`TimerScheduled` event, and it resolves only when the same sequence and timer
+identity has one `TimerFired` event. The recorded delay must equal the current
+workflow call. Worker and server restarts therefore preserve the original
+deadline, while replay and repeated polling do not append or consume the timer
+twice. Changed command order, changed delay, unpaired events, duplicate durable
+sequences, and duplicate fires return `Error::NonDeterministicReplay`; its
+`ReplayFailure` exposes stable `reason`, `sequence`, `expected`, and `actual`
+fields. Durations too large to round up without shortening the requested wait
+return `Error::TimerDurationOverflow` without emitting a command.
+
+```rust
+# use std::time::Duration;
+# use durable_workflow::{json, Client, Worker};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "reminder-workers");
+worker.register_workflow("send-reminder", |ctx, _input| async move {
+    ctx.sleep(Duration::from_secs(30)).await?;
+    let receipt = ctx.activity("deliver-reminder", json!([])).await?;
+    Ok(receipt)
+});
+# }
+```
+
+Use `WorkflowContext::sleep` only inside workflow code. Ordinary
+`tokio::time::sleep` remains appropriate for worker-process concerns such as
+local polling or shutdown coordination, but it is not durable workflow state.
+
+Running and completed executions remain available through `WorkflowHandle`'s
+`describe`, `query`, and `result` methods. Server protocol incompatibilities
+remain `Error::Protocol(ProtocolFailure)`, including stable `reason`, `status`,
+and requested/supported version fields; other rejected worker requests remain
+typed `Error::Http` values with the response status and body.
 
 ## Worker
 

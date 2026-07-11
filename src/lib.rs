@@ -1,15 +1,15 @@
 //! Minimal Rust SDK for the Durable Workflow worker protocol.
 //!
-//! The crate covers the v1 Rust round-trip: start, signal, and query workflows,
-//! register a Rust worker, poll workflow, activity, and read-only query tasks,
-//! reconstruct typed workflow-instance state through deterministic replay,
-//! heartbeat worker and activity liveness, and exchange JSON-native payloads
-//! through the same `avro` generic wrapper used by the existing first-party
-//! SDKs.
+//! The crate covers the v1 Rust round-trip: start, signal, query, and durably
+//! sleep in workflows; register a Rust worker; poll workflow, activity, and
+//! read-only query tasks; reconstruct typed workflow-instance state through
+//! deterministic replay; heartbeat worker and activity liveness; and exchange
+//! JSON-native payloads through the same `avro` generic wrapper used by the
+//! existing first-party SDKs.
 
 use std::{
     any::{Any, TypeId},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     pin::Pin,
     sync::{
@@ -82,6 +82,8 @@ pub enum Error {
     QueryFailed(QueryFailure),
     #[error(transparent)]
     Protocol(ProtocolFailure),
+    #[error(transparent)]
+    NonDeterministicReplay(ReplayFailure),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
@@ -90,10 +92,42 @@ pub enum Error {
     WorkflowYieldedWithoutCommand,
     #[error("workflow state lock is poisoned")]
     WorkflowStatePoisoned,
+    #[error("timer duration is too large for the worker protocol")]
+    TimerDurationOverflow,
     #[error("operation timed out")]
     Timeout,
     #[error("worker loop error: {0}")]
     WorkerLoop(String),
+}
+
+/// A stable, machine-readable failure raised when workflow code no longer
+/// reconstructs the durable command stream recorded in history.
+#[derive(Clone, Debug, Error)]
+#[error("non-deterministic workflow replay ({reason}) at sequence {sequence:?}: {message}")]
+pub struct ReplayFailure {
+    pub reason: String,
+    pub sequence: Option<u64>,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+    pub message: String,
+}
+
+impl ReplayFailure {
+    fn new(
+        reason: impl Into<String>,
+        sequence: Option<u64>,
+        expected: Option<String>,
+        actual: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            reason: reason.into(),
+            sequence,
+            expected,
+            actual,
+            message: message.into(),
+        }
+    }
 }
 
 /// A stable, machine-readable workflow query or query-task settlement failure.
@@ -2182,15 +2216,21 @@ impl Worker {
                         "QueryWorkflowStateUnavailable",
                     )
                 })?;
-                let workflow_state = Arc::new(Mutex::new(WorkflowState {
-                    history: history_events.as_ref().clone(),
-                    task_queue: self.task_queue.clone(),
-                    payload_codec: task.payload_codec,
-                    resume_signal: None,
-                    activity_cursor: 0,
-                    signal_cursors: HashMap::new(),
-                    commands: Vec::new(),
-                }));
+                let workflow_state = Arc::new(Mutex::new(
+                    WorkflowState::new(
+                        history_events.as_ref().clone(),
+                        self.task_queue.clone(),
+                        task.payload_codec,
+                        None,
+                    )
+                    .map_err(|error| {
+                        QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            format!("workflow replay failed before query: {error}"),
+                            "QueryWorkflowStateUnavailable",
+                        )
+                    })?,
+                ));
                 let workflow_context = WorkflowContext {
                     state: workflow_state,
                 };
@@ -2198,7 +2238,17 @@ impl Worker {
                     replay(workflow_context.clone(), context.workflow_input.clone());
                 let mut cx = TaskContext::from_waker(noop_waker_ref());
                 match invocation.future.as_mut().poll(&mut cx) {
-                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Ok(_)) => {
+                        workflow_context
+                            .ensure_history_consumed()
+                            .map_err(|error| {
+                                QueryTaskExecutionFailure::new(
+                                    "query_workflow_state_unavailable",
+                                    format!("workflow replay failed before query: {error}"),
+                                    "QueryWorkflowStateUnavailable",
+                                )
+                            })?;
+                    }
                     Poll::Ready(Err(error)) => {
                         return Err(QueryTaskExecutionFailure::new(
                             "query_workflow_state_unavailable",
@@ -2214,7 +2264,17 @@ impl Worker {
                                 "QueryWorkflowStateUnavailable",
                             )
                         })?;
-                        if commands.is_empty() {
+                        if commands.is_empty()
+                            && !workflow_context
+                                .matched_recorded_pending()
+                                .map_err(|error| {
+                                    QueryTaskExecutionFailure::new(
+                                        "query_workflow_state_unavailable",
+                                        format!("workflow replay failed before query: {error}"),
+                                        "QueryWorkflowStateUnavailable",
+                                    )
+                                })?
+                        {
                             return Err(QueryTaskExecutionFailure::new(
                                 "query_workflow_state_unavailable",
                                 "workflow replay yielded without a durable command",
@@ -2252,21 +2312,19 @@ impl Worker {
             .ok_or_else(|| Error::WorkflowNotRegistered(task.workflow_type.clone()))?;
         let input = decode_task_arguments(task.arguments.as_ref(), &task.payload_codec)?;
         let resume_signal = decode_resume_signal(&task)?;
-        let state = Arc::new(Mutex::new(WorkflowState {
-            history: task.history_events,
-            task_queue: self.task_queue.clone(),
-            payload_codec: task.payload_codec.clone(),
+        let state = Arc::new(Mutex::new(WorkflowState::new(
+            task.history_events,
+            self.task_queue.clone(),
+            task.payload_codec.clone(),
             resume_signal,
-            activity_cursor: 0,
-            signal_cursors: HashMap::new(),
-            commands: Vec::new(),
-        }));
+        )?));
         let ctx = WorkflowContext { state };
         let mut future = (workflow.execute)(ctx.clone(), input);
         let mut cx = TaskContext::from_waker(noop_waker_ref());
 
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(result)) => {
+                ctx.ensure_history_consumed()?;
                 let result = encode_value_envelope(&result, &task.payload_codec)?;
                 Ok(vec![json!({
                     "type": "complete_workflow",
@@ -2276,7 +2334,7 @@ impl Worker {
             Poll::Ready(Err(error)) => Err(error),
             Poll::Pending => {
                 let commands = ctx.take_commands()?;
-                if commands.is_empty() {
+                if commands.is_empty() && !ctx.matched_recorded_pending()? {
                     Err(Error::WorkflowYieldedWithoutCommand)
                 } else {
                     Ok(commands)
@@ -2486,7 +2544,45 @@ impl WorkflowContext {
             ctx: self.clone(),
             signal_name: signal_name.into(),
             opened_wait: false,
+            matched_pending: false,
         }
+    }
+
+    /// Wait for server-backed durable time without blocking the worker executor.
+    ///
+    /// Polling this future emits one `start_timer` command and yields. The
+    /// server records the deadline, so neither worker nor server restarts reset
+    /// the wait. Replay resolves the future only from a `TimerScheduled` and
+    /// `TimerFired` pair at the same position in the shared durable-command
+    /// stream, with matching sequence, timer identity, and delay. Sub-second
+    /// durations round up because protocol deadlines use whole seconds.
+    ///
+    /// ```no_run
+    /// # use durable_workflow::{json, Client, Worker};
+    /// # use std::time::Duration;
+    /// # fn configure(client: Client) {
+    /// let mut worker = Worker::new(client, "rust-workers");
+    /// worker.register_workflow("delayed-greeting", |ctx, _input| async move {
+    ///     ctx.sleep(Duration::from_secs(5)).await?;
+    ///     Ok(json!({"status": "timer fired"}))
+    /// });
+    /// # }
+    /// ```
+    pub fn sleep(&self, duration: Duration) -> TimerCall {
+        let delay_seconds = duration
+            .as_secs()
+            .checked_add(u64::from(duration.subsec_nanos() > 0));
+        TimerCall {
+            ctx: self.clone(),
+            delay_seconds,
+            scheduled: false,
+            matched_pending: false,
+        }
+    }
+
+    /// Alias for [`WorkflowContext::sleep`] for timer-oriented workflow code.
+    pub fn start_timer(&self, duration: Duration) -> TimerCall {
+        self.sleep(duration)
     }
 
     fn take_commands(&self) -> Result<Vec<Value>> {
@@ -2496,6 +2592,31 @@ impl WorkflowContext {
             .map_err(|_| Error::WorkflowStatePoisoned)?;
         Ok(std::mem::take(&mut state.commands))
     }
+
+    fn matched_recorded_pending(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(state.matched_recorded_pending)
+    }
+
+    fn ensure_history_consumed(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if let Some(command) = state.recorded_commands.get(state.command_cursor) {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "recorded_commands_unconsumed",
+                Some(command.sequence()),
+                Some(command.shape().to_string()),
+                Some("workflow completion".to_string()),
+                "workflow completed before consuming all recorded durable commands",
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -2504,9 +2625,69 @@ struct WorkflowState {
     task_queue: String,
     payload_codec: String,
     resume_signal: Option<ResumeSignal>,
-    activity_cursor: usize,
+    recorded_commands: Vec<RecordedCommand>,
+    command_cursor: usize,
+    matched_recorded_pending: bool,
     signal_cursors: HashMap<String, usize>,
     commands: Vec<Value>,
+}
+
+impl WorkflowState {
+    fn new(
+        history: Vec<HistoryEvent>,
+        task_queue: String,
+        payload_codec: String,
+        resume_signal: Option<ResumeSignal>,
+    ) -> Result<Self> {
+        let recorded_commands = recorded_commands(&history, &payload_codec)?;
+        Ok(Self {
+            history,
+            task_queue,
+            payload_codec,
+            resume_signal,
+            recorded_commands,
+            command_cursor: 0,
+            matched_recorded_pending: false,
+            signal_cursors: HashMap::new(),
+            commands: Vec::new(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RecordedCommand {
+    Activity {
+        sequence: u64,
+        activity_type: Option<String>,
+        result: Option<Value>,
+    },
+    Timer {
+        sequence: u64,
+        delay_seconds: u64,
+        fired: bool,
+    },
+    SignalWait {
+        sequence: u64,
+        signal_name: Option<String>,
+    },
+}
+
+impl RecordedCommand {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Activity { sequence, .. }
+            | Self::Timer { sequence, .. }
+            | Self::SignalWait { sequence, .. } => *sequence,
+        }
+    }
+
+    fn shape(&self) -> &'static str {
+        match self {
+            Self::Activity { .. } => "activity",
+            Self::Timer { .. } => "timer",
+            Self::SignalWait { .. } => "signal wait",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2534,15 +2715,46 @@ impl Future for ActivityCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        let completed = match completed_activity_results(&state.history, &state.payload_codec) {
-            Ok(completed) => completed,
-            Err(error) => return Poll::Ready(Err(error)),
-        };
+        if self.scheduled {
+            return Poll::Pending;
+        }
 
-        if state.activity_cursor < completed.len() {
-            let value = completed[state.activity_cursor].clone();
-            state.activity_cursor += 1;
-            return Poll::Ready(Ok(value));
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            let sequence = recorded.sequence();
+            match recorded {
+                RecordedCommand::Activity {
+                    activity_type,
+                    result,
+                    ..
+                } => {
+                    if let Some(recorded_type) = activity_type {
+                        if recorded_type != self.activity_type {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(
+                                ReplayFailure::new(
+                                    "recorded_command_detail_mismatch",
+                                    Some(sequence),
+                                    Some(format!("activity:{recorded_type}")),
+                                    Some(format!("activity:{}", self.activity_type)),
+                                    "recorded activity type differs from the current workflow command",
+                                ),
+                            )));
+                        }
+                    }
+                    state.command_cursor += 1;
+                    if let Some(value) = result {
+                        return Poll::Ready(Ok(value));
+                    }
+                    state.matched_recorded_pending = true;
+                    self.scheduled = true;
+                    return Poll::Pending;
+                }
+                other => {
+                    return Poll::Ready(Err(command_mismatch(
+                        &other,
+                        format!("activity:{}", self.activity_type),
+                    )));
+                }
+            }
         }
 
         if !self.scheduled {
@@ -2573,16 +2785,100 @@ impl Future for ActivityCall {
     }
 }
 
+/// Future returned by [`WorkflowContext::sleep`].
+pub struct TimerCall {
+    ctx: WorkflowContext,
+    delay_seconds: Option<u64>,
+    scheduled: bool,
+    matched_pending: bool,
+}
+
+impl Future for TimerCall {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if self.matched_pending {
+            return Poll::Pending;
+        }
+
+        let ctx = self.ctx.clone();
+        let Some(requested_delay) = self.delay_seconds else {
+            return Poll::Ready(Err(Error::TimerDurationOverflow));
+        };
+        let mut state = match ctx.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+        };
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            match recorded {
+                RecordedCommand::Timer {
+                    sequence,
+                    delay_seconds,
+                    fired,
+                    ..
+                } => {
+                    if delay_seconds != requested_delay {
+                        return Poll::Ready(Err(Error::NonDeterministicReplay(
+                            ReplayFailure::new(
+                                "timer_delay_mismatch",
+                                Some(sequence),
+                                Some(format!("timer:{delay_seconds}s")),
+                                Some(format!("timer:{requested_delay}s")),
+                                "recorded timer delay differs from the current workflow command",
+                            ),
+                        )));
+                    }
+                    state.command_cursor += 1;
+                    if fired {
+                        return Poll::Ready(Ok(()));
+                    }
+                    state.matched_recorded_pending = true;
+                    self.scheduled = true;
+                    self.matched_pending = true;
+                    return Poll::Pending;
+                }
+                other => return Poll::Ready(Err(command_mismatch(&other, "timer"))),
+            }
+        }
+
+        if !self.scheduled {
+            state.commands.push(json!({
+                "type": "start_timer",
+                "delay_seconds": requested_delay,
+            }));
+            self.scheduled = true;
+        }
+
+        Poll::Pending
+    }
+}
+
+fn command_mismatch(recorded: &RecordedCommand, actual: impl Into<String>) -> Error {
+    Error::NonDeterministicReplay(ReplayFailure::new(
+        "recorded_command_mismatch",
+        Some(recorded.sequence()),
+        Some(recorded.shape().to_string()),
+        Some(actual.into()),
+        "current workflow command does not match the recorded durable command sequence",
+    ))
+}
+
 pub struct SignalCall {
     ctx: WorkflowContext,
     signal_name: String,
     opened_wait: bool,
+    matched_pending: bool,
 }
 
 impl Future for SignalCall {
     type Output = Result<Vec<Value>>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if self.matched_pending {
+            return Poll::Pending;
+        }
+
         let ctx = self.ctx.clone();
         let mut state = match ctx.state.lock() {
             Ok(state) => state,
@@ -2599,6 +2895,48 @@ impl Future for SignalCall {
             Err(error) => return Poll::Ready(Err(error)),
         };
         let cursor = *state.signal_cursors.get(&self.signal_name).unwrap_or(&0);
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            match recorded {
+                RecordedCommand::SignalWait {
+                    sequence,
+                    signal_name,
+                } => {
+                    if let Some(recorded_name) = signal_name {
+                        if recorded_name != self.signal_name {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(
+                                ReplayFailure::new(
+                                    "recorded_command_detail_mismatch",
+                                    Some(sequence),
+                                    Some(format!("signal wait:{recorded_name}")),
+                                    Some(format!("signal wait:{}", self.signal_name)),
+                                    "recorded signal name differs from the current workflow command",
+                                ),
+                            )));
+                        }
+                    }
+
+                    state.command_cursor += 1;
+                    if cursor < signals.len() {
+                        state
+                            .signal_cursors
+                            .insert(self.signal_name.clone(), cursor + 1);
+                        return Poll::Ready(Ok(signals[cursor].clone()));
+                    }
+
+                    state.matched_recorded_pending = true;
+                    self.opened_wait = true;
+                    self.matched_pending = true;
+                    return Poll::Pending;
+                }
+                other => {
+                    return Poll::Ready(Err(command_mismatch(
+                        &other,
+                        format!("signal wait:{}", self.signal_name),
+                    )));
+                }
+            }
+        }
 
         if cursor < signals.len() {
             state
@@ -2683,24 +3021,376 @@ fn normalize_arguments(value: Value) -> Value {
     }
 }
 
-fn completed_activity_results(events: &[HistoryEvent], fallback_codec: &str) -> Result<Vec<Value>> {
-    let mut results = Vec::new();
+fn recorded_commands(
+    events: &[HistoryEvent],
+    fallback_codec: &str,
+) -> Result<Vec<RecordedCommand>> {
+    let mut events_by_sequence: BTreeMap<u64, Vec<&HistoryEvent>> = BTreeMap::new();
 
     for event in events {
-        if event.event_type != "ActivityCompleted" {
+        let is_activity = matches!(
+            event.event_type.as_str(),
+            "ActivityScheduled"
+                | "ActivityStarted"
+                | "ActivityHeartbeatRecorded"
+                | "ActivityRetryScheduled"
+                | "ActivityCompleted"
+                | "ActivityFailed"
+                | "ActivityCancelled"
+                | "ActivityTimedOut"
+        );
+        let is_workflow_timer = matches!(
+            event.event_type.as_str(),
+            "TimerScheduled" | "TimerCancelled" | "TimerFired"
+        ) && !is_internal_timer_event(event);
+        let is_signal_wait = is_recorded_signal_wait_event(event);
+        if !is_activity && !is_workflow_timer && !is_signal_wait {
             continue;
         }
 
-        let codec = event
-            .payload
-            .get("payload_codec")
-            .and_then(Value::as_str)
-            .unwrap_or(fallback_codec);
-        let result = event.payload.get("result").unwrap_or(&Value::Null);
-        results.push(decode_wire_value(result, codec)?);
+        let sequence = durable_event_sequence(event).ok_or_else(|| {
+            Error::NonDeterministicReplay(ReplayFailure::new(
+                "durable_command_sequence_missing",
+                None,
+                Some("positive workflow sequence".to_string()),
+                Some(event.event_type.clone()),
+                "durable command history event has no workflow sequence",
+            ))
+        })?;
+        if sequence == 0 {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "durable_command_sequence_invalid",
+                Some(sequence),
+                Some("positive workflow sequence".to_string()),
+                Some(sequence.to_string()),
+                "durable command history uses an invalid workflow sequence",
+            )));
+        }
+        events_by_sequence.entry(sequence).or_default().push(event);
     }
 
-    Ok(results)
+    events_by_sequence
+        .into_iter()
+        .map(|(sequence, sequence_events)| {
+            let activity_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type.starts_with("Activity"))
+                .collect();
+            let timer_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type.starts_with("Timer"))
+                .collect();
+            let signal_wait_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| is_recorded_signal_wait_event(event))
+                .collect();
+
+            let command_kind_count = usize::from(!activity_events.is_empty())
+                + usize::from(!timer_events.is_empty())
+                + usize::from(!signal_wait_events.is_empty());
+            if command_kind_count > 1 {
+                let actual = [
+                    (!activity_events.is_empty()).then_some("activity"),
+                    (!timer_events.is_empty()).then_some("timer"),
+                    (!signal_wait_events.is_empty()).then_some("signal wait"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" and ");
+                return Err(invalid_recorded_history(
+                    "durable_command_sequence_collision",
+                    sequence,
+                    "one durable command kind",
+                    &actual,
+                    "one workflow sequence records more than one durable command kind",
+                ));
+            }
+
+            if !activity_events.is_empty() {
+                let scheduled_count = activity_events
+                    .iter()
+                    .filter(|event| event.event_type == "ActivityScheduled")
+                    .count();
+                if scheduled_count > 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_activity_schedule",
+                        sequence,
+                        "at most one ActivityScheduled event",
+                        "multiple ActivityScheduled events",
+                        "activity history schedules more than one command at one workflow sequence",
+                    ));
+                }
+                let activity_type = activity_events.iter().find_map(|event| {
+                    event
+                        .payload
+                        .get("activity_type")
+                        .or_else(|| event.payload.get("activity_name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+                if activity_events.iter().filter_map(|event| {
+                    event
+                        .payload
+                        .get("activity_type")
+                        .or_else(|| event.payload.get("activity_name"))
+                        .and_then(Value::as_str)
+                }).any(|candidate| Some(candidate) != activity_type.as_deref()) {
+                    return Err(invalid_recorded_history(
+                        "activity_identity_mismatch",
+                        sequence,
+                        activity_type.as_deref().unwrap_or("one activity identity"),
+                        "conflicting activity identities",
+                        "activity lifecycle events at one workflow sequence disagree on identity",
+                    ));
+                }
+                let completed: Vec<_> = activity_events
+                    .iter()
+                    .copied()
+                    .filter(|event| event.event_type == "ActivityCompleted")
+                    .collect();
+                if completed.len() > 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_activity_completion",
+                        sequence,
+                        "one ActivityCompleted event",
+                        "multiple ActivityCompleted events",
+                        "activity history contains more than one completion for a workflow sequence",
+                    ));
+                }
+                let result = completed
+                    .first()
+                    .map(|event| {
+                        let codec = event
+                            .payload
+                            .get("payload_codec")
+                            .and_then(Value::as_str)
+                            .unwrap_or(fallback_codec);
+                        decode_wire_value(
+                            event.payload.get("result").unwrap_or(&Value::Null),
+                            codec,
+                        )
+                    })
+                    .transpose()?;
+                return Ok(RecordedCommand::Activity {
+                    sequence,
+                    activity_type,
+                    result,
+                });
+            }
+
+            if !signal_wait_events.is_empty() {
+                let opened_count = signal_wait_events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event_type.as_str(),
+                            "SignalWaitOpened" | "ConditionWaitOpened"
+                        )
+                    })
+                    .count();
+                if opened_count > 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_signal_wait_open",
+                        sequence,
+                        "at most one signal wait open event",
+                        "multiple signal wait open events",
+                        "signal history opens more than one durable wait at one workflow sequence",
+                    ));
+                }
+
+                let signal_name = signal_wait_events
+                    .iter()
+                    .find_map(|event| recorded_signal_wait_name(event));
+                if signal_wait_events
+                    .iter()
+                    .filter_map(|event| recorded_signal_wait_name(event))
+                    .any(|candidate| Some(candidate.as_str()) != signal_name.as_deref())
+                {
+                    return Err(invalid_recorded_history(
+                        "signal_wait_identity_mismatch",
+                        sequence,
+                        signal_name.as_deref().unwrap_or("one signal name"),
+                        "conflicting signal names",
+                        "signal wait lifecycle events at one workflow sequence disagree on identity",
+                    ));
+                }
+                return Ok(RecordedCommand::SignalWait {
+                    sequence,
+                    signal_name,
+                });
+            }
+
+            let scheduled: Vec<_> = timer_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "TimerScheduled")
+                .collect();
+            let fired: Vec<_> = timer_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "TimerFired")
+                .collect();
+            if scheduled.len() != 1 {
+                return Err(invalid_recorded_history(
+                    "timer_schedule_missing_or_duplicate",
+                    sequence,
+                    "one TimerScheduled event",
+                    &format!("{} TimerScheduled events", scheduled.len()),
+                    "timer replay requires exactly one recorded schedule event",
+                ));
+            }
+            if fired.len() > 1 {
+                return Err(invalid_recorded_history(
+                    "duplicate_timer_fire",
+                    sequence,
+                    "at most one TimerFired event",
+                    "multiple TimerFired events",
+                    "timer history contains more than one fire event for a workflow sequence",
+                ));
+            }
+
+            let scheduled = scheduled[0];
+            let timer_id = required_history_string(scheduled, "timer_id", sequence)?;
+            let delay_seconds = required_history_u64(scheduled, "delay_seconds", sequence)?;
+            if let Some(fired) = fired.first() {
+                let fired_timer_id = required_history_string(fired, "timer_id", sequence)?;
+                if fired_timer_id != timer_id {
+                    return Err(invalid_recorded_history(
+                        "timer_identity_mismatch",
+                        sequence,
+                        &timer_id,
+                        &fired_timer_id,
+                        "TimerFired does not correspond to the recorded TimerScheduled event",
+                    ));
+                }
+                let fired_delay = required_history_u64(fired, "delay_seconds", sequence)?;
+                if fired_delay != delay_seconds {
+                    return Err(invalid_recorded_history(
+                        "timer_history_delay_mismatch",
+                        sequence,
+                        &delay_seconds.to_string(),
+                        &fired_delay.to_string(),
+                        "TimerScheduled and TimerFired record different delays",
+                    ));
+                }
+            }
+
+            Ok(RecordedCommand::Timer {
+                sequence,
+                delay_seconds,
+                fired: !fired.is_empty(),
+            })
+        })
+        .collect()
+}
+
+fn durable_event_sequence(event: &HistoryEvent) -> Option<u64> {
+    event
+        .payload
+        .get("sequence")
+        .or_else(|| event.payload.get("workflow_sequence"))
+        .or_else(|| event.raw.get("sequence"))
+        .or_else(|| event.raw.get("workflow_sequence"))
+        .and_then(value_as_u64)
+}
+
+fn is_internal_timer_event(event: &HistoryEvent) -> bool {
+    matches!(
+        event
+            .payload
+            .get("timer_kind")
+            .or_else(|| event.raw.get("timer_kind"))
+            .and_then(Value::as_str),
+        Some("condition_timeout" | "signal_timeout")
+    )
+}
+
+fn recorded_signal_wait_name(event: &HistoryEvent) -> Option<String> {
+    match event.event_type.as_str() {
+        "SignalWaitOpened" | "SignalApplied" => event
+            .payload
+            .get("signal_name")
+            .or_else(|| event.raw.get("signal_name"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        "ConditionWaitOpened" | "ConditionWaitSatisfied" | "ConditionWaitTimedOut" => event
+            .payload
+            .get("condition_key")
+            .or_else(|| event.raw.get("condition_key"))
+            .and_then(Value::as_str)
+            .and_then(|key| key.strip_prefix("signal:"))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn is_recorded_signal_wait_event(event: &HistoryEvent) -> bool {
+    match event.event_type.as_str() {
+        "SignalWaitOpened" | "SignalApplied" => true,
+        "ConditionWaitOpened" | "ConditionWaitSatisfied" | "ConditionWaitTimedOut" => event
+            .payload
+            .get("condition_key")
+            .or_else(|| event.raw.get("condition_key"))
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("signal:")),
+        _ => false,
+    }
+}
+
+fn required_history_string(event: &HistoryEvent, field: &str, sequence: u64) -> Result<String> {
+    event
+        .payload
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "timer_history_field_missing",
+                sequence,
+                field,
+                &event.event_type,
+                "timer history is missing a required identity field",
+            )
+        })
+}
+
+fn required_history_u64(event: &HistoryEvent, field: &str, sequence: u64) -> Result<u64> {
+    event
+        .payload
+        .get(field)
+        .and_then(value_as_u64)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "timer_history_field_missing",
+                sequence,
+                field,
+                &event.event_type,
+                "timer history is missing a required numeric field",
+            )
+        })
+}
+
+fn invalid_recorded_history(
+    reason: &str,
+    sequence: u64,
+    expected: &str,
+    actual: &str,
+    message: &str,
+) -> Error {
+    Error::NonDeterministicReplay(ReplayFailure::new(
+        reason,
+        Some(sequence),
+        Some(expected.to_string()),
+        Some(actual.to_string()),
+        message,
+    ))
 }
 
 fn signal_values(
@@ -3155,6 +3845,28 @@ mod tests {
         .expect("query task")
     }
 
+    fn workflow_context(history: Vec<HistoryEvent>) -> WorkflowContext {
+        WorkflowContext {
+            state: Arc::new(Mutex::new(
+                WorkflowState::new(
+                    history,
+                    "rust-workers".to_string(),
+                    JSON_CODEC.to_string(),
+                    None,
+                )
+                .expect("valid workflow history"),
+            )),
+        }
+    }
+
+    fn history_event(event_type: &str, payload: Value) -> HistoryEvent {
+        HistoryEvent {
+            event_type: event_type.to_string(),
+            payload,
+            raw: HashMap::new(),
+        }
+    }
+
     #[test]
     fn avro_generic_wrapper_round_trips_json_values() {
         let value = json!({"greeting": "hello", "count": 3, "ok": true});
@@ -3190,15 +3902,15 @@ mod tests {
     #[test]
     fn workflow_context_schedules_activity_until_completion_is_in_history() {
         let ctx = WorkflowContext {
-            state: Arc::new(Mutex::new(WorkflowState {
-                history: Vec::new(),
-                task_queue: "rust-workers".to_string(),
-                payload_codec: DEFAULT_CODEC.to_string(),
-                resume_signal: None,
-                activity_cursor: 0,
-                signal_cursors: HashMap::new(),
-                commands: Vec::new(),
-            })),
+            state: Arc::new(Mutex::new(
+                WorkflowState::new(
+                    Vec::new(),
+                    "rust-workers".to_string(),
+                    DEFAULT_CODEC.to_string(),
+                    None,
+                )
+                .expect("workflow state"),
+            )),
         };
 
         let mut call = Box::pin(ctx.activity("hello.activity", json!(["Ada"])));
@@ -3211,6 +3923,523 @@ mod tests {
         let commands = ctx.take_commands().expect("commands");
         assert_eq!(commands[0]["type"], "schedule_activity");
         assert_eq!(commands[0]["activity_type"], "hello.activity");
+    }
+
+    #[test]
+    fn workflow_sleep_emits_one_durable_timer_and_rounds_up() {
+        let ctx = workflow_context(Vec::new());
+        let mut sleep = Box::pin(ctx.sleep(Duration::from_millis(1_001)));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            sleep.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            sleep.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+
+        let commands = ctx.take_commands().expect("timer command");
+        assert_eq!(
+            commands,
+            vec![json!({
+                "type": "start_timer",
+                "delay_seconds": 2,
+            })]
+        );
+    }
+
+    #[test]
+    fn workflow_sleep_replays_matching_schedule_and_fire_without_a_command() {
+        let history = vec![
+            history_event(
+                "TimerScheduled",
+                json!({
+                    "sequence": 1,
+                    "timer_id": "timer-1",
+                    "delay_seconds": 5,
+                    "fire_at": "2026-07-11T12:00:05Z",
+                }),
+            ),
+            history_event(
+                "TimerFired",
+                json!({
+                    "sequence": 1,
+                    "timer_id": "timer-1",
+                    "delay_seconds": 5,
+                    "fire_at": "2026-07-11T12:00:05Z",
+                    "fired_at": "2026-07-11T12:00:05Z",
+                }),
+            ),
+        ];
+
+        for _restart in 0..2 {
+            let ctx = workflow_context(history.clone());
+            let mut sleep = Box::pin(ctx.sleep(Duration::from_secs(5)));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                sleep.as_mut().poll(&mut task_context),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+            ctx.ensure_history_consumed().expect("history consumed");
+        }
+    }
+
+    #[test]
+    fn workflow_sleep_rejects_changed_delay_during_replay() {
+        let ctx = workflow_context(vec![
+            history_event(
+                "TimerScheduled",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            ),
+            history_event(
+                "TimerFired",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            ),
+        ]);
+        let mut sleep = Box::pin(ctx.sleep(Duration::from_secs(500)));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            sleep.as_mut().poll(&mut task_context)
+        else {
+            panic!("changed timer delay must be rejected");
+        };
+        assert_eq!(failure.reason, "timer_delay_mismatch");
+        assert_eq!(failure.sequence, Some(1));
+    }
+
+    #[test]
+    fn workflow_history_rejects_unpaired_or_mismatched_timer_events() {
+        let lone_fire = WorkflowState::new(
+            vec![history_event(
+                "TimerFired",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            )],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("TimerFired requires TimerScheduled");
+        assert!(matches!(
+            lone_fire,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "timer_schedule_missing_or_duplicate"
+        ));
+
+        let wrong_identity = WorkflowState::new(
+            vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerFired",
+                    json!({"sequence": 1, "timer_id": "timer-2", "delay_seconds": 5}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("fire must match scheduled timer identity");
+        assert!(matches!(
+            wrong_identity,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "timer_identity_mismatch"
+        ));
+
+        let duplicate_fire = WorkflowState::new(
+            vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerFired",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerFired",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("a durable timer cannot fire twice");
+        assert!(matches!(
+            duplicate_fire,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "duplicate_timer_fire"
+        ));
+
+        let wrong_fired_delay = WorkflowState::new(
+            vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerFired",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 6}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("timer schedule and fire delays must agree");
+        assert!(matches!(
+            wrong_fired_delay,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "timer_history_delay_mismatch"
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_activity_moved_before_recorded_timer() {
+        let ctx = workflow_context(vec![
+            history_event(
+                "TimerScheduled",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            ),
+            history_event(
+                "TimerFired",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            ),
+            history_event(
+                "ActivityCompleted",
+                json!({
+                    "sequence": 2,
+                    "activity_type": "after-timer",
+                    "payload_codec": "json",
+                    "result": {"codec": "json", "blob": "\"done\""},
+                }),
+            ),
+        ]);
+        let mut activity = Box::pin(ctx.activity("after-timer", json!([])));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            activity.as_mut().poll(&mut task_context)
+        else {
+            panic!("reordered durable command must be rejected");
+        };
+        assert_eq!(failure.reason, "recorded_command_mismatch");
+        assert_eq!(failure.sequence, Some(1));
+        assert_eq!(failure.expected.as_deref(), Some("timer"));
+        assert_eq!(failure.actual.as_deref(), Some("activity:after-timer"));
+    }
+
+    #[test]
+    fn replay_orders_signal_waits_and_timers_in_one_command_stream() {
+        let signal_then_timer = vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({"sequence": 1, "condition_key": "signal:go"}),
+            ),
+            history_event(
+                "SignalReceived",
+                json!({
+                    "signal_name": "go",
+                    "arguments": ["now"],
+                }),
+            ),
+            history_event(
+                "TimerScheduled",
+                json!({"sequence": 2, "timer_id": "timer-2", "delay_seconds": 5}),
+            ),
+            history_event(
+                "TimerFired",
+                json!({"sequence": 2, "timer_id": "timer-2", "delay_seconds": 5}),
+            ),
+        ];
+
+        let ctx = workflow_context(signal_then_timer.clone());
+        let mut signal = Box::pin(ctx.wait_signal("go"));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            signal.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(arguments)) if arguments == vec![json!("now")]
+        ));
+        let mut timer = Box::pin(ctx.sleep(Duration::from_secs(5)));
+        assert!(matches!(
+            timer.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(()))
+        ));
+        ctx.ensure_history_consumed()
+            .expect("signal and timer history consumed in order");
+
+        let reordered = workflow_context(signal_then_timer);
+        let mut timer_first = Box::pin(reordered.sleep(Duration::from_secs(5)));
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            timer_first.as_mut().poll(&mut task_context)
+        else {
+            panic!("timer cannot consume signal-wait-first history");
+        };
+        assert_eq!(failure.reason, "recorded_command_mismatch");
+        assert_eq!(failure.sequence, Some(1));
+        assert_eq!(failure.expected.as_deref(), Some("signal wait"));
+
+        let timer_then_signal = vec![
+            history_event(
+                "TimerScheduled",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            ),
+            history_event(
+                "TimerFired",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            ),
+            history_event(
+                "ConditionWaitOpened",
+                json!({"sequence": 2, "condition_key": "signal:go"}),
+            ),
+            history_event(
+                "SignalReceived",
+                json!({"signal_name": "go", "arguments": []}),
+            ),
+        ];
+        let reordered = workflow_context(timer_then_signal);
+        let mut signal_first = Box::pin(reordered.wait_signal("go"));
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            signal_first.as_mut().poll(&mut task_context)
+        else {
+            panic!("signal wait cannot consume timer-first history");
+        };
+        assert_eq!(failure.reason, "recorded_command_mismatch");
+        assert_eq!(failure.sequence, Some(1));
+        assert_eq!(failure.expected.as_deref(), Some("timer"));
+    }
+
+    #[test]
+    fn workflow_history_rejects_duplicate_or_colliding_command_sequences() {
+        let duplicate_timer = WorkflowState::new(
+            vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-2", "delay_seconds": 5}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("one workflow sequence cannot schedule two timers");
+        assert!(matches!(
+            duplicate_timer,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "timer_schedule_missing_or_duplicate"
+        ));
+
+        let colliding_kinds = WorkflowState::new(
+            vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "ActivityCompleted",
+                    json!({"sequence": 1, "activity_type": "same-sequence"}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("one workflow sequence cannot identify two command kinds");
+        assert!(matches!(
+            colliding_kinds,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "durable_command_sequence_collision"
+        ));
+
+        let duplicate_signal_wait = WorkflowState::new(
+            vec![
+                history_event(
+                    "SignalWaitOpened",
+                    json!({"sequence": 1, "signal_name": "go"}),
+                ),
+                history_event(
+                    "SignalWaitOpened",
+                    json!({"sequence": 1, "signal_name": "go"}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("one workflow sequence cannot open two signal waits");
+        assert!(matches!(
+            duplicate_signal_wait,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "duplicate_signal_wait_open"
+        ));
+    }
+
+    #[test]
+    fn workflow_sleep_rejects_unrepresentable_rounded_duration() {
+        let ctx = workflow_context(Vec::new());
+        let mut sleep = Box::pin(ctx.start_timer(Duration::new(u64::MAX, 1)));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            sleep.as_mut().poll(&mut task_context),
+            Poll::Ready(Err(Error::TimerDurationOverflow))
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn workflow_task_replay_completes_without_rescheduling_recorded_commands() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.timer", |ctx, _input| async move {
+            ctx.sleep(Duration::from_secs(5)).await?;
+            ctx.activity("after-timer", json!([])).await
+        });
+
+        let task = |history_events| WorkflowTask {
+            task_id: "wft-rust-timer-1".to_string(),
+            workflow_id: Some("wf-rust-timer".to_string()),
+            run_id: Some("run-rust-timer".to_string()),
+            workflow_type: "rust.timer".to_string(),
+            payload_codec: JSON_CODEC.to_string(),
+            arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            history_events,
+            total_history_events: None,
+            next_history_page_token: None,
+            workflow_task_attempt: 1,
+            workflow_signal_id: None,
+            signal_name: None,
+            signal_arguments: None,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+
+        let initial = worker
+            .execute_workflow_task(task(Vec::new()))
+            .expect("initial timer task");
+        assert_eq!(
+            initial,
+            vec![json!({"type": "start_timer", "delay_seconds": 5})]
+        );
+
+        let replayed = worker
+            .execute_workflow_task(task(vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerFired",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "ActivityCompleted",
+                    json!({
+                        "sequence": 2,
+                        "activity_type": "after-timer",
+                        "payload_codec": "json",
+                        "result": {"codec": "json", "blob": "\"done\""},
+                    }),
+                ),
+            ]))
+            .expect("replayed workflow task");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&replayed[0]["result"], JSON_CODEC).expect("result"),
+            json!("done")
+        );
+    }
+
+    #[test]
+    fn workflow_task_replay_keeps_recorded_unfired_timer_pending_without_rescheduling() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.timer.pending", |ctx, _input| async move {
+            ctx.sleep(Duration::from_secs(5)).await?;
+            Ok(json!({"status": "timer fired"}))
+        });
+
+        let task = WorkflowTask {
+            task_id: "wft-rust-timer-pending".to_string(),
+            workflow_id: Some("wf-rust-timer".to_string()),
+            run_id: Some("run-rust-timer".to_string()),
+            workflow_type: "rust.timer.pending".to_string(),
+            payload_codec: JSON_CODEC.to_string(),
+            arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            history_events: vec![history_event(
+                "TimerScheduled",
+                json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+            )],
+            total_history_events: Some(1),
+            next_history_page_token: None,
+            workflow_task_attempt: 1,
+            workflow_signal_id: None,
+            signal_name: None,
+            signal_arguments: None,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+
+        for _redelivery_or_restart in 0..2 {
+            let commands = worker
+                .execute_workflow_task(task.clone())
+                .expect("recorded timer remains pending");
+            assert!(
+                commands.is_empty(),
+                "recorded timer must not be rescheduled"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_task_rejects_recorded_command_removed_from_workflow_code() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.timer.removed", |_ctx, _input| async move {
+            Ok(json!({"status": "completed"}))
+        });
+        let task = WorkflowTask {
+            task_id: "wft-rust-timer-removed".to_string(),
+            workflow_id: Some("wf-rust-timer".to_string()),
+            run_id: Some("run-rust-timer".to_string()),
+            workflow_type: "rust.timer.removed".to_string(),
+            payload_codec: JSON_CODEC.to_string(),
+            arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            history_events: vec![
+                history_event(
+                    "TimerScheduled",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+                history_event(
+                    "TimerFired",
+                    json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+                ),
+            ],
+            total_history_events: Some(2),
+            next_history_page_token: None,
+            workflow_task_attempt: 1,
+            workflow_signal_id: None,
+            signal_name: None,
+            signal_arguments: None,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+
+        let Error::NonDeterministicReplay(failure) = worker
+            .execute_workflow_task(task)
+            .expect_err("removed timer must fail replay")
+        else {
+            panic!("expected typed replay failure");
+        };
+        assert_eq!(failure.reason, "recorded_commands_unconsumed");
+        assert_eq!(failure.sequence, Some(1));
     }
 
     #[test]
