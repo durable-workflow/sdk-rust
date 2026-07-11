@@ -38,6 +38,9 @@ pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
 pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
 
 const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
+const WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE: &str =
+    "Workflow task waiting for scheduled history.";
+const WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE: &str = "WorkflowTaskWaitingForHistory";
 
 const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "lease_expired",
@@ -901,12 +904,30 @@ impl Client {
         workflow_task_attempt: u64,
         message: impl Into<String>,
     ) -> Result<Value> {
+        self.fail_workflow_task_with_type(
+            task_id,
+            lease_owner,
+            workflow_task_attempt,
+            message,
+            "RustWorkflowTaskFailure",
+        )
+        .await
+    }
+
+    async fn fail_workflow_task_with_type(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        workflow_task_attempt: u64,
+        message: impl Into<String>,
+        failure_type: &str,
+    ) -> Result<Value> {
         let body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
             "failure": {
                 "message": message.into(),
-                "type": "RustWorkflowTaskFailure"
+                "type": failure_type
             }
         });
         let path = format!("/worker/workflow-tasks/{task_id}/fail");
@@ -2034,6 +2055,22 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
 
         match self.execute_workflow_task(task) {
+            Ok(commands) if commands.is_empty() => {
+                // A replay can consume a recorded pending durable command
+                // without producing a new command. The standalone protocol
+                // acknowledges that state through the typed waiting outcome;
+                // an empty completion is rejected by servers that require at
+                // least one executable command.
+                self.client
+                    .fail_workflow_task_with_type(
+                        &task_id,
+                        &lease_owner,
+                        attempt,
+                        WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE,
+                        WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE,
+                    )
+                    .await?;
+            }
             Ok(commands) => {
                 self.client
                     .complete_workflow_task(&task_id, &lease_owner, attempt, commands)
@@ -6049,6 +6086,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_enabled_worker_stays_live_when_signal_replay_emits_no_commands() {
+        let server = MockWorkerServer::waiting_query_worker();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observations);
+        let mut worker = Worker::new(client, "rust-snapshot-workers")
+            .worker_id("rust-snapshot-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .on_worker_heartbeat(move |observation| {
+                observed
+                    .lock()
+                    .expect("heartbeat observations")
+                    .push(observation.clone());
+            });
+
+        worker.register_workflow("snapshot", |ctx, _input| async move {
+            ctx.wait_signal("finish").await?;
+            Ok(json!({"status": "finished"}))
+        });
+        worker.register_query("snapshot", "current", |ctx, _args| async move {
+            let current = ctx
+                .signals("increment")
+                .iter()
+                .filter_map(|arguments| arguments.first().and_then(Value::as_i64))
+                .sum::<i64>();
+            Ok(json!(current))
+        });
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(3_200)))
+            .await
+            .expect("pending workflow and query poller must remain live until shutdown");
+
+        assert!(
+            observations.lock().expect("heartbeat observations").len() >= 4,
+            "the immediate heartbeat and at least three advertised one-second intervals must be acknowledged"
+        );
+        assert!(
+            server.request_count("/api/worker/workflow-tasks/poll") >= 3,
+            "workflow polling must continue after empty replay acknowledgements"
+        );
+        assert!(
+            server.request_count("/api/worker/query-tasks/poll") >= 2,
+            "query polling must continue after serving the current query"
+        );
+        assert_eq!(
+            server.request_body("/api/worker/register")["capabilities"],
+            json!([QUERY_TASKS_CAPABILITY])
+        );
+
+        for task_id in ["snapshot-wait-3", "snapshot-wait-5"] {
+            let fail_path = format!("/api/worker/workflow-tasks/{task_id}/fail");
+            let completion_path = format!("/api/worker/workflow-tasks/{task_id}/complete");
+            let failure = server.request_body(&fail_path);
+            assert_eq!(
+                failure["failure"]["type"],
+                WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE
+            );
+            assert_eq!(server.request_count(&completion_path), 0);
+        }
+
+        let query_completion =
+            server.request_body("/api/worker/query-tasks/snapshot-current/complete");
+        assert_eq!(query_completion["result"], json!(8));
+    }
+
+    #[tokio::test]
     async fn worker_retries_poll_and_heartbeat_transport_failures_independently() {
         let server = MockWorkerServer::transient_worker_failures();
         let client = Client::builder(server.base_url())
@@ -6164,6 +6271,7 @@ mod tests {
     struct MockWorkerBehavior {
         reject_query_protocol: bool,
         reject_query_completion: bool,
+        waiting_query_worker: bool,
         poll_failures_per_path: usize,
         heartbeat_failures: usize,
         unauthorized_polls: bool,
@@ -6184,6 +6292,13 @@ mod tests {
         fn reject_query_completion() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 reject_query_completion: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn waiting_query_worker() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                waiting_query_worker: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -6386,7 +6501,125 @@ mod tests {
             return;
         }
 
+        if behavior.waiting_query_worker {
+            if path == "/api/worker/workflow-tasks/poll" && request_number <= 2 {
+                let amounts = if request_number == 1 {
+                    vec![3]
+                } else {
+                    vec![3, 5]
+                };
+                let task_id = if request_number == 1 {
+                    "snapshot-wait-3"
+                } else {
+                    "snapshot-wait-5"
+                };
+                let history_events = std::iter::once(json!({
+                    "event_type": "SignalWaitOpened",
+                    "payload": {"sequence": 1, "signal_name": "finish"}
+                }))
+                .chain(amounts.iter().enumerate().map(|(index, amount)| {
+                    json!({
+                        "event_type": "SignalReceived",
+                        "payload": {
+                            "signal_id": format!("increment-{amount}"),
+                            "signal_name": "increment",
+                            "workflow_sequence": index + 2,
+                            "payload_codec": DEFAULT_CODEC,
+                            "arguments": encode_value_envelope(&json!([amount]), DEFAULT_CODEC)
+                                .expect("Avro signal envelope")
+                        }
+                    })
+                }))
+                .collect::<Vec<_>>();
+                let body = json!({
+                    "task": {
+                        "task_id": task_id,
+                        "workflow_id": "snapshot-1",
+                        "run_id": "snapshot-run-1",
+                        "workflow_type": "snapshot",
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC)
+                            .expect("Avro workflow arguments"),
+                        "history_events": history_events,
+                        "workflow_task_attempt": 1,
+                        "workflow_signal_id": format!("increment-{}", amounts.last().expect("amount")),
+                        "signal_name": "increment",
+                        "signal_arguments": encode_value_envelope(
+                            &json!([amounts.last().expect("amount")]),
+                            DEFAULT_CODEC,
+                        )
+                        .expect("Avro resume signal"),
+                        "lease_owner": "rust-snapshot-worker"
+                    }
+                })
+                .to_string();
+                write_mock_response(stream, "200 OK", &body);
+                return;
+            }
+
+            if path == "/api/worker/query-tasks/poll" && request_number == 1 {
+                let history_events = [3, 5]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, amount)| {
+                        json!({
+                            "event_type": "SignalReceived",
+                            "payload": {
+                                "signal_id": format!("increment-{amount}"),
+                                "signal_name": "increment",
+                                "workflow_sequence": index + 2,
+                                "payload_codec": DEFAULT_CODEC,
+                                "arguments": encode_value_envelope(&json!([amount]), DEFAULT_CODEC)
+                                    .expect("Avro query signal envelope")
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let body = json!({
+                    "task": {
+                        "query_task_id": "snapshot-current",
+                        "query_task_attempt": 1,
+                        "lease_owner": "rust-snapshot-worker",
+                        "workflow_id": "snapshot-1",
+                        "run_id": "snapshot-run-1",
+                        "workflow_type": "snapshot",
+                        "query_name": "current",
+                        "payload_codec": DEFAULT_CODEC,
+                        "workflow_arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC)
+                            .expect("Avro workflow arguments"),
+                        "query_arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC)
+                            .expect("Avro query arguments"),
+                        "history_events": history_events,
+                        "run_status": "waiting"
+                    }
+                })
+                .to_string();
+                write_mock_response(stream, "200 OK", &body);
+                return;
+            }
+
+            if path == "/api/worker/workflow-tasks/snapshot-wait-3/fail"
+                || path == "/api/worker/workflow-tasks/snapshot-wait-5/fail"
+            {
+                write_mock_response(
+                    stream,
+                    "200 OK",
+                    r#"{"outcome":"waiting_for_history","recorded":true}"#,
+                );
+                return;
+            }
+
+            if path == "/api/worker/query-tasks/snapshot-current/complete" {
+                write_mock_response(stream, "200 OK", r#"{"outcome":"completed"}"#);
+                return;
+            }
+        }
+
         let (status, body) = match path {
+            "/api/worker/register" if behavior.waiting_query_worker => (
+                "200 OK",
+                r#"{"worker_id":"rust-snapshot-worker","registered":true,"heartbeat_interval_seconds":1}"#,
+            ),
             "/api/worker/register" => (
                 "200 OK",
                 r#"{"worker_id":"mock-worker","registered":true,"heartbeat_interval_seconds":3600}"#,

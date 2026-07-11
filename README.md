@@ -13,17 +13,17 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.5 --exact
+cargo add durable-workflow@0.1.6 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.5"
+durable-workflow = "=0.1.6"
 ```
 
-Version `0.1.5` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.6` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`.
@@ -284,6 +284,12 @@ Workflow, activity, and query polls advertise the configured poll timeout to
 the server. An empty response at that boundary is normal: `Worker::run` and
 `Worker::run_until` keep every poller and worker heartbeats running, so the same
 worker can accept work after an idle period.
+
+Replaying a workflow that is still blocked on a recorded activity, timer,
+child workflow, or signal wait can also produce no new commands. The worker
+acknowledges that task as waiting for scheduled history instead of submitting
+an invalid empty completion. Workflow and query pollers therefore remain live,
+and worker heartbeats continue while unrelated signals are recorded.
 
 Poll acquisition and worker-heartbeat transport failures, HTTP 408/429
 responses, and server errors use capped exponential backoff. Configure the
