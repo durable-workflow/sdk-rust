@@ -2,8 +2,9 @@
 
 `durable-workflow` is the first-party Rust SDK for Durable Workflow workers
 and clients. It can register workflow and activity handlers, long-poll the
-worker protocol, start, signal, and query workflow executions, start and await
-durable child workflows, expose named read-only query handlers, heartbeat
+worker protocol, start, signal, query, cancel, terminate, and await workflow
+executions, start and await durable child workflows, expose named read-only
+query handlers, heartbeat
 workers and activities, and exchange JSON-native payloads through the
 platform's generic Avro wrapper. Workflow code can also wait on server-backed
 durable time without blocking a Rust executor thread.
@@ -13,21 +14,23 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.7 --exact
+cargo add durable-workflow@0.1.8 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.7"
+durable-workflow = "=0.1.8"
 ```
 
-Version `0.1.7` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.8` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
-timeout, and typed terminal options are available from `0.1.7`.
+timeout, and typed terminal options are available from `0.1.7`. Workflow
+cancellation, termination, selected-run safety, and typed workflow outcomes
+are available from `0.1.8`.
 
 ## Compatibility
 
@@ -38,7 +41,8 @@ timeout, and typed terminal options are available from `0.1.7`.
 | `0.1.2`–`0.1.3` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
 | `0.1.4` | `>=0.2,<0.3` | `1.2` (timers; replayed queries require `1.8`) | `2` |
 | `0.1.5`–`0.1.6` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.7+` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.7` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.8+` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -50,7 +54,9 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 `child-workflows`, `child-workflow-command`, and
 `child-workflow-failure-reasons`. Activity-options releases publish
 `activity-options`, `activity-retry-policy`, `activity-timeouts`, and
-`activity-failure-reasons`. Existing worker operations retain the `1.2`
+`activity-failure-reasons`. Lifecycle releases publish
+`workflow-lifecycle-commands`, `workflow-lifecycle-run-targeting`, and
+`workflow-terminal-outcomes`. Existing worker operations retain the `1.2`
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor. The server's advertised protocol manifests remain
 authoritative when checking compatibility during deployment.
@@ -95,8 +101,72 @@ local polling or shutdown coordination, but it is not durable workflow state.
 Running and completed executions remain available through `WorkflowHandle`'s
 `describe`, `query`, and `result` methods. Server protocol incompatibilities
 remain `Error::Protocol(ProtocolFailure)`, including stable `reason`, `status`,
-and requested/supported version fields; other rejected worker requests remain
-typed `Error::Http` values with the response status and body.
+and requested/supported version fields. Activity settlement rejections are
+typed `Error::ActivityTaskRejected`; other rejected worker requests remain
+`Error::Http` values with the response status and body.
+
+## Workflow cancellation, termination, and outcomes
+
+Cancellation is cooperative. Use it when workflow and activity code should run
+cleanup; use termination only as a forced operator stop. Instance-targeted
+commands resolve the server's current run at command time:
+
+```rust
+# use durable_workflow::{Client, Result, WorkflowCommandOptions};
+# async fn stop(client: &Client) -> Result<()> {
+client.cancel_workflow(
+    "order-42",
+    WorkflowCommandOptions::new()
+        .reason("customer withdrew the order")
+        .request_id("cancel-order-42"),
+).await?;
+# Ok(())
+# }
+```
+
+A `WorkflowHandle` offers the same `cancel` and `terminate` methods. When the
+handle's original run identity matters, use `cancel_selected_run` or
+`terminate_selected_run`. These call the run-targeted endpoint and fail with
+`Error::WorkflowCommandRejected(WorkflowCommandRejection)` if that run is no
+longer current. Automation can match `reason ==
+"historical_run_command_rejected"`; the rejection also retains `workflow_id`,
+`run_id`, `target_scope`, HTTP status, and the original response body.
+
+`WorkflowHandle::result` still returns the decoded `Value` on success. Other
+terminal states are distinct typed errors. Handles returned by `start_workflow`
+carry a run ID, and `result` automatically describes that selected run rather
+than a newer current run that may reuse the same workflow ID:
+
+```rust
+# use durable_workflow::{Error, Result, WorkflowHandle, WorkflowResultOptions};
+# async fn wait(handle: WorkflowHandle) -> Result<()> {
+match handle.result(WorkflowResultOptions::default()).await {
+    Ok(value) => println!("completed: {value}"),
+    Err(Error::WorkflowCancelled(outcome)) => {
+        println!("cancelled {} / {:?}: {}", outcome.workflow_id, outcome.run_id, outcome.reason);
+    }
+    Err(Error::WorkflowTerminated(outcome)) => {
+        println!("terminated: {}", outcome.reason);
+    }
+    Err(Error::WorkflowFailed(outcome)) => {
+        println!("failure {:?}: {:?}", outcome.failure_id, outcome.exception_class);
+    }
+    Err(Error::WorkflowTimedOut(outcome)) => {
+        println!("timeout category: {:?}", outcome.failure_category);
+    }
+    Err(error) => return Err(error),
+}
+# Ok(())
+# }
+```
+
+Every `WorkflowTerminalOutcome` carries workflow/run identity and a stable
+kind and reason. It also exposes failure category and identity, exception type
+and class, non-retryable state, message, exception payload, and the raw
+description whenever the server supplies them. A local result-wait deadline
+uses the same typed timeout with reason `result_wait_timeout` and category
+`client_timeout`; it is distinguishable from a server-terminal `timed_out`
+run without parsing display text.
 
 ## Durable activity options
 
@@ -200,7 +270,7 @@ call; they are not SDK HTTP retry limits.
 
 ## Worker
 
-```rust
+```rust,no_run
 use durable_workflow::{json, Client, Result, Worker};
 
 #[derive(Clone, Default)]
@@ -219,7 +289,11 @@ async fn main() -> Result<()> {
 
     worker.register_activity("hello.activity", |ctx, args| async move {
         ctx.heartbeat(json!({"stage": "started"})).await?;
-        let name = args.first().and_then(|value| value.as_str()).unwrap_or("world");
+        let name = args
+            .as_array()
+            .and_then(|arguments| arguments.first())
+            .and_then(|value| value.as_str())
+            .unwrap_or("world");
         Ok(json!(format!("hello, {name}")))
     });
 
@@ -317,7 +391,9 @@ acknowledgements for metrics or structured logging.
 
 Activity handlers report progress with `ActivityContext::heartbeat`. The
 returned `ActivityHeartbeatResponse` exposes `heartbeat_recorded` and
-`cancel_requested` so long-running work can respond to server state:
+`cancel_requested`, plus `can_continue`, `reason`, and the run close state, so
+long-running work can stop and clean up without treating cancellation as a
+transport or codec failure:
 
 ```rust
 # use durable_workflow::{json, Client, Result, Worker};
@@ -329,13 +405,29 @@ let mut worker = Worker::new(client, "rust-workers")
 
 worker.register_activity("batch.process", |ctx, _args| async move {
     let acknowledgement = ctx.heartbeat(json!({"completed": 25})).await?;
-    if acknowledgement.cancel_requested {
-        return Ok(json!({"cancelled": true}));
+    if acknowledgement.should_stop() {
+        cleanup_temporary_files();
+        return Ok(json!({"cleanup": "complete"}));
     }
     Ok(json!({"completed": 100}))
 });
 # }
+# fn cleanup_temporary_files() {}
 ```
+
+The server remains authoritative after cancellation: if the handler finishes
+late, its completion is refused and cannot turn the run into success. Direct
+client settlement calls return `Error::ActivityTaskRejected` with a stable
+reason such as `run_cancelled`, `run_terminated`, or `stale_attempt`. The
+managed worker treats these definitive late-settlement responses as terminal
+for that leased attempt and continues polling, including after a worker
+restart during cancellation. `Client::poll_activity_task_response` and
+`Client::poll_workflow_task_response` preserve drain and poll-stop metadata for
+lower-level worker integrations; `Client::poll_query_task_response` does the
+same for query tasks. Call `outcome()` on any full poll response and match
+`WorkerPollOutcome::Stop` instead of parsing a display string. In particular,
+the server's HTTP `409` / `worker_draining` response decodes as a normal stop
+outcome. Managed workers honor it by ceasing new polls and draining cleanly.
 
 Lower-level integrations can call `Client::heartbeat_worker` and
 `Client::heartbeat_activity_task` directly.

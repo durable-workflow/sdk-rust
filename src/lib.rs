@@ -1,11 +1,4 @@
-//! Minimal Rust SDK for the Durable Workflow worker protocol.
-//!
-//! The crate covers the v1 Rust round-trip: start, signal, query, durably sleep,
-//! and start and await child workflows; register a Rust worker; poll workflow,
-//! activity, and read-only query tasks; reconstruct typed workflow-instance
-//! state through deterministic replay; heartbeat worker and activity liveness;
-//! and exchange JSON-native payloads through the same `avro` generic wrapper
-//! used by the existing first-party SDKs.
+#![doc = include_str!("../README.md")]
 
 use std::{
     any::{Any, TypeId},
@@ -91,6 +84,18 @@ pub enum Error {
     ChildWorkflowFailed(ChildWorkflowFailure),
     #[error(transparent)]
     ActivityFailed(ActivityFailure),
+    #[error(transparent)]
+    WorkflowCommandRejected(WorkflowCommandRejection),
+    #[error(transparent)]
+    WorkflowFailed(WorkflowTerminalOutcome),
+    #[error(transparent)]
+    WorkflowCancelled(WorkflowTerminalOutcome),
+    #[error(transparent)]
+    WorkflowTerminated(WorkflowTerminalOutcome),
+    #[error(transparent)]
+    WorkflowTimedOut(WorkflowTerminalOutcome),
+    #[error(transparent)]
+    ActivityTaskRejected(ActivityTaskRejection),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
@@ -109,6 +114,119 @@ pub enum Error {
     InvalidChildWorkflowOptions(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
+}
+
+/// The lifecycle command sent to a workflow execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowCommandKind {
+    Cancel,
+    Terminate,
+}
+
+impl WorkflowCommandKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Terminate => "terminate",
+        }
+    }
+}
+
+/// Optional structured fields for a cancellation or termination request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WorkflowCommandOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl WorkflowCommandOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+}
+
+/// The accepted, machine-readable result of a lifecycle command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowCommandResult {
+    pub command: WorkflowCommandKind,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub outcome: Option<String>,
+    pub reason: Option<String>,
+    pub command_status: Option<String>,
+    pub raw: Value,
+}
+
+/// A stable rejection returned by instance- or selected-run lifecycle commands.
+#[derive(Clone, Debug, Error)]
+#[error("workflow {command:?} rejected ({reason}, HTTP {status}): {message}")]
+pub struct WorkflowCommandRejection {
+    pub command: WorkflowCommandKind,
+    pub status: u16,
+    pub reason: String,
+    pub message: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub target_scope: Option<String>,
+    pub body: Value,
+}
+
+/// Stable terminal categories returned by [`WorkflowHandle::result`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowTerminalKind {
+    Failed,
+    Cancelled,
+    Terminated,
+    TimedOut,
+}
+
+/// A typed terminal workflow outcome with durable identity and failure metadata.
+///
+/// Match the corresponding [`enum@Error`] variant and inspect these fields instead
+/// of parsing its display representation. Fields remain `None` when an older
+/// server did not publish that metadata.
+#[derive(Clone, Debug, Error)]
+#[error("workflow {workflow_id} run {run_id:?} ended as {kind:?} ({reason})")]
+pub struct WorkflowTerminalOutcome {
+    pub kind: WorkflowTerminalKind,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub reason: String,
+    pub failure_category: Option<String>,
+    pub failure_id: Option<String>,
+    pub exception_type: Option<String>,
+    pub exception_class: Option<String>,
+    pub non_retryable: Option<bool>,
+    pub message: Option<String>,
+    pub exception: Option<Value>,
+    pub raw: Value,
+}
+
+/// A worker-side activity settlement or heartbeat rejected by durable state.
+#[derive(Clone, Debug, Error)]
+#[error("activity task {operation} rejected ({reason}, HTTP {status})")]
+pub struct ActivityTaskRejection {
+    pub operation: String,
+    pub status: u16,
+    pub reason: String,
+    pub task_id: String,
+    pub activity_attempt_id: String,
+    pub cancel_requested: bool,
+    pub can_continue: Option<bool>,
+    pub run_closed_reason: Option<String>,
+    pub body: Value,
 }
 
 /// Stable validation categories for [`ActivityOptions`].
@@ -988,6 +1106,97 @@ impl Client {
         .await
     }
 
+    /// Request cooperative cancellation of the current run for an instance.
+    pub async fn cancel_workflow(
+        &self,
+        workflow_id: &str,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        self.workflow_command(workflow_id, None, WorkflowCommandKind::Cancel, options)
+            .await
+    }
+
+    /// Request cooperative cancellation only if `run_id` is still current.
+    pub async fn cancel_workflow_run(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        self.workflow_command(
+            workflow_id,
+            Some(run_id),
+            WorkflowCommandKind::Cancel,
+            options,
+        )
+        .await
+    }
+
+    /// Forcefully terminate the current run for an instance.
+    pub async fn terminate_workflow(
+        &self,
+        workflow_id: &str,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        self.workflow_command(workflow_id, None, WorkflowCommandKind::Terminate, options)
+            .await
+    }
+
+    /// Forcefully terminate only if `run_id` is still current.
+    pub async fn terminate_workflow_run(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        self.workflow_command(
+            workflow_id,
+            Some(run_id),
+            WorkflowCommandKind::Terminate,
+            options,
+        )
+        .await
+    }
+
+    async fn workflow_command(
+        &self,
+        workflow_id: &str,
+        run_id: Option<&str>,
+        command: WorkflowCommandKind,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        let path = match run_id {
+            Some(run_id) => format!(
+                "/workflows/{workflow_id}/runs/{run_id}/{}",
+                command.as_str()
+            ),
+            None => format!("/workflows/{workflow_id}/{}", command.as_str()),
+        };
+        let data = match self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::ControlPlane,
+                Some(&options),
+            )
+            .await
+        {
+            Ok(data) => data,
+            Err(Error::Http { status, body }) => {
+                return Err(Error::WorkflowCommandRejected(workflow_command_rejection(
+                    command,
+                    status,
+                    body,
+                    workflow_id,
+                    run_id,
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(workflow_command_result(command, data, workflow_id, run_id))
+    }
+
     /// Execute a named, read-only query against a running or completed workflow.
     ///
     /// Arguments and results use the platform payload envelope. Server and
@@ -1033,6 +1242,25 @@ impl Client {
 
     pub async fn describe_workflow(&self, workflow_id: &str) -> Result<WorkflowDescription> {
         let path = format!("/workflows/{workflow_id}");
+        let mut data: WorkflowDescription = self
+            .request_json(
+                reqwest::Method::GET,
+                &path,
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+            )
+            .await?;
+        data.decode_payloads()?;
+        Ok(data)
+    }
+
+    /// Describe one selected run, including historical terminal runs.
+    pub async fn describe_workflow_run(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+    ) -> Result<WorkflowDescription> {
+        let path = format!("/workflows/{workflow_id}/runs/{run_id}");
         let mut data: WorkflowDescription = self
             .request_json(
                 reqwest::Method::GET,
@@ -1105,6 +1333,19 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<Option<QueryTask>> {
+        Ok(self
+            .poll_query_task_response(worker_id, task_queue, timeout)
+            .await?
+            .task)
+    }
+
+    /// Poll a query task while preserving server stop and drain metadata.
+    pub async fn poll_query_task_response(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+    ) -> Result<PollQueryTaskResponse> {
         let timeout_seconds = long_poll_timeout_seconds(timeout);
         let body = json!({
             "worker_id": worker_id,
@@ -1112,16 +1353,16 @@ impl Client {
             "poll_request_id": unique_request_id("rust-query-poll"),
             "timeout_seconds": timeout_seconds,
         });
-        let data: PollQueryTaskResponse = self
-            .request_json_with_timeout(
+        worker_poll_response(
+            self.request_json_with_timeout(
                 reqwest::Method::POST,
                 "/worker/query-tasks/poll",
                 RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
                 Some(&body),
                 timeout + Duration::from_secs(5),
             )
-            .await?;
-        Ok(data.task)
+            .await,
+        )
     }
 
     /// Complete a query task without appending workflow history.
@@ -1251,15 +1492,16 @@ impl Client {
             "task_queue": task_queue,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let mut data: PollWorkflowTaskResponse = self
-            .request_json_with_timeout(
+        let mut data: PollWorkflowTaskResponse = worker_poll_response(
+            self.request_json_with_timeout(
                 reqwest::Method::POST,
                 "/worker/workflow-tasks/poll",
                 RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
                 Some(&body),
                 timeout + Duration::from_secs(5),
             )
-            .await?;
+            .await,
+        )?;
 
         if let Some(task) = data.task.as_mut() {
             self.fetch_remaining_workflow_history(worker_id, task)
@@ -1398,21 +1640,35 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<Option<ActivityTask>> {
+        Ok(self
+            .poll_activity_task_response(worker_id, task_queue, timeout)
+            .await?
+            .task)
+    }
+
+    /// Poll an activity task while preserving server stop and drain metadata.
+    pub async fn poll_activity_task_response(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+    ) -> Result<PollActivityTaskResponse> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let data: PollActivityTaskResponse = self
-            .request_json_with_timeout(
+        let data: PollActivityTaskResponse = worker_poll_response(
+            self.request_json_with_timeout(
                 reqwest::Method::POST,
                 "/worker/activity-tasks/poll",
                 RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
                 Some(&body),
                 timeout + Duration::from_secs(5),
             )
-            .await?;
-        Ok(data.task)
+            .await,
+        )?;
+        Ok(data)
     }
 
     pub async fn complete_activity_task(
@@ -1430,13 +1686,18 @@ impl Client {
             "result": result
         });
         let path = format!("/worker/activity-tasks/{task_id}/complete");
-        self.request_json(
-            reqwest::Method::POST,
-            &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-            Some(&body),
+        activity_task_response(
+            self.request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await,
+            "complete",
+            task_id,
+            activity_attempt_id,
         )
-        .await
     }
 
     pub async fn fail_activity_task(
@@ -1457,13 +1718,18 @@ impl Client {
             }
         });
         let path = format!("/worker/activity-tasks/{task_id}/fail");
-        self.request_json(
-            reqwest::Method::POST,
-            &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-            Some(&body),
+        activity_task_response(
+            self.request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await,
+            "fail",
+            task_id,
+            activity_attempt_id,
         )
-        .await
     }
 
     pub async fn heartbeat_activity_task(
@@ -1479,13 +1745,18 @@ impl Client {
             "details": details
         });
         let path = format!("/worker/activity-tasks/{task_id}/heartbeat");
-        self.request_json(
-            reqwest::Method::POST,
-            &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-            Some(&body),
+        activity_task_response(
+            self.request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await,
+            "heartbeat",
+            task_id,
+            activity_attempt_id,
         )
-        .await
     }
 
     async fn request_json<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -1591,6 +1862,80 @@ fn query_failure(status: reqwest::StatusCode, raw_body: String) -> QueryFailure 
     }
 }
 
+fn workflow_command_result(
+    command: WorkflowCommandKind,
+    data: Value,
+    workflow_id: &str,
+    run_id: Option<&str>,
+) -> WorkflowCommandResult {
+    WorkflowCommandResult {
+        command,
+        workflow_id: data
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .unwrap_or(workflow_id)
+            .to_string(),
+        run_id: data
+            .get("run_id")
+            .and_then(Value::as_str)
+            .or(run_id)
+            .map(str::to_string),
+        outcome: data
+            .get("outcome")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reason: data
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        command_status: data
+            .get("command_status")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        raw: data,
+    }
+}
+
+fn workflow_command_rejection(
+    command: WorkflowCommandKind,
+    status: reqwest::StatusCode,
+    raw_body: String,
+    workflow_id: &str,
+    run_id: Option<&str>,
+) -> WorkflowCommandRejection {
+    let body = serde_json::from_str(&raw_body).unwrap_or_else(|_| json!({"message": raw_body}));
+    WorkflowCommandRejection {
+        command,
+        status: status.as_u16(),
+        reason: body
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("workflow_command_rejected")
+            .to_string(),
+        message: body
+            .get("message")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("workflow lifecycle command was rejected")
+            .to_string(),
+        workflow_id: body
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .unwrap_or(workflow_id)
+            .to_string(),
+        run_id: body
+            .get("run_id")
+            .and_then(Value::as_str)
+            .or(run_id)
+            .map(str::to_string),
+        target_scope: body
+            .get("target_scope")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        body,
+    }
+}
+
 fn query_task_response(response: Result<Value>) -> Result<Value> {
     match response {
         Err(Error::Http { status, body }) => Err(Error::QueryFailed(query_failure(status, body))),
@@ -1598,11 +1943,100 @@ fn query_task_response(response: Result<Value>) -> Result<Value> {
     }
 }
 
+fn worker_poll_response<T: DeserializeOwned>(response: Result<T>) -> Result<T> {
+    match response {
+        Err(Error::Http { status, body })
+            if status == reqwest::StatusCode::CONFLICT && worker_poll_body_is_stop(&body) =>
+        {
+            Ok(serde_json::from_str(&body)?)
+        }
+        response => response,
+    }
+}
+
+fn worker_poll_body_is_stop(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|body| {
+            worker_poll_is_stop(
+                body.get("poll_status").and_then(Value::as_str),
+                body.get("reason").and_then(Value::as_str),
+            )
+        })
+}
+
+fn worker_poll_is_stop(poll_status: Option<&str>, reason: Option<&str>) -> bool {
+    matches!(poll_status, Some("draining" | "stopped"))
+        || matches!(reason, Some("worker_draining" | "worker_stopped"))
+}
+
 fn query_task_rejection_is_final(error: &Error) -> bool {
     matches!(
         error,
         Error::QueryFailed(failure)
             if QUERY_TASK_FINAL_REJECTION_REASONS.contains(&failure.reason.as_str())
+    )
+}
+
+fn activity_task_response<T>(
+    response: Result<T>,
+    operation: &str,
+    task_id: &str,
+    activity_attempt_id: &str,
+) -> Result<T> {
+    match response {
+        Err(Error::Http { status, body }) => {
+            let body = serde_json::from_str(&body).unwrap_or_else(|_| json!({"message": body}));
+            Err(Error::ActivityTaskRejected(ActivityTaskRejection {
+                operation: operation.to_string(),
+                status: status.as_u16(),
+                reason: body
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("activity_task_rejected")
+                    .to_string(),
+                task_id: body
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(task_id)
+                    .to_string(),
+                activity_attempt_id: body
+                    .get("activity_attempt_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(activity_attempt_id)
+                    .to_string(),
+                cancel_requested: body
+                    .get("cancel_requested")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                can_continue: body.get("can_continue").and_then(Value::as_bool),
+                run_closed_reason: body
+                    .get("run_closed_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                body,
+            }))
+        }
+        response => response,
+    }
+}
+
+fn activity_task_rejection_is_final(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::ActivityTaskRejected(rejection)
+            if matches!(
+                rejection.reason.as_str(),
+                "run_cancelled"
+                    | "run_terminated"
+                    | "attempt_closed"
+                    | "stale_attempt"
+                    | "activity_cancelled"
+                    | "task_cancelled"
+                    | "run_closed"
+                    | "activity_not_running"
+                    | "attempt_not_found"
+            )
     )
 }
 
@@ -1737,6 +2171,49 @@ impl WorkflowHandle {
             .await
     }
 
+    /// Request cooperative cancellation of whichever run is current.
+    pub async fn cancel(&self, options: WorkflowCommandOptions) -> Result<WorkflowCommandResult> {
+        self.client
+            .cancel_workflow(&self.workflow_id, options)
+            .await
+    }
+
+    /// Request cancellation only if this handle's selected run is still current.
+    pub async fn cancel_selected_run(
+        &self,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run cancellation".to_string())
+        })?;
+        self.client
+            .cancel_workflow_run(&self.workflow_id, run_id, options)
+            .await
+    }
+
+    /// Forcefully terminate whichever run is current.
+    pub async fn terminate(
+        &self,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        self.client
+            .terminate_workflow(&self.workflow_id, options)
+            .await
+    }
+
+    /// Terminate only if this handle's selected run is still current.
+    pub async fn terminate_selected_run(
+        &self,
+        options: WorkflowCommandOptions,
+    ) -> Result<WorkflowCommandResult> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run termination".to_string())
+        })?;
+        self.client
+            .terminate_workflow_run(&self.workflow_id, run_id, options)
+            .await
+    }
+
     /// Execute a named, read-only query against this workflow.
     pub async fn query<T: Serialize>(&self, query_name: &str, input: T) -> Result<Value> {
         self.client
@@ -1748,20 +2225,53 @@ impl WorkflowHandle {
         let started = Instant::now();
 
         loop {
-            let description = self.describe().await?;
+            let description = match self.run_id.as_deref() {
+                Some(run_id) => {
+                    self.client
+                        .describe_workflow_run(&self.workflow_id, run_id)
+                        .await?
+                }
+                None => self.describe().await?,
+            };
             if description.is_completed() {
                 return Ok(description.output.unwrap_or(Value::Null));
             }
 
             if description.is_terminal() {
-                return Err(Error::Codec(format!(
-                    "workflow {} closed with status {:?}",
-                    self.workflow_id, description.status
-                )));
+                let outcome = workflow_terminal_outcome(
+                    &description,
+                    &self.workflow_id,
+                    self.run_id.as_deref(),
+                );
+                return Err(match outcome.kind {
+                    WorkflowTerminalKind::Failed => Error::WorkflowFailed(outcome),
+                    WorkflowTerminalKind::Cancelled => Error::WorkflowCancelled(outcome),
+                    WorkflowTerminalKind::Terminated => Error::WorkflowTerminated(outcome),
+                    WorkflowTerminalKind::TimedOut => Error::WorkflowTimedOut(outcome),
+                });
             }
 
             if started.elapsed() >= options.timeout {
-                return Err(Error::Timeout);
+                return Err(Error::WorkflowTimedOut(WorkflowTerminalOutcome {
+                    kind: WorkflowTerminalKind::TimedOut,
+                    workflow_id: description
+                        .workflow_id
+                        .clone()
+                        .unwrap_or_else(|| self.workflow_id.clone()),
+                    run_id: description.run_id.clone().or_else(|| self.run_id.clone()),
+                    reason: "result_wait_timeout".to_string(),
+                    failure_category: Some("client_timeout".to_string()),
+                    failure_id: None,
+                    exception_type: None,
+                    exception_class: None,
+                    non_retryable: None,
+                    message: Some(format!(
+                        "workflow result was not terminal within {:?}",
+                        options.timeout
+                    )),
+                    exception: None,
+                    raw: description.raw_value(),
+                }));
             }
 
             tokio::time::sleep(options.poll_interval).await;
@@ -1790,6 +2300,16 @@ pub struct WorkflowDescription {
     pub run_id: Option<String>,
     pub workflow_type: Option<String>,
     pub status: Option<String>,
+    #[serde(default)]
+    pub closed_reason: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub failure: Option<Value>,
+    #[serde(default)]
+    pub exception: Option<Value>,
+    #[serde(default)]
+    pub failures: Vec<Value>,
     #[serde(default)]
     pub output: Option<Value>,
     #[serde(default)]
@@ -1828,6 +2348,166 @@ impl WorkflowDescription {
 
         Ok(())
     }
+
+    fn raw_value(&self) -> Value {
+        let mut data = self.raw.clone();
+        data.insert(
+            "workflow_id".to_string(),
+            self.workflow_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        data.insert(
+            "run_id".to_string(),
+            self.run_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        data.insert(
+            "workflow_type".to_string(),
+            self.workflow_type
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        data.insert(
+            "status".to_string(),
+            self.status
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        data.insert(
+            "closed_reason".to_string(),
+            self.closed_reason
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        if let Some(failure) = &self.failure {
+            data.insert("failure".to_string(), failure.clone());
+        }
+        if let Some(exception) = &self.exception {
+            data.insert("exception".to_string(), exception.clone());
+        }
+        Value::Object(data.into_iter().collect())
+    }
+}
+
+fn workflow_terminal_outcome(
+    description: &WorkflowDescription,
+    workflow_id: &str,
+    run_id: Option<&str>,
+) -> WorkflowTerminalOutcome {
+    let terminal_kind = description
+        .closed_reason
+        .as_deref()
+        .or(description.status.as_deref())
+        .unwrap_or("failed")
+        .to_ascii_lowercase();
+    let kind = match terminal_kind.as_str() {
+        "cancelled" | "canceled" => WorkflowTerminalKind::Cancelled,
+        "terminated" => WorkflowTerminalKind::Terminated,
+        "timed_out" | "timedout" => WorkflowTerminalKind::TimedOut,
+        _ => WorkflowTerminalKind::Failed,
+    };
+    let default_reason = match kind {
+        WorkflowTerminalKind::Failed => "workflow_failed",
+        WorkflowTerminalKind::Cancelled => "cancelled",
+        WorkflowTerminalKind::Terminated => "terminated",
+        WorkflowTerminalKind::TimedOut => "timed_out",
+    };
+    let failure = description
+        .failure
+        .as_ref()
+        .filter(|value| value.is_object());
+    let nested_failure = failure
+        .and_then(|value| value.get("failures"))
+        .and_then(Value::as_array)
+        .and_then(|failures| failures.last())
+        .or_else(|| description.failures.last());
+    let exception = description
+        .exception
+        .clone()
+        .or_else(|| failure.and_then(|value| value.get("exception")).cloned())
+        .or_else(|| {
+            nested_failure
+                .and_then(|value| value.get("exception_payload"))
+                .cloned()
+        });
+    let string_field = |name: &str| {
+        failure
+            .and_then(|value| value.get(name))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                nested_failure
+                    .and_then(|value| value.get(name))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+    };
+    let exception_field = |name: &str| {
+        exception
+            .as_ref()
+            .and_then(|value| value.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let message = description
+        .error
+        .clone()
+        .or_else(|| string_field("message"))
+        .or_else(|| exception_field("message"));
+    let reason = description
+        .raw
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            failure
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| description.closed_reason.clone())
+        .unwrap_or_else(|| default_reason.to_string());
+    let failure_id = string_field("failure_id").or_else(|| {
+        nested_failure
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+
+    WorkflowTerminalOutcome {
+        kind,
+        workflow_id: description
+            .workflow_id
+            .clone()
+            .unwrap_or_else(|| workflow_id.to_string()),
+        run_id: description
+            .run_id
+            .clone()
+            .or_else(|| run_id.map(str::to_string)),
+        reason,
+        failure_category: string_field("failure_category")
+            .or_else(|| Some(default_reason.to_string())),
+        failure_id,
+        exception_type: string_field("exception_type").or_else(|| exception_field("type")),
+        exception_class: string_field("exception_class").or_else(|| exception_field("class")),
+        non_retryable: failure
+            .and_then(|value| value.get("non_retryable"))
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                nested_failure
+                    .and_then(|value| value.get("non_retryable"))
+                    .and_then(Value::as_bool)
+            }),
+        message,
+        exception,
+        raw: description.raw_value(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1856,16 +2536,102 @@ pub struct PollWorkflowTaskResponse {
     pub server_capabilities: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct PollActivityTaskResponse {
-    #[serde(default)]
-    task: Option<ActivityTask>,
+impl PollWorkflowTaskResponse {
+    /// Classify this response without parsing server display text.
+    pub fn outcome(&self) -> WorkerPollOutcome {
+        worker_poll_outcome(
+            self.task.is_some(),
+            self.poll_status.as_deref(),
+            self.reason.as_deref(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct PollQueryTaskResponse {
+pub struct PollActivityTaskResponse {
     #[serde(default)]
-    task: Option<QueryTask>,
+    pub task: Option<ActivityTask>,
+    #[serde(default)]
+    pub poll_status: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl PollActivityTaskResponse {
+    /// Classify this response without parsing server display text.
+    pub fn outcome(&self) -> WorkerPollOutcome {
+        worker_poll_outcome(
+            self.task.is_some(),
+            self.poll_status.as_deref(),
+            self.reason.as_deref(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PollQueryTaskResponse {
+    #[serde(default)]
+    pub task: Option<QueryTask>,
+    #[serde(default)]
+    pub poll_status: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl PollQueryTaskResponse {
+    /// Classify this response without parsing server display text.
+    pub fn outcome(&self) -> WorkerPollOutcome {
+        worker_poll_outcome(
+            self.task.is_some(),
+            self.poll_status.as_deref(),
+            self.reason.as_deref(),
+        )
+    }
+}
+
+/// Stable classification for worker poll responses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerPollOutcome {
+    /// A task was leased and is available on the response.
+    Task,
+    /// No task was leased, but the worker should continue polling.
+    Idle {
+        poll_status: Option<String>,
+        reason: Option<String>,
+    },
+    /// The server asked this worker to stop claiming new work.
+    Stop {
+        poll_status: Option<String>,
+        reason: Option<String>,
+    },
+}
+
+impl WorkerPollOutcome {
+    pub fn should_stop(&self) -> bool {
+        matches!(self, Self::Stop { .. })
+    }
+}
+
+fn worker_poll_outcome(
+    has_task: bool,
+    poll_status: Option<&str>,
+    reason: Option<&str>,
+) -> WorkerPollOutcome {
+    if worker_poll_is_stop(poll_status, reason) {
+        return WorkerPollOutcome::Stop {
+            poll_status: poll_status.map(str::to_string),
+            reason: reason.map(str::to_string),
+        };
+    }
+
+    if has_task {
+        WorkerPollOutcome::Task
+    } else {
+        WorkerPollOutcome::Idle {
+            poll_status: poll_status.map(str::to_string),
+            reason: reason.map(str::to_string),
+        }
+    }
 }
 
 /// An ephemeral server-routed query task.
@@ -2035,6 +2801,25 @@ pub struct ActivityHeartbeatResponse {
     pub cancel_requested: bool,
     #[serde(default)]
     pub heartbeat_recorded: bool,
+    #[serde(default)]
+    pub can_continue: Option<bool>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub run_closed_reason: Option<String>,
+    #[serde(default)]
+    pub run_closed_at: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    #[serde(default)]
+    pub last_heartbeat_at: Option<String>,
+}
+
+impl ActivityHeartbeatResponse {
+    /// Whether the activity should stop instead of attempting completion.
+    pub fn should_stop(&self) -> bool {
+        self.cancel_requested || self.can_continue == Some(false)
+    }
 }
 
 fn default_payload_codec() -> String {
@@ -2119,6 +2904,13 @@ impl Default for WorkerRetryPolicy {
             max_backoff: Duration::from_secs(5),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedPollOutcome {
+    Idle,
+    Handled,
+    Stop,
 }
 
 #[derive(Clone)]
@@ -2429,36 +3221,48 @@ impl Worker {
                 }
                 result = OptionFuture::from(workflow_poller.as_mut()), if workflow_poller.is_some() => {
                     workflow_poller = None;
+                    let stopped_by_server = stop.load(Ordering::SeqCst);
                     stop.store(true, Ordering::SeqCst);
                     let poller_result = optional_poller_result("workflow", result);
                     let join_result =
                         join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await;
                     poller_result?;
                     join_result?;
+                    if stopped_by_server {
+                        return Ok(());
+                    }
                     return Err(Error::WorkerLoop(
                         "workflow poller stopped unexpectedly".to_string(),
                     ));
                 }
                 result = OptionFuture::from(activity_poller.as_mut()), if activity_poller.is_some() => {
                     activity_poller = None;
+                    let stopped_by_server = stop.load(Ordering::SeqCst);
                     stop.store(true, Ordering::SeqCst);
                     let poller_result = optional_poller_result("activity", result);
                     let join_result =
                         join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await;
                     poller_result?;
                     join_result?;
+                    if stopped_by_server {
+                        return Ok(());
+                    }
                     return Err(Error::WorkerLoop(
                         "activity poller stopped unexpectedly".to_string(),
                     ));
                 }
                 result = OptionFuture::from(query_poller.as_mut()), if query_poller.is_some() => {
                     query_poller = None;
+                    let stopped_by_server = stop.load(Ordering::SeqCst);
                     stop.store(true, Ordering::SeqCst);
                     let poller_result = optional_poller_result("query", result);
                     let join_result =
                         join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await;
                     poller_result?;
                     join_result?;
+                    if stopped_by_server {
+                        return Ok(());
+                    }
                     return Err(Error::WorkerLoop(
                         "query poller stopped unexpectedly".to_string(),
                     ));
@@ -2476,27 +3280,41 @@ impl Worker {
 
     pub async fn run_once(&self) -> Result<usize> {
         let mut handled = 0;
-        if self.poll_workflow_once().await? {
-            handled += 1;
+        match self.poll_workflow_once().await? {
+            ManagedPollOutcome::Handled => handled += 1,
+            ManagedPollOutcome::Stop => return Ok(handled),
+            ManagedPollOutcome::Idle => {}
         }
-        if self.poll_activity_once().await? {
-            handled += 1;
+        match self.poll_activity_once().await? {
+            ManagedPollOutcome::Handled => handled += 1,
+            ManagedPollOutcome::Stop => return Ok(handled),
+            ManagedPollOutcome::Idle => {}
         }
-        if !self.queries.is_empty() && self.poll_query_once().await? {
-            handled += 1;
+        if !self.queries.is_empty() {
+            match self.poll_query_once().await? {
+                ManagedPollOutcome::Handled => handled += 1,
+                ManagedPollOutcome::Stop => return Ok(handled),
+                ManagedPollOutcome::Idle => {}
+            }
         }
         Ok(handled)
     }
 
-    async fn poll_workflow_once(&self) -> Result<bool> {
-        let Some(task) = self
+    async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        let response = self
             .retry_worker_operation(|| {
-                self.client
-                    .poll_workflow_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+                self.client.poll_workflow_task_response(
+                    &self.worker_id,
+                    &self.task_queue,
+                    self.poll_timeout,
+                )
             })
-            .await?
-        else {
-            return Ok(false);
+            .await?;
+        if response.outcome().should_stop() {
+            return Ok(ManagedPollOutcome::Stop);
+        }
+        let Some(task) = response.task else {
+            return Ok(ManagedPollOutcome::Idle);
         };
 
         let task_id = task.task_id.clone();
@@ -2535,26 +3353,35 @@ impl Worker {
             }
         }
 
-        Ok(true)
+        Ok(ManagedPollOutcome::Handled)
     }
 
     async fn poll_workflows_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
-            self.poll_workflow_once().await?;
+            if self.poll_workflow_once().await? == ManagedPollOutcome::Stop {
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
         }
 
         Ok(())
     }
 
-    async fn poll_activity_once(&self) -> Result<bool> {
-        let Some(task) = self
+    async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
+        let response = self
             .retry_worker_operation(|| {
-                self.client
-                    .poll_activity_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+                self.client.poll_activity_task_response(
+                    &self.worker_id,
+                    &self.task_queue,
+                    self.poll_timeout,
+                )
             })
-            .await?
-        else {
-            return Ok(false);
+            .await?;
+        if response.outcome().should_stop() {
+            return Ok(ManagedPollOutcome::Stop);
+        }
+        let Some(task) = response.task else {
+            return Ok(ManagedPollOutcome::Idle);
         };
 
         let task_id = task.task_id.clone();
@@ -2571,12 +3398,19 @@ impl Worker {
         let result = self.execute_activity_task(task).await;
         match result {
             Ok(value) => {
-                self.client
+                let completion = self
+                    .client
                     .complete_activity_task(&task_id, &attempt_id, &lease_owner, value, &codec)
-                    .await?;
+                    .await;
+                if let Err(error) = completion {
+                    if !activity_task_rejection_is_final(&error) {
+                        return Err(error);
+                    }
+                }
             }
             Err(error) => {
-                self.client
+                let failure = self
+                    .client
                     .fail_activity_task(
                         &task_id,
                         &attempt_id,
@@ -2584,30 +3418,44 @@ impl Worker {
                         error.to_string(),
                         false,
                     )
-                    .await?;
+                    .await;
+                if let Err(error) = failure {
+                    if !activity_task_rejection_is_final(&error) {
+                        return Err(error);
+                    }
+                }
             }
         }
 
-        Ok(true)
+        Ok(ManagedPollOutcome::Handled)
     }
 
     async fn poll_activities_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
-            self.poll_activity_once().await?;
+            if self.poll_activity_once().await? == ManagedPollOutcome::Stop {
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
         }
 
         Ok(())
     }
 
-    async fn poll_query_once(&self) -> Result<bool> {
-        let Some(task) = self
+    async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {
+        let response = self
             .retry_worker_operation(|| {
-                self.client
-                    .poll_query_task(&self.worker_id, &self.task_queue, self.poll_timeout)
+                self.client.poll_query_task_response(
+                    &self.worker_id,
+                    &self.task_queue,
+                    self.poll_timeout,
+                )
             })
-            .await?
-        else {
-            return Ok(false);
+            .await?;
+        if response.outcome().should_stop() {
+            return Ok(ManagedPollOutcome::Stop);
+        }
+        let Some(task) = response.task else {
+            return Ok(ManagedPollOutcome::Idle);
         };
 
         let query_task_id = task.query_task_id.clone();
@@ -2639,7 +3487,7 @@ impl Worker {
                                 return Err(error);
                             }
                         }
-                        return Ok(true);
+                        return Ok(ManagedPollOutcome::Handled);
                     }
                 };
 
@@ -2679,12 +3527,15 @@ impl Worker {
             }
         }
 
-        Ok(true)
+        Ok(ManagedPollOutcome::Handled)
     }
 
     async fn poll_queries_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
-            self.poll_query_once().await?;
+            if self.poll_query_once().await? == ManagedPollOutcome::Stop {
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
         }
 
         Ok(())
@@ -7326,6 +8177,378 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_commands_support_instance_and_selected_run_targets() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let options = WorkflowCommandOptions::new()
+            .reason("cleanup requested")
+            .request_id("cancel-17");
+        let cancelled = client
+            .cancel_workflow("wf-lifecycle", options)
+            .await
+            .expect("instance cancellation");
+        assert_eq!(cancelled.command, WorkflowCommandKind::Cancel);
+        assert_eq!(cancelled.run_id.as_deref(), Some("run-current"));
+        assert_eq!(cancelled.outcome.as_deref(), Some("cancelled"));
+        assert_eq!(
+            server.request_body("/api/workflows/wf-lifecycle/cancel"),
+            json!({"reason":"cleanup requested","request_id":"cancel-17"})
+        );
+
+        let terminated = client
+            .terminate_workflow(
+                "wf-lifecycle",
+                WorkflowCommandOptions::new().reason("forced stop"),
+            )
+            .await
+            .expect("instance termination");
+        assert_eq!(terminated.command, WorkflowCommandKind::Terminate);
+        assert_eq!(terminated.outcome.as_deref(), Some("terminated"));
+
+        client
+            .cancel_workflow_run(
+                "wf-lifecycle",
+                "run-current",
+                WorkflowCommandOptions::default(),
+            )
+            .await
+            .expect("selected run cancellation");
+        client
+            .terminate_workflow_run(
+                "wf-lifecycle",
+                "run-current",
+                WorkflowCommandOptions::default(),
+            )
+            .await
+            .expect("selected run termination");
+
+        for (command, error) in [
+            (
+                WorkflowCommandKind::Cancel,
+                client
+                    .cancel_workflow_run(
+                        "wf-lifecycle",
+                        "run-stale",
+                        WorkflowCommandOptions::default(),
+                    )
+                    .await
+                    .expect_err("stale cancellation must be rejected"),
+            ),
+            (
+                WorkflowCommandKind::Terminate,
+                client
+                    .terminate_workflow_run(
+                        "wf-lifecycle",
+                        "run-stale",
+                        WorkflowCommandOptions::default(),
+                    )
+                    .await
+                    .expect_err("stale termination must be rejected"),
+            ),
+        ] {
+            let Error::WorkflowCommandRejected(rejection) = error else {
+                panic!("expected typed command rejection");
+            };
+            assert_eq!(rejection.command, command);
+            assert_eq!(rejection.status, 409);
+            assert_eq!(rejection.reason, "historical_run_command_rejected");
+            assert_eq!(rejection.run_id.as_deref(), Some("run-stale"));
+            assert_eq!(rejection.target_scope.as_deref(), Some("run"));
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_result_returns_each_typed_terminal_outcome() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let options = WorkflowResultOptions {
+            poll_interval: Duration::ZERO,
+            timeout: Duration::from_secs(1),
+        };
+
+        let failed = WorkflowHandle {
+            client: client.clone(),
+            workflow_id: "wf-failed".to_string(),
+            run_id: Some("run-failed".to_string()),
+            workflow_type: "failure".to_string(),
+        }
+        .result(options)
+        .await
+        .expect_err("failed outcome");
+        let Error::WorkflowFailed(failure) = failed else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(failure.workflow_id, "wf-failed");
+        assert_eq!(failure.run_id.as_deref(), Some("run-failed"));
+        assert_eq!(failure.failure_id.as_deref(), Some("failure-17"));
+        assert_eq!(failure.failure_category.as_deref(), Some("application"));
+        assert_eq!(failure.exception_type.as_deref(), Some("PaymentError"));
+        assert_eq!(
+            failure.exception_class.as_deref(),
+            Some("billing::PaymentError")
+        );
+        assert_eq!(failure.non_retryable, Some(true));
+
+        for (workflow_id, expected_kind, expected_reason) in [
+            (
+                "wf-cancelled",
+                WorkflowTerminalKind::Cancelled,
+                "cleanup requested",
+            ),
+            (
+                "wf-terminated",
+                WorkflowTerminalKind::Terminated,
+                "forced stop",
+            ),
+            (
+                "wf-timed-out",
+                WorkflowTerminalKind::TimedOut,
+                "run_timeout",
+            ),
+        ] {
+            let error = WorkflowHandle {
+                client: client.clone(),
+                workflow_id: workflow_id.to_string(),
+                run_id: None,
+                workflow_type: "terminal".to_string(),
+            }
+            .result(options)
+            .await
+            .expect_err("typed terminal outcome");
+            let outcome = match error {
+                Error::WorkflowCancelled(outcome) => outcome,
+                Error::WorkflowTerminated(outcome) => outcome,
+                Error::WorkflowTimedOut(outcome) => outcome,
+                other => panic!("unexpected terminal error: {other}"),
+            };
+            assert_eq!(outcome.kind, expected_kind);
+            assert_eq!(outcome.workflow_id, workflow_id);
+            assert_eq!(outcome.reason, expected_reason);
+        }
+
+        let wait_timeout = WorkflowHandle {
+            client,
+            workflow_id: "wf-waiting".to_string(),
+            run_id: Some("run-waiting".to_string()),
+            workflow_type: "waiting".to_string(),
+        }
+        .result(WorkflowResultOptions {
+            poll_interval: Duration::ZERO,
+            timeout: Duration::ZERO,
+        })
+        .await
+        .expect_err("client wait timeout");
+        let Error::WorkflowTimedOut(timeout) = wait_timeout else {
+            panic!("expected typed client timeout");
+        };
+        assert_eq!(timeout.reason, "result_wait_timeout");
+        assert_eq!(timeout.failure_category.as_deref(), Some("client_timeout"));
+        assert_eq!(timeout.run_id.as_deref(), Some("run-waiting"));
+    }
+
+    #[tokio::test]
+    async fn workflow_result_awaits_the_handle_selected_run() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let error = WorkflowHandle {
+            client,
+            workflow_id: "wf-selected".to_string(),
+            run_id: Some("run-selected".to_string()),
+            workflow_type: "selected".to_string(),
+        }
+        .result(WorkflowResultOptions {
+            poll_interval: Duration::ZERO,
+            timeout: Duration::from_secs(1),
+        })
+        .await
+        .expect_err("the selected run is cancelled even though the current run completed");
+
+        let Error::WorkflowCancelled(outcome) = error else {
+            panic!("expected selected run cancellation");
+        };
+        assert_eq!(outcome.run_id.as_deref(), Some("run-selected"));
+        assert_eq!(outcome.reason, "selected run cancelled");
+        assert_eq!(
+            server.request_count("/api/workflows/wf-selected/runs/run-selected"),
+            1
+        );
+        assert_eq!(server.request_count("/api/workflows/wf-selected"), 0);
+    }
+
+    #[tokio::test]
+    async fn poll_responses_decode_http_conflict_drain_as_a_stable_stop() {
+        let server = MockWorkerServer::draining_polls();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let workflow = client
+            .poll_workflow_task_response("draining-worker", "rust-workers", Duration::ZERO)
+            .await
+            .expect("workflow drain response");
+        let activity = client
+            .poll_activity_task_response("draining-worker", "rust-workers", Duration::ZERO)
+            .await
+            .expect("activity drain response");
+        let query = client
+            .poll_query_task_response("draining-worker", "rust-workers", Duration::ZERO)
+            .await
+            .expect("query drain response");
+
+        for outcome in [workflow.outcome(), activity.outcome(), query.outcome()] {
+            assert_eq!(
+                outcome,
+                WorkerPollOutcome::Stop {
+                    poll_status: Some("draining".to_string()),
+                    reason: Some("worker_draining".to_string()),
+                }
+            );
+        }
+
+        assert!(client
+            .poll_workflow_task("draining-worker", "rust-workers", Duration::ZERO)
+            .await
+            .expect("compatibility poll")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_worker_honors_drain_stop_for_every_task_family() {
+        let server = MockWorkerServer::draining_polls();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let mut workflow_worker = Worker::new(client.clone(), "rust-workers")
+            .worker_id("draining-workflow-worker")
+            .poll_timeout(Duration::ZERO);
+        workflow_worker.register_workflow("counter", |_ctx, _args| async { Ok(Value::Null) });
+        workflow_worker
+            .run()
+            .await
+            .expect("workflow drain is a clean stop");
+
+        let mut activity_worker = Worker::new(client.clone(), "rust-workers")
+            .worker_id("draining-activity-worker")
+            .poll_timeout(Duration::ZERO);
+        activity_worker.register_activity("write", |_ctx, _args| async { Ok(Value::Null) });
+        activity_worker
+            .run()
+            .await
+            .expect("activity drain is a clean stop");
+
+        let mut query_worker = Worker::new(client, "rust-workers")
+            .worker_id("draining-query-worker")
+            .poll_timeout(Duration::ZERO);
+        query_worker.register_query("counter", "current", |_ctx, _args| async {
+            Ok(Value::Null)
+        });
+        query_worker
+            .run()
+            .await
+            .expect("query drain is a clean stop");
+    }
+
+    #[tokio::test]
+    async fn activity_cancellation_and_late_completion_remain_machine_readable() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let heartbeat = client
+            .heartbeat_activity_task(
+                "activity-cancel",
+                "attempt-cancel",
+                "rust-worker",
+                json!({"stage":"cleanup"}),
+            )
+            .await
+            .expect("cancellation heartbeat");
+        assert!(heartbeat.cancel_requested);
+        assert!(heartbeat.should_stop());
+        assert_eq!(heartbeat.reason.as_deref(), Some("run_cancelled"));
+        assert_eq!(heartbeat.run_closed_reason.as_deref(), Some("cancelled"));
+
+        let error = client
+            .complete_activity_task(
+                "activity-cancel",
+                "attempt-cancel",
+                "rust-worker",
+                json!({"late":true}),
+                JSON_CODEC,
+            )
+            .await
+            .expect_err("late completion must be refused");
+        assert!(activity_task_rejection_is_final(&error));
+        let Error::ActivityTaskRejected(rejection) = error else {
+            panic!("expected typed activity rejection");
+        };
+        assert_eq!(rejection.status, 409);
+        assert_eq!(rejection.reason, "run_cancelled");
+        assert!(rejection.cancel_requested);
+        assert_eq!(rejection.can_continue, Some(false));
+    }
+
+    #[tokio::test]
+    async fn managed_worker_survives_late_completion_and_restart_during_cancellation() {
+        let server = MockWorkerServer::cancelled_activity();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&cancellation_observed);
+        let mut worker = Worker::new(client.clone(), "rust-workers")
+            .worker_id("rust-cancel-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_activity("cancel-aware", move |ctx, _args| {
+            let observed = Arc::clone(&observed);
+            async move {
+                let heartbeat = ctx.heartbeat(json!({"stage":"running"})).await?;
+                observed.store(heartbeat.should_stop(), Ordering::SeqCst);
+                Ok(json!({"late":"completion"}))
+            }
+        });
+
+        assert_eq!(
+            worker.run_once().await.expect("cancelled attempt handled"),
+            1
+        );
+        assert!(cancellation_observed.load(Ordering::SeqCst));
+        assert_eq!(
+            server.request_count("/api/worker/activity-tasks/activity-cancel/complete"),
+            1
+        );
+
+        let mut restarted = Worker::new(client, "rust-workers")
+            .worker_id("rust-cancel-worker-restarted")
+            .poll_timeout(Duration::from_millis(10));
+        restarted.register_activity("cancel-aware", |_ctx, _args| async move { Ok(Value::Null) });
+        assert_eq!(
+            restarted
+                .run_once()
+                .await
+                .expect("replacement worker continues polling"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn baseline_worker_endpoints_send_the_baseline_protocol() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -7789,6 +9012,8 @@ mod tests {
         poll_failures_per_path: usize,
         heartbeat_failures: usize,
         unauthorized_polls: bool,
+        cancelled_activity: bool,
+        draining_polls: bool,
     }
 
     impl MockWorkerServer {
@@ -7835,6 +9060,20 @@ mod tests {
         fn unauthorized_polls() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 unauthorized_polls: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn cancelled_activity() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                cancelled_activity: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn draining_polls() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                draining_polls: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -7995,6 +9234,14 @@ mod tests {
             );
             return;
         }
+        if behavior.draining_polls && is_poll {
+            write_mock_response(
+                stream,
+                "409 Conflict",
+                r#"{"task":null,"poll_status":"draining","reason":"worker_draining","worker_status":"draining","drain_intent":"draining"}"#,
+            );
+            return;
+        }
 
         if behavior.reject_query_protocol && path.starts_with("/api/worker/query-tasks/") {
             let requested_version = worker_protocol.as_deref().unwrap_or("missing");
@@ -8139,6 +9386,14 @@ mod tests {
                 r#"{"worker_id":"mock-worker","registered":true,"heartbeat_interval_seconds":3600}"#,
             ),
             "/api/worker/heartbeat" => ("200 OK", "{}"),
+            "/api/worker/activity-tasks/poll"
+                if behavior.cancelled_activity && request_number == 1 =>
+            {
+                (
+                    "200 OK",
+                    r#"{"task":{"task_id":"activity-cancel","activity_attempt_id":"attempt-cancel","activity_type":"cancel-aware","payload_codec":"json","arguments":{"codec":"json","blob":"[]"},"attempt_number":1,"lease_owner":"rust-cancel-worker"}}"#,
+                )
+            }
             "/api/worker/activity-tasks/poll" | "/api/worker/workflow-tasks/poll" => {
                 ("200 OK", r#"{"task":null}"#)
             }
@@ -8153,6 +9408,14 @@ mod tests {
             "/api/worker/query-tasks/poll" => ("200 OK", r#"{"task":null}"#),
             "/api/worker/query-tasks/query-capture/complete"
             | "/api/worker/query-tasks/query-capture/fail" => ("200 OK", "{}"),
+            "/api/worker/activity-tasks/activity-cancel/heartbeat" => (
+                "200 OK",
+                r#"{"activity_attempt_id":"attempt-cancel","cancel_requested":true,"can_continue":false,"reason":"run_cancelled","run_closed_reason":"cancelled","heartbeat_recorded":false}"#,
+            ),
+            "/api/worker/activity-tasks/activity-cancel/complete" => (
+                "409 Conflict",
+                r#"{"task_id":"activity-cancel","activity_attempt_id":"attempt-cancel","reason":"run_cancelled","cancel_requested":true,"can_continue":false,"run_closed_reason":"cancelled"}"#,
+            ),
             "/api/workflows/counter-1/query/current" => (
                 "200 OK",
                 r#"{"workflow_id":"counter-1","query_name":"current","result":{"count":8},"result_envelope":{"codec":"json","blob":"{\"count\":8}"}}"#,
@@ -8160,6 +9423,55 @@ mod tests {
             "/api/workflows/counter-1/query/missing" => (
                 "404 Not Found",
                 r#"{"workflow_id":"counter-1","query_name":"missing","reason":"rejected_unknown_query","message":"unknown query"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/cancel" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-current","outcome":"cancelled","reason":"cleanup requested","command_status":"accepted"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/terminate" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-current","outcome":"terminated","reason":"forced stop","command_status":"accepted"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-current/cancel" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-current","outcome":"cancelled","command_status":"accepted"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-current/terminate" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-current","outcome":"terminated","command_status":"accepted"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-stale/cancel"
+            | "/api/workflows/wf-lifecycle/runs/run-stale/terminate" => (
+                "409 Conflict",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-stale","reason":"historical_run_command_rejected","target_scope":"run","message":"Commands cannot target historical runs."}"#,
+            ),
+            "/api/workflows/wf-failed" | "/api/workflows/wf-failed/runs/run-failed" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-failed","run_id":"run-failed","status":"failed","closed_reason":"failed","error":"payment failed","failure":{"message":"payment failed","failure_category":"application","exception_type":"PaymentError","exception_class":"billing::PaymentError","non_retryable":true,"exception":{"type":"PaymentError","class":"billing::PaymentError","message":"payment failed"},"failures":[{"id":"failure-17","failure_category":"application"}]}}"#,
+            ),
+            "/api/workflows/wf-cancelled" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-cancelled","run_id":"run-cancelled","status":"cancelled","closed_reason":"cancelled","reason":"cleanup requested"}"#,
+            ),
+            "/api/workflows/wf-terminated" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-terminated","run_id":"run-terminated","status":"terminated","closed_reason":"terminated","reason":"forced stop"}"#,
+            ),
+            "/api/workflows/wf-timed-out" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-timed-out","run_id":"run-timed-out","status":"failed","closed_reason":"timed_out","reason":"run_timeout"}"#,
+            ),
+            "/api/workflows/wf-waiting" | "/api/workflows/wf-waiting/runs/run-waiting" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-waiting","run_id":"run-waiting","status":"waiting"}"#,
+            ),
+            "/api/workflows/wf-selected" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-selected","run_id":"run-current","status":"completed","output":"current run output"}"#,
+            ),
+            "/api/workflows/wf-selected/runs/run-selected" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-selected","run_id":"run-selected","status":"cancelled","closed_reason":"cancelled","reason":"selected run cancelled"}"#,
             ),
             _ => ("404 Not Found", r#"{"message":"not found"}"#),
         };
