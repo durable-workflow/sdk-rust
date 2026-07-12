@@ -13,20 +13,21 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.6 --exact
+cargo add durable-workflow@0.1.7 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.6"
+durable-workflow = "=0.1.7"
 ```
 
-Version `0.1.6` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.7` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
-durable child workflows are available from `0.1.5`.
+durable child workflows are available from `0.1.5`. Durable activity retry,
+timeout, and typed terminal options are available from `0.1.7`.
 
 ## Compatibility
 
@@ -36,7 +37,8 @@ durable child workflows are available from `0.1.5`.
 | `0.1.1` | `>=0.2,<0.3` | `1.2` (snapshot queries require `1.8`) | `2` |
 | `0.1.2`–`0.1.3` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
 | `0.1.4` | `>=0.2,<0.3` | `1.2` (timers; replayed queries require `1.8`) | `2` |
-| `0.1.5+` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.5`–`0.1.6` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.7+` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -46,7 +48,9 @@ The machine-readable values live in `[package.metadata.durable-workflow]` in
 Timer-capable releases additionally publish `durable-timers`, `timer-command`,
 and `timer-replay-validation`. Child-capable releases additionally publish
 `child-workflows`, `child-workflow-command`, and
-`child-workflow-failure-reasons`. Existing worker operations retain the `1.2`
+`child-workflow-failure-reasons`. Activity-options releases publish
+`activity-options`, `activity-retry-policy`, `activity-timeouts`, and
+`activity-failure-reasons`. Existing worker operations retain the `1.2`
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor. The server's advertised protocol manifests remain
 authoritative when checking compatibility during deployment.
@@ -93,6 +97,64 @@ Running and completed executions remain available through `WorkflowHandle`'s
 remain `Error::Protocol(ProtocolFailure)`, including stable `reason`, `status`,
 and requested/supported version fields; other rejected worker requests remain
 typed `Error::Http` values with the response status and body.
+
+## Durable activity options
+
+`WorkflowContext::activity_with_options` adds routing, durable retries, and
+server-enforced timeouts while the existing `activity` and `activity_on_queue`
+convenience methods remain unchanged. `ActivityRetryPolicy` accepts explicit
+backoff intervals or generates integer exponential intervals. All options are
+recorded on the single `schedule_activity` command; transport retry settings
+on `Worker` and `Client` are separate.
+
+```rust
+# use durable_workflow::{json, ActivityOptions, ActivityRetryPolicy, Error, Result, WorkflowContext};
+# use std::time::Duration;
+# async fn charge(ctx: WorkflowContext) -> Result<durable_workflow::Value> {
+let options = ActivityOptions::new()
+    .task_queue("payments")
+    .retry_policy(
+        ActivityRetryPolicy::new(4)
+            .exponential_backoff(Duration::from_secs(1), 2, Some(Duration::from_secs(30)))
+            .non_retryable_error_type("PaymentDeclined"),
+    )
+    .start_to_close_timeout(Duration::from_secs(60))
+    .schedule_to_start_timeout(Duration::from_secs(10))
+    .schedule_to_close_timeout(Duration::from_secs(180))
+    .heartbeat_timeout(Duration::from_secs(15));
+
+match ctx
+    .activity_with_options("charge-card", options, json!([{"order_id": "order-42"}]))
+    .await
+{
+    Ok(receipt) => Ok(receipt),
+    Err(Error::ActivityFailed(failure)) => Ok(json!({
+        "kind": format!("{:?}", failure.kind),
+        "reason": failure.reason,
+        "category": failure.failure_category,
+        "activity_execution_id": failure.activity_execution_id,
+        "timeout_kind": failure.timeout_kind,
+    })),
+    Err(error) => Err(error),
+}
+# }
+```
+
+Timeouts use `Duration` and round up to whole protocol seconds.
+`start_to_close_timeout` limits one attempt, `schedule_to_start_timeout` limits
+queue wait, `schedule_to_close_timeout` includes all attempts and retry
+backoff, and `heartbeat_timeout` limits the gap between heartbeats. Invalid
+positive values, ordering, retry bounds, blank error types, and empty policies
+return `Error::InvalidActivityOptions(ActivityOptionsError)` before any command
+is emitted.
+
+Completed activities still return their decoded value. Terminal
+`ActivityFailed`, `ActivityCancelled`, and `ActivityTimedOut` history returns
+`Error::ActivityFailed(ActivityFailure)`. Match `ActivityFailureKind` and the
+stable `reason`, `failure_category`, and `timeout_kind` fields; durable activity
+and attempt identities are retained when the server provides them. A retry
+history with no terminal event remains pending during replay and does not emit
+a second activity schedule after a worker restart.
 
 ## Child workflows
 
@@ -310,6 +372,8 @@ are never retried indefinitely.
 `examples/hello_world.rs` contains a complete round trip: it registers a Rust
 worker, starts a workflow, sends a signal, runs an activity, heartbeats that
 activity, exposes a named query, and waits for the completed result.
+`examples/activity_options.rs` is an executable retry scenario with activity
+heartbeats, a heartbeat timeout, and typed terminal failure handling.
 
 With a Durable Workflow server running locally:
 
@@ -318,6 +382,9 @@ DURABLE_WORKFLOW_SERVER_URL=http://127.0.0.1:8080 \
 DURABLE_WORKFLOW_TOKEN=your-token \
 cargo run --example hello_world
 ```
+
+Run the activity-options scenario with the same environment using
+`cargo run --example activity_options`.
 
 `TASK_QUEUE` optionally overrides the default `rust-workers` task queue.
 

@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -25,6 +25,10 @@ snapshot-inspection-queries = true
 child-workflows = true
 child-workflow-command = "start_child_workflow"
 child-workflow-failure-reasons = ["child_workflow", "cancelled", "terminated"]
+activity-options = true
+activity-retry-policy = true
+activity-timeouts = ["start_to_close", "schedule_to_start", "schedule_to_close", "heartbeat"]
+activity-failure-reasons = ["activity", "cancelled", "timeout"]
 payload-codecs = ["avro", "json"]
 durable-timers = true
 timer-command = "start_timer"

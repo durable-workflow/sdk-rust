@@ -89,6 +89,8 @@ pub enum Error {
     NonDeterministicReplay(ReplayFailure),
     #[error(transparent)]
     ChildWorkflowFailed(ChildWorkflowFailure),
+    #[error(transparent)]
+    ActivityFailed(ActivityFailure),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
@@ -105,6 +107,81 @@ pub enum Error {
     WorkerLoop(String),
     #[error("invalid child workflow options: {0}")]
     InvalidChildWorkflowOptions(String),
+    #[error(transparent)]
+    InvalidActivityOptions(ActivityOptionsError),
+}
+
+/// Stable validation categories for [`ActivityOptions`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityOptionsErrorKind {
+    EmptyTaskQueue,
+    EmptyRetryPolicy,
+    InvalidMaxAttempts,
+    BackoffWithoutRetryBudget,
+    TooManyBackoffIntervals,
+    InvalidBackoffCoefficient,
+    BackoffGenerationTooLarge,
+    BackoffOverflow,
+    EmptyNonRetryableErrorType,
+    TimeoutNotPositive,
+    TimeoutOverflow,
+    TimeoutOrder,
+}
+
+/// A machine-readable activity-options validation failure.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("invalid activity options ({kind:?}, {field:?}): {message}")]
+pub struct ActivityOptionsError {
+    pub kind: ActivityOptionsErrorKind,
+    pub field: Option<&'static str>,
+    pub message: String,
+}
+
+impl ActivityOptionsError {
+    fn new(
+        kind: ActivityOptionsErrorKind,
+        field: Option<&'static str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+/// Stable terminal categories returned when an awaited activity does not succeed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityFailureKind {
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+/// A stable, machine-readable terminal activity failure.
+///
+/// Match [`Error::ActivityFailed`] and inspect `kind`, `reason`,
+/// `failure_category`, or `timeout_kind`; display text is only diagnostic.
+#[derive(Clone, Debug, Error)]
+#[error("activity failed ({reason}): {message}")]
+pub struct ActivityFailure {
+    pub kind: ActivityFailureKind,
+    pub reason: String,
+    pub message: String,
+    pub activity_execution_id: Option<String>,
+    pub activity_attempt_id: Option<String>,
+    pub activity_type: Option<String>,
+    pub activity_class: Option<String>,
+    pub attempt_number: Option<u64>,
+    pub failure_id: Option<String>,
+    pub failure_category: Option<String>,
+    pub timeout_kind: Option<String>,
+    pub non_retryable: bool,
+    pub exception_type: Option<String>,
+    pub exception_class: Option<String>,
+    pub code: Option<Value>,
+    pub exception: Option<Value>,
 }
 
 /// Stable terminal categories returned when an awaited child does not succeed.
@@ -225,6 +302,381 @@ impl ChildWorkflowOptions {
         self.run_timeout_seconds = Some(seconds);
         self
     }
+}
+
+/// Backoff intervals for one durable activity retry policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivityBackoff {
+    /// Use these intervals between attempts. The server repeats the final
+    /// interval if the retry budget contains more attempts than entries.
+    Explicit(Vec<Duration>),
+    /// Generate one interval for every retry using integer exponential growth.
+    Exponential {
+        initial_interval: Duration,
+        coefficient: u32,
+        maximum_interval: Option<Duration>,
+    },
+}
+
+/// Durable server-side retry policy for one activity execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivityRetryPolicy {
+    pub max_attempts: Option<u32>,
+    pub backoff: Option<ActivityBackoff>,
+    pub non_retryable_error_types: Vec<String>,
+}
+
+impl ActivityRetryPolicy {
+    /// Start a policy with a finite attempt budget, including the first attempt.
+    pub fn new(max_attempts: u32) -> Self {
+        Self {
+            max_attempts: Some(max_attempts),
+            ..Self::default()
+        }
+    }
+
+    pub fn backoff_intervals(mut self, intervals: impl IntoIterator<Item = Duration>) -> Self {
+        self.backoff = Some(ActivityBackoff::Explicit(intervals.into_iter().collect()));
+        self
+    }
+
+    pub fn exponential_backoff(
+        mut self,
+        initial_interval: Duration,
+        coefficient: u32,
+        maximum_interval: Option<Duration>,
+    ) -> Self {
+        self.backoff = Some(ActivityBackoff::Exponential {
+            initial_interval,
+            coefficient,
+            maximum_interval,
+        });
+        self
+    }
+
+    pub fn non_retryable_error_type(mut self, error_type: impl Into<String>) -> Self {
+        self.non_retryable_error_types.push(error_type.into());
+        self
+    }
+
+    pub fn non_retryable_error_types(
+        mut self,
+        error_types: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.non_retryable_error_types
+            .extend(error_types.into_iter().map(Into::into));
+        self
+    }
+}
+
+/// Options recorded atomically on one deterministic `schedule_activity` command.
+///
+/// Durations are rounded up to whole seconds when encoded, so the server never
+/// receives a shorter timeout or backoff than the caller requested.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivityOptions {
+    pub task_queue: Option<String>,
+    pub retry_policy: Option<ActivityRetryPolicy>,
+    pub start_to_close_timeout: Option<Duration>,
+    pub schedule_to_start_timeout: Option<Duration>,
+    pub schedule_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
+}
+
+impl ActivityOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn task_queue(mut self, task_queue: impl Into<String>) -> Self {
+        self.task_queue = Some(task_queue.into());
+        self
+    }
+
+    pub fn retry_policy(mut self, policy: ActivityRetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    pub fn start_to_close_timeout(mut self, timeout: Duration) -> Self {
+        self.start_to_close_timeout = Some(timeout);
+        self
+    }
+
+    pub fn schedule_to_start_timeout(mut self, timeout: Duration) -> Self {
+        self.schedule_to_start_timeout = Some(timeout);
+        self
+    }
+
+    pub fn schedule_to_close_timeout(mut self, timeout: Duration) -> Self {
+        self.schedule_to_close_timeout = Some(timeout);
+        self
+    }
+
+    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
+        self
+    }
+
+    fn validate(&self) -> std::result::Result<ValidatedActivityOptions, ActivityOptionsError> {
+        if self
+            .task_queue
+            .as_deref()
+            .is_some_and(|queue| queue.trim().is_empty())
+        {
+            return Err(ActivityOptionsError::new(
+                ActivityOptionsErrorKind::EmptyTaskQueue,
+                Some("task_queue"),
+                "task_queue must not be empty",
+            ));
+        }
+
+        for (field, value) in [
+            ("start_to_close_timeout", self.start_to_close_timeout),
+            ("schedule_to_start_timeout", self.schedule_to_start_timeout),
+            ("schedule_to_close_timeout", self.schedule_to_close_timeout),
+            ("heartbeat_timeout", self.heartbeat_timeout),
+        ] {
+            if value.is_some_and(|value| value.is_zero()) {
+                return Err(ActivityOptionsError::new(
+                    ActivityOptionsErrorKind::TimeoutNotPositive,
+                    Some(field),
+                    format!("{field} must be positive"),
+                ));
+            }
+        }
+
+        validate_timeout_order(
+            "heartbeat_timeout",
+            self.heartbeat_timeout,
+            "start_to_close_timeout",
+            self.start_to_close_timeout,
+        )?;
+        validate_timeout_order(
+            "start_to_close_timeout",
+            self.start_to_close_timeout,
+            "schedule_to_close_timeout",
+            self.schedule_to_close_timeout,
+        )?;
+        validate_timeout_order(
+            "schedule_to_start_timeout",
+            self.schedule_to_start_timeout,
+            "schedule_to_close_timeout",
+            self.schedule_to_close_timeout,
+        )?;
+
+        Ok(ValidatedActivityOptions {
+            task_queue: self.task_queue.clone(),
+            retry_policy: self
+                .retry_policy
+                .as_ref()
+                .map(validate_activity_retry_policy)
+                .transpose()?,
+            start_to_close_timeout: timeout_seconds(
+                "start_to_close_timeout",
+                self.start_to_close_timeout,
+            )?,
+            schedule_to_start_timeout: timeout_seconds(
+                "schedule_to_start_timeout",
+                self.schedule_to_start_timeout,
+            )?,
+            schedule_to_close_timeout: timeout_seconds(
+                "schedule_to_close_timeout",
+                self.schedule_to_close_timeout,
+            )?,
+            heartbeat_timeout: timeout_seconds("heartbeat_timeout", self.heartbeat_timeout)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedActivityOptions {
+    task_queue: Option<String>,
+    retry_policy: Option<Value>,
+    start_to_close_timeout: Option<u64>,
+    schedule_to_start_timeout: Option<u64>,
+    schedule_to_close_timeout: Option<u64>,
+    heartbeat_timeout: Option<u64>,
+}
+
+fn validate_timeout_order(
+    smaller_name: &'static str,
+    smaller: Option<Duration>,
+    larger_name: &'static str,
+    larger: Option<Duration>,
+) -> std::result::Result<(), ActivityOptionsError> {
+    if matches!((smaller, larger), (Some(smaller), Some(larger)) if smaller > larger) {
+        return Err(ActivityOptionsError::new(
+            ActivityOptionsErrorKind::TimeoutOrder,
+            Some(smaller_name),
+            format!("{smaller_name} must be <= {larger_name}"),
+        ));
+    }
+    Ok(())
+}
+
+fn timeout_seconds(
+    field: &'static str,
+    value: Option<Duration>,
+) -> std::result::Result<Option<u64>, ActivityOptionsError> {
+    value
+        .map(|value| {
+            activity_protocol_seconds(value).ok_or_else(|| {
+                ActivityOptionsError::new(
+                    ActivityOptionsErrorKind::TimeoutOverflow,
+                    Some(field),
+                    format!("{field} is too large for the worker protocol"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn duration_seconds_ceil(value: Duration) -> Option<u64> {
+    value
+        .as_secs()
+        .checked_add(u64::from(value.subsec_nanos() > 0))
+}
+
+fn activity_protocol_seconds(value: Duration) -> Option<u64> {
+    duration_seconds_ceil(value).filter(|seconds| *seconds <= i64::MAX as u64)
+}
+
+fn validate_activity_retry_policy(
+    policy: &ActivityRetryPolicy,
+) -> std::result::Result<Value, ActivityOptionsError> {
+    if policy.max_attempts.is_none()
+        && policy.backoff.is_none()
+        && policy.non_retryable_error_types.is_empty()
+    {
+        return Err(ActivityOptionsError::new(
+            ActivityOptionsErrorKind::EmptyRetryPolicy,
+            Some("retry_policy"),
+            "retry_policy must configure at least one field",
+        ));
+    }
+    if policy.max_attempts == Some(0) {
+        return Err(ActivityOptionsError::new(
+            ActivityOptionsErrorKind::InvalidMaxAttempts,
+            Some("retry_policy.max_attempts"),
+            "max_attempts must be >= 1",
+        ));
+    }
+    if policy
+        .non_retryable_error_types
+        .iter()
+        .any(|error_type| error_type.trim().is_empty())
+    {
+        return Err(ActivityOptionsError::new(
+            ActivityOptionsErrorKind::EmptyNonRetryableErrorType,
+            Some("retry_policy.non_retryable_error_types"),
+            "non_retryable_error_types must not contain empty values",
+        ));
+    }
+
+    let backoff_seconds = match &policy.backoff {
+        None => None,
+        Some(backoff) => {
+            let max_attempts = policy.max_attempts.ok_or_else(|| {
+                ActivityOptionsError::new(
+                    ActivityOptionsErrorKind::BackoffWithoutRetryBudget,
+                    Some("retry_policy.backoff"),
+                    "backoff requires max_attempts",
+                )
+            })?;
+            let retry_count = max_attempts.saturating_sub(1) as usize;
+            let intervals = match backoff {
+                ActivityBackoff::Explicit(intervals) => {
+                    if intervals.len() > retry_count {
+                        return Err(ActivityOptionsError::new(
+                            ActivityOptionsErrorKind::TooManyBackoffIntervals,
+                            Some("retry_policy.backoff"),
+                            "backoff interval count must not exceed max_attempts - 1",
+                        ));
+                    }
+                    intervals.clone()
+                }
+                ActivityBackoff::Exponential {
+                    initial_interval,
+                    coefficient,
+                    maximum_interval,
+                } => {
+                    if *coefficient < 1 {
+                        return Err(ActivityOptionsError::new(
+                            ActivityOptionsErrorKind::InvalidBackoffCoefficient,
+                            Some("retry_policy.backoff.coefficient"),
+                            "backoff coefficient must be >= 1",
+                        ));
+                    }
+                    if retry_count > 10_000 {
+                        return Err(ActivityOptionsError::new(
+                            ActivityOptionsErrorKind::BackoffGenerationTooLarge,
+                            Some("retry_policy.max_attempts"),
+                            "generated backoff supports at most 10000 retry intervals",
+                        ));
+                    }
+                    let mut current = *initial_interval;
+                    let mut intervals = Vec::with_capacity(retry_count);
+                    for _ in 0..retry_count {
+                        let interval = maximum_interval
+                            .map(|maximum| current.min(maximum))
+                            .unwrap_or(current);
+                        intervals.push(interval);
+                        if maximum_interval.is_some_and(|maximum| interval == maximum) {
+                            break;
+                        }
+                        current = current.checked_mul(*coefficient).ok_or_else(|| {
+                            ActivityOptionsError::new(
+                                ActivityOptionsErrorKind::BackoffOverflow,
+                                Some("retry_policy.backoff"),
+                                "generated backoff interval overflowed",
+                            )
+                        })?;
+                    }
+                    intervals
+                }
+            };
+            Some(
+                intervals
+                    .into_iter()
+                    .map(|interval| {
+                        activity_protocol_seconds(interval).ok_or_else(|| {
+                            ActivityOptionsError::new(
+                                ActivityOptionsErrorKind::BackoffOverflow,
+                                Some("retry_policy.backoff"),
+                                "backoff interval is too large for the worker protocol",
+                            )
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            )
+        }
+    };
+
+    let mut encoded = serde_json::Map::new();
+    if let Some(max_attempts) = policy.max_attempts {
+        encoded.insert("max_attempts".to_string(), json!(max_attempts));
+    }
+    if let Some(backoff_seconds) = backoff_seconds {
+        encoded.insert("backoff_seconds".to_string(), json!(backoff_seconds));
+    }
+    if !policy.non_retryable_error_types.is_empty() {
+        let mut canonical_error_types = Vec::new();
+        for error_type in policy
+            .non_retryable_error_types
+            .iter()
+            .map(|error_type| error_type.trim())
+        {
+            if !canonical_error_types.contains(&error_type) {
+                canonical_error_types.push(error_type);
+            }
+        }
+        encoded.insert(
+            "non_retryable_error_types".to_string(),
+            json!(canonical_error_types),
+        );
+    }
+    Ok(Value::Object(encoded))
 }
 
 /// A stable, machine-readable failure raised when workflow code no longer
@@ -2697,7 +3149,7 @@ impl WorkflowContext {
         activity_type: impl Into<String>,
         args: T,
     ) -> ActivityCall {
-        self.activity_on_queue(activity_type, None::<String>, args)
+        self.activity_with_options(activity_type, ActivityOptions::new(), args)
     }
 
     pub fn activity_on_queue<T, Q>(
@@ -2710,10 +3162,58 @@ impl WorkflowContext {
         T: Serialize,
         Q: Into<String>,
     {
+        let mut options = ActivityOptions::new();
+        options.task_queue = task_queue.map(Into::into);
+        self.activity_with_options(activity_type, options, args)
+    }
+
+    /// Schedule one durable activity with retry, routing, and timeout options.
+    ///
+    /// Options are validated before the command is emitted. Once the command is
+    /// recorded, replay consumes the same activity lifecycle at this command
+    /// position and never emits a duplicate schedule.
+    ///
+    /// ```no_run
+    /// # use durable_workflow::{json, ActivityOptions, ActivityRetryPolicy, Error, Result, WorkflowContext};
+    /// # use std::time::Duration;
+    /// # async fn run(ctx: WorkflowContext) -> Result<durable_workflow::Value> {
+    /// let result = ctx
+    ///     .activity_with_options(
+    ///         "charge-card",
+    ///         ActivityOptions::new()
+    ///             .task_queue("payments")
+    ///             .retry_policy(
+    ///                 ActivityRetryPolicy::new(4).exponential_backoff(
+    ///                     Duration::from_secs(1),
+    ///                     2,
+    ///                     Some(Duration::from_secs(30)),
+    ///                 ),
+    ///             )
+    ///             .start_to_close_timeout(Duration::from_secs(60))
+    ///             .schedule_to_close_timeout(Duration::from_secs(180))
+    ///             .heartbeat_timeout(Duration::from_secs(15)),
+    ///         json!([{"order_id": "order-42"}]),
+    ///     )
+    ///     .await;
+    /// match result {
+    ///     Err(Error::ActivityFailed(failure)) => Ok(json!({
+    ///         "reason": failure.reason,
+    ///         "timeout_kind": failure.timeout_kind,
+    ///     })),
+    ///     other => other,
+    /// }
+    /// # }
+    /// ```
+    pub fn activity_with_options<T: Serialize>(
+        &self,
+        activity_type: impl Into<String>,
+        options: ActivityOptions,
+        args: T,
+    ) -> ActivityCall {
         ActivityCall {
             ctx: self.clone(),
             activity_type: activity_type.into(),
-            task_queue: task_queue.map(Into::into),
+            options,
             args: Some(serde_json::to_value(args).map_err(Error::from)),
             scheduled: false,
         }
@@ -2911,7 +3411,8 @@ enum RecordedCommand {
     Activity {
         sequence: u64,
         activity_type: Option<String>,
-        result: Option<Value>,
+        options: Option<RecordedActivityOptions>,
+        outcome: Option<ActivityOutcome>,
     },
     Timer {
         sequence: u64,
@@ -2927,6 +3428,169 @@ enum RecordedCommand {
         sequence: u64,
         signal_name: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecordedActivityOptions {
+    task_queue: RecordedSnapshotValue<Option<String>>,
+    execution_mode: RecordedSnapshotValue<Option<String>>,
+    retry_policy: ActivityRetrySnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+enum RecordedSnapshotValue<T> {
+    /// Older history did not persist this field, so it cannot constrain replay.
+    Unknown,
+    Known(T),
+}
+
+impl<T: PartialEq> RecordedSnapshotValue<T> {
+    fn matches_current(&self, current: &Self) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Known(recorded) => matches!(current, Self::Known(value) if value == recorded),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ActivityRetrySnapshot {
+    snapshot_version: RecordedSnapshotValue<Option<u64>>,
+    max_attempts: RecordedSnapshotValue<Option<u64>>,
+    backoff_seconds: RecordedSnapshotValue<Vec<u64>>,
+    start_to_close_timeout: RecordedSnapshotValue<Option<u64>>,
+    schedule_to_start_timeout: RecordedSnapshotValue<Option<u64>>,
+    schedule_to_close_timeout: RecordedSnapshotValue<Option<u64>>,
+    heartbeat_timeout: RecordedSnapshotValue<Option<u64>>,
+    non_retryable_error_types: RecordedSnapshotValue<Vec<String>>,
+}
+
+impl ActivityRetrySnapshot {
+    fn matches_current(&self, current: &Self) -> bool {
+        self.snapshot_version
+            .matches_current(&current.snapshot_version)
+            && self.max_attempts.matches_current(&current.max_attempts)
+            && self
+                .backoff_seconds
+                .matches_current(&current.backoff_seconds)
+            && self
+                .start_to_close_timeout
+                .matches_current(&current.start_to_close_timeout)
+            && self
+                .schedule_to_start_timeout
+                .matches_current(&current.schedule_to_start_timeout)
+            && self
+                .schedule_to_close_timeout
+                .matches_current(&current.schedule_to_close_timeout)
+            && self
+                .heartbeat_timeout
+                .matches_current(&current.heartbeat_timeout)
+            && self
+                .non_retryable_error_types
+                .matches_current(&current.non_retryable_error_types)
+    }
+}
+
+fn recorded_optional_u64(
+    object: Option<&serde_json::Map<String, Value>>,
+    field: &str,
+) -> RecordedSnapshotValue<Option<u64>> {
+    match object.and_then(|object| object.get(field)) {
+        None => RecordedSnapshotValue::Unknown,
+        Some(Value::Null) => RecordedSnapshotValue::Known(None),
+        Some(value) => RecordedSnapshotValue::Known(value_as_u64(value)),
+    }
+}
+
+fn recorded_optional_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> RecordedSnapshotValue<Option<String>> {
+    match object.get(field) {
+        None => RecordedSnapshotValue::Unknown,
+        Some(Value::Null) => RecordedSnapshotValue::Known(None),
+        Some(value) => RecordedSnapshotValue::Known(value.as_str().map(str::to_string)),
+    }
+}
+
+fn recorded_activity_retry_snapshot(policy: Option<&Value>) -> ActivityRetrySnapshot {
+    let policy = policy.and_then(Value::as_object);
+    let backoff_seconds = policy
+        .and_then(|policy| policy.get("backoff_seconds"))
+        .and_then(Value::as_array)
+        .map(|intervals| intervals.iter().filter_map(value_as_u64).collect())
+        .map_or(RecordedSnapshotValue::Unknown, RecordedSnapshotValue::Known);
+    let mut non_retryable_error_types = Vec::new();
+    for error_type in policy
+        .and_then(|policy| policy.get("non_retryable_error_types"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|error_type| !error_type.is_empty())
+    {
+        if !non_retryable_error_types
+            .iter()
+            .any(|recorded| recorded == error_type)
+        {
+            non_retryable_error_types.push(error_type.to_string());
+        }
+    }
+
+    ActivityRetrySnapshot {
+        snapshot_version: recorded_optional_u64(policy, "snapshot_version"),
+        max_attempts: recorded_optional_u64(policy, "max_attempts"),
+        backoff_seconds,
+        start_to_close_timeout: recorded_optional_u64(policy, "start_to_close_timeout"),
+        schedule_to_start_timeout: recorded_optional_u64(policy, "schedule_to_start_timeout"),
+        schedule_to_close_timeout: recorded_optional_u64(policy, "schedule_to_close_timeout"),
+        heartbeat_timeout: recorded_optional_u64(policy, "heartbeat_timeout"),
+        non_retryable_error_types: if policy
+            .is_some_and(|policy| policy.contains_key("non_retryable_error_types"))
+        {
+            RecordedSnapshotValue::Known(non_retryable_error_types)
+        } else {
+            RecordedSnapshotValue::Unknown
+        },
+    }
+}
+
+fn current_activity_retry_snapshot(options: &ValidatedActivityOptions) -> ActivityRetrySnapshot {
+    let policy = options.retry_policy.as_ref();
+    let max_attempts = match policy.and_then(|policy| policy.get("max_attempts")) {
+        Some(Value::Null) => None,
+        Some(value) => value_as_u64(value),
+        None => Some(1),
+    };
+    let backoff_seconds = policy
+        .and_then(|policy| policy.get("backoff_seconds"))
+        .and_then(Value::as_array)
+        .map(|intervals| intervals.iter().filter_map(value_as_u64).collect())
+        .unwrap_or_default();
+    let non_retryable_error_types = policy
+        .and_then(|policy| policy.get("non_retryable_error_types"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+
+    ActivityRetrySnapshot {
+        snapshot_version: RecordedSnapshotValue::Known(Some(1)),
+        max_attempts: RecordedSnapshotValue::Known(max_attempts),
+        backoff_seconds: RecordedSnapshotValue::Known(backoff_seconds),
+        start_to_close_timeout: RecordedSnapshotValue::Known(options.start_to_close_timeout),
+        schedule_to_start_timeout: RecordedSnapshotValue::Known(options.schedule_to_start_timeout),
+        schedule_to_close_timeout: RecordedSnapshotValue::Known(options.schedule_to_close_timeout),
+        heartbeat_timeout: RecordedSnapshotValue::Known(options.heartbeat_timeout),
+        non_retryable_error_types: RecordedSnapshotValue::Known(non_retryable_error_types),
+    }
+}
+
+fn activity_options_description(options: &RecordedActivityOptions) -> String {
+    serde_json::to_string(options).unwrap_or_else(|_| format!("{options:?}"))
 }
 
 impl RecordedCommand {
@@ -2959,7 +3623,7 @@ struct ResumeSignal {
 pub struct ActivityCall {
     ctx: WorkflowContext,
     activity_type: String,
-    task_queue: Option<String>,
+    options: ActivityOptions,
     args: Option<Result<Value>>,
     scheduled: bool,
 }
@@ -2978,12 +3642,31 @@ impl Future for ActivityCall {
             return Poll::Pending;
         }
 
+        let options = match self.options.validate() {
+            Ok(options) => options,
+            Err(error) => {
+                return Poll::Ready(Err(Error::InvalidActivityOptions(error)));
+            }
+        };
+        let task_queue = options
+            .task_queue
+            .clone()
+            .unwrap_or_else(|| state.task_queue.clone());
+        let current_recorded_options = RecordedActivityOptions {
+            task_queue: RecordedSnapshotValue::Known(Some(task_queue.clone())),
+            // Rust schedules ordinary durable activities. The server records a
+            // non-null mode only for a specialized execution primitive.
+            execution_mode: RecordedSnapshotValue::Known(None),
+            retry_policy: current_activity_retry_snapshot(&options),
+        };
+
         if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
             let sequence = recorded.sequence();
             match recorded {
                 RecordedCommand::Activity {
                     activity_type,
-                    result,
+                    options: recorded_options,
+                    outcome,
                     ..
                 } => {
                     if let Some(recorded_type) = activity_type {
@@ -2999,9 +3682,53 @@ impl Future for ActivityCall {
                             )));
                         }
                     }
+                    if let Some(recorded_options) = recorded_options {
+                        if !recorded_options
+                            .task_queue
+                            .matches_current(&current_recorded_options.task_queue)
+                        {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(
+                                ReplayFailure::new(
+                                    "activity_task_queue_mismatch",
+                                    Some(sequence),
+                                    Some(activity_options_description(&recorded_options)),
+                                    Some(activity_options_description(&current_recorded_options)),
+                                    "recorded activity task queue differs from the current workflow command",
+                                ),
+                            )));
+                        }
+                        if !recorded_options
+                            .execution_mode
+                            .matches_current(&current_recorded_options.execution_mode)
+                        {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(
+                                ReplayFailure::new(
+                                    "activity_execution_mode_mismatch",
+                                    Some(sequence),
+                                    Some(activity_options_description(&recorded_options)),
+                                    Some(activity_options_description(&current_recorded_options)),
+                                    "recorded activity execution mode differs from the current workflow command",
+                                ),
+                            )));
+                        }
+                        if !recorded_options
+                            .retry_policy
+                            .matches_current(&current_recorded_options.retry_policy)
+                        {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(
+                                ReplayFailure::new(
+                                    "activity_retry_policy_mismatch",
+                                    Some(sequence),
+                                    Some(activity_options_description(&recorded_options)),
+                                    Some(activity_options_description(&current_recorded_options)),
+                                    "recorded activity retry policy differs from the current workflow command",
+                                ),
+                            )));
+                        }
+                    }
                     state.command_cursor += 1;
-                    if let Some(value) = result {
-                        return Poll::Ready(Ok(value));
+                    if let Some(outcome) = outcome {
+                        return Poll::Ready(outcome.map_err(Error::ActivityFailed));
                     }
                     state.matched_recorded_pending = true;
                     self.scheduled = true;
@@ -3017,10 +3744,6 @@ impl Future for ActivityCall {
         }
 
         if !self.scheduled {
-            let task_queue = self
-                .task_queue
-                .clone()
-                .unwrap_or_else(|| state.task_queue.clone());
             let args = match self.args.take().unwrap_or(Ok(Value::Null)) {
                 Ok(args) => args,
                 Err(error) => return Poll::Ready(Err(error)),
@@ -3031,12 +3754,35 @@ impl Future for ActivityCall {
                 Err(error) => return Poll::Ready(Err(error)),
             };
 
-            state.commands.push(json!({
-                "type": "schedule_activity",
-                "activity_type": self.activity_type.clone(),
-                "queue": task_queue,
-                "arguments": envelope
-            }));
+            let mut command = serde_json::Map::from_iter([
+                ("type".to_string(), json!("schedule_activity")),
+                (
+                    "activity_type".to_string(),
+                    json!(self.activity_type.clone()),
+                ),
+                ("queue".to_string(), json!(task_queue)),
+                ("arguments".to_string(), envelope),
+            ]);
+            for (field, value) in [
+                ("start_to_close_timeout", options.start_to_close_timeout),
+                (
+                    "schedule_to_start_timeout",
+                    options.schedule_to_start_timeout,
+                ),
+                (
+                    "schedule_to_close_timeout",
+                    options.schedule_to_close_timeout,
+                ),
+                ("heartbeat_timeout", options.heartbeat_timeout),
+            ] {
+                if let Some(value) = value {
+                    command.insert(field.to_string(), json!(value));
+                }
+            }
+            if let Some(retry_policy) = options.retry_policy {
+                command.insert("retry_policy".to_string(), retry_policy);
+            }
+            state.commands.push(Value::Object(command));
             self.scheduled = true;
         }
 
@@ -3568,38 +4314,49 @@ fn recorded_commands(
                         "activity lifecycle events at one workflow sequence disagree on identity",
                     ));
                 }
-                let completed: Vec<_> = activity_events
+                let terminal: Vec<_> = activity_events
                     .iter()
                     .copied()
-                    .filter(|event| event.event_type == "ActivityCompleted")
-                    .collect();
-                if completed.len() > 1 {
-                    return Err(invalid_recorded_history(
-                        "duplicate_activity_completion",
-                        sequence,
-                        "one ActivityCompleted event",
-                        "multiple ActivityCompleted events",
-                        "activity history contains more than one completion for a workflow sequence",
-                    ));
-                }
-                let result = completed
-                    .first()
-                    .map(|event| {
-                        let codec = event
-                            .payload
-                            .get("payload_codec")
-                            .and_then(Value::as_str)
-                            .unwrap_or(fallback_codec);
-                        decode_wire_value(
-                            event.payload.get("result").unwrap_or(&Value::Null),
-                            codec,
+                    .filter(|event| {
+                        matches!(
+                            event.event_type.as_str(),
+                            "ActivityCompleted"
+                                | "ActivityFailed"
+                                | "ActivityCancelled"
+                                | "ActivityTimedOut"
                         )
                     })
+                    .collect();
+                if terminal.len() > 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_activity_terminal_event",
+                        sequence,
+                        "at most one terminal activity event",
+                        "multiple terminal activity events",
+                        "activity history settles one command more than once",
+                    ));
+                }
+                let outcome = terminal
+                    .first()
+                    .map(|event| activity_outcome(event, fallback_codec, activity_type.clone()))
                     .transpose()?;
+                let options = activity_events
+                    .iter()
+                    .find(|event| event.event_type == "ActivityScheduled")
+                    .and_then(|event| event.payload.get("activity"))
+                    .and_then(Value::as_object)
+                    .map(|activity| RecordedActivityOptions {
+                        task_queue: recorded_optional_string(activity, "queue"),
+                        execution_mode: recorded_optional_string(activity, "execution_mode"),
+                        retry_policy: recorded_activity_retry_snapshot(
+                            activity.get("retry_policy"),
+                        ),
+                    });
                 return Ok(RecordedCommand::Activity {
                     sequence,
                     activity_type,
-                    result,
+                    options,
+                    outcome,
                 });
             }
 
@@ -3880,6 +4637,99 @@ fn invalid_recorded_history(
     ))
 }
 
+type ActivityOutcome = std::result::Result<Value, ActivityFailure>;
+
+fn activity_outcome(
+    event: &HistoryEvent,
+    fallback_codec: &str,
+    recorded_activity_type: Option<String>,
+) -> Result<ActivityOutcome> {
+    if event.event_type == "ActivityCompleted" {
+        let codec = event
+            .payload
+            .get("payload_codec")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_codec);
+        return Ok(Ok(decode_wire_value(
+            event.payload.get("result").unwrap_or(&Value::Null),
+            codec,
+        )?));
+    }
+
+    let payload = &event.payload;
+    let (kind, fallback_reason, fallback_message) = match event.event_type.as_str() {
+        "ActivityFailed" => (ActivityFailureKind::Failed, "activity", "activity failed"),
+        "ActivityCancelled" => (
+            ActivityFailureKind::Cancelled,
+            "cancelled",
+            "activity was cancelled",
+        ),
+        "ActivityTimedOut" => (
+            ActivityFailureKind::TimedOut,
+            "timeout",
+            "activity timed out",
+        ),
+        _ => unreachable!("activity_outcome is called only for terminal activity events"),
+    };
+    let exception = payload
+        .get("exception")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let failure_category = payload_string(payload, "failure_category");
+    let timeout_kind = payload_string(payload, "timeout_kind");
+    let reason = payload_string(payload, "reason").unwrap_or_else(|| match kind {
+        ActivityFailureKind::Failed => failure_category
+            .clone()
+            .unwrap_or_else(|| fallback_reason.to_string()),
+        ActivityFailureKind::Cancelled => fallback_reason.to_string(),
+        ActivityFailureKind::TimedOut => timeout_kind
+            .clone()
+            .unwrap_or_else(|| fallback_reason.to_string()),
+    });
+    let message = payload_string(payload, "message")
+        .or_else(|| {
+            exception
+                .as_ref()
+                .and_then(|value| payload_string(value, "message"))
+        })
+        .unwrap_or_else(|| fallback_message.to_string());
+
+    Ok(Err(ActivityFailure {
+        kind,
+        reason,
+        message,
+        activity_execution_id: payload_string(payload, "activity_execution_id"),
+        activity_attempt_id: payload_string(payload, "activity_attempt_id"),
+        activity_type: payload_string(payload, "activity_type")
+            .or_else(|| payload_string(payload, "activity_name"))
+            .or(recorded_activity_type),
+        activity_class: payload_string(payload, "activity_class"),
+        attempt_number: payload.get("attempt_number").and_then(value_as_u64),
+        failure_id: payload_string(payload, "failure_id"),
+        failure_category,
+        timeout_kind,
+        non_retryable: payload
+            .get("non_retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        exception_type: payload_string(payload, "exception_type").or_else(|| {
+            exception
+                .as_ref()
+                .and_then(|value| payload_string(value, "type"))
+        }),
+        exception_class: payload_string(payload, "exception_class").or_else(|| {
+            exception
+                .as_ref()
+                .and_then(|value| payload_string(value, "class"))
+        }),
+        code: payload
+            .get("code")
+            .filter(|value| !value.is_null())
+            .cloned(),
+        exception,
+    }))
+}
+
 type ChildWorkflowOutcome = std::result::Result<ChildWorkflowResult, ChildWorkflowFailure>;
 
 fn child_workflow_outcomes(
@@ -3994,6 +4844,30 @@ fn payload_string(payload: &Value, key: &str) -> Option<String> {
 
 fn workflow_failure_command(error: &Error) -> Value {
     let (exception_type, exception_class, properties) = match error {
+        Error::ActivityFailed(failure) => (
+            match failure.kind {
+                ActivityFailureKind::Failed => "ActivityFailed",
+                ActivityFailureKind::Cancelled => "ActivityCancelled",
+                ActivityFailureKind::TimedOut => "ActivityTimedOut",
+            },
+            "durable_workflow::ActivityFailure",
+            json!({
+                "reason": failure.reason,
+                "activity_execution_id": failure.activity_execution_id,
+                "activity_attempt_id": failure.activity_attempt_id,
+                "activity_type": failure.activity_type,
+                "activity_class": failure.activity_class,
+                "attempt_number": failure.attempt_number,
+                "failure_id": failure.failure_id,
+                "failure_category": failure.failure_category,
+                "timeout_kind": failure.timeout_kind,
+                "activity_non_retryable": failure.non_retryable,
+                "activity_exception_type": failure.exception_type,
+                "activity_exception_class": failure.exception_class,
+                "activity_code": failure.code,
+                "activity_exception": failure.exception,
+            }),
+        ),
         Error::ChildWorkflowFailed(failure) => (
             match failure.kind {
                 ChildWorkflowFailureKind::Failed => "ChildWorkflowFailed",
@@ -4025,6 +4899,7 @@ fn workflow_failure_command(error: &Error) -> Value {
         _ => ("RustWorkflowError", "durable_workflow::Error", Value::Null),
     };
     let non_retryable = match error {
+        Error::ActivityFailed(failure) => failure.non_retryable,
         Error::ChildWorkflowFailed(failure) => failure.non_retryable,
         Error::NonDeterministicReplay(_) => true,
         _ => false,
@@ -4521,6 +5396,96 @@ mod tests {
         }
     }
 
+    fn completed_retry_activity_history() -> Vec<HistoryEvent> {
+        vec![
+            history_event(
+                "ActivityScheduled",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-1",
+                    "activity": {
+                        "id": "act-1",
+                        "sequence": 1,
+                        "type": "flaky",
+                        "queue": "critical-activities",
+                        "execution_mode": null,
+                        "retry_policy": {
+                            "snapshot_version": 1,
+                            "max_attempts": 3,
+                            "backoff_seconds": [2, 4],
+                            "start_to_close_timeout": 30,
+                            "schedule_to_start_timeout": 5,
+                            "schedule_to_close_timeout": 90,
+                            "heartbeat_timeout": 10,
+                            "non_retryable_error_types": ["PermanentError"]
+                        }
+                    }
+                }),
+            ),
+            history_event(
+                "ActivityStarted",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-1",
+                    "activity_attempt_id": "attempt-1",
+                    "attempt_number": 1
+                }),
+            ),
+            history_event(
+                "ActivityRetryScheduled",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-1",
+                    "activity_attempt_id": "attempt-1",
+                    "attempt_number": 1,
+                    "retry_after_attempt": 1,
+                    "retry_backoff_seconds": 2,
+                    "failure_category": "activity",
+                    "exception_type": "TransientError"
+                }),
+            ),
+            history_event(
+                "ActivityStarted",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-1",
+                    "activity_attempt_id": "attempt-2",
+                    "attempt_number": 2
+                }),
+            ),
+            history_event(
+                "ActivityCompleted",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-1",
+                    "activity_attempt_id": "attempt-2",
+                    "attempt_number": 2,
+                    "payload_codec": "json",
+                    "result": {"codec": "json", "blob": "{\"status\":\"recovered\"}"}
+                }),
+            ),
+        ]
+    }
+
+    fn retry_activity_options() -> ActivityOptions {
+        ActivityOptions::new()
+            .task_queue("critical-activities")
+            .retry_policy(
+                ActivityRetryPolicy::new(3)
+                    .backoff_intervals([Duration::from_secs(2), Duration::from_secs(4)])
+                    .non_retryable_error_type("PermanentError"),
+            )
+            .start_to_close_timeout(Duration::from_secs(30))
+            .schedule_to_start_timeout(Duration::from_secs(5))
+            .schedule_to_close_timeout(Duration::from_secs(90))
+            .heartbeat_timeout(Duration::from_secs(10))
+    }
+
     #[test]
     fn avro_generic_wrapper_round_trips_json_values() {
         let value = json!({"greeting": "hello", "count": 3, "ok": true});
@@ -4579,6 +5544,555 @@ mod tests {
         let commands = ctx.take_commands().expect("commands");
         assert_eq!(commands[0]["type"], "schedule_activity");
         assert_eq!(commands[0]["activity_type"], "hello.activity");
+    }
+
+    #[test]
+    fn activity_options_encode_retry_policy_queue_and_every_timeout() {
+        let ctx = workflow_context(Vec::new());
+        let options = ActivityOptions::new()
+            .task_queue("payments")
+            .retry_policy(
+                ActivityRetryPolicy::new(4)
+                    .exponential_backoff(Duration::from_secs(1), 3, Some(Duration::from_secs(10)))
+                    .non_retryable_error_type("ValidationError"),
+            )
+            .start_to_close_timeout(Duration::from_secs(120))
+            .schedule_to_start_timeout(Duration::from_secs(10))
+            .schedule_to_close_timeout(Duration::from_secs(300))
+            .heartbeat_timeout(Duration::from_secs(15));
+        let mut call = Box::pin(ctx.activity_with_options(
+            "charge-card",
+            options,
+            json!([{"order_id": "o-1"}]),
+        ));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+
+        let commands = ctx.take_commands().expect("activity command");
+        assert_eq!(commands.len(), 1, "one future emits one logical schedule");
+        assert_eq!(commands[0]["queue"], "payments");
+        assert_eq!(
+            commands[0]["retry_policy"],
+            json!({
+                "max_attempts": 4,
+                "backoff_seconds": [1, 3, 9],
+                "non_retryable_error_types": ["ValidationError"],
+            })
+        );
+        assert_eq!(commands[0]["start_to_close_timeout"], 120);
+        assert_eq!(commands[0]["schedule_to_start_timeout"], 10);
+        assert_eq!(commands[0]["schedule_to_close_timeout"], 300);
+        assert_eq!(commands[0]["heartbeat_timeout"], 15);
+    }
+
+    #[test]
+    fn activity_options_encode_explicit_and_rounded_backoff_intervals() {
+        let ctx = workflow_context(Vec::new());
+        let options = ActivityOptions::new().retry_policy(
+            ActivityRetryPolicy::new(3)
+                .backoff_intervals([Duration::from_millis(1), Duration::from_millis(1_001)]),
+        );
+        let mut call = Box::pin(ctx.activity_with_options("work", options, json!([])));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert_eq!(
+            ctx.take_commands().expect("command")[0]["retry_policy"]["backoff_seconds"],
+            json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn invalid_activity_options_return_typed_errors_before_emitting_commands() {
+        let cases = [
+            (
+                ActivityOptions::new().task_queue("  "),
+                ActivityOptionsErrorKind::EmptyTaskQueue,
+            ),
+            (
+                ActivityOptions::new().retry_policy(ActivityRetryPolicy::default()),
+                ActivityOptionsErrorKind::EmptyRetryPolicy,
+            ),
+            (
+                ActivityOptions::new().retry_policy(ActivityRetryPolicy::new(0)),
+                ActivityOptionsErrorKind::InvalidMaxAttempts,
+            ),
+            (
+                ActivityOptions::new().retry_policy(ActivityRetryPolicy {
+                    max_attempts: None,
+                    backoff: Some(ActivityBackoff::Explicit(vec![Duration::from_secs(1)])),
+                    non_retryable_error_types: Vec::new(),
+                }),
+                ActivityOptionsErrorKind::BackoffWithoutRetryBudget,
+            ),
+            (
+                ActivityOptions::new().retry_policy(
+                    ActivityRetryPolicy::new(2)
+                        .backoff_intervals([Duration::from_secs(1), Duration::from_secs(2)]),
+                ),
+                ActivityOptionsErrorKind::TooManyBackoffIntervals,
+            ),
+            (
+                ActivityOptions::new().retry_policy(
+                    ActivityRetryPolicy::new(2).exponential_backoff(
+                        Duration::from_secs(1),
+                        0,
+                        None,
+                    ),
+                ),
+                ActivityOptionsErrorKind::InvalidBackoffCoefficient,
+            ),
+            (
+                ActivityOptions::new()
+                    .retry_policy(ActivityRetryPolicy::new(2).non_retryable_error_type("  ")),
+                ActivityOptionsErrorKind::EmptyNonRetryableErrorType,
+            ),
+            (
+                ActivityOptions::new().retry_policy(
+                    ActivityRetryPolicy::new(10_002).exponential_backoff(
+                        Duration::from_secs(1),
+                        1,
+                        None,
+                    ),
+                ),
+                ActivityOptionsErrorKind::BackoffGenerationTooLarge,
+            ),
+            (
+                ActivityOptions::new().retry_policy(
+                    ActivityRetryPolicy::new(2)
+                        .backoff_intervals([Duration::from_secs(i64::MAX as u64 + 1)]),
+                ),
+                ActivityOptionsErrorKind::BackoffOverflow,
+            ),
+        ];
+
+        for (options, expected_kind) in cases {
+            let ctx = workflow_context(Vec::new());
+            let mut call = Box::pin(ctx.activity_with_options("work", options, json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::InvalidActivityOptions(error))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("expected typed activity validation error");
+            };
+            assert_eq!(error.kind, expected_kind);
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    #[test]
+    fn activity_options_validate_positive_and_ordered_timeouts() {
+        let zero_timeout_cases = [
+            ActivityOptions::new().start_to_close_timeout(Duration::ZERO),
+            ActivityOptions::new().schedule_to_start_timeout(Duration::ZERO),
+            ActivityOptions::new().schedule_to_close_timeout(Duration::ZERO),
+            ActivityOptions::new().heartbeat_timeout(Duration::ZERO),
+        ];
+        for options in zero_timeout_cases {
+            assert_eq!(
+                options.validate().expect_err("zero timeout").kind,
+                ActivityOptionsErrorKind::TimeoutNotPositive
+            );
+        }
+
+        let ordering_cases = [
+            ActivityOptions::new()
+                .heartbeat_timeout(Duration::from_secs(11))
+                .start_to_close_timeout(Duration::from_secs(10)),
+            ActivityOptions::new()
+                .start_to_close_timeout(Duration::from_secs(31))
+                .schedule_to_close_timeout(Duration::from_secs(30)),
+            ActivityOptions::new()
+                .schedule_to_start_timeout(Duration::from_secs(31))
+                .schedule_to_close_timeout(Duration::from_secs(30)),
+        ];
+        for options in ordering_cases {
+            assert_eq!(
+                options.validate().expect_err("timeout order").kind,
+                ActivityOptionsErrorKind::TimeoutOrder
+            );
+        }
+
+        assert_eq!(
+            ActivityOptions::new()
+                .start_to_close_timeout(Duration::from_secs(i64::MAX as u64 + 1))
+                .validate()
+                .expect_err("protocol integer overflow")
+                .kind,
+            ActivityOptionsErrorKind::TimeoutOverflow
+        );
+    }
+
+    #[test]
+    fn replayed_activity_retry_history_completes_without_duplicate_schedule() {
+        let ctx = workflow_context(completed_retry_activity_history());
+        let mut call =
+            Box::pin(ctx.activity_with_options("flaky", retry_activity_options(), json!([])));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(result)) if result == json!({"status": "recovered"})
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+        ctx.ensure_history_consumed().expect("history consumed");
+    }
+
+    #[test]
+    fn duplicate_non_retryable_types_use_one_command_and_replay_representation() {
+        let mut options = retry_activity_options();
+        options
+            .retry_policy
+            .as_mut()
+            .expect("retry policy")
+            .non_retryable_error_types
+            .extend([" PermanentError ".to_string(), "PermanentError".to_string()]);
+
+        let new_ctx = workflow_context(Vec::new());
+        let mut new_call =
+            Box::pin(new_ctx.activity_with_options("flaky", options.clone(), json!([])));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            new_call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = new_ctx.take_commands().expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0]["retry_policy"]["non_retryable_error_types"],
+            json!(["PermanentError"])
+        );
+
+        let replay_ctx = workflow_context(completed_retry_activity_history());
+        let mut replay_call =
+            Box::pin(replay_ctx.activity_with_options("flaky", options, json!([])));
+        assert!(matches!(
+            replay_call.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(result)) if result == json!({"status": "recovered"})
+        ));
+        assert!(replay_ctx.take_commands().expect("commands").is_empty());
+        replay_ctx
+            .ensure_history_consumed()
+            .expect("history consumed");
+    }
+
+    #[test]
+    fn replayed_intermediate_retry_remains_pending_across_restarts() {
+        let history = completed_retry_activity_history()
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+
+        for _restart in 0..2 {
+            let ctx = workflow_context(history.clone());
+            let mut call =
+                Box::pin(ctx.activity_with_options("flaky", retry_activity_options(), json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                call.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    #[test]
+    fn replayed_activity_rejects_changed_queue_retry_and_every_timeout_field() {
+        let mut changed_queue = retry_activity_options();
+        changed_queue.task_queue = Some("different-queue".to_string());
+
+        let mut changed_max_attempts = retry_activity_options();
+        let retry_policy = changed_max_attempts
+            .retry_policy
+            .as_mut()
+            .expect("retry policy");
+        retry_policy.max_attempts = Some(4);
+
+        let mut changed_backoff = retry_activity_options();
+        let retry_policy = changed_backoff.retry_policy.as_mut().expect("retry policy");
+        retry_policy.backoff = Some(ActivityBackoff::Explicit(vec![
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+        ]));
+
+        let mut changed_non_retryable_types = retry_activity_options();
+        let retry_policy = changed_non_retryable_types
+            .retry_policy
+            .as_mut()
+            .expect("retry policy");
+        retry_policy.non_retryable_error_types = vec!["AnotherPermanentError".to_string()];
+
+        let mut changed_start_to_close = retry_activity_options();
+        changed_start_to_close.start_to_close_timeout = Some(Duration::from_secs(31));
+        let mut changed_schedule_to_start = retry_activity_options();
+        changed_schedule_to_start.schedule_to_start_timeout = Some(Duration::from_secs(6));
+        let mut changed_schedule_to_close = retry_activity_options();
+        changed_schedule_to_close.schedule_to_close_timeout = Some(Duration::from_secs(91));
+        let mut changed_heartbeat = retry_activity_options();
+        changed_heartbeat.heartbeat_timeout = Some(Duration::from_secs(11));
+
+        let cases = [
+            (changed_queue, "activity_task_queue_mismatch"),
+            (changed_max_attempts, "activity_retry_policy_mismatch"),
+            (changed_backoff, "activity_retry_policy_mismatch"),
+            (
+                changed_non_retryable_types,
+                "activity_retry_policy_mismatch",
+            ),
+            (changed_start_to_close, "activity_retry_policy_mismatch"),
+            (changed_schedule_to_start, "activity_retry_policy_mismatch"),
+            (changed_schedule_to_close, "activity_retry_policy_mismatch"),
+            (changed_heartbeat, "activity_retry_policy_mismatch"),
+        ];
+
+        for (options, expected_reason) in cases {
+            let ctx = workflow_context(completed_retry_activity_history());
+            let mut call = Box::pin(ctx.activity_with_options("flaky", options, json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("changed activity options must fail replay");
+            };
+            assert_eq!(failure.reason, expected_reason);
+            assert_eq!(failure.sequence, Some(1));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    #[test]
+    fn replayed_activity_rejects_changed_execution_mode_and_snapshot_version() {
+        let cases = [
+            (
+                "execution_mode",
+                json!("local"),
+                "activity_execution_mode_mismatch",
+            ),
+            (
+                "snapshot_version",
+                json!(2),
+                "activity_retry_policy_mismatch",
+            ),
+        ];
+
+        for (field, value, expected_reason) in cases {
+            let mut history = completed_retry_activity_history();
+            let activity = history[0].payload["activity"]
+                .as_object_mut()
+                .expect("activity snapshot");
+            if field == "execution_mode" {
+                activity.insert(field.to_string(), value);
+            } else {
+                activity["retry_policy"]
+                    .as_object_mut()
+                    .expect("retry snapshot")
+                    .insert(field.to_string(), value);
+            }
+
+            let ctx = workflow_context(history);
+            let mut call =
+                Box::pin(ctx.activity_with_options("flaky", retry_activity_options(), json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("changed {field} must fail replay");
+            };
+            assert_eq!(failure.reason, expected_reason);
+            assert_eq!(failure.sequence, Some(1));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    #[test]
+    fn replayed_legacy_activity_treats_missing_option_snapshot_as_unknown() {
+        let mut history = completed_retry_activity_history();
+        let activity = history[0].payload["activity"]
+            .as_object_mut()
+            .expect("activity snapshot");
+        activity.remove("execution_mode");
+        activity.remove("retry_policy");
+
+        let mut current = retry_activity_options();
+        current.start_to_close_timeout = Some(Duration::from_secs(45));
+        current.schedule_to_start_timeout = Some(Duration::from_secs(8));
+        current.schedule_to_close_timeout = Some(Duration::from_secs(120));
+        current.heartbeat_timeout = Some(Duration::from_secs(12));
+
+        let ctx = workflow_context(history);
+        let mut call = Box::pin(ctx.activity_with_options("flaky", current, json!([])));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(result)) if result == json!({"status": "recovered"})
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+        ctx.ensure_history_consumed().expect("history consumed");
+    }
+
+    #[test]
+    fn terminal_activity_failed_after_start_returns_typed_failure() {
+        let history = vec![
+            history_event(
+                "ActivityScheduled",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-terminal",
+                    "activity": {
+                        "id": "act-terminal",
+                        "sequence": 1,
+                        "type": "flaky",
+                        "queue": "critical-activities",
+                        "retry_policy": {
+                            "snapshot_version": 1,
+                            "max_attempts": 3,
+                            "backoff_seconds": [2, 4],
+                            "non_retryable_error_types": ["PermanentError"]
+                        }
+                    }
+                }),
+            ),
+            history_event(
+                "ActivityStarted",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-terminal",
+                    "activity_attempt_id": "attempt-1",
+                    "attempt_number": 1
+                }),
+            ),
+            history_event(
+                "ActivityFailed",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "flaky",
+                    "activity_execution_id": "act-terminal",
+                    "activity_attempt_id": "attempt-1",
+                    "attempt_number": 1,
+                    "failure_id": "failure-terminal",
+                    "failure_category": "activity",
+                    "exception_type": "PermanentError",
+                    "message": "cannot retry",
+                    "non_retryable": true
+                }),
+            ),
+        ];
+        let ctx = workflow_context(history);
+        let mut call =
+            Box::pin(ctx.activity_with_options("flaky", retry_activity_options(), json!([])));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        let Poll::Ready(Err(Error::ActivityFailed(failure))) =
+            call.as_mut().poll(&mut task_context)
+        else {
+            panic!("terminal ActivityFailed must settle the activity future");
+        };
+        assert_eq!(failure.kind, ActivityFailureKind::Failed);
+        assert_eq!(
+            failure.activity_execution_id.as_deref(),
+            Some("act-terminal")
+        );
+        assert_eq!(failure.exception_type.as_deref(), Some("PermanentError"));
+        assert!(failure.non_retryable);
+        assert!(ctx.take_commands().expect("commands").is_empty());
+        ctx.ensure_history_consumed().expect("history consumed");
+    }
+
+    #[test]
+    fn activity_terminal_events_return_machine_readable_failures() {
+        let cases = [
+            (
+                "ActivityFailed",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "charge-card",
+                    "activity_execution_id": "act-1",
+                    "activity_attempt_id": "attempt-2",
+                    "attempt_number": 2,
+                    "failure_id": "failure-1",
+                    "failure_category": "activity",
+                    "exception_type": "PaymentDeclined",
+                    "exception_class": "payments.PaymentDeclined",
+                    "message": "card declined",
+                    "non_retryable": true
+                }),
+                ActivityFailureKind::Failed,
+                "activity",
+            ),
+            (
+                "ActivityCancelled",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "charge-card",
+                    "activity_execution_id": "act-1",
+                    "activity_attempt_id": "attempt-1"
+                }),
+                ActivityFailureKind::Cancelled,
+                "cancelled",
+            ),
+        ];
+
+        for (event_type, payload, expected_kind, expected_reason) in cases {
+            let ctx = workflow_context(vec![history_event(event_type, payload)]);
+            let mut call = Box::pin(ctx.activity("charge-card", json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::ActivityFailed(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("expected terminal activity failure");
+            };
+            assert_eq!(failure.kind, expected_kind);
+            assert_eq!(failure.reason, expected_reason);
+            assert_eq!(failure.activity_execution_id.as_deref(), Some("act-1"));
+            assert_eq!(failure.activity_type.as_deref(), Some("charge-card"));
+        }
+    }
+
+    #[test]
+    fn every_activity_timeout_class_is_typed() {
+        for timeout_kind in [
+            "start_to_close",
+            "schedule_to_start",
+            "schedule_to_close",
+            "heartbeat",
+        ] {
+            let ctx = workflow_context(vec![history_event(
+                "ActivityTimedOut",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "slow",
+                    "activity_execution_id": "act-timeout",
+                    "activity_attempt_id": "attempt-timeout",
+                    "failure_category": "timeout",
+                    "timeout_kind": timeout_kind,
+                    "message": "deadline expired"
+                }),
+            )]);
+            let mut call = Box::pin(ctx.activity("slow", json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::ActivityFailed(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("expected timeout failure");
+            };
+            assert_eq!(failure.kind, ActivityFailureKind::TimedOut);
+            assert_eq!(failure.reason, timeout_kind);
+            assert_eq!(failure.timeout_kind.as_deref(), Some(timeout_kind));
+            assert_eq!(failure.failure_category.as_deref(), Some("timeout"));
+        }
     }
 
     #[test]
