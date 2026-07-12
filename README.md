@@ -14,24 +14,26 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.10 --exact
+cargo add durable-workflow@0.1.11 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.10"
+durable-workflow = "=0.1.11"
 ```
 
-Version `0.1.10` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.11` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
 timeout, and typed terminal options are available from `0.1.7`. Workflow
 cancellation, termination, selected-run safety, and typed workflow outcomes
 are available from `0.1.8`. Advertised worker-heartbeat cadence remains bounded
-after delayed acknowledgements and retries from `0.1.9`.
+after delayed acknowledgements and retries from `0.1.9`. From `0.1.11`, an
+uncaught error returned by a workflow handler settles the run as a typed
+workflow failure instead of leaving the workflow task to retry indefinitely.
 
 ## Compatibility
 

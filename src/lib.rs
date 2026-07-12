@@ -3064,6 +3064,12 @@ impl Worker {
         self
     }
 
+    /// Register a workflow handler.
+    ///
+    /// An uncaught [`enum@Error`] returned by the handler fails the workflow run and
+    /// is reported to clients as [`Error::WorkflowFailed`]. Errors that occur
+    /// while acquiring or decoding a worker task remain worker-operation
+    /// failures and do not get converted into workflow outcomes.
     pub fn register_workflow<F, Fut>(&mut self, workflow_type: impl Into<String>, handler: F)
     where
         F: Fn(WorkflowContext, Value) -> Fut + Send + Sync + 'static,
@@ -3887,10 +3893,7 @@ impl Worker {
                     "result": result
                 })])
             }
-            Poll::Ready(Err(error @ Error::ChildWorkflowFailed(_))) => {
-                Ok(vec![workflow_failure_command(&error)])
-            }
-            Poll::Ready(Err(error)) => Err(error),
+            Poll::Ready(Err(error)) => Ok(vec![workflow_failure_command(&error)]),
             Poll::Pending => {
                 let commands = ctx.take_commands()?;
                 if commands.is_empty() && !ctx.matched_recorded_pending()? {
@@ -7465,6 +7468,49 @@ mod tests {
         assert_eq!(
             decode_wire_value(&replayed[0]["result"], JSON_CODEC).expect("result"),
             json!("done")
+        );
+    }
+
+    #[test]
+    fn uncaught_workflow_handler_error_emits_terminal_failure_command() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.failing", |_ctx, _input| async move {
+            Err(Error::Codec("rust_conformance_failure".to_string()))
+        });
+        let task = WorkflowTask {
+            task_id: "wft-rust-failing-1".to_string(),
+            workflow_id: Some("wf-rust-failing".to_string()),
+            run_id: Some("run-rust-failing".to_string()),
+            workflow_type: "rust.failing".to_string(),
+            payload_codec: JSON_CODEC.to_string(),
+            arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("input")),
+            history_events: Vec::new(),
+            total_history_events: Some(0),
+            next_history_page_token: None,
+            workflow_task_attempt: 1,
+            workflow_signal_id: None,
+            signal_name: None,
+            signal_arguments: None,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("handler failure becomes a workflow command");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], "fail_workflow");
+        assert_eq!(commands[0]["exception_type"], "RustWorkflowError");
+        assert_eq!(commands[0]["exception_class"], "durable_workflow::Error");
+        assert_eq!(commands[0]["non_retryable"], false);
+        assert_eq!(
+            commands[0]["message"],
+            "codec error: rust_conformance_failure"
+        );
+        assert_eq!(
+            commands[0]["exception"]["message"],
+            "codec error: rust_conformance_failure"
         );
     }
 
