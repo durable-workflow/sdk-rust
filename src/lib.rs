@@ -3156,11 +3156,18 @@ impl Worker {
         F: Future<Output = ()>,
     {
         let registration = self.register().await?;
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(
+        let heartbeat_interval = Duration::from_secs(
             registration
                 .heartbeat_interval_seconds
                 .unwrap_or(self.heartbeat_interval.as_secs().max(1)),
-        ));
+        );
+        // The first heartbeat is immediate. Subsequent heartbeats are scheduled
+        // from the completion of the preceding attempt, including its bounded
+        // retries. A fixed-epoch interval can leave an already-due tick queued
+        // while an acknowledgement is slow, producing a catch-up heartbeat as
+        // soon as that request completes.
+        let heartbeat = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(heartbeat);
         tokio::pin!(shutdown);
         let stop = Arc::new(AtomicBool::new(false));
         // Poll responses may already have leased server-side work by the time
@@ -3188,15 +3195,18 @@ impl Worker {
                     stop.store(true, Ordering::SeqCst);
                     break;
                 }
-                _ = heartbeat.tick() => {
-                    match self.retry_worker_operation(|| {
+                _ = &mut heartbeat => {
+                    let result = self.retry_worker_operation(|| {
                         self.client.heartbeat_worker(
                             &self.worker_id,
                             self.max_concurrent_workflow_tasks,
                             self.max_concurrent_activity_tasks,
                         )
-                    }).await
-                    {
+                    }).await;
+                    heartbeat
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + heartbeat_interval);
+                    match result {
                         Ok(acknowledgement) => {
                             if let Some(observer) = &self.heartbeat_observer {
                                 observer(&WorkerHeartbeatObservation {
@@ -8823,6 +8833,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_worker_heartbeat_keeps_cadence_and_pollers_live() {
+        let server = MockWorkerServer::delayed_heartbeat_worker();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("client");
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observations);
+        let mut worker = Worker::new(client, "rust-snapshot-workers")
+            .worker_id("rust-snapshot-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .on_worker_heartbeat(move |observation| {
+                observed
+                    .lock()
+                    .expect("heartbeat observations")
+                    .push(observation.clone());
+            });
+
+        worker.register_workflow("snapshot", |ctx, _input| async move {
+            ctx.wait_signal("finish").await?;
+            Ok(json!({"status": "finished"}))
+        });
+        worker.register_query("snapshot", "current", |ctx, _args| async move {
+            Ok(json!(ctx
+                .signals("increment")
+                .iter()
+                .filter_map(|arguments| arguments.first().and_then(Value::as_i64))
+                .sum::<i64>()))
+        });
+        worker.register_activity("cancel-aware", |_ctx, _args| async move {
+            Ok(json!({"late": "completion"}))
+        });
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(3_800)))
+            .await
+            .expect("delayed heartbeat must allow a clean worker shutdown");
+
+        let observations = observations.lock().expect("heartbeat observations");
+        assert!(
+            observations.len() >= 3,
+            "the immediate heartbeat, delayed acknowledgement, and next cadence heartbeat must complete"
+        );
+        assert!(
+            observations.windows(2).all(|pair| {
+                pair[1].acknowledged_at_unix_millis
+                    .saturating_sub(pair[0].acknowledged_at_unix_millis)
+                    >= 850
+            }),
+            "successful acknowledgements must not catch up faster than the advertised one-second cadence: {observations:?}"
+        );
+        drop(observations);
+
+        let heartbeat_times = server.request_times("/api/worker/heartbeat");
+        let delayed_request_at = *heartbeat_times
+            .get(1)
+            .expect("intentionally delayed heartbeat request");
+        let delay_window_start = delayed_request_at + Duration::from_millis(100);
+        let delay_window_end = delayed_request_at + Duration::from_millis(1_400);
+        for path in [
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            assert!(
+                server
+                    .request_times(path)
+                    .iter()
+                    .any(|received_at| *received_at >= delay_window_start
+                        && *received_at <= delay_window_end),
+                "{path} must keep polling while a heartbeat acknowledgement is delayed"
+            );
+        }
+        assert!(
+            server.request_count("/api/worker/workflow-tasks/snapshot-wait-3/fail") >= 1,
+            "workflow work must be settled"
+        );
+        assert!(
+            server.request_count("/api/worker/activity-tasks/activity-cancel/complete") >= 1,
+            "activity work must be settled"
+        );
+        assert!(
+            server.request_count("/api/worker/query-tasks/snapshot-current/complete") >= 1,
+            "query work must be settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn retried_worker_heartbeat_restarts_the_advertised_cadence() {
+        let server = MockWorkerServer::heartbeat_retry_worker();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observations);
+        let worker = Worker::new(client, "rust-workers")
+            .worker_id("heartbeat-retry-worker")
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_millis(300),
+                max_backoff: Duration::from_millis(300),
+            })
+            .on_worker_heartbeat(move |observation| {
+                observed
+                    .lock()
+                    .expect("heartbeat observations")
+                    .push(observation.clone());
+            });
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(2_700)))
+            .await
+            .expect("retryable heartbeat failure must remain bounded and recover");
+
+        let observations = observations.lock().expect("heartbeat observations");
+        assert!(observations.len() >= 3, "heartbeat retry must recover");
+        assert!(
+            observations.windows(2).all(|pair| {
+                pair[1]
+                    .acknowledged_at_unix_millis
+                    .saturating_sub(pair[0].acknowledged_at_unix_millis)
+                    >= 850
+            }),
+            "a successful retry must start a fresh advertised cadence: {observations:?}"
+        );
+        assert_eq!(
+            server.request_count("/api/worker/heartbeat"),
+            observations.len() + 1,
+            "one retryable failure must add exactly one bounded request"
+        );
+    }
+
+    #[tokio::test]
     async fn query_enabled_worker_stays_live_when_signal_replay_emits_no_commands() {
         let server = MockWorkerServer::waiting_query_worker();
         let client = Client::builder(server.base_url())
@@ -8995,6 +9139,7 @@ mod tests {
         path: String,
         worker_protocol: Option<String>,
         body: String,
+        received_at: Instant,
     }
 
     struct MockWorkerServer {
@@ -9011,6 +9156,10 @@ mod tests {
         waiting_query_worker: bool,
         poll_failures_per_path: usize,
         heartbeat_failures: usize,
+        heartbeat_failure_request: Option<usize>,
+        delayed_heartbeat_request: Option<usize>,
+        heartbeat_response_delay: Duration,
+        concurrent_requests: bool,
         unauthorized_polls: bool,
         cancelled_activity: bool,
         draining_polls: bool,
@@ -9046,6 +9195,26 @@ mod tests {
             Self::start_with_behavior(MockWorkerBehavior {
                 poll_failures_per_path: 1,
                 heartbeat_failures: 1,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn delayed_heartbeat_worker() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                waiting_query_worker: true,
+                delayed_heartbeat_request: Some(2),
+                heartbeat_response_delay: Duration::from_millis(1_500),
+                concurrent_requests: true,
+                cancelled_activity: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn heartbeat_retry_worker() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                waiting_query_worker: true,
+                heartbeat_failure_request: Some(2),
+                concurrent_requests: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -9089,16 +9258,38 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server_requests = Arc::clone(&requests);
             let thread = thread::spawn(move || {
+                let mut request_threads = Vec::new();
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            handle_mock_worker_request(&mut stream, &server_requests, behavior)
+                            if behavior.concurrent_requests {
+                                let requests = Arc::clone(&server_requests);
+                                request_threads.push(thread::spawn(move || {
+                                    handle_mock_worker_request(&mut stream, &requests, behavior)
+                                }));
+                            } else {
+                                handle_mock_worker_request(&mut stream, &server_requests, behavior);
+                            }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            let mut index = 0;
+                            while index < request_threads.len() {
+                                if request_threads[index].is_finished() {
+                                    request_threads
+                                        .swap_remove(index)
+                                        .join()
+                                        .expect("join mock request");
+                                } else {
+                                    index += 1;
+                                }
+                            }
                             thread::sleep(Duration::from_millis(5));
                         }
                         Err(_) => break,
                     }
+                }
+                for request_thread in request_threads {
+                    request_thread.join().expect("join mock request");
                 }
             });
 
@@ -9130,6 +9321,16 @@ mod tests {
                 .iter()
                 .filter(|request| request.path == path)
                 .count()
+        }
+
+        fn request_times(&self, path: &str) -> Vec<Instant> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .filter(|request| request.path == path)
+                .map(|request| request.received_at)
+                .collect()
         }
 
         fn request_body(&self, path: &str) -> Value {
@@ -9207,6 +9408,7 @@ mod tests {
                 path: path.to_string(),
                 worker_protocol: worker_protocol.clone(),
                 body: body.to_string(),
+                received_at: Instant::now(),
             });
             requests
                 .iter()
@@ -9225,6 +9427,16 @@ mod tests {
         }
         if path == "/api/worker/heartbeat" && request_number <= behavior.heartbeat_failures {
             return;
+        }
+        if path == "/api/worker/heartbeat"
+            && behavior.heartbeat_failure_request == Some(request_number)
+        {
+            return;
+        }
+        if path == "/api/worker/heartbeat"
+            && behavior.delayed_heartbeat_request == Some(request_number)
+        {
+            thread::sleep(behavior.heartbeat_response_delay);
         }
         if behavior.unauthorized_polls && is_poll {
             write_mock_response(

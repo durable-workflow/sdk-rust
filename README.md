@@ -14,23 +14,24 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.8 --exact
+cargo add durable-workflow@0.1.9 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.8"
+durable-workflow = "=0.1.9"
 ```
 
-Version `0.1.8` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.9` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
 timeout, and typed terminal options are available from `0.1.7`. Workflow
 cancellation, termination, selected-run safety, and typed workflow outcomes
-are available from `0.1.8`.
+are available from `0.1.8`. Advertised worker-heartbeat cadence remains bounded
+after delayed acknowledgements and retries from `0.1.9`.
 
 ## Compatibility
 
@@ -387,7 +388,10 @@ retained in `body`. Stable reasons include `rejected_unknown_query`,
 heartbeats automatically. The registration response supplies the preferred
 cadence; `Worker::heartbeat_interval` is the fallback when the server does not
 advertise one. Use `Worker::on_worker_heartbeat` to observe successful server
-acknowledgements for metrics or structured logging.
+acknowledgements for metrics or structured logging. After each heartbeat
+attempt and its bounded retries finish, the worker waits for a complete
+advertised interval before sending the next heartbeat. Delayed responses
+therefore do not queue catch-up requests.
 
 Activity handlers report progress with `ActivityContext::heartbeat`. The
 returned `ActivityHeartbeatResponse` exposes `heartbeat_recorded` and
