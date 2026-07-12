@@ -14,17 +14,17 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.11 --exact
+cargo add durable-workflow@0.1.12 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.11"
+durable-workflow = "=0.1.12"
 ```
 
-Version `0.1.11` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.12` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
@@ -34,6 +34,8 @@ are available from `0.1.8`. Advertised worker-heartbeat cadence remains bounded
 after delayed acknowledgements and retries from `0.1.9`. From `0.1.11`, an
 uncaught error returned by a workflow handler settles the run as a typed
 workflow failure instead of leaving the workflow task to retry indefinitely.
+From `0.1.12`, managed workers settle the exact server-terminal run-timeout
+completion race without hiding other completion failures.
 
 ## Compatibility
 
@@ -476,6 +478,21 @@ child workflow, or signal wait can also produce no new commands. The worker
 acknowledges that task as waiting for scheduled history instead of submitting
 an invalid empty completion. Workflow and query pollers therefore remain live,
 and worker heartbeats continue while unrelated signals are recorded.
+
+A run deadline can expire while a worker holds a workflow task. If completion
+returns the authoritative conflict for that exact task, attempt, and selected
+run -- `recorded=false`, `reason=run_timed_out`, and terminal
+`run_status=failed` -- the managed worker considers the tick settled and keeps
+polling. The rejected commands were not recorded and cannot overwrite the
+terminal run. A bare HTTP 409, a different run identity, or any nearby lease,
+ownership, protocol, validation, or nonterminal conflict remains an error.
+`Client::complete_workflow_task` is unchanged for lower-level integrations: it
+returns the HTTP status and machine-readable response body directly.
+
+This settlement race is separate from `WorkflowResultOptions::timeout`. The
+former acknowledges server-terminal state for one selected run; the latter is
+only a client-side wait bound and produces `result_wait_timeout` if the run is
+still nonterminal.
 
 Poll acquisition and worker-heartbeat transport failures, HTTP 408/429
 responses, and server errors use capped exponential backoff. Configure the

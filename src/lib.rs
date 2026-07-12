@@ -2118,6 +2118,34 @@ fn activity_task_rejection_is_final(error: &Error) -> bool {
     )
 }
 
+fn workflow_task_completion_is_terminal_timeout(
+    error: &Error,
+    task_id: &str,
+    workflow_task_attempt: u64,
+    run_id: Option<&str>,
+) -> bool {
+    let Error::Http { status, body } = error else {
+        return false;
+    };
+    if *status != reqwest::StatusCode::CONFLICT {
+        return false;
+    }
+
+    let Some(run_id) = run_id else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+
+    body.get("recorded").and_then(Value::as_bool) == Some(false)
+        && body.get("reason").and_then(Value::as_str) == Some("run_timed_out")
+        && body.get("run_status").and_then(Value::as_str) == Some("failed")
+        && body.get("run_id").and_then(Value::as_str) == Some(run_id)
+        && body.get("task_id").and_then(Value::as_str) == Some(task_id)
+        && body.get("workflow_task_attempt").and_then(Value::as_u64) == Some(workflow_task_attempt)
+}
+
 fn protocol_failure(status: reqwest::StatusCode, raw_body: &str) -> Option<ProtocolFailure> {
     let body: Value = serde_json::from_str(raw_body).ok()?;
     let reason = body.get("reason")?.as_str()?;
@@ -3372,6 +3400,19 @@ impl Worker {
         .await
     }
 
+    /// Poll and settle at most one task from each enabled task family.
+    ///
+    /// A workflow may reach its server-enforced run deadline while this worker
+    /// holds a task. When the completion endpoint authoritatively rejects that
+    /// selected task and run with `recorded=false`, `reason=run_timed_out`, and
+    /// terminal `run_status=failed`, the workflow tick is considered settled:
+    /// the late command was not recorded and cannot replace the terminal run.
+    /// Every other completion rejection remains an error. This worker-level
+    /// race handling is distinct from [`WorkflowResultOptions::timeout`], which
+    /// only bounds how long a client waits for a result.
+    ///
+    /// Direct callers of [`Client::complete_workflow_task`] continue to receive
+    /// the original [`Error::Http`] status and response body.
     pub async fn run_once(&self) -> Result<usize> {
         let mut handled = 0;
         match self.poll_workflow_once().await? {
@@ -3413,6 +3454,7 @@ impl Worker {
 
         let task_id = task.task_id.clone();
         let attempt = task.workflow_task_attempt;
+        let run_id = task.run_id.clone();
         let lease_owner = task
             .lease_owner
             .clone()
@@ -3436,9 +3478,20 @@ impl Worker {
                     .await?;
             }
             Ok(commands) => {
-                self.client
+                let completion = self
+                    .client
                     .complete_workflow_task(&task_id, &lease_owner, attempt, commands)
-                    .await?;
+                    .await;
+                if let Err(error) = completion {
+                    if !workflow_task_completion_is_terminal_timeout(
+                        &error,
+                        &task_id,
+                        attempt,
+                        run_id.as_deref(),
+                    ) {
+                        return Err(error);
+                    }
+                }
             }
             Err(error) => {
                 self.client
@@ -8726,6 +8779,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_worker_absorbs_selected_run_terminal_timeout_completion_race() {
+        let response = r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"outcome":"completed","recorded":false,"run_id":"run-selected-timeout","run_status":"failed","created_task_ids":[],"reason":"run_timed_out"}"#;
+        let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let direct_error = client
+            .complete_workflow_task(
+                "workflow-timeout-task",
+                "timeout-worker",
+                3,
+                vec![json!({"type": "complete_workflow", "result": null})],
+            )
+            .await
+            .expect_err("the low-level client preserves the completion rejection");
+        let Error::Http { status, body } = direct_error else {
+            panic!("expected the original HTTP completion rejection");
+        };
+        assert_eq!(status, reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("response body")["reason"],
+            "run_timed_out"
+        );
+
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("timeout-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+            Ok(json!({"late": "result"}))
+        });
+
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("authoritative selected-run timeout settles the tick"),
+            1
+        );
+        assert_eq!(
+            server.request_count("/api/worker/workflow-tasks/workflow-timeout-task/complete"),
+            2,
+            "both the direct client proof and managed worker must see the rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worker_does_not_swallow_nearby_completion_errors() {
+        for (name, status, response) in [
+            ("bare conflict", "409 Conflict", r#"{"message":"conflict"}"#),
+            (
+                "command was recorded",
+                "409 Conflict",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":true,"run_id":"run-selected-timeout","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+            (
+                "lease conflict",
+                "409 Conflict",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","run_status":"failed","reason":"lease_expired"}"#,
+            ),
+            (
+                "nonterminal run",
+                "409 Conflict",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","run_status":"waiting","reason":"run_timed_out"}"#,
+            ),
+            (
+                "different selected run",
+                "409 Conflict",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-reused-workflow-current","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+            (
+                "different task attempt",
+                "409 Conflict",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":4,"recorded":false,"run_id":"run-selected-timeout","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+            (
+                "authentication failure",
+                "401 Unauthorized",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+            (
+                "authorization failure",
+                "403 Forbidden",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+            (
+                "protocol failure",
+                "400 Bad Request",
+                r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.2","requested_version":"1.3"}"#,
+            ),
+            (
+                "malformed command",
+                "422 Unprocessable Entity",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+            (
+                "transient server failure",
+                "503 Service Unavailable",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","run_status":"failed","reason":"run_timed_out"}"#,
+            ),
+        ] {
+            let server = MockWorkerServer::workflow_completion(status, response);
+            let client = Client::builder(server.base_url())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client");
+            let mut worker = Worker::new(client, "rust-workers")
+                .worker_id("timeout-worker")
+                .poll_timeout(Duration::from_millis(10));
+            worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+                Ok(json!({"late": "result"}))
+            });
+
+            let error = worker
+                .run_once()
+                .await
+                .expect_err(&format!("{name} must remain an error"));
+            assert!(
+                matches!(error, Error::Http { .. } | Error::Protocol(_)),
+                "{name} returned an unexpected error variant: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn baseline_worker_endpoints_send_the_baseline_protocol() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -9330,6 +9509,8 @@ mod tests {
         unauthorized_polls: bool,
         cancelled_activity: bool,
         draining_polls: bool,
+        workflow_completion_status: Option<&'static str>,
+        workflow_completion_body: Option<&'static str>,
     }
 
     impl MockWorkerServer {
@@ -9410,6 +9591,14 @@ mod tests {
         fn draining_polls() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 draining_polls: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn workflow_completion(status: &'static str, body: &'static str) -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                workflow_completion_status: Some(status),
+                workflow_completion_body: Some(body),
                 ..MockWorkerBehavior::default()
             })
         }
@@ -9639,6 +9828,28 @@ mod tests {
                 r#"{"reason":"query_task_timed_out","message":"query task timed out before completion"}"#,
             );
             return;
+        }
+
+        if behavior.workflow_completion_status.is_some()
+            && path == "/api/worker/workflow-tasks/poll"
+            && request_number == 1
+        {
+            write_mock_response(
+                stream,
+                "200 OK",
+                r#"{"task":{"task_id":"workflow-timeout-task","workflow_id":"reused-workflow-id","run_id":"run-selected-timeout","workflow_type":"timeout.workflow","payload_codec":"json","arguments":{"codec":"json","blob":"[]"},"history_events":[],"workflow_task_attempt":3,"lease_owner":"timeout-worker"}}"#,
+            );
+            return;
+        }
+
+        if path == "/api/worker/workflow-tasks/workflow-timeout-task/complete" {
+            if let (Some(status), Some(body)) = (
+                behavior.workflow_completion_status,
+                behavior.workflow_completion_body,
+            ) {
+                write_mock_response(stream, status, body);
+                return;
+            }
         }
 
         if behavior.waiting_query_worker {
