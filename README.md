@@ -14,17 +14,17 @@ durable time without blocking a Rust executor thread.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.9 --exact
+cargo add durable-workflow@0.1.10 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.9"
+durable-workflow = "=0.1.10"
 ```
 
-Version `0.1.9` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.10` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
@@ -43,7 +43,8 @@ after delayed acknowledgements and retries from `0.1.9`.
 | `0.1.4` | `>=0.2,<0.3` | `1.2` (timers; replayed queries require `1.8`) | `2` |
 | `0.1.5`–`0.1.6` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.7` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.8+` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.8`–`0.1.9` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.10+` | `>=0.2,<0.3` | `1.2` (workflow lifecycle with server start deadlines, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -57,7 +58,8 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 `activity-options`, `activity-retry-policy`, `activity-timeouts`, and
 `activity-failure-reasons`. Lifecycle releases publish
 `workflow-lifecycle-commands`, `workflow-lifecycle-run-targeting`, and
-`workflow-terminal-outcomes`. Existing worker operations retain the `1.2`
+`workflow-terminal-outcomes`; releases with start deadline support also publish
+`workflow-start-timeouts`. Existing worker operations retain the `1.2`
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor. The server's advertised protocol manifests remain
 authoritative when checking compatibility during deployment.
@@ -168,6 +170,30 @@ description whenever the server supplies them. A local result-wait deadline
 uses the same typed timeout with reason `result_wait_timeout` and category
 `client_timeout`; it is distinguishable from a server-terminal `timed_out`
 run without parsing display text.
+
+Use `Client::start_workflow_with_options` when the server, rather than the
+caller, must enforce a workflow deadline:
+
+```rust
+# use durable_workflow::{json, Client, Result, WorkflowStartOptions};
+# async fn start(client: Client) -> Result<()> {
+let handle = client.start_workflow_with_options(
+    "orders.await-payment",
+    "orders",
+    "order-42",
+    WorkflowStartOptions::new()
+        .execution_timeout_seconds(300)
+        .run_timeout_seconds(30),
+    json!([]),
+).await?;
+# let _ = handle;
+# Ok(())
+# }
+```
+
+Both values must be positive and the run timeout cannot exceed the execution
+timeout. The existing `start_workflow` method retains its 3600-second execution
+and 600-second run defaults.
 
 ## Durable activity options
 

@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -32,6 +32,7 @@ activity-failure-reasons = ["activity", "cancelled", "timeout"]
 workflow-lifecycle-commands = ["cancel", "terminate"]
 workflow-lifecycle-run-targeting = "current-run-guard"
 workflow-terminal-outcomes = ["failed", "cancelled", "terminated", "timed_out"]
+workflow-start-timeouts = ["execution_timeout_seconds", "run_timeout_seconds"]
 payload-codecs = ["avro", "json"]
 durable-timers = true
 timer-command = "start_timer"

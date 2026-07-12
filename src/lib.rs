@@ -141,6 +141,63 @@ pub struct WorkflowCommandOptions {
     pub request_id: Option<String>,
 }
 
+/// Server-enforced timeout policy for a workflow start.
+///
+/// These deadlines are distinct from [`WorkflowResultOptions::timeout`], which
+/// only bounds how long the caller waits. A server deadline produces a terminal
+/// [`Error::WorkflowTimedOut`] outcome whose reason is `execution_timeout` or
+/// `run_timeout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowStartOptions {
+    pub execution_timeout_seconds: u64,
+    pub run_timeout_seconds: u64,
+}
+
+impl Default for WorkflowStartOptions {
+    fn default() -> Self {
+        Self {
+            execution_timeout_seconds: 3600,
+            run_timeout_seconds: 600,
+        }
+    }
+}
+
+impl WorkflowStartOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn execution_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.execution_timeout_seconds = seconds;
+        self
+    }
+
+    pub fn run_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.run_timeout_seconds = seconds;
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.execution_timeout_seconds == 0 {
+            return Err(Error::Codec(
+                "execution_timeout_seconds must be at least 1".to_string(),
+            ));
+        }
+        if self.run_timeout_seconds == 0 {
+            return Err(Error::Codec(
+                "run_timeout_seconds must be at least 1".to_string(),
+            ));
+        }
+        if self.run_timeout_seconds > self.execution_timeout_seconds {
+            return Err(Error::Codec(
+                "run_timeout_seconds cannot exceed execution_timeout_seconds".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 impl WorkflowCommandOptions {
     pub fn new() -> Self {
         Self::default()
@@ -1046,6 +1103,27 @@ impl Client {
         workflow_id: &str,
         input: T,
     ) -> Result<WorkflowHandle> {
+        self.start_workflow_with_options(
+            workflow_type,
+            task_queue,
+            workflow_id,
+            WorkflowStartOptions::default(),
+            input,
+        )
+        .await
+    }
+
+    /// Start a workflow with explicit server-enforced execution and run
+    /// deadlines.
+    pub async fn start_workflow_with_options<T: Serialize>(
+        &self,
+        workflow_type: &str,
+        task_queue: &str,
+        workflow_id: &str,
+        options: WorkflowStartOptions,
+        input: T,
+    ) -> Result<WorkflowHandle> {
+        options.validate()?;
         let input = serde_json::to_value(input)?;
         let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
         let body = json!({
@@ -1053,8 +1131,8 @@ impl Client {
             "workflow_type": workflow_type,
             "task_queue": task_queue,
             "input": input_envelope,
-            "execution_timeout_seconds": 3600,
-            "run_timeout_seconds": 600
+            "execution_timeout_seconds": options.execution_timeout_seconds,
+            "run_timeout_seconds": options.run_timeout_seconds
         });
 
         let data: Value = self
@@ -8272,6 +8350,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_start_options_send_server_enforced_deadlines() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let handle = client
+            .start_workflow_with_options(
+                "rust.timeout",
+                "rust-timeouts",
+                "wf-start-options",
+                WorkflowStartOptions::new()
+                    .execution_timeout_seconds(30)
+                    .run_timeout_seconds(1),
+                json!([]),
+            )
+            .await
+            .expect("workflow start");
+
+        assert_eq!(handle.run_id.as_deref(), Some("run-start-options"));
+        let body = server.request_body("/api/workflows");
+        assert_eq!(body["execution_timeout_seconds"], 30);
+        assert_eq!(body["run_timeout_seconds"], 1);
+
+        let invalid = client
+            .start_workflow_with_options(
+                "rust.timeout",
+                "rust-timeouts",
+                "wf-invalid-options",
+                WorkflowStartOptions::new()
+                    .execution_timeout_seconds(1)
+                    .run_timeout_seconds(2),
+                json!([]),
+            )
+            .await
+            .expect_err("invalid deadline ordering");
+        assert!(invalid
+            .to_string()
+            .contains("run_timeout_seconds cannot exceed execution_timeout_seconds"));
+    }
+
+    #[tokio::test]
     async fn workflow_result_returns_each_typed_terminal_outcome() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -9589,6 +9710,10 @@ mod tests {
         }
 
         let (status, body) = match path {
+            "/api/workflows" => (
+                "201 Created",
+                r#"{"workflow_id":"wf-start-options","run_id":"run-start-options","workflow_type":"rust.timeout"}"#,
+            ),
             "/api/worker/register" if behavior.waiting_query_worker => (
                 "200 OK",
                 r#"{"worker_id":"rust-snapshot-worker","registered":true,"heartbeat_interval_seconds":1}"#,
