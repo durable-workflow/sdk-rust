@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -44,6 +44,11 @@ version-markers = true
 version-marker-command = "record_version_marker"
 version-marker-history-event = "VersionMarkerRecorded"
 version-marker-helpers = ["patched", "deprecate_patch"]
+continue-as-new = true
+continue-as-new-command = "continue_as_new"
+continue-as-new-routing-overrides = ["workflow_type", "queue"]
+workflow-history-budget = ["total_history_events", "history_size_bytes", "continue_as_new_recommended", "history_budget_pressure"]
+workflow-result-routing = "current-run-chain-with-selected-run-view"
 
 [lib]
 name = "durable_workflow"

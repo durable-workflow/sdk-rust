@@ -115,6 +115,11 @@ pub enum Error {
     InvalidChildWorkflowOptions(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
+    #[error(transparent)]
+    InvalidContinueAsNewOptions(#[from] ContinueAsNewOptionsError),
+    #[doc(hidden)]
+    #[error("workflow requested continue as new")]
+    ContinueAsNew(ContinueAsNewRequest),
 }
 
 /// The lifecycle command sent to a workflow execution.
@@ -197,6 +202,71 @@ impl WorkflowStartOptions {
 
         Ok(())
     }
+}
+
+/// Optional routing overrides for a continue-as-new transition.
+///
+/// Omitted values retain the current workflow type and task queue. Server-owned
+/// instance metadata is not accepted here and is carried by the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContinueAsNewOptions {
+    pub workflow_type: Option<String>,
+    pub task_queue: Option<String>,
+}
+
+impl ContinueAsNewOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn workflow_type(mut self, workflow_type: impl Into<String>) -> Self {
+        self.workflow_type = Some(workflow_type.into());
+        self
+    }
+
+    pub fn task_queue(mut self, task_queue: impl Into<String>) -> Self {
+        self.task_queue = Some(task_queue.into());
+        self
+    }
+
+    fn validate(&self) -> std::result::Result<(), ContinueAsNewOptionsError> {
+        for (field, value) in [
+            ("workflow_type", self.workflow_type.as_deref()),
+            ("task_queue", self.task_queue.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(ContinueAsNewOptionsError {
+                    field,
+                    message: format!("{field} must not be empty"),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A stable validation error raised before a continue-as-new command is emitted.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("invalid continue-as-new option {field}: {message}")]
+pub struct ContinueAsNewOptionsError {
+    pub field: &'static str,
+    pub message: String,
+}
+
+/// Public history-budget information attached to the current workflow task.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkflowHistoryBudget {
+    pub event_count: u64,
+    pub size_bytes: Option<u64>,
+    pub continue_as_new_recommended: bool,
+    pub pressure: Option<String>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ContinueAsNewRequest {
+    arguments: Value,
+    options: ContinueAsNewOptions,
 }
 
 impl WorkflowCommandOptions {
@@ -1170,12 +1240,40 @@ impl Client {
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
+        self.signal_workflow_target(workflow_id, None, signal_name, input)
+            .await
+    }
+
+    /// Signal only if `run_id` is still the current run for this instance.
+    pub async fn signal_workflow_run<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        signal_name: &str,
+        input: T,
+    ) -> Result<Value> {
+        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input)
+            .await
+    }
+
+    async fn signal_workflow_target<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: Option<&str>,
+        signal_name: &str,
+        input: T,
+    ) -> Result<Value> {
         let input = serde_json::to_value(input)?;
         let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
         let body = json!({
             "input": input_envelope
         });
-        let path = format!("/workflows/{workflow_id}/signal/{signal_name}");
+        let path = match run_id {
+            Some(run_id) => {
+                format!("/workflows/{workflow_id}/runs/{run_id}/signal/{signal_name}")
+            }
+            None => format!("/workflows/{workflow_id}/signal/{signal_name}"),
+        };
         self.request_json(
             reqwest::Method::POST,
             &path,
@@ -1287,12 +1385,40 @@ impl Client {
         query_name: &str,
         input: T,
     ) -> Result<Value> {
+        self.query_workflow_target(workflow_id, None, query_name, input)
+            .await
+    }
+
+    /// Query only if `run_id` is still current, preventing accidental retargeting.
+    pub async fn query_workflow_run<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        query_name: &str,
+        input: T,
+    ) -> Result<Value> {
+        self.query_workflow_target(workflow_id, Some(run_id), query_name, input)
+            .await
+    }
+
+    async fn query_workflow_target<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: Option<&str>,
+        query_name: &str,
+        input: T,
+    ) -> Result<Value> {
         let input = serde_json::to_value(input)?;
         let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
         let body = json!({
             "input": input_envelope
         });
-        let path = format!("/workflows/{workflow_id}/query/{query_name}");
+        let path = match run_id {
+            Some(run_id) => {
+                format!("/workflows/{workflow_id}/runs/{run_id}/query/{query_name}")
+            }
+            None => format!("/workflows/{workflow_id}/query/{query_name}"),
+        };
         let response: Value = match self
             .request_json(
                 reqwest::Method::POST,
@@ -2268,13 +2394,38 @@ pub struct WorkflowHandle {
 }
 
 impl WorkflowHandle {
+    /// Describe whichever run is current for this stable workflow instance.
     pub async fn describe(&self) -> Result<WorkflowDescription> {
         self.client.describe_workflow(&self.workflow_id).await
+    }
+
+    /// Describe the run identity originally selected by this handle.
+    pub async fn describe_selected_run(&self) -> Result<WorkflowDescription> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run description".to_string())
+        })?;
+        self.client
+            .describe_workflow_run(&self.workflow_id, run_id)
+            .await
     }
 
     pub async fn signal<T: Serialize>(&self, signal_name: &str, input: T) -> Result<Value> {
         self.client
             .signal_workflow(&self.workflow_id, signal_name, input)
+            .await
+    }
+
+    /// Signal only if this handle's selected run is still current.
+    pub async fn signal_selected_run<T: Serialize>(
+        &self,
+        signal_name: &str,
+        input: T,
+    ) -> Result<Value> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run signaling".to_string())
+        })?;
+        self.client
+            .signal_workflow_run(&self.workflow_id, run_id, signal_name, input)
             .await
     }
 
@@ -2328,11 +2479,43 @@ impl WorkflowHandle {
             .await
     }
 
+    /// Query only if this handle's selected run is still current.
+    pub async fn query_selected_run<T: Serialize>(
+        &self,
+        query_name: &str,
+        input: T,
+    ) -> Result<Value> {
+        let run_id = self
+            .run_id
+            .as_deref()
+            .ok_or_else(|| Error::Codec("run_id is required for selected-run query".to_string()))?;
+        self.client
+            .query_workflow_run(&self.workflow_id, run_id, query_name, input)
+            .await
+    }
+
+    /// Await the final terminal outcome of the current continue-as-new chain.
     pub async fn result(&self, options: WorkflowResultOptions) -> Result<Value> {
+        self.result_target(options, None).await
+    }
+
+    /// Await only the run identity originally selected by this handle.
+    pub async fn result_selected_run(&self, options: WorkflowResultOptions) -> Result<Value> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run result".to_string())
+        })?;
+        self.result_target(options, Some(run_id)).await
+    }
+
+    async fn result_target(
+        &self,
+        options: WorkflowResultOptions,
+        selected_run_id: Option<&str>,
+    ) -> Result<Value> {
         let started = Instant::now();
 
         loop {
-            let description = match self.run_id.as_deref() {
+            let description = match selected_run_id {
                 Some(run_id) => {
                     self.client
                         .describe_workflow_run(&self.workflow_id, run_id)
@@ -2345,11 +2528,8 @@ impl WorkflowHandle {
             }
 
             if description.is_terminal() {
-                let outcome = workflow_terminal_outcome(
-                    &description,
-                    &self.workflow_id,
-                    self.run_id.as_deref(),
-                );
+                let outcome =
+                    workflow_terminal_outcome(&description, &self.workflow_id, selected_run_id);
                 return Err(match outcome.kind {
                     WorkflowTerminalKind::Failed => Error::WorkflowFailed(outcome),
                     WorkflowTerminalKind::Cancelled => Error::WorkflowCancelled(outcome),
@@ -2365,7 +2545,10 @@ impl WorkflowHandle {
                         .workflow_id
                         .clone()
                         .unwrap_or_else(|| self.workflow_id.clone()),
-                    run_id: description.run_id.clone().or_else(|| self.run_id.clone()),
+                    run_id: description
+                        .run_id
+                        .clone()
+                        .or_else(|| selected_run_id.map(str::to_string)),
                     reason: "result_wait_timeout".to_string(),
                     failure_category: Some("client_timeout".to_string()),
                     failure_id: None,
@@ -2785,6 +2968,12 @@ pub struct WorkflowTask {
     pub history_events: Vec<HistoryEvent>,
     #[serde(default)]
     pub total_history_events: Option<u64>,
+    #[serde(default)]
+    pub history_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub continue_as_new_recommended: Option<bool>,
+    #[serde(default)]
+    pub history_budget_pressure: Option<String>,
     #[serde(default)]
     pub next_history_page_token: Option<String>,
     #[serde(default = "default_workflow_task_attempt")]
@@ -3926,14 +4115,24 @@ impl Worker {
             .ok_or_else(|| Error::WorkflowNotRegistered(task.workflow_type.clone()))?;
         let input = decode_task_arguments(task.arguments.as_ref(), &task.payload_codec)?;
         let resume_signal = decode_resume_signal(&task)?;
-        let state = Arc::new(Mutex::new(WorkflowState::new_with_identity(
+        let history_budget = WorkflowHistoryBudget {
+            event_count: task
+                .total_history_events
+                .unwrap_or_else(|| u64::try_from(task.history_events.len()).unwrap_or(u64::MAX)),
+            size_bytes: task.history_size_bytes,
+            continue_as_new_recommended: task.continue_as_new_recommended.unwrap_or(false),
+            pressure: task.history_budget_pressure.clone(),
+        };
+        let mut workflow_state = WorkflowState::new_with_identity(
             task.history_events,
             task.workflow_id,
             task.run_id,
             self.task_queue.clone(),
             task.payload_codec.clone(),
             resume_signal,
-        )?));
+        )?;
+        workflow_state.history_budget = history_budget;
+        let state = Arc::new(Mutex::new(workflow_state));
         let ctx = WorkflowContext { state };
         let mut future = (workflow.execute)(ctx.clone(), input);
         let mut cx = TaskContext::from_waker(noop_waker_ref());
@@ -3950,6 +4149,14 @@ impl Worker {
                 Ok(commands)
             }
             Poll::Ready(Err(error)) => {
+                if let Error::ContinueAsNew(request) = error {
+                    let mut commands = ctx.take_commands()?;
+                    if let Some(command) = ctx.continue_as_new_command(request)? {
+                        commands.push(command);
+                    }
+                    ctx.ensure_history_consumed()?;
+                    return Ok(commands);
+                }
                 // A handler error must not hide a committed durable command that
                 // upgraded workflow code no longer consumes.
                 ctx.ensure_history_consumed()?;
@@ -4154,6 +4361,37 @@ impl WorkflowContext {
             workflow_id: state.workflow_id.clone(),
             run_id: state.run_id.clone(),
         })
+    }
+
+    /// Return the server-published history budget for this workflow task.
+    pub fn history_budget(&self) -> Result<WorkflowHistoryBudget> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(state.history_budget.clone())
+    }
+
+    /// Continue this workflow instance as a fresh run with replacement arguments.
+    ///
+    /// Return this value directly from the workflow handler. The worker converts
+    /// it to the terminal protocol command only after replay has consumed every
+    /// recorded durable command.
+    pub fn continue_as_new<T: Serialize>(&self, args: T) -> Result<Value> {
+        self.continue_as_new_with_options(ContinueAsNewOptions::new(), args)
+    }
+
+    /// Continue as new with optional workflow-type and task-queue overrides.
+    pub fn continue_as_new_with_options<T: Serialize>(
+        &self,
+        options: ContinueAsNewOptions,
+        args: T,
+    ) -> Result<Value> {
+        options.validate()?;
+        Err(Error::ContinueAsNew(ContinueAsNewRequest {
+            arguments: normalize_arguments(serde_json::to_value(args)?),
+            options,
+        }))
     }
 
     pub fn activity<T: Serialize>(
@@ -4477,6 +4715,35 @@ impl WorkflowContext {
         Ok(std::mem::take(&mut state.commands))
     }
 
+    fn continue_as_new_command(&self, request: ContinueAsNewRequest) -> Result<Option<Value>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            return Err(command_mismatch(&recorded, "continue as new"));
+        }
+        if state.recorded_continue_as_new_sequence.is_some() {
+            state.continue_as_new_consumed = true;
+            return Ok(None);
+        }
+
+        let arguments = encode_value_envelope(&request.arguments, &state.payload_codec)?;
+        let mut command = serde_json::Map::from_iter([
+            ("type".to_string(), json!("continue_as_new")),
+            ("arguments".to_string(), arguments),
+            ("queue".to_string(), json!(state.task_queue.clone())),
+        ]);
+        if let Some(workflow_type) = request.options.workflow_type {
+            command.insert("workflow_type".to_string(), json!(workflow_type));
+        }
+        if let Some(task_queue) = request.options.task_queue {
+            command.insert("queue".to_string(), json!(task_queue));
+        }
+        Ok(Some(Value::Object(command)))
+    }
+
     fn matched_recorded_pending(&self) -> Result<bool> {
         let state = self
             .state
@@ -4499,6 +4766,18 @@ impl WorkflowContext {
                 "workflow completed before consuming all recorded durable commands",
             )));
         }
+        if let Some(sequence) = state
+            .recorded_continue_as_new_sequence
+            .filter(|_| !state.continue_as_new_consumed)
+        {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "recorded_continue_as_new_unconsumed",
+                Some(sequence),
+                Some("continue as new".to_string()),
+                Some("workflow completion".to_string()),
+                "workflow completed without consuming its recorded continue-as-new transition",
+            )));
+        }
         Ok(())
     }
 }
@@ -4510,8 +4789,11 @@ struct WorkflowState {
     run_id: Option<String>,
     task_queue: String,
     payload_codec: String,
+    history_budget: WorkflowHistoryBudget,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
+    recorded_continue_as_new_sequence: Option<u64>,
+    continue_as_new_consumed: bool,
     command_cursor: usize,
     matched_recorded_pending: bool,
     signal_cursors: HashMap<String, usize>,
@@ -4553,14 +4835,54 @@ impl WorkflowState {
                 run_id: run_id.clone(),
             },
         )?;
+        let recorded_continue_as_new = history
+            .iter()
+            .filter(|event| event.event_type == "WorkflowContinuedAsNew")
+            .collect::<Vec<_>>();
+        if recorded_continue_as_new.len() > 1 {
+            return Err(invalid_recorded_history(
+                "duplicate_continue_as_new_transition",
+                recorded_continue_as_new
+                    .last()
+                    .and_then(|event| durable_event_sequence(event))
+                    .unwrap_or(0),
+                "one WorkflowContinuedAsNew event",
+                &format!(
+                    "{} WorkflowContinuedAsNew events",
+                    recorded_continue_as_new.len()
+                ),
+                "workflow history records one continue-as-new transition more than once",
+            ));
+        }
+        let recorded_continue_as_new_sequence = recorded_continue_as_new
+            .first()
+            .map(|event| {
+                durable_event_sequence(event).ok_or_else(|| {
+                    Error::NonDeterministicReplay(ReplayFailure::new(
+                        "continue_as_new_sequence_missing",
+                        None,
+                        Some("recorded transition sequence".to_string()),
+                        Some("missing sequence".to_string()),
+                        "WorkflowContinuedAsNew history is missing its recorded sequence",
+                    ))
+                })
+            })
+            .transpose()?;
+        let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
         Ok(Self {
             history,
             workflow_id,
             run_id,
             task_queue,
             payload_codec,
+            history_budget: WorkflowHistoryBudget {
+                event_count,
+                ..WorkflowHistoryBudget::default()
+            },
             resume_signal,
             recorded_commands,
+            recorded_continue_as_new_sequence,
+            continue_as_new_consumed: false,
             command_cursor: 0,
             matched_recorded_pending: false,
             signal_cursors: HashMap::new(),
@@ -6801,6 +7123,9 @@ mod tests {
                 encode_value_envelope(&json!([]), payload_codec).expect("workflow arguments"),
             ),
             total_history_events: Some(history_events.len() as u64),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             history_events,
             next_history_page_token: None,
             workflow_task_attempt: 1,
@@ -7121,6 +7446,9 @@ mod tests {
                 arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("arguments")),
                 history_events,
                 total_history_events: None,
+                history_size_bytes: None,
+                continue_as_new_recommended: None,
+                history_budget_pressure: None,
                 next_history_page_token: None,
                 workflow_task_attempt: 1,
                 workflow_signal_id: None,
@@ -8300,6 +8628,9 @@ mod tests {
             arguments: Some(json!({"codec": "json", "blob": "[]"})),
             history_events,
             total_history_events: None,
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: None,
             workflow_task_attempt: 1,
             workflow_signal_id: None,
@@ -8346,6 +8677,110 @@ mod tests {
     }
 
     #[test]
+    fn workflow_continue_as_new_emits_arguments_type_and_queue_once() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.continue", |ctx, _input| async move {
+            ctx.continue_as_new_with_options(
+                ContinueAsNewOptions::new()
+                    .workflow_type("rust.next")
+                    .task_queue("next-workers"),
+                json!([2, {"cursor": "next"}]),
+            )
+        });
+
+        let commands = worker
+            .execute_workflow_task(workflow_task("rust.continue", Vec::new(), DEFAULT_CODEC))
+            .expect("continue-as-new command");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], "continue_as_new");
+        assert_eq!(commands[0]["workflow_type"], "rust.next");
+        assert_eq!(commands[0]["queue"], "next-workers");
+        assert_eq!(
+            decode_wire_value(&commands[0]["arguments"], DEFAULT_CODEC)
+                .expect("continue-as-new arguments"),
+            json!([2, {"cursor": "next"}])
+        );
+    }
+
+    #[test]
+    fn recorded_continue_as_new_is_consumed_without_duplicate_successor_command() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.continue", |ctx, _input| async move {
+            ctx.continue_as_new(json!([2]))
+        });
+        let task = workflow_task(
+            "rust.continue",
+            vec![history_event(
+                "WorkflowContinuedAsNew",
+                json!({"sequence": 1, "continued_to_run_id": "run-next"}),
+            )],
+            JSON_CODEC,
+        );
+
+        for _worker_restart_or_redelivery in 0..2 {
+            let commands = worker
+                .execute_workflow_task(task.clone())
+                .expect("recorded transition replays");
+            assert!(
+                commands.is_empty(),
+                "replay must not emit another successor"
+            );
+        }
+    }
+
+    #[test]
+    fn continue_as_new_rejects_invalid_overrides_before_emitting_a_command() {
+        let ctx = workflow_context(Vec::new());
+        let error = ctx
+            .continue_as_new_with_options(ContinueAsNewOptions::new().task_queue("  "), json!([1]))
+            .expect_err("blank queue must be rejected");
+
+        let Error::InvalidContinueAsNewOptions(error) = error else {
+            panic!("expected typed continue-as-new validation error");
+        };
+        assert_eq!(error.field, "task_queue");
+        assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn workflow_context_exposes_server_history_budget() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.history-budget", |ctx, _input| async move {
+            let budget = ctx.history_budget()?;
+            Ok(json!({
+                "events": budget.event_count,
+                "bytes": budget.size_bytes,
+                "recommended": budget.continue_as_new_recommended,
+                "pressure": budget.pressure,
+            }))
+        });
+        let task: WorkflowTask = serde_json::from_value(json!({
+            "task_id": "task-history-budget",
+            "workflow_type": "rust.history-budget",
+            "payload_codec": JSON_CODEC,
+            "history_events": [],
+            "total_history_events": 480,
+            "history_size_bytes": 1_048_576,
+            "continue_as_new_recommended": true,
+            "history_budget_pressure": "continue_as_new_recommended",
+        }))
+        .expect("published workflow task");
+
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("history-budget workflow");
+        let result = decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("result");
+        assert_eq!(result["events"], 480);
+        assert_eq!(result["bytes"], 1_048_576);
+        assert_eq!(result["recommended"], true);
+        assert_eq!(result["pressure"], "continue_as_new_recommended");
+    }
+
+    #[test]
     fn uncaught_workflow_handler_error_emits_terminal_failure_command() {
         let client = Client::new("http://127.0.0.1:8080").expect("client");
         let mut worker = Worker::new(client, "rust-workers");
@@ -8361,6 +8796,9 @@ mod tests {
             arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("input")),
             history_events: Vec::new(),
             total_history_events: Some(0),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: None,
             workflow_task_attempt: 1,
             workflow_signal_id: None,
@@ -8498,6 +8936,9 @@ mod tests {
                 json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
             )],
             total_history_events: Some(1),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: None,
             workflow_task_attempt: 1,
             workflow_signal_id: None,
@@ -8542,6 +8983,9 @@ mod tests {
                 ),
             ],
             total_history_events: Some(2),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: None,
             workflow_task_attempt: 1,
             workflow_signal_id: None,
@@ -8662,6 +9106,9 @@ mod tests {
                 },
             ],
             total_history_events: Some(2),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: None,
             workflow_task_attempt: 1,
             workflow_signal_id: None,
@@ -8845,6 +9292,9 @@ mod tests {
                 raw: HashMap::new(),
             }],
             total_history_events: Some(1),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: None,
             workflow_task_attempt: 1,
             workflow_signal_id: Some("sig-rust-1".to_string()),
@@ -8879,6 +9329,9 @@ mod tests {
                 raw: HashMap::new(),
             }],
             total_history_events: Some(3),
+            history_size_bytes: None,
+            continue_as_new_recommended: None,
+            history_budget_pressure: None,
             next_history_page_token: Some("MQ==".to_string()),
             workflow_task_attempt: 1,
             workflow_signal_id: None,
@@ -9494,25 +9947,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_result_awaits_the_handle_selected_run() {
+    async fn workflow_result_follows_chain_and_selected_result_preserves_history() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(2))
             .build()
             .expect("client");
 
-        let error = WorkflowHandle {
+        let handle = WorkflowHandle {
             client,
             workflow_id: "wf-selected".to_string(),
             run_id: Some("run-selected".to_string()),
             workflow_type: "selected".to_string(),
-        }
-        .result(WorkflowResultOptions {
+        };
+        let options = WorkflowResultOptions {
             poll_interval: Duration::ZERO,
             timeout: Duration::from_secs(1),
-        })
-        .await
-        .expect_err("the selected run is cancelled even though the current run completed");
+        };
+
+        let current = handle
+            .result(options)
+            .await
+            .expect("instance result follows the current run");
+        assert_eq!(current, json!("current run output"));
+
+        let error = handle
+            .result_selected_run(options)
+            .await
+            .expect_err("the selected run is cancelled even though the current run completed");
 
         let Error::WorkflowCancelled(outcome) = error else {
             panic!("expected selected run cancellation");
@@ -9523,7 +9985,7 @@ mod tests {
             server.request_count("/api/workflows/wf-selected/runs/run-selected"),
             1
         );
-        assert_eq!(server.request_count("/api/workflows/wf-selected"), 0);
+        assert_eq!(server.request_count("/api/workflows/wf-selected"), 1);
     }
 
     #[tokio::test]

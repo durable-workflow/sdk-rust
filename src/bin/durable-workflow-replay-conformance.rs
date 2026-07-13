@@ -12,6 +12,7 @@ use std::{
 
 const SIDE_EFFECT_SCENARIO: &str = "rust_side_effect_replay_after_worker_restart";
 const VERSION_MARKER_SCENARIO: &str = "rust_version_marker_replay_after_code_upgrade";
+const CONTINUE_AS_NEW_SCENARIO: &str = "rust_continue_as_new_chain_lifecycle";
 
 #[derive(Clone, Default)]
 struct ReplayState {
@@ -54,6 +55,13 @@ fn configured_worker(
             Ok(json!({"captured": state.captured, "version": state.version}))
         },
     );
+    worker.register_workflow("rust.continue-as-new", |ctx, input| async move {
+        let remaining = input.get(0).and_then(Value::as_u64).unwrap_or(0);
+        if remaining > 0 {
+            return ctx.continue_as_new(json!([remaining - 1]));
+        }
+        Ok(json!({"status": "completed", "links": 3}))
+    });
     worker
 }
 
@@ -100,6 +108,23 @@ async fn exercise(server_url: &str, token: Option<String>) -> std::result::Resul
         .result(Default::default())
         .await
         .map_err(|error| error.to_string())?;
+    let continue_id = format!("rust-continue-{nonce}");
+    let continued = client
+        .start_workflow("rust.continue-as-new", &queue, &continue_id, json!([3]))
+        .await
+        .map_err(|error| error.to_string())?;
+    let continued_result = continued
+        .result(Default::default())
+        .await
+        .map_err(|error| error.to_string())?;
+    let current_run = continued
+        .describe()
+        .await
+        .map_err(|error| error.to_string())?;
+    let selected_run = continued
+        .describe_selected_run()
+        .await
+        .map_err(|error| error.to_string())?;
     first_stop.store(true, Ordering::SeqCst);
     first_worker
         .await
@@ -131,6 +156,15 @@ async fn exercise(server_url: &str, token: Option<String>) -> std::result::Resul
             callback_calls.load(Ordering::SeqCst)
         ));
     }
+    let run_identity_changed = continued.run_id.is_some()
+        && current_run.run_id.is_some()
+        && continued.run_id != current_run.run_id;
+    let selected_is_historical = selected_run.closed_reason.as_deref() == Some("continued");
+    if continued_result["links"] != json!(3) || !run_identity_changed || !selected_is_historical {
+        return Err(format!(
+            "Rust continue-as-new drifted: result={continued_result}, run_identity_changed={run_identity_changed}, selected_is_historical={selected_is_historical}"
+        ));
+    }
 
     Ok(json!({
         "workflow_id": workflow_id,
@@ -139,7 +173,14 @@ async fn exercise(server_url: &str, token: Option<String>) -> std::result::Resul
         "replayed": replayed,
         "callback_calls": callback_calls.load(Ordering::SeqCst),
         "initial_supported_range": [1, 2],
-        "upgraded_supported_range": [1, 3]
+        "upgraded_supported_range": [1, 3],
+        "continue_as_new": {
+            "workflow_id": continue_id,
+            "selected_run_id": continued.run_id,
+            "current_run_id": current_run.run_id,
+            "selected_closed_reason": selected_run.closed_reason,
+            "result": continued_result
+        }
     }))
 }
 
@@ -206,7 +247,7 @@ async fn main() {
         "finished_at_unix": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "artifact_versions": versions,
         "runtime_matrix": {"runtimes": ["sdk-rust"]},
-        "scenario_results": [scenario(SIDE_EFFECT_SCENARIO), scenario(VERSION_MARKER_SCENARIO)],
+        "scenario_results": [scenario(SIDE_EFFECT_SCENARIO), scenario(VERSION_MARKER_SCENARIO), scenario(CONTINUE_AS_NEW_SCENARIO)],
         "findings": findings
     });
     let rendered =

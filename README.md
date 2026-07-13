@@ -15,17 +15,17 @@ deployments with durable version markers.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.13 --exact
+cargo add durable-workflow@0.1.14 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.13"
+durable-workflow = "=0.1.14"
 ```
 
-Version `0.1.13` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.14` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
@@ -39,6 +39,9 @@ From `0.1.12`, managed workers settle the exact server-terminal run-timeout
 completion race without hiding other completion failures.
 From `0.1.13`, typed side effects, deterministic UUIDv4 values, and version
 markers replay without re-running non-deterministic code or duplicating markers.
+From `0.1.14`, workflows can continue as new with replacement arguments and
+optional workflow-type and queue routing. Client handles follow the current
+run chain by default while retaining explicit selected-run views.
 
 ## Compatibility
 
@@ -52,7 +55,8 @@ markers replay without re-running non-deterministic code or duplicating markers.
 | `0.1.7` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.8`–`0.1.9` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.10`–`0.1.12` | `>=0.2,<0.3` | `1.2` (workflow lifecycle with server start deadlines, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.13+` | `>=0.2,<0.3` | `1.2` (side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.13` | `>=0.2,<0.3` | `1.2` (side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.14+` | `>=0.2,<0.3` | `1.2` (continue-as-new, side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -76,6 +80,9 @@ Side-effect releases additionally publish `deterministic-side-effects`,
 `side-effect-command`, and `side-effect-history-event`. Version-marker releases
 publish `version-markers`, `version-marker-command`,
 `version-marker-history-event`, and `version-marker-helpers`.
+Continue-as-new releases publish `continue-as-new`,
+`continue-as-new-command`, `continue-as-new-routing-overrides`,
+`workflow-history-budget`, and `workflow-result-routing`.
 
 ## Deterministic side effects and UUIDs
 
@@ -180,6 +187,53 @@ and requested/supported version fields. Activity settlement rejections are
 typed `Error::ActivityTaskRejected`; other rejected worker requests remain
 `Error::Http` values with the response status and body.
 
+## Bounded workflows with continue-as-new
+
+A workflow ID identifies the stable public workflow instance. Each
+continue-as-new transition closes one run and creates exactly one successor
+with a new run ID and fresh run-timeout budget. The server carries namespace,
+execution timeout, memo, search attributes, and other instance-owned metadata.
+Workflow code supplies only successor arguments and optional workflow-type or
+task-queue overrides.
+
+```rust
+# use durable_workflow::{json, Client, ContinueAsNewOptions, Value, Worker};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "invoice-workers");
+worker.register_workflow("invoice-sweep", |ctx, input| async move {
+    let next = input.get(0).and_then(Value::as_u64).unwrap_or(0);
+    let stop = input.get(1).and_then(Value::as_u64).unwrap_or(10_000);
+    let chunk_end = next.saturating_add(100).min(stop);
+
+    for invoice in next..chunk_end {
+        ctx.activity("invoice-one", json!([invoice])).await?;
+    }
+
+    if chunk_end < stop {
+        let budget = ctx.history_budget()?;
+        // Fixed chunks bound history; an adaptive workflow can transition
+        // earlier whenever the server recommendation becomes true.
+        if budget.continue_as_new_recommended || chunk_end - next >= 100 {
+            return ctx.continue_as_new_with_options(
+                ContinueAsNewOptions::new().task_queue("invoice-workers"),
+                json!([chunk_end, stop]),
+            );
+        }
+    }
+
+    Ok(json!({"processed": stop}))
+});
+# }
+```
+
+`WorkflowHandle::describe`, `signal`, `query`, and `result` resolve the current
+run, so a handle created for the first run continues to operate across the
+chain. `result` returns the final successful value or a typed terminal error
+from the final run. Use `describe_selected_run`, `signal_selected_run`,
+`query_selected_run`, or `result_selected_run` when the handle's original run
+identity is intentional. Selected-run commands are rejected once that run is
+historical; selected description and result remain available for inspection.
+
 ## Workflow cancellation, termination, and outcomes
 
 Cancellation is cooperative. Use it when workflow and activity code should run
@@ -207,10 +261,10 @@ longer current. Automation can match `reason ==
 "historical_run_command_rejected"`; the rejection also retains `workflow_id`,
 `run_id`, `target_scope`, HTTP status, and the original response body.
 
-`WorkflowHandle::result` still returns the decoded `Value` on success. Other
-terminal states are distinct typed errors. Handles returned by `start_workflow`
-carry a run ID, and `result` automatically describes that selected run rather
-than a newer current run that may reuse the same workflow ID:
+`WorkflowHandle::result` returns the decoded `Value` on success. Other terminal
+states are distinct typed errors. Handles returned by `start_workflow` carry
+the initial run ID for explicit historical inspection; `result` follows the
+instance's current run and `result_selected_run` awaits only that initial run:
 
 ```rust
 # use durable_workflow::{Error, Result, WorkflowHandle, WorkflowResultOptions};
