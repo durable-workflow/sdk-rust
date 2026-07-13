@@ -7,24 +7,25 @@ executions, start and await durable child workflows, expose named read-only
 query handlers, heartbeat
 workers and activities, and exchange JSON-native payloads through the
 platform's generic Avro wrapper. Workflow code can also wait on server-backed
-durable time without blocking a Rust executor thread.
+durable time, capture non-deterministic values exactly once, and evolve across
+deployments with durable version markers.
 
 ## Install
 
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.12 --exact
+cargo add durable-workflow@0.1.13 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.12"
+durable-workflow = "=0.1.13"
 ```
 
-Version `0.1.12` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.13` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
@@ -36,6 +37,8 @@ uncaught error returned by a workflow handler settles the run as a typed
 workflow failure instead of leaving the workflow task to retry indefinitely.
 From `0.1.12`, managed workers settle the exact server-terminal run-timeout
 completion race without hiding other completion failures.
+From `0.1.13`, typed side effects, deterministic UUIDv4 values, and version
+markers replay without re-running non-deterministic code or duplicating markers.
 
 ## Compatibility
 
@@ -48,7 +51,8 @@ completion race without hiding other completion failures.
 | `0.1.5`–`0.1.6` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.7` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.8`–`0.1.9` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.10+` | `>=0.2,<0.3` | `1.2` (workflow lifecycle with server start deadlines, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.10`–`0.1.12` | `>=0.2,<0.3` | `1.2` (workflow lifecycle with server start deadlines, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.13+` | `>=0.2,<0.3` | `1.2` (side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -67,6 +71,70 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor. The server's advertised protocol manifests remain
 authoritative when checking compatibility during deployment.
+
+Side-effect releases additionally publish `deterministic-side-effects`,
+`side-effect-command`, and `side-effect-history-event`. Version-marker releases
+publish `version-markers`, `version-marker-command`,
+`version-marker-history-event`, and `version-marker-helpers`.
+
+## Deterministic side effects and UUIDs
+
+`WorkflowContext::side_effect` evaluates its callback only when no matching
+`SideEffectRecorded` value exists at the current durable command sequence. It
+emits exactly one `record_side_effect` command with the workflow task's selected
+Avro or JSON envelope. Cold replay decodes the recorded value into the requested
+Rust type without invoking the callback.
+
+```rust
+# use durable_workflow::{json, Client, Result, Worker};
+# fn read_external_exchange_rate() -> String { "1.25".to_string() }
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "billing-workers");
+worker.register_workflow("price-invoice", |ctx, _input| async move {
+    let request_id = ctx.uuid_v4()?.to_string();
+    let exchange_rate: String = ctx.side_effect(read_external_exchange_rate)?;
+    Ok(json!({
+        "request_id": request_id,
+        "exchange_rate": exchange_rate,
+    }))
+});
+# }
+```
+
+Use side effects only for small value capture. Calls that need retries,
+timeouts, cancellation, or observable external work remain activities. A
+missing, duplicate, malformed, reordered, codec-incompatible, or Rust
+type-incompatible recorded value returns `Error::NonDeterministicReplay` with
+stable `ReplayFailure` fields.
+
+## Version markers and staged code evolution
+
+`get_version(change_id, min_supported, max_supported)` chooses
+`max_supported` for a new run. After the server commits the marker, every
+worker restart and later code deployment reads that exact version. Repeating
+the same change ID in one execution returns the cached choice and never emits a
+second marker.
+
+Start a rollout by preserving both branches:
+
+```rust
+# use durable_workflow::{json, Result, WorkflowContext, Value};
+# async fn rollout(ctx: WorkflowContext) -> Result<Value> {
+let version = ctx.get_version("invoice-tax-v2", 1, 2)?;
+if version == 1 {
+    Ok(json!({"calculation": "legacy"}))
+} else {
+    Ok(json!({"calculation": "v2"}))
+}
+# }
+```
+
+Once all version `1` runs have drained, a later deployment can require
+`get_version("invoice-tax-v2", 2, 2)`. A still-running version `1` history is
+then rejected deterministically instead of silently taking new code. For a
+boolean rollout, `patched(change_id)` uses the standard `-1` legacy / `1`
+patched range. After removing the old branch, call `deprecate_patch(change_id)`
+at the same location to keep existing histories replay-compatible.
 
 ## Durable timers
 

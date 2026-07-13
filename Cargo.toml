@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -37,6 +37,13 @@ payload-codecs = ["avro", "json"]
 durable-timers = true
 timer-command = "start_timer"
 timer-replay-validation = "command-order+sequence+timer-id+delay"
+deterministic-side-effects = true
+side-effect-command = "record_side_effect"
+side-effect-history-event = "SideEffectRecorded"
+version-markers = true
+version-marker-command = "record_version_marker"
+version-marker-history-event = "VersionMarkerRecorded"
+version-marker-helpers = ["patched", "deprecate_patch"]
 
 [lib]
 name = "durable_workflow"
@@ -53,6 +60,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

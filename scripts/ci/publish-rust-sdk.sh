@@ -47,6 +47,13 @@ snapshot_inspection_queries="$(jq -er '.packages[0].metadata["durable-workflow"]
 child_workflows="$(jq -er '.packages[0].metadata["durable-workflow"]["child-workflows"]' <<<"$metadata")"
 child_workflow_command="$(jq -er '.packages[0].metadata["durable-workflow"]["child-workflow-command"]' <<<"$metadata")"
 child_workflow_failure_reasons="$(jq -cer '.packages[0].metadata["durable-workflow"]["child-workflow-failure-reasons"]' <<<"$metadata")"
+deterministic_side_effects="$(jq -er '.packages[0].metadata["durable-workflow"]["deterministic-side-effects"]' <<<"$metadata")"
+side_effect_command="$(jq -er '.packages[0].metadata["durable-workflow"]["side-effect-command"]' <<<"$metadata")"
+side_effect_history_event="$(jq -er '.packages[0].metadata["durable-workflow"]["side-effect-history-event"]' <<<"$metadata")"
+version_markers="$(jq -er '.packages[0].metadata["durable-workflow"]["version-markers"]' <<<"$metadata")"
+version_marker_command="$(jq -er '.packages[0].metadata["durable-workflow"]["version-marker-command"]' <<<"$metadata")"
+version_marker_history_event="$(jq -er '.packages[0].metadata["durable-workflow"]["version-marker-history-event"]' <<<"$metadata")"
+version_marker_helpers="$(jq -cer '.packages[0].metadata["durable-workflow"]["version-marker-helpers"]' <<<"$metadata")"
 
 if [[ "$package_name" != "durable-workflow" ]]; then
     printf 'unexpected Rust SDK package name: %s\n' "$package_name" >&2
@@ -68,7 +75,7 @@ if [[ "$package_documentation" != "https://rust.durable-workflow.com/" ]]; then
     printf 'unexpected Rust SDK documentation metadata: %s\n' "$package_documentation" >&2
     exit 1
 fi
-if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' ]]; then
+if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi
@@ -141,6 +148,13 @@ write_evidence() {
         --arg child_workflows "$child_workflows" \
         --arg child_workflow_command "$child_workflow_command" \
         --argjson child_workflow_failure_reasons "$child_workflow_failure_reasons" \
+        --arg deterministic_side_effects "$deterministic_side_effects" \
+        --arg side_effect_command "$side_effect_command" \
+        --arg side_effect_history_event "$side_effect_history_event" \
+        --arg version_markers "$version_markers" \
+        --arg version_marker_command "$version_marker_command" \
+        --arg version_marker_history_event "$version_marker_history_event" \
+        --argjson version_marker_helpers "$version_marker_helpers" \
         --arg release_tag "$release_tag" \
         --arg release_commit "$release_commit" \
         --arg release_run_id "$release_run_id" \
@@ -180,7 +194,14 @@ write_evidence() {
                 snapshot_inspection_queries: ($snapshot_inspection_queries == "true"),
                 child_workflows: ($child_workflows == "true"),
                 child_workflow_command: $child_workflow_command,
-                child_workflow_failure_reasons: $child_workflow_failure_reasons
+                child_workflow_failure_reasons: $child_workflow_failure_reasons,
+                deterministic_side_effects: ($deterministic_side_effects == "true"),
+                side_effect_command: $side_effect_command,
+                side_effect_history_event: $side_effect_history_event,
+                version_markers: ($version_markers == "true"),
+                version_marker_command: $version_marker_command,
+                version_marker_history_event: $version_marker_history_event,
+                version_marker_helpers: $version_marker_helpers
             },
             release: {
                 sdk_tag: $release_tag,

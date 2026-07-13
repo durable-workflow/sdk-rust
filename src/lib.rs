@@ -19,6 +19,7 @@ use futures_util::{future::OptionFuture, task::noop_waker_ref};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub use serde_json::{json, Value};
 use thiserror::Error;
+pub use uuid::Uuid;
 
 pub const WORKER_PROTOCOL_VERSION: &str = "1.2";
 pub const CONTROL_PLANE_VERSION: &str = "2";
@@ -3941,12 +3942,28 @@ impl Worker {
             Poll::Ready(Ok(result)) => {
                 ctx.ensure_history_consumed()?;
                 let result = encode_value_envelope(&result, &task.payload_codec)?;
-                Ok(vec![json!({
+                let mut commands = ctx.take_commands()?;
+                commands.push(json!({
                     "type": "complete_workflow",
                     "result": result
-                })])
+                }));
+                Ok(commands)
             }
-            Poll::Ready(Err(error)) => Ok(vec![workflow_failure_command(&error)]),
+            Poll::Ready(Err(error)) => {
+                // A handler error must not hide a committed durable command that
+                // upgraded workflow code no longer consumes.
+                ctx.ensure_history_consumed()?;
+                if workflow_task_integrity_error(&error) {
+                    // Replay and protocol failures describe the workflow-task
+                    // decision itself. Do not let commands queued earlier in
+                    // this uncommitted decision escape alongside a terminal
+                    // workflow failure.
+                    return Err(error);
+                }
+                let mut commands = ctx.take_commands()?;
+                commands.push(workflow_failure_command(&error));
+                Ok(commands)
+            }
             Poll::Pending => {
                 let commands = ctx.take_commands()?;
                 if commands.is_empty() && !ctx.matched_recorded_pending()? {
@@ -4260,6 +4277,156 @@ impl WorkflowContext {
         self.sleep(duration)
     }
 
+    /// Evaluate a non-deterministic callback once and durably record its typed value.
+    ///
+    /// On replay the callback is not invoked: the value is decoded from the
+    /// sequence-matched `SideEffectRecorded` event using the workflow's payload
+    /// codec. Use this for UUIDs, wall-clock snapshots, random values, and other
+    /// small values that must remain fixed for the lifetime of a workflow run.
+    pub fn side_effect<T, F>(&self, callback: F) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce() -> T,
+    {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+                return match recorded {
+                    RecordedCommand::SideEffect { sequence, value } => {
+                        state.command_cursor += 1;
+                        serde_json::from_value(value).map_err(|error| {
+                            Error::NonDeterministicReplay(ReplayFailure::new(
+                                "side_effect_type_mismatch",
+                                Some(sequence),
+                                Some(std::any::type_name::<T>().to_string()),
+                                Some(error.to_string()),
+                                "recorded side-effect value is incompatible with the requested Rust type",
+                            ))
+                        })
+                    }
+                    other => Err(command_mismatch(&other, "side effect")),
+                };
+            }
+        }
+
+        let value = callback();
+        let json_value = serde_json::to_value(&value)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let result = encode_value_envelope(&json_value, &state.payload_codec)?;
+        state.commands.push(json!({
+            "type": "record_side_effect",
+            "result": result,
+        }));
+        Ok(value)
+    }
+
+    /// Record a UUIDv4 once and return the same UUID on every replay.
+    pub fn uuid_v4(&self) -> Result<Uuid> {
+        self.side_effect(Uuid::new_v4)
+    }
+
+    /// Select the newest supported version for a change, or replay the version
+    /// already committed for that stable change ID.
+    pub fn get_version(
+        &self,
+        change_id: impl Into<String>,
+        min_supported: i32,
+        max_supported: i32,
+    ) -> Result<i32> {
+        let change_id = change_id.into();
+        if change_id.trim().is_empty() {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "version_change_id_invalid",
+                None,
+                Some("non-empty change ID".to_string()),
+                Some(change_id),
+                "version markers require a stable non-empty change ID",
+            )));
+        }
+        if min_supported > max_supported {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "version_range_invalid",
+                None,
+                Some("min_supported <= max_supported".to_string()),
+                Some(format!("{min_supported}..={max_supported}")),
+                "version marker supported range is invalid",
+            )));
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if let Some((version, sequence)) = state.version_markers.get(&change_id).copied() {
+            ensure_version_supported(&change_id, version, min_supported, max_supported, sequence)?;
+            return Ok(version);
+        }
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            return match recorded {
+                RecordedCommand::VersionMarker {
+                    sequence,
+                    change_id: recorded_change_id,
+                    version,
+                    ..
+                } => {
+                    if recorded_change_id != change_id {
+                        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                            "version_change_id_mismatch",
+                            Some(sequence),
+                            Some(recorded_change_id),
+                            Some(change_id),
+                            "recorded version marker change ID differs from current workflow code",
+                        )));
+                    }
+                    ensure_version_supported(
+                        &change_id,
+                        version,
+                        min_supported,
+                        max_supported,
+                        sequence,
+                    )?;
+                    state.command_cursor += 1;
+                    state.version_markers.insert(change_id, (version, sequence));
+                    Ok(version)
+                }
+                other => Err(command_mismatch(
+                    &other,
+                    format!("version marker:{change_id}"),
+                )),
+            };
+        }
+
+        let version = max_supported;
+        state.commands.push(json!({
+            "type": "record_version_marker",
+            "change_id": change_id,
+            "version": version,
+            "min_supported": min_supported,
+            "max_supported": max_supported,
+        }));
+        // Sequence numbers are assigned by the server. Zero identifies a marker
+        // selected in this uncommitted decision batch for duplicate-call checks.
+        state.version_markers.insert(change_id, (version, 0));
+        Ok(version)
+    }
+
+    /// Record or replay the standard `-1` (legacy) / `1` (patched) marker.
+    pub fn patched(&self, change_id: impl Into<String>) -> Result<bool> {
+        Ok(self.get_version(change_id, -1, 1)? == 1)
+    }
+
+    /// Keep a patch marker in history after the legacy branch has been removed.
+    pub fn deprecate_patch(&self, change_id: impl Into<String>) -> Result<()> {
+        self.get_version(change_id, -1, 1).map(|_| ())
+    }
+
     /// Start a named durable child on an explicit queue and await its result.
     ///
     /// The command is recorded in the parent's sequence-ordered durable command
@@ -4348,6 +4515,7 @@ struct WorkflowState {
     command_cursor: usize,
     matched_recorded_pending: bool,
     signal_cursors: HashMap<String, usize>,
+    version_markers: HashMap<String, (i32, u64)>,
     commands: Vec<Value>,
 }
 
@@ -4396,6 +4564,7 @@ impl WorkflowState {
             command_cursor: 0,
             matched_recorded_pending: false,
             signal_cursors: HashMap::new(),
+            version_markers: HashMap::new(),
             commands: Vec::new(),
         })
     }
@@ -4422,6 +4591,15 @@ enum RecordedCommand {
     SignalWait {
         sequence: u64,
         signal_name: Option<String>,
+    },
+    SideEffect {
+        sequence: u64,
+        value: Value,
+    },
+    VersionMarker {
+        sequence: u64,
+        change_id: String,
+        version: i32,
     },
 }
 
@@ -4594,7 +4772,9 @@ impl RecordedCommand {
             Self::Activity { sequence, .. }
             | Self::Timer { sequence, .. }
             | Self::ChildWorkflow { sequence, .. }
-            | Self::SignalWait { sequence, .. } => *sequence,
+            | Self::SignalWait { sequence, .. }
+            | Self::SideEffect { sequence, .. }
+            | Self::VersionMarker { sequence, .. } => *sequence,
         }
     }
 
@@ -4604,8 +4784,29 @@ impl RecordedCommand {
             Self::Timer { .. } => "timer",
             Self::ChildWorkflow { .. } => "child workflow",
             Self::SignalWait { .. } => "signal wait",
+            Self::SideEffect { .. } => "side effect",
+            Self::VersionMarker { .. } => "version marker",
         }
     }
+}
+
+fn ensure_version_supported(
+    change_id: &str,
+    version: i32,
+    min_supported: i32,
+    max_supported: i32,
+    sequence: u64,
+) -> Result<()> {
+    if (min_supported..=max_supported).contains(&version) {
+        return Ok(());
+    }
+    Err(Error::NonDeterministicReplay(ReplayFailure::new(
+        "version_marker_incompatible_range",
+        (sequence != 0).then_some(sequence),
+        Some(format!("{min_supported}..={max_supported}")),
+        Some(format!("{change_id}:{version}")),
+        "recorded workflow version is outside the range supported by current code",
+    )))
 }
 
 #[derive(Clone, Debug)]
@@ -5196,7 +5397,15 @@ fn recorded_commands(
                 | "ChildRunTerminated"
         );
         let is_signal_wait = is_recorded_signal_wait_event(event);
-        if !is_activity && !is_workflow_timer && !is_child_workflow && !is_signal_wait {
+        let is_side_effect = event.event_type == "SideEffectRecorded";
+        let is_version_marker = event.event_type == "VersionMarkerRecorded";
+        if !is_activity
+            && !is_workflow_timer
+            && !is_child_workflow
+            && !is_signal_wait
+            && !is_side_effect
+            && !is_version_marker
+        {
             continue;
         }
 
@@ -5221,7 +5430,7 @@ fn recorded_commands(
         events_by_sequence.entry(sequence).or_default().push(event);
     }
 
-    events_by_sequence
+    let commands: Vec<RecordedCommand> = events_by_sequence
         .into_iter()
         .map(|(sequence, sequence_events)| {
             let activity_events: Vec<_> = sequence_events
@@ -5247,17 +5456,31 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| is_recorded_signal_wait_event(event))
                 .collect();
+            let side_effect_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "SideEffectRecorded")
+                .collect();
+            let version_marker_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "VersionMarkerRecorded")
+                .collect();
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
                 + usize::from(!child_events.is_empty())
-                + usize::from(!signal_wait_events.is_empty());
+                + usize::from(!signal_wait_events.is_empty())
+                + usize::from(!side_effect_events.is_empty())
+                + usize::from(!version_marker_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
                     (!timer_events.is_empty()).then_some("timer"),
                     (!child_events.is_empty()).then_some("child workflow"),
                     (!signal_wait_events.is_empty()).then_some("signal wait"),
+                    (!side_effect_events.is_empty()).then_some("side effect"),
+                    (!version_marker_events.is_empty()).then_some("version marker"),
                 ]
                 .into_iter()
                 .flatten()
@@ -5463,6 +5686,101 @@ fn recorded_commands(
                 });
             }
 
+            if !side_effect_events.is_empty() {
+                if side_effect_events.len() != 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_side_effect_record",
+                        sequence,
+                        "one SideEffectRecorded event",
+                        &format!("{} SideEffectRecorded events", side_effect_events.len()),
+                        "side-effect history records one workflow command more than once",
+                    ));
+                }
+                let event = side_effect_events[0];
+                let result = event.payload.get("result").ok_or_else(|| {
+                    invalid_recorded_history(
+                        "side_effect_result_missing",
+                        sequence,
+                        "recorded result payload",
+                        "missing result",
+                        "side-effect history is missing its recorded value",
+                    )
+                })?;
+                let has_published_envelope = result.as_str().is_some()
+                    || result.as_object().is_some_and(|envelope| {
+                        envelope.get("codec").and_then(Value::as_str).is_some()
+                            && envelope.get("blob").and_then(Value::as_str).is_some()
+                    });
+                if !has_published_envelope {
+                    return Err(invalid_recorded_history(
+                        "side_effect_payload_malformed",
+                        sequence,
+                        "payload blob or {codec, blob} envelope",
+                        &result.to_string(),
+                        "side-effect history result does not use a published payload envelope",
+                    ));
+                }
+                let codec = event
+                    .payload
+                    .get("payload_codec")
+                    .and_then(Value::as_str)
+                    .unwrap_or(fallback_codec);
+                let value = decode_wire_value(result, codec).map_err(|error| {
+                    invalid_recorded_history(
+                        "side_effect_payload_incompatible",
+                        sequence,
+                        &format!("valid {codec} payload envelope"),
+                        &error.to_string(),
+                        "side-effect history payload cannot be decoded with its recorded codec",
+                    )
+                })?;
+                return Ok(RecordedCommand::SideEffect { sequence, value });
+            }
+
+            if !version_marker_events.is_empty() {
+                if version_marker_events.len() != 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_version_marker_record",
+                        sequence,
+                        "one VersionMarkerRecorded event",
+                        &format!("{} VersionMarkerRecorded events", version_marker_events.len()),
+                        "version-marker history records one workflow command more than once",
+                    ));
+                }
+                let payload = &version_marker_events[0].payload;
+                let change_id = payload
+                    .get("change_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        invalid_recorded_history(
+                            "version_marker_field_missing",
+                            sequence,
+                            "non-empty change_id",
+                            "missing or invalid change_id",
+                            "version-marker history is missing its stable change ID",
+                        )
+                    })?;
+                let version = required_version_i32(payload, "version", sequence)?;
+                let min_supported = required_version_i32(payload, "min_supported", sequence)?;
+                let max_supported = required_version_i32(payload, "max_supported", sequence)?;
+                if min_supported > max_supported || version < min_supported || version > max_supported {
+                    return Err(invalid_recorded_history(
+                        "version_marker_history_range_invalid",
+                        sequence,
+                        "min_supported <= version <= max_supported",
+                        &format!("{min_supported} <= {version} <= {max_supported}"),
+                        "recorded version marker contains an internally incompatible range",
+                    ));
+                }
+                return Ok(RecordedCommand::VersionMarker {
+                    sequence,
+                    change_id,
+                    version,
+                });
+            }
+
             let scheduled: Vec<_> = timer_events
                 .iter()
                 .copied()
@@ -5524,7 +5842,69 @@ fn recorded_commands(
                 fired: !fired.is_empty(),
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+
+    for (index, command) in commands.iter().enumerate() {
+        let expected = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| {
+                invalid_recorded_history(
+                    "durable_command_sequence_invalid",
+                    command.sequence(),
+                    "representable positive workflow sequence",
+                    &command.sequence().to_string(),
+                    "durable command history exceeds the supported workflow sequence range",
+                )
+            })?;
+        if command.sequence() != expected {
+            return Err(invalid_recorded_history(
+                "durable_command_sequence_mismatch",
+                command.sequence(),
+                &expected.to_string(),
+                &command.sequence().to_string(),
+                "durable command history does not follow the recorded workflow command sequence",
+            ));
+        }
+    }
+
+    let mut marker_sequences = HashMap::new();
+    for command in &commands {
+        if let RecordedCommand::VersionMarker {
+            sequence,
+            change_id,
+            ..
+        } = command
+        {
+            if let Some(first_sequence) = marker_sequences.insert(change_id.clone(), *sequence) {
+                return Err(invalid_recorded_history(
+                    "duplicate_version_marker",
+                    *sequence,
+                    &format!("one marker for change ID {change_id:?}"),
+                    &format!("markers at sequences {first_sequence} and {sequence}"),
+                    "workflow history contains duplicate markers for one stable change ID",
+                ));
+            }
+        }
+    }
+
+    Ok(commands)
+}
+
+fn required_version_i32(payload: &Value, field: &str, sequence: u64) -> Result<i32> {
+    payload
+        .get(field)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "version_marker_field_missing",
+                sequence,
+                &format!("integer {field}"),
+                "missing or out-of-range integer",
+                "version-marker history is missing a required integer field",
+            )
+        })
 }
 
 fn durable_event_sequence(event: &HistoryEvent) -> Option<u64> {
@@ -5915,6 +6295,13 @@ fn workflow_failure_command(error: &Error) -> Value {
     })
 }
 
+fn workflow_task_integrity_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NonDeterministicReplay(_) | Error::Protocol(_) | Error::WorkflowStatePoisoned
+    )
+}
+
 fn signal_values(
     events: &[HistoryEvent],
     signal_name: &str,
@@ -6287,6 +6674,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        sync::atomic::AtomicUsize,
         thread,
     };
 
@@ -6368,6 +6756,13 @@ mod tests {
     }
 
     fn workflow_context(history: Vec<HistoryEvent>) -> WorkflowContext {
+        workflow_context_with_codec(history, JSON_CODEC)
+    }
+
+    fn workflow_context_with_codec(
+        history: Vec<HistoryEvent>,
+        payload_codec: &str,
+    ) -> WorkflowContext {
         WorkflowContext {
             state: Arc::new(Mutex::new(
                 WorkflowState::new_with_identity(
@@ -6375,7 +6770,7 @@ mod tests {
                     None,
                     None,
                     "rust-workers".to_string(),
-                    JSON_CODEC.to_string(),
+                    payload_codec.to_string(),
                     None,
                 )
                 .expect("valid workflow history"),
@@ -6389,6 +6784,408 @@ mod tests {
             payload,
             raw: HashMap::new(),
         }
+    }
+
+    fn workflow_task(
+        workflow_type: &str,
+        history_events: Vec<HistoryEvent>,
+        payload_codec: &str,
+    ) -> WorkflowTask {
+        WorkflowTask {
+            task_id: format!("wft-{workflow_type}"),
+            workflow_id: Some(format!("wf-{workflow_type}")),
+            run_id: Some(format!("run-{workflow_type}")),
+            workflow_type: workflow_type.to_string(),
+            payload_codec: payload_codec.to_string(),
+            arguments: Some(
+                encode_value_envelope(&json!([]), payload_codec).expect("workflow arguments"),
+            ),
+            total_history_events: Some(history_events.len() as u64),
+            history_events,
+            next_history_page_token: None,
+            workflow_task_attempt: 1,
+            workflow_signal_id: None,
+            signal_name: None,
+            signal_arguments: None,
+            lease_owner: Some("rust-worker".to_string()),
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    struct SideEffectProbe {
+        request_id: String,
+        attempt: u32,
+    }
+
+    #[test]
+    fn typed_side_effect_runs_callback_once_and_replay_skips_it() {
+        let calls = AtomicUsize::new(0);
+        let ctx = workflow_context(Vec::new());
+        let value = ctx
+            .side_effect(|| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                SideEffectProbe {
+                    request_id: "request-42".to_string(),
+                    attempt: 3,
+                }
+            })
+            .expect("first side effect");
+        assert_eq!(value.attempt, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let commands = ctx.take_commands().expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], "record_side_effect");
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("JSON result"),
+            serde_json::to_value(&value).expect("value")
+        );
+
+        let replay = workflow_context(vec![history_event(
+            "SideEffectRecorded",
+            json!({"sequence": 1, "result": commands[0]["result"].clone()}),
+        )]);
+        let replayed: SideEffectProbe = replay
+            .side_effect(|| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("committed side-effect callbacks must not run during replay")
+            })
+            .expect("replayed side effect");
+        assert_eq!(replayed, value);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(replay.take_commands().expect("commands").is_empty());
+        replay.ensure_history_consumed().expect("history consumed");
+    }
+
+    #[test]
+    fn side_effect_uses_avro_envelope_and_uuid_is_replay_stable() {
+        let ctx = workflow_context_with_codec(Vec::new(), DEFAULT_CODEC);
+        let value = ctx
+            .side_effect(|| SideEffectProbe {
+                request_id: "avro-request".to_string(),
+                attempt: 1,
+            })
+            .expect("Avro side effect");
+        let uuid = ctx.uuid_v4().expect("deterministic UUID");
+        let commands = ctx.take_commands().expect("commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["result"]["codec"], DEFAULT_CODEC);
+        assert_eq!(commands[1]["result"]["codec"], DEFAULT_CODEC);
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("Avro result"),
+            serde_json::to_value(&value).expect("value")
+        );
+
+        let replay = workflow_context_with_codec(
+            vec![
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 1, "result": commands[0]["result"].clone()}),
+                ),
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 2, "result": commands[1]["result"].clone()}),
+                ),
+            ],
+            DEFAULT_CODEC,
+        );
+        let replayed: SideEffectProbe = replay
+            .side_effect(|| panic!("Avro callback must not run"))
+            .expect("replayed Avro value");
+        let replayed_uuid = replay.uuid_v4().expect("replayed UUID");
+        assert_eq!(replayed, value);
+        assert_eq!(replayed_uuid, uuid);
+        assert!(replay.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn ordered_side_effects_share_the_durable_command_stream() {
+        let first = encode_value_envelope(&json!("first"), JSON_CODEC).expect("first");
+        let second = encode_value_envelope(&json!(29), JSON_CODEC).expect("second");
+        let ctx = workflow_context(vec![
+            history_event(
+                "SideEffectRecorded",
+                json!({"sequence": 1, "result": first}),
+            ),
+            history_event(
+                "SideEffectRecorded",
+                json!({"sequence": 2, "result": second}),
+            ),
+        ]);
+        let first: String = ctx
+            .side_effect(|| panic!("first callback must not run"))
+            .expect("first replay");
+        let second: i32 = ctx
+            .side_effect(|| panic!("second callback must not run"))
+            .expect("second replay");
+        assert_eq!(first, "first");
+        assert_eq!(second, 29);
+        ctx.ensure_history_consumed().expect("ordered history");
+
+        let reordered = workflow_context(vec![history_event(
+            "VersionMarkerRecorded",
+            json!({
+                "sequence": 1,
+                "change_id": "before-side-effect",
+                "version": 1,
+                "min_supported": 1,
+                "max_supported": 1,
+            }),
+        )]);
+        let error = reordered
+            .side_effect(|| "new".to_string())
+            .expect_err("command reordering must fail");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "recorded_command_mismatch"
+        ));
+    }
+
+    #[test]
+    fn version_markers_replay_across_upgrades_and_do_not_duplicate() {
+        let ctx = workflow_context(Vec::new());
+        assert_eq!(ctx.get_version("checkout-v2", 1, 2).expect("version"), 2);
+        assert_eq!(ctx.get_version("checkout-v2", 1, 3).expect("cached"), 2);
+        assert!(ctx.patched("new-search").expect("patch"));
+        ctx.deprecate_patch("new-search").expect("deprecate patch");
+        let commands = ctx.take_commands().expect("commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["type"], "record_version_marker");
+        assert_eq!(commands[0]["version"], 2);
+        assert_eq!(commands[1]["change_id"], "new-search");
+
+        let replay = workflow_context(vec![history_event(
+            "VersionMarkerRecorded",
+            json!({
+                "sequence": 1,
+                "change_id": "checkout-v2",
+                "version": 2,
+                "min_supported": 1,
+                "max_supported": 2,
+            }),
+        )]);
+        assert_eq!(replay.get_version("checkout-v2", 1, 4).expect("upgrade"), 2);
+        assert_eq!(replay.get_version("checkout-v2", 2, 5).expect("repeat"), 2);
+        assert!(replay.take_commands().expect("commands").is_empty());
+        replay.ensure_history_consumed().expect("history consumed");
+    }
+
+    #[test]
+    fn version_markers_reject_incompatible_or_malformed_history() {
+        let incompatible = workflow_context(vec![history_event(
+            "VersionMarkerRecorded",
+            json!({
+                "sequence": 1,
+                "change_id": "checkout-v2",
+                "version": 1,
+                "min_supported": 1,
+                "max_supported": 2,
+            }),
+        )]);
+        let error = incompatible
+            .get_version("checkout-v2", 2, 3)
+            .expect_err("old version is unsupported");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "version_marker_incompatible_range"
+        ));
+
+        for (history, reason) in [
+            (
+                vec![history_event("SideEffectRecorded", json!({"sequence": 1}))],
+                "side_effect_result_missing",
+            ),
+            (
+                vec![history_event(
+                    "SideEffectRecorded",
+                    json!({
+                        "sequence": 1,
+                        "result": {"codec": "avro", "blob": "not-base64"},
+                    }),
+                )],
+                "side_effect_payload_incompatible",
+            ),
+            (
+                vec![history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 1, "result": {"unwrapped": true}}),
+                )],
+                "side_effect_payload_malformed",
+            ),
+            (
+                vec![history_event(
+                    "VersionMarkerRecorded",
+                    json!({
+                        "sequence": 1,
+                        "change_id": "change",
+                        "version": 1,
+                        "min_supported": 2,
+                        "max_supported": 1,
+                    }),
+                )],
+                "version_marker_history_range_invalid",
+            ),
+        ] {
+            let error = WorkflowState::new(
+                history,
+                "rust-workers".to_string(),
+                JSON_CODEC.to_string(),
+                None,
+            )
+            .expect_err("malformed history must fail");
+            assert!(matches!(
+                error,
+                Error::NonDeterministicReplay(ReplayFailure { reason: actual, .. })
+                    if actual == reason
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_side_effects_and_version_markers_are_rejected() {
+        let duplicate_side_effect = WorkflowState::new(
+            vec![
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 1, "result": {"codec": "json", "blob": "1"}}),
+                ),
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 1, "result": {"codec": "json", "blob": "2"}}),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("duplicate side effect");
+        assert!(matches!(
+            duplicate_side_effect,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "duplicate_side_effect_record"
+        ));
+
+        let marker = |sequence| {
+            history_event(
+                "VersionMarkerRecorded",
+                json!({
+                    "sequence": sequence,
+                    "change_id": "same-change",
+                    "version": 1,
+                    "min_supported": 1,
+                    "max_supported": 1,
+                }),
+            )
+        };
+        let duplicate_marker = WorkflowState::new(
+            vec![marker(1), marker(2)],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("duplicate marker");
+        assert!(matches!(
+            duplicate_marker,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "duplicate_version_marker"
+        ));
+    }
+
+    #[test]
+    fn cold_worker_replay_does_not_repeat_committed_side_effects_or_markers() {
+        fn worker(calls: Arc<AtomicUsize>) -> Worker {
+            let client = Client::new("http://127.0.0.1:8080").expect("client");
+            let mut worker = Worker::new(client, "rust-workers");
+            worker.register_workflow("rust.side-effect-version", move |ctx, _input| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let captured = ctx.side_effect(|| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "captured-once".to_string()
+                    })?;
+                    let version = ctx.get_version("cold-restart", 1, 2)?;
+                    Ok(json!({"captured": captured, "version": version}))
+                }
+            });
+            worker
+        }
+
+        fn task(history_events: Vec<HistoryEvent>) -> WorkflowTask {
+            WorkflowTask {
+                task_id: "wft-side-effect-version".to_string(),
+                workflow_id: Some("wf-side-effect-version".to_string()),
+                run_id: Some("run-side-effect-version".to_string()),
+                workflow_type: "rust.side-effect-version".to_string(),
+                payload_codec: JSON_CODEC.to_string(),
+                arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("arguments")),
+                history_events,
+                total_history_events: None,
+                next_history_page_token: None,
+                workflow_task_attempt: 1,
+                workflow_signal_id: None,
+                signal_name: None,
+                signal_arguments: None,
+                lease_owner: Some("rust-worker".to_string()),
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let initial = worker(Arc::clone(&calls))
+            .execute_workflow_task(task(Vec::new()))
+            .expect("initial execution");
+        assert_eq!(
+            initial
+                .iter()
+                .map(|command| &command["type"])
+                .collect::<Vec<_>>(),
+            vec![
+                "record_side_effect",
+                "record_version_marker",
+                "complete_workflow"
+            ]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let restarted = worker(Arc::clone(&calls));
+        let replayed = restarted
+            .execute_workflow_task(task(vec![
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 1, "result": initial[0]["result"].clone()}),
+                ),
+                history_event(
+                    "VersionMarkerRecorded",
+                    json!({
+                        "sequence": 2,
+                        "change_id": "cold-restart",
+                        "version": 2,
+                        "min_supported": 1,
+                        "max_supported": 2,
+                    }),
+                ),
+            ]))
+            .expect("cold replay");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0]["type"], "complete_workflow");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn side_effect_replay_rejects_changed_rust_value_type() {
+        let result = encode_value_envelope(&json!({"value": 42}), JSON_CODEC).expect("result");
+        let ctx = workflow_context(vec![history_event(
+            "SideEffectRecorded",
+            json!({"sequence": 1, "result": result}),
+        )]);
+        let error = ctx
+            .side_effect::<Vec<String>, _>(|| panic!("callback must not run"))
+            .expect_err("changed type must fail replay");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "side_effect_type_mismatch"
+        ));
     }
 
     fn completed_retry_activity_history() -> Vec<HistoryEvent> {
@@ -7450,6 +8247,30 @@ mod tests {
     }
 
     #[test]
+    fn workflow_history_rejects_changed_numeric_command_sequence() {
+        let result = encode_value_envelope(&json!({"captured": true}), JSON_CODEC)
+            .expect("side-effect result");
+        let error = WorkflowState::new(
+            vec![history_event(
+                "SideEffectRecorded",
+                json!({"sequence": 99, "result": result}),
+            )],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("the first durable command must have sequence one");
+
+        let Error::NonDeterministicReplay(failure) = error else {
+            panic!("expected typed replay failure");
+        };
+        assert_eq!(failure.reason, "durable_command_sequence_mismatch");
+        assert_eq!(failure.sequence, Some(99));
+        assert_eq!(failure.expected.as_deref(), Some("1"));
+        assert_eq!(failure.actual.as_deref(), Some("99"));
+    }
+
+    #[test]
     fn workflow_sleep_rejects_unrepresentable_rounded_duration() {
         let ctx = workflow_context(Vec::new());
         let mut sleep = Box::pin(ctx.start_timer(Duration::new(u64::MAX, 1)));
@@ -7565,6 +8386,95 @@ mod tests {
             commands[0]["exception"]["message"],
             "codec error: rust_conformance_failure"
         );
+    }
+
+    #[test]
+    fn ordinary_handler_error_preserves_commands_queued_in_the_same_decision() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.failing-after-side-effect", |ctx, _input| async move {
+            let _: String = ctx.side_effect(|| "captured".to_string())?;
+            Err(Error::WorkerLoop("application failure".to_string()))
+        });
+
+        let commands = worker
+            .execute_workflow_task(workflow_task(
+                "rust.failing-after-side-effect",
+                Vec::new(),
+                JSON_CODEC,
+            ))
+            .expect("ordinary failure remains a workflow decision");
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["type"], "record_side_effect");
+        assert_eq!(commands[1]["type"], "fail_workflow");
+    }
+
+    #[test]
+    fn handler_error_cannot_hide_an_unconsumed_committed_side_effect() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.removed-side-effect", |_ctx, _input| async move {
+            Err(Error::WorkerLoop("application failure".to_string()))
+        });
+        let result =
+            encode_value_envelope(&json!("committed"), JSON_CODEC).expect("side-effect result");
+
+        let error = worker
+            .execute_workflow_task(workflow_task(
+                "rust.removed-side-effect",
+                vec![history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 1, "result": result}),
+                )],
+                JSON_CODEC,
+            ))
+            .expect_err("removed committed history must not become fail_workflow");
+
+        let Error::NonDeterministicReplay(failure) = error else {
+            panic!("expected typed replay failure");
+        };
+        assert_eq!(failure.reason, "recorded_commands_unconsumed");
+        assert_eq!(failure.sequence, Some(1));
+        assert_eq!(failure.expected.as_deref(), Some("side effect"));
+    }
+
+    #[test]
+    fn replay_error_discards_side_effect_queued_before_incompatible_marker_check() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow(
+            "rust.side-effect-before-marker-error",
+            |ctx, _input| async move {
+                assert_eq!(ctx.get_version("restart-safe", 1, 1)?, 1);
+                let _: String = ctx.side_effect(|| "must-not-commit".to_string())?;
+                ctx.get_version("restart-safe", 2, 2)?;
+                Ok(Value::Null)
+            },
+        );
+
+        let error = worker
+            .execute_workflow_task(workflow_task(
+                "rust.side-effect-before-marker-error",
+                vec![history_event(
+                    "VersionMarkerRecorded",
+                    json!({
+                        "sequence": 1,
+                        "change_id": "restart-safe",
+                        "version": 1,
+                        "min_supported": 1,
+                        "max_supported": 1,
+                    }),
+                )],
+                JSON_CODEC,
+            ))
+            .expect_err("replay error must return no queued workflow commands");
+
+        let Error::NonDeterministicReplay(failure) = error else {
+            panic!("expected typed replay failure");
+        };
+        assert_eq!(failure.reason, "version_marker_incompatible_range");
+        assert_eq!(failure.sequence, Some(1));
     }
 
     #[test]
