@@ -15,17 +15,17 @@ deployments with durable version markers.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.14 --exact
+cargo add durable-workflow@0.1.15 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.14"
+durable-workflow = "=0.1.15"
 ```
 
-Version `0.1.14` requires Rust `1.86` or newer. Snapshot inspection queries were
+Version `0.1.15` requires Rust `1.86` or newer. Snapshot inspection queries were
 introduced in `0.1.1`; replayed workflow-instance state queries are available
 from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
 durable child workflows are available from `0.1.5`. Durable activity retry,
@@ -42,6 +42,9 @@ markers replay without re-running non-deterministic code or duplicating markers.
 From `0.1.14`, workflows can continue as new with replacement arguments and
 optional workflow-type and queue routing. Client handles follow the current
 run chain by default while retaining explicit selected-run views.
+From `0.1.15`, replay preserves positive, strictly ordered global workflow
+sequences even when signals or other non-command events leave gaps between
+durable commands.
 
 ## Compatibility
 
@@ -56,7 +59,8 @@ run chain by default while retaining explicit selected-run views.
 | `0.1.8`–`0.1.9` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.10`–`0.1.12` | `>=0.2,<0.3` | `1.2` (workflow lifecycle with server start deadlines, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
 | `0.1.13` | `>=0.2,<0.3` | `1.2` (side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.14+` | `>=0.2,<0.3` | `1.2` (continue-as-new, side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.14` | `>=0.2,<0.3` | `1.2` (continue-as-new, side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
+| `0.1.15+` | `>=0.2,<0.3` | `1.2` (global durable-sequence gaps, continue-as-new, side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and

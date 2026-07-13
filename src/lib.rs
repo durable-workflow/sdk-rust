@@ -5693,6 +5693,7 @@ fn recorded_commands(
     parent: WorkflowIdentity,
 ) -> Result<Vec<RecordedCommand>> {
     let mut events_by_sequence: BTreeMap<u64, Vec<&HistoryEvent>> = BTreeMap::new();
+    let mut last_new_sequence = None;
 
     for event in events {
         let is_activity = matches!(
@@ -5748,6 +5749,20 @@ fn recorded_commands(
                 Some(sequence.to_string()),
                 "durable command history uses an invalid workflow sequence",
             )));
+        }
+        if !events_by_sequence.contains_key(&sequence) {
+            if let Some(previous) = last_new_sequence {
+                if sequence < previous {
+                    return Err(invalid_recorded_history(
+                        "durable_command_sequence_mismatch",
+                        sequence,
+                        &format!("workflow sequence greater than {previous}"),
+                        &sequence.to_string(),
+                        "durable commands are not strictly ordered by their recorded workflow sequence",
+                    ));
+                }
+            }
+            last_new_sequence = Some(sequence);
         }
         events_by_sequence.entry(sequence).or_default().push(event);
     }
@@ -6165,30 +6180,6 @@ fn recorded_commands(
             })
         })
         .collect::<Result<_>>()?;
-
-    for (index, command) in commands.iter().enumerate() {
-        let expected = u64::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_add(1))
-            .ok_or_else(|| {
-                invalid_recorded_history(
-                    "durable_command_sequence_invalid",
-                    command.sequence(),
-                    "representable positive workflow sequence",
-                    &command.sequence().to_string(),
-                    "durable command history exceeds the supported workflow sequence range",
-                )
-            })?;
-        if command.sequence() != expected {
-            return Err(invalid_recorded_history(
-                "durable_command_sequence_mismatch",
-                command.sequence(),
-                &expected.to_string(),
-                &command.sequence().to_string(),
-                "durable command history does not follow the recorded workflow command sequence",
-            ));
-        }
-    }
 
     let mut marker_sequences = HashMap::new();
     for command in &commands {
@@ -7404,7 +7395,7 @@ mod tests {
             )
         };
         let duplicate_marker = WorkflowState::new(
-            vec![marker(1), marker(2)],
+            vec![marker(1), marker(3)],
             "rust-workers".to_string(),
             JSON_CODEC.to_string(),
             None,
@@ -8575,27 +8566,148 @@ mod tests {
     }
 
     #[test]
-    fn workflow_history_rejects_changed_numeric_command_sequence() {
+    fn workflow_history_accepts_a_first_command_after_global_sequence_gaps() {
         let result = encode_value_envelope(&json!({"captured": true}), JSON_CODEC)
             .expect("side-effect result");
-        let error = WorkflowState::new(
+        let ctx = workflow_context(vec![history_event(
+            "SideEffectRecorded",
+            json!({"sequence": 99, "result": result}),
+        )]);
+
+        let replayed: Value = ctx
+            .side_effect(|| panic!("recorded side effect must not run"))
+            .expect("positive global workflow sequence is valid");
+        assert_eq!(replayed, json!({"captured": true}));
+        ctx.ensure_history_consumed().expect("history consumed");
+    }
+
+    #[test]
+    fn workflow_history_rejects_zero_and_descending_command_sequences() {
+        let result =
+            encode_value_envelope(&json!("captured"), JSON_CODEC).expect("side-effect result");
+        let zero = WorkflowState::new(
             vec![history_event(
                 "SideEffectRecorded",
-                json!({"sequence": 99, "result": result}),
+                json!({"sequence": 0, "result": result.clone()}),
             )],
             "rust-workers".to_string(),
             JSON_CODEC.to_string(),
             None,
         )
-        .expect_err("the first durable command must have sequence one");
+        .expect_err("durable command sequences must be positive");
+        assert!(matches!(
+            zero,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "durable_command_sequence_invalid"
+        ));
 
-        let Error::NonDeterministicReplay(failure) = error else {
+        let descending = WorkflowState::new(
+            vec![
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 3, "result": result}),
+                ),
+                history_event(
+                    "VersionMarkerRecorded",
+                    json!({
+                        "sequence": 2,
+                        "change_id": "descending-marker",
+                        "version": 1,
+                        "min_supported": 1,
+                        "max_supported": 1,
+                    }),
+                ),
+            ],
+            "rust-workers".to_string(),
+            JSON_CODEC.to_string(),
+            None,
+        )
+        .expect_err("new durable commands must remain strictly ordered");
+        let Error::NonDeterministicReplay(failure) = descending else {
             panic!("expected typed replay failure");
         };
         assert_eq!(failure.reason, "durable_command_sequence_mismatch");
-        assert_eq!(failure.sequence, Some(99));
-        assert_eq!(failure.expected.as_deref(), Some("1"));
-        assert_eq!(failure.actual.as_deref(), Some("99"));
+        assert_eq!(failure.sequence, Some(2));
+        assert_eq!(
+            failure.expected.as_deref(),
+            Some("workflow sequence greater than 3")
+        );
+        assert_eq!(failure.actual.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn workflow_task_replay_completes_after_signals_create_sequence_gaps() {
+        fn worker() -> Worker {
+            let client = Client::new("http://127.0.0.1:8080").expect("client");
+            let mut worker = Worker::new(client, "rust-workers");
+            worker.register_workflow("rust.finish-after-gaps", |ctx, _input| async move {
+                ctx.wait_signal("finish").await?;
+                let marker: String =
+                    ctx.side_effect(|| panic!("recorded side effect must not run"))?;
+                assert_eq!(marker, "after-finish");
+                Ok(json!("finished"))
+            });
+            worker
+        }
+
+        let marker =
+            encode_value_envelope(&json!("after-finish"), JSON_CODEC).expect("side-effect result");
+        let task = workflow_task(
+            "rust.finish-after-gaps",
+            vec![
+                history_event(
+                    "ConditionWaitOpened",
+                    json!({"sequence": 1, "condition_key": "signal:finish"}),
+                ),
+                history_event(
+                    "SignalReceived",
+                    json!({
+                        "signal_id": "increment-3",
+                        "signal_name": "increment",
+                        "workflow_sequence": 2,
+                        "payload_codec": "json",
+                        "arguments": {"codec": "json", "blob": "[3]"},
+                    }),
+                ),
+                history_event(
+                    "SignalReceived",
+                    json!({
+                        "signal_id": "increment-5",
+                        "signal_name": "increment",
+                        "workflow_sequence": 3,
+                        "payload_codec": "json",
+                        "arguments": {"codec": "json", "blob": "[5]"},
+                    }),
+                ),
+                history_event(
+                    "SignalReceived",
+                    json!({
+                        "signal_id": "finish",
+                        "signal_name": "finish",
+                        "workflow_sequence": 4,
+                        "payload_codec": "json",
+                        "arguments": {"codec": "json", "blob": "[]"},
+                    }),
+                ),
+                history_event(
+                    "SideEffectRecorded",
+                    json!({"sequence": 5, "result": marker}),
+                ),
+            ],
+            JSON_CODEC,
+        );
+
+        for _original_or_cold_worker in 0..2 {
+            let commands = worker()
+                .execute_workflow_task(task.clone())
+                .expect("signal gaps preserve deterministic replay");
+            assert_eq!(commands.len(), 1, "replay emits only terminal completion");
+            assert_eq!(commands[0]["type"], "complete_workflow");
+            assert_eq!(
+                decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("workflow output"),
+                json!("finished")
+            );
+        }
     }
 
     #[test]
@@ -9465,10 +9577,18 @@ mod tests {
                 }
             },
             {
+                "type": "ConditionWaitOpened",
+                "payload": {
+                    "sequence": 3,
+                    "condition_key": "signal:increment"
+                }
+            },
+            {
                 "type": "SignalReceived",
                 "payload": {
                     "signal_id": "signal-3",
                     "signal_name": "increment",
+                    "workflow_sequence": 2,
                     "payload_codec": "json",
                     "arguments": {"codec": "json", "blob": "[3]"}
                 }
@@ -9536,12 +9656,34 @@ mod tests {
                         }
                     },
                     {
-                        "type": "SignalReceived",
-                        "payload": {"signal_id": "signal-3", "signal_name": "increment"}
+                        "type": "ConditionWaitOpened",
+                        "payload": {
+                            "sequence": 3,
+                            "condition_key": "signal:increment"
+                        }
                     },
                     {
                         "type": "SignalReceived",
-                        "payload": {"signal_id": "signal-5", "signal_name": "increment"}
+                        "payload": {
+                            "signal_id": "signal-3",
+                            "signal_name": "increment",
+                            "workflow_sequence": 2
+                        }
+                    },
+                    {
+                        "type": "ConditionWaitOpened",
+                        "payload": {
+                            "sequence": 5,
+                            "condition_key": "signal:increment"
+                        }
+                    },
+                    {
+                        "type": "SignalReceived",
+                        "payload": {
+                            "signal_id": "signal-5",
+                            "signal_name": "increment",
+                            "workflow_sequence": 4
+                        }
                     }
                 ],
                 "activities": [{
@@ -9554,12 +9696,14 @@ mod tests {
                     {
                         "id": "signal-3",
                         "name": "increment",
+                        "workflow_sequence": 2,
                         "payload_codec": "json",
                         "arguments": "[3]"
                     },
                     {
                         "id": "signal-5",
                         "name": "increment",
+                        "workflow_sequence": 4,
                         "payload_codec": "json",
                         "arguments": "[5]"
                     }
