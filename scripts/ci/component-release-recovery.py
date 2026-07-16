@@ -304,9 +304,45 @@ def verify_recovery_workflow_source(name: str, source: str) -> None:
         rf'gh\s+workflow\s+run\s+{re.escape(component.release_workflow)}\s+--ref\s+"\$RELEASE_TAG"',
         source,
     )
+    selector_at = source.find("select-publication-run")
+    if name == "sdk-rust":
+        publish_job_at = source.find("  publish:\n")
+        environment_at = source.find("environment: release-plan-publication", publish_job_at)
+        deploy_key_at = source.find("secrets.RELEASE_PLAN_DEPLOY_KEY", environment_at)
+        tag_publisher_at = source.find("publish-planned-tag.py", deploy_key_at)
+        completion_at = source.find("--component sdk-rust --plan recovery-input/release-plan.json", tag_publisher_at)
+        if (
+            dispatch is None
+            or publish_job_at < 0
+            or 'if: needs.discover.outputs.action == \'publish\'' not in source[publish_job_at:environment_at]
+            or environment_at < publish_job_at
+            or deploy_key_at < environment_at
+            or tag_publisher_at < deploy_key_at
+            or '--tag "$RELEASE_TAG"' not in source[tag_publisher_at:]
+            or '--commit "$RELEASE_COMMIT"' not in source[tag_publisher_at:]
+            or selector_at < tag_publisher_at
+            or selector_at > dispatch.start()
+            or completion_at < dispatch.start()
+            or "contents: write" in source
+            or "databaseId,displayTitle,headBranch,headSha,status,conclusion" not in source
+            or '--release-tag "$RELEASE_TAG"' not in source
+            or '--release-commit "$RELEASE_COMMIT"' not in source
+        ):
+            raise RecoveryError(
+                f"{component.repository} publication must create or verify the exact source tag through "
+                "its protected repository deploy key before dispatch, then verify the completed public release",
+                "default-branch-preflight",
+            )
+        release_input = f'-f {component.release_tag_input}="$RELEASE_TAG"'
+        if source.find(release_input, dispatch.start()) < 0:
+            raise RecoveryError(
+                f"{component.repository} publication must retain the declared release tag input",
+                "default-branch-preflight",
+            )
+        return
+
     tag_ref_at = source.find('-f ref="refs/tags/$RELEASE_TAG"')
     tag_commit_at = source.find('-f sha="$RELEASE_COMMIT"', tag_ref_at)
-    selector_at = source.find("select-publication-run")
     if (
         dispatch is None
         or tag_ref_at < 0

@@ -45,7 +45,9 @@ jobs:
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/test-publish-planned-tag.py
           scripts/ci/test-crates-io-publish.sh
+          python scripts/ci/test-publish-planned-tag.py
 
   target-branch-qualification:
     name: Target branch qualification
