@@ -12,15 +12,20 @@ permissions:
 
 jobs:
   verify:
-    name: Verify crate
+    name: Rust ${{ matrix.rust }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.86.0', 'stable']
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.86
-        uses: dtolnay/rust-toolchain@1.86.0
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt
 
       - name: Check formatting
@@ -41,3 +46,15 @@ jobs:
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
           scripts/ci/test-crates-io-publish.sh
+
+  target-branch-qualification:
+    name: Target branch qualification
+    if: ${{ always() }}
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require the MSRV and current stable toolchains
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: test "$VERIFY_RESULT" = success
