@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -35,6 +36,13 @@ PLAN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,55}$")
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?$")
 ALPHA_VERSION_PATTERN = re.compile(r"^2\.0\.0-alpha\.[1-9][0-9]*$")
 BETA_VERSION_PATTERN = re.compile(r"^2\.0\.0-beta\.[1-9][0-9]*$")
+
+# SHA-256 of durable-workflow/sdk-rust's release recovery workflow at main
+# commit 31e87f4aa13a7fd255fd277a62c43c96ee1532ab. The verifier normalizes only
+# CRLF line endings to LF before hashing. Exact source identity is the bounded
+# security contract because arbitrary shell execution cannot be proven safe by
+# source-pattern matching.
+SDK_RUST_RELEASE_RECOVERY_SHA256 = "8938ed8a7b029c492c08b3243c649adbed013ac3cd3dec57f9e23f396e46d079"
 
 
 @dataclass(frozen=True)
@@ -290,6 +298,17 @@ def discover_plan(client: PublicClient, requested_tag: str | None) -> tuple[str,
 
 def verify_recovery_workflow_source(name: str, source: str) -> None:
     component = COMPONENTS[name]
+    if name == "sdk-rust":
+        normalized_source = source.replace("\r\n", "\n").encode("utf-8")
+        actual_digest = hashlib.sha256(normalized_source).hexdigest()
+        if not hmac.compare_digest(actual_digest, SDK_RUST_RELEASE_RECOVERY_SHA256):
+            raise RecoveryError(
+                f"{component.repository} release recovery workflow does not match the approved "
+                "protected publication source identity",
+                "default-branch-preflight",
+            )
+        return
+
     if not re.search(r"(?m)^  schedule:\s*$", source) or not re.search(
         r"(?m)^  workflow_dispatch:\s*$", source
     ):
@@ -304,45 +323,9 @@ def verify_recovery_workflow_source(name: str, source: str) -> None:
         rf'gh\s+workflow\s+run\s+{re.escape(component.release_workflow)}\s+--ref\s+"\$RELEASE_TAG"',
         source,
     )
-    selector_at = source.find("select-publication-run")
-    if name == "sdk-rust":
-        publish_job_at = source.find("  publish:\n")
-        environment_at = source.find("environment: release-plan-publication", publish_job_at)
-        deploy_key_at = source.find("secrets.RELEASE_PLAN_DEPLOY_KEY", environment_at)
-        tag_publisher_at = source.find("publish-planned-tag.py", deploy_key_at)
-        completion_at = source.find("--component sdk-rust --plan recovery-input/release-plan.json", tag_publisher_at)
-        if (
-            dispatch is None
-            or publish_job_at < 0
-            or 'if: needs.discover.outputs.action == \'publish\'' not in source[publish_job_at:environment_at]
-            or environment_at < publish_job_at
-            or deploy_key_at < environment_at
-            or tag_publisher_at < deploy_key_at
-            or '--tag "$RELEASE_TAG"' not in source[tag_publisher_at:]
-            or '--commit "$RELEASE_COMMIT"' not in source[tag_publisher_at:]
-            or selector_at < tag_publisher_at
-            or selector_at > dispatch.start()
-            or completion_at < dispatch.start()
-            or "contents: write" in source
-            or "databaseId,displayTitle,headBranch,headSha,status,conclusion" not in source
-            or '--release-tag "$RELEASE_TAG"' not in source
-            or '--release-commit "$RELEASE_COMMIT"' not in source
-        ):
-            raise RecoveryError(
-                f"{component.repository} publication must create or verify the exact source tag through "
-                "its protected repository deploy key before dispatch, then verify the completed public release",
-                "default-branch-preflight",
-            )
-        release_input = f'-f {component.release_tag_input}="$RELEASE_TAG"'
-        if source.find(release_input, dispatch.start()) < 0:
-            raise RecoveryError(
-                f"{component.repository} publication must retain the declared release tag input",
-                "default-branch-preflight",
-            )
-        return
-
     tag_ref_at = source.find('-f ref="refs/tags/$RELEASE_TAG"')
     tag_commit_at = source.find('-f sha="$RELEASE_COMMIT"', tag_ref_at)
+    selector_at = source.find("select-publication-run")
     if (
         dispatch is None
         or tag_ref_at < 0
