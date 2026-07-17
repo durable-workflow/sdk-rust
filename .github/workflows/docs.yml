@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@1.86.0
@@ -38,7 +38,7 @@ jobs:
           printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=durable_workflow/"><link rel="canonical" href="durable_workflow/"><title>Durable Workflow Rust SDK</title><p><a href="durable_workflow/">Open the Durable Workflow Rust SDK API reference</a>.</p>' > target/doc/index.html
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
 
@@ -52,4 +52,4 @@ jobs:
     steps:
       - name: Deploy GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
