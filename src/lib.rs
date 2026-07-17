@@ -4784,7 +4784,6 @@ impl WorkflowContext {
 
 #[derive(Debug)]
 struct WorkflowState {
-    history: Vec<HistoryEvent>,
     workflow_id: Option<String>,
     run_id: Option<String>,
     task_queue: String,
@@ -4796,7 +4795,6 @@ struct WorkflowState {
     continue_as_new_consumed: bool,
     command_cursor: usize,
     matched_recorded_pending: bool,
-    signal_cursors: HashMap<String, usize>,
     version_markers: HashMap<String, (i32, u64)>,
     commands: Vec<Value>,
 }
@@ -4870,7 +4868,6 @@ impl WorkflowState {
             .transpose()?;
         let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
         Ok(Self {
-            history,
             workflow_id,
             run_id,
             task_queue,
@@ -4885,7 +4882,6 @@ impl WorkflowState {
             continue_as_new_consumed: false,
             command_cursor: 0,
             matched_recorded_pending: false,
-            signal_cursors: HashMap::new(),
             version_markers: HashMap::new(),
             commands: Vec::new(),
         })
@@ -4912,7 +4908,8 @@ enum RecordedCommand {
     },
     SignalWait {
         sequence: u64,
-        signal_name: Option<String>,
+        signal_name: String,
+        value: Option<Vec<Value>>,
     },
     SideEffect {
         sequence: u64,
@@ -5133,7 +5130,6 @@ fn ensure_version_supported(
 
 #[derive(Clone, Debug)]
 struct ResumeSignal {
-    signal_id: Option<String>,
     signal_name: String,
     arguments: Vec<Value>,
 }
@@ -5551,43 +5547,39 @@ impl Future for SignalCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        let signals = match signal_values(
-            &state.history,
-            &self.signal_name,
-            &state.payload_codec,
-            state.resume_signal.as_ref(),
-        ) {
-            Ok(signals) => signals,
-            Err(error) => return Poll::Ready(Err(error)),
-        };
-        let cursor = *state.signal_cursors.get(&self.signal_name).unwrap_or(&0);
-
         if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
             match recorded {
                 RecordedCommand::SignalWait {
                     sequence,
                     signal_name,
+                    value,
                 } => {
-                    if let Some(recorded_name) = signal_name {
-                        if recorded_name != self.signal_name {
-                            return Poll::Ready(Err(Error::NonDeterministicReplay(
-                                ReplayFailure::new(
-                                    "recorded_command_detail_mismatch",
-                                    Some(sequence),
-                                    Some(format!("signal wait:{recorded_name}")),
-                                    Some(format!("signal wait:{}", self.signal_name)),
-                                    "recorded signal name differs from the current workflow command",
-                                ),
-                            )));
-                        }
+                    if signal_name != self.signal_name {
+                        return Poll::Ready(Err(Error::NonDeterministicReplay(
+                            ReplayFailure::new(
+                                "recorded_command_detail_mismatch",
+                                Some(sequence),
+                                Some(format!("signal wait:{signal_name}")),
+                                Some(format!("signal wait:{}", self.signal_name)),
+                                "recorded signal name differs from the current workflow command",
+                            ),
+                        )));
                     }
 
                     state.command_cursor += 1;
-                    if cursor < signals.len() {
-                        state
-                            .signal_cursors
-                            .insert(self.signal_name.clone(), cursor + 1);
-                        return Poll::Ready(Ok(signals[cursor].clone()));
+                    if let Some(value) = value {
+                        return Poll::Ready(Ok(value));
+                    }
+                    if state
+                        .resume_signal
+                        .as_ref()
+                        .is_some_and(|signal| signal.signal_name == self.signal_name)
+                    {
+                        let signal = state
+                            .resume_signal
+                            .take()
+                            .expect("matching resume signal is present");
+                        return Poll::Ready(Ok(signal.arguments));
                     }
 
                     state.matched_recorded_pending = true;
@@ -5604,17 +5596,22 @@ impl Future for SignalCall {
             }
         }
 
-        if cursor < signals.len() {
-            state
-                .signal_cursors
-                .insert(self.signal_name.clone(), cursor + 1);
-            return Poll::Ready(Ok(signals[cursor].clone()));
+        if state
+            .resume_signal
+            .as_ref()
+            .is_some_and(|signal| signal.signal_name == self.signal_name)
+        {
+            let signal = state
+                .resume_signal
+                .take()
+                .expect("matching resume signal is present");
+            return Poll::Ready(Ok(signal.arguments));
         }
 
         if !self.opened_wait {
             state.commands.push(json!({
-                "type": "open_condition_wait",
-                "condition_key": format!("signal:{}", self.signal_name)
+                "type": "open_signal_wait",
+                "signal_name": self.signal_name
             }));
             self.opened_wait = true;
         }
@@ -5673,7 +5670,6 @@ fn decode_resume_signal(task: &WorkflowTask) -> Result<Option<ResumeSignal>> {
     };
 
     Ok(Some(ResumeSignal {
-        signal_id: task.workflow_signal_id.clone(),
         signal_name: signal_name.to_string(),
         arguments,
     }))
@@ -5982,44 +5978,61 @@ fn recorded_commands(
             }
 
             if !signal_wait_events.is_empty() {
-                let opened_count = signal_wait_events
+                let opened: Vec<_> = signal_wait_events
                     .iter()
-                    .filter(|event| {
-                        matches!(
-                            event.event_type.as_str(),
-                            "SignalWaitOpened" | "ConditionWaitOpened"
-                        )
-                    })
-                    .count();
-                if opened_count > 1 {
+                    .copied()
+                    .filter(|event| event.event_type == "SignalWaitOpened")
+                    .collect();
+                if opened.len() != 1 {
                     return Err(invalid_recorded_history(
-                        "duplicate_signal_wait_open",
+                        "signal_wait_open_missing_or_duplicate",
                         sequence,
-                        "at most one signal wait open event",
-                        "multiple signal wait open events",
-                        "signal history opens more than one durable wait at one workflow sequence",
+                        "one SignalWaitOpened event",
+                        &format!("{} SignalWaitOpened events", opened.len()),
+                        "signal replay requires exactly one canonical wait-open event",
                     ));
                 }
 
-                let signal_name = signal_wait_events
+                let applied: Vec<_> = signal_wait_events
                     .iter()
-                    .find_map(|event| recorded_signal_wait_name(event));
-                if signal_wait_events
+                    .copied()
+                    .filter(|event| event.event_type == "SignalApplied")
+                    .collect();
+                if applied.len() > 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_signal_wait_apply",
+                        sequence,
+                        "at most one SignalApplied event",
+                        "multiple SignalApplied events",
+                        "signal history applies one durable wait more than once",
+                    ));
+                }
+
+                let signal_names = signal_wait_events
                     .iter()
-                    .filter_map(|event| recorded_signal_wait_name(event))
-                    .any(|candidate| Some(candidate.as_str()) != signal_name.as_deref())
-                {
+                    .map(|event| required_signal_wait_name(event, sequence))
+                    .collect::<Result<Vec<_>>>()?;
+                let signal_name = signal_names
+                    .first()
+                    .expect("signal wait events are not empty")
+                    .clone();
+                if signal_names.iter().any(|candidate| candidate != &signal_name) {
                     return Err(invalid_recorded_history(
                         "signal_wait_identity_mismatch",
                         sequence,
-                        signal_name.as_deref().unwrap_or("one signal name"),
+                        &signal_name,
                         "conflicting signal names",
                         "signal wait lifecycle events at one workflow sequence disagree on identity",
                     ));
                 }
+                let value = applied
+                    .first()
+                    .map(|event| decode_signal_event_arguments(event, fallback_codec))
+                    .transpose()?;
                 return Ok(RecordedCommand::SignalWait {
                     sequence,
                     signal_name,
+                    value,
                 });
             }
 
@@ -6241,38 +6254,30 @@ fn is_internal_timer_event(event: &HistoryEvent) -> bool {
     )
 }
 
-fn recorded_signal_wait_name(event: &HistoryEvent) -> Option<String> {
-    match event.event_type.as_str() {
-        "SignalWaitOpened" | "SignalApplied" => event
-            .payload
-            .get("signal_name")
-            .or_else(|| event.raw.get("signal_name"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        "ConditionWaitOpened" | "ConditionWaitSatisfied" | "ConditionWaitTimedOut" => event
-            .payload
-            .get("condition_key")
-            .or_else(|| event.raw.get("condition_key"))
-            .and_then(Value::as_str)
-            .and_then(|key| key.strip_prefix("signal:"))
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        _ => None,
-    }
+fn required_signal_wait_name(event: &HistoryEvent, sequence: u64) -> Result<String> {
+    event
+        .payload
+        .get("signal_name")
+        .or_else(|| event.raw.get("signal_name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "signal_wait_name_missing",
+                sequence,
+                "non-empty signal_name",
+                &event.event_type,
+                "canonical signal-wait history is missing its signal identity",
+            )
+        })
 }
 
 fn is_recorded_signal_wait_event(event: &HistoryEvent) -> bool {
-    match event.event_type.as_str() {
-        "SignalWaitOpened" | "SignalApplied" => true,
-        "ConditionWaitOpened" | "ConditionWaitSatisfied" | "ConditionWaitTimedOut" => event
-            .payload
-            .get("condition_key")
-            .or_else(|| event.raw.get("condition_key"))
-            .and_then(Value::as_str)
-            .is_some_and(|key| key.starts_with("signal:")),
-        _ => false,
-    }
+    matches!(
+        event.event_type.as_str(),
+        "SignalWaitOpened" | "SignalApplied"
+    )
 }
 
 fn required_history_string(event: &HistoryEvent, field: &str, sequence: u64) -> Result<String> {
@@ -6615,48 +6620,25 @@ fn workflow_task_integrity_error(error: &Error) -> bool {
     )
 }
 
-fn signal_values(
-    events: &[HistoryEvent],
-    signal_name: &str,
-    fallback_codec: &str,
-    resume_signal: Option<&ResumeSignal>,
-) -> Result<Vec<Vec<Value>>> {
-    let mut signals = Vec::new();
-
-    for event in events {
-        if event.event_type != "SignalApplied" && event.event_type != "SignalReceived" {
-            continue;
-        }
-
-        if event.payload.get("signal_name").and_then(Value::as_str) != Some(signal_name) {
-            continue;
-        }
-
-        let codec = event
-            .payload
-            .get("payload_codec")
-            .and_then(Value::as_str)
-            .unwrap_or(fallback_codec);
-        let raw = event
-            .payload
-            .get("value")
-            .or_else(|| event.payload.get("input"))
-            .or_else(|| event.payload.get("arguments"));
-        let decoded = match raw.filter(|value| !value.is_null()) {
-            Some(value) => decode_wire_value(value, codec)?,
-            None => resume_signal
-                .filter(|signal| resume_signal_matches_event(signal, event, signal_name))
-                .map(|signal| Value::Array(signal.arguments.clone()))
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        };
-        let args = match normalize_arguments(decoded) {
-            Value::Array(values) => values,
-            _ => unreachable!("normalize_arguments always returns an array"),
-        };
-        signals.push(args);
-    }
-
-    Ok(signals)
+fn decode_signal_event_arguments(event: &HistoryEvent, fallback_codec: &str) -> Result<Vec<Value>> {
+    let codec = event
+        .payload
+        .get("payload_codec")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_codec);
+    let raw = event
+        .payload
+        .get("value")
+        .or_else(|| event.payload.get("input"))
+        .or_else(|| event.payload.get("arguments"));
+    let decoded = match raw.filter(|value| !value.is_null()) {
+        Some(value) => decode_wire_value(value, codec)?,
+        None => Value::Array(Vec::new()),
+    };
+    let Value::Array(arguments) = normalize_arguments(decoded) else {
+        unreachable!("normalize_arguments always returns an array");
+    };
+    Ok(arguments)
 }
 
 fn hydrate_query_history_from_export(task: &mut QueryTask) -> Result<()> {
@@ -6961,24 +6943,6 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-}
-
-fn resume_signal_matches_event(
-    resume_signal: &ResumeSignal,
-    event: &HistoryEvent,
-    signal_name: &str,
-) -> bool {
-    if resume_signal.signal_name != signal_name {
-        return false;
-    }
-
-    match (
-        resume_signal.signal_id.as_deref(),
-        event.payload.get("signal_id").and_then(Value::as_str),
-    ) {
-        (Some(resume_id), Some(event_id)) => resume_id == event_id,
-        _ => true,
-    }
 }
 
 #[cfg(test)]
@@ -8417,17 +8381,69 @@ mod tests {
     }
 
     #[test]
-    fn replay_orders_signal_waits_and_timers_in_one_command_stream() {
-        let signal_then_timer = vec![
+    fn workflow_context_emits_a_typed_named_signal_wait() {
+        let ctx = workflow_context(Vec::new());
+        let mut signal = Box::pin(ctx.wait_signal("finish"));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            signal.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert_eq!(
+            ctx.take_commands().expect("signal-wait command"),
+            vec![json!({
+                "type": "open_signal_wait",
+                "signal_name": "finish",
+            })]
+        );
+    }
+
+    #[test]
+    fn condition_wait_history_does_not_resolve_a_typed_signal_wait() {
+        let ctx = workflow_context(vec![
             history_event(
                 "ConditionWaitOpened",
-                json!({"sequence": 1, "condition_key": "signal:go"}),
+                json!({"sequence": 1, "condition_key": "signal:finish"}),
+            ),
+            history_event(
+                "ConditionWaitSatisfied",
+                json!({"sequence": 1, "condition_key": "signal:finish"}),
             ),
             history_event(
                 "SignalReceived",
+                json!({"signal_name": "finish", "arguments": []}),
+            ),
+        ]);
+        let mut signal = Box::pin(ctx.wait_signal("finish"));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            signal.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert_eq!(
+            ctx.take_commands().expect("typed signal-wait command"),
+            vec![json!({
+                "type": "open_signal_wait",
+                "signal_name": "finish",
+            })]
+        );
+    }
+
+    #[test]
+    fn replay_orders_signal_waits_and_timers_in_one_command_stream() {
+        let signal_then_timer = vec![
+            history_event(
+                "SignalWaitOpened",
+                json!({"sequence": 1, "signal_name": "go"}),
+            ),
+            history_event(
+                "SignalApplied",
                 json!({
+                    "sequence": 1,
                     "signal_name": "go",
-                    "arguments": ["now"],
+                    "value": {"codec": "json", "blob": "[\"now\"]"},
                 }),
             ),
             history_event(
@@ -8476,12 +8492,16 @@ mod tests {
                 json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
             ),
             history_event(
-                "ConditionWaitOpened",
-                json!({"sequence": 2, "condition_key": "signal:go"}),
+                "SignalWaitOpened",
+                json!({"sequence": 2, "signal_name": "go"}),
             ),
             history_event(
-                "SignalReceived",
-                json!({"signal_name": "go", "arguments": []}),
+                "SignalApplied",
+                json!({
+                    "sequence": 2,
+                    "signal_name": "go",
+                    "value": {"codec": "json", "blob": "[]"},
+                }),
             ),
         ];
         let reordered = workflow_context(timer_then_signal);
@@ -8561,7 +8581,7 @@ mod tests {
         assert!(matches!(
             duplicate_signal_wait,
             Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
-                if reason == "duplicate_signal_wait_open"
+                if reason == "signal_wait_open_missing_or_duplicate"
         ));
     }
 
@@ -8656,8 +8676,8 @@ mod tests {
             "rust.finish-after-gaps",
             vec![
                 history_event(
-                    "ConditionWaitOpened",
-                    json!({"sequence": 1, "condition_key": "signal:finish"}),
+                    "SignalWaitOpened",
+                    json!({"sequence": 1, "signal_name": "finish"}),
                 ),
                 history_event(
                     "SignalReceived",
@@ -8687,6 +8707,16 @@ mod tests {
                         "workflow_sequence": 4,
                         "payload_codec": "json",
                         "arguments": {"codec": "json", "blob": "[]"},
+                    }),
+                ),
+                history_event(
+                    "SignalApplied",
+                    json!({
+                        "sequence": 1,
+                        "signal_id": "finish",
+                        "signal_name": "finish",
+                        "payload_codec": "json",
+                        "value": {"codec": "json", "blob": "[]"},
                     }),
                 ),
                 history_event(
@@ -9478,9 +9508,15 @@ mod tests {
         assert_eq!(task.total_history_events, Some(3));
         assert_eq!(task.next_history_page_token, None);
 
-        let signals =
-            signal_values(&task.history_events, "start", DEFAULT_CODEC, None).expect("signals");
-        assert_eq!(signals, vec![vec![json!("Rust")]]);
+        let signal = task
+            .history_events
+            .iter()
+            .find(|event| event.event_type == "SignalReceived")
+            .expect("signal event");
+        assert_eq!(
+            decode_signal_event_arguments(signal, DEFAULT_CODEC).expect("signal arguments"),
+            vec![json!("Rust")]
+        );
     }
 
     #[tokio::test]
@@ -9577,10 +9613,10 @@ mod tests {
                 }
             },
             {
-                "type": "ConditionWaitOpened",
+                "type": "SignalWaitOpened",
                 "payload": {
                     "sequence": 3,
-                    "condition_key": "signal:increment"
+                    "signal_name": "increment"
                 }
             },
             {
@@ -9591,6 +9627,16 @@ mod tests {
                     "workflow_sequence": 2,
                     "payload_codec": "json",
                     "arguments": {"codec": "json", "blob": "[3]"}
+                }
+            },
+            {
+                "type": "SignalApplied",
+                "payload": {
+                    "sequence": 3,
+                    "signal_id": "signal-3",
+                    "signal_name": "increment",
+                    "payload_codec": "json",
+                    "value": {"codec": "json", "blob": "[3]"}
                 }
             }
         ]);
@@ -9656,10 +9702,10 @@ mod tests {
                         }
                     },
                     {
-                        "type": "ConditionWaitOpened",
+                        "type": "SignalWaitOpened",
                         "payload": {
                             "sequence": 3,
-                            "condition_key": "signal:increment"
+                            "signal_name": "increment"
                         }
                     },
                     {
@@ -9671,10 +9717,18 @@ mod tests {
                         }
                     },
                     {
-                        "type": "ConditionWaitOpened",
+                        "type": "SignalApplied",
+                        "payload": {
+                            "sequence": 3,
+                            "signal_id": "signal-3",
+                            "signal_name": "increment"
+                        }
+                    },
+                    {
+                        "type": "SignalWaitOpened",
                         "payload": {
                             "sequence": 5,
-                            "condition_key": "signal:increment"
+                            "signal_name": "increment"
                         }
                     },
                     {
@@ -9683,6 +9737,14 @@ mod tests {
                             "signal_id": "signal-5",
                             "signal_name": "increment",
                             "workflow_sequence": 4
+                        }
+                    },
+                    {
+                        "type": "SignalApplied",
+                        "payload": {
+                            "sequence": 5,
+                            "signal_id": "signal-5",
+                            "signal_name": "increment"
                         }
                     }
                 ],
@@ -10829,7 +10891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_enabled_worker_stays_live_when_signal_replay_emits_no_commands() {
+    async fn query_enabled_worker_ignores_unmatched_signals_then_completes_once() {
         let server = MockWorkerServer::waiting_query_worker();
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(2))
@@ -10882,6 +10944,15 @@ mod tests {
             json!([QUERY_TASKS_CAPABILITY])
         );
 
+        let opened = server.request_body("/api/worker/workflow-tasks/snapshot-open/complete");
+        assert_eq!(
+            opened["commands"],
+            json!([{
+                "type": "open_signal_wait",
+                "signal_name": "finish",
+            }])
+        );
+
         for task_id in ["snapshot-wait-3", "snapshot-wait-5"] {
             let fail_path = format!("/api/worker/workflow-tasks/{task_id}/fail");
             let completion_path = format!("/api/worker/workflow-tasks/{task_id}/complete");
@@ -10896,6 +10967,21 @@ mod tests {
         let query_completion =
             server.request_body("/api/worker/query-tasks/snapshot-current/complete");
         assert_eq!(query_completion["result"], json!(8));
+
+        let terminal_path = "/api/worker/workflow-tasks/snapshot-finish/complete";
+        assert_eq!(
+            server.request_count(terminal_path),
+            1,
+            "the matching signal must settle the workflow exactly once"
+        );
+        let terminal = server.request_body(terminal_path);
+        assert_eq!(terminal["commands"].as_array().map(Vec::len), Some(1));
+        assert_eq!(terminal["commands"][0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&terminal["commands"][0]["result"], DEFAULT_CODEC)
+                .expect("terminal workflow result"),
+            json!({"status": "finished"})
+        );
     }
 
     #[tokio::test]
@@ -11016,6 +11102,7 @@ mod tests {
         reject_query_protocol: bool,
         reject_query_completion: bool,
         waiting_query_worker: bool,
+        complete_named_signal: bool,
         poll_failures_per_path: usize,
         heartbeat_failures: usize,
         heartbeat_failure_request: Option<usize>,
@@ -11051,6 +11138,7 @@ mod tests {
         fn waiting_query_worker() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 waiting_query_worker: true,
+                complete_named_signal: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -11369,18 +11457,49 @@ mod tests {
         }
 
         if behavior.waiting_query_worker {
-            if path == "/api/worker/workflow-tasks/poll" && request_number <= 2 {
-                let amounts = if request_number == 1 {
+            if behavior.complete_named_signal
+                && path == "/api/worker/workflow-tasks/poll"
+                && request_number == 1
+            {
+                let body = json!({
+                    "task": {
+                        "task_id": "snapshot-open",
+                        "workflow_id": "snapshot-1",
+                        "run_id": "snapshot-run-1",
+                        "workflow_type": "snapshot",
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC)
+                            .expect("Avro workflow arguments"),
+                        "history_events": [],
+                        "workflow_task_attempt": 1,
+                        "lease_owner": "rust-snapshot-worker"
+                    }
+                })
+                .to_string();
+                write_mock_response(stream, "200 OK", &body);
+                return;
+            }
+
+            let signal_request = request_number - usize::from(behavior.complete_named_signal);
+            let signal_request_limit = 2 + usize::from(behavior.complete_named_signal);
+            if path == "/api/worker/workflow-tasks/poll"
+                && signal_request >= 1
+                && signal_request <= signal_request_limit
+            {
+                let finish = behavior.complete_named_signal && signal_request == 3;
+                let amounts = if signal_request == 1 {
                     vec![3]
                 } else {
                     vec![3, 5]
                 };
-                let task_id = if request_number == 1 {
+                let task_id = if signal_request == 1 {
                     "snapshot-wait-3"
+                } else if finish {
+                    "snapshot-finish"
                 } else {
                     "snapshot-wait-5"
                 };
-                let history_events = std::iter::once(json!({
+                let mut history_events = std::iter::once(json!({
                     "event_type": "SignalWaitOpened",
                     "payload": {"sequence": 1, "signal_name": "finish"}
                 }))
@@ -11398,6 +11517,33 @@ mod tests {
                     })
                 }))
                 .collect::<Vec<_>>();
+                let (resume_id, resume_name, resume_arguments) = if finish {
+                    history_events.push(json!({
+                        "event_type": "SignalReceived",
+                        "payload": {
+                            "signal_id": "finish",
+                            "signal_name": "finish",
+                            "workflow_sequence": 4,
+                            "payload_codec": DEFAULT_CODEC,
+                            "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC)
+                                .expect("Avro finish signal envelope")
+                        }
+                    }));
+                    (
+                        "finish".to_string(),
+                        "finish".to_string(),
+                        encode_value_envelope(&json!([]), DEFAULT_CODEC)
+                            .expect("Avro finish resume signal"),
+                    )
+                } else {
+                    let amount = amounts.last().expect("amount");
+                    (
+                        format!("increment-{amount}"),
+                        "increment".to_string(),
+                        encode_value_envelope(&json!([amount]), DEFAULT_CODEC)
+                            .expect("Avro increment resume signal"),
+                    )
+                };
                 let body = json!({
                     "task": {
                         "task_id": task_id,
@@ -11409,13 +11555,9 @@ mod tests {
                             .expect("Avro workflow arguments"),
                         "history_events": history_events,
                         "workflow_task_attempt": 1,
-                        "workflow_signal_id": format!("increment-{}", amounts.last().expect("amount")),
-                        "signal_name": "increment",
-                        "signal_arguments": encode_value_envelope(
-                            &json!([amounts.last().expect("amount")]),
-                            DEFAULT_CODEC,
-                        )
-                        .expect("Avro resume signal"),
+                        "workflow_signal_id": resume_id,
+                        "signal_name": resume_name,
+                        "signal_arguments": resume_arguments,
                         "lease_owner": "rust-snapshot-worker"
                     }
                 })
@@ -11472,6 +11614,20 @@ mod tests {
                     stream,
                     "200 OK",
                     r#"{"outcome":"waiting_for_history","recorded":true}"#,
+                );
+                return;
+            }
+
+            if path == "/api/worker/workflow-tasks/snapshot-open/complete" {
+                write_mock_response(stream, "200 OK", r#"{"outcome":"waiting","recorded":true}"#);
+                return;
+            }
+
+            if path == "/api/worker/workflow-tasks/snapshot-finish/complete" {
+                write_mock_response(
+                    stream,
+                    "200 OK",
+                    r#"{"outcome":"completed","run_status":"completed","recorded":true}"#,
                 );
                 return;
             }
