@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
