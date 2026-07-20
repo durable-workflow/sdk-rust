@@ -1551,23 +1551,40 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<PollQueryTaskResponse> {
+        let poll_request_id = unique_request_id("rust-query-poll");
+        self.poll_query_task_response_with_request_id(
+            worker_id,
+            task_queue,
+            timeout,
+            &poll_request_id,
+            1,
+        )
+        .await
+    }
+
+    async fn poll_query_task_response_with_request_id(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+        poll_request_id: &str,
+        transport_retries: usize,
+    ) -> Result<PollQueryTaskResponse> {
         let timeout_seconds = long_poll_timeout_seconds(timeout);
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
-            "poll_request_id": unique_request_id("rust-query-poll"),
+            "poll_request_id": poll_request_id,
             "timeout_seconds": timeout_seconds,
         });
-        worker_poll_response(
-            self.request_json_with_timeout(
-                reqwest::Method::POST,
-                "/worker/query-tasks/poll",
-                RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
-                Some(&body),
-                timeout + Duration::from_secs(5),
-            )
-            .await,
+        self.poll_request_json(
+            "/worker/query-tasks/poll",
+            RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+            &body,
+            timeout + Duration::from_secs(5),
+            transport_retries,
         )
+        .await
     }
 
     /// Complete a query task without appending workflow history.
@@ -1692,21 +1709,40 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<PollWorkflowTaskResponse> {
+        let poll_request_id = unique_request_id("rust-workflow-poll");
+        self.poll_workflow_task_response_with_request_id(
+            worker_id,
+            task_queue,
+            timeout,
+            &poll_request_id,
+            1,
+        )
+        .await
+    }
+
+    async fn poll_workflow_task_response_with_request_id(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+        poll_request_id: &str,
+        transport_retries: usize,
+    ) -> Result<PollWorkflowTaskResponse> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
+            "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let mut data: PollWorkflowTaskResponse = worker_poll_response(
-            self.request_json_with_timeout(
-                reqwest::Method::POST,
+        let mut data: PollWorkflowTaskResponse = self
+            .poll_request_json(
                 "/worker/workflow-tasks/poll",
                 RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-                Some(&body),
+                &body,
                 timeout + Duration::from_secs(5),
+                transport_retries,
             )
-            .await,
-        )?;
+            .await?;
 
         if let Some(task) = data.task.as_mut() {
             self.fetch_remaining_workflow_history(worker_id, task)
@@ -1858,21 +1894,40 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<PollActivityTaskResponse> {
+        let poll_request_id = unique_request_id("rust-activity-poll");
+        self.poll_activity_task_response_with_request_id(
+            worker_id,
+            task_queue,
+            timeout,
+            &poll_request_id,
+            1,
+        )
+        .await
+    }
+
+    async fn poll_activity_task_response_with_request_id(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+        poll_request_id: &str,
+        transport_retries: usize,
+    ) -> Result<PollActivityTaskResponse> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
+            "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let data: PollActivityTaskResponse = worker_poll_response(
-            self.request_json_with_timeout(
-                reqwest::Method::POST,
+        let data: PollActivityTaskResponse = self
+            .poll_request_json(
                 "/worker/activity-tasks/poll",
                 RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-                Some(&body),
+                &body,
                 timeout + Duration::from_secs(5),
+                transport_retries,
             )
-            .await,
-        )?;
+            .await?;
         Ok(data)
     }
 
@@ -2028,6 +2083,34 @@ impl Client {
         }
 
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn poll_request_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        protocol: RequestProtocol,
+        body: &B,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Result<T> {
+        let mut retries = 0;
+
+        loop {
+            let response = self
+                .request_json_with_timeout(
+                    reqwest::Method::POST,
+                    path,
+                    protocol,
+                    Some(body),
+                    timeout,
+                )
+                .await;
+
+            match response {
+                Err(Error::Transport(_)) if retries < max_retries => retries += 1,
+                response => return worker_poll_response(response),
+            }
+        }
     }
 
     fn auth_token(&self, worker: bool) -> Option<&str> {
@@ -3626,12 +3709,15 @@ impl Worker {
     }
 
     async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
             .retry_worker_operation(|| {
-                self.client.poll_workflow_task_response(
+                self.client.poll_workflow_task_response_with_request_id(
                     &self.worker_id,
                     &self.task_queue,
                     self.poll_timeout,
+                    &poll_request_id,
+                    0,
                 )
             })
             .await?;
@@ -3705,12 +3791,15 @@ impl Worker {
     }
 
     async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
+        let poll_request_id = unique_request_id("rust-activity-poll");
         let response = self
             .retry_worker_operation(|| {
-                self.client.poll_activity_task_response(
+                self.client.poll_activity_task_response_with_request_id(
                     &self.worker_id,
                     &self.task_queue,
                     self.poll_timeout,
+                    &poll_request_id,
+                    0,
                 )
             })
             .await?;
@@ -3779,12 +3868,15 @@ impl Worker {
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {
+        let poll_request_id = unique_request_id("rust-query-poll");
         let response = self
             .retry_worker_operation(|| {
-                self.client.poll_query_task_response(
+                self.client.poll_query_task_response_with_request_id(
                     &self.worker_id,
                     &self.task_queue,
                     self.poll_timeout,
+                    &poll_request_id,
+                    0,
                 )
             })
             .await?;
@@ -10528,6 +10620,16 @@ mod tests {
             server.request_body("/api/worker/activity-tasks/poll")["timeout_seconds"],
             1
         );
+        assert!(
+            server.request_body("/api/worker/workflow-tasks/poll")["poll_request_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rust-workflow-poll-"))
+        );
+        assert!(
+            server.request_body("/api/worker/activity-tasks/poll")["poll_request_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rust-activity-poll-"))
+        );
     }
 
     #[tokio::test]
@@ -10574,6 +10676,91 @@ mod tests {
             server.request_body("/api/worker/query-tasks/poll")["timeout_seconds"],
             1
         );
+        assert!(
+            server.request_body("/api/worker/query-tasks/poll")["poll_request_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rust-query-poll-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_client_polls_retry_once_with_the_same_request_id() {
+        let server = MockWorkerServer::transient_worker_failures();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        client
+            .poll_workflow_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("workflow poll retry");
+        client
+            .poll_activity_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("activity poll retry");
+        client
+            .poll_query_task("capture-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("query poll retry");
+
+        for path in [
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            let bodies = server.request_bodies(path);
+            assert_eq!(bodies.len(), 2, "{path} must be retried once");
+            assert_eq!(
+                bodies[0]["poll_request_id"], bodies[1]["poll_request_id"],
+                "{path} must preserve the request binding across retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_poll_retries_preserve_request_id_across_consecutive_failures() {
+        let server = MockWorkerServer::consecutive_poll_failures(2);
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "capture")
+            .worker_id("capture-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        worker.register_workflow(
+            "capture.workflow",
+            |_ctx, _input| async move { Ok(Value::Null) },
+        );
+        worker.register_activity(
+            "capture.activity",
+            |_ctx, _input| async move { Ok(Value::Null) },
+        );
+        worker.register_query("capture.workflow", "current", |_ctx, _args| async move {
+            Ok(Value::Null)
+        });
+
+        assert_eq!(worker.run_once().await.expect("poll retries"), 0);
+
+        for path in [
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            let bodies = server.request_bodies(path);
+            assert_eq!(bodies.len(), 3, "{path} must use exactly two retries");
+            assert!(
+                bodies
+                    .iter()
+                    .all(|body| body["poll_request_id"] == bodies[0]["poll_request_id"]),
+                "{path} must preserve one request binding across every retry"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11050,7 +11237,36 @@ mod tests {
         assert_eq!(
             server.request_count("/api/worker/workflow-tasks/poll"),
             3,
-            "one initial request plus two retries"
+            "one initial request plus exactly two retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_retry_policy_can_disable_poll_retries() {
+        let server = MockWorkerServer::unavailable_polls();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("no-retry-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 0,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+
+        let error = worker
+            .run_once()
+            .await
+            .expect_err("disabled retries must return the first transport failure");
+        assert!(matches!(error, Error::Transport(_)));
+        assert_eq!(
+            server.request_count("/api/worker/workflow-tasks/poll"),
+            1,
+            "max_retries=0 must send only the initial request"
         );
     }
 
@@ -11147,6 +11363,13 @@ mod tests {
             Self::start_with_behavior(MockWorkerBehavior {
                 poll_failures_per_path: 1,
                 heartbeat_failures: 1,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn consecutive_poll_failures(count: usize) -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                poll_failures_per_path: count,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -11303,6 +11526,23 @@ mod tests {
             serde_json::from_str(body).unwrap_or_else(|error| {
                 panic!("invalid JSON request body for {path}: {error}: {body:?}")
             })
+        }
+
+        fn request_bodies(&self, path: &str) -> Vec<Value> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .filter(|request| request.path == path)
+                .map(|request| {
+                    serde_json::from_str(&request.body).unwrap_or_else(|error| {
+                        panic!(
+                            "invalid JSON request body for {path}: {error}: {:?}",
+                            request.body
+                        )
+                    })
+                })
+                .collect()
         }
     }
 
