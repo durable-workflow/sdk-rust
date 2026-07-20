@@ -12,6 +12,8 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
+from cli_release_verifier_contract import CliRecoveryWorkflowSourceTest, CliReleaseAuthorityTest
+
 RECOVERY_SCRIPT = Path(__file__).with_name("component-release-recovery.py")
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 RUST_WORKFLOW_SOURCE = REPOSITORY_ROOT / ".github/workflows/release-plan-recovery.yml"
