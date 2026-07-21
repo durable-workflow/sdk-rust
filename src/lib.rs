@@ -10930,8 +10930,24 @@ mod tests {
         worker.register_workflow("workflow.observed", |_ctx, _input| async move {
             Ok(Value::Null)
         });
+        let acknowledged = Arc::clone(&observations);
         worker
-            .run_until(tokio::time::sleep(Duration::from_millis(20)))
+            .run_until(async move {
+                tokio::time::timeout(Duration::from_secs(2), async move {
+                    loop {
+                        if !acknowledged
+                            .lock()
+                            .expect("heartbeat observations")
+                            .is_empty()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("heartbeat acknowledgement within timeout");
+            })
             .await
             .expect("run worker");
 
