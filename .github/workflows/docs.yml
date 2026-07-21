@@ -43,6 +43,9 @@ jobs:
   deploy:
     name: Deploy rustdoc
     needs: build
+    if: >-
+      github.repository == 'durable-workflow/sdk-rust' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

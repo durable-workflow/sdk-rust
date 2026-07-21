@@ -1,6 +1,6 @@
 name: Release
 
-run-name: Release ${{ inputs.release_tag || github.ref_name }} for ${{ inputs.release_plan || 'direct' }}
+run-name: Release ${{ inputs.release_tag || github.ref_name }} at ${{ inputs.release_commit || github.sha }} for ${{ inputs.release_plan || 'direct' }}
 
 on:
   push:
@@ -10,6 +10,10 @@ on:
     inputs:
       release_tag:
         description: Existing immutable SDK release tag to publish or verify
+        required: true
+        type: string
+      release_commit:
+        description: Exact source commit declared by the immutable release plan
         required: true
         type: string
       release_plan:
@@ -28,6 +32,10 @@ concurrency:
 jobs:
   publish:
     name: Publish exact crates.io package
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      (github.repository == 'durable-workflow/sdk-rust' &&
+       github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     environment: crates-io
     timeout-minutes: 20
@@ -42,16 +50,23 @@ jobs:
       - name: Resolve exact release identity
         env:
           REQUESTED_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          REQUESTED_RELEASE_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.release_commit || github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$REQUESTED_RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
             printf 'release tag must be an exact SDK SemVer: %s\n' "$REQUESTED_RELEASE_TAG" >&2
             exit 1
           fi
+          if [[ ! "$REQUESTED_RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'release commit must be a full lowercase Git commit: %s\n' \
+              "$REQUESTED_RELEASE_COMMIT" >&2
+            exit 1
+          fi
           head_commit="$(git rev-parse HEAD)"
           tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
-          if [[ "$tag_commit" != "$head_commit" ]]; then
-            printf 'release tag %s does not identify checkout commit %s\n' "$REQUESTED_RELEASE_TAG" "$head_commit" >&2
+          if [[ "$tag_commit" != "$head_commit" || "$tag_commit" != "$REQUESTED_RELEASE_COMMIT" ]]; then
+            printf 'release tag %s resolves to %s, not requested commit %s at checkout %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$REQUESTED_RELEASE_COMMIT" "$head_commit" >&2
             exit 1
           fi
           {

@@ -32,6 +32,12 @@ class CliRecoveryWorkflowSourceTest(unittest.TestCase):
     def test_cli_workflow_fixture_matches_the_pinned_protected_authority(self) -> None:
         digest = hashlib.sha256(CURRENT_CLI_RECOVERY_WORKFLOW.encode("utf-8")).hexdigest()
         self.assertEqual(self.recovery.CLI_RELEASE_RECOVERY_SHA256, digest)
+        self.assertIn(
+            "    if: >-\n"
+            "      github.ref == 'refs/heads/main' &&\n"
+            "      needs.discover.outputs.action == 'publish'",
+            CURRENT_CLI_RECOVERY_WORKFLOW,
+        )
         self.recovery.verify_recovery_workflow_source("cli", CURRENT_CLI_RECOVERY_WORKFLOW)
         self.recovery.verify_recovery_workflow_source(
             "cli",

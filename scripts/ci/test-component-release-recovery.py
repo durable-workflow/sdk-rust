@@ -12,15 +12,17 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from cli_release_verifier_contract import CliRecoveryWorkflowSourceTest, CliReleaseAuthorityTest
+from cli_release_verifier_contract import CliRecoveryWorkflowSourceTest, CliReleaseAuthorityTest  # noqa: F401
 
 RECOVERY_SCRIPT = Path(__file__).with_name("component-release-recovery.py")
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 RUST_WORKFLOW_SOURCE = REPOSITORY_ROOT / ".github/workflows/release-plan-recovery.yml"
+RELEASE_WORKFLOW_SOURCE = REPOSITORY_ROOT / ".github/workflows/release.yml"
 
 # The repository workflow is the canonical source identified by the verifier's
 # pinned digest, not a reduced semantic approximation of its shell commands.
 CURRENT_RUST_RECOVERY_WORKFLOW = RUST_WORKFLOW_SOURCE.read_text(encoding="utf-8")
+CURRENT_RELEASE_WORKFLOW = RELEASE_WORKFLOW_SOURCE.read_text(encoding="utf-8")
 
 GENERIC_RECOVERY_WORKFLOW = r"""on:
   schedule:
@@ -318,6 +320,13 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
         source = CURRENT_RUST_RECOVERY_WORKFLOW
         digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
         self.assertEqual(digest, self.recovery.SDK_RUST_RELEASE_RECOVERY_SHA256)
+        self.assertIn(
+            "    if: >-\n"
+            "      github.repository == 'durable-workflow/sdk-rust' &&\n"
+            "      github.ref == 'refs/heads/main' &&\n"
+            "      needs.discover.outputs.action == 'publish'",
+            source,
+        )
         self.recovery.verify_recovery_workflow_source("sdk-rust", source)
         self.recovery.verify_recovery_workflow_source("sdk-rust", source.replace("\n", "\r\n"))
 
@@ -327,6 +336,23 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
             {
                 "one-byte mutation": source.replace("timeout-minutes: 30", "timeout-minutes: 31", 1),
                 "one-line mutation": source + "\n",
+                "missing dispatch repository guard": source.replace(
+                    "      github.repository == 'durable-workflow/sdk-rust' &&\n", "", 1
+                ),
+                "wrong dispatch repository guard": source.replace(
+                    "github.repository == 'durable-workflow/sdk-rust'",
+                    "github.repository == 'durable-workflow/example'",
+                    1,
+                ),
+                "missing dispatch ref guard": source.replace(
+                    "      github.ref == 'refs/heads/main' &&\n", "", 1
+                ),
+                "wrong dispatch ref guard": source.replace("refs/heads/main", "refs/heads/topic", 1),
+                "dispatch guard OR bypass": source.replace(
+                    "github.ref == 'refs/heads/main' &&",
+                    "(github.ref == 'refs/heads/main' || inputs.force) &&",
+                    1,
+                ),
                 "readarray release tag mutation": source.replace(
                     "          select_publication_run() {",
                     "          readarray -t release_identity < <(printf '%s\\n' mutable)\n"
@@ -416,8 +442,8 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
                     1,
                 ),
                 "run identity has unapproved field": source.replace(
-                    "databaseId,displayTitle,headBranch,headSha,status,conclusion",
-                    "databaseId,displayTitle,headBranch,headSha,status,conclusion,event",
+                    "databaseId,event,displayTitle,headBranch,headSha,status,conclusion",
+                    "databaseId,event,displayTitle,headBranch,headSha,status,conclusion,url",
                     1,
                 ),
             }
@@ -497,8 +523,19 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
                 "mismatched selector commit": source.replace(
                     '--release-commit "$RELEASE_COMMIT"', '--release-commit "$GITHUB_SHA"', 1
                 ),
+                "mismatched selector plan": source.replace(
+                    '--release-plan "$PLAN_TAG"', '--release-plan "release-plan/mutable"', 1
+                ),
+                "tag-ref dispatch": source.replace(
+                    "gh workflow run release.yml --ref main",
+                    'gh workflow run release.yml --ref "$RELEASE_TAG"',
+                    1,
+                ),
                 "mismatched dispatch tag": source.replace(
                     '-f release_tag="$RELEASE_TAG"', '-f release_tag="$GITHUB_REF_NAME"', 1
+                ),
+                "mismatched dispatch commit": source.replace(
+                    '-f release_commit="$RELEASE_COMMIT"', '-f release_commit="$GITHUB_SHA"', 1
                 ),
                 "missing completed verification": source.replace(
                     "--component sdk-rust --plan recovery-input/release-plan.json",
@@ -524,6 +561,67 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
         )
         with self.assertRaises(self.recovery.RecoveryError):
             self.recovery.verify_recovery_workflow_source("server", protected_only)
+
+
+class ProtectedReleaseDispatchTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.recovery = load_recovery_module()
+        cls.release_tag = "2.0.0-beta.4"
+        cls.release_commit = "a" * 40
+        cls.release_plan = "release-plan/beta.4"
+        cls.title = f"Release {cls.release_tag} at {cls.release_commit} for {cls.release_plan}"
+
+    def run_record(self, **overrides: object) -> dict[str, object]:
+        record: dict[str, object] = {
+            "databaseId": 42,
+            "event": "workflow_dispatch",
+            "displayTitle": self.title,
+            "headBranch": "main",
+            "headSha": "b" * 40,
+            "status": "completed",
+            "conclusion": "success",
+        }
+        record.update(overrides)
+        return record
+
+    def select(self, runs: object) -> dict[str, object]:
+        return self.recovery.select_publication_run(
+            self.release_tag,
+            self.release_commit,
+            self.release_plan,
+            runs,
+        )
+
+    def test_release_dispatch_is_guarded_and_validates_the_planned_identity(self) -> None:
+        self.assertIn("github.ref == 'refs/heads/main'", CURRENT_RELEASE_WORKFLOW)
+        self.assertIn("release_commit:\n", CURRENT_RELEASE_WORKFLOW)
+        self.assertIn("REQUESTED_RELEASE_COMMIT:", CURRENT_RELEASE_WORKFLOW)
+        self.assertIn('"$tag_commit" != "$REQUESTED_RELEASE_COMMIT"', CURRENT_RELEASE_WORKFLOW)
+        self.assertIn("inputs.release_commit || github.sha", CURRENT_RELEASE_WORKFLOW)
+
+    def test_selects_only_the_exact_protected_main_dispatch(self) -> None:
+        selection = self.select([self.run_record()])
+        self.assertEqual(
+            {"action": "complete", "run_id": 42, "status": "completed", "conclusion": "success"},
+            selection,
+        )
+
+        for label, mutation in {
+            "old tag-headed dispatch": {"headBranch": self.release_tag, "headSha": self.release_commit},
+            "tag push": {"event": "push", "headBranch": self.release_tag, "headSha": self.release_commit},
+            "wrong tag": {"displayTitle": self.title.replace(self.release_tag, "2.0.0-beta.5")},
+            "wrong commit": {"displayTitle": self.title.replace(self.release_commit, "c" * 40)},
+            "wrong plan": {"displayTitle": self.title.replace(self.release_plan, "release-plan/beta.5")},
+        }.items():
+            with self.subTest(label):
+                self.assertEqual("dispatch", self.select([self.run_record(**mutation)])["action"])
+
+    def test_rejects_ambiguous_or_incomplete_exact_dispatches(self) -> None:
+        with self.assertRaisesRegex(self.recovery.RecoveryError, "multiple protected publication runs"):
+            self.select([self.run_record(), self.run_record(databaseId=43)])
+        with self.assertRaisesRegex(self.recovery.RecoveryError, "metadata is incomplete"):
+            self.select([self.run_record(headSha="not-a-commit")])
 
 
 if __name__ == "__main__":

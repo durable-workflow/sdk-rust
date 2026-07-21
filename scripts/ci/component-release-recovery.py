@@ -55,14 +55,14 @@ SOURCE_CHANGELOGS = {"workflow", "waterline", "sdk-php", "sdk-python"}
 # SHA-256 of durable-workflow/cli's protected release recovery workflow.
 # Exact source identity is required because source-pattern matching cannot
 # prove that tag creation remains inside the protected repository authority.
-CLI_RELEASE_RECOVERY_SHA256 = "29fde398856e0db8c43c14dc3c3544fcb21ad9c79db71661db1637e8f89c588a"
+CLI_RELEASE_RECOVERY_SHA256 = "de1e7f37bcbadf3644b53d127abcae11ec823fd6602a682a58617c6b257dae11"
 
 # SHA-256 of durable-workflow/sdk-rust's release recovery workflow using the
 # supported action runtimes. The verifier normalizes only CRLF line endings to
 # LF before hashing. Exact source identity is the bounded security contract
 # because arbitrary shell execution cannot be proven safe by source-pattern
 # matching.
-SDK_RUST_RELEASE_RECOVERY_SHA256 = "0055b197f7ef3f826275bd5514a33891a9cbf10f5d74b9fefa1647f5eefe868a"
+SDK_RUST_RELEASE_RECOVERY_SHA256 = "d6bca15d3f09aa3e7ecf6fc796b81a008e3e4cba2fdea10391f8ede0cab3548c"
 
 
 @dataclass(frozen=True)
@@ -721,25 +721,46 @@ def verify_recovery_workflow_source(name: str, source: str) -> None:
 def select_publication_run(
     release_tag: str,
     release_commit: str,
+    release_plan: str,
     runs: Any,
 ) -> dict[str, Any]:
-    if not VERSION_PATTERN.fullmatch(release_tag) or not COMMIT_PATTERN.fullmatch(release_commit):
+    if (
+        not VERSION_PATTERN.fullmatch(release_tag)
+        or not COMMIT_PATTERN.fullmatch(release_commit)
+        or not release_plan.startswith(PLAN_TAG_PREFIX)
+        or not PLAN_PATTERN.fullmatch(release_plan.removeprefix(PLAN_TAG_PREFIX))
+    ):
         raise RecoveryError("publication run selection requires an exact release identity", "publication")
     if not isinstance(runs, list):
         raise RecoveryError("publication run metadata must be a JSON array", "publication")
 
+    expected_title = f"Release {release_tag} at {release_commit} for {release_plan}"
     exact_runs: list[dict[str, Any]] = []
     for run in runs:
-        if not isinstance(run, dict) or run.get("headBranch") != release_tag:
+        if not isinstance(run, dict):
             continue
-        if run.get("headSha") != release_commit:
-            raise RecoveryError(
-                f"publication run {run.get('databaseId')} for {release_tag} is bound to a different source commit",
-                "publication",
-            )
-        if not isinstance(run.get("databaseId"), int) or not isinstance(run.get("status"), str):
+        if (
+            run.get("event") != "workflow_dispatch"
+            or run.get("headBranch") != "main"
+            or run.get("displayTitle") != expected_title
+        ):
+            continue
+        if (
+            not isinstance(run.get("databaseId"), int)
+            or run["databaseId"] < 1
+            or not isinstance(run.get("status"), str)
+            or not run["status"]
+            or not isinstance(run.get("headSha"), str)
+            or not COMMIT_PATTERN.fullmatch(run["headSha"])
+        ):
             raise RecoveryError("publication run metadata is incomplete", "publication")
         exact_runs.append(run)
+
+    if len(exact_runs) > 1:
+        raise RecoveryError(
+            f"multiple protected publication runs claim exact release {release_tag} at {release_commit}",
+            "publication",
+        )
 
     selected = next((run for run in exact_runs if run["status"] != "completed"), None)
     action = "wait"
@@ -1352,6 +1373,7 @@ def main() -> int:
     select_run = subparsers.add_parser("select-publication-run")
     select_run.add_argument("--release-tag", required=True)
     select_run.add_argument("--release-commit", required=True)
+    select_run.add_argument("--release-plan", required=True)
     select_run.add_argument("--runs", required=True, type=Path)
 
     args = parser.parse_args()
@@ -1363,7 +1385,7 @@ def main() -> int:
                 runs = json.loads(args.runs.read_bytes())
             except (OSError, json.JSONDecodeError) as error:
                 raise RecoveryError(f"cannot read publication run metadata: {error}", "publication") from error
-            selection = select_publication_run(args.release_tag, args.release_commit, runs)
+            selection = select_publication_run(args.release_tag, args.release_commit, args.release_plan, runs)
             print(
                 "\t".join(
                     str(selection.get(field) or "")
