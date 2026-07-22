@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -177,10 +178,11 @@ class PlannedTagPublicationTest(unittest.TestCase):
         spec.loader.exec_module(recovery)
         source = (REPOSITORY_ROOT / ".github/workflows/release-plan-recovery.yml").read_text(encoding="utf-8")
 
-        recovery.verify_recovery_workflow_source("sdk-rust", source)
+        expected_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        recovery.verify_recovery_workflow_source("sdk-rust", source, expected_sha256)
         without_environment = source.replace("environment: release-plan-publication", "environment: unprotected")
         with self.assertRaises(recovery.RecoveryError):
-            recovery.verify_recovery_workflow_source("sdk-rust", without_environment)
+            recovery.verify_recovery_workflow_source("sdk-rust", without_environment, expected_sha256)
 
 
 if __name__ == "__main__":

@@ -306,7 +306,11 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
 
     def assert_rejected(self, source: str) -> None:
         with self.assertRaises(self.recovery.RecoveryError) as caught:
-            self.recovery.verify_recovery_workflow_source("sdk-rust", source)
+            self.recovery.verify_recovery_workflow_source(
+                "sdk-rust",
+                source,
+                hashlib.sha256(CURRENT_RUST_RECOVERY_WORKFLOW.encode("utf-8")).hexdigest(),
+            )
         self.assertEqual(caught.exception.phase, "default-branch-preflight")
 
     def assert_variants_rejected(self, variants: dict[str, str]) -> None:
@@ -319,7 +323,6 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
     def test_accepts_only_the_current_protected_rust_workflow_identity(self) -> None:
         source = CURRENT_RUST_RECOVERY_WORKFLOW
         digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        self.assertEqual(digest, self.recovery.SDK_RUST_RELEASE_RECOVERY_SHA256)
         self.assertIn(
             "    if: >-\n"
             "      github.repository == 'durable-workflow/sdk-rust' &&\n"
@@ -327,8 +330,8 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
             "      needs.discover.outputs.action == 'publish'",
             source,
         )
-        self.recovery.verify_recovery_workflow_source("sdk-rust", source)
-        self.recovery.verify_recovery_workflow_source("sdk-rust", source.replace("\n", "\r\n"))
+        self.recovery.verify_recovery_workflow_source("sdk-rust", source, digest)
+        self.recovery.verify_recovery_workflow_source("sdk-rust", source.replace("\n", "\r\n"), digest)
 
     def test_rejects_shell_semantic_bypasses_and_any_source_mutation(self) -> None:
         source = CURRENT_RUST_RECOVERY_WORKFLOW
@@ -553,14 +556,17 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
         )
 
     def test_other_components_keep_the_contents_api_contract(self) -> None:
-        self.recovery.verify_recovery_workflow_source("server", GENERIC_RECOVERY_WORKFLOW)
+        expected_sha256 = hashlib.sha256(GENERIC_RECOVERY_WORKFLOW.encode("utf-8")).hexdigest()
+        self.recovery.verify_recovery_workflow_source(
+            "server", GENERIC_RECOVERY_WORKFLOW, expected_sha256
+        )
 
         protected_only = GENERIC_RECOVERY_WORKFLOW.replace(
             '-f ref="refs/tags/$RELEASE_TAG" -f sha="$RELEASE_COMMIT"',
             'python scripts/ci/publish-planned-tag.py --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"',
         )
         with self.assertRaises(self.recovery.RecoveryError):
-            self.recovery.verify_recovery_workflow_source("server", protected_only)
+            self.recovery.verify_recovery_workflow_source("server", protected_only, expected_sha256)
 
 
 class ProtectedReleaseDispatchTest(unittest.TestCase):
