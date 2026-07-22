@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PRODUCT_TRAIN = "2.0.0-beta.3"
+PRODUCT_TRAIN = "2.0.0-beta.4"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -39,7 +39,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
     def _write_mock_commands(self) -> None:
         self._write_executable(
             "cargo",
-            r'''
+            r"""
             #!/usr/bin/env python3
             import json
             import os
@@ -69,11 +69,11 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 archive.write_bytes(b"local crate")
             else:
                 raise SystemExit(f"unexpected cargo command: {command}")
-            ''',
+            """,
         )
         self._write_executable(
             "git",
-            r'''
+            r"""
             #!/usr/bin/env python3
             import os
             import sys
@@ -85,7 +85,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 print(os.environ["MOCK_RELEASE_COMMIT"])
             else:
                 raise SystemExit(f"unexpected git command: {command}")
-            ''',
+            """,
         )
         self._write_executable(
             "curl",
@@ -126,12 +126,12 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         self._write_executable(
             "tar",
-            r'''
+            r"""
             #!/usr/bin/env python3
             import json
             import os
             print(json.dumps({"git": {"sha1": os.environ["MOCK_RELEASE_COMMIT"], "dirty": False}}))
-            ''',
+            """,
         )
 
     def _publish(self, manifest: Path = MANIFEST) -> subprocess.CompletedProcess[str]:
@@ -163,14 +163,19 @@ class PublishRustSdkContractTest(unittest.TestCase):
         manifest.write_text(source.replace(old, new, 1), encoding="utf-8")
         return manifest
 
-    def test_manifest_declares_one_beta3_product_train(self) -> None:
+    def test_manifest_declares_one_beta4_product_train(self) -> None:
         package = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))["package"]
         metadata = package["metadata"]["durable-workflow"]
         self.assertEqual(PRODUCT_TRAIN, package["version"])
         self.assertEqual(PRODUCT_TRAIN, metadata["product-train"])
         self.assertEqual(PRODUCT_TRAIN, metadata["supported-server-versions"])
 
-    def test_release_path_accepts_and_emits_beta3_product_train(self) -> None:
+    def test_readme_uses_cargo_supported_exact_requirement(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"cargo add durable-workflow@={PRODUCT_TRAIN}", readme)
+        self.assertNotIn(f"cargo add durable-workflow@{PRODUCT_TRAIN} --exact", readme)
+
+    def test_release_path_accepts_and_emits_beta4_product_train(self) -> None:
         result = self._publish()
         self.assertEqual(0, result.returncode, result.stderr)
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
@@ -182,7 +187,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
     def test_release_path_rejects_a_divergent_product_train(self) -> None:
         manifest = self._manifest_with(
             f'product-train = "{PRODUCT_TRAIN}"',
-            'product-train = "2.0.0-beta.4"',
+            'product-train = "2.0.0-beta.3"',
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
