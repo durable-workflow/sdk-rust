@@ -36,6 +36,7 @@ package_rust_version="$(jq -er '.packages[0].rust_version' <<<"$metadata")"
 package_repository="$(jq -er '.packages[0].repository' <<<"$metadata")"
 package_documentation="$(jq -er '.packages[0].documentation' <<<"$metadata")"
 target_directory="$(jq -er '.target_directory' <<<"$metadata")"
+product_train="$(jq -er '.packages[0].metadata["durable-workflow"]["product-train"]' <<<"$metadata")"
 server_compatibility="$(jq -er '.packages[0].metadata["durable-workflow"]["supported-server-versions"]' <<<"$metadata")"
 worker_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["worker-protocol-version"]' <<<"$metadata")"
 control_plane="$(jq -er '.packages[0].metadata["durable-workflow"]["control-plane-version"]' <<<"$metadata")"
@@ -75,7 +76,11 @@ if [[ "$package_documentation" != "https://rust.durable-workflow.com/" ]]; then
     printf 'unexpected Rust SDK documentation metadata: %s\n' "$package_documentation" >&2
     exit 1
 fi
-if [[ "$server_compatibility" != ">=0.2,<0.3" || "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
+if [[ "$product_train" != "$package_version" || "$server_compatibility" != "$product_train" ]]; then
+    printf 'Rust SDK package, product train, and supported server must share one release: %s, %s, %s\n' "$package_version" "$product_train" "$server_compatibility" >&2
+    exit 1
+fi
+if [[ "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi
@@ -137,6 +142,7 @@ write_evidence() {
         --arg repository "$package_repository" \
         --arg published_repository "$published_repository" \
         --arg documentation "$package_documentation" \
+        --arg product_train "$product_train" \
         --arg server_compatibility "$server_compatibility" \
         --arg worker_protocol "$worker_protocol" \
         --arg control_plane "$control_plane" \
@@ -183,6 +189,7 @@ write_evidence() {
                 archive_vcs_commit: $archive_vcs_commit,
                 archive_vcs_dirty: ($archive_vcs_dirty == "true")
             },
+            product_train: $product_train,
             supported_server_versions: $server_compatibility,
             protocol_compatibility: {
                 worker_protocol: $worker_protocol,

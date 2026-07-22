@@ -15,52 +15,25 @@ deployments with durable version markers.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@0.1.15 --exact
+cargo add durable-workflow@2.0.0-beta.3 --exact
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=0.1.15"
+durable-workflow = "=2.0.0-beta.3"
 ```
 
-Version `0.1.15` requires Rust `1.86` or newer. Snapshot inspection queries were
-introduced in `0.1.1`; replayed workflow-instance state queries are available
-from `0.1.2`, deterministic durable timers are available from `0.1.4`, and
-durable child workflows are available from `0.1.5`. Durable activity retry,
-timeout, and typed terminal options are available from `0.1.7`. Workflow
-cancellation, termination, selected-run safety, and typed workflow outcomes
-are available from `0.1.8`. Advertised worker-heartbeat cadence remains bounded
-after delayed acknowledgements and retries from `0.1.9`. From `0.1.11`, an
-uncaught error returned by a workflow handler settles the run as a typed
-workflow failure instead of leaving the workflow task to retry indefinitely.
-From `0.1.12`, managed workers settle the exact server-terminal run-timeout
-completion race without hiding other completion failures.
-From `0.1.13`, typed side effects, deterministic UUIDv4 values, and version
-markers replay without re-running non-deterministic code or duplicating markers.
-From `0.1.14`, workflows can continue as new with replacement arguments and
-optional workflow-type and queue routing. Client handles follow the current
-run chain by default while retaining explicit selected-run views.
-From `0.1.15`, replay preserves positive, strictly ordered global workflow
-sequences even when signals or other non-command events leave gaps between
-durable commands.
+Version `2.0.0-beta.3` requires Rust `1.86` or newer and includes the complete
+Durable Workflow 2.0 beta baseline described below.
 
 ## Compatibility
 
-| SDK releases | Durable Workflow server | Worker protocol | Control plane |
-| --- | --- | --- | --- |
-| `0.1.0` | `>=0.2,<0.3` | `1.2` | `2` |
-| `0.1.1` | `>=0.2,<0.3` | `1.2` (snapshot queries require `1.8`) | `2` |
-| `0.1.2`–`0.1.3` | `>=0.2,<0.3` | `1.2` (replayed queries require `1.8`) | `2` |
-| `0.1.4` | `>=0.2,<0.3` | `1.2` (timers; replayed queries require `1.8`) | `2` |
-| `0.1.5`–`0.1.6` | `>=0.2,<0.3` | `1.2` (timers and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.7` | `>=0.2,<0.3` | `1.2` (activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.8`–`0.1.9` | `>=0.2,<0.3` | `1.2` (workflow lifecycle, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.10`–`0.1.12` | `>=0.2,<0.3` | `1.2` (workflow lifecycle with server start deadlines, activity options, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.13` | `>=0.2,<0.3` | `1.2` (side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.14` | `>=0.2,<0.3` | `1.2` (continue-as-new, side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
-| `0.1.15+` | `>=0.2,<0.3` | `1.2` (global durable-sequence gaps, continue-as-new, side effects, version markers, lifecycle, activities, timers, and child workflows; replayed queries require `1.8`) | `2` |
+Rust SDK `2.0.0-beta.3` is supported with server `2.0.0-beta.3`, control plane
+`2`, and the server's additive worker-protocol negotiation window. Earlier
+crate versions remain historical and are not separate supported feature
+levels. No compatibility shim connects earlier 2.0 prereleases to this train.
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
 `Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
@@ -668,6 +641,6 @@ the authoritative source for the `durable-workflow` crate and its Rust API
 documentation.
 
 Crate releases follow semantic versioning and are tagged with the exact crate
-version, such as `0.1.1`. Rust SDK versions are independent from Durable
-Workflow server image versions. A compatible server range is declared in
-package metadata instead of coupling crate publication to a server release.
+version. During the 2.0 beta, the crate advances with the synchronized product
+train. After stable 2.0, fixes, additive capabilities, and breaking changes use
+ordinary patch, minor, and major progression respectively.
