@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PRODUCT_TRAIN = "2.0.0-beta.6"
+PRODUCT_TRAIN = "2.0.0-beta.10"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 

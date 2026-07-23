@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.0-beta.6"
+version = "2.0.0-beta.10"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -14,8 +14,8 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/examples/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.0-beta.6"
-supported-server-versions = "2.0.0-beta.6"
+product-train = "2.0.0-beta.10"
+supported-server-versions = "2.0.0-beta.10"
 worker-protocol-version = "1.2"
 control-plane-version = "2"
 query-tasks = true
