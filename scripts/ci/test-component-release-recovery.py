@@ -212,7 +212,17 @@ def captured_github_authority(module, record: dict[str, object]) -> list[object]
                 {
                     "id": protection["required_reviewer_rule_ids"][0],
                     "type": "required_reviewers",
-                    "reviewers": [{"type": "User"}],
+                    "reviewers": [
+                        {
+                            "type": "User",
+                            "reviewer": {
+                                **approval["user"],
+                                "avatar_url": "https://avatars.githubusercontent.com/u/55?v=4",
+                                "site_admin": False,
+                                "type": "User",
+                            },
+                        }
+                    ],
                 }
             ],
             "deployment_branch_policy": protection["deployment_branch_policy"],
@@ -813,6 +823,53 @@ class ImmutablePlanDiscoveryTest(unittest.TestCase):
                 client.json.side_effect = responses
                 with self.assertRaises(self.recovery.RecoveryError):
                     self.recovery.revalidate_supersession_authority(record, client)
+
+    def test_terminal_failure_rejects_approval_history_for_a_rerun_attempt(self) -> None:
+        failed = lifecycle_plan(self.recovery)
+        successor = json.loads(json.dumps(failed))
+        successor["plan"] = "successor-plan"
+        successor["components"]["workflow"]["version"] = "2.0.0-alpha.2"
+        record = supersession_record(self.recovery, failed, successor, "a" * 40)
+        authorization = record["authorization"]
+        authorization["run_attempt"] = 2
+        authorization["environment_approval"]["run_attempt"] = 2
+        client = mock.Mock()
+        client.json.side_effect = captured_github_authority(self.recovery, record)
+
+        with self.assertRaisesRegex(
+            self.recovery.RecoveryError,
+            "approval history cannot bind.*rerun attempt",
+        ):
+            self.recovery.revalidate_supersession_authority(record, client)
+
+        self.assertEqual(3, client.json.call_count)
+
+    def test_terminal_failure_rejects_approver_outside_current_policy(self) -> None:
+        failed = lifecycle_plan(self.recovery)
+        successor = json.loads(json.dumps(failed))
+        successor["plan"] = "successor-plan"
+        successor["components"]["workflow"]["version"] = "2.0.0-alpha.2"
+        record = supersession_record(self.recovery, failed, successor, "a" * 40)
+        responses = captured_github_authority(self.recovery, record)
+        responses[0]["protection_rules"][0]["reviewers"][0]["reviewer"].update(
+            {
+                "html_url": "https://github.com/different-reviewer",
+                "id": 77,
+                "login": "different-reviewer",
+                "node_id": "different-reviewer-node",
+                "url": "https://api.github.com/users/different-reviewer",
+            }
+        )
+        client = mock.Mock()
+        client.json.side_effect = responses
+
+        with self.assertRaisesRegex(
+            self.recovery.RecoveryError,
+            "approving user is not authorized by the current reviewer policy",
+        ):
+            self.recovery.revalidate_supersession_authority(record, client)
+
+        self.assertEqual(4, client.json.call_count)
 
     def test_terminal_failure_rejects_incomplete_lifecycle_authority(self) -> None:
         failed = lifecycle_plan(self.recovery)
