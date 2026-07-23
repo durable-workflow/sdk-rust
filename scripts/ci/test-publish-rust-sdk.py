@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PRODUCT_TRAIN = "2.0.0-beta.5"
+PRODUCT_TRAIN = "2.0.0-beta.6"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -163,7 +163,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         manifest.write_text(source.replace(old, new, 1), encoding="utf-8")
         return manifest
 
-    def test_manifest_declares_one_beta5_product_train(self) -> None:
+    def test_manifest_declares_one_beta6_product_train(self) -> None:
         package = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))["package"]
         metadata = package["metadata"]["durable-workflow"]
         self.assertEqual(PRODUCT_TRAIN, package["version"])
@@ -175,7 +175,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertIn(f"cargo add durable-workflow@={PRODUCT_TRAIN}", readme)
         self.assertNotIn(f"cargo add durable-workflow@{PRODUCT_TRAIN} --exact", readme)
 
-    def test_release_path_accepts_and_emits_beta5_product_train(self) -> None:
+    def test_release_path_accepts_and_emits_beta6_product_train(self) -> None:
         result = self._publish()
         self.assertEqual(0, result.returncode, result.stderr)
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))

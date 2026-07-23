@@ -15,22 +15,22 @@ deployments with durable version markers.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-beta.5
+cargo add durable-workflow@=2.0.0-beta.6
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-beta.5"
+durable-workflow = "=2.0.0-beta.6"
 ```
 
-Version `2.0.0-beta.5` requires Rust `1.86` or newer and includes the complete
+Version `2.0.0-beta.6` requires Rust `1.86` or newer and includes the complete
 Durable Workflow 2.0 beta baseline described below.
 
 ## Compatibility
 
-Rust SDK `2.0.0-beta.5` is supported with server `2.0.0-beta.5`, control plane
+Rust SDK `2.0.0-beta.6` is supported with server `2.0.0-beta.6`, control plane
 `2`, and the server's additive worker-protocol negotiation window. Earlier
 crate versions remain historical and are not separate supported feature
 levels. No compatibility shim connects earlier 2.0 prereleases to this train.
