@@ -21,6 +21,8 @@ jobs:
         rust: ['1.86.0', 'stable']
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
 
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
@@ -45,11 +47,20 @@ jobs:
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/test-component-release-recovery.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/test-component-release-recovery.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
           scripts/ci/test-crates-io-publish.sh
-          python scripts/ci/test-component-release-recovery.py
+          arguments=()
+          if [ -n "$CONFORMANCE_BASE_REF" ]; then
+            arguments+=(--previous-ref "$CONFORMANCE_BASE_REF")
+          fi
+          python scripts/ci/release_recovery_consumer_conformance.py \
+            --contract scripts/ci/release-recovery-consumer-contract.json \
+            --adapter scripts/ci/release-recovery-consumer-adapter.json \
+            "${arguments[@]}"
           python scripts/ci/test-publish-planned-tag.py
           python scripts/ci/test-publish-rust-sdk.py
+        env:
+          CONFORMANCE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
 
   target-branch-qualification:
     name: Target branch qualification
