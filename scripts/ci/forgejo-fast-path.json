@@ -1,0 +1,38 @@
+{
+  "schema": "durable-workflow.sdk-rust.forgejo-fast-path/v1",
+  "runner_profile": "warm-local",
+  "budget_seconds": 90,
+  "job_timeout_minutes": 2,
+  "checks": [
+    {
+      "id": "manifest",
+      "command": ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+      "quiet_stdout": true
+    },
+    {
+      "id": "rustfmt",
+      "command": ["cargo", "fmt", "--all", "--check"]
+    },
+    {
+      "id": "diff-boundary",
+      "command": ["git", "diff", "--check", "{candidate_range}"]
+    },
+    {
+      "id": "public-boundary",
+      "command": ["scripts/check-public-boundary.sh"]
+    },
+    {
+      "id": "compile",
+      "command": ["cargo", "check", "--all-targets"]
+    }
+  ],
+  "github_authoritative_checks": [
+    "msrv-all-target-tests",
+    "stable-all-target-tests",
+    "typed-avro-compatibility",
+    "typed-avro-regression-budget",
+    "warning-free-rustdoc",
+    "publishable-package-content",
+    "release-tooling"
+  ]
+}
