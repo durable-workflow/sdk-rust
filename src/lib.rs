@@ -4,6 +4,7 @@ use std::{
     any::{Any, TypeId},
     collections::{BTreeMap, HashMap},
     future::Future,
+    io::{self, Read},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,10 +14,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value, Schema};
+use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{
+    de::DeserializeOwned,
+    ser::{SerializeMap, SerializeSeq},
+    Deserialize, Serialize, Serializer,
+};
 pub use serde_json::{json, Value};
 use thiserror::Error;
 pub use uuid::Uuid;
@@ -28,6 +33,8 @@ pub const JSON_CODEC: &str = "json";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
 /// Worker-registration capability for server-routed read-only queries.
 pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
+/// Worker-registration capability for synchronous workflow updates.
+pub const WORKFLOW_UPDATES_CAPABILITY: &str = "workflow_updates";
 /// First additive worker protocol that defines query-task transport.
 pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
 
@@ -43,10 +50,12 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "query_task_timed_out",
 ];
 
-const AVRO_PAYLOAD_SCHEMA_JSON: &str = r#"{"type":"record","name":"Payload","namespace":"durable_workflow","fields":[{"name":"json","type":"string"},{"name":"version","type":"int","default":1}]}"#;
-const AVRO_PAYLOAD_VERSION: i32 = 1;
+pub const AVRO_VALUE_SCHEMA_JSON: &str = r#"{"type":"record","name":"Value","namespace":"durable_workflow.protocol","fields":[{"name":"value","type":["null",{"type":"record","name":"BooleanValue","fields":[{"name":"boolean","type":"boolean"}]},{"type":"record","name":"LongValue","fields":[{"name":"long","type":"long"}]},{"type":"record","name":"DoubleValue","fields":[{"name":"double","type":"double"}]},{"type":"record","name":"BytesValue","fields":[{"name":"bytes","type":"bytes"}]},{"type":"record","name":"StringValue","fields":[{"name":"string","type":"string"}]},{"type":"record","name":"ArrayValue","fields":[{"name":"items","type":{"type":"array","items":"Value"}}]},{"type":"record","name":"MapValue","fields":[{"name":"entries","type":{"type":"map","values":"Value"}}]}]}]}"#;
+pub const AVRO_VALUE_SCHEMA_FINGERPRINT_HEX: &str = "e2a33dff55802237";
+pub const AVRO_VALUE_SCHEMA_FINGERPRINT: [u8; 8] = [0xe2, 0xa3, 0x3d, 0xff, 0x55, 0x80, 0x22, 0x37];
+const AVRO_SINGLE_OBJECT_MAGIC: [u8; 2] = [0xc3, 0x01];
 
-static AVRO_PAYLOAD_SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
+static AVRO_VALUE_SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 enum RequestProtocol {
@@ -265,7 +274,7 @@ pub struct WorkflowHistoryBudget {
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct ContinueAsNewRequest {
-    arguments: Value,
+    arguments: AvroValue,
     options: ContinueAsNewOptions,
 }
 
@@ -477,6 +486,15 @@ pub struct ChildWorkflowResult {
     pub child: WorkflowIdentity,
     pub child_workflow_type: Option<String>,
     pub result: Value,
+}
+
+/// Lossless successful child result for fixed Avro Value workflows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildWorkflowAvroResult {
+    pub parent: WorkflowIdentity,
+    pub child: WorkflowIdentity,
+    pub child_workflow_type: Option<String>,
+    pub result: AvroValue,
 }
 
 /// Server behavior when a parent closes while its child is still open.
@@ -991,11 +1009,216 @@ impl PayloadEnvelope {
     pub fn json<T: Serialize>(value: &T) -> Result<Self> {
         encode_payload(value, JSON_CODEC)
     }
+
+    /// Encode an explicit typed value, including the bytes branch that JSON
+    /// serialization cannot represent.
+    pub fn avro_value(value: &AvroValue) -> Result<Self> {
+        encode_avro_value(value)
+    }
+}
+
+/// Native adapter for the fixed language-neutral Avro Value schema.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AvroValue {
+    Null,
+    Boolean(bool),
+    Long(i64),
+    Double(f64),
+    Bytes(Vec<u8>),
+    String(String),
+    Array(Vec<AvroValue>),
+    Map(BTreeMap<String, AvroValue>),
+}
+
+impl AvroValue {
+    fn from_serialize<T: Serialize>(value: &T) -> Result<Self> {
+        Self::from_serde_value(
+            serde_value::to_value(value).map_err(|error| {
+                Error::Codec(format!("could not adapt value for Avro: {error}"))
+            })?,
+        )
+    }
+
+    fn from_serde_value(value: serde_value::Value) -> Result<Self> {
+        use serde_value::Value as SerdeValue;
+
+        match value {
+            SerdeValue::Unit => Ok(Self::Null),
+            SerdeValue::Bool(value) => Ok(Self::Boolean(value)),
+            SerdeValue::I8(value) => Ok(Self::Long(i64::from(value))),
+            SerdeValue::I16(value) => Ok(Self::Long(i64::from(value))),
+            SerdeValue::I32(value) => Ok(Self::Long(i64::from(value))),
+            SerdeValue::I64(value) => Ok(Self::Long(value)),
+            SerdeValue::U8(value) => Ok(Self::Long(i64::from(value))),
+            SerdeValue::U16(value) => Ok(Self::Long(i64::from(value))),
+            SerdeValue::U32(value) => Ok(Self::Long(i64::from(value))),
+            SerdeValue::U64(value) => i64::try_from(value).map(Self::Long).map_err(|_| {
+                Error::Codec(
+                    "integer_overflow: Avro Value long must be within signed 64-bit range"
+                        .to_string(),
+                )
+            }),
+            SerdeValue::F32(value) => Self::finite_double(f64::from(value)),
+            SerdeValue::F64(value) => Self::finite_double(value),
+            SerdeValue::Char(value) => Ok(Self::String(value.to_string())),
+            SerdeValue::String(value) => Ok(Self::String(value)),
+            SerdeValue::Bytes(value) => Ok(Self::Bytes(value)),
+            SerdeValue::Option(None) => Ok(Self::Null),
+            SerdeValue::Option(Some(value)) | SerdeValue::Newtype(value) => {
+                Self::from_serde_value(*value)
+            }
+            SerdeValue::Seq(values) => values
+                .into_iter()
+                .map(Self::from_serde_value)
+                .collect::<Result<Vec<_>>>()
+                .map(Self::Array),
+            SerdeValue::Map(values) => values
+                .into_iter()
+                .map(|(key, value)| {
+                    let SerdeValue::String(key) = key else {
+                        return Err(Error::Codec(
+                            "invalid_map_key: Avro Value map keys must be strings".to_string(),
+                        ));
+                    };
+
+                    Ok((key, Self::from_serde_value(value)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+                .map(Self::Map),
+        }
+    }
+
+    fn finite_double(value: f64) -> Result<Self> {
+        if !value.is_finite() {
+            return Err(Error::Codec(
+                "non_finite_float: Avro Value doubles must be finite".to_string(),
+            ));
+        }
+
+        Ok(Self::Double(value))
+    }
+
+    fn into_json(self) -> Result<Value> {
+        match self {
+            Self::Null => Ok(Value::Null),
+            Self::Boolean(value) => Ok(Value::Bool(value)),
+            Self::Long(value) => Ok(Value::Number(value.into())),
+            Self::Double(value) => serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .ok_or_else(|| {
+                    Error::Codec(
+                        "non_finite_float: decoded Avro Value double is not finite".to_string(),
+                    )
+                }),
+            Self::Bytes(value) => Ok(json!({
+                "$type": "bytes",
+                "base64": BASE64.encode(value),
+            })),
+            Self::String(value) => Ok(Value::String(value)),
+            Self::Array(values) => values
+                .into_iter()
+                .map(Self::into_json)
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Array),
+            Self::Map(values) => values
+                .into_iter()
+                .map(|(key, value)| Ok((key, value.into_json()?)))
+                .collect::<Result<serde_json::Map<_, _>>>()
+                .map(Value::Object),
+        }
+    }
+
+    fn into_serde_value(self) -> serde_value::Value {
+        use serde_value::Value as SerdeValue;
+
+        match self {
+            Self::Null => SerdeValue::Unit,
+            Self::Boolean(value) => SerdeValue::Bool(value),
+            Self::Long(value) => SerdeValue::I64(value),
+            Self::Double(value) => SerdeValue::F64(value),
+            Self::Bytes(value) => SerdeValue::Bytes(value),
+            Self::String(value) => SerdeValue::String(value),
+            Self::Array(values) => {
+                SerdeValue::Seq(values.into_iter().map(Self::into_serde_value).collect())
+            }
+            Self::Map(values) => SerdeValue::Map(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (SerdeValue::String(key), value.into_serde_value()))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub fn deserialize<T: DeserializeOwned>(self) -> Result<T> {
+        self.into_serde_value().deserialize_into().map_err(|error| {
+            Error::Codec(format!(
+                "avro_value_type_mismatch: could not adapt decoded value: {error}"
+            ))
+        })
+    }
+}
+
+impl Serialize for AvroValue {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Boolean(value) => serializer.serialize_bool(*value),
+            Self::Long(value) => serializer.serialize_i64(*value),
+            Self::Double(value) => serializer.serialize_f64(*value),
+            Self::Bytes(value) => serializer.serialize_bytes(value),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(value)?;
+                }
+                sequence.end()
+            }
+            Self::Map(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+pub fn encode_avro_value(value: &AvroValue) -> Result<PayloadEnvelope> {
+    let datum = avro_value_to_datum(value)?;
+    let datum = to_avro_datum(avro_value_schema()?, datum)
+        .map_err(|err| Error::Codec(format!("avro_value_encode_failed: {err}")))?;
+    let mut bytes = Vec::with_capacity(datum.len() + 10);
+    bytes.extend_from_slice(&AVRO_SINGLE_OBJECT_MAGIC);
+    bytes.extend_from_slice(&AVRO_VALUE_SCHEMA_FINGERPRINT);
+    bytes.extend_from_slice(&datum);
+    Ok(PayloadEnvelope {
+        codec: DEFAULT_CODEC.to_string(),
+        blob: BASE64.encode(bytes),
+    })
+}
+
+pub fn decode_avro_value(envelope: &PayloadEnvelope) -> Result<AvroValue> {
+    if envelope.codec != DEFAULT_CODEC {
+        return Err(Error::Codec(format!(
+            "unsupported payload codec {:?}",
+            envelope.codec
+        )));
+    }
+    decode_avro_value_blob(&envelope.blob)
 }
 
 pub fn encode_payload<T: Serialize>(value: &T, codec: &str) -> Result<PayloadEnvelope> {
-    let value = serde_json::to_value(value)?;
-    let blob = encode_value_blob(&value, codec)?;
+    let blob = match codec {
+        JSON_CODEC => serde_json::to_string(value)?,
+        DEFAULT_CODEC => encode_avro_value(&AvroValue::from_serialize(value)?)?.blob,
+        other => return Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+    };
 
     Ok(PayloadEnvelope {
         codec: codec.to_string(),
@@ -1004,20 +1227,16 @@ pub fn encode_payload<T: Serialize>(value: &T, codec: &str) -> Result<PayloadEnv
 }
 
 pub fn decode_payload<T: DeserializeOwned>(envelope: &PayloadEnvelope) -> Result<T> {
-    let value = decode_blob(&envelope.blob, &envelope.codec)?;
-    Ok(serde_json::from_value(value)?)
-}
-
-fn encode_value_envelope(value: &Value, codec: &str) -> Result<Value> {
-    Ok(serde_json::to_value(encode_payload(value, codec)?)?)
-}
-
-fn encode_value_blob(value: &Value, codec: &str) -> Result<String> {
-    match codec {
-        JSON_CODEC => Ok(serde_json::to_string(value)?),
-        DEFAULT_CODEC => encode_avro_generic(value),
+    match envelope.codec.as_str() {
+        JSON_CODEC => Ok(serde_json::from_str(&envelope.blob)?),
+        DEFAULT_CODEC => decode_avro_value(envelope)?.deserialize(),
         other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
     }
+}
+
+#[cfg(test)]
+fn encode_value_envelope(value: &Value, codec: &str) -> Result<Value> {
+    Ok(serde_json::to_value(encode_payload(value, codec)?)?)
 }
 
 fn decode_wire_value(value: &Value, fallback_codec: &str) -> Result<Value> {
@@ -1041,80 +1260,273 @@ fn decode_wire_value(value: &Value, fallback_codec: &str) -> Result<Value> {
     Ok(value.clone())
 }
 
+fn encode_typed_envelope(value: &AvroValue, codec: &str) -> Result<Value> {
+    let envelope = match codec {
+        DEFAULT_CODEC => encode_avro_value(value)?,
+        JSON_CODEC => PayloadEnvelope {
+            codec: JSON_CODEC.to_string(),
+            blob: serde_json::to_string(&value.clone().into_json()?)?,
+        },
+        other => return Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+    };
+    Ok(serde_json::to_value(envelope)?)
+}
+
+fn decode_wire_avro_value(value: &Value, fallback_codec: &str) -> Result<AvroValue> {
+    if value.is_null() {
+        return Ok(AvroValue::Null);
+    }
+
+    if let Some(object) = value.as_object() {
+        if let (Some(codec), Some(blob)) = (
+            object.get("codec").and_then(Value::as_str),
+            object.get("blob").and_then(Value::as_str),
+        ) {
+            return match codec {
+                DEFAULT_CODEC => decode_avro_value_blob(blob),
+                JSON_CODEC => AvroValue::from_serialize(&serde_json::from_str::<Value>(blob)?),
+                other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+            };
+        }
+    }
+
+    if let Some(blob) = value.as_str() {
+        return match fallback_codec {
+            DEFAULT_CODEC => decode_avro_value_blob(blob),
+            JSON_CODEC => AvroValue::from_serialize(&serde_json::from_str::<Value>(blob)?),
+            other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+        };
+    }
+
+    AvroValue::from_serialize(value)
+}
+
+fn normalize_avro_arguments(value: AvroValue) -> AvroValue {
+    match value {
+        AvroValue::Null => AvroValue::Array(Vec::new()),
+        AvroValue::Array(_) => value,
+        other => AvroValue::Array(vec![other]),
+    }
+}
+
 fn decode_blob(blob: &str, codec: &str) -> Result<Value> {
     match codec {
         JSON_CODEC => Ok(serde_json::from_str(blob)?),
-        DEFAULT_CODEC => decode_avro_generic(blob),
+        DEFAULT_CODEC => decode_avro_value_blob(blob)?.into_json(),
         other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
     }
 }
 
-fn encode_avro_generic(value: &Value) -> Result<String> {
-    let json = serde_json::to_string(value)?;
-    let datum = to_value(AvroPayload {
-        json,
-        version: AVRO_PAYLOAD_VERSION,
-    })
-    .map_err(|err| Error::Codec(format!("could not convert avro generic wrapper: {err}")))?;
-    let datum = to_avro_datum(avro_payload_schema()?, datum)
-        .map_err(|err| Error::Codec(format!("could not encode avro generic wrapper: {err}")))?;
+fn decode_avro_value_blob(blob: &str) -> Result<AvroValue> {
+    let bytes = BASE64.decode(blob).map_err(|err| {
+        Error::Codec(format!(
+            "invalid_payload_framing: expected strict base64 Avro single-object bytes: {err}"
+        ))
+    })?;
 
-    let mut bytes = Vec::with_capacity(datum.len() + 1);
-    bytes.push(0x00);
-    bytes.extend_from_slice(&datum);
-    Ok(BASE64.encode(bytes))
-}
-
-fn decode_avro_generic(blob: &str) -> Result<Value> {
-    let bytes = BASE64
-        .decode(blob)
-        .map_err(|err| Error::Codec(format!("invalid avro base64 payload: {err}")))?;
-
-    if bytes.is_empty() {
-        return Err(Error::Codec("avro payload is empty".to_string()));
+    if bytes.len() < 10 || bytes[..2] != AVRO_SINGLE_OBJECT_MAGIC {
+        return Err(Error::Codec(
+            "invalid_payload_framing: expected Avro single-object magic c301".to_string(),
+        ));
     }
 
-    match bytes[0] {
-        0x00 => {}
-        0x01 => {
-            return Err(Error::Codec(
-                "typed avro payloads require a schema context; v1 supports the generic wrapper"
-                    .to_string(),
-            ));
-        }
-        other => {
-            return Err(Error::Codec(format!(
-                "unknown avro payload prefix 0x{other:02x}"
-            )));
-        }
-    }
-
-    let mut datum = &bytes[1..];
-    let datum = from_avro_datum(avro_payload_schema()?, &mut datum, None)
-        .map_err(|err| Error::Codec(format!("could not decode avro generic wrapper: {err}")))?;
-    let payload: AvroPayload = from_value(&datum)
-        .map_err(|err| Error::Codec(format!("invalid avro generic wrapper record: {err}")))?;
-
-    if payload.version != AVRO_PAYLOAD_VERSION {
+    let fingerprint: [u8; 8] = bytes[2..10]
+        .try_into()
+        .map_err(|_| Error::Codec("invalid Avro fingerprint length".to_string()))?;
+    if fingerprint != AVRO_VALUE_SCHEMA_FINGERPRINT {
         return Err(Error::Codec(format!(
-            "unsupported avro generic wrapper version {}",
-            payload.version
+            "unsupported_payload_schema: unknown CRC-64-AVRO fingerprint {}",
+            fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         )));
     }
 
-    Ok(serde_json::from_str(&payload.json)?)
+    let mut datum_reader = StrictAvroDatumReader::new(&bytes[10..]);
+    // The current fingerprint selects the current immutable schema, so reader
+    // resolution would only re-walk the same recursive union. Future retained
+    // writer fingerprints supply a distinct reader schema in this branch.
+    let datum = from_avro_datum(avro_value_schema()?, &mut datum_reader, None);
+    if datum_reader.truncated {
+        return Err(Error::Codec(
+            "invalid_payload_framing: truncated Avro Value datum".to_string(),
+        ));
+    }
+    let datum = datum.map_err(|err| {
+        Error::Codec(format!(
+            "invalid_payload_framing: malformed Avro Value datum: {err}"
+        ))
+    })?;
+    if datum_reader.remaining() != 0 {
+        return Err(Error::Codec(format!(
+            "invalid_payload_framing: {} trailing bytes after Avro Value datum",
+            datum_reader.remaining()
+        )));
+    }
+    avro_value_from_datum(datum)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AvroPayload {
-    json: String,
-    version: i32,
+struct StrictAvroDatumReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    truncated: bool,
 }
 
-fn avro_payload_schema() -> Result<&'static Schema> {
-    match AVRO_PAYLOAD_SCHEMA.get_or_init(|| {
-        Schema::parse_str(AVRO_PAYLOAD_SCHEMA_JSON)
-            .map_err(|err| format!("could not parse avro payload schema: {err}"))
+impl<'a> StrictAvroDatumReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            truncated: false,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+}
+
+impl Read for StrictAvroDatumReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = buffer.len().min(self.remaining());
+        buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        if count < buffer.len() {
+            self.truncated = true;
+        }
+
+        Ok(count)
+    }
+}
+
+fn avro_value_to_datum(value: &AvroValue) -> Result<AvroDatum> {
+    let branch = match value {
+        AvroValue::Null => AvroDatum::Union(0, Box::new(AvroDatum::Null)),
+        AvroValue::Boolean(value) => AvroDatum::Union(
+            1,
+            Box::new(AvroDatum::Record(vec![(
+                "boolean".to_string(),
+                AvroDatum::Boolean(*value),
+            )])),
+        ),
+        AvroValue::Long(value) => AvroDatum::Union(
+            2,
+            Box::new(AvroDatum::Record(vec![(
+                "long".to_string(),
+                AvroDatum::Long(*value),
+            )])),
+        ),
+        AvroValue::Double(value) => {
+            if !value.is_finite() {
+                return Err(Error::Codec(
+                    "non_finite_float: Avro Value doubles must be finite".to_string(),
+                ));
+            }
+            AvroDatum::Union(
+                3,
+                Box::new(AvroDatum::Record(vec![(
+                    "double".to_string(),
+                    AvroDatum::Double(*value),
+                )])),
+            )
+        }
+        AvroValue::Bytes(value) => AvroDatum::Union(
+            4,
+            Box::new(AvroDatum::Record(vec![(
+                "bytes".to_string(),
+                AvroDatum::Bytes(value.clone()),
+            )])),
+        ),
+        AvroValue::String(value) => AvroDatum::Union(
+            5,
+            Box::new(AvroDatum::Record(vec![(
+                "string".to_string(),
+                AvroDatum::String(value.clone()),
+            )])),
+        ),
+        AvroValue::Array(values) => AvroDatum::Union(
+            6,
+            Box::new(AvroDatum::Record(vec![(
+                "items".to_string(),
+                AvroDatum::Array(
+                    values
+                        .iter()
+                        .map(avro_value_to_datum)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            )])),
+        ),
+        AvroValue::Map(values) => AvroDatum::Union(
+            7,
+            Box::new(AvroDatum::Record(vec![(
+                "entries".to_string(),
+                AvroDatum::Map(
+                    values
+                        .iter()
+                        .map(|(key, value)| Ok((key.clone(), avro_value_to_datum(value)?)))
+                        .collect::<Result<HashMap<_, _>>>()?,
+                ),
+            )])),
+        ),
+    };
+    Ok(AvroDatum::Record(vec![("value".to_string(), branch)]))
+}
+
+fn avro_value_from_datum(datum: AvroDatum) -> Result<AvroValue> {
+    let AvroDatum::Record(mut outer) = datum else {
+        return Err(Error::Codec(
+            "invalid_payload_framing: datum is not a Value record".to_string(),
+        ));
+    };
+    let (_, branch) = outer
+        .pop()
+        .filter(|(name, _)| name == "value")
+        .ok_or_else(|| Error::Codec("invalid_payload_framing: Value field missing".to_string()))?;
+    let AvroDatum::Union(_, branch) = branch else {
+        return Err(Error::Codec(
+            "invalid_payload_framing: invalid Value union".to_string(),
+        ));
+    };
+    match *branch {
+        AvroDatum::Null => Ok(AvroValue::Null),
+        AvroDatum::Record(mut fields) => {
+            let (name, value) = fields.pop().ok_or_else(|| {
+                Error::Codec("invalid_payload_framing: empty Value branch".to_string())
+            })?;
+            match (name.as_str(), value) {
+                ("boolean", AvroDatum::Boolean(value)) => Ok(AvroValue::Boolean(value)),
+                ("long", AvroDatum::Long(value)) => Ok(AvroValue::Long(value)),
+                ("double", AvroDatum::Double(value)) if value.is_finite() => {
+                    Ok(AvroValue::Double(value))
+                }
+                ("bytes", AvroDatum::Bytes(value)) => Ok(AvroValue::Bytes(value)),
+                ("string", AvroDatum::String(value)) => Ok(AvroValue::String(value)),
+                ("items", AvroDatum::Array(values)) => values
+                    .into_iter()
+                    .map(avro_value_from_datum)
+                    .collect::<Result<Vec<_>>>()
+                    .map(AvroValue::Array),
+                ("entries", AvroDatum::Map(values)) => values
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, avro_value_from_datum(value)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()
+                    .map(AvroValue::Map),
+                _ => Err(Error::Codec(
+                    "invalid_payload_framing: unknown Value branch".to_string(),
+                )),
+            }
+        }
+        _ => Err(Error::Codec(
+            "invalid_payload_framing: invalid Value branch".to_string(),
+        )),
+    }
+}
+
+fn avro_value_schema() -> Result<&'static Schema> {
+    match AVRO_VALUE_SCHEMA.get_or_init(|| {
+        Schema::parse_str(AVRO_VALUE_SCHEMA_JSON)
+            .map_err(|err| format!("could not parse Avro Value schema: {err}"))
     }) {
         Ok(schema) => Ok(schema),
         Err(message) => Err(Error::Codec(message.clone())),
@@ -1195,8 +1607,8 @@ impl Client {
         input: T,
     ) -> Result<WorkflowHandle> {
         options.validate()?;
-        let input = serde_json::to_value(input)?;
-        let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
+        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
+        let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
         let body = json!({
             "workflow_id": workflow_id,
             "workflow_type": workflow_type,
@@ -1263,8 +1675,8 @@ impl Client {
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
-        let input = serde_json::to_value(input)?;
-        let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
+        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
+        let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
         let body = json!({
             "input": input_envelope
         });
@@ -1401,6 +1813,72 @@ impl Client {
             .await
     }
 
+    /// Query a workflow and return the lossless fixed Avro Value result.
+    pub async fn query_workflow_avro_value<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        query_name: &str,
+        input: T,
+    ) -> Result<AvroValue> {
+        self.query_workflow_avro_value_target(workflow_id, None, query_name, input)
+            .await
+    }
+
+    /// Query a selected run and return the lossless fixed Avro Value result.
+    pub async fn query_workflow_run_avro_value<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        query_name: &str,
+        input: T,
+    ) -> Result<AvroValue> {
+        self.query_workflow_avro_value_target(workflow_id, Some(run_id), query_name, input)
+            .await
+    }
+
+    async fn query_workflow_avro_value_target<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: Option<&str>,
+        query_name: &str,
+        input: T,
+    ) -> Result<AvroValue> {
+        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
+        let body = json!({"input": encode_typed_envelope(&input, DEFAULT_CODEC)?});
+        let path = match run_id {
+            Some(run_id) => {
+                format!("/workflows/{workflow_id}/runs/{run_id}/query/{query_name}")
+            }
+            None => format!("/workflows/{workflow_id}/query/{query_name}"),
+        };
+        let response: Value = match self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(Error::Http { status, body }) => {
+                return Err(Error::QueryFailed(query_failure(status, body)));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let envelope = response
+            .get("result_envelope")
+            .filter(|envelope| !envelope.is_null())
+            .ok_or_else(|| {
+                Error::Codec(
+                    "missing_payload_envelope: typed query result requires result_envelope"
+                        .to_string(),
+                )
+            })?;
+        decode_wire_avro_value(envelope, DEFAULT_CODEC)
+    }
+
     async fn query_workflow_target<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -1408,8 +1886,8 @@ impl Client {
         query_name: &str,
         input: T,
     ) -> Result<Value> {
-        let input = serde_json::to_value(input)?;
-        let input_envelope = encode_value_envelope(&normalize_arguments(input), DEFAULT_CODEC)?;
+        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
+        let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
         let body = json!({
             "input": input_envelope
         });
@@ -1443,6 +1921,73 @@ impl Client {
         }
 
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Send a synchronous update using fixed Avro Value arguments.
+    pub async fn update_workflow<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<Value> {
+        let response = self
+            .update_workflow_response(workflow_id, update_name, input, request_id)
+            .await?;
+        if let Some(envelope) = response
+            .get("result_envelope")
+            .filter(|envelope| !envelope.is_null())
+        {
+            return decode_wire_value(envelope, DEFAULT_CODEC);
+        }
+        Ok(response.get("result").cloned().unwrap_or(response))
+    }
+
+    /// Send a synchronous update and retain a bytes-capable Avro result.
+    pub async fn update_workflow_avro_value<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<AvroValue> {
+        let response = self
+            .update_workflow_response(workflow_id, update_name, input, request_id)
+            .await?;
+        let envelope = response
+            .get("result_envelope")
+            .filter(|envelope| !envelope.is_null())
+            .ok_or_else(|| {
+                Error::Codec(
+                    "missing_payload_envelope: typed update result requires result_envelope"
+                        .to_string(),
+                )
+            })?;
+        decode_wire_avro_value(envelope, DEFAULT_CODEC)
+    }
+
+    async fn update_workflow_response<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<Value> {
+        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
+        let mut body = json!({
+            "input": encode_typed_envelope(&input, DEFAULT_CODEC)?,
+            "wait_for": "completed",
+        });
+        if let Some(request_id) = request_id {
+            body["request_id"] = json!(request_id);
+        }
+        self.request_json(
+            reqwest::Method::POST,
+            &format!("/workflows/{workflow_id}/update/{update_name}"),
+            RequestProtocol::ControlPlane,
+            Some(&body),
+        )
+        .await
     }
 
     pub async fn describe_workflow(&self, workflow_id: &str) -> Result<WorkflowDescription> {
@@ -1510,7 +2055,33 @@ impl Client {
         max_concurrent_activity_tasks: usize,
         capabilities: Vec<String>,
     ) -> Result<RegisterWorkerResponse> {
-        let body = json!({
+        self.register_worker_with_command_contracts(
+            worker_id,
+            task_queue,
+            supported_workflow_types,
+            supported_activity_types,
+            max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks,
+            capabilities,
+            Value::Object(serde_json::Map::new()),
+        )
+        .await
+    }
+
+    /// Register a worker and advertise its named query and update handlers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_worker_with_command_contracts(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        supported_workflow_types: Vec<String>,
+        supported_activity_types: Vec<String>,
+        max_concurrent_workflow_tasks: usize,
+        max_concurrent_activity_tasks: usize,
+        capabilities: Vec<String>,
+        workflow_command_contracts: Value,
+    ) -> Result<RegisterWorkerResponse> {
+        let mut body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
             "runtime": "rust",
@@ -1521,6 +2092,12 @@ impl Client {
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
+        if workflow_command_contracts
+            .as_object()
+            .is_some_and(|contracts| !contracts.is_empty())
+        {
+            body["workflow_command_contracts"] = workflow_command_contracts;
+        }
 
         self.request_json(
             reqwest::Method::POST,
@@ -1588,20 +2165,21 @@ impl Client {
     }
 
     /// Complete a query task without appending workflow history.
-    pub async fn complete_query_task(
+    pub async fn complete_query_task<T: Serialize>(
         &self,
         query_task_id: &str,
         lease_owner: &str,
         query_task_attempt: u64,
-        result: Value,
+        result: T,
         codec: &str,
     ) -> Result<Value> {
-        let result_envelope = encode_value_envelope(&result, codec)?;
+        let typed_result = AvroValue::from_serialize(&result)?;
+        let result_envelope = encode_typed_envelope(&typed_result, codec)?;
         self.complete_query_task_with_envelope(
             query_task_id,
             lease_owner,
             query_task_attempt,
-            result,
+            typed_result.into_json()?,
             result_envelope,
         )
         .await
@@ -1931,15 +2509,15 @@ impl Client {
         Ok(data)
     }
 
-    pub async fn complete_activity_task(
+    pub async fn complete_activity_task<T: Serialize>(
         &self,
         task_id: &str,
         activity_attempt_id: &str,
         lease_owner: &str,
-        result: Value,
+        result: T,
         codec: &str,
     ) -> Result<Value> {
-        let result = encode_value_envelope(&result, codec)?;
+        let result = encode_typed_envelope(&AvroValue::from_serialize(&result)?, codec)?;
         let body = json!({
             "activity_attempt_id": activity_attempt_id,
             "lease_owner": lease_owner,
@@ -1992,13 +2570,14 @@ impl Client {
         )
     }
 
-    pub async fn heartbeat_activity_task(
+    pub async fn heartbeat_activity_task<T: Serialize>(
         &self,
         task_id: &str,
         activity_attempt_id: &str,
         lease_owner: &str,
-        details: Value,
+        details: T,
     ) -> Result<ActivityHeartbeatResponse> {
+        let details = encode_typed_envelope(&AvroValue::from_serialize(&details)?, DEFAULT_CODEC)?;
         let body = json!({
             "activity_attempt_id": activity_attempt_id,
             "lease_owner": lease_owner,
@@ -2562,6 +3141,38 @@ impl WorkflowHandle {
             .await
     }
 
+    pub async fn query_avro_value<T: Serialize>(
+        &self,
+        query_name: &str,
+        input: T,
+    ) -> Result<AvroValue> {
+        self.client
+            .query_workflow_avro_value(&self.workflow_id, query_name, input)
+            .await
+    }
+
+    pub async fn update<T: Serialize>(
+        &self,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<Value> {
+        self.client
+            .update_workflow(&self.workflow_id, update_name, input, request_id)
+            .await
+    }
+
+    pub async fn update_avro_value<T: Serialize>(
+        &self,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<AvroValue> {
+        self.client
+            .update_workflow_avro_value(&self.workflow_id, update_name, input, request_id)
+            .await
+    }
+
     /// Query only if this handle's selected run is still current.
     pub async fn query_selected_run<T: Serialize>(
         &self,
@@ -2582,12 +3193,69 @@ impl WorkflowHandle {
         self.result_target(options, None).await
     }
 
+    /// Await the final result without projecting Avro bytes through JSON.
+    pub async fn result_avro_value(&self, options: WorkflowResultOptions) -> Result<AvroValue> {
+        self.result_avro_value_target(options, None).await
+    }
+
     /// Await only the run identity originally selected by this handle.
     pub async fn result_selected_run(&self, options: WorkflowResultOptions) -> Result<Value> {
         let run_id = self.run_id.as_deref().ok_or_else(|| {
             Error::Codec("run_id is required for selected-run result".to_string())
         })?;
         self.result_target(options, Some(run_id)).await
+    }
+
+    /// Await the selected run's result on the lossless Avro Value surface.
+    pub async fn result_selected_run_avro_value(
+        &self,
+        options: WorkflowResultOptions,
+    ) -> Result<AvroValue> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run result".to_string())
+        })?;
+        self.result_avro_value_target(options, Some(run_id)).await
+    }
+
+    async fn result_avro_value_target(
+        &self,
+        options: WorkflowResultOptions,
+        selected_run_id: Option<&str>,
+    ) -> Result<AvroValue> {
+        let started = Instant::now();
+
+        loop {
+            let description = match selected_run_id {
+                Some(run_id) => {
+                    self.client
+                        .describe_workflow_run(&self.workflow_id, run_id)
+                        .await?
+                }
+                None => self.describe().await?,
+            };
+            if description.is_completed() {
+                return description.output_avro_value.ok_or_else(|| {
+                    Error::Codec(
+                        "missing_payload_envelope: typed workflow result requires output_envelope"
+                            .to_string(),
+                    )
+                });
+            }
+            if description.is_terminal() {
+                let outcome =
+                    workflow_terminal_outcome(&description, &self.workflow_id, selected_run_id);
+                return Err(match outcome.kind {
+                    WorkflowTerminalKind::Failed => Error::WorkflowFailed(outcome),
+                    WorkflowTerminalKind::Cancelled => Error::WorkflowCancelled(outcome),
+                    WorkflowTerminalKind::Terminated => Error::WorkflowTerminated(outcome),
+                    WorkflowTerminalKind::TimedOut => Error::WorkflowTimedOut(outcome),
+                });
+            }
+            if started.elapsed() >= options.timeout {
+                return Err(Error::Timeout);
+            }
+            tokio::time::sleep(options.poll_interval).await;
+        }
     }
 
     async fn result_target(
@@ -2687,6 +3355,8 @@ pub struct WorkflowDescription {
     pub output: Option<Value>,
     #[serde(default)]
     pub output_envelope: Option<Value>,
+    #[serde(skip)]
+    pub output_avro_value: Option<AvroValue>,
     #[serde(flatten)]
     pub raw: HashMap<String, Value>,
 }
@@ -2716,7 +3386,9 @@ impl WorkflowDescription {
 
     fn decode_payloads(&mut self) -> Result<()> {
         if let Some(envelope) = &self.output_envelope {
-            self.output = Some(decode_wire_value(envelope, DEFAULT_CODEC)?);
+            let value = decode_wire_avro_value(envelope, DEFAULT_CODEC)?;
+            self.output = Some(value.clone().into_json()?);
+            self.output_avro_value = Some(value);
         }
 
         Ok(())
@@ -3068,6 +3740,10 @@ pub struct WorkflowTask {
     #[serde(default)]
     pub signal_arguments: Option<Value>,
     #[serde(default)]
+    pub workflow_update_id: Option<String>,
+    #[serde(default)]
+    pub update_name: Option<String>,
+    #[serde(default)]
     pub lease_owner: Option<String>,
 }
 
@@ -3129,7 +3805,15 @@ pub struct QuerySignal {
     pub id: Option<String>,
     pub name: String,
     pub arguments: Vec<Value>,
+    avro_arguments: Vec<AvroValue>,
     pub workflow_sequence: Option<u64>,
+}
+
+impl QuerySignal {
+    /// Lossless fixed Avro Value arguments for this committed signal.
+    pub fn arguments_avro_value(&self) -> &[AvroValue] {
+        &self.avro_arguments
+    }
 }
 
 /// Immutable state supplied to a registered query handler.
@@ -3144,6 +3828,7 @@ pub struct QueryContext {
     pub workflow_type: String,
     pub run_status: Option<String>,
     workflow_input: Value,
+    workflow_input_avro_value: AvroValue,
     history_events: Arc<Vec<HistoryEvent>>,
     signal_events: Arc<Vec<QuerySignal>>,
 }
@@ -3152,6 +3837,11 @@ impl QueryContext {
     /// The normalized argument list used to start the workflow.
     pub fn workflow_input(&self) -> &Value {
         &self.workflow_input
+    }
+
+    /// The lossless fixed Avro Value argument list used to start the workflow.
+    pub fn workflow_input_avro_value(&self) -> &AvroValue {
+        &self.workflow_input_avro_value
     }
 
     /// The immutable committed history used for this query snapshot.
@@ -3170,6 +3860,15 @@ impl QueryContext {
             .iter()
             .filter(|signal| signal.name == signal_name)
             .map(|signal| signal.arguments.clone())
+            .collect()
+    }
+
+    /// Lossless fixed Avro Value arguments for committed signals with `signal_name`.
+    pub fn signals_avro_value(&self, signal_name: &str) -> Vec<Vec<AvroValue>> {
+        self.signal_events
+            .iter()
+            .filter(|signal| signal.name == signal_name)
+            .map(|signal| signal.avro_arguments.clone())
             .collect()
     }
 }
@@ -3213,18 +3912,19 @@ fn default_attempt_number() -> u64 {
     1
 }
 
-type WorkflowFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
-type WorkflowHandler = Arc<dyn Fn(WorkflowContext, Value) -> WorkflowFuture + Send + Sync>;
+type WorkflowFuture = Pin<Box<dyn Future<Output = Result<AvroValue>> + Send + 'static>>;
+type WorkflowHandler = Arc<dyn Fn(WorkflowContext, AvroValue) -> WorkflowFuture + Send + Sync>;
 type ErasedWorkflowState = Arc<dyn Any + Send + Sync>;
 type WorkflowStateSnapshot = Arc<dyn Fn() -> Result<ErasedWorkflowState> + Send + Sync>;
 type ReplayedWorkflowHandler =
-    Arc<dyn Fn(WorkflowContext, Value) -> ReplayedWorkflowInvocation + Send + Sync>;
-type ActivityFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
-type ActivityHandler = Arc<dyn Fn(ActivityContext, Value) -> ActivityFuture + Send + Sync>;
-type QueryFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>;
-type QueryHandler = Arc<dyn Fn(QueryContext, Value) -> QueryFuture + Send + Sync>;
+    Arc<dyn Fn(WorkflowContext, AvroValue) -> ReplayedWorkflowInvocation + Send + Sync>;
+type ActivityFuture = Pin<Box<dyn Future<Output = Result<AvroValue>> + Send + 'static>>;
+type ActivityHandler = Arc<dyn Fn(ActivityContext, AvroValue) -> ActivityFuture + Send + Sync>;
+type QueryFuture = Pin<Box<dyn Future<Output = Result<AvroValue>> + Send + 'static>>;
+type QueryHandler = Arc<dyn Fn(QueryContext, AvroValue) -> QueryFuture + Send + Sync>;
+type UpdateHandler = Arc<dyn Fn(QueryContext, AvroValue) -> QueryFuture + Send + Sync>;
 type ReplayedQueryHandler = Arc<
-    dyn Fn(QueryContext, ErasedWorkflowState, Value) -> std::result::Result<QueryFuture, String>
+    dyn Fn(QueryContext, ErasedWorkflowState, AvroValue) -> std::result::Result<QueryFuture, String>
         + Send
         + Sync,
 >;
@@ -3300,6 +4000,7 @@ pub struct Worker {
     workflows: HashMap<String, RegisteredWorkflow>,
     activities: HashMap<String, ActivityHandler>,
     queries: HashMap<String, HashMap<String, RegisteredQuery>>,
+    updates: HashMap<String, HashMap<String, UpdateHandler>>,
     max_concurrent_workflow_tasks: usize,
     max_concurrent_activity_tasks: usize,
     poll_timeout: Duration,
@@ -3317,6 +4018,7 @@ impl Worker {
             workflows: HashMap::new(),
             activities: HashMap::new(),
             queries: HashMap::new(),
+            updates: HashMap::new(),
             max_concurrent_workflow_tasks: 10,
             max_concurrent_activity_tasks: 10,
             poll_timeout: Duration::from_secs(30),
@@ -3376,6 +4078,32 @@ impl Worker {
         F: Fn(WorkflowContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let handler = Arc::new(handler);
+        self.workflows.insert(
+            workflow_type.into(),
+            RegisteredWorkflow {
+                execute: Arc::new(move |ctx, input| {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        let result = handler(ctx, input.into_json()?).await?;
+                        AvroValue::from_serialize(&result)
+                    })
+                }),
+                replay: None,
+                state_type: None,
+            },
+        );
+    }
+
+    /// Register a workflow on the lossless fixed Avro Value surface.
+    pub fn register_workflow_avro_value<F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(WorkflowContext, AvroValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AvroValue>> + Send + 'static,
+    {
         self.workflows.insert(
             workflow_type.into(),
             RegisteredWorkflow {
@@ -3409,20 +4137,70 @@ impl Worker {
 
         let execute_factory = Arc::clone(&state_factory);
         let execute_handler = Arc::clone(&handler);
-        let execute = Arc::new(move |ctx: WorkflowContext, input: Value| {
+        let execute = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
             let state = WorkflowInstance::new(execute_factory());
-            let future = execute_handler(ctx, input, state);
-            Box::pin(future) as WorkflowFuture
+            let handler = Arc::clone(&execute_handler);
+            Box::pin(async move {
+                let result = handler(ctx, input.into_json()?, state).await?;
+                AvroValue::from_serialize(&result)
+            }) as WorkflowFuture
         });
 
-        let replay = Arc::new(move |ctx: WorkflowContext, input: Value| {
+        let replay = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
             let state = WorkflowInstance::new(state_factory());
             let snapshot_state = state.clone();
             let snapshot: WorkflowStateSnapshot =
                 Arc::new(move || Ok(Arc::new(snapshot_state.snapshot()?) as ErasedWorkflowState));
-            let future = handler(ctx, input, state);
+            let replay_handler = Arc::clone(&handler);
+            let future = async move {
+                let result = replay_handler(ctx, input.into_json()?, state).await?;
+                AvroValue::from_serialize(&result)
+            };
             ReplayedWorkflowInvocation {
                 future: Box::pin(future),
+                snapshot,
+            }
+        });
+
+        self.workflows.insert(
+            workflow_type.into(),
+            RegisteredWorkflow {
+                execute,
+                replay: Some(replay),
+                state_type: Some(TypeId::of::<S>()),
+            },
+        );
+    }
+
+    /// Register a replayable workflow on the lossless fixed Avro Value surface.
+    pub fn register_replayed_workflow_avro_value<S, Factory, F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        state_factory: Factory,
+        handler: F,
+    ) where
+        S: Clone + Send + Sync + 'static,
+        Factory: Fn() -> S + Send + Sync + 'static,
+        F: Fn(WorkflowContext, AvroValue, WorkflowInstance<S>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AvroValue>> + Send + 'static,
+    {
+        let state_factory = Arc::new(state_factory);
+        let handler = Arc::new(handler);
+
+        let execute_factory = Arc::clone(&state_factory);
+        let execute_handler = Arc::clone(&handler);
+        let execute = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
+            let state = WorkflowInstance::new(execute_factory());
+            Box::pin(execute_handler(ctx, input, state)) as WorkflowFuture
+        });
+
+        let replay = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
+            let state = WorkflowInstance::new(state_factory());
+            let snapshot_state = state.clone();
+            let snapshot: WorkflowStateSnapshot =
+                Arc::new(move || Ok(Arc::new(snapshot_state.snapshot()?) as ErasedWorkflowState));
+            ReplayedWorkflowInvocation {
+                future: Box::pin(handler(ctx, input, state)),
                 snapshot,
             }
         });
@@ -3441,6 +4219,28 @@ impl Worker {
     where
         F: Fn(ActivityContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.activities.insert(
+            activity_type.into(),
+            Arc::new(move |ctx, args| {
+                let handler = Arc::clone(&handler);
+                Box::pin(async move {
+                    let result = handler(ctx, args.into_json()?).await?;
+                    AvroValue::from_serialize(&result)
+                })
+            }),
+        );
+    }
+
+    /// Register an activity on the lossless fixed Avro Value surface.
+    pub fn register_activity_avro_value<F, Fut>(
+        &mut self,
+        activity_type: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(ActivityContext, AvroValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
         self.activities.insert(
             activity_type.into(),
@@ -3461,6 +4261,32 @@ impl Worker {
     ) where
         F: Fn(QueryContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.queries
+            .entry(workflow_type.into())
+            .or_default()
+            .insert(
+                query_name.into(),
+                RegisteredQuery::Snapshot(Arc::new(move |ctx, args| {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        let result = handler(ctx, args.into_json()?).await?;
+                        AvroValue::from_serialize(&result)
+                    })
+                })),
+            );
+    }
+
+    /// Register a query handler on the lossless fixed Avro Value surface.
+    pub fn register_query_avro_value<F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        query_name: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(QueryContext, AvroValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
         self.queries
             .entry(workflow_type.into())
@@ -3492,6 +4318,41 @@ impl Worker {
             let state = state.downcast::<S>().map_err(|_| {
                 "registered query state type does not match the replayed workflow state".to_string()
             })?;
+            let handler = Arc::clone(&handler);
+            Ok(Box::pin(async move {
+                let result = handler(ctx, state, args.into_json()?).await?;
+                AvroValue::from_serialize(&result)
+            }))
+        });
+
+        self.queries
+            .entry(workflow_type.into())
+            .or_default()
+            .insert(
+                query_name.into(),
+                RegisteredQuery::Replayed {
+                    state_type: TypeId::of::<S>(),
+                    handler: erased_handler,
+                },
+            );
+    }
+
+    /// Register a replayed-state query on the lossless fixed Avro Value surface.
+    pub fn register_replayed_query_avro_value<S, F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        query_name: impl Into<String>,
+        handler: F,
+    ) where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(QueryContext, Arc<S>, AvroValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AvroValue>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        let erased_handler: ReplayedQueryHandler = Arc::new(move |ctx, state, args| {
+            let state = state.downcast::<S>().map_err(|_| {
+                "registered query state type does not match the replayed workflow state".to_string()
+            })?;
             Ok(Box::pin(handler(ctx, state, args)))
         });
 
@@ -3507,19 +4368,93 @@ impl Worker {
             );
     }
 
+    /// Register a synchronous workflow update handler.
+    pub fn register_update<F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        update_name: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(QueryContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.updates
+            .entry(workflow_type.into())
+            .or_default()
+            .insert(
+                update_name.into(),
+                Arc::new(move |ctx, args| {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        let result = handler(ctx, args.into_json()?).await?;
+                        AvroValue::from_serialize(&result)
+                    })
+                }),
+            );
+    }
+
+    /// Register an update handler on the lossless fixed Avro Value surface.
+    pub fn register_update_avro_value<F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        update_name: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(QueryContext, AvroValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AvroValue>> + Send + 'static,
+    {
+        self.updates
+            .entry(workflow_type.into())
+            .or_default()
+            .insert(
+                update_name.into(),
+                Arc::new(move |ctx, args| Box::pin(handler(ctx, args))),
+            );
+    }
+
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
+        let mut command_contracts = serde_json::Map::new();
+        for workflow_type in self.workflows.keys() {
+            let mut queries = self
+                .queries
+                .get(workflow_type)
+                .map(|handlers| handlers.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            queries.sort();
+            let mut updates = self
+                .updates
+                .get(workflow_type)
+                .map(|handlers| handlers.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            updates.sort();
+            if !queries.is_empty() || !updates.is_empty() {
+                command_contracts.insert(
+                    workflow_type.clone(),
+                    json!({
+                        "queries": queries,
+                        "updates": updates,
+                    }),
+                );
+            }
+        }
+
         self.client
-            .register_worker_with_capabilities(
+            .register_worker_with_command_contracts(
                 &self.worker_id,
                 &self.task_queue,
                 self.workflows.keys().cloned().collect(),
                 self.activities.keys().cloned().collect(),
                 self.max_concurrent_workflow_tasks,
                 self.max_concurrent_activity_tasks,
-                (!self.queries.is_empty())
-                    .then(|| QUERY_TASKS_CAPABILITY.to_string())
-                    .into_iter()
-                    .collect(),
+                [
+                    (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
+                    (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+                Value::Object(command_contracts),
             )
             .await
     }
@@ -3897,7 +4832,7 @@ impl Worker {
 
         match self.execute_query_task(task).await {
             Ok(value) => {
-                let result_envelope = match encode_value_envelope(&value, &codec) {
+                let result_envelope = match encode_typed_envelope(&value, &codec) {
                     Ok(result_envelope) => result_envelope,
                     Err(error) => {
                         let failure = self
@@ -3926,7 +4861,7 @@ impl Worker {
                         &query_task_id,
                         &lease_owner,
                         attempt,
-                        value,
+                        value.clone().into_json()?,
                         result_envelope,
                     )
                     .await
@@ -3994,7 +4929,7 @@ impl Worker {
     async fn execute_query_task(
         &self,
         mut task: QueryTask,
-    ) -> std::result::Result<Value, QueryTaskExecutionFailure> {
+    ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         if !matches!(task.payload_codec.as_str(), DEFAULT_CODEC | JSON_CODEC) {
             return Err(QueryTaskExecutionFailure::new(
                 "query_payload_decode_failed",
@@ -4032,24 +4967,30 @@ impl Worker {
             ));
         };
 
-        let args = decode_task_arguments(task.query_arguments.as_ref(), &task.payload_codec)
+        let args = decode_task_avro_arguments(task.query_arguments.as_ref(), &task.payload_codec)
             .map_err(|error| {
-                QueryTaskExecutionFailure::new(
-                    "query_payload_decode_failed",
-                    format!("cannot decode query arguments: {error}"),
-                    "QueryPayloadDecodeFailed",
-                )
-            })?;
-        let workflow_input =
-            decode_task_arguments(task.workflow_arguments.as_ref(), &task.payload_codec).map_err(
-                |error| {
+            QueryTaskExecutionFailure::new(
+                "query_payload_decode_failed",
+                format!("cannot decode query arguments: {error}"),
+                "QueryPayloadDecodeFailed",
+            )
+        })?;
+        let workflow_input_typed =
+            decode_task_avro_arguments(task.workflow_arguments.as_ref(), &task.payload_codec)
+                .map_err(|error| {
                     QueryTaskExecutionFailure::new(
                         "query_workflow_state_unavailable",
                         format!("cannot decode workflow start input: {error}"),
                         "QueryWorkflowStateUnavailable",
                     )
-                },
-            )?;
+                })?;
+        let workflow_input = workflow_input_typed.clone().into_json().map_err(|error| {
+            QueryTaskExecutionFailure::new(
+                "query_workflow_state_unavailable",
+                format!("cannot project workflow start input: {error}"),
+                "QueryWorkflowStateUnavailable",
+            )
+        })?;
         hydrate_query_history_from_export(&mut task).map_err(|error| {
             QueryTaskExecutionFailure::new(
                 "query_workflow_state_unavailable",
@@ -4078,6 +5019,7 @@ impl Worker {
             workflow_type: task.workflow_type.clone(),
             run_status: task.run_status,
             workflow_input,
+            workflow_input_avro_value: workflow_input_typed.clone(),
             history_events: Arc::clone(&history_events),
             signal_events: Arc::new(signal_events),
         };
@@ -4129,8 +5071,7 @@ impl Worker {
                 let workflow_context = WorkflowContext {
                     state: workflow_state,
                 };
-                let mut invocation =
-                    replay(workflow_context.clone(), context.workflow_input.clone());
+                let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone());
                 let mut cx = TaskContext::from_waker(noop_waker_ref());
                 match invocation.future.as_mut().poll(&mut cx) {
                     Poll::Ready(Ok(_)) => {
@@ -4201,11 +5142,19 @@ impl Worker {
     }
 
     fn execute_workflow_task(&self, task: WorkflowTask) -> Result<Vec<Value>> {
+        if let Some(update_id) = task
+            .workflow_update_id
+            .as_deref()
+            .filter(|update_id| !update_id.is_empty())
+        {
+            return self.execute_update_task(&task, update_id);
+        }
+
         let workflow = self
             .workflows
             .get(&task.workflow_type)
             .ok_or_else(|| Error::WorkflowNotRegistered(task.workflow_type.clone()))?;
-        let input = decode_task_arguments(task.arguments.as_ref(), &task.payload_codec)?;
+        let input = decode_task_avro_arguments(task.arguments.as_ref(), &task.payload_codec)?;
         let resume_signal = decode_resume_signal(&task)?;
         let history_budget = WorkflowHistoryBudget {
             event_count: task
@@ -4232,7 +5181,7 @@ impl Worker {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(result)) => {
                 ctx.ensure_history_consumed()?;
-                let result = encode_value_envelope(&result, &task.payload_codec)?;
+                let result = encode_typed_envelope(&result, &task.payload_codec)?;
                 let mut commands = ctx.take_commands()?;
                 commands.push(json!({
                     "type": "complete_workflow",
@@ -4274,12 +5223,77 @@ impl Worker {
         }
     }
 
-    async fn execute_activity_task(&self, task: ActivityTask) -> Result<Value> {
+    fn execute_update_task(&self, task: &WorkflowTask, update_id: &str) -> Result<Vec<Value>> {
+        if !self.workflows.contains_key(&task.workflow_type) {
+            return Err(Error::WorkflowNotRegistered(task.workflow_type.clone()));
+        }
+
+        let accepted = task.history_events.iter().rev().find_map(|event| {
+            (event.event_type == "UpdateAccepted"
+                && event.payload.get("update_id").and_then(Value::as_str) == Some(update_id))
+            .then_some(&event.payload)
+        });
+        let update_name = accepted
+            .and_then(|payload| payload.get("update_name"))
+            .and_then(Value::as_str)
+            .or(task.update_name.as_deref())
+            .unwrap_or_default();
+        let Some(handler) = self
+            .updates
+            .get(&task.workflow_type)
+            .and_then(|handlers| handlers.get(update_name))
+        else {
+            return Ok(vec![json!({
+                "type": "fail_update",
+                "update_id": update_id,
+                "message": format!(
+                    "no update handler is registered for {}.{update_name}",
+                    task.workflow_type
+                ),
+                "exception_type": "UnknownUpdate",
+                "non_retryable": true,
+            })]);
+        };
+        let arguments = accepted
+            .and_then(|payload| payload.get("arguments"))
+            .or(task.arguments.as_ref());
+        let arguments = decode_task_avro_arguments(arguments, &task.payload_codec)?;
+        let context = QueryContext {
+            workflow_id: task.workflow_id.clone(),
+            run_id: task.run_id.clone(),
+            workflow_type: task.workflow_type.clone(),
+            run_status: Some("running".to_string()),
+            workflow_input: Value::Null,
+            workflow_input_avro_value: AvroValue::Null,
+            history_events: Arc::new(task.history_events.clone()),
+            signal_events: Arc::new(Vec::new()),
+        };
+        let mut future = handler(context, arguments);
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(result)) => Ok(vec![json!({
+                "type": "complete_update",
+                "update_id": update_id,
+                "result": encode_typed_envelope(&result, &task.payload_codec)?,
+            })]),
+            Poll::Ready(Err(error)) => Ok(vec![json!({
+                "type": "fail_update",
+                "update_id": update_id,
+                "message": error.to_string(),
+                "exception_type": "UpdateFailed",
+                "non_retryable": true,
+            })]),
+            Poll::Pending => Err(Error::WorkflowYieldedWithoutCommand),
+        }
+    }
+
+    async fn execute_activity_task(&self, task: ActivityTask) -> Result<AvroValue> {
         let handler = self
             .activities
             .get(&task.activity_type)
             .ok_or_else(|| Error::ActivityNotRegistered(task.activity_type.clone()))?;
-        let args = decode_task_arguments(task.arguments.as_ref(), &task.payload_codec)?;
+        let args = decode_task_avro_arguments(task.arguments.as_ref(), &task.payload_codec)?;
         let attempt_id = task
             .activity_attempt_id
             .clone()
@@ -4481,7 +5495,7 @@ impl WorkflowContext {
     ) -> Result<Value> {
         options.validate()?;
         Err(Error::ContinueAsNew(ContinueAsNewRequest {
-            arguments: normalize_arguments(serde_json::to_value(args)?),
+            arguments: normalize_avro_arguments(AvroValue::from_serialize(&args)?),
             options,
         }))
     }
@@ -4556,9 +5570,28 @@ impl WorkflowContext {
             ctx: self.clone(),
             activity_type: activity_type.into(),
             options,
-            args: Some(serde_json::to_value(args).map_err(Error::from)),
+            args: Some(AvroValue::from_serialize(&args)),
             scheduled: false,
         }
+    }
+
+    pub async fn activity_avro_value<T: Serialize>(
+        &self,
+        activity_type: impl Into<String>,
+        args: T,
+    ) -> Result<AvroValue> {
+        let mut call = self.activity(activity_type, args);
+        std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
+    }
+
+    pub async fn activity_avro_value_with_options<T: Serialize>(
+        &self,
+        activity_type: impl Into<String>,
+        options: ActivityOptions,
+        args: T,
+    ) -> Result<AvroValue> {
+        let mut call = self.activity_with_options(activity_type, options, args);
+        std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 
     pub fn wait_signal(&self, signal_name: impl Into<String>) -> SignalCall {
@@ -4568,6 +5601,14 @@ impl WorkflowContext {
             opened_wait: false,
             matched_pending: false,
         }
+    }
+
+    pub async fn wait_signal_avro_value(
+        &self,
+        signal_name: impl Into<String>,
+    ) -> Result<Vec<AvroValue>> {
+        let mut call = self.wait_signal(signal_name);
+        std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 
     /// Wait for server-backed durable time without blocking the worker executor.
@@ -4627,7 +5668,7 @@ impl WorkflowContext {
                 return match recorded {
                     RecordedCommand::SideEffect { sequence, value } => {
                         state.command_cursor += 1;
-                        serde_json::from_value(value).map_err(|error| {
+                        value.deserialize().map_err(|error| {
                             Error::NonDeterministicReplay(ReplayFailure::new(
                                 "side_effect_type_mismatch",
                                 Some(sequence),
@@ -4643,12 +5684,46 @@ impl WorkflowContext {
         }
 
         let value = callback();
-        let json_value = serde_json::to_value(&value)?;
+        let avro_value = AvroValue::from_serialize(&value)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
-        let result = encode_value_envelope(&json_value, &state.payload_codec)?;
+        let result = encode_typed_envelope(&avro_value, &state.payload_codec)?;
+        state.commands.push(json!({
+            "type": "record_side_effect",
+            "result": result,
+        }));
+        Ok(value)
+    }
+
+    /// Record or replay a lossless fixed Avro Value side effect.
+    pub fn side_effect_avro_value<F>(&self, callback: F) -> Result<AvroValue>
+    where
+        F: FnOnce() -> AvroValue,
+    {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+                return match recorded {
+                    RecordedCommand::SideEffect { value, .. } => {
+                        state.command_cursor += 1;
+                        Ok(value)
+                    }
+                    other => Err(command_mismatch(&other, "side effect")),
+                };
+            }
+        }
+
+        let value = callback();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let result = encode_typed_envelope(&value, &state.payload_codec)?;
         state.commands.push(json!({
             "type": "record_side_effect",
             "result": result,
@@ -4793,10 +5868,20 @@ impl WorkflowContext {
             ctx: self.clone(),
             workflow_type: workflow_type.into(),
             options,
-            args: Some(serde_json::to_value(args).map_err(Error::from)),
+            args: Some(AvroValue::from_serialize(&args)),
             scheduled: false,
             matched_pending: false,
         }
+    }
+
+    pub async fn start_child_workflow_avro_value<T: Serialize>(
+        &self,
+        workflow_type: impl Into<String>,
+        options: ChildWorkflowOptions,
+        args: T,
+    ) -> Result<ChildWorkflowAvroResult> {
+        let mut call = self.start_child_workflow(workflow_type, options, args);
+        std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 
     fn take_commands(&self) -> Result<Vec<Value>> {
@@ -4821,7 +5906,7 @@ impl WorkflowContext {
             return Ok(None);
         }
 
-        let arguments = encode_value_envelope(&request.arguments, &state.payload_codec)?;
+        let arguments = encode_typed_envelope(&request.arguments, &state.payload_codec)?;
         let mut command = serde_json::Map::from_iter([
             ("type".to_string(), json!("continue_as_new")),
             ("arguments".to_string(), arguments),
@@ -5001,11 +6086,11 @@ enum RecordedCommand {
     SignalWait {
         sequence: u64,
         signal_name: String,
-        value: Option<Vec<Value>>,
+        value: Option<Vec<AvroValue>>,
     },
     SideEffect {
         sequence: u64,
-        value: Value,
+        value: AvroValue,
     },
     VersionMarker {
         sequence: u64,
@@ -5223,21 +6308,22 @@ fn ensure_version_supported(
 #[derive(Clone, Debug)]
 struct ResumeSignal {
     signal_name: String,
-    arguments: Vec<Value>,
+    arguments: Vec<AvroValue>,
 }
 
 pub struct ActivityCall {
     ctx: WorkflowContext,
     activity_type: String,
     options: ActivityOptions,
-    args: Option<Result<Value>>,
+    args: Option<Result<AvroValue>>,
     scheduled: bool,
 }
 
-impl Future for ActivityCall {
-    type Output = Result<Value>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+impl ActivityCall {
+    fn poll_avro_value(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<AvroValue>> {
         let ctx = self.ctx.clone();
         let mut state = match ctx.state.lock() {
             Ok(state) => state,
@@ -5350,12 +6436,12 @@ impl Future for ActivityCall {
         }
 
         if !self.scheduled {
-            let args = match self.args.take().unwrap_or(Ok(Value::Null)) {
+            let args = match self.args.take().unwrap_or(Ok(AvroValue::Null)) {
                 Ok(args) => args,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            let arguments = normalize_arguments(args);
-            let envelope = match encode_value_envelope(&arguments, &state.payload_codec) {
+            let arguments = normalize_avro_arguments(args);
+            let envelope = match encode_typed_envelope(&arguments, &state.payload_codec) {
                 Ok(envelope) => envelope,
                 Err(error) => return Poll::Ready(Err(error)),
             };
@@ -5393,6 +6479,18 @@ impl Future for ActivityCall {
         }
 
         Poll::Pending
+    }
+}
+
+impl Future for ActivityCall {
+    type Output = Result<Value>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match self.poll_avro_value(cx) {
+            Poll::Ready(Ok(value)) => Poll::Ready(value.into_json()),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -5470,15 +6568,16 @@ pub struct ChildWorkflowCall {
     ctx: WorkflowContext,
     workflow_type: String,
     options: ChildWorkflowOptions,
-    args: Option<Result<Value>>,
+    args: Option<Result<AvroValue>>,
     scheduled: bool,
     matched_pending: bool,
 }
 
-impl Future for ChildWorkflowCall {
-    type Output = Result<ChildWorkflowResult>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+impl ChildWorkflowCall {
+    fn poll_avro_value(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<ChildWorkflowAvroResult>> {
         if self.matched_pending {
             return Poll::Pending;
         }
@@ -5548,15 +6647,17 @@ impl Future for ChildWorkflowCall {
                 }
             }
 
-            let args = match self.args.take().unwrap_or(Ok(Value::Null)) {
+            let args = match self.args.take().unwrap_or(Ok(AvroValue::Null)) {
                 Ok(args) => args,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            let arguments =
-                match encode_value_envelope(&normalize_arguments(args), &state.payload_codec) {
-                    Ok(arguments) => arguments,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
+            let arguments = match encode_typed_envelope(
+                &normalize_avro_arguments(args),
+                &state.payload_codec,
+            ) {
+                Ok(arguments) => arguments,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
             let mut command = json!({
                 "type": "start_child_workflow",
                 "workflow_type": self.workflow_type,
@@ -5608,6 +6709,26 @@ impl Future for ChildWorkflowCall {
     }
 }
 
+impl Future for ChildWorkflowCall {
+    type Output = Result<ChildWorkflowResult>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match self.poll_avro_value(cx) {
+            Poll::Ready(Ok(result)) => match result.result.into_json() {
+                Ok(projected) => Poll::Ready(Ok(ChildWorkflowResult {
+                    parent: result.parent,
+                    child: result.child,
+                    child_workflow_type: result.child_workflow_type,
+                    result: projected,
+                })),
+                Err(error) => Poll::Ready(Err(error)),
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 fn command_mismatch(recorded: &RecordedCommand, actual: impl Into<String>) -> Error {
     Error::NonDeterministicReplay(ReplayFailure::new(
         "recorded_command_mismatch",
@@ -5625,10 +6746,11 @@ pub struct SignalCall {
     matched_pending: bool,
 }
 
-impl Future for SignalCall {
-    type Output = Result<Vec<Value>>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+impl SignalCall {
+    fn poll_avro_value(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<Vec<AvroValue>>> {
         if self.matched_pending {
             return Poll::Pending;
         }
@@ -5712,6 +6834,23 @@ impl Future for SignalCall {
     }
 }
 
+impl Future for SignalCall {
+    type Output = Result<Vec<Value>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match self.poll_avro_value(cx) {
+            Poll::Ready(Ok(values)) => Poll::Ready(
+                values
+                    .into_iter()
+                    .map(AvroValue::into_json)
+                    .collect::<Result<Vec<_>>>(),
+            ),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ActivityContext {
     client: Client,
@@ -5731,16 +6870,18 @@ impl ActivityContext {
                 &self.task_id,
                 &self.activity_attempt_id,
                 &self.lease_owner,
-                serde_json::to_value(details)?,
+                details,
             )
             .await
     }
 }
 
-fn decode_task_arguments(value: Option<&Value>, codec: &str) -> Result<Value> {
+fn decode_task_avro_arguments(value: Option<&Value>, codec: &str) -> Result<AvroValue> {
     match value {
-        Some(value) => Ok(normalize_arguments(decode_wire_value(value, codec)?)),
-        None => Ok(Value::Array(Vec::new())),
+        Some(value) => Ok(normalize_avro_arguments(decode_wire_avro_value(
+            value, codec,
+        )?)),
+        None => Ok(AvroValue::Array(Vec::new())),
     }
 }
 
@@ -5756,23 +6897,15 @@ fn decode_resume_signal(task: &WorkflowTask) -> Result<Option<ResumeSignal>> {
         return Ok(None);
     };
 
-    let decoded = normalize_arguments(decode_wire_value(arguments, &task.payload_codec)?);
-    let Value::Array(arguments) = decoded else {
-        unreachable!("normalize_arguments always returns an array");
+    let decoded = normalize_avro_arguments(decode_wire_avro_value(arguments, &task.payload_codec)?);
+    let AvroValue::Array(arguments) = decoded else {
+        unreachable!("normalize_avro_arguments always returns an array");
     };
 
     Ok(Some(ResumeSignal {
         signal_name: signal_name.to_string(),
         arguments,
     }))
-}
-
-fn normalize_arguments(value: Value) -> Value {
-    match value {
-        Value::Null => Value::Array(Vec::new()),
-        Value::Array(_) => value,
-        other => Value::Array(vec![other]),
-    }
 }
 
 fn recorded_commands(
@@ -6167,7 +7300,7 @@ fn recorded_commands(
                     .get("payload_codec")
                     .and_then(Value::as_str)
                     .unwrap_or(fallback_codec);
-                let value = decode_wire_value(result, codec).map_err(|error| {
+                let value = decode_wire_avro_value(result, codec).map_err(|error| {
                     invalid_recorded_history(
                         "side_effect_payload_incompatible",
                         sequence,
@@ -6422,7 +7555,7 @@ fn invalid_recorded_history(
     ))
 }
 
-type ActivityOutcome = std::result::Result<Value, ActivityFailure>;
+type ActivityOutcome = std::result::Result<AvroValue, ActivityFailure>;
 
 fn activity_outcome(
     event: &HistoryEvent,
@@ -6435,7 +7568,7 @@ fn activity_outcome(
             .get("payload_codec")
             .and_then(Value::as_str)
             .unwrap_or(fallback_codec);
-        return Ok(Ok(decode_wire_value(
+        return Ok(Ok(decode_wire_avro_value(
             event.payload.get("result").unwrap_or(&Value::Null),
             codec,
         )?));
@@ -6515,7 +7648,7 @@ fn activity_outcome(
     }))
 }
 
-type ChildWorkflowOutcome = std::result::Result<ChildWorkflowResult, ChildWorkflowFailure>;
+type ChildWorkflowOutcome = std::result::Result<ChildWorkflowAvroResult, ChildWorkflowFailure>;
 
 fn child_workflow_outcomes(
     events: &[HistoryEvent],
@@ -6605,14 +7738,14 @@ fn child_workflow_outcomes(
             .get("result")
             .or_else(|| payload.get("output"))
             .unwrap_or(&Value::Null);
-        outcomes.push(Ok(ChildWorkflowResult {
+        outcomes.push(Ok(ChildWorkflowAvroResult {
             parent: parent.clone(),
             child: WorkflowIdentity {
                 workflow_id: child_workflow_id,
                 run_id: child_workflow_run_id,
             },
             child_workflow_type,
-            result: decode_wire_value(result, codec)?,
+            result: decode_wire_avro_value(result, codec)?,
         }));
     }
 
@@ -6712,7 +7845,10 @@ fn workflow_task_integrity_error(error: &Error) -> bool {
     )
 }
 
-fn decode_signal_event_arguments(event: &HistoryEvent, fallback_codec: &str) -> Result<Vec<Value>> {
+fn decode_signal_event_arguments(
+    event: &HistoryEvent,
+    fallback_codec: &str,
+) -> Result<Vec<AvroValue>> {
     let codec = event
         .payload
         .get("payload_codec")
@@ -6724,11 +7860,11 @@ fn decode_signal_event_arguments(event: &HistoryEvent, fallback_codec: &str) -> 
         .or_else(|| event.payload.get("input"))
         .or_else(|| event.payload.get("arguments"));
     let decoded = match raw.filter(|value| !value.is_null()) {
-        Some(value) => decode_wire_value(value, codec)?,
-        None => Value::Array(Vec::new()),
+        Some(value) => decode_wire_avro_value(value, codec)?,
+        None => AvroValue::Array(Vec::new()),
     };
-    let Value::Array(arguments) = normalize_arguments(decoded) else {
-        unreachable!("normalize_arguments always returns an array");
+    let AvroValue::Array(arguments) = normalize_avro_arguments(decoded) else {
+        unreachable!("normalize_avro_arguments always returns an array");
     };
     Ok(arguments)
 }
@@ -6970,7 +8106,7 @@ fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
             .or_else(|| event.payload.get("arguments"))
             .filter(|value| !value.is_null())
             .or_else(|| matched_export.and_then(|signal| signal.get("arguments")));
-        let arguments = decode_query_signal_arguments(raw_arguments, codec)?;
+        let (arguments, avro_arguments) = decode_query_signal_arguments(raw_arguments, codec)?;
         let workflow_sequence = event
             .payload
             .get("workflow_sequence")
@@ -6990,6 +8126,7 @@ fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
             }),
             name: name.to_string(),
             arguments,
+            avro_arguments,
             workflow_sequence,
         });
     }
@@ -7006,11 +8143,13 @@ fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
                 .get("payload_codec")
                 .and_then(Value::as_str)
                 .unwrap_or(export_codec);
-            let arguments = decode_query_signal_arguments(signal.get("arguments"), codec)?;
+            let (arguments, avro_arguments) =
+                decode_query_signal_arguments(signal.get("arguments"), codec)?;
             signals.push(QuerySignal {
                 id: signal.get("id").and_then(Value::as_str).map(str::to_string),
                 name: name.to_string(),
                 arguments,
+                avro_arguments,
                 workflow_sequence: signal.get("workflow_sequence").and_then(value_as_u64),
             });
         }
@@ -7020,15 +8159,23 @@ fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
     Ok(signals)
 }
 
-fn decode_query_signal_arguments(raw: Option<&Value>, codec: &str) -> Result<Vec<Value>> {
+fn decode_query_signal_arguments(
+    raw: Option<&Value>,
+    codec: &str,
+) -> Result<(Vec<Value>, Vec<AvroValue>)> {
     let decoded = match raw.filter(|value| !value.is_null()) {
-        Some(value) => decode_wire_value(value, codec)?,
-        None => Value::Array(Vec::new()),
+        Some(value) => decode_wire_avro_value(value, codec)?,
+        None => AvroValue::Array(Vec::new()),
     };
-    let Value::Array(arguments) = normalize_arguments(decoded) else {
-        unreachable!("normalize_arguments always returns an array");
+    let AvroValue::Array(avro_arguments) = normalize_avro_arguments(decoded) else {
+        unreachable!("normalize_avro_arguments always returns an array");
     };
-    Ok(arguments)
+    let arguments = avro_arguments
+        .iter()
+        .cloned()
+        .map(AvroValue::into_json)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((arguments, avro_arguments))
 }
 
 fn value_as_u64(value: &Value) -> Option<u64> {
@@ -7046,6 +8193,56 @@ mod tests {
         sync::atomic::AtomicUsize,
         thread,
     };
+
+    fn typed_fidelity_probe() -> AvroValue {
+        AvroValue::Map(BTreeMap::from([
+            ("bytes".to_string(), AvroValue::Bytes(vec![0, 0xff])),
+            ("empty".to_string(), AvroValue::Map(BTreeMap::new())),
+            (
+                "numeric".to_string(),
+                AvroValue::Map(BTreeMap::from([
+                    ("0".to_string(), AvroValue::String("zero".to_string())),
+                    ("1".to_string(), AvroValue::String("one".to_string())),
+                ])),
+            ),
+            (
+                "nested".to_string(),
+                AvroValue::Array(vec![AvroValue::Map(BTreeMap::from([(
+                    "enabled".to_string(),
+                    AvroValue::Boolean(true),
+                )]))]),
+            ),
+            (
+                "projection_collisions".to_string(),
+                AvroValue::Array(projection_collision_probe()),
+            ),
+        ]))
+    }
+
+    fn projection_collision_probe() -> Vec<AvroValue> {
+        vec![
+            AvroValue::Map(BTreeMap::from([
+                ("$type".to_string(), AvroValue::String("bytes".to_string())),
+                (
+                    "base64".to_string(),
+                    AvroValue::String("ordinary user text".to_string()),
+                ),
+            ])),
+            AvroValue::Map(BTreeMap::from([
+                ("$type".to_string(), AvroValue::String("map".to_string())),
+                (
+                    "entries".to_string(),
+                    AvroValue::Array(vec![AvroValue::Map(BTreeMap::from([
+                        ("key".to_string(), AvroValue::String("ordinary".to_string())),
+                        (
+                            "value".to_string(),
+                            AvroValue::String("user map".to_string()),
+                        ),
+                    ]))]),
+                ),
+            ])),
+        ]
+    }
 
     #[derive(Clone, Debug, Default, PartialEq)]
     struct ReplayCounterState {
@@ -7179,6 +8376,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         }
     }
@@ -7267,6 +8466,34 @@ mod tests {
         assert_eq!(replayed, value);
         assert_eq!(replayed_uuid, uuid);
         assert!(replay.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn typed_side_effect_replay_preserves_bytes_and_maps() {
+        let ctx = workflow_context_with_codec(Vec::new(), DEFAULT_CODEC);
+        let value = ctx
+            .side_effect_avro_value(typed_fidelity_probe)
+            .expect("typed side effect");
+        let commands = ctx.take_commands().expect("side-effect command");
+        assert_eq!(
+            decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                .expect("recorded side effect"),
+            value
+        );
+
+        let replay = workflow_context_with_codec(
+            vec![history_event(
+                "SideEffectRecorded",
+                json!({"sequence": 1, "result": commands[0]["result"].clone()}),
+            )],
+            DEFAULT_CODEC,
+        );
+        assert_eq!(
+            replay
+                .side_effect_avro_value(|| panic!("replay must not invoke callback"))
+                .expect("replayed typed side effect"),
+            value
+        );
     }
 
     #[test]
@@ -7501,6 +8728,8 @@ mod tests {
                 workflow_signal_id: None,
                 signal_name: None,
                 signal_arguments: None,
+                workflow_update_id: None,
+                update_name: None,
                 lease_owner: Some("rust-worker".to_string()),
             }
         }
@@ -7654,11 +8883,302 @@ mod tests {
     }
 
     #[test]
-    fn avro_generic_wrapper_round_trips_json_values() {
+    fn fixed_avro_value_round_trips_json_values() {
         let value = json!({"greeting": "hello", "count": 3, "ok": true});
         let envelope = PayloadEnvelope::avro(&value).expect("encode");
         assert_eq!(envelope.codec, DEFAULT_CODEC);
         assert_eq!(decode_payload::<Value>(&envelope).expect("decode"), value);
+    }
+
+    #[tokio::test]
+    async fn typed_worker_surfaces_preserve_bytes_and_map_list_identity() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow_avro_value("typed.echo", |_ctx, input| async move { Ok(input) });
+        worker
+            .register_activity_avro_value("typed.activity", |_ctx, input| async move { Ok(input) });
+        worker.register_query_avro_value("typed.echo", "inspect", |_ctx, input| async move {
+            Ok(input)
+        });
+        worker.register_update_avro_value("typed.echo", "replace", |_ctx, input| async move {
+            Ok(input)
+        });
+        worker.register_workflow_avro_value("typed.signal", |ctx, _input| async move {
+            Ok(AvroValue::Array(
+                ctx.wait_signal_avro_value("changed").await?,
+            ))
+        });
+
+        let arguments = AvroValue::Array(vec![typed_fidelity_probe()]);
+        let envelope = encode_typed_envelope(&arguments, DEFAULT_CODEC).expect("typed envelope");
+
+        let mut workflow = workflow_task("typed.echo", Vec::new(), DEFAULT_CODEC);
+        workflow.arguments = Some(envelope.clone());
+        let commands = worker
+            .execute_workflow_task(workflow)
+            .expect("typed workflow task");
+        assert_eq!(commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                .expect("typed workflow result"),
+            arguments
+        );
+
+        let activity = ActivityTask {
+            task_id: "activity-typed".to_string(),
+            activity_attempt_id: Some("attempt-typed".to_string()),
+            attempt_id: None,
+            activity_type: "typed.activity".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(envelope.clone()),
+            attempt_number: 1,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+        assert_eq!(
+            worker
+                .execute_activity_task(activity)
+                .await
+                .expect("typed activity result"),
+            arguments
+        );
+
+        let query = QueryTask {
+            query_task_id: "query-typed".to_string(),
+            query_task_attempt: 1,
+            lease_owner: Some("rust-worker".to_string()),
+            workflow_id: Some("typed-1".to_string()),
+            run_id: Some("run-typed".to_string()),
+            workflow_type: "typed.echo".to_string(),
+            query_name: "inspect".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            workflow_arguments: Some(
+                encode_typed_envelope(&AvroValue::Array(Vec::new()), DEFAULT_CODEC)
+                    .expect("workflow input"),
+            ),
+            query_arguments: Some(envelope.clone()),
+            history_events: Vec::new(),
+            history_export: None,
+            run_status: Some("running".to_string()),
+        };
+        assert_eq!(
+            worker
+                .execute_query_task(query)
+                .await
+                .expect("typed query result"),
+            arguments
+        );
+
+        let mut update = workflow_task(
+            "typed.echo",
+            vec![history_event(
+                "UpdateAccepted",
+                json!({
+                    "update_id": "update-typed",
+                    "update_name": "replace",
+                    "arguments": envelope.clone(),
+                }),
+            )],
+            DEFAULT_CODEC,
+        );
+        update.workflow_update_id = Some("update-typed".to_string());
+        update.update_name = Some("replace".to_string());
+        let commands = worker
+            .execute_workflow_task(update)
+            .expect("typed update task");
+        assert_eq!(commands[0]["type"], "complete_update");
+        assert_eq!(
+            decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                .expect("typed update result"),
+            arguments
+        );
+
+        let mut signal = workflow_task(
+            "typed.signal",
+            vec![history_event(
+                "SignalReceived",
+                json!({
+                    "signal_id": "signal-typed",
+                    "signal_name": "changed",
+                    "arguments": envelope.clone(),
+                }),
+            )],
+            DEFAULT_CODEC,
+        );
+        signal.workflow_signal_id = Some("signal-typed".to_string());
+        signal.signal_name = Some("changed".to_string());
+        signal.signal_arguments = Some(envelope);
+        let commands = worker
+            .execute_workflow_task(signal)
+            .expect("typed signal resume");
+        assert_eq!(
+            decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                .expect("typed signal result"),
+            arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_helpers_never_parse_json_inspection_projection() {
+        let collision_values = projection_collision_probe();
+        let expected = AvroValue::Array(collision_values.clone());
+        let envelope = encode_typed_envelope(&expected, DEFAULT_CODEC).expect("collision envelope");
+
+        let activity_context = workflow_context_with_codec(
+            vec![history_event(
+                "ActivityCompleted",
+                json!({
+                    "sequence": 1,
+                    "activity_type": "collision.activity",
+                    "payload_codec": DEFAULT_CODEC,
+                    "result": envelope.clone(),
+                }),
+            )],
+            DEFAULT_CODEC,
+        );
+        assert_eq!(
+            activity_context
+                .activity_avro_value("collision.activity", AvroValue::Array(Vec::new()))
+                .await
+                .expect("typed activity collision result"),
+            expected
+        );
+
+        let signal_context = workflow_context_with_codec(
+            vec![
+                history_event(
+                    "SignalWaitOpened",
+                    json!({"sequence": 1, "signal_name": "collision"}),
+                ),
+                history_event(
+                    "SignalApplied",
+                    json!({
+                        "sequence": 1,
+                        "signal_name": "collision",
+                        "payload_codec": DEFAULT_CODEC,
+                        "value": envelope.clone(),
+                    }),
+                ),
+            ],
+            DEFAULT_CODEC,
+        );
+        assert_eq!(
+            signal_context
+                .wait_signal_avro_value("collision")
+                .await
+                .expect("typed signal collision arguments"),
+            collision_values
+        );
+
+        let child_context = workflow_context_with_codec(
+            vec![
+                history_event(
+                    "ChildWorkflowScheduled",
+                    json!({
+                        "sequence": 1,
+                        "child_workflow_instance_id": "collision-child",
+                        "child_workflow_run_id": "collision-run",
+                        "child_workflow_type": "collision.child",
+                    }),
+                ),
+                history_event(
+                    "ChildRunCompleted",
+                    json!({
+                        "sequence": 1,
+                        "child_workflow_instance_id": "collision-child",
+                        "child_workflow_run_id": "collision-run",
+                        "child_workflow_type": "collision.child",
+                        "payload_codec": DEFAULT_CODEC,
+                        "result": envelope,
+                    }),
+                ),
+            ],
+            DEFAULT_CODEC,
+        );
+        let child = child_context
+            .start_child_workflow_avro_value(
+                "collision.child",
+                ChildWorkflowOptions::new("collision-workers"),
+                AvroValue::Array(Vec::new()),
+            )
+            .await
+            .expect("typed child collision result");
+        assert_eq!(child.result, expected);
+    }
+
+    #[tokio::test]
+    async fn replayed_typed_query_keeps_lossless_workflow_and_query_inputs() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_replayed_workflow_avro_value(
+            "typed.replayed",
+            || (),
+            |_ctx, input, _state| async move { Ok(input) },
+        );
+        worker.register_replayed_query_avro_value::<(), _, _>(
+            "typed.replayed",
+            "inspect",
+            |ctx, _state, args| async move {
+                let mut signals = ctx.signals_avro_value("collision");
+                let signal = signals
+                    .pop()
+                    .map(AvroValue::Array)
+                    .unwrap_or_else(|| AvroValue::Array(Vec::new()));
+                Ok(AvroValue::Array(vec![
+                    ctx.workflow_input_avro_value().clone(),
+                    signal,
+                    args,
+                ]))
+            },
+        );
+        let arguments = AvroValue::Array(projection_collision_probe());
+        let signal_arguments =
+            encode_typed_envelope(&arguments, DEFAULT_CODEC).expect("typed query signal arguments");
+        let task = QueryTask {
+            query_task_id: "query-typed-replay".to_string(),
+            query_task_attempt: 1,
+            lease_owner: Some("rust-worker".to_string()),
+            workflow_id: Some("typed-replay".to_string()),
+            run_id: Some("run-typed-replay".to_string()),
+            workflow_type: "typed.replayed".to_string(),
+            query_name: "inspect".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            workflow_arguments: Some(
+                encode_typed_envelope(&arguments, DEFAULT_CODEC).expect("workflow arguments"),
+            ),
+            query_arguments: Some(
+                encode_typed_envelope(&arguments, DEFAULT_CODEC).expect("query arguments"),
+            ),
+            history_events: vec![history_event(
+                "SignalReceived",
+                json!({
+                    "signal_id": "collision-signal",
+                    "signal_name": "collision",
+                    "workflow_sequence": 1,
+                    "payload_codec": DEFAULT_CODEC,
+                    "arguments": signal_arguments,
+                }),
+            )],
+            history_export: None,
+            run_status: Some("completed".to_string()),
+        };
+
+        assert_eq!(
+            worker
+                .execute_query_task(task)
+                .await
+                .expect("typed replay query"),
+            AvroValue::Array(vec![arguments.clone(), arguments.clone(), arguments])
+        );
+    }
+
+    #[test]
+    fn public_avro_adapter_rejects_non_string_map_keys_before_json_conversion() {
+        let value = BTreeMap::from([(1_i32, "integer key")]);
+        let error = PayloadEnvelope::avro(&value)
+            .expect_err("integer map keys must fail")
+            .to_string();
+
+        assert!(error.contains("invalid_map_key"));
     }
 
     #[test]
@@ -7672,17 +9192,14 @@ mod tests {
     }
 
     #[test]
-    fn typed_avro_payload_without_schema_context_keeps_diagnostic() {
+    fn prerelease_avro_payload_without_single_object_frame_is_rejected() {
         let envelope = PayloadEnvelope {
             codec: DEFAULT_CODEC.to_string(),
             blob: BASE64.encode([0x01]),
         };
 
-        let error = decode_payload::<Value>(&envelope).expect_err("typed payload must fail");
-        assert_eq!(
-            error.to_string(),
-            "codec error: typed avro payloads require a schema context; v1 supports the generic wrapper"
-        );
+        let error = decode_payload::<Value>(&envelope).expect_err("prerelease payload must fail");
+        assert!(error.to_string().contains("invalid_payload_framing"));
     }
 
     #[test]
@@ -8870,6 +10387,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         };
 
@@ -8935,6 +10454,31 @@ mod tests {
             decode_wire_value(&commands[0]["arguments"], DEFAULT_CODEC)
                 .expect("continue-as-new arguments"),
             json!([2, {"cursor": "next"}])
+        );
+    }
+
+    #[test]
+    fn continue_as_new_preserves_typed_arguments() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow_avro_value("rust.typed-continue", |ctx, _input| async move {
+            ctx.continue_as_new(AvroValue::Array(vec![typed_fidelity_probe()]))?;
+            unreachable!("continue-as-new returns a control-flow error")
+        });
+
+        let commands = worker
+            .execute_workflow_task(workflow_task(
+                "rust.typed-continue",
+                Vec::new(),
+                DEFAULT_CODEC,
+            ))
+            .expect("typed continue-as-new command");
+
+        assert_eq!(commands[0]["type"], "continue_as_new");
+        assert_eq!(
+            decode_wire_avro_value(&commands[0]["arguments"], DEFAULT_CODEC)
+                .expect("typed continue arguments"),
+            AvroValue::Array(vec![typed_fidelity_probe()])
         );
     }
 
@@ -9038,6 +10582,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         };
 
@@ -9178,6 +10724,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         };
 
@@ -9225,6 +10773,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         };
 
@@ -9348,6 +10898,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         }
     }
@@ -9385,6 +10937,77 @@ mod tests {
             assert_eq!(output["child_run_id"], "run-child");
             assert_eq!(output["result"], json!({"from": "python", "ok": true}));
         }
+    }
+
+    #[test]
+    fn typed_child_arguments_and_results_survive_replay() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-parent-workers");
+        worker.register_workflow_avro_value("rust.typed-parent", |ctx, _input| async move {
+            let child = ctx
+                .start_child_workflow_avro_value(
+                    "python.typed-child",
+                    ChildWorkflowOptions::new("python-workers"),
+                    AvroValue::Array(vec![typed_fidelity_probe()]),
+                )
+                .await?;
+            Ok(child.result)
+        });
+
+        let initial = worker
+            .execute_workflow_task(workflow_task(
+                "rust.typed-parent",
+                Vec::new(),
+                DEFAULT_CODEC,
+            ))
+            .expect("typed child start");
+        assert_eq!(initial[0]["type"], "start_child_workflow");
+        assert_eq!(
+            decode_wire_avro_value(&initial[0]["arguments"], DEFAULT_CODEC)
+                .expect("typed child arguments"),
+            AvroValue::Array(vec![typed_fidelity_probe()])
+        );
+
+        let result = encode_typed_envelope(&typed_fidelity_probe(), DEFAULT_CODEC)
+            .expect("typed child result");
+        let task = workflow_task(
+            "rust.typed-parent",
+            vec![
+                history_event(
+                    "ChildWorkflowScheduled",
+                    json!({
+                        "sequence": 1,
+                        "child_call_id": "call-typed",
+                        "child_workflow_instance_id": "wf-child",
+                        "child_workflow_run_id": "run-child",
+                        "child_workflow_type": "python.typed-child",
+                    }),
+                ),
+                history_event(
+                    "ChildRunCompleted",
+                    json!({
+                        "sequence": 1,
+                        "child_call_id": "call-typed",
+                        "child_workflow_instance_id": "wf-child",
+                        "child_workflow_run_id": "run-child",
+                        "child_workflow_type": "python.typed-child",
+                        "payload_codec": DEFAULT_CODEC,
+                        "result": result,
+                    }),
+                ),
+            ],
+            DEFAULT_CODEC,
+        );
+
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("typed child replay");
+        assert_eq!(commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                .expect("typed parent result"),
+            typed_fidelity_probe()
+        );
     }
 
     #[test]
@@ -9534,6 +11157,8 @@ mod tests {
             workflow_signal_id: Some("sig-rust-1".to_string()),
             signal_name: Some("start".to_string()),
             signal_arguments: Some(signal_arguments),
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         };
 
@@ -9571,6 +11196,8 @@ mod tests {
             workflow_signal_id: None,
             signal_name: None,
             signal_arguments: None,
+            workflow_update_id: None,
+            update_name: None,
             lease_owner: Some("rust-worker".to_string()),
         };
 
@@ -9607,7 +11234,7 @@ mod tests {
             .expect("signal event");
         assert_eq!(
             decode_signal_event_arguments(signal, DEFAULT_CODEC).expect("signal arguments"),
-            vec![json!("Rust")]
+            vec![AvroValue::String("Rust".to_string())]
         );
     }
 
@@ -9688,7 +11315,7 @@ mod tests {
         };
 
         let result = worker.execute_query_task(task).await.expect("query result");
-        assert_eq!(result, json!(0));
+        assert_eq!(result.into_json().expect("query projection"), json!(0));
     }
 
     #[tokio::test]
@@ -9742,7 +11369,7 @@ mod tests {
             .await
             .expect("running replay query");
         assert_eq!(
-            running,
+            running.clone().into_json().expect("query projection"),
             json!({"loaded": "loaded", "count": 3, "finished": false})
         );
 
@@ -9754,7 +11381,7 @@ mod tests {
             ))
             .await
             .expect("query mutates only its detached state clone");
-        assert_eq!(detached, json!(999));
+        assert_eq!(detached.into_json().expect("query projection"), json!(999));
         let failed = worker
             .execute_query_task(replay_counter_query(
                 "failed-mutation",
@@ -9871,7 +11498,7 @@ mod tests {
             .await
             .expect("completed cold replay query");
         assert_eq!(
-            completed,
+            completed.into_json().expect("query projection"),
             json!({"loaded": "loaded", "count": 8, "finished": true})
         );
     }
@@ -9934,7 +11561,7 @@ mod tests {
         .expect("query task");
 
         let result = worker.execute_query_task(task).await.expect("query result");
-        assert_eq!(result, json!(9));
+        assert_eq!(result.into_json().expect("query projection"), json!(9));
     }
 
     #[tokio::test]
@@ -10022,6 +11649,126 @@ mod tests {
         };
         assert_eq!(failure.status, 404);
         assert_eq!(failure.reason, "rejected_unknown_query");
+    }
+
+    #[tokio::test]
+    async fn public_client_surfaces_send_and_receive_lossless_avro_values() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let arguments = AvroValue::Array(vec![typed_fidelity_probe()]);
+
+        client
+            .start_workflow(
+                "typed.echo",
+                "rust-workers",
+                "typed-start",
+                arguments.clone(),
+            )
+            .await
+            .expect("typed workflow start");
+        assert_eq!(
+            decode_wire_avro_value(
+                &server.request_body("/api/workflows")["input"],
+                DEFAULT_CODEC,
+            )
+            .expect("typed start input"),
+            arguments
+        );
+
+        client
+            .signal_workflow("typed-1", "changed", arguments.clone())
+            .await
+            .expect("typed signal");
+        assert_eq!(
+            decode_wire_avro_value(
+                &server.request_body("/api/workflows/typed-1/signal/changed")["input"],
+                DEFAULT_CODEC,
+            )
+            .expect("typed signal input"),
+            arguments
+        );
+
+        assert_eq!(
+            client
+                .query_workflow_avro_value("typed-1", "inspect", arguments.clone())
+                .await
+                .expect("typed query"),
+            typed_fidelity_probe()
+        );
+        assert_eq!(
+            decode_wire_avro_value(
+                &server.request_body("/api/workflows/typed-1/query/inspect")["input"],
+                DEFAULT_CODEC,
+            )
+            .expect("typed query input"),
+            arguments
+        );
+
+        assert_eq!(
+            client
+                .update_workflow_avro_value(
+                    "typed-1",
+                    "replace",
+                    arguments.clone(),
+                    Some("typed-request"),
+                )
+                .await
+                .expect("typed update"),
+            typed_fidelity_probe()
+        );
+        let update = server.request_body("/api/workflows/typed-1/update/replace");
+        assert_eq!(update["request_id"], "typed-request");
+        assert_eq!(
+            decode_wire_avro_value(&update["input"], DEFAULT_CODEC).expect("typed update input"),
+            arguments
+        );
+
+        let handle = WorkflowHandle {
+            client: client.clone(),
+            workflow_id: "typed-1".to_string(),
+            run_id: Some("run-typed-1".to_string()),
+            workflow_type: "typed.echo".to_string(),
+        };
+        assert_eq!(
+            handle
+                .result_avro_value(WorkflowResultOptions::default())
+                .await
+                .expect("typed workflow result"),
+            typed_fidelity_probe()
+        );
+
+        client
+            .complete_activity_task(
+                "activity-typed",
+                "attempt-typed",
+                "rust-worker",
+                typed_fidelity_probe(),
+                DEFAULT_CODEC,
+            )
+            .await
+            .expect("typed activity completion");
+        assert_eq!(
+            decode_wire_avro_value(
+                &server.request_body("/api/worker/activity-tasks/activity-typed/complete")
+                    ["result"],
+                DEFAULT_CODEC,
+            )
+            .expect("typed activity result"),
+            typed_fidelity_probe()
+        );
+        client
+            .fail_activity_task(
+                "activity-typed",
+                "attempt-typed",
+                "rust-worker",
+                "typed failure",
+                true,
+            )
+            .await
+            .expect("activity failure");
     }
 
     #[tokio::test]
@@ -10375,7 +12122,7 @@ mod tests {
                 "activity-cancel",
                 "attempt-cancel",
                 "rust-worker",
-                json!({"stage":"cleanup"}),
+                typed_fidelity_probe(),
             )
             .await
             .expect("cancellation heartbeat");
@@ -10383,6 +12130,14 @@ mod tests {
         assert!(heartbeat.should_stop());
         assert_eq!(heartbeat.reason.as_deref(), Some("run_cancelled"));
         assert_eq!(heartbeat.run_closed_reason.as_deref(), Some("cancelled"));
+        let heartbeat_body =
+            server.request_body("/api/worker/activity-tasks/activity-cancel/heartbeat");
+        assert_eq!(heartbeat_body["details"]["codec"], DEFAULT_CODEC);
+        assert_eq!(
+            decode_wire_avro_value(&heartbeat_body["details"], DEFAULT_CODEC)
+                .expect("typed heartbeat details"),
+            typed_fidelity_probe()
+        );
 
         let error = client
             .complete_activity_task(
@@ -11124,6 +12879,7 @@ mod tests {
                 .sum::<i64>();
             Ok(json!(current))
         });
+        worker.register_update("snapshot", "replace", |_ctx, args| async move { Ok(args) });
 
         worker
             .run_until(tokio::time::sleep(Duration::from_millis(3_200)))
@@ -11144,7 +12900,14 @@ mod tests {
         );
         assert_eq!(
             server.request_body("/api/worker/register")["capabilities"],
-            json!([QUERY_TASKS_CAPABILITY])
+            json!([QUERY_TASKS_CAPABILITY, WORKFLOW_UPDATES_CAPABILITY])
+        );
+        assert_eq!(
+            server.request_body("/api/worker/register")["workflow_command_contracts"]["snapshot"],
+            json!({
+                "queries": ["current"],
+                "updates": ["replace"],
+            })
         );
 
         let opened = server.request_body("/api/worker/workflow-tasks/snapshot-open/complete");
@@ -11894,6 +13657,37 @@ mod tests {
             }
         }
 
+        if matches!(
+            path,
+            "/api/workflows/typed-1/query/inspect" | "/api/workflows/typed-1/update/replace"
+        ) {
+            let result = encode_typed_envelope(&typed_fidelity_probe(), DEFAULT_CODEC)
+                .expect("typed mock result");
+            let body = json!({
+                "result": typed_fidelity_probe().into_json().expect("result projection"),
+                "result_envelope": result,
+            })
+            .to_string();
+            write_mock_response(stream, "200 OK", &body);
+            return;
+        }
+
+        if path == "/api/workflows/typed-1" {
+            let result = encode_typed_envelope(&typed_fidelity_probe(), DEFAULT_CODEC)
+                .expect("typed mock result");
+            let body = json!({
+                "workflow_id": "typed-1",
+                "run_id": "run-typed-1",
+                "workflow_type": "typed.echo",
+                "status": "completed",
+                "output": typed_fidelity_probe().into_json().expect("output projection"),
+                "output_envelope": result,
+            })
+            .to_string();
+            write_mock_response(stream, "200 OK", &body);
+            return;
+        }
+
         let (status, body) = match path {
             "/api/workflows" => (
                 "201 Created",
@@ -11938,6 +13732,9 @@ mod tests {
                 "409 Conflict",
                 r#"{"task_id":"activity-cancel","activity_attempt_id":"attempt-cancel","reason":"run_cancelled","cancel_requested":true,"can_continue":false,"run_closed_reason":"cancelled"}"#,
             ),
+            "/api/worker/activity-tasks/activity-typed/complete"
+            | "/api/worker/activity-tasks/activity-typed/fail"
+            | "/api/workflows/typed-1/signal/changed" => ("200 OK", "{}"),
             "/api/workflows/counter-1/query/current" => (
                 "200 OK",
                 r#"{"workflow_id":"counter-1","query_name":"current","result":{"count":8},"result_envelope":{"codec":"json","blob":"{\"count\":8}"}}"#,

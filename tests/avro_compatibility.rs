@@ -1,82 +1,332 @@
-use apache_avro::{from_avro_datum, from_value, Schema};
+use std::collections::BTreeMap;
+
+use apache_avro::{
+    from_avro_datum, rabin::Rabin, to_avro_datum, types::Value as AvroDatum, Schema,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use durable_workflow::{decode_payload, encode_payload, PayloadEnvelope, DEFAULT_CODEC};
-use serde::Deserialize;
-use serde_json::Value;
+use durable_workflow::{
+    decode_avro_value, encode_avro_value, AvroValue, PayloadEnvelope,
+    AVRO_VALUE_SCHEMA_FINGERPRINT, AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, AVRO_VALUE_SCHEMA_JSON,
+    DEFAULT_CODEC,
+};
 
-#[derive(Debug, Deserialize)]
-struct CompatibilityFixture {
-    schema: String,
-    json: String,
-    value: Value,
-    producers: Vec<ProducerFixture>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProducerFixture {
-    runtime: String,
-    library: String,
-    blob: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenericWrapper {
-    json: String,
-    version: i32,
-}
-
-fn fixture() -> CompatibilityFixture {
-    serde_json::from_str(include_str!("fixtures/avro_generic_wrapper.json"))
-        .expect("valid Avro compatibility fixture")
+fn cases() -> Vec<(&'static str, AvroValue, &'static str)> {
+    vec![
+        ("null", AvroValue::Null, "wwHioz3/VYAiNwA="),
+        (
+            "boolean_false",
+            AvroValue::Boolean(false),
+            "wwHioz3/VYAiNwIA",
+        ),
+        ("boolean_true", AvroValue::Boolean(true), "wwHioz3/VYAiNwIB"),
+        (
+            "long_min",
+            AvroValue::Long(i64::MIN),
+            "wwHioz3/VYAiNwT///////////8B",
+        ),
+        (
+            "long_max",
+            AvroValue::Long(i64::MAX),
+            "wwHioz3/VYAiNwT+//////////8B",
+        ),
+        ("long_7", AvroValue::Long(7), "wwHioz3/VYAiNwQO"),
+        (
+            "double_7",
+            AvroValue::Double(7.0),
+            "wwHioz3/VYAiNwYAAAAAAAAcQA==",
+        ),
+        (
+            "negative_zero",
+            AvroValue::Double(-0.0),
+            "wwHioz3/VYAiNwYAAAAAAAAAgA==",
+        ),
+        (
+            "bytes_00ff",
+            AvroValue::Bytes(vec![0, 255]),
+            "wwHioz3/VYAiNwgEAP8=",
+        ),
+        (
+            "string_utf8",
+            AvroValue::String("héllo".to_string()),
+            "wwHioz3/VYAiNwoMaMOpbGxv",
+        ),
+        (
+            "array",
+            AvroValue::Array(vec![
+                AvroValue::Null,
+                AvroValue::Boolean(true),
+                AvroValue::Long(7),
+                AvroValue::Double(7.0),
+                AvroValue::Bytes(vec![0, 255]),
+                AvroValue::String("text".to_string()),
+            ]),
+            "wwHioz3/VYAiNwwMAAIBBA4GAAAAAAAAHEAIBAD/Cgh0ZXh0AA==",
+        ),
+        (
+            "map",
+            AvroValue::Map(BTreeMap::from([
+                ("a".to_string(), AvroValue::Long(1)),
+                (
+                    "b".to_string(),
+                    AvroValue::Array(vec![AvroValue::Boolean(false)]),
+                ),
+            ])),
+            "wwHioz3/VYAiNw4EAmEEAgJiDAICAAAA",
+        ),
+        (
+            "map_empty",
+            AvroValue::Map(BTreeMap::new()),
+            "wwHioz3/VYAiNw4A",
+        ),
+        (
+            "map_key_0",
+            AvroValue::Map(BTreeMap::from([(
+                "0".to_string(),
+                AvroValue::String("zero".to_string()),
+            )])),
+            "wwHioz3/VYAiNw4CAjAKCHplcm8A",
+        ),
+        (
+            "map_keys_0_1",
+            AvroValue::Map(BTreeMap::from([
+                ("0".to_string(), AvroValue::String("zero".to_string())),
+                ("1".to_string(), AvroValue::String("one".to_string())),
+            ])),
+            "wwHioz3/VYAiNw4EAjAKCHplcm8CMQoGb25lAA==",
+        ),
+        (
+            "nested",
+            AvroValue::Map(BTreeMap::from([(
+                "items".to_string(),
+                AvroValue::Array(vec![
+                    AvroValue::Map(BTreeMap::from([(
+                        "enabled".to_string(),
+                        AvroValue::Boolean(true),
+                    )])),
+                    AvroValue::Bytes(b"bytes".to_vec()),
+                    AvroValue::Double(-2.5),
+                ]),
+            )])),
+            "wwHioz3/VYAiNw4CCml0ZW1zDAYOAg5lbmFibGVkAgEACApieXRlcwYAAAAAAAAEwAAA",
+        ),
+    ]
 }
 
 #[test]
-fn decodes_python_and_php_official_avro_datums() {
-    let fixture = fixture();
-    assert_eq!(fixture.producers.len(), 2);
-
-    for producer in fixture.producers {
-        assert!(matches!(producer.runtime.as_str(), "Python" | "PHP"));
-        assert!(producer.library.contains("avro"));
-
-        let envelope = PayloadEnvelope {
-            codec: DEFAULT_CODEC.to_string(),
-            blob: producer.blob,
-        };
-        let decoded: Value = decode_payload(&envelope).unwrap_or_else(|error| {
-            panic!(
-                "could not decode {} {} fixture: {error}",
-                producer.runtime, producer.library
-            )
-        });
-        assert_eq!(decoded, fixture.value);
-    }
+fn canonical_schema_has_verified_rabin_fingerprint() {
+    let schema = Schema::parse_str(AVRO_VALUE_SCHEMA_JSON).expect("parse Value schema");
+    let fingerprint = schema.fingerprint::<Rabin>();
+    assert_eq!(fingerprint.bytes.as_slice(), AVRO_VALUE_SCHEMA_FINGERPRINT);
+    assert_eq!(
+        fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        AVRO_VALUE_SCHEMA_FINGERPRINT_HEX
+    );
 }
 
 #[test]
-fn rust_datum_matches_official_python_and_php_output() {
-    let fixture = fixture();
-    let envelope = encode_payload(&fixture.value, DEFAULT_CODEC).expect("encode Rust payload");
+fn rust_matches_cross_language_golden_single_object_bytes() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
+            .expect("parse checked-in golden fixture");
+    let fixture_cases = fixture["cases"].as_array().expect("golden cases");
+    assert_eq!(fixture_cases.len(), cases().len());
 
-    for producer in &fixture.producers {
+    for (name, value, expected) in cases() {
+        let fixture_case = fixture_cases
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap_or_else(|| panic!("missing shared fixture case {name}"));
+        assert_eq!(fixture_case["wire_base64"], expected, "{name}");
         assert_eq!(
-            envelope.blob, producer.blob,
-            "Rust output differs from {} {}",
-            producer.runtime, producer.library
+            decode_avro_value(&PayloadEnvelope {
+                codec: DEFAULT_CODEC.to_string(),
+                blob: expected.to_string(),
+            })
+            .unwrap_or_else(|error| panic!("{name}: {error}")),
+            value,
+            "{name}"
+        );
+        let encoded = encode_avro_value(&value).unwrap_or_else(|error| panic!("{name}: {error}"));
+        if !matches!(value, AvroValue::Map(_)) {
+            assert_eq!(encoded.blob, expected, "{name}");
+        }
+        let decoded = decode_avro_value(&encoded).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(decoded, value, "{name}");
+        let reencoded =
+            encode_avro_value(&decoded).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(
+            decode_avro_value(&reencoded).unwrap_or_else(|error| panic!("{name}: {error}")),
+            value,
+            "{name}"
+        );
+        assert_eq!(
+            &BASE64.decode(expected).expect("base64 golden")[..10],
+            &[0xc3, 0x01, 0xe2, 0xa3, 0x3d, 0xff, 0x55, 0x80, 0x22, 0x37],
+            "{name}"
         );
     }
+}
 
-    let bytes = BASE64
-        .decode(&envelope.blob)
-        .expect("Rust output is valid base64");
-    assert_eq!(bytes.first(), Some(&0x00));
+#[test]
+fn shared_malformed_frames_are_rejected() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
+            .expect("parse checked-in golden fixture");
+    for case in fixture["malformed_frames"]
+        .as_array()
+        .expect("malformed frames")
+    {
+        let error = decode_avro_value(&PayloadEnvelope {
+            codec: DEFAULT_CODEC.to_string(),
+            blob: case["wire_base64"]
+                .as_str()
+                .expect("wire bytes")
+                .to_string(),
+        })
+        .expect_err("malformed frame must fail")
+        .to_string();
+        assert!(
+            error.contains(case["error"].as_str().expect("error contract")),
+            "{}: {error}",
+            case["name"]
+        );
+    }
+}
 
-    let schema = Schema::parse_str(&fixture.schema).expect("parse wrapper schema");
-    let mut encoded_datum = &bytes[1..];
-    let datum = from_avro_datum(&schema, &mut encoded_datum, None)
-        .expect("official Apache Avro decodes the Rust datum");
-    let wrapper: GenericWrapper = from_value(&datum).expect("decode wrapper record");
+#[test]
+fn shared_alternate_map_orders_decode_to_the_same_nested_value() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
+            .expect("parse checked-in golden fixture");
+    let expected = AvroValue::Map(BTreeMap::from([
+        (
+            "outer".to_string(),
+            AvroValue::Array(vec![AvroValue::Map(BTreeMap::from([
+                ("left".to_string(), AvroValue::Long(1)),
+                ("right".to_string(), AvroValue::Bytes(b"x".to_vec())),
+            ]))]),
+        ),
+        ("tail".to_string(), AvroValue::String("done".to_string())),
+    ]));
 
-    assert_eq!(wrapper.json, fixture.json);
-    assert_eq!(wrapper.version, 1);
+    for blob in fixture["alternate_map_orders"][0]["wire_base64"]
+        .as_array()
+        .expect("alternate map frames")
+    {
+        let decoded = decode_avro_value(&PayloadEnvelope {
+            codec: DEFAULT_CODEC.to_string(),
+            blob: blob.as_str().expect("alternate map frame").to_string(),
+        })
+        .expect("decode alternate map order");
+        assert_eq!(decoded, expected);
+        let reencoded = encode_avro_value(&decoded).expect("reencode alternate map value");
+        assert_eq!(
+            decode_avro_value(&reencoded).expect("decode reencoded alternate map value"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn rust_decodes_the_shared_nested_cross_language_golden() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
+            .expect("parse checked-in golden fixture");
+    let nested = fixture["cases"]
+        .as_array()
+        .expect("golden cases")
+        .iter()
+        .find(|case| case["name"] == "nested")
+        .expect("nested golden");
+    let envelope = PayloadEnvelope {
+        codec: DEFAULT_CODEC.to_string(),
+        blob: nested["wire_base64"]
+            .as_str()
+            .expect("nested wire bytes")
+            .to_string(),
+    };
+    let expected = AvroValue::Map(BTreeMap::from([(
+        "items".to_string(),
+        AvroValue::Array(vec![
+            AvroValue::Map(BTreeMap::from([(
+                "enabled".to_string(),
+                AvroValue::Boolean(true),
+            )])),
+            AvroValue::Bytes(b"bytes".to_vec()),
+            AvroValue::Double(-2.5),
+        ]),
+    )]));
+
+    assert_eq!(
+        decode_avro_value(&envelope).expect("decode nested golden"),
+        expected
+    );
+}
+
+#[test]
+fn rejects_non_finite_values_and_unknown_fingerprints() {
+    let error = encode_avro_value(&AvroValue::Double(f64::NAN))
+        .expect_err("NaN must fail")
+        .to_string();
+    assert!(error.contains("non_finite_float"));
+
+    let mut bytes = BASE64.decode(cases()[0].2).expect("base64 golden");
+    bytes[2] ^= 0xff;
+    let error = decode_avro_value(&PayloadEnvelope {
+        codec: DEFAULT_CODEC.to_string(),
+        blob: BASE64.encode(bytes),
+    })
+    .expect_err("unknown fingerprint must fail")
+    .to_string();
+    assert!(error.contains("unsupported_payload_schema"));
+}
+
+#[test]
+fn appended_named_branch_resolves_old_data_and_old_reader_rejects_new_branch() {
+    let v1_json: serde_json::Value =
+        serde_json::from_str(AVRO_VALUE_SCHEMA_JSON).expect("parse schema json");
+    let mut v2_json = v1_json.clone();
+    v2_json["fields"][0]["type"]
+        .as_array_mut()
+        .expect("Value union")
+        .push(serde_json::json!({
+            "type": "record",
+            "name": "TimestampValue",
+            "fields": [{"name": "timestamp", "type": "string"}]
+        }));
+    let v1 = Schema::parse_str(&v1_json.to_string()).expect("v1 schema");
+    let v2 = Schema::parse_str(&v2_json.to_string()).expect("v2 schema");
+
+    let old = AvroDatum::Record(vec![(
+        "value".to_string(),
+        AvroDatum::Union(
+            2,
+            Box::new(AvroDatum::Record(vec![(
+                "long".to_string(),
+                AvroDatum::Long(7),
+            )])),
+        ),
+    )]);
+    let old_bytes = to_avro_datum(&v1, old).expect("encode old datum");
+    let mut old_slice = old_bytes.as_slice();
+    let resolved = from_avro_datum(&v1, &mut old_slice, Some(&v2)).expect("resolve old datum");
+    assert!(matches!(resolved, AvroDatum::Record(_)));
+
+    let new = AvroDatum::Record(vec![(
+        "value".to_string(),
+        AvroDatum::Union(
+            8,
+            Box::new(AvroDatum::Record(vec![(
+                "timestamp".to_string(),
+                AvroDatum::String("2026-07-28T00:00:00Z".to_string()),
+            )])),
+        ),
+    )]);
+    let new_bytes = to_avro_datum(&v2, new).expect("encode new datum");
+    let mut new_slice = new_bytes.as_slice();
+    assert!(from_avro_datum(&v2, &mut new_slice, Some(&v1)).is_err());
 }

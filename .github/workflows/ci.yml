@@ -36,6 +36,10 @@ jobs:
       - name: Test all targets
         run: cargo test --all-targets
 
+      - name: Enforce Avro Value regression budget
+        if: matrix.rust == 'stable'
+        run: cargo run --release --example avro_value_benchmark -- --enforce
+
       - name: Build warning-free API documentation
         env:
           RUSTDOCFLAGS: -D warnings

@@ -5,8 +5,8 @@ and clients. It can register workflow and activity handlers, long-poll the
 worker protocol, start, signal, query, cancel, terminate, and await workflow
 executions, start and await durable child workflows, expose named read-only
 query handlers, heartbeat
-workers and activities, and exchange JSON-native payloads through the
-platform's generic Avro wrapper. Workflow code can also wait on server-backed
+workers and activities, and exchange language-neutral native values through the
+platform's fixed typed Avro Value protocol. Workflow code can also wait on server-backed
 durable time, capture non-deterministic values exactly once, and evolve across
 deployments with durable version markers.
 
@@ -15,22 +15,22 @@ deployments with durable version markers.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.1
+cargo add durable-workflow@=2.0.0-rc.3
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.1"
+durable-workflow = "=2.0.0-rc.3"
 ```
 
-Version `2.0.0-rc.1` requires Rust `1.86` or newer and includes the complete
+Version `2.0.0-rc.3` requires Rust `1.86` or newer and includes the complete
 Durable Workflow 2.0 beta baseline described below.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.1` is supported with server `2.0.0-rc.1`, control plane
+Rust SDK `2.0.0-rc.3` is supported with server `2.0.0-rc.3`, control plane
 `2`, and the server's additive worker-protocol negotiation window. Earlier
 crate versions remain historical and are not separate supported feature
 levels. No compatibility shim connects earlier 2.0 prereleases to this train.
@@ -52,6 +52,31 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor. The server's advertised protocol manifests remain
 authoritative when checking compatibility during deployment.
+
+## Avro Value protocol
+
+The default `avro` codec writes the fixed recursive
+`durable_workflow.protocol.Value` schema using standard Avro single-object
+framing. `AvroValue` keeps booleans, signed 64-bit integers, finite doubles,
+bytes, UTF-8 strings, lists, and string-keyed maps distinct. The ordinary
+Serde adapter selects those fixed branches and rejects non-string map keys
+before encoding; use `PayloadEnvelope::avro_value()` and
+`decode_avro_value()` when the bytes branch must remain explicit.
+JSON-safe values returned by inspection APIs are one-way display projections.
+Lossless query, update, result, activity, signal, and child-workflow code uses
+the corresponding `*_avro_value` API and requires the authoritative payload
+envelope; it never parses a display projection back into protocol data.
+
+The encoder writes the current bundled schema. The decoder selects a bundled
+writer schema by its CRC-64-AVRO fingerprint and resolves it against the
+current reader. Unknown fingerprints and incompatible branches fail with
+`unsupported_payload_schema`; there is no implicit JSON fallback or live
+schema lookup.
+
+Run `cargo run --release --example avro_value_benchmark` to compare compact
+JSON, the removed prerelease wrapper, and the production fixed-schema path over
+the shared checked-in corpus. Pass `-- --enforce` to apply the same calibrated
+optimized-path regression budget as CI.
 
 Side-effect releases additionally publish `deterministic-side-effects`,
 `side-effect-command`, and `side-effect-history-event`. Version-marker releases
@@ -501,7 +526,9 @@ worker.register_replayed_query::<CounterState, _, _>("counter", "current", |_ctx
 `QueryContext` exposes normalized workflow input, raw committed history, and
 decoded signals. Use it for transport-level inspection when replayed typed
 state is not appropriate; snapshot handlers must reduce history themselves and
-are not workflow-instance query parity.
+are not workflow-instance query parity. Typed query handlers read exact
+workflow input and signal arguments through `workflow_input_avro_value()`,
+`QuerySignal::arguments_avro_value()`, or `signals_avro_value()`.
 
 Client-side rejections are `Error::QueryFailed(QueryFailure)`. Match the
 public `reason` and `status` fields for automation; the original response is
