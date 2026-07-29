@@ -26,14 +26,16 @@ def _load_validator() -> ModuleType:
 
 
 VALIDATOR = _load_validator()
+REPOSITORY_POLICY = json.loads(
+    (Path(__file__).resolve().parents[2] / "regression-corpus-policy.json").read_text(
+        encoding="utf-8"
+    )
+)
 CODEC_GUARD = {
     "glob": "src/lib.rs",
     "content_patterns": ["Avro", "avro", "Codec", "codec", "framing"],
 }
-REPLAY_GUARD = {
-    "glob": "src/lib.rs",
-    "content_patterns": ["Replay", "replay", "History", "history"],
-}
+REPLAY_GUARD = REPOSITORY_POLICY["categories"]["replay"]["guards"][0]
 POLICY = {
     "$schema": "https://example.invalid/regression-corpus-policy.json",
     "schema": "durable-workflow.regression-corpus-policy/v1",
@@ -162,6 +164,52 @@ fn replay_commands(history: &[u8]) -> bool {
     history.len() < 10
 }
 
+struct WorkflowContext;
+
+impl WorkflowContext {
+    fn continue_as_new_command(&self, cursor: usize) -> bool {
+        cursor == 1
+    }
+}
+
+enum RecordedSnapshotValue<T> {
+    Unknown,
+    Known(T),
+}
+
+impl<T: PartialEq> RecordedSnapshotValue<T> {
+    fn matches_current(&self, current: &Self) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Known(recorded) => matches!(current, Self::Known(value) if value == recorded),
+        }
+    }
+}
+
+struct ActivityRetrySnapshot {
+    max_attempts: u64,
+}
+
+impl ActivityRetrySnapshot {
+    fn matches_current(&self, current: &Self) -> bool {
+        self.max_attempts == current.max_attempts
+    }
+}
+
+fn recorded_activity_retry_snapshot(max_attempts: u64) -> ActivityRetrySnapshot {
+    ActivityRetrySnapshot { max_attempts }
+}
+
+struct CacheSnapshot {
+    generation: u64,
+}
+
+impl CacheSnapshot {
+    fn matches_current(&self, current: &Self) -> bool {
+        self.generation == current.generation
+    }
+}
+
 fn health_check(enabled: bool) -> bool {
     enabled
 }
@@ -218,6 +266,63 @@ fn health_check(enabled: bool) -> bool {
         )
 
         self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_continue_as_new_consumption_without_keyword_is_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace("cursor == 1", "cursor > 1"),
+            encoding="utf-8",
+        )
+
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_activity_snapshot_comparison_without_keyword_is_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "self.max_attempts == current.max_attempts",
+                "self.max_attempts <= current.max_attempts",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_recorded_snapshot_comparison_without_keyword_is_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "Self::Unknown => true",
+                "Self::Unknown => false",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_recorded_snapshot_decoding_without_keyword_is_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "ActivityRetrySnapshot { max_attempts }",
+                "ActivityRetrySnapshot { max_attempts: max_attempts.max(1) }",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_same_named_unrelated_comparison_is_not_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "self.generation == current.generation",
+                "self.generation <= current.generation",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(self._guard_matches(REPLAY_GUARD))
 
     def test_edit_inside_unrelated_function_is_not_related(self) -> None:
         source = self.root / "src/lib.rs"

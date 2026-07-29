@@ -42,7 +42,13 @@
             "Replay",
             "replay",
             "History",
-            "history"
+            "history",
+            "fn continue_as_new_command\\b",
+            "impl<T: PartialEq> RecordedSnapshotValue<T>",
+            "impl ActivityRetrySnapshot",
+            "fn recorded_optional_(?:u64|string)\\b",
+            "fn recorded_activity_retry_snapshot\\b",
+            "fn current_activity_retry_snapshot\\b"
           ]
         }
       ]
