@@ -162,14 +162,33 @@ def _fixture_evidence(
     )
 
 
+def _codec_semantics(
+    *,
+    fingerprint: str | None,
+    value: Mapping[str, Any],
+    wire: Mapping[str, str] | None,
+    operation: str,
+    error: str | None,
+) -> Mapping[str, Any]:
+    """Project a fixture onto behavior asserted by the official Rust consumers."""
+    return {
+        "protocol": {"fingerprint": fingerprint},
+        "value": value if operation == "encode_reject" else None,
+        "framing": {
+            "wire": wire if operation in {"round_trip", "decode_reject"} else None,
+        },
+        "failure_policy": {"operation": operation, "error": error},
+    }
+
+
 def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) -> list[Evidence]:
     _string(document.get("$schema"), f"{path}.$schema")
     if document.get("fixture_schema") != CODEC_SCHEMA:
         raise CorpusError(f"{path} must declare fixture_schema={CODEC_SCHEMA}")
     identity = _string(document.get("id"), f"{path}.id")
     protocol = _object(document.get("protocol"), f"{path}.protocol")
-    codec = _string(protocol.get("codec"), f"{path}.protocol.codec")
-    schema = _string(protocol.get("schema"), f"{path}.protocol.schema")
+    _string(protocol.get("codec"), f"{path}.protocol.codec")
+    _string(protocol.get("schema"), f"{path}.protocol.schema")
     version = _string(protocol.get("version"), f"{path}.protocol.version")
     fingerprint = _nullable_string(protocol.get("fingerprint"), f"{path}.protocol.fingerprint")
     bindings = _unique_strings(
@@ -183,7 +202,7 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     value = _object(document.get("value"), f"{path}.value")
     _string(value.get("type"), f"{path}.value.type")
     framing = _object(document.get("framing"), f"{path}.framing")
-    encoding = _string(framing.get("encoding"), f"{path}.framing.encoding")
+    _string(framing.get("encoding"), f"{path}.framing.encoding")
     wire = _nullable_string(framing.get("wire_base64"), f"{path}.framing.wire_base64")
     policy = _object(document.get("failure_policy"), f"{path}.failure_policy")
     operation = _string(policy.get("operation"), f"{path}.failure_policy.operation")
@@ -208,17 +227,13 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     )
     if len(supersedes) != len(set(supersedes)) or identity in supersedes:
         raise CorpusError(f"{path}.supersedes is invalid")
-    semantic = {
-        "protocol": {
-            "codec": codec,
-            "schema": schema,
-            "version": version,
-            "fingerprint": fingerprint,
-        },
-        "value": value if operation == "encode_reject" else None,
-        "framing": {"encoding": encoding, "wire": semantic_wire},
-        "failure_policy": {"operation": operation, "error": error},
-    }
+    semantic = _codec_semantics(
+        fingerprint=fingerprint,
+        value=value,
+        wire=semantic_wire,
+        operation=operation,
+        error=error,
+    )
     return [
         _fixture_evidence(
             category="codec",
@@ -283,7 +298,7 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
 
 
 def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidence]:
-    schema = _string(document.get("schema"), f"{path}.schema")
+    _string(document.get("schema"), f"{path}.schema")
     fingerprint = _string(document.get("fingerprint"), f"{path}.fingerprint")
     identity_version = "avro-value-v1"
     protocol_version = "1"
@@ -299,7 +314,7 @@ def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidenc
             name = _string(entry.get("name"), f"{path}.{section}[{index}].name")
             wire = entry.get("wire_base64")
             if section == "alternate":
-                semantic_wire = [
+                semantic_wires = [
                     _wire_semantics(
                         wire_value,
                         f"{path}.{section}[{index}].wire_base64[]",
@@ -311,45 +326,43 @@ def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidenc
                 ]
             elif section == "case":
                 wire_value = _string(wire, f"{path}.{section}[{index}].wire_base64")
-                semantic_wire = _wire_semantics(
-                    wire_value,
-                    f"{path}.{section}[{index}].wire_base64",
-                )
+                semantic_wires = [
+                    _wire_semantics(
+                        wire_value,
+                        f"{path}.{section}[{index}].wire_base64",
+                    )
+                ]
             elif not isinstance(wire, str):
                 raise CorpusError(f"{path}.{section}[{index}].wire_base64 must be a string")
             else:
-                semantic_wire = _wire_semantics(
-                    wire,
-                    f"{path}.{section}[{index}].wire_base64",
-                    allow_invalid=True,
+                semantic_wires = [
+                    _wire_semantics(
+                        wire,
+                        f"{path}.{section}[{index}].wire_base64",
+                        allow_invalid=True,
+                    )
+                ]
+            operation = "decode_reject" if section == "malformed" else "round_trip"
+            error = entry.get("error") if section == "malformed" else None
+            for wire_index, semantic_wire in enumerate(semantic_wires):
+                identity = f"{identity_version}:{section}:{name}"
+                if section == "alternate":
+                    identity = f"{identity}:{wire_index}"
+                evidence.append(
+                    _fixture_evidence(
+                        category="codec",
+                        identity=identity,
+                        path=path,
+                        protocol_version=protocol_version,
+                        semantic_value=_codec_semantics(
+                            fingerprint=fingerprint,
+                            value={},
+                            wire=semantic_wire,
+                            operation=operation,
+                            error=error,
+                        ),
+                    )
                 )
-            semantic = {
-                "protocol": {
-                    "codec": "avro",
-                    "schema": schema,
-                    "version": protocol_version,
-                    "fingerprint": fingerprint,
-                },
-                "value": None,
-                "framing": {
-                    "encoding": "avro-single-object",
-                    "wire": semantic_wire,
-                },
-                "failure_policy": (
-                    {"operation": "decode_reject", "error": entry.get("error")}
-                    if section == "malformed"
-                    else {"operation": "round_trip", "error": None}
-                ),
-            }
-            evidence.append(
-                _fixture_evidence(
-                    category="codec",
-                    identity=f"{identity_version}:{section}:{name}",
-                    path=path,
-                    protocol_version=protocol_version,
-                    semantic_value=semantic,
-                )
-            )
     return evidence
 
 

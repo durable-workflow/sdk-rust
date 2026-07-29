@@ -94,7 +94,10 @@ GOLDEN_FIXTURE = {
     "alternate_map_orders": [
         {
             "name": "alternate",
-            "wire_base64": ["AA==", "AQ=="],
+            "wire_base64": [
+                "wwHioz3/VYAiNw4ECm91dGVyDAIOBAhsZWZ0BAIKcmlnaHQIAngAAAh0YWlsCghkb25lAA==",
+                "wwHioz3/VYAiNw4ECHRhaWwKCGRvbmUKb3V0ZXIMAg4ECnJpZ2h0CAJ4CGxlZnQEAgAAAA==",
+            ],
         }
     ],
     "malformed_frames": [
@@ -652,6 +655,138 @@ class PolicyImmutabilityTest(unittest.TestCase):
         ):
             self._validate()
 
+    def test_consumer_ignored_metadata_cannot_satisfy_guarded_growth(self) -> None:
+        duplicate = json.loads(json.dumps(CODEC_FIXTURE))
+        duplicate["id"] = "metadata-only-relabel"
+        duplicate["protocol"]["codec"] = "renamed-codec"
+        duplicate["protocol"]["schema"] = "renamed-schema"
+        duplicate["protocol"]["version"] = "999"
+        duplicate["framing"]["encoding"] = "renamed-encoding"
+        (self.fixture.parent / "metadata-only-relabel.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            self._validate()
+
+    def test_each_alternate_map_wire_cannot_be_rewrapped_as_new_evidence(self) -> None:
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+        duplicate = json.loads(json.dumps(CODEC_FIXTURE))
+        duplicate["value"] = {
+            "type": "map",
+            "entries": [
+                {
+                    "key": "outer",
+                    "value": {
+                        "type": "array",
+                        "items": [
+                            {
+                                "type": "map",
+                                "entries": [
+                                    {
+                                        "key": "left",
+                                        "value": {"type": "long", "value": "1"},
+                                    },
+                                    {
+                                        "key": "right",
+                                        "value": {"type": "bytes", "base64": "eA=="},
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "key": "tail",
+                    "value": {"type": "string", "value": "done"},
+                },
+            ],
+        }
+        path = self.fixture.parent / "rewrapped-alternate-map-wire.json"
+        for index, wire in enumerate(
+            GOLDEN_FIXTURE["alternate_map_orders"][0]["wire_base64"]
+        ):
+            with self.subTest(index=index):
+                duplicate["id"] = f"rewrapped-alternate-map-wire-{index}"
+                duplicate["framing"]["wire_base64"] = wire
+                path.write_text(json.dumps(duplicate), encoding="utf-8")
+                try:
+                    with self.assertRaisesRegex(
+                        VALIDATOR.CorpusError,
+                        "duplicate semantic fixtures",
+                    ):
+                        self._validate()
+                finally:
+                    path.unlink()
+
+    def test_encode_rejection_values_remain_part_of_semantic_identity(self) -> None:
+        first = json.loads(json.dumps(CODEC_FIXTURE))
+        first["failure_policy"] = {
+            "operation": "encode_reject",
+            "error": "first stable error",
+        }
+        first["framing"]["wire_base64"] = None
+        second = json.loads(json.dumps(first))
+        second["value"]["value"] = "1"
+
+        first_evidence = VALIDATOR._codec_fixture(first, "first.json", "rust")[0]
+        second_evidence = VALIDATOR._codec_fixture(second, "second.json", "rust")[0]
+
+        self.assertNotEqual(
+            first_evidence.semantic_digest,
+            second_evidence.semantic_digest,
+        )
+
+    def test_encode_rejection_ignores_unconsumed_wire_metadata(self) -> None:
+        first = json.loads(json.dumps(CODEC_FIXTURE))
+        first["failure_policy"] = {
+            "operation": "encode_reject",
+            "error": "stable encode error",
+        }
+        first["framing"]["wire_base64"] = None
+        second = json.loads(json.dumps(first))
+        second["framing"]["wire_base64"] = "AQ=="
+
+        first_evidence = VALIDATOR._codec_fixture(first, "first.json", "rust")[0]
+        second_evidence = VALIDATOR._codec_fixture(second, "second.json", "rust")[0]
+
+        self.assertEqual(
+            first_evidence.semantic_digest,
+            second_evidence.semantic_digest,
+        )
+
+    def test_stable_rejection_policy_remains_part_of_semantic_identity(self) -> None:
+        first = json.loads(json.dumps(CODEC_FIXTURE))
+        first["failure_policy"] = {
+            "operation": "decode_reject",
+            "error": "first stable error",
+        }
+        second = json.loads(json.dumps(first))
+        second["failure_policy"]["error"] = "second stable error"
+
+        first_evidence = VALIDATOR._codec_fixture(first, "first.json", "rust")[0]
+        second_evidence = VALIDATOR._codec_fixture(second, "second.json", "rust")[0]
+
+        self.assertNotEqual(
+            first_evidence.semantic_digest,
+            second_evidence.semantic_digest,
+        )
+
     def test_equivalent_base64_bytes_cannot_satisfy_guarded_growth(self) -> None:
         duplicate = json.loads(json.dumps(CODEC_FIXTURE))
         duplicate["id"] = "rewrapped-golden-null"
@@ -717,7 +852,7 @@ class PolicyImmutabilityTest(unittest.TestCase):
         )
 
         self.assertTrue(result["counts"]["codec"]["related_change"])
-        self.assertEqual(result["counts"]["codec"]["current"], 6)
+        self.assertEqual(result["counts"]["codec"]["current"], 7)
         self.assertEqual(result["counts"]["codec"]["new_fixture_evidence"], 1)
         self.assertEqual(result["negative_controls"]["codec"], 1)
         self.assertEqual(
