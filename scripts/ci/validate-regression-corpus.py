@@ -30,6 +30,15 @@ SUPPORTED_FORMATS = {
 }
 SUPPORTED_CATEGORIES = {"codec", "replay"}
 SUPPORTED_BINDINGS = {"php", "python", "rust"}
+RUST_OFFICIAL_CONSUMER_SELECTORS = {
+    "codec": {
+        ("schema/avro-value-v1-golden.json", "avro-value-golden-v1"),
+        ("tests/fixtures/codec-regressions/*.json", "codec-regression-v1"),
+    },
+    "replay": {
+        ("tests/fixtures/replay-regressions/*.json", "replay-regression-v1"),
+    },
+}
 ZERO_COMMIT = re.compile(r"^0+$")
 
 
@@ -95,11 +104,19 @@ def _json(content: bytes, path: str) -> Mapping[str, Any]:
     return _object(value, path)
 
 
-def _valid_base64(value: str, context: str) -> None:
+def _wire_semantics(
+    value: str,
+    context: str,
+    *,
+    allow_invalid: bool = False,
+) -> Mapping[str, str]:
     try:
-        base64.b64decode(value, validate=True)
+        decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
-        raise CorpusError(f"{context} is not canonical base64") from error
+        if allow_invalid:
+            return {"invalid_base64": value}
+        raise CorpusError(f"{context} is not valid base64") from error
+    return {"bytes_base64": base64.b64encode(decoded).decode("ascii")}
 
 
 def _fixture_evidence(
@@ -142,7 +159,7 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     value = _object(document.get("value"), f"{path}.value")
     _string(value.get("type"), f"{path}.value.type")
     framing = _object(document.get("framing"), f"{path}.framing")
-    _string(framing.get("encoding"), f"{path}.framing.encoding")
+    encoding = _string(framing.get("encoding"), f"{path}.framing.encoding")
     wire = _nullable_string(framing.get("wire_base64"), f"{path}.framing.wire_base64")
     policy = _object(document.get("failure_policy"), f"{path}.failure_policy")
     operation = _string(policy.get("operation"), f"{path}.failure_policy.operation")
@@ -155,8 +172,11 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
         raise CorpusError(f"{path} round-trip evidence cannot declare an error")
     if operation != "round_trip" and error is None:
         raise CorpusError(f"{path} rejection evidence must declare its stable error policy")
-    if wire is not None:
-        _valid_base64(wire, f"{path}.framing.wire_base64")
+    semantic_wire = (
+        _wire_semantics(wire, f"{path}.framing.wire_base64")
+        if wire is not None
+        else None
+    )
 
     supersedes = tuple(
         _string(item, f"{path}.supersedes[]")
@@ -172,7 +192,7 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
             "fingerprint": fingerprint,
         },
         "value": value if operation == "encode_reject" else None,
-        "wire_base64": wire,
+        "framing": {"encoding": encoding, "wire": semantic_wire},
         "failure_policy": {"operation": operation, "error": error},
     }
     return [
@@ -221,7 +241,6 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
         raise CorpusError(f"{path}.supersedes is invalid")
     semantic = {
         "protocol_version": protocol_version,
-        "bindings": sorted(bindings),
         "workflow": workflow,
         "history": history,
         "command_sequence": commands,
@@ -242,7 +261,8 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
 def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidence]:
     schema = _string(document.get("schema"), f"{path}.schema")
     fingerprint = _string(document.get("fingerprint"), f"{path}.fingerprint")
-    version = "avro-value-v1"
+    identity_version = "avro-value-v1"
+    protocol_version = "1"
     evidence: list[Evidence] = []
     sections = {
         "case": _list(document.get("cases"), f"{path}.cases", nonempty=True),
@@ -254,24 +274,43 @@ def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidenc
             entry = _object(raw_entry, f"{path}.{section}[{index}]")
             name = _string(entry.get("name"), f"{path}.{section}[{index}].name")
             wire = entry.get("wire_base64")
-            semantic_wire: Any = wire
             if section == "alternate":
-                semantic_wire = list(_unique_strings(wire, f"{path}.{section}[{index}].wire_base64"))
-                for wire_value in semantic_wire:
-                    _valid_base64(wire_value, f"{path}.{section}[{index}].wire_base64[]")
+                semantic_wire = [
+                    _wire_semantics(
+                        wire_value,
+                        f"{path}.{section}[{index}].wire_base64[]",
+                    )
+                    for wire_value in _unique_strings(
+                        wire,
+                        f"{path}.{section}[{index}].wire_base64",
+                    )
+                ]
             elif section == "case":
                 wire_value = _string(wire, f"{path}.{section}[{index}].wire_base64")
-                _valid_base64(wire_value, f"{path}.{section}[{index}].wire_base64")
+                semantic_wire = _wire_semantics(
+                    wire_value,
+                    f"{path}.{section}[{index}].wire_base64",
+                )
             elif not isinstance(wire, str):
                 raise CorpusError(f"{path}.{section}[{index}].wire_base64 must be a string")
+            else:
+                semantic_wire = _wire_semantics(
+                    wire,
+                    f"{path}.{section}[{index}].wire_base64",
+                    allow_invalid=True,
+                )
             semantic = {
                 "protocol": {
                     "codec": "avro",
                     "schema": schema,
-                    "version": version,
+                    "version": protocol_version,
                     "fingerprint": fingerprint,
                 },
-                "framing": semantic_wire,
+                "value": None,
+                "framing": {
+                    "encoding": "avro-single-object",
+                    "wire": semantic_wire,
+                },
                 "failure_policy": (
                     {"operation": "decode_reject", "error": entry.get("error")}
                     if section == "malformed"
@@ -281,9 +320,9 @@ def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidenc
             evidence.append(
                 _fixture_evidence(
                     category="codec",
-                    identity=f"{version}:{section}:{name}",
+                    identity=f"{identity_version}:{section}:{name}",
                     path=path,
-                    protocol_version=version,
+                    protocol_version=protocol_version,
                     semantic_value=semantic,
                 )
             )
@@ -367,7 +406,10 @@ def _policy(document: Mapping[str, Any], path: str) -> Mapping[str, Any]:
         fixtures = _list(category.get("fixtures"), f"{path}.categories.{name}.fixtures", nonempty=True)
         for index, raw_fixture in enumerate(fixtures):
             fixture = _object(raw_fixture, f"{path}.categories.{name}.fixtures[{index}]")
-            _string(fixture.get("glob"), f"{path}.categories.{name}.fixtures[{index}].glob")
+            fixture_glob = _string(
+                fixture.get("glob"),
+                f"{path}.categories.{name}.fixtures[{index}].glob",
+            )
             fixture_format = _string(
                 fixture.get("format"),
                 f"{path}.categories.{name}.fixtures[{index}].format",
@@ -378,6 +420,14 @@ def _policy(document: Mapping[str, Any], path: str) -> Mapping[str, Any]:
                 name == "codec" and fixture_format == "avro-value-golden-v1"
             ) and not (name == "replay" and fixture_format == "golden-history-v1"):
                 raise CorpusError(f"{path}.categories.{name} contains a fixture for another category")
+            if binding == "rust" and (
+                fixture_glob,
+                fixture_format,
+            ) not in RUST_OFFICIAL_CONSUMER_SELECTORS[name]:
+                raise CorpusError(
+                    f"{path}.categories.{name}.fixtures[{index}] is not discovered "
+                    f"by an official Rust {name} corpus consumer"
+                )
         guards = _list(category.get("guards"), f"{path}.categories.{name}.guards", nonempty=True)
         for index, raw_guard in enumerate(guards):
             guard = _object(raw_guard, f"{path}.categories.{name}.guards[{index}]")

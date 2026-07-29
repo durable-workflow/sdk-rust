@@ -1,0 +1,52 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-side-effect-version-cold-replay",
+  "protocol_version": "1.2",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.side-effect-version",
+    "input": []
+  },
+  "history": [
+    {
+      "event_type": "SideEffectRecorded",
+      "payload": {
+        "sequence": 1,
+        "result": {
+          "codec": "json",
+          "blob": "\"captured-once\""
+        }
+      }
+    },
+    {
+      "event_type": "VersionMarkerRecorded",
+      "payload": {
+        "sequence": 2,
+        "change_id": "cold-restart",
+        "version": 2,
+        "min_supported": 1,
+        "max_supported": 2
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "captured": "captured-once",
+        "version": 2
+      }
+    }
+  ],
+  "expected": {
+    "side_effect_callback_calls": 0,
+    "type": "complete_workflow",
+    "result": {
+      "captured": "captured-once",
+      "version": 2
+    }
+  }
+}

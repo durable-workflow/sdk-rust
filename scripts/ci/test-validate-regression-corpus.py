@@ -72,6 +72,59 @@ CODEC_FIXTURE = {
     },
     "failure_policy": {"operation": "round_trip", "error": None},
 }
+GOLDEN_FIXTURE = {
+    "schema": "durable_workflow.protocol.Value",
+    "fingerprint": "e2a33dff55802237",
+    "cases": [
+        {
+            "name": "null",
+            "kind": "null",
+            "wire_base64": "wwHioz3/VYAiNwA=",
+        },
+        {
+            "name": "long_7",
+            "kind": "long",
+            "value": "7",
+            "wire_base64": "wwHioz3/VYAiNwQO",
+        },
+    ],
+    "alternate_map_orders": [
+        {
+            "name": "alternate",
+            "wire_base64": ["AA==", "AQ=="],
+        }
+    ],
+    "malformed_frames": [
+        {
+            "name": "invalid_base64",
+            "error": "invalid_payload_framing",
+            "wire_base64": "%%%",
+        }
+    ],
+}
+REPLAY_POLICY = {
+    "$schema": "https://example.invalid/regression-corpus-policy.json",
+    "schema": "durable-workflow.regression-corpus-policy/v1",
+    "repository": "sdk-rust",
+    "binding": "rust",
+    "categories": {
+        "replay": {
+            "fixtures": [
+                {
+                    "glob": "tests/fixtures/replay-regressions/*.json",
+                    "format": "replay-regression-v1",
+                }
+            ],
+            "guards": [REPLAY_GUARD],
+        }
+    },
+}
+REPLAY_FIXTURE = json.loads(
+    (
+        Path(__file__).resolve().parents[2]
+        / "tests/fixtures/replay-regressions/side-effect-version-cold-replay.json"
+    ).read_text(encoding="utf-8")
+)
 
 
 class GuardClassificationTest(unittest.TestCase):
@@ -159,6 +212,77 @@ fn health_check(enabled: bool) -> bool {
         self.assertFalse(self._guard_matches())
 
 
+class ReplaySemanticIdentityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="regression-corpus-replay-")
+        self.root = Path(self.temporary.name)
+        self.fixture = (
+            self.root
+            / "tests/fixtures/replay-regressions/side-effect-version-cold-replay.json"
+        )
+        self.fixture.parent.mkdir(parents=True)
+        self.fixture.write_text(json.dumps(REPLAY_FIXTURE), encoding="utf-8")
+        (self.root / "src").mkdir()
+        self.source = self.root / "src/lib.rs"
+        self.source.write_text(
+            "fn replay_commands(history: &[u8]) -> bool { !history.is_empty() }\n",
+            encoding="utf-8",
+        )
+        (self.root / "regression-corpus-policy.json").write_text(
+            json.dumps(REPLAY_POLICY),
+            encoding="utf-8",
+        )
+        self._git("init", "--quiet")
+        self._git("add", ".")
+        self._git(
+            "-c",
+            "user.name=Replay Corpus Test",
+            "-c",
+            "user.email=replay-corpus@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _git(self, *arguments: str) -> None:
+        subprocess.run(
+            ["git", *arguments],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_binding_metadata_cannot_satisfy_guarded_replay_growth(self) -> None:
+        duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
+        duplicate["id"] = "rust-side-effect-version-cold-replay-with-php-metadata"
+        duplicate["bindings"].append("php")
+        (self.fixture.parent / "binding-metadata-rewrap.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!history.is_empty()", "history.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+            )
+
+
 class PolicyImmutabilityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="regression-corpus-policy-")
@@ -171,6 +295,9 @@ class PolicyImmutabilityTest(unittest.TestCase):
         self.fixture.write_text(json.dumps(CODEC_FIXTURE), encoding="utf-8")
         self.manifest = self.fixture.parent / "manifest.txt"
         self.manifest.write_text(f"{self.fixture.name}\n", encoding="utf-8")
+        self.golden_fixture = self.root / "schema/avro-value-v1-golden.json"
+        self.golden_fixture.parent.mkdir()
+        self.golden_fixture.write_text(json.dumps(GOLDEN_FIXTURE), encoding="utf-8")
         preexisting_fixture = json.loads(json.dumps(CODEC_FIXTURE))
         preexisting_fixture["id"] = "preexisting-unselected-codec-evidence"
         preexisting_fixture["framing"]["wire_base64"] = "AQ=="
@@ -249,13 +376,7 @@ class PolicyImmutabilityTest(unittest.TestCase):
         ):
             self._validate()
 
-    def test_policy_can_extend_selectors_and_guards(self) -> None:
-        self.policy["categories"]["codec"]["fixtures"].append(
-            {
-                "glob": "tests/fixtures/additional-codec-regressions/*.json",
-                "format": "codec-regression-v1",
-            }
-        )
+    def test_policy_can_extend_guard_patterns(self) -> None:
         self.policy["categories"]["codec"]["guards"][0]["content_patterns"].append(
             "wire"
         )
@@ -264,6 +385,33 @@ class PolicyImmutabilityTest(unittest.TestCase):
         result = self._validate()
 
         self.assertEqual(result["status"], "pass")
+
+    def test_unconsumed_codec_fixture_cannot_satisfy_guarded_growth(self) -> None:
+        self.policy["categories"]["codec"]["fixtures"].append(
+            {
+                "glob": "tests/fixtures/additional-codec-regressions/*.json",
+                "format": "codec-regression-v1",
+            }
+        )
+        new_fixture = json.loads(json.dumps(CODEC_FIXTURE))
+        new_fixture["id"] = "unconsumed-codec-evidence"
+        new_fixture["framing"]["wire_base64"] = "Ag=="
+        path = self.root / "tests/fixtures/additional-codec-regressions/evidence.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(new_fixture), encoding="utf-8")
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+        self._write_policy()
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "not discovered by an official Rust codec corpus consumer",
+        ):
+            self._validate()
 
     def test_selector_expansion_cannot_manufacture_guarded_growth(self) -> None:
         self.policy["categories"]["codec"]["fixtures"].append(
@@ -282,7 +430,51 @@ class PolicyImmutabilityTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             VALIDATOR.CorpusError,
-            r"corpus did not grow \(base=2, current=2\)",
+            "not discovered by an official Rust codec corpus consumer",
+        ):
+            self._validate()
+
+    def test_cross_format_rewrap_cannot_satisfy_guarded_growth(self) -> None:
+        duplicate = json.loads(json.dumps(CODEC_FIXTURE))
+        duplicate["id"] = "rewrapped-golden-long"
+        duplicate["value"] = {"type": "long", "value": "7"}
+        duplicate["framing"]["wire_base64"] = "wwHioz3/VYAiNwQO"
+        (self.fixture.parent / "rewrapped-golden-long.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            self._validate()
+
+    def test_equivalent_base64_bytes_cannot_satisfy_guarded_growth(self) -> None:
+        duplicate = json.loads(json.dumps(CODEC_FIXTURE))
+        duplicate["id"] = "rewrapped-golden-null"
+        duplicate["value"] = {"type": "null"}
+        duplicate["framing"]["wire_base64"] = "wwHioz3/VYAiNwB="
+        (self.fixture.parent / "rewrapped-golden-null.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
         ):
             self._validate()
 
@@ -304,7 +496,7 @@ class PolicyImmutabilityTest(unittest.TestCase):
         result = self._validate()
 
         self.assertTrue(result["counts"]["codec"]["related_change"])
-        self.assertEqual(result["counts"]["codec"]["current"], 2)
+        self.assertEqual(result["counts"]["codec"]["current"], 6)
         self.assertEqual(result["counts"]["codec"]["new_fixture_evidence"], 1)
 
 
