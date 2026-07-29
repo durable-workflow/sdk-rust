@@ -415,6 +415,81 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
                 "HEAD",
             )
 
+    def test_protocol_version_cannot_satisfy_guarded_replay_growth(self) -> None:
+        duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
+        duplicate["id"] = "rust-side-effect-version-cold-replay-new-protocol"
+        duplicate["protocol_version"] = "1.3"
+        (self.fixture.parent / "protocol-version-rewrap.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!history.is_empty()", "history.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+            )
+
+    def test_workflow_input_default_cannot_satisfy_guarded_replay_growth(self) -> None:
+        duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
+        duplicate["id"] = "rust-side-effect-version-cold-replay-default-input"
+        duplicate["workflow"].pop("input")
+        (self.fixture.parent / "default-input-rewrap.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!history.is_empty()", "history.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+            )
+
+    def test_ignored_workflow_key_cannot_satisfy_guarded_replay_growth(self) -> None:
+        duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
+        duplicate["id"] = "rust-side-effect-version-cold-replay-ignored-workflow-key"
+        duplicate["workflow"]["consumer_ignored"] = "new evidence"
+        (self.fixture.parent / "ignored-workflow-key-rewrap.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!history.is_empty()", "history.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+            )
+
     def test_already_passing_replay_fixture_rejects_candidate_consumer_trick(self) -> None:
         fixture = json.loads(json.dumps(REPLAY_FIXTURE))
         fixture["id"] = "already-passing-replay-evidence"

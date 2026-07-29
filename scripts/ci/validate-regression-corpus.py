@@ -260,15 +260,18 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     if binding is not None and binding not in bindings:
         raise CorpusError(f"{path} does not name this repository's {binding} binding")
     workflow = _object(document.get("workflow"), f"{path}.workflow")
-    _string(workflow.get("type"), f"{path}.workflow.type")
-    history = document.get("history")
+    workflow_type = _string(workflow.get("type"), f"{path}.workflow.type")
+    workflow_input = workflow.get("input", [])
+    _list(workflow_input, f"{path}.workflow.input")
+    declared_history = document.get("history")
     commands = document.get("command_sequence")
-    if history is None and commands is None:
+    if declared_history is None and commands is None:
         raise CorpusError(f"{path} must include history or command_sequence")
-    if history is not None:
-        _list(history, f"{path}.history", nonempty=True)
+    if declared_history is not None:
+        _list(declared_history, f"{path}.history", nonempty=True)
     if commands is not None:
         _list(commands, f"{path}.command_sequence", nonempty=True)
+    history = declared_history if declared_history is not None else []
     expected = _object(document.get("expected"), f"{path}.expected")
     if not expected:
         raise CorpusError(f"{path}.expected must not be empty")
@@ -278,9 +281,14 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     )
     if len(supersedes) != len(set(supersedes)) or identity in supersedes:
         raise CorpusError(f"{path}.supersedes is invalid")
+    # Keep identity aligned with effective values that execute_fixture consumes
+    # or asserts. Protocol version, bindings, and extra workflow declarations
+    # are validated metadata or ignored by the official replay path.
     semantic = {
-        "protocol_version": protocol_version,
-        "workflow": workflow,
+        "workflow": {
+            "type": workflow_type,
+            "input": workflow_input,
+        },
         "history": history,
         "command_sequence": commands,
         "expected": expected,
