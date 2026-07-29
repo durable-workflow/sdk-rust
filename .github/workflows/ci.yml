@@ -11,6 +11,26 @@ permissions:
   contents: read
 
 jobs:
+  regression-corpus:
+    name: Regression corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require durable replay and codec evidence
+        env:
+          CORPUS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python scripts/ci/test-validate-regression-corpus.py
+          arguments=()
+          if [[ "$CORPUS_BASE_REF" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$CORPUS_BASE_REF" =~ ^0+$ ]]; then
+            arguments+=(--base-ref "$CORPUS_BASE_REF")
+          fi
+          python scripts/ci/validate-regression-corpus.py "${arguments[@]}"
+
   verify:
     name: Rust ${{ matrix.rust }}
     if: ${{ github.server_url == 'https://github.com' }}
@@ -71,10 +91,15 @@ jobs:
   target-branch-qualification:
     name: Target branch qualification
     if: ${{ always() }}
-    needs: [verify]
+    needs: [regression-corpus, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
+      - name: Require regression corpus validation
+        env:
+          CORPUS_RESULT: ${{ needs.regression-corpus.result }}
+        run: test "$CORPUS_RESULT" = success
+
       - name: Check out candidate source
         if: ${{ github.server_url != 'https://github.com' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6

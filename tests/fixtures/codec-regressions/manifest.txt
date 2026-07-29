@@ -1,0 +1,1 @@
+avro-value-v1-long-zero.json

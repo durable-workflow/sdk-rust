@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/policy-schema.json",
+  "schema": "durable-workflow.regression-corpus-policy/v1",
+  "repository": "sdk-rust",
+  "binding": "rust",
+  "categories": {
+    "codec": {
+      "fixtures": [
+        {
+          "glob": "schema/avro-value-v1-golden.json",
+          "format": "avro-value-golden-v1"
+        },
+        {
+          "glob": "tests/fixtures/codec-regressions/*.json",
+          "format": "codec-regression-v1"
+        }
+      ],
+      "guards": [
+        {
+          "glob": "src/lib.rs",
+          "content_patterns": [
+            "Avro",
+            "avro",
+            "Codec",
+            "codec",
+            "framing"
+          ]
+        }
+      ]
+    },
+    "replay": {
+      "fixtures": [
+        {
+          "glob": "tests/fixtures/replay-regressions/*.json",
+          "format": "replay-regression-v1"
+        }
+      ],
+      "guards": [
+        {
+          "glob": "src/lib.rs",
+          "content_patterns": [
+            "Replay",
+            "replay",
+            "History",
+            "history"
+          ]
+        }
+      ]
+    }
+  }
+}
