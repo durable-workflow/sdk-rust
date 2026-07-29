@@ -9,11 +9,13 @@ import binascii
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,19 @@ RUST_OFFICIAL_CONSUMER_SELECTORS = {
         ("tests/fixtures/replay-regressions/*.json", "replay-regression-v1"),
     },
 }
+RUST_OFFICIAL_CONSUMERS = {
+    "codec": (
+        "tests/codec_regression_corpus.rs",
+        "codec_regression_corpus",
+        "checked_in_codec_regression_corpus_uses_apache_avro",
+    ),
+    "replay": (
+        "tests/replay_regression_corpus.rs",
+        "replay_regression_corpus",
+        "checked_in_replay_regression_corpus_uses_official_worker_replay",
+    ),
+}
+CODEC_FIXTURE_MANIFEST = "tests/fixtures/codec-regressions/manifest.txt"
 ZERO_COMMIT = re.compile(r"^0+$")
 
 
@@ -54,6 +69,15 @@ class Evidence:
     protocol_version: str
     semantic_digest: str
     supersedes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConsumerResult:
+    returncode: int
+    output: str
+
+
+ConsumerRunner = Callable[[Path, str], ConsumerResult]
 
 
 def _canonical_digest(value: Any) -> str:
@@ -626,6 +650,294 @@ def _fixture_paths(policy: Mapping[str, Any], files: Mapping[str, bytes]) -> set
     }
 
 
+def _category_fixture_paths(
+    policy: Mapping[str, Any],
+    files: Mapping[str, bytes],
+    category_name: str,
+) -> set[str]:
+    category = _object(
+        _object(policy["categories"], "categories")[category_name],
+        f"categories.{category_name}",
+    )
+    return {
+        path
+        for raw_fixture in _list(
+            category["fixtures"],
+            f"categories.{category_name}.fixtures",
+        )
+        for path in files
+        if _matches(
+            path,
+            _string(_object(raw_fixture, "fixture")["glob"], "fixture.glob"),
+        )
+    }
+
+
+def _write_files(root: Path, files: Mapping[str, bytes]) -> None:
+    for path, content in files.items():
+        destination = root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+
+
+def _consumer_result(checkout: Path, category: str) -> ConsumerResult:
+    _, test_target, test_name = RUST_OFFICIAL_CONSUMERS[category]
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = str(
+        checkout.parent / f"target-{checkout.name}"
+    )
+    command = [
+        environment.get("CARGO", "cargo"),
+        "test",
+        "--quiet",
+        "--test",
+        test_target,
+        test_name,
+        "--",
+        "--exact",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=checkout,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as error:
+        output = (error.stderr or "") + (error.stdout or "")
+        return ConsumerResult(124, f"consumer timed out after 300 seconds\n{output}")
+    return ConsumerResult(
+        result.returncode,
+        f"{result.stdout}\n{result.stderr}".strip(),
+    )
+
+
+def _consumer_failure(
+    *,
+    category: str,
+    fixture: str,
+    revision: str,
+    result: ConsumerResult,
+) -> CorpusError:
+    detail = result.output[-4000:].strip()
+    suffix = f":\n{detail}" if detail else ""
+    return CorpusError(
+        f"{category} fixture {fixture} did not pass against {revision} production "
+        f"through the trusted official Rust consumer{suffix}"
+    )
+
+
+def _configure_consumer_fixture(
+    *,
+    checkouts: Sequence[Path],
+    selected_paths: set[str],
+    base_files: Mapping[str, bytes],
+    current_files: Mapping[str, bytes],
+    fixture_path: str | None,
+    category: str,
+) -> None:
+    for checkout in checkouts:
+        for path in selected_paths:
+            candidate = checkout / path
+            if candidate.is_file() or candidate.is_symlink():
+                candidate.unlink()
+        _write_files(
+            checkout,
+            {
+                path: base_files[path]
+                for path in selected_paths
+                if path in base_files
+            },
+        )
+        if fixture_path is not None:
+            _write_files(checkout, {fixture_path: current_files[fixture_path]})
+
+        if category == "codec":
+            directory = checkout / Path(CODEC_FIXTURE_MANIFEST).parent
+            names = sorted(
+                path.name
+                for path in directory.glob("*.json")
+                if path.is_file()
+            )
+            manifest = checkout / CODEC_FIXTURE_MANIFEST
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                "".join(f"{name}\n" for name in names),
+                encoding="utf-8",
+            )
+
+
+def _rust_negative_controls(
+    *,
+    policy_repository_path: str,
+    policy: Mapping[str, Any],
+    base_files: Mapping[str, bytes],
+    current_files: Mapping[str, bytes],
+    fixtures: Mapping[str, Sequence[str]],
+    consumer_runner: ConsumerRunner,
+) -> dict[str, int]:
+    if policy.get("binding") != "rust":
+        return {}
+    controlled_categories = {
+        category: tuple(sorted(paths))
+        for category, paths in fixtures.items()
+        if paths
+    }
+    if not controlled_categories:
+        return {}
+    if policy_repository_path not in base_files:
+        raise CorpusError(
+            "the base revision must contain the regression corpus policy "
+            "for Rust negative controls"
+        )
+
+    base_policy = _policy(
+        _json(
+            base_files[policy_repository_path],
+            f"base:{policy_repository_path}",
+        ),
+        f"base:{policy_repository_path}",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="durable-workflow-rust-negative-control-"
+    ) as temporary:
+        temporary_root = Path(temporary)
+        base_checkout = temporary_root / "base"
+        candidate_checkout = temporary_root / "candidate"
+        base_checkout.mkdir()
+        candidate_checkout.mkdir()
+        _write_files(base_checkout, base_files)
+        _write_files(candidate_checkout, current_files)
+
+        trusted_files = {policy_repository_path: base_files[policy_repository_path]}
+        for category in controlled_categories:
+            consumer_path = RUST_OFFICIAL_CONSUMERS[category][0]
+            if consumer_path not in base_files:
+                raise CorpusError(
+                    f"base revision has no trusted official Rust {category} consumer "
+                    f"at {consumer_path}"
+                )
+            if consumer_path not in current_files:
+                raise CorpusError(
+                    f"candidate removed the official Rust {category} consumer "
+                    f"at {consumer_path}"
+                )
+            trusted_files[consumer_path] = base_files[consumer_path]
+        _write_files(base_checkout, trusted_files)
+        _write_files(candidate_checkout, trusted_files)
+
+        results: dict[str, int] = {}
+        for category, new_paths in controlled_categories.items():
+            if category not in _object(base_policy["categories"], "base categories"):
+                raise CorpusError(
+                    f"base policy has no trusted Rust {category} consumer category"
+                )
+            selected_paths = _category_fixture_paths(
+                policy,
+                current_files,
+                category,
+            )
+            selected_paths.update(
+                _category_fixture_paths(
+                    policy,
+                    base_files,
+                    category,
+                )
+            )
+            _configure_consumer_fixture(
+                checkouts=(base_checkout, candidate_checkout),
+                selected_paths=selected_paths,
+                base_files=base_files,
+                current_files=current_files,
+                fixture_path=None,
+                category=category,
+            )
+            for revision, checkout in (
+                ("base", base_checkout),
+                ("candidate", candidate_checkout),
+            ):
+                baseline = consumer_runner(checkout, category)
+                if baseline.returncode != 0:
+                    raise _consumer_failure(
+                        category=category,
+                        fixture="<baseline corpus>",
+                        revision=revision,
+                        result=baseline,
+                    )
+
+            for fixture_path in new_paths:
+                _configure_consumer_fixture(
+                    checkouts=(base_checkout, candidate_checkout),
+                    selected_paths=selected_paths,
+                    base_files=base_files,
+                    current_files=current_files,
+                    fixture_path=fixture_path,
+                    category=category,
+                )
+                candidate_result = consumer_runner(candidate_checkout, category)
+                if candidate_result.returncode != 0:
+                    raise _consumer_failure(
+                        category=category,
+                        fixture=fixture_path,
+                        revision="candidate",
+                        result=candidate_result,
+                    )
+                base_result = consumer_runner(base_checkout, category)
+                if base_result.returncode == 0:
+                    raise CorpusError(
+                        f"{category} fixture {fixture_path} already passes against "
+                        "the base production implementation; guarded corpus growth "
+                        "requires fail-before/pass-after evidence"
+                    )
+
+            consumer_path = RUST_OFFICIAL_CONSUMERS[category][0]
+            for path in selected_paths:
+                candidate = candidate_checkout / path
+                if candidate.is_file() or candidate.is_symlink():
+                    candidate.unlink()
+            _write_files(
+                candidate_checkout,
+                {
+                    path: current_files[path]
+                    for path in selected_paths
+                    if path in current_files
+                },
+            )
+            _write_files(
+                candidate_checkout,
+                {
+                    policy_repository_path: current_files[policy_repository_path],
+                    consumer_path: current_files[consumer_path],
+                },
+            )
+            if category == "codec":
+                manifest = candidate_checkout / CODEC_FIXTURE_MANIFEST
+                if manifest.is_file() or manifest.is_symlink():
+                    manifest.unlink()
+                if CODEC_FIXTURE_MANIFEST in current_files:
+                    _write_files(
+                        candidate_checkout,
+                        {
+                            CODEC_FIXTURE_MANIFEST: current_files[
+                                CODEC_FIXTURE_MANIFEST
+                            ]
+                        },
+                    )
+            official_result = consumer_runner(candidate_checkout, category)
+            if official_result.returncode != 0:
+                raise _consumer_failure(
+                    category=category,
+                    fixture="<candidate corpus>",
+                    revision="candidate official",
+                    result=official_result,
+                )
+            results[category] = len(new_paths)
+        return results
+
+
 def _changed_paths(root: Path, base_ref: str) -> tuple[set[str], set[str]]:
     output = _run(["git", "diff", "--name-status", "--find-renames", base_ref, "--"], root)
     changed: set[str] = set()
@@ -695,7 +1007,13 @@ def _guard_matches(
     return any(re.search(pattern, changed_context) for pattern in patterns)
 
 
-def validate(root: Path, policy_path: Path, base_ref: str | None) -> dict[str, Any]:
+def validate(
+    root: Path,
+    policy_path: Path,
+    base_ref: str | None,
+    *,
+    consumer_runner: ConsumerRunner = _consumer_result,
+) -> dict[str, Any]:
     root = root.resolve()
     policy_file = policy_path if policy_path.is_absolute() else root / policy_path
     try:
@@ -707,6 +1025,7 @@ def validate(root: Path, policy_path: Path, base_ref: str | None) -> dict[str, A
     changed: set[str] = set()
     added_paths: set[str] = set()
     base_evidence: list[Evidence] = []
+    base_files: dict[str, bytes] = {}
     if base_ref and not ZERO_COMMIT.fullmatch(base_ref):
         _run(["git", "rev-parse", "--verify", f"{base_ref}^{{commit}}"], root)
         changed, added_paths = _changed_paths(root, base_ref)
@@ -748,6 +1067,7 @@ def validate(root: Path, policy_path: Path, base_ref: str | None) -> dict[str, A
                 )
 
     counts: dict[str, dict[str, int | bool]] = {}
+    negative_control_fixtures: dict[str, list[str]] = {}
     for category_name, raw_category in _object(policy["categories"], "categories").items():
         current_count = sum(item.category == category_name for item in current_evidence)
         base_count = sum(item.category == category_name for item in base_evidence)
@@ -772,18 +1092,35 @@ def validate(root: Path, policy_path: Path, base_ref: str | None) -> dict[str, A
                     f"{category_name} implementation changed but its corpus growth "
                     "does not include a newly added fixture"
                 )
+            if related:
+                negative_control_fixtures[category_name] = sorted(
+                    {
+                        item.path
+                        for item in current_evidence
+                        if item.category == category_name and item.path in added_paths
+                    }
+                )
         counts[category_name] = {
             "base": base_count,
             "current": current_count,
             "new_fixture_evidence": new_fixture_evidence,
             "related_change": related,
         }
+    negative_controls = _rust_negative_controls(
+        policy_repository_path=policy_repository_path,
+        policy=policy,
+        base_files=base_files,
+        current_files=current_files,
+        fixtures=negative_control_fixtures,
+        consumer_runner=consumer_runner,
+    )
     return {
         "schema": POLICY_SCHEMA,
         "repository": policy["repository"],
         "base_ref": base_ref,
         "changed_paths": len(changed),
         "counts": counts,
+        "negative_controls": negative_controls,
         "status": "pass",
     }
 

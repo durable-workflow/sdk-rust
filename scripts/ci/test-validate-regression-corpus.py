@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
+from unittest import mock
 
 
 def _load_validator() -> ModuleType:
@@ -127,6 +128,25 @@ REPLAY_FIXTURE = json.loads(
 )
 
 
+class ConsumerIsolationTest(unittest.TestCase):
+    def test_base_and_candidate_cargo_outputs_are_isolated(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            VALIDATOR._consumer_result(Path("/tmp/corpus/base"), "codec")
+            VALIDATOR._consumer_result(Path("/tmp/corpus/candidate"), "codec")
+
+        targets = [call.kwargs["env"]["CARGO_TARGET_DIR"] for call in run.call_args_list]
+        self.assertEqual(
+            targets,
+            ["/tmp/corpus/target-base", "/tmp/corpus/target-candidate"],
+        )
+        self.assertEqual(len(targets), len(set(targets)))
+
+
 class GuardClassificationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="regression-corpus-guard-")
@@ -222,6 +242,11 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
         )
         self.fixture.parent.mkdir(parents=True)
         self.fixture.write_text(json.dumps(REPLAY_FIXTURE), encoding="utf-8")
+        self.consumer = self.root / "tests/replay_regression_corpus.rs"
+        self.consumer.write_text(
+            "// trusted base replay consumer\n",
+            encoding="utf-8",
+        )
         (self.root / "src").mkdir()
         self.source = self.root / "src/lib.rs"
         self.source.write_text(
@@ -282,6 +307,48 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
                 "HEAD",
             )
 
+    def test_already_passing_replay_fixture_rejects_candidate_consumer_trick(self) -> None:
+        fixture = json.loads(json.dumps(REPLAY_FIXTURE))
+        fixture["id"] = "already-passing-replay-evidence"
+        fixture["expected"]["side_effect_callback_calls"] = 42
+        (self.fixture.parent / "already-passing.json").write_text(
+            json.dumps(fixture),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            "fn replay_commands(history: &[u8]) -> bool { "
+            "history.iter().next().is_some() }\n",
+            encoding="utf-8",
+        )
+        self.consumer.write_text(
+            "// candidate-only consumer manufactures a failure\n",
+            encoding="utf-8",
+        )
+
+        def already_passes(
+            checkout: Path,
+            category: str,
+        ) -> VALIDATOR.ConsumerResult:
+            self.assertEqual(category, "replay")
+            self.assertEqual(
+                (checkout / "tests/replay_regression_corpus.rs").read_text(
+                    encoding="utf-8"
+                ),
+                "// trusted base replay consumer\n",
+            )
+            return VALIDATOR.ConsumerResult(0, "fixture passes")
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "already passes against the base production implementation",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+                consumer_runner=already_passes,
+            )
+
 
 class PolicyImmutabilityTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -295,6 +362,11 @@ class PolicyImmutabilityTest(unittest.TestCase):
         self.fixture.write_text(json.dumps(CODEC_FIXTURE), encoding="utf-8")
         self.manifest = self.fixture.parent / "manifest.txt"
         self.manifest.write_text(f"{self.fixture.name}\n", encoding="utf-8")
+        self.consumer = self.root / "tests/codec_regression_corpus.rs"
+        self.consumer.write_text(
+            "// trusted base codec consumer\n",
+            encoding="utf-8",
+        )
         self.golden_fixture = self.root / "schema/avro-value-v1-golden.json"
         self.golden_fixture.parent.mkdir()
         self.golden_fixture.write_text(json.dumps(GOLDEN_FIXTURE), encoding="utf-8")
@@ -352,6 +424,25 @@ class PolicyImmutabilityTest(unittest.TestCase):
             self.root,
             Path("regression-corpus-policy.json"),
             "HEAD",
+            consumer_runner=self._consumer_runner,
+        )
+
+    @staticmethod
+    def _consumer_runner(
+        checkout: Path,
+        category: str,
+    ) -> VALIDATOR.ConsumerResult:
+        if category != "codec":
+            return VALIDATOR.ConsumerResult(1, f"unexpected category {category}")
+        fixtures = list(
+            (checkout / "tests/fixtures/codec-regressions").glob("*.json")
+        )
+        fixed = "bytes.len() > 1" in (checkout / "src/lib.rs").read_text(
+            encoding="utf-8"
+        )
+        return VALIDATOR.ConsumerResult(
+            1 if len(fixtures) > 1 and not fixed else 0,
+            "simulated official Apache Avro consumer",
         )
 
     def test_policy_cannot_hide_deleted_fixture(self) -> None:
@@ -486,18 +577,92 @@ class PolicyImmutabilityTest(unittest.TestCase):
             json.dumps(new_fixture),
             encoding="utf-8",
         )
+        self.manifest.write_text(
+            f"{self.fixture.name}\nnew-codec-evidence.json\n",
+            encoding="utf-8",
+        )
         self.source.write_text(
             self.source.read_text(encoding="utf-8").replace(
                 "!bytes.is_empty()", "bytes.len() > 1"
             ),
             encoding="utf-8",
         )
+        self.consumer.write_text(
+            "// candidate official codec consumer\n",
+            encoding="utf-8",
+        )
+        observed_consumers: list[str] = []
 
-        result = self._validate()
+        def observe_consumer(
+            checkout: Path,
+            category: str,
+        ) -> VALIDATOR.ConsumerResult:
+            observed_consumers.append(
+                (checkout / "tests/codec_regression_corpus.rs").read_text(
+                    encoding="utf-8"
+                )
+            )
+            return self._consumer_runner(checkout, category)
+
+        result = VALIDATOR.validate(
+            self.root,
+            Path("regression-corpus-policy.json"),
+            "HEAD",
+            consumer_runner=observe_consumer,
+        )
 
         self.assertTrue(result["counts"]["codec"]["related_change"])
         self.assertEqual(result["counts"]["codec"]["current"], 6)
         self.assertEqual(result["counts"]["codec"]["new_fixture_evidence"], 1)
+        self.assertEqual(result["negative_controls"]["codec"], 1)
+        self.assertEqual(
+            observed_consumers,
+            ["// trusted base codec consumer\n"] * 4
+            + ["// candidate official codec consumer\n"],
+        )
+
+    def test_already_passing_codec_fixture_rejects_candidate_consumer_trick(self) -> None:
+        fixture = json.loads(json.dumps(CODEC_FIXTURE))
+        fixture["id"] = "already-passing-codec-evidence"
+        fixture["value"] = {"type": "long", "value": "1"}
+        fixture["framing"]["wire_base64"] = "Aw=="
+        (self.fixture.parent / "already-passing.json").write_text(
+            json.dumps(fixture),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            "fn decode_avro_value_blob(bytes: &[u8]) -> bool { "
+            "bytes.first().is_some() }\n",
+            encoding="utf-8",
+        )
+        self.consumer.write_text(
+            "// candidate-only consumer manufactures a failure\n",
+            encoding="utf-8",
+        )
+
+        def already_passes(
+            checkout: Path,
+            category: str,
+        ) -> VALIDATOR.ConsumerResult:
+            self.assertEqual(category, "codec")
+            self.assertEqual(
+                (checkout / "tests/codec_regression_corpus.rs").read_text(
+                    encoding="utf-8"
+                ),
+                "// trusted base codec consumer\n",
+            )
+            return VALIDATOR.ConsumerResult(0, "fixture passes")
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "already passes against the base production implementation",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+                consumer_runner=already_passes,
+            )
 
 
 if __name__ == "__main__":
