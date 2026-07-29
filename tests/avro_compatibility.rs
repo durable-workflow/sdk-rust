@@ -10,6 +10,10 @@ use durable_workflow::{
     DEFAULT_CODEC,
 };
 
+const PACKAGED_AVRO_VALUE_SCHEMA_JSON: &str =
+    include_str!("../schema/durable_workflow.protocol.Value.v1.avsc");
+const GOLDEN_FIXTURE_JSON: &str = include_str!("../schema/avro-value-v1-golden.json");
+
 fn cases() -> Vec<(&'static str, AvroValue, &'static str)> {
     vec![
         ("null", AvroValue::Null, "wwHioz3/VYAiNwA="),
@@ -113,25 +117,45 @@ fn cases() -> Vec<(&'static str, AvroValue, &'static str)> {
 }
 
 #[test]
-fn canonical_schema_has_verified_rabin_fingerprint() {
-    let schema = Schema::parse_str(AVRO_VALUE_SCHEMA_JSON).expect("parse Value schema");
+fn packaged_runtime_schema_fingerprints_match_golden_fixture() {
+    assert_eq!(AVRO_VALUE_SCHEMA_JSON, PACKAGED_AVRO_VALUE_SCHEMA_JSON);
+
+    let schema = Schema::parse_str(PACKAGED_AVRO_VALUE_SCHEMA_JSON).expect("parse Value schema");
     let fingerprint = schema.fingerprint::<Rabin>();
     assert_eq!(fingerprint.bytes.as_slice(), AVRO_VALUE_SCHEMA_FINGERPRINT);
+    let fingerprint_hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(fingerprint_hex, AVRO_VALUE_SCHEMA_FINGERPRINT_HEX);
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
     assert_eq!(
-        fingerprint
-            .bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
-        AVRO_VALUE_SCHEMA_FINGERPRINT_HEX
+        fixture["fingerprint"]
+            .as_str()
+            .expect("fixture fingerprint"),
+        fingerprint_hex
     );
+
+    for case in fixture["cases"].as_array().expect("golden cases") {
+        let frame = BASE64
+            .decode(case["wire_base64"].as_str().expect("golden wire bytes"))
+            .expect("base64 golden");
+        assert_eq!(
+            &frame[2..10],
+            fingerprint.bytes.as_slice(),
+            "{}",
+            case["name"]
+        );
+    }
 }
 
 #[test]
 fn rust_matches_cross_language_golden_single_object_bytes() {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
-            .expect("parse checked-in golden fixture");
+        serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
     let fixture_cases = fixture["cases"].as_array().expect("golden cases");
     assert_eq!(fixture_cases.len(), cases().len());
 
@@ -165,7 +189,7 @@ fn rust_matches_cross_language_golden_single_object_bytes() {
         );
         assert_eq!(
             &BASE64.decode(expected).expect("base64 golden")[..10],
-            &[0xc3, 0x01, 0xe2, 0xa3, 0x3d, 0xff, 0x55, 0x80, 0x22, 0x37],
+            &[&[0xc3, 0x01], AVRO_VALUE_SCHEMA_FINGERPRINT.as_slice()].concat(),
             "{name}"
         );
     }
@@ -174,8 +198,7 @@ fn rust_matches_cross_language_golden_single_object_bytes() {
 #[test]
 fn shared_malformed_frames_are_rejected() {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
-            .expect("parse checked-in golden fixture");
+        serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
     for case in fixture["malformed_frames"]
         .as_array()
         .expect("malformed frames")
@@ -200,8 +223,7 @@ fn shared_malformed_frames_are_rejected() {
 #[test]
 fn shared_alternate_map_orders_decode_to_the_same_nested_value() {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
-            .expect("parse checked-in golden fixture");
+        serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
     let expected = AvroValue::Map(BTreeMap::from([
         (
             "outer".to_string(),
@@ -234,8 +256,7 @@ fn shared_alternate_map_orders_decode_to_the_same_nested_value() {
 #[test]
 fn rust_decodes_the_shared_nested_cross_language_golden() {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/avro-value-v1-golden.json"))
-            .expect("parse checked-in golden fixture");
+        serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
     let nested = fixture["cases"]
         .as_array()
         .expect("golden cases")

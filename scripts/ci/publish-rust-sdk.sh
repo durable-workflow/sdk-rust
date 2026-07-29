@@ -76,8 +76,20 @@ if [[ "$package_documentation" != "https://rust.durable-workflow.com/" ]]; then
     printf 'unexpected Rust SDK documentation metadata: %s\n' "$package_documentation" >&2
     exit 1
 fi
-if [[ "$product_train" != "$package_version" || "$server_compatibility" != "$product_train" ]]; then
-    printf 'Rust SDK package, product train, and supported server must share one release: %s, %s, %s\n' "$package_version" "$product_train" "$server_compatibility" >&2
+same_rc_channel=false
+if [[ "$package_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
+    package_release_base="${BASH_REMATCH[1]}"
+    package_release_candidate="${BASH_REMATCH[2]}"
+    if [[ "$product_train" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
+        product_release_base="${BASH_REMATCH[1]}"
+        product_release_candidate="${BASH_REMATCH[2]}"
+        if [[ "$package_release_base" == "$product_release_base" && $((10#$package_release_candidate)) -ge $((10#$product_release_candidate)) ]]; then
+            same_rc_channel=true
+        fi
+    fi
+fi
+if [[ "$server_compatibility" != "$product_train" || ( "$package_version" != "$product_train" && "$same_rc_channel" != "true" ) ]]; then
+    printf 'Rust SDK package must match or advance within the product train release candidate channel, and supported server must match the product train: %s, %s, %s\n' "$package_version" "$product_train" "$server_compatibility" >&2
     exit 1
 fi
 if [[ "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then

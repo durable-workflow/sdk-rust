@@ -16,7 +16,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
+PACKAGE_VERSION = "2.0.0-rc.6"
 PRODUCT_TRAIN = "2.0.0-rc.5"
+SERVER_VERSION = "2.0.0-rc.5"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -100,9 +102,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
             url = args[-1]
             if url.endswith("/download"):
                 output.write_bytes(b"published crate")
-            elif url.endswith("/{PRODUCT_TRAIN}"):
+            elif url.endswith("/{PACKAGE_VERSION}"):
                 output.write_text(json.dumps({{"version": {{
-                    "num": "{PRODUCT_TRAIN}",
+                    "num": "{PACKAGE_VERSION}",
                     "checksum": "{CHECKSUM}",
                     "created_at": "2026-07-22T00:00:00Z",
                 }}}}), encoding="utf-8")
@@ -141,7 +143,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
                 "CARGO_TARGET_DIR": str(self.temp / "target"),
                 "MOCK_RELEASE_COMMIT": RELEASE_COMMIT,
-                "RELEASE_TAG": PRODUCT_TRAIN,
+                "RELEASE_TAG": PACKAGE_VERSION,
                 "RUST_SDK_MANIFEST_PATH": str(manifest),
                 "RUST_SDK_RELEASE_EVIDENCE_PATH": str(self.evidence),
             }
@@ -163,25 +165,25 @@ class PublishRustSdkContractTest(unittest.TestCase):
         manifest.write_text(source.replace(old, new, 1), encoding="utf-8")
         return manifest
 
-    def test_manifest_declares_one_beta6_product_train(self) -> None:
+    def test_manifest_declares_component_and_qualified_baseline(self) -> None:
         package = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))["package"]
         metadata = package["metadata"]["durable-workflow"]
-        self.assertEqual(PRODUCT_TRAIN, package["version"])
+        self.assertEqual(PACKAGE_VERSION, package["version"])
         self.assertEqual(PRODUCT_TRAIN, metadata["product-train"])
-        self.assertEqual(PRODUCT_TRAIN, metadata["supported-server-versions"])
+        self.assertEqual(SERVER_VERSION, metadata["supported-server-versions"])
 
     def test_readme_uses_cargo_supported_exact_requirement(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn(f"cargo add durable-workflow@={PRODUCT_TRAIN}", readme)
-        self.assertNotIn(f"cargo add durable-workflow@{PRODUCT_TRAIN} --exact", readme)
+        self.assertIn(f"cargo add durable-workflow@={PACKAGE_VERSION}", readme)
+        self.assertNotIn(f"cargo add durable-workflow@{PACKAGE_VERSION} --exact", readme)
 
-    def test_release_path_accepts_and_emits_beta6_product_train(self) -> None:
+    def test_release_path_accepts_component_advance_and_emits_baseline(self) -> None:
         result = self._publish()
         self.assertEqual(0, result.returncode, result.stderr)
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
-        self.assertEqual(PRODUCT_TRAIN, evidence["package_version"])
+        self.assertEqual(PACKAGE_VERSION, evidence["package_version"])
         self.assertEqual(PRODUCT_TRAIN, evidence["product_train"])
-        self.assertEqual(PRODUCT_TRAIN, evidence["supported_server_versions"])
+        self.assertEqual(SERVER_VERSION, evidence["supported_server_versions"])
         self.assertTrue(evidence["registry_verified"])
 
     def test_release_path_rejects_a_divergent_product_train(self) -> None:
@@ -191,16 +193,25 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("must share one release", result.stderr)
+        self.assertIn("release candidate channel", result.stderr)
+
+    def test_release_path_rejects_a_component_behind_the_product_train(self) -> None:
+        manifest = self._manifest_with(
+            f'version = "{PACKAGE_VERSION}"',
+            'version = "2.0.0-rc.4"',
+        )
+        result = self._publish(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("match or advance", result.stderr)
 
     def test_release_path_rejects_a_divergent_server_version(self) -> None:
         manifest = self._manifest_with(
-            f'supported-server-versions = "{PRODUCT_TRAIN}"',
+            f'supported-server-versions = "{SERVER_VERSION}"',
             'supported-server-versions = ">=0.2,<0.3"',
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("must share one release", result.stderr)
+        self.assertIn("supported server must match", result.stderr)
 
 
 if __name__ == "__main__":

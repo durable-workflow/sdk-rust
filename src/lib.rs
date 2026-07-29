@@ -50,7 +50,9 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "query_task_timed_out",
 ];
 
-pub const AVRO_VALUE_SCHEMA_JSON: &str = r#"{"type":"record","name":"Value","namespace":"durable_workflow.protocol","fields":[{"name":"value","type":["null",{"type":"record","name":"BooleanValue","fields":[{"name":"boolean","type":"boolean"}]},{"type":"record","name":"LongValue","fields":[{"name":"long","type":"long"}]},{"type":"record","name":"DoubleValue","fields":[{"name":"double","type":"double"}]},{"type":"record","name":"BytesValue","fields":[{"name":"bytes","type":"bytes"}]},{"type":"record","name":"StringValue","fields":[{"name":"string","type":"string"}]},{"type":"record","name":"ArrayValue","fields":[{"name":"items","type":{"type":"array","items":"Value"}}]},{"type":"record","name":"MapValue","fields":[{"name":"entries","type":{"type":"map","values":"Value"}}]}]}]}"#;
+/// Canonical Avro Value schema packaged with the crate and parsed by the runtime.
+pub const AVRO_VALUE_SCHEMA_JSON: &str =
+    include_str!("../schema/durable_workflow.protocol.Value.v1.avsc");
 pub const AVRO_VALUE_SCHEMA_FINGERPRINT_HEX: &str = "e2a33dff55802237";
 pub const AVRO_VALUE_SCHEMA_FINGERPRINT: [u8; 8] = [0xe2, 0xa3, 0x3d, 0xff, 0x55, 0x80, 0x22, 0x37];
 const AVRO_SINGLE_OBJECT_MAGIC: [u8; 2] = [0xc3, 0x01];
