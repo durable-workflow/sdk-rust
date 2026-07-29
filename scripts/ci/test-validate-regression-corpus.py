@@ -104,7 +104,7 @@ GOLDEN_FIXTURE = {
         {
             "name": "invalid_base64",
             "error": "invalid_payload_framing",
-            "wire_base64": "%%%",
+            "wire_base64": "JSUl",
         }
     ],
 }
@@ -880,9 +880,16 @@ class PolicyImmutabilityTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             VALIDATOR.CorpusError,
-            "duplicate semantic fixtures",
+            "is not canonical base64",
         ):
             self._validate()
+
+    def test_malformed_golden_wire_must_be_canonical_base64(self) -> None:
+        fixture = json.loads(json.dumps(GOLDEN_FIXTURE))
+        fixture["malformed_frames"][0]["wire_base64"] = "%%%"
+
+        with self.assertRaisesRegex(VALIDATOR.CorpusError, "base64"):
+            VALIDATOR._avro_golden_fixture(fixture, "golden.json")
 
     def test_guarded_growth_accepts_new_fixture(self) -> None:
         new_fixture = json.loads(json.dumps(CODEC_FIXTURE))

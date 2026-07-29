@@ -131,16 +131,81 @@ def _json(content: bytes, path: str) -> Mapping[str, Any]:
 def _wire_semantics(
     value: str,
     context: str,
-    *,
-    allow_invalid: bool = False,
 ) -> Mapping[str, str]:
     try:
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
-        if allow_invalid:
-            return {"invalid_base64": value}
         raise CorpusError(f"{context} is not valid base64") from error
-    return {"bytes_base64": base64.b64encode(decoded).decode("ascii")}
+    canonical = base64.b64encode(decoded).decode("ascii")
+    if value != canonical:
+        raise CorpusError(f"{context} is not canonical base64")
+    return {"bytes_base64": canonical}
+
+
+def _canonical_wire_migration(base_content: bytes, current_content: bytes) -> bool:
+    """Allow the one-way repair of legacy malformed-frame wire spellings."""
+
+    try:
+        base_document = json.loads(base_content)
+        current_document = json.loads(current_content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(base_document, dict) or not isinstance(current_document, dict):
+        return False
+    base_frames = base_document.get("malformed_frames")
+    current_frames = current_document.get("malformed_frames")
+    if not isinstance(base_frames, list) or not isinstance(current_frames, list):
+        return False
+    if len(base_frames) != len(current_frames):
+        return False
+
+    migrated = False
+    for index, (base_frame, current_frame) in enumerate(
+        zip(base_frames, current_frames, strict=True)
+    ):
+        if not isinstance(base_frame, dict) or not isinstance(current_frame, dict):
+            return False
+        base_wire = base_frame.get("wire_base64")
+        current_wire = current_frame.get("wire_base64")
+        if base_wire == current_wire:
+            continue
+        if not isinstance(base_wire, str) or not isinstance(current_wire, str):
+            return False
+        try:
+            _wire_semantics(base_wire, f"base.malformed_frames[{index}].wire_base64")
+        except CorpusError:
+            pass
+        else:
+            return False
+        try:
+            _wire_semantics(
+                current_wire,
+                f"current.malformed_frames[{index}].wire_base64",
+            )
+        except CorpusError:
+            return False
+        base_frame["wire_base64"] = current_wire
+        migrated = True
+
+    return migrated and base_document == current_document
+
+
+def _replay_semantic(
+    *,
+    workflow_type: str,
+    workflow_input: Any,
+    history: Any,
+    command_sequence: Any,
+    expected: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Project every replay representation onto consumer-executed values."""
+
+    return {
+        "workflow": {"type": workflow_type, "input": workflow_input},
+        "history": history,
+        "command_sequence": command_sequence,
+        "expected": expected,
+    }
 
 
 def _fixture_evidence(
@@ -164,7 +229,6 @@ def _fixture_evidence(
 
 def _codec_semantics(
     *,
-    fingerprint: str | None,
     value: Mapping[str, Any],
     wire: Mapping[str, str] | None,
     operation: str,
@@ -172,7 +236,6 @@ def _codec_semantics(
 ) -> Mapping[str, Any]:
     """Project a fixture onto behavior asserted by the official Rust consumers."""
     return {
-        "protocol": {"fingerprint": fingerprint},
         "value": value if operation == "encode_reject" else None,
         "framing": {
             "wire": wire if operation in {"round_trip", "decode_reject"} else None,
@@ -190,7 +253,7 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     _string(protocol.get("codec"), f"{path}.protocol.codec")
     _string(protocol.get("schema"), f"{path}.protocol.schema")
     version = _string(protocol.get("version"), f"{path}.protocol.version")
-    fingerprint = _nullable_string(protocol.get("fingerprint"), f"{path}.protocol.fingerprint")
+    _nullable_string(protocol.get("fingerprint"), f"{path}.protocol.fingerprint")
     bindings = _unique_strings(
         document.get("bindings"),
         f"{path}.bindings",
@@ -228,7 +291,6 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     if len(supersedes) != len(set(supersedes)) or identity in supersedes:
         raise CorpusError(f"{path}.supersedes is invalid")
     semantic = _codec_semantics(
-        fingerprint=fingerprint,
         value=value,
         wire=semantic_wire,
         operation=operation,
@@ -284,15 +346,13 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     # Keep identity aligned with effective values that execute_fixture consumes
     # or asserts. Protocol version, bindings, and extra workflow declarations
     # are validated metadata or ignored by the official replay path.
-    semantic = {
-        "workflow": {
-            "type": workflow_type,
-            "input": workflow_input,
-        },
-        "history": history,
-        "command_sequence": commands,
-        "expected": expected,
-    }
+    semantic = _replay_semantic(
+        workflow_type=workflow_type,
+        workflow_input=workflow_input,
+        history=history,
+        command_sequence=commands,
+        expected=expected,
+    )
     return [
         _fixture_evidence(
             category="replay",
@@ -307,7 +367,7 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
 
 def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidence]:
     _string(document.get("schema"), f"{path}.schema")
-    fingerprint = _string(document.get("fingerprint"), f"{path}.fingerprint")
+    _string(document.get("fingerprint"), f"{path}.fingerprint")
     identity_version = "avro-value-v1"
     protocol_version = "1"
     evidence: list[Evidence] = []
@@ -347,7 +407,6 @@ def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidenc
                     _wire_semantics(
                         wire,
                         f"{path}.{section}[{index}].wire_base64",
-                        allow_invalid=True,
                     )
                 ]
             operation = "decode_reject" if section == "malformed" else "round_trip"
@@ -363,7 +422,6 @@ def _avro_golden_fixture(document: Mapping[str, Any], path: str) -> list[Evidenc
                         path=path,
                         protocol_version=protocol_version,
                         semantic_value=_codec_semantics(
-                            fingerprint=fingerprint,
                             value={},
                             wire=semantic_wire,
                             operation=operation,
@@ -401,14 +459,13 @@ def _golden_history_fixture(
         _object(expected, f"{path}.cases[{index}].expected")
         workflow_type = case.get("workflow_type", case.get("scenario"))
         _string(workflow_type, f"{path}.cases[{index}].workflow identity")
-        semantic = {
-            "protocol_version": protocol_version,
-            "runtime": runtime,
-            "workflow": workflow_type,
-            "start_input": case.get("start_input"),
-            "history": history,
-            "expected": expected,
-        }
+        semantic = _replay_semantic(
+            workflow_type=workflow_type,
+            workflow_input=case.get("start_input", []),
+            history=history,
+            command_sequence=case.get("command_sequence"),
+            expected=expected,
+        )
         evidence.append(
             _fixture_evidence(
                 category="replay",
@@ -1064,7 +1121,12 @@ def validate(
         # Apply current coverage to both revisions so selector expansion cannot
         # manufacture growth from pre-existing fixture evidence.
         for path in _fixture_paths(policy, base_files):
-            if current_files.get(path) != base_files[path]:
+            current_content = current_files.get(path)
+            if current_content != base_files[path] and current_content is not None:
+                if _canonical_wire_migration(base_files[path], current_content):
+                    base_files[path] = current_content
+                    continue
+            if current_content != base_files[path]:
                 raise CorpusError(f"immutable fixture file {path} was changed, moved, or removed")
         base_evidence = _inventory(policy, base_files)
     current_evidence = _inventory(policy, current_files, new_paths=added_paths)
