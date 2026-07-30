@@ -56,9 +56,6 @@ RUST_OFFICIAL_CONSUMERS = {
 RUST_REPLAY_CONSUMER_SUPPORT = "tests/replay_regression_corpus/"
 CODEC_FIXTURE_MANIFEST = "tests/fixtures/codec-regressions/manifest.txt"
 ZERO_COMMIT = re.compile(r"^0+$")
-LEGACY_MALFORMED_WIRE_REPAIRS = {
-    "%%%": "JSUl",
-}
 REPLAY_VALUE_IDENTITY_SCHEMA = "durable-workflow.replay-value-identity/v1"
 REPLAY_VALUE_IDENTITY_CONSUMER = (
     "replay_value_identity_consumer",
@@ -164,7 +161,7 @@ def _canonical_wire_replacement(value: str) -> str | None:
     try:
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError):
-        return LEGACY_MALFORMED_WIRE_REPAIRS.get(value)
+        return None
 
     canonical = base64.b64encode(decoded).decode("ascii")
     return canonical if canonical != value else None

@@ -1446,13 +1446,12 @@ class PolicyImmutabilityTest(unittest.TestCase):
 
         self.assertEqual(result["counts"]["codec"]["base"], result["counts"]["codec"]["current"])
 
-    def test_malformed_wire_migration_accepts_explicit_legacy_repair(self) -> None:
+    def test_malformed_wire_migration_rejects_invalid_base64_repair(self) -> None:
         self._set_malformed_wire_base("%%%")
         self._write_malformed_wire("JSUl")
 
-        result = self._validate()
-
-        self.assertEqual(result["counts"]["codec"]["base"], result["counts"]["codec"]["current"])
+        with self.assertRaisesRegex(VALIDATOR.CorpusError, "immutable fixture file"):
+            self._validate()
 
     def test_malformed_name_migration_accepts_decoded_behavior_reclassification(self) -> None:
         self._set_malformed_name_base("invalid_base64")
