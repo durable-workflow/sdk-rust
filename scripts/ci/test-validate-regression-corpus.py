@@ -102,7 +102,7 @@ GOLDEN_FIXTURE = {
     ],
     "malformed_frames": [
         {
-            "name": "invalid_base64",
+            "name": "decoded_non_magic_bytes",
             "error": "invalid_payload_framing",
             "wire_base64": "JSUl",
         }
@@ -1129,6 +1129,27 @@ class PolicyImmutabilityTest(unittest.TestCase):
         fixture["malformed_frames"][0]["wire_base64"] = wire
         self.golden_fixture.write_text(json.dumps(fixture), encoding="utf-8")
 
+    def _set_malformed_name_base(self, name: str) -> None:
+        fixture = json.loads(json.dumps(GOLDEN_FIXTURE))
+        fixture["malformed_frames"][0]["name"] = name
+        self.golden_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+        self._git("add", ".")
+        self._git(
+            "-c",
+            "user.name=Corpus Policy Test",
+            "-c",
+            "user.email=corpus-policy@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "legacy-malformed-name",
+        )
+
+    def _write_malformed_name(self, name: str) -> None:
+        fixture = json.loads(json.dumps(GOLDEN_FIXTURE))
+        fixture["malformed_frames"][0]["name"] = name
+        self.golden_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+
     @staticmethod
     def _consumer_runner(
         checkout: Path,
@@ -1432,6 +1453,21 @@ class PolicyImmutabilityTest(unittest.TestCase):
         result = self._validate()
 
         self.assertEqual(result["counts"]["codec"]["base"], result["counts"]["codec"]["current"])
+
+    def test_malformed_name_migration_accepts_decoded_behavior_reclassification(self) -> None:
+        self._set_malformed_name_base("invalid_base64")
+        self._write_malformed_name("decoded_non_magic_bytes")
+
+        result = self._validate()
+
+        self.assertEqual(result["counts"]["codec"]["base"], result["counts"]["codec"]["current"])
+
+    def test_malformed_name_migration_rejects_unrelated_reclassification(self) -> None:
+        self._set_malformed_name_base("invalid_base64")
+        self._write_malformed_name("unrelated_name")
+
+        with self.assertRaisesRegex(VALIDATOR.CorpusError, "immutable fixture file"):
+            self._validate()
 
     def test_guarded_growth_accepts_new_fixture(self) -> None:
         new_fixture = json.loads(json.dumps(CODEC_FIXTURE))

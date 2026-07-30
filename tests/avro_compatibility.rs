@@ -221,6 +221,44 @@ fn shared_malformed_frames_are_rejected() {
 }
 
 #[test]
+fn invalid_base64_and_decoded_non_magic_bytes_use_distinct_framing_branches() {
+    let invalid_base64_error = decode_avro_value(&PayloadEnvelope {
+        codec: DEFAULT_CODEC.to_string(),
+        blob: "%%%".to_string(),
+    })
+    .expect_err("invalid base64 payload envelope must fail")
+    .to_string();
+    assert!(invalid_base64_error.contains("invalid_payload_framing"));
+    assert!(invalid_base64_error.contains("expected strict base64 Avro single-object bytes"));
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
+    let decoded_non_magic_bytes = fixture["malformed_frames"]
+        .as_array()
+        .expect("malformed frames")
+        .iter()
+        .find(|case| case["name"] == "decoded_non_magic_bytes")
+        .expect("decoded non-magic bytes case");
+    let canonical_blob = decoded_non_magic_bytes["wire_base64"]
+        .as_str()
+        .expect("wire bytes");
+    assert_eq!(
+        BASE64.decode(canonical_blob).expect("canonical base64"),
+        b"%%%"
+    );
+
+    let non_magic_error = decode_avro_value(&PayloadEnvelope {
+        codec: DEFAULT_CODEC.to_string(),
+        blob: canonical_blob.to_string(),
+    })
+    .expect_err("decoded non-magic bytes must fail")
+    .to_string();
+    assert!(non_magic_error.contains("invalid_payload_framing"));
+    assert!(non_magic_error.contains("expected Avro single-object magic c301"));
+    assert_ne!(invalid_base64_error, non_magic_error);
+}
+
+#[test]
 fn shared_alternate_map_orders_decode_to_the_same_nested_value() {
     let fixture: serde_json::Value =
         serde_json::from_str(GOLDEN_FIXTURE_JSON).expect("parse checked-in golden fixture");
