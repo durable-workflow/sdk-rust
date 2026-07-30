@@ -190,6 +190,319 @@ def _canonical_wire_migration(base_content: bytes, current_content: bytes) -> bo
     return migrated and base_document == current_document
 
 
+def _canonical_command_type(value: str) -> str:
+    """Normalize runtime command class names to their wire discriminator."""
+
+    words = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", words).lower()
+
+
+def _canonical_replay_command(value: Any) -> Any:
+    """Normalize the command forms accepted by replay consumers."""
+
+    if not isinstance(value, Mapping):
+        return value
+
+    command = dict(value)
+    command_type = command.get("command_type")
+    if not isinstance(command_type, str) or not command_type:
+        return command
+
+    wire_type = _canonical_command_type(command_type)
+    declared_type = command.get("type")
+    if declared_type is None or declared_type == wire_type:
+        command.pop("command_type")
+        command["type"] = wire_type
+    return command
+
+
+def _canonical_replay_commands(value: Any) -> Any:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return value
+    return [_canonical_replay_command(command) for command in value]
+
+
+RUST_RECORDED_EVENT_TYPES = {
+    "ActivityScheduled",
+    "ActivityStarted",
+    "ActivityHeartbeatRecorded",
+    "ActivityRetryScheduled",
+    "ActivityCompleted",
+    "ActivityFailed",
+    "ActivityCancelled",
+    "ActivityTimedOut",
+    "TimerScheduled",
+    "TimerCancelled",
+    "TimerFired",
+    "ChildWorkflowScheduled",
+    "ChildRunCompleted",
+    "ChildRunFailed",
+    "ChildRunCancelled",
+    "ChildRunTerminated",
+    "SignalWaitOpened",
+    "SignalApplied",
+    "SideEffectRecorded",
+    "VersionMarkerRecorded",
+    "WorkflowContinuedAsNew",
+}
+
+
+def _consumer_u64(value: Any) -> int | None:
+    """Resolve the integer forms accepted by Rust's value_as_u64 helper."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= (1 << 64) - 1 else None
+    if not isinstance(value, str) or re.fullmatch(r"\+?[0-9]+", value) is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed <= (1 << 64) - 1 else None
+
+
+def _consumer_i32(value: Any, context: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < -(1 << 31)
+        or value > (1 << 31) - 1
+    ):
+        raise CorpusError(f"{context} must be a signed 32-bit integer")
+    return value
+
+
+def _consumer_replay_value(value: Any, fallback_codec: str, context: str) -> Any:
+    """Decode a published payload envelope as the Rust replay consumer does."""
+
+    if isinstance(value, Mapping):
+        codec = value.get("codec")
+        blob = value.get("blob")
+        if not isinstance(codec, str) or not isinstance(blob, str):
+            raise CorpusError(f"{context} must be a payload blob or envelope")
+    elif isinstance(value, str):
+        codec = fallback_codec
+        blob = value
+    else:
+        raise CorpusError(f"{context} must be a payload blob or envelope")
+
+    if codec == "json":
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError as error:
+            raise CorpusError(f"{context} is not valid json payload data") from error
+    if codec == "avro":
+        return {
+            "codec": "avro",
+            "wire": _wire_semantics(blob, context),
+        }
+    raise CorpusError(f"{context} uses unsupported payload codec {codec!r}")
+
+
+def _replay_event_sequence(
+    event: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    context: str,
+) -> int:
+    for source, field in (
+        (payload, "sequence"),
+        (payload, "workflow_sequence"),
+        (event, "sequence"),
+        (event, "workflow_sequence"),
+    ):
+        if field not in source:
+            continue
+        sequence = _consumer_u64(source[field])
+        if sequence is not None and sequence > 0:
+            return sequence
+        break
+    raise CorpusError(f"{context} has no positive workflow sequence")
+
+
+def _canonical_replay_history(
+    value: Any,
+    *,
+    fallback_codec: str,
+) -> Any:
+    """Project history onto the recorded commands resolved by Rust replay."""
+
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return value
+
+    history: list[tuple[int, Mapping[str, Any]]] = []
+    for index, raw_event in enumerate(value):
+        context = f"replay history[{index}]"
+        event = _object(raw_event, context)
+        has_event_type = "event_type" in event
+        has_type_alias = "type" in event
+        if has_event_type and has_type_alias:
+            raise CorpusError(f"{context} cannot contain both event_type and type")
+        event_type = _string(
+            event.get("event_type") if has_event_type else event.get("type"),
+            f"{context}.event_type",
+        )
+        raw_payload = event.get("payload")
+        payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+
+        if event_type not in RUST_RECORDED_EVENT_TYPES:
+            continue
+        if event_type.startswith("Timer") and (
+            payload.get("timer_kind", event.get("timer_kind"))
+            in {"condition_timeout", "signal_timeout"}
+        ):
+            continue
+
+        sequence = _replay_event_sequence(event, payload, context)
+        if event_type == "SideEffectRecorded":
+            result = payload.get("result")
+            if result is None:
+                raise CorpusError(f"{context}.payload.result is required")
+            codec = payload.get("payload_codec")
+            if not isinstance(codec, str):
+                codec = fallback_codec
+            canonical_event: Mapping[str, Any] = {
+                "kind": "side_effect",
+                "sequence": sequence,
+                "value": _consumer_replay_value(
+                    result,
+                    codec,
+                    f"{context}.payload.result",
+                ),
+            }
+        elif event_type == "VersionMarkerRecorded":
+            change_id = _string(
+                payload.get("change_id"),
+                f"{context}.payload.change_id",
+            )
+            version = _consumer_i32(
+                payload.get("version"),
+                f"{context}.payload.version",
+            )
+            min_supported = _consumer_i32(
+                payload.get("min_supported"),
+                f"{context}.payload.min_supported",
+            )
+            max_supported = _consumer_i32(
+                payload.get("max_supported"),
+                f"{context}.payload.max_supported",
+            )
+            if not min_supported <= version <= max_supported:
+                raise CorpusError(
+                    f"{context}.payload must satisfy "
+                    "min_supported <= version <= max_supported"
+                )
+            canonical_event = {
+                "kind": "version_marker",
+                "sequence": sequence,
+                "change_id": change_id,
+                "version": version,
+            }
+        elif event_type == "WorkflowContinuedAsNew":
+            canonical_event = {
+                "kind": "continue_as_new",
+                "sequence": sequence,
+            }
+        else:
+            payload.pop("sequence", None)
+            payload.pop("workflow_sequence", None)
+            canonical_event = {
+                "kind": event_type,
+                "sequence": sequence,
+                "payload": payload,
+            }
+        history.append((sequence, canonical_event))
+    return [event for _, event in sorted(history, key=lambda item: item[0])]
+
+
+def _merge_replay_assertions(left: Any, right: Any, context: str) -> Any:
+    """Merge two compatible partial assertions over the same replay output."""
+
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        merged = dict(left)
+        for key, value in right.items():
+            if key in merged:
+                merged[key] = _merge_replay_assertions(
+                    merged[key],
+                    value,
+                    f"{context}.{key}",
+                )
+            else:
+                merged[key] = value
+        return merged
+
+    if (
+        isinstance(left, Sequence)
+        and not isinstance(left, str | bytes)
+        and isinstance(right, Sequence)
+        and not isinstance(right, str | bytes)
+    ):
+        if len(left) != len(right):
+            raise CorpusError(f"replay command assertions conflict at {context}")
+        return [
+            _merge_replay_assertions(left_item, right_item, f"{context}[{index}]")
+            for index, (left_item, right_item) in enumerate(
+                zip(left, right, strict=True)
+            )
+        ]
+
+    if left != right:
+        raise CorpusError(f"replay command assertions conflict at {context}")
+    return left
+
+
+def _canonical_executed_commands(
+    command_sequence: Any,
+    expected: Mapping[str, Any],
+) -> Any:
+    """Collapse every consumer-supported command assertion onto one output."""
+
+    executed_commands = (
+        _canonical_replay_commands(command_sequence)
+        if command_sequence is not None
+        else None
+    )
+    expected_sequence = expected.get("command_sequence")
+    if expected_sequence is not None:
+        canonical_expected = _canonical_replay_commands(expected_sequence)
+        executed_commands = (
+            canonical_expected
+            if executed_commands is None
+            else _merge_replay_assertions(
+                executed_commands,
+                canonical_expected,
+                "command_sequence",
+            )
+        )
+
+    first_command = {
+        key: value for key, value in expected.items() if key != "command_sequence"
+    }
+    if first_command:
+        canonical_first = _canonical_replay_command(first_command)
+        if executed_commands is None:
+            executed_commands = [canonical_first]
+        elif (
+            not isinstance(executed_commands, Sequence)
+            or isinstance(executed_commands, str | bytes)
+            or len(executed_commands) != 1
+        ):
+            raise CorpusError(
+                "flattened expected command requires exactly one executed command"
+            )
+        else:
+            executed_commands = [
+                _merge_replay_assertions(
+                    executed_commands[0],
+                    canonical_first,
+                    "command_sequence[0]",
+                )
+            ]
+
+    return executed_commands
+
+
 def _replay_semantic(
     *,
     workflow_type: str,
@@ -197,14 +510,20 @@ def _replay_semantic(
     history: Any,
     command_sequence: Any,
     expected: Mapping[str, Any],
+    fallback_codec: str,
 ) -> Mapping[str, Any]:
     """Project every replay representation onto consumer-executed values."""
 
     return {
         "workflow": {"type": workflow_type, "input": workflow_input},
-        "history": history,
-        "command_sequence": command_sequence,
-        "expected": expected,
+        "history": _canonical_replay_history(
+            history,
+            fallback_codec=fallback_codec,
+        ),
+        "executed_commands": _canonical_executed_commands(
+            command_sequence,
+            expected,
+        ),
     }
 
 
@@ -352,6 +671,7 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
         history=history,
         command_sequence=commands,
         expected=expected,
+        fallback_codec="json",
     )
     return [
         _fixture_evidence(
@@ -465,6 +785,7 @@ def _golden_history_fixture(
             history=history,
             command_sequence=case.get("command_sequence"),
             expected=expected,
+            fallback_codec="json",
         )
         evidence.append(
             _fixture_evidence(
