@@ -118,6 +118,14 @@ def _nullable_string(value: Any, context: str) -> str | None:
     return _string(value, context)
 
 
+def _nullable_wire_string(value: Any, context: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CorpusError(f"{context} must be a string or null")
+    return value
+
+
 def _unique_strings(value: Any, context: str, *, allowed: set[str] | None = None) -> tuple[str, ...]:
     values = tuple(_string(item, f"{context}[]") for item in _list(value, context, nonempty=True))
     if len(values) != len(set(values)):
@@ -707,7 +715,10 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     _string(value.get("type"), f"{path}.value.type")
     framing = _object(document.get("framing"), f"{path}.framing")
     _string(framing.get("encoding"), f"{path}.framing.encoding")
-    wire = _nullable_string(framing.get("wire_base64"), f"{path}.framing.wire_base64")
+    wire = _nullable_wire_string(
+        framing.get("wire_base64"),
+        f"{path}.framing.wire_base64",
+    )
     policy = _object(document.get("failure_policy"), f"{path}.failure_policy")
     operation = _string(policy.get("operation"), f"{path}.failure_policy.operation")
     if operation not in {"round_trip", "decode_reject", "encode_reject"}:

@@ -105,7 +105,12 @@ GOLDEN_FIXTURE = {
             "name": "decoded_non_magic_bytes",
             "error": "invalid_payload_framing",
             "wire_base64": "JSUl",
-        }
+        },
+        {
+            "name": "empty_blob",
+            "error": "invalid_payload_framing",
+            "wire_base64": "",
+        },
     ],
 }
 REPLAY_POLICY = {
@@ -1270,6 +1275,112 @@ class PolicyImmutabilityTest(unittest.TestCase):
         ):
             self._validate()
 
+    def test_empty_golden_wire_rewrap_cannot_satisfy_guarded_growth(self) -> None:
+        duplicate = json.loads(json.dumps(CODEC_FIXTURE))
+        duplicate["id"] = "rewrapped-golden-empty-blob"
+        duplicate["value"] = {"type": "bytes", "base64": ""}
+        duplicate["framing"]["wire_base64"] = ""
+        duplicate["failure_policy"] = {
+            "operation": "decode_reject",
+            "error": "invalid_payload_framing",
+        }
+        (self.fixture.parent / "rewrapped-golden-empty-blob.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 1"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            self._validate()
+
+    def test_decode_operations_accept_only_canonical_string_wires(self) -> None:
+        for operation in ("round_trip", "decode_reject"):
+            with self.subTest(operation=operation, wire="empty"):
+                fixture = json.loads(json.dumps(CODEC_FIXTURE))
+                fixture["framing"]["wire_base64"] = ""
+                fixture["failure_policy"] = {
+                    "operation": operation,
+                    "error": None if operation == "round_trip" else "stable error",
+                }
+
+                evidence = VALIDATOR._codec_fixture(
+                    fixture,
+                    f"{operation}-empty.json",
+                    "rust",
+                )[0]
+
+                self.assertIsInstance(evidence.semantic_digest, str)
+
+            invalid_wires = {
+                "null": None,
+                "non-string": 0,
+                "invalid-base64": "%%%",
+                "noncanonical-base64": "AR==",
+            }
+            for label, wire in invalid_wires.items():
+                with self.subTest(operation=operation, wire=label):
+                    fixture = json.loads(json.dumps(CODEC_FIXTURE))
+                    fixture["framing"]["wire_base64"] = wire
+                    fixture["failure_policy"] = {
+                        "operation": operation,
+                        "error": None if operation == "round_trip" else "stable error",
+                    }
+
+                    with self.assertRaises(VALIDATOR.CorpusError):
+                        VALIDATOR._codec_fixture(
+                            fixture,
+                            f"{operation}-{label}.json",
+                            "rust",
+                        )
+
+            with self.subTest(operation=operation, wire="omitted"):
+                fixture = json.loads(json.dumps(CODEC_FIXTURE))
+                fixture["framing"].pop("wire_base64")
+                fixture["failure_policy"] = {
+                    "operation": operation,
+                    "error": None if operation == "round_trip" else "stable error",
+                }
+
+                with self.assertRaisesRegex(
+                    VALIDATOR.CorpusError,
+                    "must include wire_base64",
+                ):
+                    VALIDATOR._codec_fixture(
+                        fixture,
+                        f"{operation}-omitted.json",
+                        "rust",
+                    )
+
+    def test_empty_wire_remains_distinct_from_non_empty_wire(self) -> None:
+        empty = json.loads(json.dumps(CODEC_FIXTURE))
+        empty["framing"]["wire_base64"] = ""
+        empty["failure_policy"] = {
+            "operation": "decode_reject",
+            "error": "stable error",
+        }
+        non_empty = json.loads(json.dumps(empty))
+        non_empty["framing"]["wire_base64"] = "AQ=="
+
+        empty_evidence = VALIDATOR._codec_fixture(empty, "empty.json", "rust")[0]
+        non_empty_evidence = VALIDATOR._codec_fixture(
+            non_empty,
+            "non-empty.json",
+            "rust",
+        )[0]
+
+        self.assertNotEqual(
+            empty_evidence.semantic_digest,
+            non_empty_evidence.semantic_digest,
+        )
+
     def test_consumer_ignored_metadata_cannot_satisfy_guarded_growth(self) -> None:
         duplicate = json.loads(json.dumps(CODEC_FIXTURE))
         duplicate["id"] = "metadata-only-relabel"
@@ -1511,7 +1622,7 @@ class PolicyImmutabilityTest(unittest.TestCase):
         )
 
         self.assertTrue(result["counts"]["codec"]["related_change"])
-        self.assertEqual(result["counts"]["codec"]["current"], 7)
+        self.assertEqual(result["counts"]["codec"]["current"], 8)
         self.assertEqual(result["counts"]["codec"]["new_fixture_evidence"], 1)
         self.assertEqual(result["negative_controls"]["codec"], 1)
         self.assertEqual(
