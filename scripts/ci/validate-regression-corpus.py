@@ -53,6 +53,7 @@ RUST_OFFICIAL_CONSUMERS = {
         "checked_in_replay_regression_corpus_uses_official_worker_replay",
     ),
 }
+RUST_REPLAY_CONSUMER_SUPPORT = "tests/replay_regression_corpus/"
 CODEC_FIXTURE_MANIFEST = "tests/fixtures/codec-regressions/manifest.txt"
 ZERO_COMMIT = re.compile(r"^0+$")
 LEGACY_MALFORMED_WIRE_REPAIRS = {
@@ -1190,6 +1191,43 @@ def _write_files(root: Path, files: Mapping[str, bytes]) -> None:
         destination.write_bytes(content)
 
 
+def _consumer_source_paths(
+    files: Mapping[str, bytes],
+    category: str,
+) -> set[str]:
+    consumer_path = RUST_OFFICIAL_CONSUMERS[category][0]
+    paths = {consumer_path} if consumer_path in files else set()
+    if category == "replay":
+        paths.update(
+            path
+            for path in files
+            if path.startswith(RUST_REPLAY_CONSUMER_SUPPORT)
+        )
+    return paths
+
+
+def _replace_consumer_sources(
+    *,
+    checkouts: Sequence[Path],
+    category: str,
+    known_paths: set[str],
+    source_files: Mapping[str, bytes],
+) -> None:
+    sources = _consumer_source_paths(source_files, category)
+    for checkout in checkouts:
+        for path in known_paths:
+            candidate = checkout / path
+            if candidate.is_file() or candidate.is_symlink():
+                candidate.unlink()
+        _write_files(
+            checkout,
+            {
+                path: source_files[path]
+                for path in sources
+            },
+        )
+
+
 def _consumer_result(checkout: Path, category: str) -> ConsumerResult:
     _, test_target, test_name = RUST_OFFICIAL_CONSUMERS[category]
     environment = os.environ.copy()
@@ -1236,7 +1274,7 @@ def _consumer_failure(
     suffix = f":\n{detail}" if detail else ""
     return CorpusError(
         f"{category} fixture {fixture} did not pass against {revision} production "
-        f"through the trusted official Rust consumer{suffix}"
+        f"through the controlled official Rust consumer{suffix}"
     )
 
 
@@ -1323,6 +1361,7 @@ def _rust_negative_controls(
         _write_files(candidate_checkout, current_files)
 
         trusted_files = {policy_repository_path: base_files[policy_repository_path]}
+        consumer_source_paths: dict[str, set[str]] = {}
         for category in controlled_categories:
             consumer_path = RUST_OFFICIAL_CONSUMERS[category][0]
             if consumer_path not in base_files:
@@ -1335,9 +1374,20 @@ def _rust_negative_controls(
                     f"candidate removed the official Rust {category} consumer "
                     f"at {consumer_path}"
                 )
-            trusted_files[consumer_path] = base_files[consumer_path]
+            base_consumer_sources = _consumer_source_paths(base_files, category)
+            current_consumer_sources = _consumer_source_paths(current_files, category)
+            consumer_source_paths[category] = (
+                base_consumer_sources | current_consumer_sources
+            )
         _write_files(base_checkout, trusted_files)
         _write_files(candidate_checkout, trusted_files)
+        for category in controlled_categories:
+            _replace_consumer_sources(
+                checkouts=(base_checkout, candidate_checkout),
+                category=category,
+                known_paths=consumer_source_paths[category],
+                source_files=base_files,
+            )
 
         results: dict[str, int] = {}
         for category, new_paths in controlled_categories.items():
@@ -1378,6 +1428,18 @@ def _rust_negative_controls(
                         result=baseline,
                     )
 
+            if category == "replay":
+                # Replay scenarios are executable consumer code, so a newly
+                # registered workflow must accompany its fixture. Install the
+                # exact candidate consumer surface into both checkouts: only
+                # the production implementation differs between the controls.
+                _replace_consumer_sources(
+                    checkouts=(base_checkout, candidate_checkout),
+                    category=category,
+                    known_paths=consumer_source_paths[category],
+                    source_files=current_files,
+                )
+
             for fixture_path in new_paths:
                 _configure_consumer_fixture(
                     checkouts=(base_checkout, candidate_checkout),
@@ -1403,7 +1465,6 @@ def _rust_negative_controls(
                         "requires fail-before/pass-after evidence"
                     )
 
-            consumer_path = RUST_OFFICIAL_CONSUMERS[category][0]
             for path in selected_paths:
                 candidate = candidate_checkout / path
                 if candidate.is_file() or candidate.is_symlink():
@@ -1420,8 +1481,13 @@ def _rust_negative_controls(
                 candidate_checkout,
                 {
                     policy_repository_path: current_files[policy_repository_path],
-                    consumer_path: current_files[consumer_path],
                 },
+            )
+            _replace_consumer_sources(
+                checkouts=(candidate_checkout,),
+                category=category,
+                known_paths=consumer_source_paths[category],
+                source_files=current_files,
             )
             if category == "codec":
                 manifest = candidate_checkout / CODEC_FIXTURE_MANIFEST

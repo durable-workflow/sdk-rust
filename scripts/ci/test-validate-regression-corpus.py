@@ -839,11 +839,96 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
                 "HEAD",
             )
 
-    def test_already_passing_replay_fixture_rejects_candidate_consumer_trick(self) -> None:
+    def test_guarded_growth_accepts_new_replay_scenario(self) -> None:
+        fixture = json.loads(json.dumps(REPLAY_FIXTURE))
+        fixture["id"] = "rust-continue-as-new-replay"
+        fixture["workflow"]["type"] = "corpus.continue-as-new"
+        fixture["command_sequence"] = [{"type": "continue_as_new"}]
+        fixture["expected"] = {"type": "continue_as_new"}
+        new_fixture = self.fixture.parent / "continue-as-new.json"
+        new_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+        self.source.write_text(
+            "fn replay_commands(history: &[u8]) -> bool { history.len() > 1 }\n",
+            encoding="utf-8",
+        )
+        self.consumer.write_text(
+            "// candidate consumer registers corpus.continue-as-new\n",
+            encoding="utf-8",
+        )
+        support = self.root / "tests/replay_regression_corpus/continue_as_new.rs"
+        support.parent.mkdir()
+        support.write_text(
+            "// candidate continue-as-new workflow harness\n",
+            encoding="utf-8",
+        )
+        observed_consumers: list[tuple[str, str]] = []
+
+        def run_consumer(
+            checkout: Path,
+            category: str,
+        ) -> VALIDATOR.ConsumerResult:
+            self.assertEqual(category, "replay")
+            consumer = (checkout / "tests/replay_regression_corpus.rs").read_text(
+                encoding="utf-8"
+            )
+            observed_consumers.append((checkout.name, consumer))
+            if not (
+                checkout
+                / "tests/fixtures/replay-regressions/continue-as-new.json"
+            ).is_file():
+                return VALIDATOR.ConsumerResult(0, "baseline corpus passes")
+            if "registers corpus.continue-as-new" not in consumer:
+                return VALIDATOR.ConsumerResult(1, "workflow is not registered")
+            if not (
+                checkout
+                / "tests/replay_regression_corpus/continue_as_new.rs"
+            ).is_file():
+                return VALIDATOR.ConsumerResult(1, "workflow harness is missing")
+            fixed = "history.len() > 1" in (checkout / "src/lib.rs").read_text(
+                encoding="utf-8"
+            )
+            return VALIDATOR.ConsumerResult(
+                0 if fixed else 1,
+                "simulated continue-as-new replay",
+            )
+
+        result = VALIDATOR.validate(
+            self.root,
+            Path("regression-corpus-policy.json"),
+            "HEAD",
+            consumer_runner=run_consumer,
+        )
+
+        self.assertTrue(result["counts"]["replay"]["related_change"])
+        self.assertEqual(result["counts"]["replay"]["current"], 2)
+        self.assertEqual(result["counts"]["replay"]["new_fixture_evidence"], 1)
+        self.assertEqual(result["negative_controls"]["replay"], 1)
+        self.assertEqual(
+            observed_consumers,
+            [
+                ("base", "// trusted base replay consumer\n"),
+                ("candidate", "// trusted base replay consumer\n"),
+                (
+                    "candidate",
+                    "// candidate consumer registers corpus.continue-as-new\n",
+                ),
+                (
+                    "base",
+                    "// candidate consumer registers corpus.continue-as-new\n",
+                ),
+                (
+                    "candidate",
+                    "// candidate consumer registers corpus.continue-as-new\n",
+                ),
+            ],
+        )
+
+    def test_candidate_consumer_cannot_hide_already_passing_replay_fixture(self) -> None:
         fixture = json.loads(json.dumps(REPLAY_FIXTURE))
         fixture["id"] = "already-passing-replay-evidence"
         fixture["expected"]["side_effect_callback_calls"] = 42
-        (self.fixture.parent / "already-passing.json").write_text(
+        new_fixture = self.fixture.parent / "already-passing.json"
+        new_fixture.write_text(
             json.dumps(fixture),
             encoding="utf-8",
         )
@@ -853,21 +938,26 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.consumer.write_text(
-            "// candidate-only consumer manufactures a failure\n",
+            "// candidate consumer claims base production fails\n",
             encoding="utf-8",
         )
+        observed_consumers: list[str] = []
 
         def already_passes(
             checkout: Path,
             category: str,
         ) -> VALIDATOR.ConsumerResult:
             self.assertEqual(category, "replay")
-            self.assertEqual(
-                (checkout / "tests/replay_regression_corpus.rs").read_text(
-                    encoding="utf-8"
-                ),
-                "// trusted base replay consumer\n",
+            consumer = (checkout / "tests/replay_regression_corpus.rs").read_text(
+                encoding="utf-8"
             )
+            observed_consumers.append(consumer)
+            expected_consumer = (
+                "// candidate consumer claims base production fails\n"
+                if (checkout / new_fixture.relative_to(self.root)).is_file()
+                else "// trusted base replay consumer\n"
+            )
+            self.assertEqual(consumer, expected_consumer)
             return VALIDATOR.ConsumerResult(0, "fixture passes")
 
         with self.assertRaisesRegex(
@@ -880,6 +970,65 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
                 "HEAD",
                 consumer_runner=already_passes,
             )
+        self.assertEqual(
+            observed_consumers,
+            [
+                "// trusted base replay consumer\n",
+                "// trusted base replay consumer\n",
+                "// candidate consumer claims base production fails\n",
+                "// candidate consumer claims base production fails\n",
+            ],
+        )
+
+    def test_candidate_consumer_failure_cannot_bypass_candidate_pass(self) -> None:
+        fixture = json.loads(json.dumps(REPLAY_FIXTURE))
+        fixture["id"] = "consumer-forced-replay-failure"
+        fixture["expected"]["side_effect_callback_calls"] = 43
+        new_fixture = self.fixture.parent / "consumer-forced-failure.json"
+        new_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+        self.source.write_text(
+            "fn replay_commands(history: &[u8]) -> bool { history.len() > 1 }\n",
+            encoding="utf-8",
+        )
+        self.consumer.write_text(
+            "// candidate consumer forces every new scenario to fail\n",
+            encoding="utf-8",
+        )
+        observed_consumers: list[str] = []
+
+        def forced_failure(
+            checkout: Path,
+            category: str,
+        ) -> VALIDATOR.ConsumerResult:
+            self.assertEqual(category, "replay")
+            consumer = (checkout / "tests/replay_regression_corpus.rs").read_text(
+                encoding="utf-8"
+            )
+            observed_consumers.append(consumer)
+            if not (checkout / new_fixture.relative_to(self.root)).is_file():
+                return VALIDATOR.ConsumerResult(0, "baseline corpus passes")
+            if "forces every new scenario to fail" in consumer:
+                return VALIDATOR.ConsumerResult(1, "consumer-forced failure")
+            return VALIDATOR.ConsumerResult(0, "fixture passes")
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "did not pass against candidate production",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+                consumer_runner=forced_failure,
+            )
+        self.assertEqual(
+            observed_consumers,
+            [
+                "// trusted base replay consumer\n",
+                "// trusted base replay consumer\n",
+                "// candidate consumer forces every new scenario to fail\n",
+            ],
+        )
 
 
 class PolicyImmutabilityTest(unittest.TestCase):
