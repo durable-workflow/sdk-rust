@@ -61,6 +61,11 @@ REPLAY_VALUE_IDENTITY_CONSUMER = (
     "replay_value_identity_consumer",
     "canonical_replay_value_uses_official_avro_consumer",
 )
+CODEC_VALUE_IDENTITY_SCHEMA = "durable-workflow.codec-value-identity/v1"
+CODEC_VALUE_IDENTITY_CONSUMER = (
+    "codec_regression_corpus",
+    "checked_in_codec_regression_corpus_uses_apache_avro",
+)
 RUST_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -264,6 +269,92 @@ def _official_replay_value_identity(
     ):
         raise CorpusError(
             f"{context} official Rust replay value consumer disagreed with the request"
+        )
+    return response["value"]
+
+
+def _official_codec_value_identity(
+    value: Mapping[str, Any],
+    context: str,
+) -> Mapping[str, Any]:
+    """Ask the Rust corpus consumer to project a tagged value onto AvroValue."""
+
+    request_id = _canonical_digest({"value": value})
+    request = {
+        "schema": CODEC_VALUE_IDENTITY_SCHEMA,
+        "request_id": request_id,
+        "value": value,
+    }
+    test_target, test_name = CODEC_VALUE_IDENTITY_CONSUMER
+    environment = os.environ.copy()
+    command = [
+        environment.get("CARGO", "cargo"),
+        "test",
+        "--quiet",
+        "--test",
+        test_target,
+        test_name,
+        "--",
+        "--exact",
+    ]
+    with tempfile.TemporaryDirectory(
+        prefix="durable-workflow-codec-value-identity-"
+    ) as temporary:
+        request_path = Path(temporary) / "request.json"
+        response_path = Path(temporary) / "response.json"
+        request_path.write_text(
+            json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        environment["DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_REQUEST"] = str(
+            request_path
+        )
+        environment["DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_RESPONSE"] = str(
+            response_path
+        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=RUST_REPOSITORY_ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise CorpusError(
+                f"{context} official Rust codec value consumer is unavailable: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip())[-4000:]
+            suffix = f": {detail}" if detail else ""
+            raise CorpusError(
+                f"{context} official Rust codec value consumer rejected the value"
+                f"{suffix}"
+            )
+        if not response_path.is_file():
+            raise CorpusError(
+                f"{context} official Rust codec value consumer is unavailable: "
+                "no response was produced"
+            )
+        try:
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CorpusError(
+                f"{context} official Rust codec value consumer disagreed: "
+                "its response is not valid JSON"
+            ) from error
+
+    if (
+        not isinstance(response, Mapping)
+        or response.get("schema") != CODEC_VALUE_IDENTITY_SCHEMA
+        or response.get("request_id") != request_id
+        or not isinstance(response.get("value"), Mapping)
+        or not isinstance(response["value"].get("type"), str)
+    ):
+        raise CorpusError(
+            f"{context} official Rust codec value consumer disagreed with the request"
         )
     return response["value"]
 
@@ -742,8 +833,13 @@ def _codec_fixture(document: Mapping[str, Any], path: str, binding: str | None) 
     )
     if len(supersedes) != len(set(supersedes)) or identity in supersedes:
         raise CorpusError(f"{path}.supersedes is invalid")
+    semantic_value = (
+        _official_codec_value_identity(value, f"{path}.value")
+        if operation == "encode_reject"
+        else value
+    )
     semantic = _codec_semantics(
-        value=value,
+        value=semantic_value,
         wire=semantic_wire,
         operation=operation,
         error=error,

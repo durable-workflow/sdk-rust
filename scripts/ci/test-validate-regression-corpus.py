@@ -269,6 +269,90 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
         run.assert_not_called()
 
 
+class CodecValueIdentityConsumerTest(unittest.TestCase):
+    @staticmethod
+    def _responding_consumer(
+        *,
+        request_id: str | None = None,
+        value: object | None = None,
+    ):
+        def run(*_arguments, **kwargs):
+            request = json.loads(
+                Path(
+                    kwargs["env"]["DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_REQUEST"]
+                ).read_text(encoding="utf-8")
+            )
+            response = {
+                "schema": VALIDATOR.CODEC_VALUE_IDENTITY_SCHEMA,
+                "request_id": request["request_id"] if request_id is None else request_id,
+                "value": (
+                    {"type": "long", "value": 0}
+                    if value is None
+                    else value
+                ),
+            }
+            Path(
+                kwargs["env"]["DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_RESPONSE"]
+            ).write_text(json.dumps(response), encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        return run
+
+    def test_codec_identity_is_obtained_from_the_rust_consumer(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=self._responding_consumer(),
+        ) as run:
+            identity = VALIDATOR._official_codec_value_identity(
+                {"type": "long", "value": "0", "consumer_ignored": True},
+                "fixture.value",
+            )
+
+        self.assertEqual(identity, {"type": "long", "value": 0})
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[1:6],
+            [
+                "test",
+                "--quiet",
+                "--test",
+                "codec_regression_corpus",
+                "checked_in_codec_regression_corpus_uses_apache_avro",
+            ],
+        )
+
+    def test_missing_rust_codec_consumer_fails_closed(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=FileNotFoundError("cargo is unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                VALIDATOR.CorpusError,
+                "official Rust codec value consumer is unavailable",
+            ):
+                VALIDATOR._official_codec_value_identity(
+                    {"type": "long", "value": "0"},
+                    "fixture.value",
+                )
+
+    def test_rust_codec_consumer_disagreement_fails_closed(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=self._responding_consumer(request_id="another-request"),
+        ):
+            with self.assertRaisesRegex(
+                VALIDATOR.CorpusError,
+                "official Rust codec value consumer disagreed with the request",
+            ):
+                VALIDATOR._official_codec_value_identity(
+                    {"type": "long", "value": "0"},
+                    "fixture.value",
+                )
+
+
 class GuardClassificationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="regression-corpus-guard-")
@@ -1469,14 +1553,43 @@ class PolicyImmutabilityTest(unittest.TestCase):
         first["framing"]["wire_base64"] = None
         second = json.loads(json.dumps(first))
         second["value"]["value"] = "1"
+        changed_type = json.loads(json.dumps(first))
+        changed_type["value"] = {"type": "boolean", "value": False}
 
         first_evidence = VALIDATOR._codec_fixture(first, "first.json", "rust")[0]
         second_evidence = VALIDATOR._codec_fixture(second, "second.json", "rust")[0]
+        changed_type_evidence = VALIDATOR._codec_fixture(
+            changed_type,
+            "changed-type.json",
+            "rust",
+        )[0]
 
         self.assertNotEqual(
             first_evidence.semantic_digest,
             second_evidence.semantic_digest,
         )
+        self.assertNotEqual(
+            first_evidence.semantic_digest,
+            changed_type_evidence.semantic_digest,
+        )
+
+    def test_malformed_encode_rejection_value_fails_closed(self) -> None:
+        fixture = json.loads(json.dumps(CODEC_FIXTURE))
+        fixture["failure_policy"] = {
+            "operation": "encode_reject",
+            "error": "stable encode error",
+        }
+        fixture["framing"]["wire_base64"] = None
+        fixture["value"] = {
+            "type": "array",
+            "items": [{"type": "long"}],
+        }
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "official Rust codec value consumer rejected the value",
+        ):
+            VALIDATOR._codec_fixture(fixture, "malformed.json", "rust")
 
     def test_encode_rejection_ignores_unconsumed_wire_metadata(self) -> None:
         first = json.loads(json.dumps(CODEC_FIXTURE))
@@ -1495,6 +1608,33 @@ class PolicyImmutabilityTest(unittest.TestCase):
             first_evidence.semantic_digest,
             second_evidence.semantic_digest,
         )
+
+    def test_ignored_encode_rejection_value_member_is_duplicate_evidence(self) -> None:
+        first = json.loads(json.dumps(CODEC_FIXTURE))
+        first["id"] = "non-finite-double"
+        first["failure_policy"] = {
+            "operation": "encode_reject",
+            "error": "non_finite_float",
+        }
+        first["framing"]["wire_base64"] = None
+        first["value"] = {"type": "double", "value": "NaN"}
+        decorated = json.loads(json.dumps(first))
+        decorated["id"] = "decorated-non-finite-double"
+        decorated["value"]["consumer_ignored"] = {"note": "metadata only"}
+        (self.fixture.parent / "non-finite-double.json").write_text(
+            json.dumps(first),
+            encoding="utf-8",
+        )
+        (self.fixture.parent / "decorated-non-finite-double.json").write_text(
+            json.dumps(decorated),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            self._validate()
 
     def test_stable_rejection_policy_remains_part_of_semantic_identity(self) -> None:
         first = json.loads(json.dumps(CODEC_FIXTURE))

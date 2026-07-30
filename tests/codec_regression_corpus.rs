@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, env, fs, path::Path};
 
 use durable_workflow::{
     decode_avro_value, encode_avro_value, AvroValue, PayloadEnvelope,
@@ -8,6 +8,9 @@ use serde_json::Value;
 
 const FIXTURE_DIRECTORY: &str = "tests/fixtures/codec-regressions";
 const FIXTURE_MANIFEST: &str = include_str!("fixtures/codec-regressions/manifest.txt");
+const IDENTITY_SCHEMA: &str = "durable-workflow.codec-value-identity/v1";
+const IDENTITY_REQUEST_ENV: &str = "DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_REQUEST";
+const IDENTITY_RESPONSE_ENV: &str = "DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_RESPONSE";
 
 fn tagged_value(value: &Value) -> AvroValue {
     match value["type"].as_str().expect("tagged value type") {
@@ -60,8 +63,74 @@ fn tagged_value(value: &Value) -> AvroValue {
     }
 }
 
-#[test]
-fn checked_in_codec_regression_corpus_uses_apache_avro() {
+fn canonical_avro_value(value: AvroValue) -> Value {
+    match value {
+        AvroValue::Null => serde_json::json!({"type": "null"}),
+        AvroValue::Boolean(value) => {
+            serde_json::json!({"type": "boolean", "value": value})
+        }
+        AvroValue::Long(value) => serde_json::json!({"type": "long", "value": value}),
+        AvroValue::Double(value) => serde_json::json!({
+            "type": "double",
+            "bits": format!("{:016x}", value.to_bits()),
+        }),
+        AvroValue::Bytes(value) => serde_json::json!({
+            "type": "bytes",
+            "base64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                value,
+            ),
+        }),
+        AvroValue::String(value) => serde_json::json!({"type": "string", "value": value}),
+        AvroValue::Array(values) => serde_json::json!({
+            "type": "array",
+            "items": values
+                .into_iter()
+                .map(canonical_avro_value)
+                .collect::<Vec<_>>(),
+        }),
+        AvroValue::Map(values) => serde_json::json!({
+            "type": "map",
+            "entries": values
+                .into_iter()
+                .map(|(key, value)| serde_json::json!({
+                    "key": key,
+                    "value": canonical_avro_value(value),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn process_identity_request(request_path: &Path, response_path: &Path) -> Result<(), String> {
+    let request: Value = serde_json::from_str(
+        &fs::read_to_string(request_path)
+            .map_err(|error| format!("read {}: {error}", request_path.display()))?,
+    )
+    .map_err(|error| format!("parse {}: {error}", request_path.display()))?;
+    if request["schema"] != IDENTITY_SCHEMA {
+        return Err("codec value identity request has an unsupported schema".to_string());
+    }
+    let request_id = request["request_id"]
+        .as_str()
+        .ok_or_else(|| "codec value identity request has no request_id".to_string())?;
+    let value = request
+        .get("value")
+        .ok_or_else(|| "codec value identity request has no value".to_string())?;
+    let response = serde_json::json!({
+        "schema": IDENTITY_SCHEMA,
+        "request_id": request_id,
+        "value": canonical_avro_value(tagged_value(value)),
+    });
+    fs::write(
+        response_path,
+        serde_json::to_vec(&response)
+            .map_err(|error| format!("encode codec value identity response: {error}"))?,
+    )
+    .map_err(|error| format!("write {}: {error}", response_path.display()))
+}
+
+fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
         .lines()
@@ -146,4 +215,43 @@ fn checked_in_codec_regression_corpus_uses_apache_avro() {
             other => panic!("unsupported failure policy {other}"),
         }
     }
+}
+
+#[test]
+fn checked_in_codec_regression_corpus_uses_apache_avro() {
+    match (
+        env::var_os(IDENTITY_REQUEST_ENV),
+        env::var_os(IDENTITY_RESPONSE_ENV),
+    ) {
+        (Some(request), Some(response)) => {
+            process_identity_request(Path::new(&request), Path::new(&response))
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        (None, None) => check_corpus(),
+        _ => {
+            panic!("{IDENTITY_REQUEST_ENV} and {IDENTITY_RESPONSE_ENV} must be configured together")
+        }
+    }
+}
+
+#[test]
+fn ignored_tagged_value_members_do_not_change_encode_rejection() {
+    let value = serde_json::json!({"type": "double", "value": "NaN"});
+    let decorated = serde_json::json!({"type": "double", "value": "NaN", "consumer_ignored": true});
+
+    let value = tagged_value(&value);
+    let decorated = tagged_value(&decorated);
+
+    assert_eq!(
+        canonical_avro_value(value.clone()),
+        canonical_avro_value(decorated.clone()),
+    );
+    assert_eq!(
+        encode_avro_value(&value)
+            .expect_err("non-finite double must be rejected")
+            .to_string(),
+        encode_avro_value(&decorated)
+            .expect_err("decorated non-finite double must be rejected")
+            .to_string(),
+    );
 }
