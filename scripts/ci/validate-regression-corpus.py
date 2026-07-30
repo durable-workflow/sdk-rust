@@ -55,6 +55,9 @@ RUST_OFFICIAL_CONSUMERS = {
 }
 CODEC_FIXTURE_MANIFEST = "tests/fixtures/codec-regressions/manifest.txt"
 ZERO_COMMIT = re.compile(r"^0+$")
+LEGACY_MALFORMED_WIRE_REPAIRS = {
+    "%%%": "JSUl",
+}
 REPLAY_VALUE_IDENTITY_SCHEMA = "durable-workflow.replay-value-identity/v1"
 REPLAY_VALUE_IDENTITY_CONSUMER = (
     "replay_value_identity_consumer",
@@ -152,6 +155,18 @@ def _wire_semantics(
     decoded = _canonical_wire_bytes(value, context)
     canonical = base64.b64encode(decoded).decode("ascii")
     return {"bytes_base64": canonical}
+
+
+def _canonical_wire_replacement(value: str) -> str | None:
+    """Return the only permitted canonical replacement for a legacy wire."""
+
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return LEGACY_MALFORMED_WIRE_REPAIRS.get(value)
+
+    canonical = base64.b64encode(decoded).decode("ascii")
+    return canonical if canonical != value else None
 
 
 def _official_replay_value_identity(
@@ -276,11 +291,7 @@ def _canonical_wire_migration(base_content: bytes, current_content: bytes) -> bo
             continue
         if not isinstance(base_wire, str) or not isinstance(current_wire, str):
             return False
-        try:
-            _wire_semantics(base_wire, f"base.malformed_frames[{index}].wire_base64")
-        except CorpusError:
-            pass
-        else:
+        if current_wire != _canonical_wire_replacement(base_wire):
             return False
         try:
             _wire_semantics(

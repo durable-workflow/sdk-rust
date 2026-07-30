@@ -959,6 +959,27 @@ class PolicyImmutabilityTest(unittest.TestCase):
             consumer_runner=self._consumer_runner,
         )
 
+    def _set_malformed_wire_base(self, wire: str) -> None:
+        fixture = json.loads(json.dumps(GOLDEN_FIXTURE))
+        fixture["malformed_frames"][0]["wire_base64"] = wire
+        self.golden_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+        self._git("add", ".")
+        self._git(
+            "-c",
+            "user.name=Corpus Policy Test",
+            "-c",
+            "user.email=corpus-policy@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "legacy-malformed-wire",
+        )
+
+    def _write_malformed_wire(self, wire: str) -> None:
+        fixture = json.loads(json.dumps(GOLDEN_FIXTURE))
+        fixture["malformed_frames"][0]["wire_base64"] = wire
+        self.golden_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+
     @staticmethod
     def _consumer_runner(
         checkout: Path,
@@ -1239,6 +1260,29 @@ class PolicyImmutabilityTest(unittest.TestCase):
 
         with self.assertRaisesRegex(VALIDATOR.CorpusError, "base64"):
             VALIDATOR._avro_golden_fixture(fixture, "golden.json")
+
+    def test_malformed_wire_migration_rejects_different_decoded_bytes(self) -> None:
+        self._set_malformed_wire_base("AR==")
+        self._write_malformed_wire("Ag==")
+
+        with self.assertRaisesRegex(VALIDATOR.CorpusError, "immutable fixture file"):
+            self._validate()
+
+    def test_malformed_wire_migration_accepts_same_decoded_bytes(self) -> None:
+        self._set_malformed_wire_base("AR==")
+        self._write_malformed_wire("AQ==")
+
+        result = self._validate()
+
+        self.assertEqual(result["counts"]["codec"]["base"], result["counts"]["codec"]["current"])
+
+    def test_malformed_wire_migration_accepts_explicit_legacy_repair(self) -> None:
+        self._set_malformed_wire_base("%%%")
+        self._write_malformed_wire("JSUl")
+
+        result = self._validate()
+
+        self.assertEqual(result["counts"]["codec"]["base"], result["counts"]["codec"]["current"])
 
     def test_guarded_growth_accepts_new_fixture(self) -> None:
         new_fixture = json.loads(json.dumps(CODEC_FIXTURE))
