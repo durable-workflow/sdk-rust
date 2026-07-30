@@ -386,15 +386,17 @@ def _consumer_replay_value(value: Any, fallback_codec: str, context: str) -> Any
         codec = value.get("codec")
         blob = value.get("blob")
         if not isinstance(codec, str) or not isinstance(blob, str):
-            codec = None
+            raise CorpusError(
+                f"{context} must be a payload blob or published payload envelope"
+            )
     elif isinstance(value, str):
         codec = fallback_codec
         blob = value
     else:
-        codec = None
-        blob = None
+        raise CorpusError(
+            f"{context} must be a payload blob or published payload envelope"
+        )
     if codec == "avro":
-        assert isinstance(blob, str)
         _canonical_wire_bytes(blob, context)
     return _official_replay_value_identity(value, fallback_codec, context)
 

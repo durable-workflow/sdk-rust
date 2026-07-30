@@ -42,18 +42,24 @@ fn consumer_typed_json_value(value: &Value) -> Result<AvroValue, String> {
 }
 
 fn canonical_replay_value(value: &Value, fallback_codec: &str) -> Result<Value, String> {
-    let envelope = value
-        .as_object()
-        .and_then(|value| {
-            value
-                .get("codec")
-                .and_then(Value::as_str)
-                .zip(value.get("blob").and_then(Value::as_str))
-        })
-        .or_else(|| value.as_str().map(|blob| (fallback_codec, blob)));
-
-    let Some((codec, blob)) = envelope else {
-        return consumer_typed_json_value(value).map(canonical_avro_value);
+    let (codec, blob) = if let Some(envelope) = value.as_object() {
+        let codec = envelope
+            .get("codec")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "replay value is not a payload blob or published payload envelope".to_string()
+            })?;
+        let blob = envelope
+            .get("blob")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "replay value is not a payload blob or published payload envelope".to_string()
+            })?;
+        (codec, blob)
+    } else if let Some(blob) = value.as_str() {
+        (fallback_codec, blob)
+    } else {
+        return Err("replay value is not a payload blob or published payload envelope".to_string());
     };
     match codec {
         JSON_CODEC => {
@@ -133,6 +139,11 @@ fn canonical_replay_value_uses_official_avro_consumer() {
                     .expect("decode JSON replay identity"),
                 canonical_replay_value(&changed_avro_value, JSON_CODEC)
                     .expect("decode changed Avro replay identity"),
+            );
+            assert!(
+                canonical_replay_value(&json!({"captured": "once"}), JSON_CODEC,)
+                    .expect_err("raw JSON values are not published side-effect envelopes")
+                    .contains("published payload envelope")
             );
         }
         _ => panic!("{REQUEST_ENV} and {RESPONSE_ENV} must be configured together"),

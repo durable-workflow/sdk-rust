@@ -245,6 +245,24 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
                     "fixture.result",
                 )
 
+    def test_non_envelope_side_effect_value_fails_closed(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=self._responding_consumer(),
+        ) as run:
+            with self.assertRaisesRegex(
+                VALIDATOR.CorpusError,
+                "published payload envelope",
+            ):
+                VALIDATOR._consumer_replay_value(
+                    {"captured": "once"},
+                    "json",
+                    "fixture.result",
+                )
+
+        run.assert_not_called()
+
 
 class GuardClassificationTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -671,6 +689,20 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
                 self.root,
                 Path("regression-corpus-policy.json"),
                 "HEAD",
+            )
+
+    def test_non_envelope_side_effect_value_is_rejected(self) -> None:
+        malformed = json.loads(json.dumps(REPLAY_FIXTURE))
+        malformed["history"][0]["payload"]["result"] = {"captured": "once"}
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "published payload envelope",
+        ):
+            VALIDATOR._replay_fixture(
+                malformed,
+                "malformed.json",
+                "rust",
             )
 
     def test_changed_avro_side_effect_value_remains_distinct_evidence(self) -> None:

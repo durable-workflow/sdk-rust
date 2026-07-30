@@ -367,9 +367,21 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
     }
 
     let completion_path = format!("/api/worker/workflow-tasks/{task_id}/complete");
-    let completion = server.request_body(&completion_path).ok_or_else(|| {
-        format!("{fixture_id} did not complete through the official Rust worker path")
-    })?;
+    let completion = match server.request_body(&completion_path) {
+        Some(completion) => completion,
+        None => {
+            let failure_path = format!("/api/worker/workflow-tasks/{task_id}/fail");
+            let detail = server
+                .request_body(&failure_path)
+                .and_then(|failure| failure["failure"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| {
+                    "did not complete through the official Rust worker path".to_string()
+                });
+            return Err(format!(
+                "{fixture_id} official Rust worker rejected replay: {detail}"
+            ));
+        }
+    };
     let commands = completion["commands"]
         .as_array()
         .ok_or_else(|| format!("{fixture_id} completion has no command sequence"))?
@@ -450,6 +462,22 @@ async fn json_and_avro_side_effect_rewraps_execute_identically() {
         .expect("Avro replay rewrap must execute");
 
     assert_eq!(json_result, avro_result);
+}
+
+#[tokio::test]
+async fn non_envelope_side_effect_value_is_rejected_by_official_worker() {
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/replay-regressions/side-effect-version-cold-replay.json"
+    ))
+    .expect("parse checked-in replay fixture");
+    fixture["id"] = json!("rust-side-effect-version-cold-replay-non-envelope");
+    fixture["history"][0]["payload"]["result"] = json!({"captured": "once"});
+
+    let error = execute_fixture(&fixture)
+        .await
+        .expect_err("raw side-effect values must not execute as published replay evidence");
+
+    assert!(error.contains("side_effect_payload_malformed"), "{error}");
 }
 
 #[tokio::test]
