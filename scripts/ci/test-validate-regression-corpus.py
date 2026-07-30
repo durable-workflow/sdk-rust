@@ -131,6 +131,8 @@ REPLAY_FIXTURE = json.loads(
         / "tests/fixtures/replay-regressions/side-effect-version-cold-replay.json"
     ).read_text(encoding="utf-8")
 )
+CAPTURED_ONCE_AVRO = "wwHioz3/VYAiNwoaY2FwdHVyZWQtb25jZQ=="
+CAPTURED_TWICE_AVRO = "wwHioz3/VYAiNwocY2FwdHVyZWQtdHdpY2U="
 
 
 class ConsumerIsolationTest(unittest.TestCase):
@@ -150,6 +152,98 @@ class ConsumerIsolationTest(unittest.TestCase):
             ["/tmp/corpus/target-base", "/tmp/corpus/target-candidate"],
         )
         self.assertEqual(len(targets), len(set(targets)))
+
+
+class ReplayValueIdentityConsumerTest(unittest.TestCase):
+    @staticmethod
+    def _responding_consumer(
+        *,
+        request_id: str | None = None,
+        value: object | None = None,
+    ):
+        def run(*_arguments, **kwargs):
+            request = json.loads(
+                Path(
+                    kwargs["env"][
+                        "DURABLE_WORKFLOW_REPLAY_VALUE_IDENTITY_REQUEST"
+                    ]
+                ).read_text(encoding="utf-8")
+            )
+            response = {
+                "schema": VALIDATOR.REPLAY_VALUE_IDENTITY_SCHEMA,
+                "request_id": request["request_id"] if request_id is None else request_id,
+                "value": (
+                    {"type": "string", "value": "captured-once"}
+                    if value is None
+                    else value
+                ),
+            }
+            Path(
+                kwargs["env"]["DURABLE_WORKFLOW_REPLAY_VALUE_IDENTITY_RESPONSE"]
+            ).write_text(json.dumps(response), encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        return run
+
+    def test_replay_identity_is_obtained_from_the_rust_consumer(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=self._responding_consumer(),
+        ) as run:
+            identity = VALIDATOR._official_replay_value_identity(
+                {"codec": "json", "blob": '"captured-once"'},
+                "json",
+                "fixture.result",
+            )
+
+        self.assertEqual(
+            identity,
+            {"type": "string", "value": "captured-once"},
+        )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[1:6],
+            [
+                "test",
+                "--quiet",
+                "--test",
+                "replay_value_identity_consumer",
+                "canonical_replay_value_uses_official_avro_consumer",
+            ],
+        )
+
+    def test_missing_rust_consumer_fails_closed(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=FileNotFoundError("cargo is unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                VALIDATOR.CorpusError,
+                "official Rust replay value consumer is unavailable",
+            ):
+                VALIDATOR._official_replay_value_identity(
+                    {"codec": "json", "blob": '"captured-once"'},
+                    "json",
+                    "fixture.result",
+                )
+
+    def test_rust_consumer_disagreement_fails_closed(self) -> None:
+        with mock.patch.object(
+            VALIDATOR.subprocess,
+            "run",
+            side_effect=self._responding_consumer(request_id="another-request"),
+        ):
+            with self.assertRaisesRegex(
+                VALIDATOR.CorpusError,
+                "official Rust replay value consumer disagreed with the request",
+            ):
+                VALIDATOR._official_replay_value_identity(
+                    {"codec": "json", "blob": '"captured-once"'},
+                    "json",
+                    "fixture.result",
+                )
 
 
 class GuardClassificationTest(unittest.TestCase):
@@ -540,6 +634,54 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
         changed["history"][1]["payload"]["max_supported"] = 3
         changed["command_sequence"][0]["result"]["version"] = 3
         changed["expected"]["result"]["version"] = 3
+
+        original_evidence = VALIDATOR._replay_fixture(
+            REPLAY_FIXTURE,
+            "original.json",
+            "rust",
+        )[0]
+        changed_evidence = VALIDATOR._replay_fixture(
+            changed,
+            "changed.json",
+            "rust",
+        )[0]
+
+        self.assertNotEqual(
+            original_evidence.semantic_digest,
+            changed_evidence.semantic_digest,
+        )
+
+    def test_json_and_avro_side_effect_rewraps_are_duplicate_evidence(self) -> None:
+        duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
+        duplicate["id"] = "rust-side-effect-version-cold-replay-avro"
+        duplicate["history"][0]["payload"]["result"] = {
+            "codec": "avro",
+            "blob": CAPTURED_ONCE_AVRO,
+        }
+        (self.fixture.parent / "avro-side-effect-rewrap.json").write_text(
+            json.dumps(duplicate),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "duplicate semantic fixtures",
+        ):
+            VALIDATOR.validate(
+                self.root,
+                Path("regression-corpus-policy.json"),
+                "HEAD",
+            )
+
+    def test_changed_avro_side_effect_value_remains_distinct_evidence(self) -> None:
+        changed = json.loads(json.dumps(REPLAY_FIXTURE))
+        changed["id"] = "rust-side-effect-version-cold-replay-avro-changed"
+        changed["history"][0]["payload"]["result"] = {
+            "codec": "avro",
+            "blob": CAPTURED_TWICE_AVRO,
+        }
+        changed["command_sequence"][0]["result"]["captured"] = "captured-twice"
+        changed["expected"]["result"]["captured"] = "captured-twice"
 
         original_evidence = VALIDATOR._replay_fixture(
             REPLAY_FIXTURE,

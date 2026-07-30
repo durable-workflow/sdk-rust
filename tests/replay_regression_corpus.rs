@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use durable_workflow::{json, Client, Value, Worker, JSON_CODEC};
+use durable_workflow::{encode_avro_value, json, AvroValue, Client, Value, Worker, JSON_CODEC};
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
 
@@ -426,6 +426,30 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     }
+}
+
+#[tokio::test]
+async fn json_and_avro_side_effect_rewraps_execute_identically() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/replay-regressions/side-effect-version-cold-replay.json"
+    ))
+    .expect("parse checked-in replay fixture");
+    let mut avro_fixture = fixture.clone();
+    avro_fixture["id"] = json!("rust-side-effect-version-cold-replay-avro");
+    avro_fixture["history"][0]["payload"]["result"] = serde_json::to_value(
+        encode_avro_value(&AvroValue::String("captured-once".to_string()))
+            .expect("encode replayed side effect"),
+    )
+    .expect("serialize Avro replay envelope");
+
+    let json_result = execute_fixture(&fixture)
+        .await
+        .expect("JSON replay fixture must execute");
+    let avro_result = execute_fixture(&avro_fixture)
+        .await
+        .expect("Avro replay rewrap must execute");
+
+    assert_eq!(json_result, avro_result);
 }
 
 #[tokio::test]

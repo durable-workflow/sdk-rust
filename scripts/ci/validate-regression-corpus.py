@@ -55,6 +55,12 @@ RUST_OFFICIAL_CONSUMERS = {
 }
 CODEC_FIXTURE_MANIFEST = "tests/fixtures/codec-regressions/manifest.txt"
 ZERO_COMMIT = re.compile(r"^0+$")
+REPLAY_VALUE_IDENTITY_SCHEMA = "durable-workflow.replay-value-identity/v1"
+REPLAY_VALUE_IDENTITY_CONSUMER = (
+    "replay_value_identity_consumer",
+    "canonical_replay_value_uses_official_avro_consumer",
+)
+RUST_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class CorpusError(RuntimeError):
@@ -128,10 +134,7 @@ def _json(content: bytes, path: str) -> Mapping[str, Any]:
     return _object(value, path)
 
 
-def _wire_semantics(
-    value: str,
-    context: str,
-) -> Mapping[str, str]:
+def _canonical_wire_bytes(value: str, context: str) -> bytes:
     try:
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
@@ -139,7 +142,109 @@ def _wire_semantics(
     canonical = base64.b64encode(decoded).decode("ascii")
     if value != canonical:
         raise CorpusError(f"{context} is not canonical base64")
+    return decoded
+
+
+def _wire_semantics(
+    value: str,
+    context: str,
+) -> Mapping[str, str]:
+    decoded = _canonical_wire_bytes(value, context)
+    canonical = base64.b64encode(decoded).decode("ascii")
     return {"bytes_base64": canonical}
+
+
+def _official_replay_value_identity(
+    value: Any,
+    fallback_codec: str,
+    context: str,
+) -> Mapping[str, Any]:
+    """Ask the Rust consumer to project a replay value onto its typed identity."""
+
+    request_id = _canonical_digest(
+        {
+            "fallback_codec": fallback_codec,
+            "value": value,
+        }
+    )
+    request = {
+        "schema": REPLAY_VALUE_IDENTITY_SCHEMA,
+        "request_id": request_id,
+        "fallback_codec": fallback_codec,
+        "value": value,
+    }
+    test_target, test_name = REPLAY_VALUE_IDENTITY_CONSUMER
+    environment = os.environ.copy()
+    command = [
+        environment.get("CARGO", "cargo"),
+        "test",
+        "--quiet",
+        "--test",
+        test_target,
+        test_name,
+        "--",
+        "--exact",
+    ]
+    with tempfile.TemporaryDirectory(
+        prefix="durable-workflow-replay-value-identity-"
+    ) as temporary:
+        request_path = Path(temporary) / "request.json"
+        response_path = Path(temporary) / "response.json"
+        request_path.write_text(
+            json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        environment["DURABLE_WORKFLOW_REPLAY_VALUE_IDENTITY_REQUEST"] = str(
+            request_path
+        )
+        environment["DURABLE_WORKFLOW_REPLAY_VALUE_IDENTITY_RESPONSE"] = str(
+            response_path
+        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=RUST_REPOSITORY_ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise CorpusError(
+                f"{context} official Rust replay value consumer is unavailable: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip())[-4000:]
+            suffix = f": {detail}" if detail else ""
+            raise CorpusError(
+                f"{context} official Rust replay value consumer rejected the value"
+                f"{suffix}"
+            )
+        if not response_path.is_file():
+            raise CorpusError(
+                f"{context} official Rust replay value consumer is unavailable: "
+                "no response was produced"
+            )
+        try:
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CorpusError(
+                f"{context} official Rust replay value consumer disagreed: "
+                "its response is not valid JSON"
+            ) from error
+
+    if (
+        not isinstance(response, Mapping)
+        or response.get("schema") != REPLAY_VALUE_IDENTITY_SCHEMA
+        or response.get("request_id") != request_id
+        or not isinstance(response.get("value"), Mapping)
+        or not isinstance(response["value"].get("type"), str)
+    ):
+        raise CorpusError(
+            f"{context} official Rust replay value consumer disagreed with the request"
+        )
+    return response["value"]
 
 
 def _canonical_wire_migration(base_content: bytes, current_content: bytes) -> bool:
@@ -281,24 +386,17 @@ def _consumer_replay_value(value: Any, fallback_codec: str, context: str) -> Any
         codec = value.get("codec")
         blob = value.get("blob")
         if not isinstance(codec, str) or not isinstance(blob, str):
-            raise CorpusError(f"{context} must be a payload blob or envelope")
+            codec = None
     elif isinstance(value, str):
         codec = fallback_codec
         blob = value
     else:
-        raise CorpusError(f"{context} must be a payload blob or envelope")
-
-    if codec == "json":
-        try:
-            return json.loads(blob)
-        except json.JSONDecodeError as error:
-            raise CorpusError(f"{context} is not valid json payload data") from error
+        codec = None
+        blob = None
     if codec == "avro":
-        return {
-            "codec": "avro",
-            "wire": _wire_semantics(blob, context),
-        }
-    raise CorpusError(f"{context} uses unsupported payload codec {codec!r}")
+        assert isinstance(blob, str)
+        _canonical_wire_bytes(blob, context)
+    return _official_replay_value_identity(value, fallback_codec, context)
 
 
 def _replay_event_sequence(
