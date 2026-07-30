@@ -37,7 +37,7 @@ jobs:
 
   verify:
     name: Rust ${{ matrix.rust }}
-    if: ${{ github.server_url == 'https://github.com' }}
+    if: ${{ vars.SOURCE_QUALIFICATION_MODE == '' || vars.SOURCE_QUALIFICATION_MODE == 'complete' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -48,6 +48,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
@@ -76,7 +77,7 @@ jobs:
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-forgejo-fast-path.py scripts/ci/test-component-release-recovery.py scripts/ci/test-forgejo-fast-path.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/test-component-release-recovery.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
           scripts/ci/test-crates-io-publish.sh
           arguments=()
           if [ -n "$CONFORMANCE_BASE_REF" ]; then
@@ -88,14 +89,42 @@ jobs:
             "${arguments[@]}"
           python scripts/ci/test-publish-planned-tag.py
           python scripts/ci/test-publish-rust-sdk.py
-          python scripts/ci/test-forgejo-fast-path.py
+          python scripts/ci/test-source-qualification.py
         env:
           CONFORMANCE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+
+  bounded-qualification:
+    name: Bounded structural qualification
+    if: ${{ vars.SOURCE_QUALIFICATION_MODE == 'bounded' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out candidate source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the structural toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: 1.86.0
+          components: rustfmt
+
+      - name: Run bounded candidate structure checks
+        env:
+          CANDIDATE_EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_BEFORE_SHA: ${{ github.event.before }}
+          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CANDIDATE_CURRENT_SHA: ${{ github.sha }}
+          BOUNDED_QUALIFICATION_TIMING: ${{ runner.temp }}/bounded-qualification-timing.json
+        run: python3 scripts/ci/run-bounded-qualification.py
 
   target-branch-qualification:
     name: Target branch qualification
     if: ${{ always() }}
-    needs: [regression-corpus, verify]
+    needs: [regression-corpus, verify, bounded-qualification]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -104,31 +133,21 @@ jobs:
           CORPUS_RESULT: ${{ needs.regression-corpus.result }}
         run: test "$CORPUS_RESULT" = success
 
-      - name: Check out candidate source
-        if: ${{ github.server_url != 'https://github.com' }}
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install the structural toolchain
-        if: ${{ github.server_url != 'https://github.com' }}
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
-        with:
-          toolchain: 1.86.0
-          components: rustfmt
-
-      - name: Run bounded candidate structure checks
-        if: ${{ github.server_url != 'https://github.com' }}
+      - name: Require the selected source qualification route
         env:
-          CANDIDATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          CANDIDATE_BEFORE_SHA: ${{ github.event.before }}
-          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          FORGEJO_FAST_PATH_TIMING: ${{ runner.temp }}/forgejo-fast-path-timing.json
-        run: python3 scripts/ci/run-forgejo-fast-path.py
-
-      - name: Require the MSRV and current stable toolchains
-        if: ${{ github.server_url == 'https://github.com' }}
-        env:
-          VERIFY_RESULT: ${{ needs.verify.result }}
-        run: test "$VERIFY_RESULT" = success
+          QUALIFICATION_MODE: ${{ vars.SOURCE_QUALIFICATION_MODE }}
+          COMPLETE_RESULT: ${{ needs.verify.result }}
+          BOUNDED_RESULT: ${{ needs.bounded-qualification.result }}
+        run: |
+          case "${QUALIFICATION_MODE:-complete}" in
+            complete)
+              test "$COMPLETE_RESULT" = success
+              ;;
+            bounded)
+              test "$BOUNDED_RESULT" = success
+              ;;
+            *)
+              printf 'unsupported source qualification mode: %s\n' "$QUALIFICATION_MODE" >&2
+              exit 1
+              ;;
+          esac

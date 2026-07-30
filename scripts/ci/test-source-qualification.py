@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for local and GitHub Rust SDK qualification routing."""
+"""Contract tests for provider-neutral Rust SDK source qualification."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/public-boundary.yml"
-CONTRACT = ROOT / "scripts/ci/forgejo-fast-path.json"
+CONTRACT = ROOT / "scripts/ci/bounded-qualification.json"
 
 
 def job(workflow: str, name: str) -> str:
@@ -26,21 +26,19 @@ def job(workflow: str, name: str) -> str:
     return match.group("body")
 
 
-class ForgejoFastPathContractTest(unittest.TestCase):
+class SourceQualificationContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         self.boundary_workflow = BOUNDARY_WORKFLOW.read_text(encoding="utf-8")
         self.contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
 
-    def test_fast_path_has_one_sub_two_minute_machine_readable_budget(self) -> None:
+    def test_bounded_route_has_a_cold_compile_budget(self) -> None:
         self.assertEqual(
-            "durable-workflow.sdk-rust.forgejo-fast-path/v1",
+            "durable-workflow.sdk-rust.bounded-qualification/v1",
             self.contract["schema"],
         )
-        self.assertEqual("warm-local", self.contract["runner_profile"])
-        self.assertGreater(self.contract["budget_seconds"], 0)
-        self.assertLess(self.contract["budget_seconds"], 120)
-        self.assertEqual(2, self.contract["job_timeout_minutes"])
+        self.assertEqual(150, self.contract["budget_seconds"])
+        self.assertEqual(3, self.contract["job_timeout_minutes"])
 
         expected_checks = {
             "manifest": ["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -54,20 +52,33 @@ class ForgejoFastPathContractTest(unittest.TestCase):
             {check["id"]: check["command"] for check in self.contract["checks"]},
         )
 
-    def test_forgejo_runs_only_the_bounded_structural_route(self) -> None:
+    def test_control_plane_can_select_the_bounded_structural_route(self) -> None:
         verify = job(self.workflow, "verify")
+        bounded = job(self.workflow, "bounded-qualification")
         qualification = job(self.workflow, "target-branch-qualification")
         boundary = job(self.boundary_workflow, "scan")
 
-        self.assertIn("github.server_url == 'https://github.com'", verify)
-        self.assertIn("github.server_url != 'https://github.com'", qualification)
-        self.assertIn("timeout-minutes: 2", qualification)
-        self.assertIn("toolchain: 1.86.0", qualification)
-        self.assertIn("python3 scripts/ci/run-forgejo-fast-path.py", qualification)
-        self.assertIn("persist-credentials: false", qualification)
-        self.assertIn("github.server_url == 'https://github.com'", boundary)
+        self.assertIn(
+            "vars.SOURCE_QUALIFICATION_MODE == '' || "
+            "vars.SOURCE_QUALIFICATION_MODE == 'complete'",
+            verify,
+        )
+        self.assertIn("vars.SOURCE_QUALIFICATION_MODE == 'bounded'", bounded)
+        self.assertIn("timeout-minutes: 3", bounded)
+        self.assertIn("toolchain: 1.86.0", bounded)
+        self.assertIn(
+            "python3 scripts/ci/run-bounded-qualification.py", bounded
+        )
+        self.assertIn("persist-credentials: false", bounded)
+        self.assertIn("QUALIFICATION_MODE:", qualification)
+        self.assertIn("BOUNDED_RESULT:", qualification)
+        self.assertIn('case "${QUALIFICATION_MODE:-complete}" in', qualification)
+        self.assertIn('test "$BOUNDED_RESULT" = success', qualification)
+        self.assertIn("unsupported source qualification mode", qualification)
+        self.assertNotIn("server_url", self.workflow)
+        self.assertNotIn("server_url", boundary)
 
-    def test_github_keeps_the_complete_authoritative_matrix(self) -> None:
+    def test_default_route_keeps_the_complete_matrix(self) -> None:
         verify = job(self.workflow, "verify")
         qualification = job(self.workflow, "target-branch-qualification")
 
@@ -79,7 +90,7 @@ class ForgejoFastPathContractTest(unittest.TestCase):
         self.assertIn("cargo doc --all-features --no-deps", verify)
         self.assertIn("cargo package", verify)
         self.assertIn("Validate release tooling", verify)
-        self.assertIn('test "$VERIFY_RESULT" = success', qualification)
+        self.assertIn('test "$COMPLETE_RESULT" = success', qualification)
         self.assertEqual(
             {
                 "msrv-all-target-tests",
@@ -90,13 +101,22 @@ class ForgejoFastPathContractTest(unittest.TestCase):
                 "publishable-package-content",
                 "release-tooling",
             },
-            set(self.contract["github_authoritative_checks"]),
+            set(self.contract["complete_checks"]),
         )
 
-    def test_untrusted_github_pull_requests_remain_read_only(self) -> None:
+    def test_untrusted_pull_requests_remain_read_only_with_pinned_actions(self) -> None:
         self.assertIn("pull_request:", self.workflow)
         self.assertNotIn("pull_request_target:", self.workflow)
         self.assertRegex(self.workflow, r"permissions:\n  contents: read")
+        self.assertRegex(self.boundary_workflow, r"permissions:\n  contents: read")
+        action_references = re.findall(
+            r"uses:\s+[^@\s]+@([^\s#]+)",
+            self.workflow + self.boundary_workflow,
+        )
+        self.assertTrue(action_references)
+        self.assertTrue(
+            all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_references)
+        )
 
 
 if __name__ == "__main__":

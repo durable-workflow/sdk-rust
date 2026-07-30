@@ -28,6 +28,11 @@ file_patterns=(
   "$(pattern_from_hex 776f726b73706163652d6871)"
   "$(pattern_from_hex 706970656c696e652f)"
   "$(pattern_from_hex 5b63726f73732d7265706f2066726f6d20)"
+  "$(pattern_from_hex 466f7267656a6f)"
+  "$(pattern_from_hex 666f7267656a6f)"
+  "$(pattern_from_hex 7761726d2d6c6f63616c)"
+  "$(pattern_from_hex 6769746875622e7365727665725f75726c)"
+  "$(pattern_from_hex 72756e6e65725f70726f66696c65)"
 )
 
 metadata_patterns=(

@@ -1,8 +1,7 @@
 {
-  "schema": "durable-workflow.sdk-rust.forgejo-fast-path/v1",
-  "runner_profile": "warm-local",
-  "budget_seconds": 90,
-  "job_timeout_minutes": 2,
+  "schema": "durable-workflow.sdk-rust.bounded-qualification/v1",
+  "budget_seconds": 150,
+  "job_timeout_minutes": 3,
   "checks": [
     {
       "id": "manifest",
@@ -26,7 +25,7 @@
       "command": ["cargo", "check", "--all-targets"]
     }
   ],
-  "github_authoritative_checks": [
+  "complete_checks": [
     "msrv-all-target-tests",
     "stable-all-target-tests",
     "typed-avro-compatibility",

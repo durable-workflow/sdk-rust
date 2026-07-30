@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded structural checks used by the local pull-request gate."""
+"""Run the bounded structural source-qualification contract."""
 
 from __future__ import annotations
 
@@ -13,38 +13,38 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CONTRACT_PATH = Path(__file__).with_name("forgejo-fast-path.json")
-TIMING_SCHEMA = "durable-workflow.sdk-rust.forgejo-fast-path-timing/v1"
+CONTRACT_PATH = Path(__file__).with_name("bounded-qualification.json")
+TIMING_SCHEMA = "durable-workflow.sdk-rust.bounded-qualification-timing/v1"
 
 
 class ContractError(ValueError):
-    """The fast-path contract is malformed."""
+    """The bounded qualification contract is malformed."""
 
 
 def load_contract() -> dict[str, Any]:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     if not isinstance(contract, dict):
-        raise ContractError("Forgejo fast-path contract must be an object")
+        raise ContractError("bounded qualification contract must be an object")
     expected_fields = {
         "schema",
-        "runner_profile",
         "budget_seconds",
         "job_timeout_minutes",
         "checks",
-        "github_authoritative_checks",
+        "complete_checks",
     }
     if set(contract) != expected_fields:
-        raise ContractError("unexpected Forgejo fast-path contract fields")
-    if contract.get("schema") != "durable-workflow.sdk-rust.forgejo-fast-path/v1":
-        raise ContractError("unexpected Forgejo fast-path contract schema")
-    if contract.get("runner_profile") != "warm-local":
-        raise ContractError("runner_profile must be warm-local")
+        raise ContractError("unexpected bounded qualification contract fields")
+    if (
+        contract.get("schema")
+        != "durable-workflow.sdk-rust.bounded-qualification/v1"
+    ):
+        raise ContractError("unexpected bounded qualification contract schema")
 
     budget = contract.get("budget_seconds")
-    if not isinstance(budget, int) or isinstance(budget, bool) or not 0 < budget < 120:
-        raise ContractError("budget_seconds must be an integer below two minutes")
-    if contract.get("job_timeout_minutes") != 2:
-        raise ContractError("job_timeout_minutes must remain two minutes")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget != 150:
+        raise ContractError("budget_seconds must remain 150 seconds")
+    if contract.get("job_timeout_minutes") != 3:
+        raise ContractError("job_timeout_minutes must remain three minutes")
 
     checks = contract.get("checks")
     if not isinstance(checks, list) or not checks:
@@ -72,24 +72,24 @@ def load_contract() -> dict[str, Any]:
             raise ContractError(f"{check_id} quiet_stdout must be boolean")
         seen_ids.add(check_id)
 
-    authoritative = contract.get("github_authoritative_checks")
+    complete = contract.get("complete_checks")
     if (
-        not isinstance(authoritative, list)
-        or not authoritative
-        or len(authoritative) != len(set(authoritative))
-        or any(not isinstance(check, str) or not check for check in authoritative)
+        not isinstance(complete, list)
+        or not complete
+        or len(complete) != len(set(complete))
+        or any(not isinstance(check, str) or not check for check in complete)
     ):
-        raise ContractError("github_authoritative_checks must be unique strings")
+        raise ContractError("complete_checks must be unique strings")
 
     return contract
 
 
 def candidate_range() -> str:
-    event = os.environ.get("GITHUB_EVENT_NAME", "")
+    event = os.environ.get("CANDIDATE_EVENT_NAME", "")
     base = os.environ.get("CANDIDATE_BASE_SHA", "")
     before = os.environ.get("CANDIDATE_BEFORE_SHA", "")
     head = os.environ.get("CANDIDATE_HEAD_SHA", "")
-    current = os.environ.get("GITHUB_SHA", "HEAD")
+    current = os.environ.get("CANDIDATE_CURRENT_SHA", "HEAD")
 
     if event == "pull_request" and base and head:
         return f"{base}..{head}"
@@ -120,20 +120,19 @@ def main() -> int:
     try:
         contract = load_contract()
     except (ContractError, json.JSONDecodeError, OSError) as error:
-        print(f"invalid Forgejo fast-path contract: {error}", file=sys.stderr)
+        print(f"invalid bounded qualification contract: {error}", file=sys.stderr)
         return 1
 
     budget = contract["budget_seconds"]
     selected_range = candidate_range()
     output = Path(
         os.environ.get(
-            "FORGEJO_FAST_PATH_TIMING",
-            ROOT / "target/ci/forgejo-fast-path-timing.json",
+            "BOUNDED_QUALIFICATION_TIMING",
+            ROOT / "target/ci/bounded-qualification-timing.json",
         )
     )
     evidence: dict[str, Any] = {
         "schema": TIMING_SCHEMA,
-        "runner_profile": contract["runner_profile"],
         "budget_seconds": budget,
         "candidate_range": selected_range,
         "checks": [],
