@@ -37,8 +37,11 @@ package_repository="$(jq -er '.packages[0].repository' <<<"$metadata")"
 package_documentation="$(jq -er '.packages[0].documentation' <<<"$metadata")"
 target_directory="$(jq -er '.target_directory' <<<"$metadata")"
 product_train="$(jq -er '.packages[0].metadata["durable-workflow"]["product-train"]' <<<"$metadata")"
+compatibility_authority="$(jq -er '.packages[0].metadata["durable-workflow"]["compatibility-authority"]' <<<"$metadata")"
 server_compatibility="$(jq -er '.packages[0].metadata["durable-workflow"]["supported-server-versions"]' <<<"$metadata")"
+qualified_server_version="$(jq -er '.packages[0].metadata["durable-workflow"]["qualified-server-version"]' <<<"$metadata")"
 worker_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["worker-protocol-version"]' <<<"$metadata")"
+server_worker_protocols="$(jq -er '.packages[0].metadata["durable-workflow"]["server-worker-protocol-versions"]' <<<"$metadata")"
 control_plane="$(jq -er '.packages[0].metadata["durable-workflow"]["control-plane-version"]' <<<"$metadata")"
 query_tasks="$(jq -er '.packages[0].metadata["durable-workflow"]["query-tasks"]' <<<"$metadata")"
 query_task_minimum_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["query-task-minimum-worker-protocol-version"]' <<<"$metadata")"
@@ -76,20 +79,12 @@ if [[ "$package_documentation" != "https://rust.durable-workflow.com/" ]]; then
     printf 'unexpected Rust SDK documentation metadata: %s\n' "$package_documentation" >&2
     exit 1
 fi
-same_rc_channel=false
-if [[ "$package_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
-    package_release_base="${BASH_REMATCH[1]}"
-    package_release_candidate="${BASH_REMATCH[2]}"
-    if [[ "$product_train" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
-        product_release_base="${BASH_REMATCH[1]}"
-        product_release_candidate="${BASH_REMATCH[2]}"
-        if [[ "$package_release_base" == "$product_release_base" && $((10#$package_release_candidate)) -ge $((10#$product_release_candidate)) ]]; then
-            same_rc_channel=true
-        fi
-    fi
+if [[ "$package_version" != "$product_train" ]]; then
+    printf 'Rust SDK package version must match its product train metadata: %s, %s\n' "$package_version" "$product_train" >&2
+    exit 1
 fi
-if [[ "$server_compatibility" != "$product_train" || ( "$package_version" != "$product_train" && "$same_rc_channel" != "true" ) ]]; then
-    printf 'Rust SDK package must match or advance within the product train release candidate channel, and supported server must match the product train: %s, %s, %s\n' "$package_version" "$product_train" "$server_compatibility" >&2
+if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.12,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.12" || "$server_worker_protocols" != ">=1.2,<2.0" ]]; then
+    printf 'unexpected Rust SDK supported Server contract: %s, %s, %s, %s\n' "$compatibility_authority" "$server_compatibility" "$qualified_server_version" "$server_worker_protocols" >&2
     exit 1
 fi
 if [[ "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
@@ -155,8 +150,11 @@ write_evidence() {
         --arg published_repository "$published_repository" \
         --arg documentation "$package_documentation" \
         --arg product_train "$product_train" \
+        --arg compatibility_authority "$compatibility_authority" \
         --arg server_compatibility "$server_compatibility" \
+        --arg qualified_server_version "$qualified_server_version" \
         --arg worker_protocol "$worker_protocol" \
+        --arg server_worker_protocols "$server_worker_protocols" \
         --arg control_plane "$control_plane" \
         --arg query_tasks "$query_tasks" \
         --arg query_task_minimum_protocol "$query_task_minimum_protocol" \
@@ -202,9 +200,12 @@ write_evidence() {
                 archive_vcs_dirty: ($archive_vcs_dirty == "true")
             },
             product_train: $product_train,
+            compatibility_authority: $compatibility_authority,
             supported_server_versions: $server_compatibility,
+            qualified_server_version: $qualified_server_version,
             protocol_compatibility: {
                 worker_protocol: $worker_protocol,
+                server_worker_protocol_versions: $server_worker_protocols,
                 control_plane: $control_plane,
                 query_tasks: ($query_tasks == "true"),
                 query_task_minimum_worker_protocol: $query_task_minimum_protocol,

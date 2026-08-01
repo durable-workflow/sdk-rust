@@ -10,35 +10,77 @@ platform's fixed typed Avro Value protocol. Workflow code can also wait on serve
 durable time, capture non-deterministic values exactly once, and evolve across
 deployments with durable version markers.
 
+## Prerequisites
+
+Rust `1.86` or newer is required. On a clean machine, install
+[rustup](https://rustup.rs/), select the current stable toolchain, and verify it
+before compiling the SDK:
+
+```sh
+rustup default stable
+rustc --version
+```
+
+You also need either a bootstrapped, authenticated self-hosted Server or a
+provisioned Durable Workflow Cloud namespace. Pass the Server base URL or the
+Cloud-provided runtime URL to `Client::builder(...)` without `/api`; the SDK
+owns and appends that suffix.
+
 ## Install
 
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.6
+cargo add durable-workflow@=2.0.0-rc.7
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.6"
+durable-workflow = "=2.0.0-rc.7"
 ```
 
-Version `2.0.0-rc.6` requires Rust `1.86` or newer and includes the complete
-Durable Workflow 2.0 beta baseline described below.
+Version `2.0.0-rc.7` includes the complete Durable Workflow 2.0 prerelease
+baseline described below.
+
+## First local run
+
+First start and authenticate a source-free local Server using either the
+[published image and bootstrap path](https://durable-workflow.com/docs/2.0/polyglot/server/#published-image--sqlite)
+or the
+[published Compose path](https://durable-workflow.com/docs/2.0/polyglot/server/#published-image--compose).
+Those setups create the `default` namespace used by the example.
+
+The single-file [`examples/hello_world.rs`](examples/hello_world.rs) uses one
+task queue, starts a uniquely identified workflow, bounds its worker lifetime,
+and prints the completed greeting. Set the token to the value used while
+bootstrapping Server, then run:
+
+```sh
+DURABLE_WORKFLOW_SERVER_URL=http://127.0.0.1:8080 \
+DURABLE_WORKFLOW_TOKEN=dev-token \
+cargo run --example hello_world
+```
+
+`TASK_QUEUE` optionally overrides the default `rust-workers` task queue.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.6` is supported with server `2.0.0-rc.5`, control plane
-`2`, and the server's additive worker-protocol negotiation window, pending
-exact requalification of the aggregate RC6 train. Earlier crate versions
-remain historical and are not separate supported feature levels. No
-compatibility shim connects earlier 2.0 prereleases to this train.
+Rust SDK `2.0.0-rc.7` supports Server `>=2.0.0-rc.12,<2.0.0`. The current
+qualification baseline is Server `2.0.0-rc.12`, proven by published-artifact
+conformance. Server build versions are identity, not the runtime negotiation
+mechanism: compatible servers must advertise control plane `2` and a
+same-major worker protocol in `>=1.2,<2.0`. The SDK sends worker protocol `1.2`;
+newer `1.x` server minors accept that header under the additive protocol
+contract.
 
 The machine-readable values live in `[package.metadata.durable-workflow]` in
-`Cargo.toml` as `supported-server-versions`, `worker-protocol-version`, and
-`control-plane-version`. Query-capable releases also publish `query-tasks`,
+`Cargo.toml` as `compatibility-authority`, `supported-server-versions`,
+`qualified-server-version`, `worker-protocol-version`,
+`server-worker-protocol-versions`, and `control-plane-version`. The server's
+advertised protocol manifests remain authoritative during deployment.
+Query-capable releases also publish `query-tasks`,
 `query-task-minimum-worker-protocol-version`, `replayed-instance-state-queries`,
 `query-state-model`, `snapshot-inspection-queries`, and `payload-codecs`.
 Timer-capable releases additionally publish `durable-timers`, `timer-command`,
@@ -51,8 +93,7 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 `workflow-terminal-outcomes`; releases with start deadline support also publish
 `workflow-start-timeouts`. Existing worker operations retain the `1.2`
 baseline; only query-task poll, complete, and fail requests use the additive
-`1.8` feature floor. The server's advertised protocol manifests remain
-authoritative when checking compatibility during deployment.
+`1.8` feature floor.
 
 ## Avro Value protocol
 
@@ -635,26 +676,13 @@ body, and protocol incompatibilities remain
 Codec, handler, and other non-retryable failures are returned immediately and
 are never retried indefinitely.
 
-## Example
+## Additional examples
 
-`examples/hello_world.rs` contains a complete round trip: it registers a Rust
-worker, starts a workflow, sends a signal, runs an activity, heartbeats that
-activity, exposes a named query, and waits for the completed result.
 `examples/activity_options.rs` is an executable retry scenario with activity
 heartbeats, a heartbeat timeout, and typed terminal failure handling.
 
-With a Durable Workflow server running locally:
-
-```sh
-DURABLE_WORKFLOW_SERVER_URL=http://127.0.0.1:8080 \
-DURABLE_WORKFLOW_TOKEN=your-token \
-cargo run --example hello_world
-```
-
 Run the activity-options scenario with the same environment using
 `cargo run --example activity_options`.
-
-`TASK_QUEUE` optionally overrides the default `rust-workers` task queue.
 
 ## API documentation
 

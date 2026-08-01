@@ -1,11 +1,12 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
-use durable_workflow::{json, Client, Result, Worker, WorkflowResultOptions};
-
-#[derive(Clone, Default)]
-struct HelloState {
-    started_by: Option<String>,
-}
+use durable_workflow::{json, Client, Error, Result, Uuid, Worker, WorkflowResultOptions};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,67 +21,64 @@ async fn main() -> Result<()> {
         .build()?;
 
     let mut worker = Worker::new(client.clone(), task_queue.clone())
-        .worker_id(format!("rust-hello-{}", unique_suffix()))
+        .worker_id(format!("rust-hello-{}", Uuid::new_v4()))
         .poll_timeout(Duration::from_secs(5));
 
-    worker.register_activity("rust.hello_activity", |ctx, args| async move {
-        ctx.heartbeat(json!({"stage": "started"})).await?;
+    worker.register_activity("rust.hello_activity", |_ctx, args| async move {
         let name = args
             .get(0)
             .and_then(|value| value.as_str())
             .unwrap_or("world");
-        Ok(json!(format!("hello, {name}")))
+        Ok(json!({"greeting": format!("Hello, {name}!")}))
     });
 
-    worker.register_replayed_workflow(
-        "rust.hello_workflow",
-        HelloState::default,
-        |ctx, _input, state| async move {
-            let signal = ctx.wait_signal("start").await?;
-            let name = signal
-                .first()
-                .and_then(|value| value.as_str())
-                .unwrap_or("world");
-            state.update(|current| current.started_by = Some(name.to_string()))?;
-            let greeting = ctx.activity("rust.hello_activity", json!([name])).await?;
-            Ok(json!({
-                "greeting": greeting,
-                "language": "rust"
-            }))
-        },
-    );
+    worker.register_workflow("rust.hello_workflow", |ctx, input| async move {
+        let name = input
+            .get(0)
+            .and_then(|value| value.as_str())
+            .unwrap_or("Rust");
+        ctx.activity("rust.hello_activity", json!([name])).await
+    });
 
-    worker.register_replayed_query::<HelloState, _, _>(
-        "rust.hello_workflow",
-        "started_by",
-        |_ctx, state, _args| async move { Ok(json!(state.started_by)) },
-    );
-
-    worker.register().await?;
-
-    let workflow_id = format!("rust-hello-{}", unique_suffix());
+    let workflow_id = format!("rust-hello-{}", Uuid::new_v4());
     let handle = client
-        .start_workflow("rust.hello_workflow", &task_queue, &workflow_id, json!([]))
-        .await?;
-
-    client
-        .signal_workflow(&handle.workflow_id, "start", json!(["Rust"]))
+        .start_workflow(
+            "rust.hello_workflow",
+            &task_queue,
+            &workflow_id,
+            json!(["Rust"]),
+        )
         .await?;
 
     let watcher = handle.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let observed_completion = Arc::clone(&completed);
     worker
         .run_until(async move {
-            loop {
-                if let Ok(description) = watcher.describe().await {
-                    if description.is_terminal() {
+            if tokio::time::timeout(Duration::from_secs(30), async move {
+                loop {
+                    if watcher
+                        .describe()
+                        .await
+                        .is_ok_and(|description| description.is_terminal())
+                    {
                         break;
                     }
-                }
 
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+            .await
+            .is_ok()
+            {
+                observed_completion.store(true, Ordering::SeqCst);
             }
         })
         .await?;
+
+    if !completed.load(Ordering::SeqCst) {
+        return Err(Error::Timeout);
+    }
 
     let result = handle
         .result(WorkflowResultOptions {
@@ -89,13 +87,7 @@ async fn main() -> Result<()> {
         })
         .await?;
 
-    println!("{}", result);
+    println!("workflow_id={workflow_id}");
+    println!("result={result}");
     Ok(())
-}
-
-fn unique_suffix() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }

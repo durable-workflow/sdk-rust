@@ -1662,7 +1662,11 @@ def _guard_matches(
     raw_guard: Any,
 ) -> bool:
     guard = _object(raw_guard, "guard")
-    matching = sorted(path for path in changed if _matches(path, _string(guard["glob"], "guard.glob")))
+    matching = sorted(
+        path
+        for path in changed
+        if _matches(path, _string(guard["glob"], "guard.glob"))
+    )
     if not matching:
         return False
     patterns = guard.get("content_patterns")
@@ -1684,20 +1688,51 @@ def _guard_matches(
     untracked = set(
         _run(["git", "ls-files", "--others", "--exclude-standard"], root).splitlines()
     )
-    context_lines: list[str] = []
+    relevant_lines: list[str] = []
     inside_hunk = False
+    enclosing_items: list[tuple[int, str]] = []
+    item_declaration = re.compile(
+        r"^(?:(?:pub(?:\([^)]*\))?|async|const|unsafe)\s+)*"
+        r"(?:fn|impl|struct|enum|trait|mod)\b"
+    )
+    closing_scope = re.compile(r"^}\s*[,;]?$")
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             inside_hunk = False
+            enclosing_items.clear()
         elif line.startswith("@@"):
             inside_hunk = True
-        elif inside_hunk and line.startswith((" ", "+", "-")):
-            context_lines.append(line[1:])
+            enclosing_items.clear()
+            match = re.match(r"^@@ [^@]* @@(?: ?(.*))?$", line)
+            if match and match.group(1):
+                relevant_lines.append(match.group(1))
+        elif inside_hunk and line.startswith(" "):
+            content = line[1:]
+            stripped = content.lstrip()
+            indentation = len(content) - len(stripped)
+            if closing_scope.fullmatch(stripped):
+                enclosing_items = [
+                    item
+                    for item in enclosing_items
+                    if item[0] < indentation
+                ]
+            elif item_declaration.match(stripped):
+                enclosing_items = [
+                    item
+                    for item in enclosing_items
+                    if item[0] < indentation
+                ]
+                enclosing_items.append((indentation, stripped))
+        elif inside_hunk and line.startswith(("+", "-")):
+            relevant_lines.extend(identity for _, identity in enclosing_items)
+            relevant_lines.append(line[1:])
     for path in matching:
         if path in untracked and (root / path).is_file():
-            context_lines.append((root / path).read_text(encoding="utf-8", errors="replace"))
-    changed_context = "\n".join(context_lines)
-    return any(re.search(pattern, changed_context) for pattern in patterns)
+            relevant_lines.append(
+                (root / path).read_text(encoding="utf-8", errors="replace")
+            )
+    relevant_context = "\n".join(relevant_lines)
+    return any(re.search(pattern, relevant_context) for pattern in patterns)
 
 
 def validate(

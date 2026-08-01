@@ -462,6 +462,49 @@ fn health_check(enabled: bool) -> bool {
 
         self.assertTrue(self._guard_matches())
 
+    def test_non_codec_test_before_avro_helper_is_not_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8")
+            + """\
+
+#[cfg(test)]
+mod tests {
+    fn typed_fidelity_probe() -> AvroValue {
+        todo!()
+    }
+}
+""",
+            encoding="utf-8",
+        )
+        self._git("add", "src/lib.rs")
+        self._git(
+            "-c",
+            "user.name=Corpus Guard Test",
+            "-c",
+            "user.email=corpus-guard@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "add-test-module",
+        )
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "mod tests {\n    fn typed_fidelity_probe() -> AvroValue",
+                """\
+mod tests {
+    #[test]
+    fn client_builder_accepts_runtime_prefix() {
+        assert!(true);
+    }
+
+    fn typed_fidelity_probe() -> AvroValue""",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(self._guard_matches())
+
     def test_neutral_edit_inside_replay_function_is_related(self) -> None:
         source = self.root / "src/lib.rs"
         source.write_text(
@@ -1256,6 +1299,72 @@ class PolicyImmutabilityTest(unittest.TestCase):
             1 if len(fixtures) > 1 and not fixed else 0,
             "simulated official Apache Avro consumer",
         )
+
+    def test_non_codec_change_in_monolithic_source_does_not_require_growth(self) -> None:
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8")
+            + """\
+
+fn value_as_u64(value: u64) -> u64 {
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    fn typed_fidelity_probe() -> AvroValue {
+        todo!()
+    }
+}
+""",
+            encoding="utf-8",
+        )
+        self._git("add", "src/lib.rs")
+        self._git(
+            "-c",
+            "user.name=Corpus Policy Test",
+            "-c",
+            "user.email=corpus-policy@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "monolithic-source-base",
+        )
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "mod tests {\n    fn typed_fidelity_probe() -> AvroValue",
+                """\
+mod tests {
+    #[test]
+    fn client_builder_accepts_runtime_prefix() {
+        assert!(true);
+    }
+
+    fn typed_fidelity_probe() -> AvroValue""",
+            ),
+            encoding="utf-8",
+        )
+
+        result = self._validate()
+
+        self.assertFalse(result["counts"]["codec"]["related_change"])
+        self.assertEqual(
+            result["counts"]["codec"]["base"],
+            result["counts"]["codec"]["current"],
+        )
+
+    def test_codec_implementation_hunk_still_requires_growth(self) -> None:
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8").replace(
+                "!bytes.is_empty()", "bytes.len() > 0"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "codec implementation changed but its corpus did not grow",
+        ):
+            self._validate()
 
     def test_policy_cannot_hide_deleted_fixture(self) -> None:
         self.policy["categories"]["codec"]["fixtures"].pop()

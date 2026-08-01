@@ -77,6 +77,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("transport error: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error(
+        "invalid Durable Workflow base URL: omit the SDK-owned /api suffix and pass the Server or Cloud runtime base URL; the SDK appends /api automatically"
+    )]
+    InvalidBaseUrl,
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("http {status}: {body}")]
@@ -3038,9 +3042,18 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client> {
+        let base_url = self.base_url.trim_end_matches('/').to_string();
+        let has_sdk_api_suffix = reqwest::Url::parse(&base_url)
+            .map(|url| url.path().trim_end_matches('/').ends_with("/api"))
+            .unwrap_or_else(|_| base_url.ends_with("/api"));
+
+        if has_sdk_api_suffix {
+            return Err(Error::InvalidBaseUrl);
+        }
+
         Ok(Client {
             http: reqwest::Client::builder().timeout(self.timeout).build()?,
-            base_url: self.base_url.trim_end_matches('/').to_string(),
+            base_url,
             token: self.token,
             control_token: self.control_token,
             worker_token: self.worker_token,
@@ -8195,6 +8208,54 @@ mod tests {
         sync::atomic::AtomicUsize,
         thread,
     };
+
+    #[test]
+    fn client_builder_rejects_the_sdk_owned_api_suffix() {
+        for base_url in [
+            "http://127.0.0.1:8080/api",
+            "http://localhost:8080/api/",
+            "https://runtime.example.test/namespaces/orders/api",
+        ] {
+            let error = Client::builder(base_url)
+                .build()
+                .expect_err("SDK-owned /api suffix must be rejected during build");
+
+            assert!(matches!(error, Error::InvalidBaseUrl), "{base_url}");
+            assert!(
+                error.to_string().contains("SDK appends /api automatically"),
+                "the validation error must explain how to fix the endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn client_builder_preserves_self_hosted_and_managed_runtime_prefixes() {
+        for (base_url, expected) in [
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            (
+                "http://localhost:8080/durable-workflow/",
+                "http://localhost:8080/durable-workflow",
+            ),
+            (
+                "https://runtime.example.test/namespaces/orders",
+                "https://runtime.example.test/namespaces/orders",
+            ),
+            (
+                "https://runtime.example.test/gateway/api/namespaces/orders",
+                "https://runtime.example.test/gateway/api/namespaces/orders",
+            ),
+            (
+                "https://api.example.test/runtime/orders/",
+                "https://api.example.test/runtime/orders",
+            ),
+        ] {
+            let client = Client::builder(base_url)
+                .build()
+                .expect("Server and Cloud runtime base URL must remain valid");
+
+            assert_eq!(client.base_url, expected);
+        }
+    }
 
     fn typed_fidelity_probe() -> AvroValue {
         AvroValue::Map(BTreeMap::from([

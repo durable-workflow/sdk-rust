@@ -16,9 +16,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PACKAGE_VERSION = "2.0.0-rc.6"
-PRODUCT_TRAIN = "2.0.0-rc.5"
-SERVER_VERSION = "2.0.0-rc.5"
+PACKAGE_VERSION = "2.0.0-rc.7"
+PRODUCT_TRAIN = PACKAGE_VERSION
+SERVER_VERSIONS = ">=2.0.0-rc.12,<2.0.0"
+QUALIFIED_SERVER_VERSION = "2.0.0-rc.12"
+SERVER_WORKER_PROTOCOLS = ">=1.2,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -170,7 +172,10 @@ class PublishRustSdkContractTest(unittest.TestCase):
         metadata = package["metadata"]["durable-workflow"]
         self.assertEqual(PACKAGE_VERSION, package["version"])
         self.assertEqual(PRODUCT_TRAIN, metadata["product-train"])
-        self.assertEqual(SERVER_VERSION, metadata["supported-server-versions"])
+        self.assertEqual("protocol-manifests", metadata["compatibility-authority"])
+        self.assertEqual(SERVER_VERSIONS, metadata["supported-server-versions"])
+        self.assertEqual(QUALIFIED_SERVER_VERSION, metadata["qualified-server-version"])
+        self.assertEqual(SERVER_WORKER_PROTOCOLS, metadata["server-worker-protocol-versions"])
 
     def test_readme_uses_cargo_supported_exact_requirement(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -183,7 +188,13 @@ class PublishRustSdkContractTest(unittest.TestCase):
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
         self.assertEqual(PACKAGE_VERSION, evidence["package_version"])
         self.assertEqual(PRODUCT_TRAIN, evidence["product_train"])
-        self.assertEqual(SERVER_VERSION, evidence["supported_server_versions"])
+        self.assertEqual("protocol-manifests", evidence["compatibility_authority"])
+        self.assertEqual(SERVER_VERSIONS, evidence["supported_server_versions"])
+        self.assertEqual(QUALIFIED_SERVER_VERSION, evidence["qualified_server_version"])
+        self.assertEqual(
+            SERVER_WORKER_PROTOCOLS,
+            evidence["protocol_compatibility"]["server_worker_protocol_versions"],
+        )
         self.assertTrue(evidence["registry_verified"])
 
     def test_release_path_rejects_a_divergent_product_train(self) -> None:
@@ -193,25 +204,25 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("release candidate channel", result.stderr)
+        self.assertIn("must match its product train", result.stderr)
 
-    def test_release_path_rejects_a_component_behind_the_product_train(self) -> None:
+    def test_release_path_rejects_a_component_version_mismatch(self) -> None:
         manifest = self._manifest_with(
             f'version = "{PACKAGE_VERSION}"',
             'version = "2.0.0-rc.4"',
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("match or advance", result.stderr)
+        self.assertIn("must match its product train", result.stderr)
 
     def test_release_path_rejects_a_divergent_server_version(self) -> None:
         manifest = self._manifest_with(
-            f'supported-server-versions = "{SERVER_VERSION}"',
+            f'supported-server-versions = "{SERVER_VERSIONS}"',
             'supported-server-versions = ">=0.2,<0.3"',
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("supported server must match", result.stderr)
+        self.assertIn("supported Server contract", result.stderr)
 
 
 if __name__ == "__main__":
