@@ -73,6 +73,54 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertNotIn("actions/upload-pages-artifact@", self.qualification)
         self.assertNotIn("actions/deploy-pages@", self.qualification)
 
+    def test_visual_changes_use_the_source_bound_organization_capture_gate(self) -> None:
+        visual = job(self.qualification, "visual-evidence")
+        checkout = step(visual, "Check out candidate source")
+        admission = step(visual, "Admit the structurally qualified candidate")
+        classify = step(visual, "Classify candidate changes")
+        capture = step(visual, "Capture candidate state matrix")
+        validate = step(visual, "Validate source-bound candidate evidence")
+        retain = step(visual, "Retain candidate visual evidence")
+
+        self.assertIn("permissions:\n      contents: read", visual)
+        self.assertIn("repository: durable-workflow/.github", visual)
+        self.assertIn("github.api_url != 'https://api.github.com'", visual)
+        self.assertIn("ref: ${{ github.sha }}", checkout)
+        self.assertNotIn("if:", checkout)
+        self.assertIn("working-directory: candidate", admission)
+        self.assertIn("python3 scripts/ci/test-docs-workflow.py", admission)
+        self.assertIn("--profile rust-sdk-reference", classify)
+        self.assertIn("github.event.pull_request.base.sha", classify)
+        self.assertIn("github.event.before", classify)
+        self.assertIn("1440x900 800x900 390x844", capture)
+        self.assertIn("capture initial", capture)
+        self.assertIn("capture granted", capture)
+        self.assertIn("capture denied", capture)
+        self.assertIn("capture preferences-open", capture)
+        self.assertIn("--source-revision", capture)
+        self.assertIn("--expected-revision", validate)
+        self.assertIn("if-no-files-found: error", retain)
+
+    def test_complete_visual_capture_is_reserved_for_github_qualification(self) -> None:
+        visual = job(self.qualification, "visual-evidence")
+        github_steps = (
+            "Check out visual evidence controller",
+            "Classify candidate changes",
+            "Install Rust 1.86",
+            "Install pinned visual capture runtime",
+            "Build candidate API reference",
+            "Capture candidate state matrix",
+            "Validate source-bound candidate evidence",
+            "Retain candidate visual evidence",
+        )
+
+        for name in github_steps:
+            with self.subTest(step=name):
+                self.assertIn(
+                    "github.api_url == 'https://api.github.com'",
+                    step(visual, name),
+                )
+
     def test_pages_publication_only_accepts_trusted_main_pushes(self) -> None:
         triggers = self.publication.split("\njobs:\n", maxsplit=1)[0]
         build = job(self.publication, "build")
