@@ -90,6 +90,10 @@ jobs:
           if [[ "$SOURCE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && \
             git -C candidate cat-file -e "${SOURCE_BASE_SHA}^{commit}" 2>/dev/null; then
             classification_args+=(--base-ref "$SOURCE_BASE_SHA")
+            if ! git -C candidate diff --quiet \
+              "$SOURCE_BASE_SHA...HEAD" -- .github/workflows/docs.yml; then
+              classification_args+=(--changed-file docs/analytics/analytics.js)
+            fi
           else
             mapfile -d '' candidate_files < <(git -C candidate ls-files -z)
             for candidate_file in "${candidate_files[@]}"; do
@@ -217,6 +221,10 @@ jobs:
           if [[ "$SOURCE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && \
             git -C candidate cat-file -e "${SOURCE_BASE_SHA}^{commit}" 2>/dev/null; then
             validation_args+=(--base-ref "$SOURCE_BASE_SHA")
+            if ! git -C candidate diff --quiet \
+              "$SOURCE_BASE_SHA...HEAD" -- .github/workflows/docs.yml; then
+              validation_args+=(--changed-file docs/analytics/analytics.js)
+            fi
           else
             mapfile -d '' candidate_files < <(git -C candidate ls-files -z)
             for candidate_file in "${candidate_files[@]}"; do

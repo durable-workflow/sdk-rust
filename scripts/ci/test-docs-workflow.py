@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import shlex
 import unittest
 
 
@@ -15,6 +16,11 @@ PAGES_CONDITION = (
     r"if: >-\n\s+github\.api_url == 'https://api\.github\.com' &&\n"
     r"\s+github\.event_name == 'push' &&\n"
     r"\s+github\.ref == 'refs/heads/main'"
+)
+PRODUCTION_HOSTNAME_ARGUMENT = ("--browser-hostname", "rust.durable-workflow.com")
+ANALYTICS_SUPPRESSION_ARGUMENT = (
+    "--suppress-request",
+    "https://www.googletagmanager.com/gtag/js?id=G-HD1YHT442Y",
 )
 
 
@@ -39,6 +45,61 @@ def step(workflow: str, name: str) -> str:
     if match is None:
         raise AssertionError(f"workflow step {name!r} is missing")
     return match.group("body")
+
+
+def capture_invocations(workflow: str) -> dict[str, tuple[str, ...]]:
+    capture_step = step(
+        job(workflow, "visual-evidence"), "Capture candidate state matrix"
+    )
+    logical_script = re.sub(r"\\\n\s*", " ", capture_step)
+    invocations: dict[str, tuple[str, ...]] = {}
+    for line in logical_script.splitlines():
+        command = shlex.split(line.strip())
+        if not command or command[0] != "capture":
+            continue
+        if len(command) < 4:
+            raise AssertionError("visual capture invocation is incomplete")
+        state = command[1]
+        if state in invocations:
+            raise AssertionError(
+                f"visual capture state {state!r} is invoked more than once"
+            )
+        invocations[state] = tuple(command)
+    return invocations
+
+
+def includes_argument(command: tuple[str, ...], argument: tuple[str, str]) -> bool:
+    return any(
+        command[index : index + 2] == argument for index in range(len(command) - 1)
+    )
+
+
+def assert_production_invocations_are_granted_only(
+    invocations: dict[str, tuple[str, ...]],
+) -> None:
+    expected_states = {"initial", "granted", "denied", "preferences-open"}
+    if set(invocations) != expected_states:
+        raise AssertionError(
+            "visual capture matrix must invoke each required state exactly once"
+        )
+
+    for argument in (PRODUCTION_HOSTNAME_ARGUMENT, ANALYTICS_SUPPRESSION_ARGUMENT):
+        if not includes_argument(invocations["granted"], argument):
+            raise AssertionError(f"granted capture is missing {argument[0]}")
+        reassigned_states = [
+            state
+            for state, command in invocations.items()
+            if state != "granted" and includes_argument(command, argument)
+        ]
+        if reassigned_states:
+            raise AssertionError(
+                f"{argument[0]} must be exclusive to the granted capture, not "
+                f"{', '.join(sorted(reassigned_states))}"
+            )
+
+
+def assert_production_flags_are_granted_only(workflow: str) -> None:
+    assert_production_invocations_are_granted_only(capture_invocations(workflow))
 
 
 class DocsWorkflowContractTest(unittest.TestCase):
@@ -92,19 +153,44 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("--profile rust-sdk-reference", classify)
         self.assertIn("github.event.pull_request.base.sha", classify)
         self.assertIn("github.event.before", classify)
+        self.assertRegex(
+            classify,
+            r'if ! git -C candidate diff --quiet \\\n'
+            r'\s+"\$SOURCE_BASE_SHA\.\.\.HEAD" -- \.github/workflows/docs\.yml; then\n'
+            r"\s+classification_args\+=\(--changed-file docs/analytics/analytics\.js\)",
+        )
         self.assertIn("1440x900 800x900 390x844", capture)
         self.assertIn("capture initial", capture)
         self.assertIn("capture granted", capture)
-        self.assertIn("--browser-hostname rust.durable-workflow.com", capture)
-        self.assertIn(
-            "--suppress-request 'https://www.googletagmanager.com/gtag/js?id=G-HD1YHT442Y'",
-            capture,
-        )
+        assert_production_flags_are_granted_only(self.qualification)
         self.assertIn("capture denied", capture)
         self.assertIn("capture preferences-open", capture)
         self.assertIn("--source-revision", capture)
         self.assertIn("--expected-revision", validate)
+        self.assertRegex(
+            validate,
+            r'if ! git -C candidate diff --quiet \\\n'
+            r'\s+"\$SOURCE_BASE_SHA\.\.\.HEAD" -- \.github/workflows/docs\.yml; then\n'
+            r"\s+validation_args\+=\(--changed-file docs/analytics/analytics\.js\)",
+        )
         self.assertIn("if-no-files-found: error", retain)
+
+    def test_production_capture_flags_cannot_be_reassigned_to_denied(self) -> None:
+        mutated = capture_invocations(self.qualification)
+        mutated["granted"] = (
+            *mutated["granted"][:4],
+            "--click",
+            '[data-consent="granted"]',
+        )
+        mutated["denied"] = (
+            *mutated["denied"][:4],
+            *PRODUCTION_HOSTNAME_ARGUMENT,
+            *ANALYTICS_SUPPRESSION_ARGUMENT,
+            *mutated["denied"][4:],
+        )
+
+        with self.assertRaisesRegex(AssertionError, "granted capture is missing"):
+            assert_production_invocations_are_granted_only(mutated)
 
     def test_visual_capture_loads_the_classified_root_entry_route(self) -> None:
         visual = job(self.qualification, "visual-evidence")
