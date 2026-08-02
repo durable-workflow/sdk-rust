@@ -26,14 +26,17 @@ jobs:
 
       - name: Build complete API documentation
         env:
-          RUSTDOCFLAGS: -D warnings
+          RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
         run: cargo doc --all-features --no-deps
 
       - name: Prepare Pages artifact
         run: |
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
-          printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=durable_workflow/"><link rel="canonical" href="durable_workflow/"><title>Durable Workflow Rust SDK</title><p><a href="durable_workflow/">Open the Durable Workflow Rust SDK API reference</a>.</p>' > target/doc/index.html
+          cp docs/index.html target/doc/index.html
+          mkdir -p target/doc/analytics
+          cp docs/analytics/analytics.css docs/analytics/analytics.js target/doc/analytics/
+          python3 scripts/check-docs-analytics.py target/doc
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
