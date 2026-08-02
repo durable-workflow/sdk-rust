@@ -101,6 +101,25 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("--expected-revision", validate)
         self.assertIn("if-no-files-found: error", retain)
 
+    def test_visual_capture_loads_the_classified_root_entry_route(self) -> None:
+        visual = job(self.qualification, "visual-evidence")
+        build = step(visual, "Build candidate API reference")
+        capture = step(visual, "Capture candidate state matrix")
+
+        self.assertIn("cp docs/index.html target/doc/index.html", build)
+        self.assertEqual(
+            ["candidate/target/doc"],
+            re.findall(
+                r"(?m)^\s*python3 -m http\.server\b[^\n]*"
+                r"--directory\s+([^\s\\]+)",
+                capture,
+            ),
+        )
+        self.assertEqual(
+            ["http://127.0.0.1:4173/", "http://127.0.0.1:4173/"],
+            re.findall(r'http://127\.0\.0\.1:4173/[^\s"\\]*', capture),
+        )
+
     def test_complete_visual_capture_is_reserved_for_github_qualification(self) -> None:
         visual = job(self.qualification, "visual-evidence")
         github_steps = (

@@ -163,7 +163,7 @@ jobs:
           for _ in range(50):
               try:
                   with urllib.request.urlopen(
-                      "http://127.0.0.1:4173/durable_workflow/index.html",
+                      "http://127.0.0.1:4173/",
                       timeout=1,
                   ) as response:
                       if response.status == 200:
@@ -177,7 +177,7 @@ jobs:
             local state=$1 width=$2 height=$3
             shift 3
             node visual-controller/scripts/pipeline_visual_capture.mjs \
-              --url http://127.0.0.1:4173/durable_workflow/index.html \
+              --url http://127.0.0.1:4173/ \
               --surface rust-sdk-reference --state "$state" \
               --width "$width" --height "$height" \
               --source-repository durable-workflow/sdk-rust \
