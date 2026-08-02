@@ -8,6 +8,7 @@
   const LOADER_ID = 'durable-workflow-ga4-loader';
   const BANNER_ID = 'durable-workflow-analytics-consent';
   const PREFERENCES_ID = 'durable-workflow-analytics-preferences';
+  const CONTROLS_ID = 'durable-workflow-analytics-controls';
   const configuredPath = document.currentScript?.dataset.analyticsPath;
   const runtime = window.__durableWorkflowAnalytics || {};
 
@@ -83,6 +84,19 @@
 
   function hideBanner() { document.getElementById(BANNER_ID)?.setAttribute('hidden', ''); }
 
+  function analyticsControls() {
+    let controls = document.getElementById(CONTROLS_ID);
+    if (controls) return controls;
+    controls = document.createElement('aside');
+    controls.id = CONTROLS_ID;
+    controls.className = 'dw-analytics-controls';
+    controls.setAttribute('aria-label', 'Analytics controls');
+    const main = document.querySelector('main .width-limiter');
+    if (main) main.insertBefore(controls, main.firstChild);
+    else document.body.insertBefore(controls, document.body.firstChild);
+    return controls;
+  }
+
   function showPreferencesButton() {
     let button = document.getElementById(PREFERENCES_ID);
     if (!button) {
@@ -92,7 +106,7 @@
       button.type = 'button';
       button.textContent = 'Analytics preferences';
       button.addEventListener('click', showBanner);
-      document.body.appendChild(button);
+      analyticsControls().appendChild(button);
     }
     button.removeAttribute('hidden');
   }
@@ -102,12 +116,14 @@
     writeConsent(value);
     hideBanner();
     showPreferencesButton();
+    document.getElementById(PREFERENCES_ID)?.focus();
     if (value === 'granted') { enableAnalytics(); return; }
     removeAnalyticsCookies();
     if (previous === 'granted' && runtime.analyticsEnabled) window.location.reload();
   }
 
   function showBanner() {
+    const moveFocus = document.activeElement?.id === PREFERENCES_ID;
     let banner = document.getElementById(BANNER_ID);
     if (!banner) {
       banner = document.createElement('section');
@@ -119,10 +135,11 @@
       banner.innerHTML = '<div><strong>Optional site analytics</strong><p>With your permission, Google Analytics receives this site\'s hostname and page path. Query strings and form values are not sent.</p></div><div class="dw-analytics-consent__actions"><button type="button" data-consent="denied">Only necessary</button><button type="button" data-consent="granted">Allow analytics</button></div>';
       banner.querySelector('[data-consent="denied"]').addEventListener('click', function () { chooseConsent('denied'); });
       banner.querySelector('[data-consent="granted"]').addEventListener('click', function () { chooseConsent('granted'); });
-      document.body.appendChild(banner);
+      analyticsControls().appendChild(banner);
     }
     document.getElementById(PREFERENCES_ID)?.setAttribute('hidden', '');
     banner.removeAttribute('hidden');
+    if (moveFocus) banner.querySelector('button')?.focus();
   }
 
   function initializeConsent() {
