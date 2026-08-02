@@ -10,8 +10,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCS_WORKFLOW = ROOT / ".github/workflows/docs.yml"
+PAGES_WORKFLOW = ROOT / ".github/workflows/pages.yml"
 PAGES_CONDITION = (
     r"if: >-\n\s+github\.api_url == 'https://api\.github\.com' &&\n"
+    r"\s+github\.event_name == 'push' &&\n"
     r"\s+github\.ref == 'refs/heads/main'"
 )
 
@@ -41,37 +43,82 @@ def step(workflow: str, name: str) -> str:
 
 class DocsWorkflowContractTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.workflow = DOCS_WORKFLOW.read_text(encoding="utf-8")
+        self.qualification = DOCS_WORKFLOW.read_text(encoding="utf-8")
+        self.publication = PAGES_WORKFLOW.read_text(encoding="utf-8")
 
     def test_docs_qualify_pull_requests_and_target_branch_pushes(self) -> None:
-        triggers = self.workflow.split("\njobs:\n", maxsplit=1)[0]
+        triggers = self.qualification.split("\njobs:\n", maxsplit=1)[0]
         self.assertRegex(
             triggers,
             r"on:\n  pull_request:\n    branches: \[main\]\n"
-            r"  push:\n    branches: \[main\]",
+            r"  push:\n    branches: \[main\]\n"
+            r"  workflow_dispatch:\n\npermissions:",
         )
+        self.assertRegex(triggers, r"permissions:\n  contents: read")
 
-    def test_build_and_analytics_validation_are_provider_neutral(self) -> None:
-        build = step(self.workflow, "Build complete API documentation")
-        prepare = step(self.workflow, "Prepare Pages artifact")
+    def test_pull_request_qualification_is_complete_and_unprivileged(self) -> None:
+        qualify = job(self.qualification, "build")
+        build = step(qualify, "Build complete API documentation")
+        validate = step(qualify, "Prepare Pages artifact")
 
         self.assertIn("cargo doc --all-features --no-deps", build)
         self.assertNotIn("if:", build)
-        self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
-        self.assertNotIn("if:", prepare)
+        self.assertIn("python3 scripts/check-docs-analytics.py target/doc", validate)
+        self.assertNotIn("if:", validate)
+        self.assertNotIn("permissions:", qualify)
+        self.assertNotIn("environment:", qualify)
+        self.assertNotIn("pages: write", self.qualification)
+        self.assertNotIn("id-token: write", self.qualification)
+        self.assertNotIn("actions/configure-pages@", self.qualification)
+        self.assertNotIn("actions/upload-pages-artifact@", self.qualification)
+        self.assertNotIn("actions/deploy-pages@", self.qualification)
 
-    def test_pages_service_actions_only_run_for_github_main(self) -> None:
-        configure = step(self.workflow, "Configure GitHub Pages")
-        upload = step(self.workflow, "Upload Pages artifact")
-        deploy = job(self.workflow, "deploy")
+    def test_pages_publication_only_accepts_trusted_main_pushes(self) -> None:
+        triggers = self.publication.split("\njobs:\n", maxsplit=1)[0]
+        build = job(self.publication, "build")
+        deploy = job(self.publication, "deploy")
 
-        self.assertRegex(configure, PAGES_CONDITION)
-        self.assertIn("uses: actions/configure-pages@", configure)
-        self.assertRegex(upload, PAGES_CONDITION)
-        self.assertIn("uses: actions/upload-pages-artifact@", upload)
+        self.assertRegex(
+            triggers,
+            r"on:\n  push:\n    branches: \[main\]\n\npermissions:",
+        )
+        self.assertNotIn("pull_request:", triggers)
+        self.assertNotIn("workflow_dispatch:", triggers)
+        self.assertRegex(build, PAGES_CONDITION)
+        self.assertRegex(build, r"permissions:\n\s+contents: read")
+        self.assertNotIn("id-token: write", build)
+        self.assertNotIn("pages: write", build)
+        self.assertNotIn("environment:", build)
         self.assertRegex(deploy, PAGES_CONDITION)
+        self.assertRegex(
+            deploy,
+            r"permissions:\n\s+id-token: write\n\s+pages: write",
+        )
+        self.assertRegex(
+            deploy,
+            r"environment:\n\s+name: github-pages\n"
+            r"\s+url: \$\{\{ steps\.deployment\.outputs\.page_url \}\}",
+        )
+
+    def test_deployment_artifact_is_rebuilt_from_the_trusted_push(self) -> None:
+        producer = job(self.publication, "build")
+        consumer = job(self.publication, "deploy")
+        checkout = step(producer, "Check out exact trusted source")
+        build = step(producer, "Build complete API documentation")
+        prepare = step(producer, "Prepare Pages artifact")
+        upload = step(producer, "Upload Pages artifact")
+        deploy = step(consumer, "Deploy GitHub Pages")
+
+        self.assertIn("ref: ${{ github.sha }}", checkout)
+        self.assertIn("persist-credentials: false", checkout)
+        self.assertIn("cargo doc --all-features --no-deps", build)
+        self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
+        self.assertIn("uses: actions/upload-pages-artifact@", upload)
         self.assertIn("uses: actions/deploy-pages@", deploy)
-        self.assertNotIn("github.repository", self.workflow)
+        self.assertIn("needs: build", consumer)
+        self.assertNotIn("actions/download-artifact@", self.publication)
+        self.assertNotIn("actions/deploy-pages@", producer)
+        self.assertNotIn("actions/upload-pages-artifact@", consumer)
 
 
 if __name__ == "__main__":
