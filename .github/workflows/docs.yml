@@ -190,7 +190,10 @@ jobs:
             width=${viewport%x*}
             height=${viewport#*x}
             capture initial "$width" "$height"
-            capture granted "$width" "$height" --click '[data-consent="granted"]'
+            capture granted "$width" "$height" \
+              --browser-hostname rust.durable-workflow.com \
+              --suppress-request 'https://www.googletagmanager.com/gtag/js?id=G-HD1YHT442Y' \
+              --click '[data-consent="granted"]'
             capture denied "$width" "$height" --click '[data-consent="denied"]'
             capture preferences-open "$width" "$height" \
               --click '[data-consent="denied"]' \

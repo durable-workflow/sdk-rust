@@ -95,6 +95,11 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("1440x900 800x900 390x844", capture)
         self.assertIn("capture initial", capture)
         self.assertIn("capture granted", capture)
+        self.assertIn("--browser-hostname rust.durable-workflow.com", capture)
+        self.assertIn(
+            "--suppress-request 'https://www.googletagmanager.com/gtag/js?id=G-HD1YHT442Y'",
+            capture,
+        )
         self.assertIn("capture denied", capture)
         self.assertIn("capture preferences-open", capture)
         self.assertIn("--source-revision", capture)
