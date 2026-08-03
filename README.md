@@ -31,17 +31,17 @@ owns and appends that suffix.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.7
+cargo add durable-workflow@=2.0.0-rc.8
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.7"
+durable-workflow = "=2.0.0-rc.8"
 ```
 
-Version `2.0.0-rc.7` includes the complete Durable Workflow 2.0 prerelease
+Version `2.0.0-rc.8` includes the complete Durable Workflow 2.0 prerelease
 baseline described below.
 
 ## First local run
@@ -64,13 +64,17 @@ cargo run --example hello_world
 ```
 
 `TASK_QUEUE` optionally overrides the default `rust-workers` task queue.
+`ClientBuilder::token` configures a shared credential for both protocol planes.
+Use `control_token` and `worker_token` for least-privilege credentials; the SDK
+never substitutes one scoped token for the other, and reports a configuration
+error before transport when only the opposite role is available.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.7` supports Server `>=2.0.0-rc.12,<2.0.0`. The current
-qualification baseline is Server `2.0.0-rc.12`, proven by published-artifact
-conformance. Server build versions are identity, not the runtime negotiation
-mechanism: compatible servers must advertise control plane `2` and a
+Rust SDK `2.0.0-rc.8` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
+qualification baseline is Server `2.0.0-rc.17`. Server build versions are
+identity, not the runtime negotiation mechanism: compatible servers must
+advertise control plane `2` and a
 same-major worker protocol in `>=1.2,<2.0`. The SDK sends worker protocol `1.2`;
 newer `1.x` server minors accept that header under the additive protocol
 contract.
@@ -590,6 +594,17 @@ acknowledgements for metrics or structured logging. After each heartbeat
 attempt and its bounded retries finish, the worker waits for a complete
 advertised interval before sending the next heartbeat. Delayed responses
 therefore do not queue catch-up requests.
+
+When `Worker::run_until` shuts down normally or a poller terminates, it stops
+and joins every poller before deregistering the successful registration exactly
+once. Deregistration uses the worker-plane protocol and worker credential, not
+the operator worker-management API. Cleanup authentication, protocol, HTTP,
+transport, and response-decoding failures are returned. If work processing and
+deregistration both fail, `Error::WorkerShutdown` preserves the primary error
+and the separately actionable deregistration error. A failed registration is
+never followed by deregistration. Lower-level integrations can call
+`Client::deregister_worker_registration`; its typed result reports the worker
+ID, the `deregistered` outcome, and the number of recovered workflow tasks.
 
 Activity handlers report progress with `ActivityContext::heartbeat`. The
 returned `ActivityHeartbeatResponse` exposes `heartbeat_recorded` and

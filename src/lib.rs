@@ -65,12 +65,6 @@ enum RequestProtocol {
     Worker(&'static str),
 }
 
-impl RequestProtocol {
-    fn is_worker(self) -> bool {
-        matches!(self, Self::Worker(_))
-    }
-}
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
@@ -124,8 +118,20 @@ pub enum Error {
     TimerDurationOverflow,
     #[error("operation timed out")]
     Timeout,
+    #[error(
+        "missing {role}-plane credentials: configure ClientBuilder::{role}_token or ClientBuilder::token; a {opposite_role}-plane token cannot authorize this request"
+    )]
+    MissingRoleCredentials {
+        role: &'static str,
+        opposite_role: &'static str,
+    },
     #[error("worker loop error: {0}")]
     WorkerLoop(String),
+    #[error("{primary}; worker deregistration also failed: {deregistration}")]
+    WorkerShutdown {
+        primary: Box<Error>,
+        deregistration: Box<Error>,
+    },
     #[error("invalid child workflow options: {0}")]
     InvalidChildWorkflowOptions(String),
     #[error(transparent)]
@@ -2114,6 +2120,28 @@ impl Client {
         .await
     }
 
+    /// Gracefully remove one worker's registration through the worker plane.
+    ///
+    /// This operation is separate from operator-facing worker management. It
+    /// uses worker-protocol authentication and returns the server's lease
+    /// recovery result.
+    pub async fn deregister_worker_registration(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerDeregistrationEnvelope> {
+        let path = format!(
+            "/worker/registrations/{}",
+            percent_encode_path_segment(worker_id)
+        );
+        self.request_json(
+            reqwest::Method::DELETE,
+            &path,
+            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            Option::<&Value>::None,
+        )
+        .await
+    }
+
     /// Long-poll for an ephemeral, read-only workflow query task.
     pub async fn poll_query_task(
         &self,
@@ -2623,6 +2651,7 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        let auth_token = self.auth_token(protocol)?;
         let mut request = self
             .http
             .request(method, format!("{}/api{}", self.base_url, path))
@@ -2643,7 +2672,7 @@ impl Client {
             }
         }
 
-        if let Some(token) = self.auth_token(protocol.is_worker()) {
+        if let Some(token) = auth_token {
             request = request.bearer_auth(token);
         }
 
@@ -2698,17 +2727,32 @@ impl Client {
         }
     }
 
-    fn auth_token(&self, worker: bool) -> Option<&str> {
-        if worker {
-            self.worker_token
-                .as_deref()
-                .or(self.token.as_deref())
-                .or(self.control_token.as_deref())
-        } else {
-            self.control_token
-                .as_deref()
-                .or(self.token.as_deref())
-                .or(self.worker_token.as_deref())
+    fn auth_token(&self, protocol: RequestProtocol) -> Result<Option<&str>> {
+        match protocol {
+            RequestProtocol::Worker(_) => {
+                if let Some(token) = self.worker_token.as_deref().or(self.token.as_deref()) {
+                    return Ok(Some(token));
+                }
+                if self.control_token.is_some() {
+                    return Err(Error::MissingRoleCredentials {
+                        role: "worker",
+                        opposite_role: "control",
+                    });
+                }
+                Ok(None)
+            }
+            RequestProtocol::ControlPlane => {
+                if let Some(token) = self.control_token.as_deref().or(self.token.as_deref()) {
+                    return Ok(Some(token));
+                }
+                if self.worker_token.is_some() {
+                    return Err(Error::MissingRoleCredentials {
+                        role: "control",
+                        opposite_role: "worker",
+                    });
+                }
+                Ok(None)
+            }
         }
     }
 }
@@ -3580,6 +3624,14 @@ pub struct RegisterWorkerResponse {
     pub protocol_version: Option<String>,
     #[serde(default)]
     pub server_capabilities: Option<Value>,
+}
+
+/// Result of gracefully removing a worker-plane registration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct WorkerDeregistrationEnvelope {
+    pub worker_id: String,
+    pub outcome: String,
+    pub recovered_workflow_task_count: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4491,6 +4543,38 @@ impl Worker {
         F: Future<Output = ()>,
     {
         let registration = self.register().await?;
+        if !registration.registered {
+            return Err(Error::WorkerLoop(format!(
+                "worker registration for {:?} was not accepted",
+                self.worker_id
+            )));
+        }
+        let registered_worker_id = registration.worker_id.clone();
+        let primary = self.run_registered_until(shutdown, registration).await;
+        let deregistration = self
+            .client
+            .deregister_worker_registration(&registered_worker_id)
+            .await;
+
+        match (primary, deregistration) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Ok(()), Err(deregistration)) => Err(deregistration),
+            (Err(primary), Ok(_)) => Err(primary),
+            (Err(primary), Err(deregistration)) => Err(Error::WorkerShutdown {
+                primary: Box::new(primary),
+                deregistration: Box::new(deregistration),
+            }),
+        }
+    }
+
+    async fn run_registered_until<F>(
+        &self,
+        shutdown: F,
+        registration: RegisterWorkerResponse,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
         let heartbeat_interval = Duration::from_secs(
             registration
                 .heartbeat_interval_seconds
@@ -5393,6 +5477,23 @@ fn default_worker_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("rust-worker-{}-{millis}", std::process::id())
+}
+
+fn percent_encode_path_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(segment.len());
+
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+
+    encoded
 }
 
 fn unique_request_id(prefix: &str) -> String {
@@ -12393,6 +12494,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_deregistration_uses_worker_plane_method_path_headers_and_result() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .worker_token(Some("worker-secret".to_string()))
+            .namespace("orders")
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let path = "/api/worker/registrations/worker%2F%CE%B1%20space";
+
+        let result = client
+            .deregister_worker_registration("worker/α space")
+            .await
+            .expect("deregister worker registration");
+
+        assert_eq!(server.method_for(path).as_deref(), Some("DELETE"));
+        assert_eq!(
+            server.worker_protocol_for(path).as_deref(),
+            Some(WORKER_PROTOCOL_VERSION)
+        );
+        assert_eq!(server.control_protocol_for(path), None);
+        assert_eq!(server.namespace_for(path).as_deref(), Some("orders"));
+        assert_eq!(
+            server.authorization_for(path).as_deref(),
+            Some("Bearer worker-secret")
+        );
+        assert_eq!(
+            result,
+            WorkerDeregistrationEnvelope {
+                worker_id: "deregistered-worker".to_string(),
+                outcome: "deregistered".to_string(),
+                recovered_workflow_task_count: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn role_scoped_tokens_are_never_used_for_the_opposite_plane() {
+        let server = MockWorkerServer::start();
+        let control_only = Client::builder(server.base_url())
+            .control_token(Some("control-secret".to_string()))
+            .build()
+            .expect("control client");
+
+        let error = control_only
+            .register_worker("worker", "queue", vec![], vec![], 1, 1)
+            .await
+            .expect_err("control token must not authorize a worker request");
+        assert!(matches!(
+            error,
+            Error::MissingRoleCredentials { role: "worker", .. }
+        ));
+        assert_eq!(server.request_count("/api/worker/register"), 0);
+
+        let worker_only = Client::builder(server.base_url())
+            .worker_token(Some("worker-secret".to_string()))
+            .build()
+            .expect("worker client");
+        let error = worker_only
+            .health()
+            .await
+            .expect_err("worker token must not authorize a control request");
+        assert!(matches!(
+            error,
+            Error::MissingRoleCredentials {
+                role: "control",
+                ..
+            }
+        ));
+        assert_eq!(server.request_count("/api/health"), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_token_supports_worker_and_control_planes() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .token(Some("shared-secret".to_string()))
+            .build()
+            .expect("client");
+
+        client.health().await.expect("control request");
+        client
+            .register_worker("worker", "queue", vec![], vec![], 1, 1)
+            .await
+            .expect("worker request");
+
+        assert_eq!(
+            server.authorization_for("/api/health").as_deref(),
+            Some("Bearer shared-secret")
+        );
+        assert_eq!(
+            server.control_protocol_for("/api/health").as_deref(),
+            Some(CONTROL_PLANE_VERSION)
+        );
+        assert_eq!(
+            server.authorization_for("/api/worker/register").as_deref(),
+            Some("Bearer shared-secret")
+        );
+        assert_eq!(
+            server
+                .worker_protocol_for("/api/worker/register")
+                .as_deref(),
+            Some(WORKER_PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
     async fn baseline_worker_endpoints_send_the_baseline_protocol() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -12685,6 +12893,194 @@ mod tests {
             server.request_count("/api/worker/query-tasks/query-late/fail"),
             0,
             "a server completion rejection must not be reported as an encoding failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_joins_pollers_and_deregisters_once() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("joined-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow(
+            "joined.workflow",
+            |_ctx, _input| async move { Ok(Value::Null) },
+        );
+        worker.register_activity(
+            "joined.activity",
+            |_ctx, _input| async move { Ok(Value::Null) },
+        );
+        worker.register_query("joined.workflow", "state", |_ctx, _input| async move {
+            Ok(Value::Null)
+        });
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(20)))
+            .await
+            .expect("normal shutdown");
+
+        let deregistration_path = "/api/worker/registrations/mock-worker";
+        assert_eq!(server.request_count(deregistration_path), 1);
+        for poll_path in [
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            assert!(server.request_count(poll_path) > 0, "missing {poll_path}");
+        }
+        assert_eq!(
+            server.captured_paths().last().map(String::as_str),
+            Some(deregistration_path),
+            "deregistration must start only after every poller has joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_failure_does_not_deregister() {
+        let server = MockWorkerServer::rejected_registration();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "rust-workers").worker_id("never-registered");
+
+        let error = worker
+            .run_until(async {})
+            .await
+            .expect_err("registration must fail");
+        assert!(matches!(
+            error,
+            Error::Http {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                ..
+            }
+        ));
+        assert!(server
+            .captured_paths()
+            .iter()
+            .all(|path| !path.starts_with("/api/worker/registrations/")));
+    }
+
+    #[tokio::test]
+    async fn declined_registration_does_not_deregister() {
+        let server = MockWorkerServer::declined_registration();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "rust-workers").worker_id("declined-worker");
+
+        let error = worker
+            .run_until(async {})
+            .await
+            .expect_err("declined registration must fail");
+        assert!(matches!(error, Error::WorkerLoop(_)));
+        assert!(error.to_string().contains("was not accepted"));
+        assert!(server
+            .captured_paths()
+            .iter()
+            .all(|path| !path.starts_with("/api/worker/registrations/")));
+    }
+
+    #[tokio::test]
+    async fn deregistration_http_failure_is_returned_after_normal_shutdown() {
+        let server = MockWorkerServer::rejected_deregistration();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "rust-workers").worker_id("forbidden-cleanup");
+
+        let error = worker
+            .run_until(async {})
+            .await
+            .expect_err("deregistration must fail");
+        assert!(matches!(
+            error,
+            Error::Http {
+                status: reqwest::StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+        assert_eq!(
+            server.request_count("/api/worker/registrations/mock-worker"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deregistration_protocol_failure_is_returned_after_normal_shutdown() {
+        let server = MockWorkerServer::rejected_deregistration_protocol();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "rust-workers").worker_id("protocol-cleanup");
+
+        let error = worker
+            .run_until(async {})
+            .await
+            .expect_err("protocol rejection must fail shutdown");
+        let Error::Protocol(failure) = error else {
+            panic!("expected typed protocol failure");
+        };
+        assert_eq!(failure.reason, "unsupported_protocol_version");
+        assert_eq!(failure.requested_version.as_deref(), Some("1.2"));
+        assert_eq!(
+            server.request_count("/api/worker/registrations/mock-worker"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_poller_error_retains_deregistration_failure_context() {
+        let server = MockWorkerServer::unauthorized_polls_and_rejected_deregistration();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("combined-failure")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("combined.workflow", |_ctx, _input| async move {
+            Ok(Value::Null)
+        });
+
+        let error = worker
+            .run()
+            .await
+            .expect_err("worker and cleanup must fail");
+        let summary = error.to_string();
+        assert!(summary.contains("authentication_failed"));
+        assert!(summary.contains("worker cannot deregister"));
+        let Error::WorkerShutdown {
+            primary,
+            deregistration,
+        } = error
+        else {
+            panic!("expected combined worker shutdown error");
+        };
+        assert!(matches!(
+            *primary,
+            Error::Http {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        ));
+        assert!(matches!(
+            *deregistration,
+            Error::Http {
+                status: reqwest::StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+        assert_eq!(
+            server.request_count("/api/worker/registrations/mock-worker"),
+            1
         );
     }
 
@@ -13142,8 +13538,12 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct CapturedRequest {
+        method: String,
         path: String,
+        authorization: Option<String>,
+        namespace: Option<String>,
         worker_protocol: Option<String>,
+        control_protocol: Option<String>,
         body: String,
         received_at: Instant,
     }
@@ -13160,6 +13560,7 @@ mod tests {
         reject_query_protocol: bool,
         reject_query_completion: bool,
         waiting_query_worker: bool,
+        decline_registration: bool,
         complete_named_signal: bool,
         poll_failures_per_path: usize,
         heartbeat_failures: usize,
@@ -13168,6 +13569,9 @@ mod tests {
         heartbeat_response_delay: Duration,
         concurrent_requests: bool,
         unauthorized_polls: bool,
+        reject_registration: bool,
+        reject_deregistration: bool,
+        reject_deregistration_protocol: bool,
         cancelled_activity: bool,
         draining_polls: bool,
         workflow_completion_status: Option<&'static str>,
@@ -13246,6 +13650,42 @@ mod tests {
         fn unauthorized_polls() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 unauthorized_polls: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn rejected_registration() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                reject_registration: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn declined_registration() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                decline_registration: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn rejected_deregistration() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                reject_deregistration: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn rejected_deregistration_protocol() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                reject_deregistration_protocol: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn unauthorized_polls_and_rejected_deregistration() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                unauthorized_polls: true,
+                reject_deregistration: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -13339,6 +13779,42 @@ mod tests {
                 .and_then(|request| request.worker_protocol.clone())
         }
 
+        fn control_protocol_for(&self, path: &str) -> Option<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .find(|request| request.path == path)
+                .and_then(|request| request.control_protocol.clone())
+        }
+
+        fn method_for(&self, path: &str) -> Option<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .find(|request| request.path == path)
+                .map(|request| request.method.clone())
+        }
+
+        fn authorization_for(&self, path: &str) -> Option<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .find(|request| request.path == path)
+                .and_then(|request| request.authorization.clone())
+        }
+
+        fn namespace_for(&self, path: &str) -> Option<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .find(|request| request.path == path)
+                .and_then(|request| request.namespace.clone())
+        }
+
         fn request_count(&self, path: &str) -> usize {
             self.requests
                 .lock()
@@ -13346,6 +13822,15 @@ mod tests {
                 .iter()
                 .filter(|request| request.path == path)
                 .count()
+        }
+
+        fn captured_paths(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .map(|request| request.path.clone())
+                .collect()
         }
 
         fn request_times(&self, path: &str) -> Vec<Instant> {
@@ -13439,16 +13924,40 @@ mod tests {
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or_default();
+        let method = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_default();
+        let authorization = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Authorization")
+                .then(|| value.trim().to_string())
+        });
+        let namespace = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("X-Namespace")
+                .then(|| value.trim().to_string())
+        });
         let worker_protocol = request.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.eq_ignore_ascii_case("X-Durable-Workflow-Protocol-Version")
                 .then(|| value.trim().to_string())
         });
+        let control_protocol = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("X-Durable-Workflow-Control-Plane-Version")
+                .then(|| value.trim().to_string())
+        });
         let request_number = {
             let mut requests = requests.lock().expect("captured requests");
             requests.push(CapturedRequest {
+                method: method.to_string(),
                 path: path.to_string(),
+                authorization,
+                namespace,
                 worker_protocol: worker_protocol.clone(),
+                control_protocol,
                 body: body.to_string(),
                 received_at: Instant::now(),
             });
@@ -13457,6 +13966,38 @@ mod tests {
                 .filter(|request| request.path == path)
                 .count()
         };
+
+        if behavior.reject_registration && path == "/api/worker/register" {
+            write_mock_response(
+                stream,
+                "503 Service Unavailable",
+                r#"{"reason":"registration_unavailable","message":"registration failed"}"#,
+            );
+            return;
+        }
+
+        if path.starts_with("/api/worker/registrations/") {
+            if behavior.reject_deregistration_protocol {
+                write_mock_response(
+                    stream,
+                    "400 Bad Request",
+                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.1","requested_version":"1.2"}"#,
+                );
+            } else if behavior.reject_deregistration {
+                write_mock_response(
+                    stream,
+                    "403 Forbidden",
+                    r#"{"reason":"authorization_failed","message":"worker cannot deregister"}"#,
+                );
+            } else {
+                write_mock_response(
+                    stream,
+                    "200 OK",
+                    r#"{"worker_id":"deregistered-worker","outcome":"deregistered","recovered_workflow_task_count":2}"#,
+                );
+            }
+            return;
+        }
 
         let is_poll = matches!(
             path,
@@ -13752,9 +14293,14 @@ mod tests {
         }
 
         let (status, body) = match path {
+            "/api/health" => ("200 OK", r#"{"status":"ok"}"#),
             "/api/workflows" => (
                 "201 Created",
                 r#"{"workflow_id":"wf-start-options","run_id":"run-start-options","workflow_type":"rust.timeout"}"#,
+            ),
+            "/api/worker/register" if behavior.decline_registration => (
+                "200 OK",
+                r#"{"worker_id":"declined-worker","registered":false}"#,
             ),
             "/api/worker/register" if behavior.waiting_query_worker => (
                 "200 OK",
