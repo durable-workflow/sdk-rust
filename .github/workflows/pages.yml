@@ -1,0 +1,215 @@
+name: API Documentation Publication
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-documentation-publication
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build trusted Pages artifact
+    if: >-
+      github.api_url == 'https://api.github.com' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact trusted source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
+
+      - name: Build complete API documentation
+        env:
+          CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}
+          RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
+        run: |
+          if ! printf '%s' "$CLOUDFLARE_WEB_ANALYTICS_TOKEN" | grep -Eq '^[a-f0-9]{32}$'; then
+            echo 'CLOUDFLARE_WEB_ANALYTICS_TOKEN must be the canonical 32-character site token' >&2
+            exit 1
+          fi
+          sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
+            docs/analytics/analytics.js
+          cargo doc --all-features --no-deps
+
+      - name: Prepare Pages artifact
+        run: |
+          printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
+          touch target/doc/.nojekyll
+          cp docs/index.html target/doc/index.html
+          cp docs/layout.css target/doc/layout.css
+          mkdir -p target/doc/analytics
+          cp docs/analytics/analytics.js target/doc/analytics/
+          python3 scripts/check-docs-analytics.py target/doc
+
+      - name: Upload qualified Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
+        with:
+          path: target/doc
+
+  visual-evidence:
+    name: Qualify trusted reference states
+    if: >-
+      github.api_url == 'https://api.github.com' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact trusted source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          repository: ${{ github.repository }}
+
+      - name: Check out visual evidence controller
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          path: visual-controller
+          persist-credentials: false
+          ref: 0421c2e3a78ba4ca2adfe118e57db88d2264a62b
+          repository: durable-workflow/.github
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
+        with:
+          node-version: "24"
+
+      - name: Install pinned visual capture runtime
+        run: npm ci --prefix visual-controller
+
+      - name: Build trusted API reference
+        working-directory: candidate
+        env:
+          CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}
+          RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
+        run: |
+          if ! printf '%s' "$CLOUDFLARE_WEB_ANALYTICS_TOKEN" | grep -Eq '^[a-f0-9]{32}$'; then
+            echo 'CLOUDFLARE_WEB_ANALYTICS_TOKEN must be the canonical 32-character site token' >&2
+            exit 1
+          fi
+          sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
+            docs/analytics/analytics.js
+          cargo doc --all-features --no-deps
+          printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
+          touch target/doc/.nojekyll
+          cp docs/index.html target/doc/index.html
+          cp docs/layout.css target/doc/layout.css
+          mkdir -p target/doc/analytics
+          cp docs/analytics/analytics.js target/doc/analytics/
+          python3 scripts/check-docs-analytics.py target/doc
+
+      - name: Capture trusted state matrix
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+          TMPDIR: ${{ runner.temp }}/rust-docs-publication-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" visual-review
+          python3 -m http.server 4173 --bind 127.0.0.1 --directory candidate/target/doc \
+            >"$RUNNER_TEMP/rust-docs-preview.log" 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          python3 - <<'PY'
+          import time
+          import urllib.request
+
+          for _ in range(50):
+              try:
+                  with urllib.request.urlopen(
+                      "http://127.0.0.1:4173/",
+                      timeout=1,
+                  ) as response:
+                      if response.status == 200:
+                          break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("trusted documentation preview did not become ready")
+          PY
+          capture() {
+            local state=$1 width=$2 height=$3
+            shift 3
+            local capture_args=()
+            if [ "$width" = 640 ] && [ "$height" = 360 ]; then
+              capture_args+=(--full-page)
+            fi
+            node visual-controller/scripts/pipeline_visual_capture.mjs \
+              --url http://127.0.0.1:4173/ \
+              --surface rust-sdk-reference --state "$state" \
+              --width "$width" --height "$height" \
+              --source-repository durable-workflow/sdk-rust \
+              --source-revision "$SOURCE_REVISION" \
+              --screenshot "visual-review/${state}-${width}x${height}.png" \
+              --report "visual-review/${state}-${width}x${height}.json" \
+              --manifest visual-review/manifest.json "${capture_args[@]}" "$@"
+          }
+          for viewport in 1440x900 800x900 390x844 640x360; do
+            width=${viewport%x*}
+            height=${viewport#*x}
+            capture analytics-ui-removed "$width" "$height"
+          done
+
+      - name: Validate trusted source-bound evidence
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python visual-controller/scripts/visual_evidence.py validate \
+            --root "$GITHUB_WORKSPACE/candidate" \
+            --profile rust-sdk-reference \
+            --expected-revision "$SOURCE_REVISION" \
+            --manifest "$GITHUB_WORKSPACE/visual-review/manifest.json" \
+            --changed-file docs/analytics/analytics.js
+
+      - name: Retain trusted visual evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          if-no-files-found: error
+          name: rust-docs-publication-visual-${{ github.sha }}
+          path: visual-review
+          retention-days: 30
+
+  deploy:
+    name: Deploy qualified rustdoc
+    needs: [build, visual-evidence]
+    if: >-
+      github.api_url == 'https://api.github.com' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      pages: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy qualified GitHub Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5
