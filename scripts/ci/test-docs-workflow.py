@@ -1,13 +1,10 @@
-#!/usr/bin/env python3
 """Structural contract tests for portable API documentation qualification."""
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
-import shlex
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCS_WORKFLOW = ROOT / ".github/workflows/docs.yml"
@@ -16,11 +13,6 @@ PAGES_CONDITION = (
     r"if: >-\n\s+github\.api_url == 'https://api\.github\.com' &&\n"
     r"\s+github\.event_name == 'push' &&\n"
     r"\s+github\.ref == 'refs/heads/main'"
-)
-PRODUCTION_HOSTNAME_ARGUMENT = ("--browser-hostname", "rust.durable-workflow.com")
-ANALYTICS_SUPPRESSION_ARGUMENT = (
-    "--suppress-request",
-    "https://www.googletagmanager.com/gtag/js?id=G-HD1YHT442Y",
 )
 
 
@@ -47,61 +39,6 @@ def step(workflow: str, name: str) -> str:
     return match.group("body")
 
 
-def capture_invocations(workflow: str) -> dict[str, tuple[str, ...]]:
-    capture_step = step(
-        job(workflow, "visual-evidence"), "Capture candidate state matrix"
-    )
-    logical_script = re.sub(r"\\\n\s*", " ", capture_step)
-    invocations: dict[str, tuple[str, ...]] = {}
-    for line in logical_script.splitlines():
-        command = shlex.split(line.strip())
-        if not command or command[0] != "capture":
-            continue
-        if len(command) < 4:
-            raise AssertionError("visual capture invocation is incomplete")
-        state = command[1]
-        if state in invocations:
-            raise AssertionError(
-                f"visual capture state {state!r} is invoked more than once"
-            )
-        invocations[state] = tuple(command)
-    return invocations
-
-
-def includes_argument(command: tuple[str, ...], argument: tuple[str, str]) -> bool:
-    return any(
-        command[index : index + 2] == argument for index in range(len(command) - 1)
-    )
-
-
-def assert_production_invocations_are_granted_only(
-    invocations: dict[str, tuple[str, ...]],
-) -> None:
-    expected_states = {"initial", "granted", "denied", "preferences-open"}
-    if set(invocations) != expected_states:
-        raise AssertionError(
-            "visual capture matrix must invoke each required state exactly once"
-        )
-
-    for argument in (PRODUCTION_HOSTNAME_ARGUMENT, ANALYTICS_SUPPRESSION_ARGUMENT):
-        if not includes_argument(invocations["granted"], argument):
-            raise AssertionError(f"granted capture is missing {argument[0]}")
-        reassigned_states = [
-            state
-            for state, command in invocations.items()
-            if state != "granted" and includes_argument(command, argument)
-        ]
-        if reassigned_states:
-            raise AssertionError(
-                f"{argument[0]} must be exclusive to the granted capture, not "
-                f"{', '.join(sorted(reassigned_states))}"
-            )
-
-
-def assert_production_flags_are_granted_only(workflow: str) -> None:
-    assert_production_invocations_are_granted_only(capture_invocations(workflow))
-
-
 class DocsWorkflowContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.qualification = DOCS_WORKFLOW.read_text(encoding="utf-8")
@@ -118,23 +55,26 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertRegex(triggers, r"permissions:\n  contents: read")
 
     def test_pull_request_qualification_is_complete_and_unprivileged(self) -> None:
-        qualify = job(self.qualification, "build")
-        build = step(qualify, "Build complete API documentation")
-        validate = step(qualify, "Prepare Pages artifact")
+        build_job = job(self.qualification, "build")
+        build = step(build_job, "Build complete API documentation")
+        prepare = step(build_job, "Prepare Pages artifact")
 
         self.assertIn("cargo doc --all-features --no-deps", build)
         self.assertNotIn("if:", build)
-        self.assertIn("python3 scripts/check-docs-analytics.py target/doc", validate)
-        self.assertNotIn("if:", validate)
-        self.assertNotIn("permissions:", qualify)
-        self.assertNotIn("environment:", qualify)
+        self.assertIn("CLOUDFLARE_WEB_ANALYTICS_TOKEN", build)
+        self.assertIn("cp docs/analytics/analytics.js", prepare)
+        self.assertNotIn("analytics.css", prepare)
+        self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
+        self.assertNotIn("if:", prepare)
+        self.assertNotIn("permissions:", build_job)
+        self.assertNotIn("environment:", build_job)
         self.assertNotIn("pages: write", self.qualification)
         self.assertNotIn("id-token: write", self.qualification)
         self.assertNotIn("actions/configure-pages@", self.qualification)
         self.assertNotIn("actions/upload-pages-artifact@", self.qualification)
         self.assertNotIn("actions/deploy-pages@", self.qualification)
 
-    def test_visual_changes_use_the_source_bound_organization_capture_gate(self) -> None:
+    def test_visual_changes_use_the_source_bound_controller(self) -> None:
         visual = job(self.qualification, "visual-evidence")
         checkout = step(visual, "Check out candidate source")
         admission = step(visual, "Admit the structurally qualified candidate")
@@ -144,10 +84,10 @@ class DocsWorkflowContractTest(unittest.TestCase):
         retain = step(visual, "Retain candidate visual evidence")
 
         self.assertIn("permissions:\n      contents: read", visual)
-        self.assertIn("repository: durable-workflow/.github", visual)
-        self.assertIn("github.api_url != 'https://api.github.com'", visual)
         self.assertIn("ref: ${{ github.sha }}", checkout)
         self.assertNotIn("if:", checkout)
+        self.assertIn("repository: durable-workflow/.github", visual)
+        self.assertIn("github.api_url != 'https://api.github.com'", visual)
         self.assertIn("working-directory: candidate", admission)
         self.assertIn("python3 scripts/ci/test-docs-workflow.py", admission)
         self.assertIn("--profile rust-sdk-reference", classify)
@@ -159,12 +99,12 @@ class DocsWorkflowContractTest(unittest.TestCase):
             r'\s+"\$SOURCE_BASE_SHA\.\.\.HEAD" -- \.github/workflows/docs\.yml; then\n'
             r"\s+classification_args\+=\(--changed-file docs/analytics/analytics\.js\)",
         )
-        self.assertIn("1440x900 800x900 390x844", capture)
-        self.assertIn("capture initial", capture)
-        self.assertIn("capture granted", capture)
-        assert_production_flags_are_granted_only(self.qualification)
-        self.assertIn("capture denied", capture)
-        self.assertIn("capture preferences-open", capture)
+        self.assertIn("1440x900 800x900 390x844 640x360", capture)
+        self.assertEqual(1, capture.count("capture analytics-ui-removed"))
+        self.assertIn("capture_args+=(--full-page)", capture)
+        self.assertNotRegex(
+            capture, r"data-consent|analytics-preferences|googletagmanager"
+        )
         self.assertIn("--source-revision", capture)
         self.assertIn("--expected-revision", validate)
         self.assertRegex(
@@ -174,42 +114,6 @@ class DocsWorkflowContractTest(unittest.TestCase):
             r"\s+validation_args\+=\(--changed-file docs/analytics/analytics\.js\)",
         )
         self.assertIn("if-no-files-found: error", retain)
-
-    def test_production_capture_flags_cannot_be_reassigned_to_denied(self) -> None:
-        mutated = capture_invocations(self.qualification)
-        mutated["granted"] = (
-            *mutated["granted"][:4],
-            "--click",
-            '[data-consent="granted"]',
-        )
-        mutated["denied"] = (
-            *mutated["denied"][:4],
-            *PRODUCTION_HOSTNAME_ARGUMENT,
-            *ANALYTICS_SUPPRESSION_ARGUMENT,
-            *mutated["denied"][4:],
-        )
-
-        with self.assertRaisesRegex(AssertionError, "granted capture is missing"):
-            assert_production_invocations_are_granted_only(mutated)
-
-    def test_visual_capture_loads_the_classified_root_entry_route(self) -> None:
-        visual = job(self.qualification, "visual-evidence")
-        build = step(visual, "Build candidate API reference")
-        capture = step(visual, "Capture candidate state matrix")
-
-        self.assertIn("cp docs/index.html target/doc/index.html", build)
-        self.assertEqual(
-            ["candidate/target/doc"],
-            re.findall(
-                r"(?m)^\s*python3 -m http\.server\b[^\n]*"
-                r"--directory\s+([^\s\\]+)",
-                capture,
-            ),
-        )
-        self.assertEqual(
-            ["http://127.0.0.1:4173/", "http://127.0.0.1:4173/"],
-            re.findall(r'http://127\.0\.0\.1:4173/[^\s"\\]*', capture),
-        )
 
     def test_complete_visual_capture_is_reserved_for_github_qualification(self) -> None:
         visual = job(self.qualification, "visual-evidence")
@@ -230,6 +134,25 @@ class DocsWorkflowContractTest(unittest.TestCase):
                     "github.api_url == 'https://api.github.com'",
                     step(visual, name),
                 )
+
+    def test_visual_capture_loads_the_classified_root_entry_route(self) -> None:
+        visual = job(self.qualification, "visual-evidence")
+        build = step(visual, "Build candidate API reference")
+        capture = step(visual, "Capture candidate state matrix")
+
+        self.assertIn("cp docs/index.html target/doc/index.html", build)
+        self.assertEqual(
+            ["candidate/target/doc"],
+            re.findall(
+                r"(?m)^\s*python3 -m http\.server\b[^\n]*"
+                r"--directory\s+([^\s\\]+)",
+                capture,
+            ),
+        )
+        self.assertEqual(
+            ["http://127.0.0.1:4173/", "http://127.0.0.1:4173/"],
+            re.findall(r'http://127\.0\.0\.1:4173/[^\s"\\]*', capture),
+        )
 
     def test_pages_publication_only_accepts_trusted_main_pushes(self) -> None:
         triggers = self.publication.split("\njobs:\n", maxsplit=1)[0]
@@ -270,7 +193,9 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", checkout)
         self.assertIn("persist-credentials: false", checkout)
         self.assertIn("cargo doc --all-features --no-deps", build)
+        self.assertIn("CLOUDFLARE_WEB_ANALYTICS_TOKEN", build)
         self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
+        self.assertNotIn("analytics.css", prepare)
         self.assertIn("uses: actions/upload-pages-artifact@", upload)
         self.assertIn("uses: actions/deploy-pages@", deploy)
         self.assertIn("needs: build", consumer)

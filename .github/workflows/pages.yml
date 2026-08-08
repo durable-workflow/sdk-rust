@@ -36,16 +36,25 @@ jobs:
 
       - name: Build complete API documentation
         env:
+          CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}
           RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
-        run: cargo doc --all-features --no-deps
+        run: |
+          if ! printf '%s' "$CLOUDFLARE_WEB_ANALYTICS_TOKEN" | grep -Eq '^[a-f0-9]{32}$'; then
+            echo 'CLOUDFLARE_WEB_ANALYTICS_TOKEN must be the canonical 32-character site token' >&2
+            exit 1
+          fi
+          sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
+            docs/analytics/analytics.js
+          cargo doc --all-features --no-deps
 
       - name: Prepare Pages artifact
         run: |
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
+          cp docs/layout.css target/doc/layout.css
           mkdir -p target/doc/analytics
-          cp docs/analytics/analytics.css docs/analytics/analytics.js target/doc/analytics/
+          cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
 
       - name: Upload Pages artifact
