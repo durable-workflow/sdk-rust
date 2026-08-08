@@ -42,7 +42,6 @@ def step(workflow: str, name: str) -> str:
 class DocsWorkflowContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.qualification = DOCS_WORKFLOW.read_text(encoding="utf-8")
-        self.publication = PAGES_WORKFLOW.read_text(encoding="utf-8")
 
     def test_docs_qualify_pull_requests_and_target_branch_pushes(self) -> None:
         triggers = self.qualification.split("\njobs:\n", maxsplit=1)[0]
@@ -58,6 +57,8 @@ class DocsWorkflowContractTest(unittest.TestCase):
         build_job = job(self.qualification, "build")
         build = step(build_job, "Build complete API documentation")
         prepare = step(build_job, "Prepare Pages artifact")
+        configure = step(build_job, "Configure GitHub Pages")
+        upload = step(build_job, "Upload qualified Pages artifact")
 
         self.assertIn("cargo doc --all-features --no-deps", build)
         self.assertNotIn("if:", build)
@@ -68,11 +69,8 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertNotIn("if:", prepare)
         self.assertNotIn("permissions:", build_job)
         self.assertNotIn("environment:", build_job)
-        self.assertNotIn("pages: write", self.qualification)
-        self.assertNotIn("id-token: write", self.qualification)
-        self.assertNotIn("actions/configure-pages@", self.qualification)
-        self.assertNotIn("actions/upload-pages-artifact@", self.qualification)
-        self.assertNotIn("actions/deploy-pages@", self.qualification)
+        self.assertRegex(configure, PAGES_CONDITION)
+        self.assertRegex(upload, PAGES_CONDITION)
 
     def test_visual_changes_use_the_source_bound_controller(self) -> None:
         visual = job(self.qualification, "visual-evidence")
@@ -154,22 +152,18 @@ class DocsWorkflowContractTest(unittest.TestCase):
             re.findall(r'http://127\.0\.0\.1:4173/[^\s"\\]*', capture),
         )
 
-    def test_pages_publication_only_accepts_trusted_main_pushes(self) -> None:
-        triggers = self.publication.split("\njobs:\n", maxsplit=1)[0]
-        build = job(self.publication, "build")
-        deploy = job(self.publication, "deploy")
+    def test_pages_publication_only_accepts_qualified_trusted_main_pushes(self) -> None:
+        build = job(self.qualification, "build")
+        visual = job(self.qualification, "visual-evidence")
+        deploy = job(self.qualification, "deploy")
 
-        self.assertRegex(
-            triggers,
-            r"on:\n  push:\n    branches: \[main\]\n\npermissions:",
-        )
-        self.assertNotIn("pull_request:", triggers)
-        self.assertNotIn("workflow_dispatch:", triggers)
-        self.assertRegex(build, PAGES_CONDITION)
-        self.assertRegex(build, r"permissions:\n\s+contents: read")
+        self.assertFalse(PAGES_WORKFLOW.exists())
         self.assertNotIn("id-token: write", build)
         self.assertNotIn("pages: write", build)
         self.assertNotIn("environment:", build)
+        self.assertNotIn("id-token: write", visual)
+        self.assertNotIn("pages: write", visual)
+        self.assertIn("needs: [build, visual-evidence]", deploy)
         self.assertRegex(deploy, PAGES_CONDITION)
         self.assertRegex(
             deploy,
@@ -182,24 +176,23 @@ class DocsWorkflowContractTest(unittest.TestCase):
         )
 
     def test_deployment_artifact_is_rebuilt_from_the_trusted_push(self) -> None:
-        producer = job(self.publication, "build")
-        consumer = job(self.publication, "deploy")
-        checkout = step(producer, "Check out exact trusted source")
+        producer = job(self.qualification, "build")
+        consumer = job(self.qualification, "deploy")
         build = step(producer, "Build complete API documentation")
         prepare = step(producer, "Prepare Pages artifact")
-        upload = step(producer, "Upload Pages artifact")
-        deploy = step(consumer, "Deploy GitHub Pages")
+        upload = step(producer, "Upload qualified Pages artifact")
+        deploy = step(consumer, "Deploy qualified GitHub Pages artifact")
 
-        self.assertIn("ref: ${{ github.sha }}", checkout)
-        self.assertIn("persist-credentials: false", checkout)
+        self.assertIn("ref: ${{ github.sha }}", producer)
+        self.assertIn("persist-credentials: false", producer)
         self.assertIn("cargo doc --all-features --no-deps", build)
         self.assertIn("CLOUDFLARE_WEB_ANALYTICS_TOKEN", build)
         self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
         self.assertNotIn("analytics.css", prepare)
         self.assertIn("uses: actions/upload-pages-artifact@", upload)
         self.assertIn("uses: actions/deploy-pages@", deploy)
-        self.assertIn("needs: build", consumer)
-        self.assertNotIn("actions/download-artifact@", self.publication)
+        self.assertIn("needs: [build, visual-evidence]", consumer)
+        self.assertNotIn("actions/download-artifact@", self.qualification)
         self.assertNotIn("actions/deploy-pages@", producer)
         self.assertNotIn("actions/upload-pages-artifact@", consumer)
 
