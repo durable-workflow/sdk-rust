@@ -31,17 +31,17 @@ owns and appends that suffix.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.10
+cargo add durable-workflow@=2.0.0-rc.11
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.10"
+durable-workflow = "=2.0.0-rc.11"
 ```
 
-Version `2.0.0-rc.10` includes the complete Durable Workflow 2.0 prerelease
+Version `2.0.0-rc.11` includes the complete Durable Workflow 2.0 prerelease
 baseline described below.
 
 ## First local run
@@ -71,8 +71,8 @@ error before transport when only the opposite role is available.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.10` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
-qualification baseline is Server `2.0.0-rc.23`. Server build versions are
+Rust SDK `2.0.0-rc.11` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
+qualification baseline is Server `2.0.0-rc.17`. Server build versions are
 identity, not the runtime negotiation mechanism: compatible servers must
 advertise control plane `2` and a
 same-major worker protocol in `>=1.2,<2.0`. The SDK sends worker protocol `1.2`;
@@ -99,10 +99,12 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 baseline; only query-task poll, complete, and fail requests use the additive
 `1.8` feature floor.
 
-The Rust SDK does not expose update-validator authoring. Worker registration
-declares an empty `update_validators` list for every workflow type so Server
-discovery does not infer synchronous validator support from ordinary update
-handlers.
+The Rust SDK does not expose update-validator authoring. High-level worker
+registration declares an empty `update_validators` list for every workflow type
+so Server discovery does not infer synchronous validator support from ordinary
+update handlers. The public low-level registration API rejects a non-empty or
+malformed validator declaration before transport while preserving legitimate
+query and update contracts.
 
 ## Avro Value protocol
 

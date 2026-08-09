@@ -1,11 +1,18 @@
 # Changelog
 
+## 2.0.0-rc.11
+
+- Reject unsupported update-validator declarations from the public low-level
+  worker registration API before transport while preserving query and update
+  handler contracts.
+- Retain the qualified Server baseline at `2.0.0-rc.17` under the additive
+  `>=2.0.0-rc.17,<2.0.0` compatibility range.
+
 ## 2.0.0-rc.10
 
 - Declare the absence of an update-validator authoring surface in registered
   workflow contracts so Server discovery does not infer validator parity.
-- Qualify this release with Server `2.0.0-rc.23` while preserving the additive
-  `>=2.0.0-rc.17,<2.0.0` protocol compatibility range.
+- Preserve the additive `>=2.0.0-rc.17,<2.0.0` protocol compatibility range.
 
 ## 2.0.0-rc.9
 

@@ -16,10 +16,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PACKAGE_VERSION = "2.0.0-rc.10"
+PACKAGE_VERSION = "2.0.0-rc.11"
 PRODUCT_TRAIN = PACKAGE_VERSION
 SERVER_VERSIONS = ">=2.0.0-rc.17,<2.0.0"
-QUALIFIED_SERVER_VERSION = "2.0.0-rc.23"
+QUALIFIED_SERVER_VERSION = "2.0.0-rc.17"
 SERVER_WORKER_PROTOCOLS = ">=1.2,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64

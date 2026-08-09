@@ -127,6 +127,10 @@ pub enum Error {
     },
     #[error("worker loop error: {0}")]
     WorkerLoop(String),
+    #[error(
+        "workflow command contract for {workflow_type:?} declares update validators, but this Rust SDK cannot execute synchronous pre-accept update validation"
+    )]
+    UnsupportedUpdateValidators { workflow_type: String },
     #[error("{primary}; worker deregistration also failed: {deregistration}")]
     WorkerShutdown {
         primary: Box<Error>,
@@ -2081,6 +2085,11 @@ impl Client {
     }
 
     /// Register a worker and advertise its named query and update handlers.
+    ///
+    /// This Rust SDK cannot execute synchronous pre-accept update validation,
+    /// so a workflow contract with a non-empty or malformed
+    /// `update_validators` declaration returns
+    /// [`Error::UnsupportedUpdateValidators`] before registration transport.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_worker_with_command_contracts(
         &self,
@@ -2093,6 +2102,22 @@ impl Client {
         capabilities: Vec<String>,
         workflow_command_contracts: Value,
     ) -> Result<RegisterWorkerResponse> {
+        if let Some(contracts) = workflow_command_contracts.as_object() {
+            for (workflow_type, contract) in contracts {
+                let Some(update_validators) = contract.get("update_validators") else {
+                    continue;
+                };
+                if !update_validators
+                    .as_array()
+                    .is_some_and(|validators| validators.is_empty())
+                {
+                    return Err(Error::UnsupportedUpdateValidators {
+                        workflow_type: workflow_type.clone(),
+                    });
+                }
+            }
+        }
+
         let mut body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
@@ -12528,6 +12553,82 @@ mod tests {
                 outcome: "deregistered".to_string(),
                 recovered_workflow_task_count: 2,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn low_level_registration_rejects_update_validators_before_transport() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        for update_validators in [json!(["approve"]), json!("approve")] {
+            let error = client
+                .register_worker_with_command_contracts(
+                    "validator-claiming-worker",
+                    "rust-workers",
+                    vec!["orders".to_string()],
+                    vec![],
+                    1,
+                    1,
+                    vec![WORKFLOW_UPDATES_CAPABILITY.to_string()],
+                    json!({
+                        "orders": {
+                            "queries": ["current"],
+                            "updates": ["approve"],
+                            "update_validators": update_validators,
+                        },
+                    }),
+                )
+                .await
+                .expect_err("unsupported validator claims must fail before registration");
+
+            let Error::UnsupportedUpdateValidators { workflow_type } = error else {
+                panic!("expected typed unsupported-validator failure");
+            };
+            assert_eq!(workflow_type, "orders");
+        }
+        assert_eq!(server.request_count("/api/worker/register"), 0);
+    }
+
+    #[tokio::test]
+    async fn low_level_registration_preserves_query_and_update_contracts() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let contracts = json!({
+            "orders": {
+                "queries": ["current"],
+                "updates": ["approve"],
+                "update_validators": [],
+            },
+            "payments": {
+                "queries": ["status"],
+                "updates": ["capture"],
+            },
+        });
+
+        client
+            .register_worker_with_command_contracts(
+                "command-worker",
+                "rust-workers",
+                vec!["orders".to_string(), "payments".to_string()],
+                vec![],
+                1,
+                1,
+                vec![WORKFLOW_UPDATES_CAPABILITY.to_string()],
+                contracts.clone(),
+            )
+            .await
+            .expect("query and update contracts must remain supported");
+
+        assert_eq!(
+            server.request_body("/api/worker/register")["workflow_command_contracts"],
+            contracts
         );
     }
 
