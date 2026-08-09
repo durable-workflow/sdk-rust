@@ -215,6 +215,21 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("must match its product train", result.stderr)
 
+    def test_release_path_refuses_a_new_pre_2_package(self) -> None:
+        manifest = self.temp / "Cargo.toml"
+        source = MANIFEST.read_text(encoding="utf-8")
+        source = source.replace(
+            f'version = "{PACKAGE_VERSION}"', 'version = "0.1.23"', 1
+        ).replace(
+            f'product-train = "{PRODUCT_TRAIN}"',
+            'product-train = "0.1.23"',
+            1,
+        )
+        manifest.write_text(source, encoding="utf-8")
+        result = self._publish(manifest)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("refuses unsupported pre-2.0", result.stderr)
+
     def test_release_path_rejects_a_divergent_server_version(self) -> None:
         manifest = self._manifest_with(
             f'supported-server-versions = "{SERVER_VERSIONS}"',

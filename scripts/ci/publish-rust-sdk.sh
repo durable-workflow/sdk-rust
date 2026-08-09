@@ -67,6 +67,11 @@ if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; 
     printf 'Rust SDK package version must be exact SemVer: %s\n' "$package_version" >&2
     exit 1
 fi
+package_major="${package_version%%.*}"
+if ((10#$package_major < 2)); then
+    printf 'Rust SDK publication refuses unsupported pre-2.0 package version: %s\n' "$package_version" >&2
+    exit 1
+fi
 if [[ "$package_rust_version" != "1.86" ]]; then
     printf 'unexpected Rust SDK minimum Rust version: %s\n' "$package_rust_version" >&2
     exit 1
