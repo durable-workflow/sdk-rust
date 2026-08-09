@@ -66,10 +66,13 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo run --release --example avro_value_benchmark -- --enforce
 
-      - name: Build warning-free API documentation
+      - name: Qualify warning-free API documentation and examples
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --all-features --no-deps
+        run: |
+          cargo doc --all-features --no-deps
+          cargo doc --all-features --no-deps --examples
+          python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc
 
       - name: Verify publishable package
         run: cargo package
@@ -77,7 +80,7 @@ jobs:
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/test-component-release-recovery.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
           python -m py_compile scripts/ci/test-docs-workflow.py
           scripts/ci/test-crates-io-publish.sh
           arguments=()
@@ -90,6 +93,7 @@ jobs:
             "${arguments[@]}"
           python scripts/ci/test-publish-planned-tag.py
           python scripts/ci/test-publish-rust-sdk.py
+          python scripts/ci/test-example-base-urls.py
           python scripts/ci/test-docs-workflow.py
           python scripts/ci/test-source-qualification.py
         env:

@@ -21,6 +21,10 @@
       "command": ["scripts/check-public-boundary.sh"]
     },
     {
+      "id": "example-base-urls",
+      "command": ["python3", "scripts/ci/validate-example-base-urls.py"]
+    },
+    {
       "id": "compile",
       "command": ["cargo", "check", "--all-targets"]
     }
@@ -30,6 +34,7 @@
     "stable-all-target-tests",
     "typed-avro-compatibility",
     "typed-avro-regression-budget",
+    "shipped-example-base-url-contract",
     "warning-free-rustdoc",
     "publishable-package-content",
     "release-tooling"

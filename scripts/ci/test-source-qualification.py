@@ -45,6 +45,10 @@ class SourceQualificationContractTest(unittest.TestCase):
             "rustfmt": ["cargo", "fmt", "--all", "--check"],
             "diff-boundary": ["git", "diff", "--check", "{candidate_range}"],
             "public-boundary": ["scripts/check-public-boundary.sh"],
+            "example-base-urls": [
+                "python3",
+                "scripts/ci/validate-example-base-urls.py",
+            ],
             "compile": ["cargo", "check", "--all-targets"],
         }
         self.assertEqual(
@@ -88,6 +92,11 @@ class SourceQualificationContractTest(unittest.TestCase):
             "cargo run --release --example avro_value_benchmark -- --enforce", verify
         )
         self.assertIn("cargo doc --all-features --no-deps", verify)
+        self.assertIn("cargo doc --all-features --no-deps --examples", verify)
+        self.assertIn(
+            "python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc",
+            verify,
+        )
         self.assertIn("cargo package", verify)
         self.assertIn("Validate release tooling", verify)
         self.assertIn('test "$COMPLETE_RESULT" = success', qualification)
@@ -97,6 +106,7 @@ class SourceQualificationContractTest(unittest.TestCase):
                 "stable-all-target-tests",
                 "typed-avro-compatibility",
                 "typed-avro-regression-budget",
+                "shipped-example-base-url-contract",
                 "warning-free-rustdoc",
                 "publishable-package-content",
                 "release-tooling",

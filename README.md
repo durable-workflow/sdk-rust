@@ -31,17 +31,17 @@ owns and appends that suffix.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.8
+cargo add durable-workflow@=2.0.0-rc.9
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.8"
+durable-workflow = "=2.0.0-rc.9"
 ```
 
-Version `2.0.0-rc.8` includes the complete Durable Workflow 2.0 prerelease
+Version `2.0.0-rc.9` includes the complete Durable Workflow 2.0 prerelease
 baseline described below.
 
 ## First local run
@@ -71,7 +71,7 @@ error before transport when only the opposite role is available.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.8` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
+Rust SDK `2.0.0-rc.9` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
 qualification baseline is Server `2.0.0-rc.17`. Server build versions are
 identity, not the runtime negotiation mechanism: compatible servers must
 advertise control plane `2` and a

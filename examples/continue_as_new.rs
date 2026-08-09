@@ -25,6 +25,6 @@ fn bounded_worker(client: Client) -> Worker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::new("http://127.0.0.1:8080/api")?;
+    let client = Client::new("http://127.0.0.1:8080")?;
     bounded_worker(client).run().await
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.0-rc.9
+
+- Correct every shipped example to pass a Server origin or path-prefixed Cloud
+  runtime URL without the SDK-owned `/api` suffix.
+- Qualify the base-URL contract across all example sources and their rendered
+  Rust documentation before publication.
+
 ## 2.0.0-rc.8
 
 - Gracefully deregister successful worker registrations after all managed
