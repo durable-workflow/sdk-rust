@@ -4501,6 +4501,7 @@ impl Worker {
                     json!({
                         "queries": queries,
                         "updates": updates,
+                        "update_validators": [],
                     }),
                 );
             }
@@ -13366,6 +13367,7 @@ mod tests {
             json!({
                 "queries": ["current"],
                 "updates": ["replace"],
+                "update_validators": [],
             })
         );
 

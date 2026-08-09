@@ -83,7 +83,7 @@ if [[ "$package_version" != "$product_train" ]]; then
     printf 'Rust SDK package version must match its product train metadata: %s, %s\n' "$package_version" "$product_train" >&2
     exit 1
 fi
-if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.17,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.17" || "$server_worker_protocols" != ">=1.2,<2.0" ]]; then
+if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.17,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.23" || "$server_worker_protocols" != ">=1.2,<2.0" ]]; then
     printf 'unexpected Rust SDK supported Server contract: %s, %s, %s, %s\n' "$compatibility_authority" "$server_compatibility" "$qualified_server_version" "$server_worker_protocols" >&2
     exit 1
 fi
