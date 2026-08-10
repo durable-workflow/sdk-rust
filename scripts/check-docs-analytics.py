@@ -4,9 +4,12 @@ from pathlib import Path
 
 build_directory = Path(sys.argv[1] if len(sys.argv) > 1 else "target/doc")
 runtime = Path("docs/analytics/analytics.js").read_text(encoding="utf-8")
+styles = Path("docs/layout.css").read_text(encoding="utf-8")
 
 if (build_directory / "analytics/analytics.js").read_text(encoding="utf-8") != runtime:
     raise SystemExit("Rendered rustdoc analytics runtime is stale")
+if not re.search(r"\.dw-cloud-promotion__eyebrow\s*\{[^}]*letter-spacing:\s*0;", styles, re.DOTALL):
+    raise SystemExit("Promotion eyebrow letter spacing must remain zero")
 
 for required in (
     "https://static.cloudflareinsights.com/beacon.min.js",
@@ -59,6 +62,28 @@ for html_file in html_files:
     if forbidden.search(html):
         raise SystemExit(
             f"{html_file} contains retired Google analytics or consent state"
+        )
+
+crate_home = (build_directory / "durable_workflow/index.html").read_text(
+    encoding="utf-8"
+)
+if crate_home.count('data-promotion-source="sdk-rust-reference"') != 1:
+    raise SystemExit("Rust reference home must render one bounded Cloud promotion")
+if (
+    'href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-reference"'
+    not in crate_home
+):
+    raise SystemExit("Rust reference promotion must resolve to the public early-access form")
+
+for promotion_boundary in (
+    "PROMOTION_SOURCE = 'sdk-rust-reference'",
+    "credentials: 'omit'",
+    "referrerPolicy: 'no-referrer'",
+    "JSON.stringify({source: PROMOTION_SOURCE, event})",
+):
+    if promotion_boundary not in runtime:
+        raise SystemExit(
+            f"Promotion analytics is missing its bounded contract: {promotion_boundary}"
         )
 
 print(

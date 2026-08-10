@@ -26,6 +26,15 @@ provisioned Durable Workflow Cloud namespace. Pass the Server base URL or the
 Cloud-provided runtime URL to `Client::builder(...)` without `/api`; the SDK
 owns and appends that suffix.
 
+<aside class="dw-cloud-promotion" aria-labelledby="dw-cloud-promotion-title" data-promotion-source="sdk-rust-reference">
+  <div>
+    <p class="dw-cloud-promotion__eyebrow">Managed Rust runtime · limited cohort</p>
+    <h2 id="dw-cloud-promotion-title">Durable Workflow Cloud launch cohort</h2>
+    <p>Run Rust clients and workers against a managed namespace while Durable Workflow operates the orchestration runtime.</p>
+  </div>
+  <a class="dw-cloud-promotion__action" data-promotion-action="early-access" href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-reference">Request early access</a>
+</aside>
+
 ## Install
 
 Add the exact crates.io release with Cargo:

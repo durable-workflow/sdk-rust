@@ -3,3 +3,65 @@
   text-overflow: clip;
   white-space: normal;
 }
+
+.dw-cloud-promotion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin: 1.5rem 0 2rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--main-color);
+  background: var(--main-background-color);
+}
+
+.dw-cloud-promotion h2,
+.dw-cloud-promotion p {
+  margin: 0;
+}
+
+.dw-cloud-promotion h2 {
+  margin-block: 0.2rem 0.35rem;
+  font-size: 1.1rem;
+}
+
+.dw-cloud-promotion__eyebrow {
+  color: var(--main-color);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.dw-cloud-promotion__action {
+  flex: 0 0 auto;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--main-color);
+  color: var(--main-color);
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.dw-cloud-promotion__action:hover,
+.dw-cloud-promotion__action:focus-visible {
+  background: var(--main-color);
+  color: var(--main-background-color);
+}
+
+@media (max-width: 700px) {
+  .dw-cloud-promotion {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1rem;
+  }
+
+  .dw-cloud-promotion__action {
+    width: 100%;
+    box-sizing: border-box;
+    text-align: center;
+    white-space: normal;
+  }
+}
