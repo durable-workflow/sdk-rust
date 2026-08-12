@@ -16,6 +16,7 @@ if re.search(r"gradient|clamp\(|letter-spacing:\s*-|\b\d+(?:\.\d+)?vw\b", landin
 
 for required in (
     "https://static.cloudflareinsights.com/beacon.min.js",
+    "navigator.webdriver === true",
     "document.querySelector(BEACON_SELECTOR)",
     "loader.type = 'module'",
     "loader.dataset.cfBeacon = JSON.stringify({token: TOKEN})",

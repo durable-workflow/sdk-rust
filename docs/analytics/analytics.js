@@ -65,6 +65,8 @@
     observer.observe(promotion);
   }
 
+  if (navigator.webdriver === true) return;
+
   initializePromotion();
 
   if (
