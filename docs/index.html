@@ -3,86 +3,100 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Start a Rust workflow and activity on Durable Workflow Cloud, then continue to the generated API reference.">
+  <meta name="description" content="Install the first-party Durable Workflow Rust SDK and explore its generated API reference and SDK guide.">
   <link rel="stylesheet" href="layout.css">
   <link rel="canonical" href="https://rust.durable-workflow.com/">
   <title>Durable Workflow for Rust</title>
   <script type="module" src="/analytics/analytics.js"></script>
 </head>
-<body class="dw-landing">
-  <header class="dw-nav">
+<body class="dw-landing" data-landing-contract="general-rust-first" data-crate-version="2.0.0-rc.12" data-rust-version="1.86">
+  <header class="dw-nav" data-landing-region="primary-navigation">
     <a class="dw-brand" href="/" aria-label="Durable Workflow Rust home">
       <span class="dw-brand__mark" aria-hidden="true">DW</span>
       <span>Durable Workflow <strong>Rust</strong></span>
     </a>
     <nav aria-label="Documentation">
-      <a href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/">Cloud quickstart</a>
-      <a href="durable_workflow/">API reference</a>
+      <a data-docs-destination="sdk-guide" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">SDK guide</a>
+      <a data-docs-destination="api-reference" href="durable_workflow/">API reference</a>
       <a href="https://github.com/durable-workflow/sdk-rust">GitHub</a>
     </nav>
   </header>
 
   <main>
-    <header class="dw-page-heading">
+    <header class="dw-page-heading" data-journey="general">
       <p class="dw-kicker">Rust SDK · 2.0 prerelease</p>
       <h1>Durable Workflow Rust SDK</h1>
-      <p>Run a Rust workflow and activity on Durable Workflow Cloud, retrieve the completed result, and inspect the run in Managed Waterline.</p>
-      <p class="dw-version"><strong>Current crate</strong> <code>durable-workflow = "=2.0.0-rc.12"</code> <span>Rust 1.86+</span></p>
+      <p data-landing-lead>Author deterministic workflows and activities, run workers, and control workflow executions with the first-party Rust SDK.</p>
+      <p class="dw-version">
+        <strong>Current published crate</strong>
+        <code>durable-workflow = "=2.0.0-rc.12"</code>
+        <span>Requires Rust 1.86+</span>
+      </p>
       <div class="dw-actions">
-        <a class="dw-button dw-button--primary" href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/">Run the Cloud quickstart</a>
-        <a class="dw-button" href="durable_workflow/">Browse the API</a>
+        <a class="dw-button dw-button--primary" data-docs-destination="api-reference" data-docs-priority="primary" data-access="general" href="durable_workflow/">Browse the API reference</a>
+        <a class="dw-button" data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">Read the SDK guide</a>
       </div>
     </header>
 
-    <section class="dw-quickstart" aria-labelledby="cloud-quickstart-title">
+    <section class="dw-quickstart" data-landing-section="first-task" data-journey="general" aria-labelledby="install-title">
       <div class="dw-section-heading">
-        <p class="dw-kicker">First completed run</p>
-        <h2 id="cloud-quickstart-title">From a Sample App Codespace</h2>
-        <p>The prepared environment includes Rust, Cargo, and the current <code>dw</code> CLI.</p>
+        <p class="dw-kicker">Start here</p>
+        <h2 id="install-title">Add the SDK to a Rust project</h2>
+        <p>The public crate and generated reference are available without an account.</p>
       </div>
 
       <ol class="dw-steps">
         <li>
           <span class="dw-step-number">1</span>
           <div>
-            <h3>Configure one namespace</h3>
-            <p>Set the complete namespace runtime URL and separate client and worker credentials.</p>
-            <pre><code>DURABLE_WORKFLOW_RUNTIME_URL='https://cloud.example/api/runtime/v1/namespaces/&lt;runtime-id&gt;'
-DURABLE_WORKFLOW_RUNTIME_NAMESPACE='orders'
-DURABLE_WORKFLOW_CLIENT_TOKEN='dwr_client_...'
-DURABLE_WORKFLOW_WORKER_TOKEN='dwr_worker_...'</code></pre>
+            <h3>Confirm the Rust toolchain</h3>
+            <p>Use Rust 1.86 or newer.</p>
+            <pre><code>rustc --version</code></pre>
           </div>
         </li>
         <li>
           <span class="dw-step-number">2</span>
           <div>
-            <h3>Run the workflow and activity</h3>
-            <p>The Sample App uses the pinned crate, one task queue, and a development build.</p>
-            <pre><code>scripts/rust-cloud.sh run</code></pre>
+            <h3>Install the exact prerelease</h3>
+            <p>Pin the current published crate while the 2.0 line is in prerelease.</p>
+            <pre><code>cargo add durable-workflow@=2.0.0-rc.12</code></pre>
           </div>
         </li>
         <li>
           <span class="dw-step-number">3</span>
           <div>
-            <h3>Verify the completed result</h3>
-            <p>The command records SDK and CLI versions, shuts the worker down cleanly, and prints the Managed Waterline destination.</p>
-            <pre><code>"status_bucket": "completed"
-"workflow_runtime": "rust"
-"activity_runtime": "rust"</code></pre>
+            <h3>Explore the authoring surface</h3>
+            <p>Open the generated modules, traits, structs, and methods, then use the guide for runtime setup and deployment.</p>
+            <div class="dw-inline-links">
+              <a data-docs-destination="api-reference" data-access="general" href="durable_workflow/">Generated API reference</a>
+              <a data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">Rust SDK guide</a>
+            </div>
           </div>
         </li>
       </ol>
     </section>
 
-    <section class="dw-next" aria-labelledby="reference-title">
+    <section class="dw-next" data-journey="general" aria-labelledby="reference-title">
       <div>
-        <p class="dw-kicker">Reference</p>
+        <p class="dw-kicker">Build with Rust</p>
         <h2 id="reference-title">Continue with the SDK</h2>
-        <p>Use the generated reference for types and methods, or the SDK guide for concepts and deployment.</p>
+        <p>Choose the depth you need: generated API details or the broader SDK guide.</p>
       </div>
       <div class="dw-next__links">
-        <a href="durable_workflow/"><strong>Generated API reference</strong><span>Modules, traits, structs, and methods</span></a>
-        <a href="https://durable-workflow.com/docs/2.0/polyglot/rust/"><strong>Rust SDK guide</strong><span>Concepts, compatibility, and deployment</span></a>
+        <a data-docs-destination="api-reference" data-access="general" href="durable_workflow/"><strong>Generated API reference</strong><span>Modules, traits, structs, and methods</span></a>
+        <a data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/"><strong>Rust SDK guide</strong><span>Concepts, compatibility, runtime setup, and deployment</span></a>
+      </div>
+    </section>
+
+    <section class="dw-cloud" data-journey="cloud" data-access="limited-early-access" aria-labelledby="cloud-title">
+      <div>
+        <p class="dw-kicker">Managed runtime · limited early access</p>
+        <h2 id="cloud-title">Durable Workflow Cloud</h2>
+        <p>Cloud is a limited early-access deployment option for teams with a provisioned namespace. Request access to join the cohort; existing participants can review the managed-runtime guide.</p>
+      </div>
+      <div class="dw-cloud__links">
+        <a class="dw-button" data-docs-destination="cloud-access" data-access="limited-early-access" href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-landing">Request early access</a>
+        <a data-docs-destination="cloud-guide" data-access="limited-early-access" href="https://durable-workflow.com/docs/2.0/polyglot/cloud-control-plane/">Read the Cloud runtime guide</a>
       </div>
     </section>
   </main>

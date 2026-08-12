@@ -72,28 +72,6 @@ if '<meta http-equiv="refresh"' in landing:
     raise SystemExit("Rust documentation root must be a task-oriented landing page")
 if len(re.findall(r"<h1(?:\s|>)", landing)) != 1:
     raise SystemExit("Rust documentation landing must expose one primary heading")
-for required_link in (
-    'href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/"',
-    'href="durable_workflow/"',
-):
-    if required_link not in landing:
-        raise SystemExit(f"Rust documentation landing is missing {required_link}")
-for required_identifier in (
-    "DURABLE_WORKFLOW_RUNTIME_URL",
-    "DURABLE_WORKFLOW_CLIENT_TOKEN",
-    "DURABLE_WORKFLOW_WORKER_TOKEN",
-    "scripts/rust-cloud.sh run",
-):
-    if required_identifier not in landing:
-        raise SystemExit(
-            f"Rust documentation landing is missing quickstart identifier {required_identifier}"
-        )
-crate_manifest = Path("Cargo.toml").read_text(encoding="utf-8")
-crate_version = re.search(r'^version = "([^"]+)"$', crate_manifest, re.MULTILINE)
-if crate_version is None:
-    raise SystemExit("Rust documentation landing could not bind the current crate version")
-if f'durable-workflow = "={crate_version.group(1)}"' not in landing:
-    raise SystemExit("Rust documentation landing crate version is stale")
 
 crate_home = (build_directory / "durable_workflow/index.html").read_text(
     encoding="utf-8"

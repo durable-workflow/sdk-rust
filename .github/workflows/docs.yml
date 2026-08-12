@@ -51,6 +51,8 @@ jobs:
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
+          python3 scripts/ci/qualify-docs-landing.py \
+            --build-directory target/doc --check-external
 
   visual-evidence:
     name: Render candidate reference states
@@ -159,6 +161,8 @@ jobs:
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
+          python3 scripts/ci/qualify-docs-landing.py \
+            --build-directory target/doc --check-external
 
       - name: Capture candidate state matrix
         if: >-

@@ -56,6 +56,8 @@ jobs:
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
+          python3 scripts/ci/qualify-docs-landing.py \
+            --build-directory target/doc --check-external
 
       - name: Upload qualified Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
@@ -124,6 +126,8 @@ jobs:
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
+          python3 scripts/ci/qualify-docs-landing.py \
+            --build-directory target/doc --check-external
 
       - name: Capture trusted state matrix
         env:
@@ -213,3 +217,124 @@ jobs:
       - name: Deploy qualified GitHub Pages artifact
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5
+
+  verify-deployment:
+    name: Verify deployed landing destinations
+    needs: [deploy]
+    if: >-
+      github.api_url == 'https://api.github.com' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact trusted source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out visual evidence controller
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          path: visual-controller
+          persist-credentials: false
+          ref: 0421c2e3a78ba4ca2adfe118e57db88d2264a62b
+          repository: durable-workflow/.github
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
+        with:
+          node-version: "24"
+
+      - name: Install pinned visual capture runtime
+        run: npm ci --prefix visual-controller
+
+      - name: Verify deployed landing and first-party destinations
+        run: |
+          python3 scripts/ci/qualify-docs-landing.py \
+            --landing-url https://rust.durable-workflow.com/ \
+            --attempts 30 --link-attempts 3 --retry-delay 10
+
+      - name: Capture deployed landing matrix
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+          TMPDIR: ${{ runner.temp }}/rust-docs-deployed-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" deployed-visual-review
+          capture() {
+            local width=$1 height=$2
+            shift 2
+            node visual-controller/scripts/pipeline_visual_capture.mjs \
+              --url https://rust.durable-workflow.com/ \
+              --surface rust-sdk-landing --state deployed-general-first \
+              --width "$width" --height "$height" \
+              --source-repository durable-workflow/sdk-rust \
+              --source-revision "$SOURCE_REVISION" \
+              --screenshot "deployed-visual-review/${width}x${height}.png" \
+              --report "deployed-visual-review/${width}x${height}.json" \
+              --manifest deployed-visual-review/manifest.json "$@"
+          }
+          capture 1440 900
+          capture 768 1024
+          capture 390 844
+          capture 640 360 --full-page
+
+      - name: Validate deployed landing reports
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report_paths = sorted(
+              path
+              for path in Path("deployed-visual-review").glob("*.json")
+              if path.name != "manifest.json"
+          )
+          if len(report_paths) != 4:
+              raise SystemExit(
+                  f"deployed landing requires four capture reports; found {len(report_paths)}"
+              )
+
+          failures = []
+          empty_report_fields = (
+              "console_errors",
+              "console_warnings",
+              "page_errors",
+              "request_failures",
+              "http_errors",
+          )
+          empty_geometry_fields = (
+              "clipped_text",
+              "clipped_control_text",
+              "unreachable_controls",
+              "overlapping_floating_elements",
+              "displaced_primary_content",
+              "orphaned_body_controls",
+          )
+          for path in report_paths:
+              report = json.loads(path.read_text(encoding="utf-8"))
+              if not 200 <= report.get("page_status", 0) < 300:
+                  failures.append(f"{path}: page did not return HTTP 2xx")
+              geometry = report.get("geometry", {})
+              if geometry.get("horizontal_overflow"):
+                  failures.append(f"{path}: horizontal overflow detected")
+              for field in empty_report_fields:
+                  if report.get(field):
+                      failures.append(f"{path}: {field} is not empty")
+              for field in empty_geometry_fields:
+                  if geometry.get(field):
+                      failures.append(f"{path}: geometry.{field} is not empty")
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY
+
+      - name: Retain deployed landing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          if-no-files-found: error
+          name: rust-docs-deployed-${{ github.sha }}
+          path: deployed-visual-review
+          retention-days: 30

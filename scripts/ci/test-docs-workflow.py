@@ -46,21 +46,13 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.qualification = DOCS_WORKFLOW.read_text(encoding="utf-8")
         self.publication = PAGES_WORKFLOW.read_text(encoding="utf-8")
 
-    def test_root_is_task_landing_before_generated_reference(self) -> None:
+    def test_root_is_a_general_first_landing(self) -> None:
         landing = DOCS_LANDING.read_text(encoding="utf-8")
 
         self.assertNotIn('<meta http-equiv="refresh"', landing)
-        self.assertIn(
-            'href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/"',
-            landing,
-        )
-        self.assertIn('href="durable_workflow/"', landing)
-        self.assertLess(
-            landing.index(
-                'href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/"'
-            ),
-            landing.index('href="durable_workflow/"'),
-        )
+        self.assertIn('data-landing-contract="general-rust-first"', landing)
+        self.assertIn('data-docs-priority="primary"', landing)
+        self.assertNotIn("rust-cloud-quickstart", landing)
 
     def test_docs_qualify_pull_requests_and_target_branch_pushes(self) -> None:
         triggers = self.qualification.split("\njobs:\n", maxsplit=1)[0]
@@ -83,6 +75,8 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("cp docs/analytics/analytics.js", prepare)
         self.assertNotIn("analytics.css", prepare)
         self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
+        self.assertIn("python3 scripts/ci/qualify-docs-landing.py", prepare)
+        self.assertIn("--build-directory target/doc --check-external", prepare)
         self.assertNotIn("if:", prepare)
         self.assertNotIn("permissions:", build_job)
         self.assertNotIn("environment:", build_job)
@@ -163,6 +157,8 @@ class DocsWorkflowContractTest(unittest.TestCase):
         capture = step(visual, "Capture candidate state matrix")
 
         self.assertIn("cp docs/index.html target/doc/index.html", build)
+        self.assertIn("python3 scripts/ci/qualify-docs-landing.py", build)
+        self.assertIn("--build-directory target/doc --check-external", build)
         self.assertEqual(
             ["candidate/target/doc"],
             re.findall(
@@ -181,6 +177,7 @@ class DocsWorkflowContractTest(unittest.TestCase):
         build = job(self.publication, "build")
         visual = job(self.publication, "visual-evidence")
         deploy = job(self.publication, "deploy")
+        verify = job(self.publication, "verify-deployment")
 
         self.assertRegex(
             triggers,
@@ -197,6 +194,8 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertNotIn("pages: write", visual)
         self.assertIn("needs: [build, visual-evidence]", deploy)
         self.assertRegex(deploy, PAGES_CONDITION)
+        self.assertIn("needs: [deploy]", verify)
+        self.assertRegex(verify, PAGES_CONDITION)
         self.assertRegex(
             deploy,
             r"permissions:\n\s+id-token: write\n\s+pages: write",
@@ -233,6 +232,35 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("--changed-file docs/analytics/analytics.js", validate)
         self.assertIn("if-no-files-found: error", retain)
 
+    def test_publication_verifies_the_deployed_landing_after_deploy(self) -> None:
+        verify = job(self.publication, "verify-deployment")
+        checkout = step(verify, "Check out exact trusted source")
+        controller_checkout = step(verify, "Check out visual evidence controller")
+        qualify = step(verify, "Verify deployed landing and first-party destinations")
+        capture = step(verify, "Capture deployed landing matrix")
+        validate = step(verify, "Validate deployed landing reports")
+        retain = step(verify, "Retain deployed landing evidence")
+
+        self.assertIn("needs: [deploy]", verify)
+        self.assertIn("ref: ${{ github.sha }}", checkout)
+        self.assertIn("persist-credentials: false", checkout)
+        self.assertIn("repository: durable-workflow/.github", controller_checkout)
+        self.assertIn(f"ref: {VISUAL_CONTROLLER_REVISION}", controller_checkout)
+        self.assertIn(
+            "--landing-url https://rust.durable-workflow.com/", qualify
+        )
+        self.assertIn("--attempts 30", qualify)
+        self.assertIn("--link-attempts 3", qualify)
+        self.assertIn("--url https://rust.durable-workflow.com/", capture)
+        self.assertIn("capture 1440 900", capture)
+        self.assertIn("capture 768 1024", capture)
+        self.assertIn("capture 390 844", capture)
+        self.assertIn("capture 640 360 --full-page", capture)
+        self.assertIn('"unreachable_controls"', validate)
+        self.assertIn('"request_failures"', validate)
+        self.assertIn('"http_errors"', validate)
+        self.assertIn("if-no-files-found: error", retain)
+
     def test_deployment_artifact_is_rebuilt_from_the_trusted_push(self) -> None:
         producer = job(self.publication, "build")
         consumer = job(self.publication, "deploy")
@@ -247,6 +275,8 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("cargo doc --all-features --no-deps", build)
         self.assertIn("CLOUDFLARE_WEB_ANALYTICS_TOKEN", build)
         self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
+        self.assertIn("python3 scripts/ci/qualify-docs-landing.py", prepare)
+        self.assertIn("--build-directory target/doc --check-external", prepare)
         self.assertNotIn("analytics.css", prepare)
         self.assertIn("uses: actions/upload-pages-artifact@", upload)
         self.assertIn("uses: actions/deploy-pages@", deploy)

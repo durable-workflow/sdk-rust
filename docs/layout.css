@@ -158,6 +158,19 @@ body.dw-landing {
   white-space: pre-wrap;
 }
 
+.dw-inline-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin-top: 0.7rem;
+}
+.dw-inline-links a {
+  color: var(--dw-accent);
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-underline-offset: 0.18rem;
+}
+
 .dw-next {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -169,6 +182,26 @@ body.dw-landing {
 .dw-next__links a:hover strong,
 .dw-next__links a:focus-visible strong { color: var(--dw-accent); }
 .dw-next__links span { color: var(--dw-muted); font-size: 0.82rem; }
+
+.dw-cloud {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2.5rem;
+  align-items: center;
+  padding: 2rem;
+  border: 1px solid var(--dw-line);
+  border-left: 3px solid var(--dw-accent);
+  background: var(--dw-surface);
+}
+.dw-cloud h2 { margin: 0; font-size: 1.35rem; line-height: 1.25; }
+.dw-cloud > div > p:last-child { max-width: 700px; margin: 0.45rem 0 0; color: var(--dw-muted); font-size: 0.88rem; }
+.dw-cloud__links { display: grid; justify-items: start; gap: 0.7rem; }
+.dw-cloud__links .dw-button { color: var(--dw-accent); }
+.dw-cloud__links > a:last-child {
+  color: var(--dw-muted);
+  font-size: 0.78rem;
+  text-underline-offset: 0.18rem;
+}
 
 .dw-landing footer {
   display: flex;
@@ -188,11 +221,13 @@ body.dw-landing {
   .dw-page-heading { padding: 2rem 0; }
   .dw-page-heading h1 { font-size: 2rem; }
   .dw-next { grid-template-columns: 1fr; gap: 1rem; }
+  .dw-cloud { grid-template-columns: 1fr; gap: 1rem; padding: 1.25rem; }
 }
 
 @media (max-width: 480px) {
   .dw-actions { display: grid; }
   .dw-button { text-align: center; }
+  .dw-cloud__links { justify-items: stretch; }
   .dw-steps li { grid-template-columns: 1fr; gap: 0.5rem; padding: 1rem; }
   .dw-landing footer { flex-direction: column; gap: 0.5rem; }
 }
