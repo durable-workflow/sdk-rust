@@ -5,11 +5,14 @@ from pathlib import Path
 build_directory = Path(sys.argv[1] if len(sys.argv) > 1 else "target/doc")
 runtime = Path("docs/analytics/analytics.js").read_text(encoding="utf-8")
 styles = Path("docs/layout.css").read_text(encoding="utf-8")
+landing_styles = styles.split(".sidebar .sidebar-elems", maxsplit=1)[0]
 
 if (build_directory / "analytics/analytics.js").read_text(encoding="utf-8") != runtime:
     raise SystemExit("Rendered rustdoc analytics runtime is stale")
 if not re.search(r"\.dw-cloud-promotion__eyebrow\s*\{[^}]*letter-spacing:\s*0;", styles, re.DOTALL):
     raise SystemExit("Promotion eyebrow letter spacing must remain zero")
+if re.search(r"gradient|clamp\(|letter-spacing:\s*-|\b\d+(?:\.\d+)?vw\b", landing_styles):
+    raise SystemExit("Rust documentation landing must use fixed type and flat surfaces")
 
 for required in (
     "https://static.cloudflareinsights.com/beacon.min.js",
@@ -63,6 +66,34 @@ for html_file in html_files:
         raise SystemExit(
             f"{html_file} contains retired Google analytics or consent state"
         )
+
+landing = (build_directory / "index.html").read_text(encoding="utf-8")
+if '<meta http-equiv="refresh"' in landing:
+    raise SystemExit("Rust documentation root must be a task-oriented landing page")
+if len(re.findall(r"<h1(?:\s|>)", landing)) != 1:
+    raise SystemExit("Rust documentation landing must expose one primary heading")
+for required_link in (
+    'href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/"',
+    'href="durable_workflow/"',
+):
+    if required_link not in landing:
+        raise SystemExit(f"Rust documentation landing is missing {required_link}")
+for required_identifier in (
+    "DURABLE_WORKFLOW_RUNTIME_URL",
+    "DURABLE_WORKFLOW_CLIENT_TOKEN",
+    "DURABLE_WORKFLOW_WORKER_TOKEN",
+    "scripts/rust-cloud.sh run",
+):
+    if required_identifier not in landing:
+        raise SystemExit(
+            f"Rust documentation landing is missing quickstart identifier {required_identifier}"
+        )
+crate_manifest = Path("Cargo.toml").read_text(encoding="utf-8")
+crate_version = re.search(r'^version = "([^"]+)"$', crate_manifest, re.MULTILINE)
+if crate_version is None:
+    raise SystemExit("Rust documentation landing could not bind the current crate version")
+if f'durable-workflow = "={crate_version.group(1)}"' not in landing:
+    raise SystemExit("Rust documentation landing crate version is stale")
 
 crate_home = (build_directory / "durable_workflow/index.html").read_text(
     encoding="utf-8"

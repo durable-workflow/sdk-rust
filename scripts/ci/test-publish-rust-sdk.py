@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PACKAGE_VERSION = "2.0.0-rc.11"
+PACKAGE_VERSION = "2.0.0-rc.12"
 PRODUCT_TRAIN = PACKAGE_VERSION
 SERVER_VERSIONS = ">=2.0.0-rc.17,<2.0.0"
 QUALIFIED_SERVER_VERSION = "2.0.0-rc.17"

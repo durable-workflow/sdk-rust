@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.0-rc.12
+
+- Add a task-oriented Rust documentation landing page that leads with the
+  supported Cloud quickstart before the generated API reference.
+- Let the released `hello_world` example accept separate client and worker
+  credentials for one namespace-scoped Cloud runtime URL.
+- Retain the qualified Server baseline at `2.0.0-rc.17` under the additive
+  `>=2.0.0-rc.17,<2.0.0` compatibility range.
+
 ## 2.0.0-rc.11
 
 - Reject unsupported update-validator declarations from the public low-level

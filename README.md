@@ -40,18 +40,33 @@ owns and appends that suffix.
 Add the exact crates.io release with Cargo:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.11
+cargo add durable-workflow@=2.0.0-rc.12
 ```
 
 Or add the same exact requirement directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.11"
+durable-workflow = "=2.0.0-rc.12"
 ```
 
-Version `2.0.0-rc.11` includes the complete Durable Workflow 2.0 prerelease
+Version `2.0.0-rc.12` includes the complete Durable Workflow 2.0 prerelease
 baseline described below.
+
+## Start with Rust Cloud
+
+The task-oriented [Rust documentation landing
+page](https://rust.durable-workflow.com/) leads to the canonical
+[Rust Cloud quickstart](https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/).
+That path starts in a prepared Sample App Codespace, uses separate client and
+worker runtime credentials against one namespace URL, runs a Rust workflow and
+activity through the Cloud-aware `dw` CLI, retrieves the completed result,
+shuts the worker down cleanly, and verifies the run in Managed Waterline.
+
+The released `hello_world` example also accepts Cloud connection settings
+without a source edit: `DURABLE_WORKFLOW_RUNTIME_URL`,
+`DURABLE_WORKFLOW_RUNTIME_NAMESPACE`, `DURABLE_WORKFLOW_CLIENT_TOKEN`, and
+`DURABLE_WORKFLOW_WORKER_TOKEN`.
 
 ## First local run
 
@@ -80,7 +95,7 @@ error before transport when only the opposite role is available.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.11` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
+Rust SDK `2.0.0-rc.12` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
 qualification baseline is Server `2.0.0-rc.17`. Server build versions are
 identity, not the runtime negotiation mechanism: compatible servers must
 advertise control plane `2` and a

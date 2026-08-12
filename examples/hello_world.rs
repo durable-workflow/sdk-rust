@@ -10,14 +10,21 @@ use durable_workflow::{json, Client, Error, Result, Uuid, Worker, WorkflowResult
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let server_url = std::env::var("DURABLE_WORKFLOW_SERVER_URL")
+    let server_url = std::env::var("DURABLE_WORKFLOW_RUNTIME_URL")
+        .or_else(|_| std::env::var("DURABLE_WORKFLOW_SERVER_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let namespace = std::env::var("DURABLE_WORKFLOW_RUNTIME_NAMESPACE")
+        .unwrap_or_else(|_| "default".to_string());
     let token = std::env::var("DURABLE_WORKFLOW_TOKEN").ok();
+    let client_token = std::env::var("DURABLE_WORKFLOW_CLIENT_TOKEN").ok();
+    let worker_token = std::env::var("DURABLE_WORKFLOW_WORKER_TOKEN").ok();
     let task_queue = std::env::var("TASK_QUEUE").unwrap_or_else(|_| "rust-workers".to_string());
 
     let client = Client::builder(server_url)
         .token(token)
-        .namespace("default")
+        .control_token(client_token)
+        .worker_token(worker_token)
+        .namespace(namespace)
         .build()?;
 
     let mut worker = Worker::new(client.clone(), task_queue.clone())

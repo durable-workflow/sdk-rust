@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DOCS_WORKFLOW = ROOT / ".github/workflows/docs.yml"
 PAGES_WORKFLOW = ROOT / ".github/workflows/pages.yml"
+DOCS_LANDING = ROOT / "docs/index.html"
 VISUAL_CONTROLLER_REVISION = "0421c2e3a78ba4ca2adfe118e57db88d2264a62b"
 PAGES_CONDITION = (
     r"if: >-\n\s+github\.api_url == 'https://api\.github\.com' &&\n"
@@ -44,6 +45,22 @@ class DocsWorkflowContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.qualification = DOCS_WORKFLOW.read_text(encoding="utf-8")
         self.publication = PAGES_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_root_is_task_landing_before_generated_reference(self) -> None:
+        landing = DOCS_LANDING.read_text(encoding="utf-8")
+
+        self.assertNotIn('<meta http-equiv="refresh"', landing)
+        self.assertIn(
+            'href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/"',
+            landing,
+        )
+        self.assertIn('href="durable_workflow/"', landing)
+        self.assertLess(
+            landing.index(
+                'href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/"'
+            ),
+            landing.index('href="durable_workflow/"'),
+        )
 
     def test_docs_qualify_pull_requests_and_target_branch_pushes(self) -> None:
         triggers = self.qualification.split("\njobs:\n", maxsplit=1)[0]

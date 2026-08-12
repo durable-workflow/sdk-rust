@@ -3,11 +3,93 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="0; url=durable_workflow/">
-  <link rel="canonical" href="durable_workflow/">
-  <title>Durable Workflow Rust SDK</title>
+  <meta name="description" content="Start a Rust workflow and activity on Durable Workflow Cloud, then continue to the generated API reference.">
+  <link rel="stylesheet" href="layout.css">
+  <link rel="canonical" href="https://rust.durable-workflow.com/">
+  <title>Durable Workflow for Rust</title>
+  <script type="module" src="/analytics/analytics.js"></script>
 </head>
-<body>
-  <p><a href="durable_workflow/">Open the Durable Workflow Rust SDK API reference</a>.</p>
+<body class="dw-landing">
+  <header class="dw-nav">
+    <a class="dw-brand" href="/" aria-label="Durable Workflow Rust home">
+      <span class="dw-brand__mark" aria-hidden="true">DW</span>
+      <span>Durable Workflow <strong>Rust</strong></span>
+    </a>
+    <nav aria-label="Documentation">
+      <a href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/">Cloud quickstart</a>
+      <a href="durable_workflow/">API reference</a>
+      <a href="https://github.com/durable-workflow/sdk-rust">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <header class="dw-page-heading">
+      <p class="dw-kicker">Rust SDK · 2.0 prerelease</p>
+      <h1>Durable Workflow Rust SDK</h1>
+      <p>Run a Rust workflow and activity on Durable Workflow Cloud, retrieve the completed result, and inspect the run in Managed Waterline.</p>
+      <p class="dw-version"><strong>Current crate</strong> <code>durable-workflow = "=2.0.0-rc.12"</code> <span>Rust 1.86+</span></p>
+      <div class="dw-actions">
+        <a class="dw-button dw-button--primary" href="https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/">Run the Cloud quickstart</a>
+        <a class="dw-button" href="durable_workflow/">Browse the API</a>
+      </div>
+    </header>
+
+    <section class="dw-quickstart" aria-labelledby="cloud-quickstart-title">
+      <div class="dw-section-heading">
+        <p class="dw-kicker">First completed run</p>
+        <h2 id="cloud-quickstart-title">From a Sample App Codespace</h2>
+        <p>The prepared environment includes Rust, Cargo, and the current <code>dw</code> CLI.</p>
+      </div>
+
+      <ol class="dw-steps">
+        <li>
+          <span class="dw-step-number">1</span>
+          <div>
+            <h3>Configure one namespace</h3>
+            <p>Set the complete namespace runtime URL and separate client and worker credentials.</p>
+            <pre><code>DURABLE_WORKFLOW_RUNTIME_URL='https://cloud.example/api/runtime/v1/namespaces/&lt;runtime-id&gt;'
+DURABLE_WORKFLOW_RUNTIME_NAMESPACE='orders'
+DURABLE_WORKFLOW_CLIENT_TOKEN='dwr_client_...'
+DURABLE_WORKFLOW_WORKER_TOKEN='dwr_worker_...'</code></pre>
+          </div>
+        </li>
+        <li>
+          <span class="dw-step-number">2</span>
+          <div>
+            <h3>Run the workflow and activity</h3>
+            <p>The Sample App uses the pinned crate, one task queue, and a development build.</p>
+            <pre><code>scripts/rust-cloud.sh run</code></pre>
+          </div>
+        </li>
+        <li>
+          <span class="dw-step-number">3</span>
+          <div>
+            <h3>Verify the completed result</h3>
+            <p>The command records SDK and CLI versions, shuts the worker down cleanly, and prints the Managed Waterline destination.</p>
+            <pre><code>"status_bucket": "completed"
+"workflow_runtime": "rust"
+"activity_runtime": "rust"</code></pre>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section class="dw-next" aria-labelledby="reference-title">
+      <div>
+        <p class="dw-kicker">Reference</p>
+        <h2 id="reference-title">Continue with the SDK</h2>
+        <p>Use the generated reference for types and methods, or the SDK guide for concepts and deployment.</p>
+      </div>
+      <div class="dw-next__links">
+        <a href="durable_workflow/"><strong>Generated API reference</strong><span>Modules, traits, structs, and methods</span></a>
+        <a href="https://durable-workflow.com/docs/2.0/polyglot/rust/"><strong>Rust SDK guide</strong><span>Concepts, compatibility, and deployment</span></a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Durable Workflow Rust SDK</span>
+    <span>Explicit 2.0 prerelease documentation</span>
+  </footer>
 </body>
 </html>
