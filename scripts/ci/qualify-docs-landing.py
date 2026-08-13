@@ -6,10 +6,16 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
+import json
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
@@ -45,8 +51,25 @@ VOID_ELEMENTS = frozenset(
 VERSIONLESS_INSTALLER = (
     "curl -fsSL https://durable-workflow.com/install-sdk.sh | sh -s -- rust"
 )
+INSTALLER_URL = "https://durable-workflow.com/install-sdk.sh"
+QUICKSTART_CONTRACT_URL = (
+    "https://durable-workflow.com/quickstart-execution-contract.json"
+)
+QUICKSTART_CONTRACT_SCHEMA = (
+    "durable-workflow.docs.v2.quickstart-execution-contract"
+)
 EXACT_PRERELEASE_VERSION = re.compile(
     r"\b\d+\.\d+\.\d+-(?:alpha|beta|rc)\.\d+\b"
+)
+VISIBLE_CARGO_PATH = re.compile(
+    r"\bcargo\s+add\s+durable-workflow\b|\bdurable-workflow\s*="
+)
+MARKDOWN_CODE_BLOCK = re.compile(r"```[^\n]*\n(?P<body>.*?)```", re.DOTALL)
+CARGO_ADD_REQUIREMENT = re.compile(
+    r"\bcargo\s+add\s+durable-workflow@(?P<requirement>[^\s`]+)"
+)
+CARGO_TOML_REQUIREMENT = re.compile(
+    r"\bdurable-workflow\s*=\s*[\"'](?P<requirement>[^\"']+)[\"']"
 )
 
 
@@ -193,6 +216,10 @@ def validate_structure(root: Node, crate_version: str, rust_version: str) -> Non
     first_task_text = visible_text(first_task)
     if VERSIONLESS_INSTALLER not in first_task_text:
         raise QualificationError("first task must use the versionless SDK installer")
+    if VISIBLE_CARGO_PATH.search(visible_text(body)):
+        raise QualificationError(
+            "visible Cargo installation must use the qualified SDK installer"
+        )
     if EXACT_PRERELEASE_VERSION.search(visible_text(body)):
         raise QualificationError(
             "visible onboarding must not contain an exact prerelease version"
@@ -390,6 +417,185 @@ def qualify_http_links(
     return destinations
 
 
+def qualified_rust_version(contract_text: str) -> str:
+    try:
+        contract = json.loads(contract_text)
+    except json.JSONDecodeError as error:
+        raise QualificationError(
+            "public quickstart authority is not valid JSON"
+        ) from error
+    if not isinstance(contract, dict) or contract.get("schema") != QUICKSTART_CONTRACT_SCHEMA:
+        raise QualificationError("public quickstart authority has an unsupported schema")
+    artifacts = contract.get("artifacts")
+    rust = artifacts.get("sdk-rust") if isinstance(artifacts, dict) else None
+    version = rust.get("version") if isinstance(rust, dict) else None
+    if not isinstance(version, str) or EXACT_PRERELEASE_VERSION.fullmatch(version) is None:
+        raise QualificationError(
+            "public quickstart authority is missing a qualified Rust prerelease"
+        )
+    return version
+
+
+def markdown_code_samples(markdown: str) -> tuple[str, ...]:
+    return tuple(match.group("body") for match in MARKDOWN_CODE_BLOCK.finditer(markdown))
+
+
+def html_code_samples(root: Node) -> tuple[str, ...]:
+    return tuple(visible_text(node) for node in walk(root) if node.tag == "code")
+
+
+def cargo_requirements(samples: Iterable[str]) -> tuple[str, ...]:
+    requirements: list[str] = []
+    for sample in samples:
+        requirements.extend(
+            match.group("requirement").rstrip(",;")
+            for match in CARGO_ADD_REQUIREMENT.finditer(sample)
+        )
+        requirements.extend(
+            match.group("requirement")
+            for match in CARGO_TOML_REQUIREMENT.finditer(sample)
+        )
+    return tuple(requirements)
+
+
+def validate_visible_cargo_paths(
+    root: Node,
+    readme: str,
+    qualified_version: str,
+) -> int:
+    surfaces = (
+        ("README", readme, markdown_code_samples(readme)),
+        ("Rust landing", visible_text(root), html_code_samples(root)),
+    )
+    direct_paths = 0
+    for name, text, samples in surfaces:
+        if VERSIONLESS_INSTALLER not in text:
+            raise QualificationError(
+                f"{name} must expose the qualified versionless Rust installer"
+            )
+        for requirement in cargo_requirements(samples):
+            direct_paths += 1
+            if requirement != f"={qualified_version}":
+                raise QualificationError(
+                    f"{name} Cargo path resolves {requirement}, but the public "
+                    f"authority qualifies ={qualified_version}"
+                )
+    return direct_paths
+
+
+def resolved_dependency_version(lock_text: str) -> str:
+    try:
+        packages = tomllib.loads(lock_text).get("package", [])
+    except (ValueError, TypeError) as error:
+        raise QualificationError("clean Cargo.lock is not valid TOML") from error
+    matches = [
+        package.get("version")
+        for package in packages
+        if isinstance(package, dict) and package.get("name") == "durable-workflow"
+    ]
+    if len(matches) != 1 or not isinstance(matches[0], str):
+        raise QualificationError(
+            "clean Cargo.lock must contain exactly one durable-workflow package"
+        )
+    return matches[0]
+
+
+def qualify_cargo_resolution(
+    root: Node,
+    readme: str,
+    installer_text: str,
+    contract_text: str,
+    cargo: str,
+    timeout: float,
+) -> tuple[str, int]:
+    qualified_version = qualified_rust_version(contract_text)
+    direct_paths = validate_visible_cargo_paths(root, readme, qualified_version)
+
+    with tempfile.TemporaryDirectory(prefix="dw-rust-onboarding-") as directory:
+        temporary = Path(directory)
+        project = temporary / "consumer"
+        project.mkdir()
+        manifest = project / "Cargo.toml"
+        manifest.write_text(
+            "[package]\n"
+            'name = "qualified-rust-onboarding"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n\n'
+            "[dependencies]\n",
+            encoding="utf-8",
+        )
+        (project / "src").mkdir()
+        (project / "src/lib.rs").write_text("", encoding="utf-8")
+
+        installer = temporary / "install-sdk.sh"
+        installer.write_text(installer_text, encoding="utf-8")
+        contract = temporary / "quickstart-execution-contract.json"
+        contract.write_text(contract_text, encoding="utf-8")
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CARGO_BIN": cargo,
+                "CARGO_HOME": str(temporary / "cargo-home"),
+                "CARGO_TARGET_DIR": str(temporary / "cargo-target"),
+                "CARGO_NET_RETRY": "3",
+                "DURABLE_WORKFLOW_QUICKSTART_CONTRACT_URL": contract.as_uri(),
+            }
+        )
+        try:
+            result = subprocess.run(
+                ["sh", str(installer), "rust"],
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise QualificationError(
+                f"qualified Rust installer could not run in a clean project: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise QualificationError(
+                "qualified Rust installer failed in a clean project: " + detail
+            )
+
+        try:
+            manifest_data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as error:
+            raise QualificationError(
+                "qualified Rust installer did not emit a valid Cargo.toml"
+            ) from error
+        dependency = manifest_data.get("dependencies", {}).get("durable-workflow")
+        requirement = (
+            dependency.get("version") if isinstance(dependency, dict) else dependency
+        )
+        if requirement != f"={qualified_version}":
+            raise QualificationError(
+                "qualified Rust installer emitted Cargo requirement "
+                f"{requirement!r}, expected '={qualified_version}'"
+            )
+
+        lock_path = project / "Cargo.lock"
+        if not lock_path.is_file():
+            raise QualificationError(
+                "qualified Rust installer did not emit a clean Cargo.lock"
+            )
+        resolved_version = resolved_dependency_version(
+            lock_path.read_text(encoding="utf-8")
+        )
+        if resolved_version != qualified_version:
+            raise QualificationError(
+                f"clean Cargo.lock resolved {resolved_version}, but the public "
+                f"authority qualifies {qualified_version}"
+            )
+
+    return qualified_version, direct_paths
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -397,10 +603,12 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--landing-url")
     parser.add_argument("--manifest", type=Path, default=ROOT / "Cargo.toml")
     parser.add_argument("--check-external", action="store_true")
+    parser.add_argument("--check-cargo-resolution", action="store_true")
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--link-attempts", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=2)
     parser.add_argument("--timeout", type=float, default=20)
+    parser.add_argument("--cargo-timeout", type=float, default=180)
     return parser.parse_args()
 
 
@@ -417,7 +625,8 @@ def main() -> int:
         crate_version, rust_version = manifest_identity(arguments.manifest)
         if arguments.build_directory is not None:
             landing_path = arguments.build_directory / "index.html"
-            root = parse_document(landing_path.read_text(encoding="utf-8"))
+            html = landing_path.read_text(encoding="utf-8")
+            root = parse_document(html)
             validate_structure(root, crate_version, rust_version)
             qualify_local_links(root, arguments.build_directory)
             destinations: tuple[str, ...] = ()
@@ -452,6 +661,33 @@ def main() -> int:
                 arguments.retry_delay,
                 arguments.timeout,
             )
+        cargo_resolution: tuple[str, int] | None = None
+        if arguments.check_cargo_resolution:
+            installer_text = retry(
+                INSTALLER_URL,
+                lambda: read_2xx(INSTALLER_URL, arguments.timeout),
+                arguments.attempts,
+                arguments.retry_delay,
+            )
+            contract_text = retry(
+                QUICKSTART_CONTRACT_URL,
+                lambda: read_2xx(QUICKSTART_CONTRACT_URL, arguments.timeout),
+                arguments.attempts,
+                arguments.retry_delay,
+            )
+            cargo = shutil.which("cargo")
+            if cargo is None:
+                raise QualificationError(
+                    "clean onboarding qualification requires Cargo"
+                )
+            cargo_resolution = qualify_cargo_resolution(
+                root,
+                (ROOT / "README.md").read_text(encoding="utf-8"),
+                installer_text,
+                contract_text,
+                cargo,
+                arguments.cargo_timeout,
+            )
     except (OSError, QualificationError) as error:
         print(f"documentation landing qualification failed:\n{error}", file=sys.stderr)
         return 1
@@ -461,6 +697,12 @@ def main() -> int:
         if destinations
         else ""
     )
+    if cargo_resolution is not None:
+        version, direct_paths = cargo_resolution
+        suffix += (
+            f"; clean Cargo resolution selected {version} with "
+            f"{direct_paths} direct alternative path(s)"
+        )
     print(f"Qualified the general-first Rust SDK landing{suffix}.")
     return 0
 

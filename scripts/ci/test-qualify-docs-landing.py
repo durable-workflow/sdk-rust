@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -58,10 +60,27 @@ class DocsLandingQualificationTest(unittest.TestCase):
                 self.rust_version,
             )
 
+    def test_rejects_a_floating_cargo_requirement_in_visible_onboarding(self) -> None:
+        floating_onboarding = self.html.replace(
+            '<p class="dw-version">',
+            '<p class="dw-version"><span>durable-workflow = "2.0.0-rc"</span>',
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            QUALIFIER.QualificationError,
+            "visible Cargo installation",
+        ):
+            QUALIFIER.validate_structure(
+                QUALIFIER.parse_document(floating_onboarding),
+                self.crate_version,
+                self.rust_version,
+            )
+
     def test_rejects_an_exact_prerelease_version_in_visible_onboarding(self) -> None:
         pinned_onboarding = self.html.replace(
-            'durable-workflow = "2.0.0-rc"',
-            f'durable-workflow = "={self.crate_version}"',
+            '<p class="dw-version">',
+            f'<p class="dw-version"><span>Qualified crate {self.crate_version}</span>',
             1,
         )
 
@@ -166,6 +185,83 @@ class DocsLandingQualificationTest(unittest.TestCase):
                 "https://rust.durable-workflow.com/",
             ),
         )
+
+    def test_visible_cargo_paths_are_bound_to_the_public_authority(self) -> None:
+        direct_paths = QUALIFIER.validate_visible_cargo_paths(
+            QUALIFIER.parse_document(self.html),
+            (ROOT / "README.md").read_text(encoding="utf-8"),
+            "2.0.0-rc.7",
+        )
+
+        self.assertEqual(0, direct_paths)
+
+    def test_rejects_a_readme_path_that_floats_past_the_authority(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme += '\n```toml\ndurable-workflow = "2.0.0-rc"\n```\n'
+
+        with self.assertRaisesRegex(
+            QUALIFIER.QualificationError,
+            "Cargo path resolves 2.0.0-rc.*qualifies =2.0.0-rc.7",
+        ):
+            QUALIFIER.validate_visible_cargo_paths(
+                QUALIFIER.parse_document(self.html),
+                readme,
+                "2.0.0-rc.7",
+            )
+
+    def test_clean_installer_resolution_uses_the_authority_version(self) -> None:
+        contract = {
+            "schema": QUALIFIER.QUICKSTART_CONTRACT_SCHEMA,
+            "artifacts": {"sdk-rust": {"version": "2.0.0-rc.7"}},
+        }
+        installer = textwrap.dedent(
+            """\
+            #!/bin/sh
+            set -eu
+            exec "$CARGO_BIN" add durable-workflow@=2.0.0-rc.7
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            cargo = Path(directory) / "cargo"
+            cargo.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    from pathlib import Path
+                    import sys
+
+                    requirement = sys.argv[2].split("@", 1)[1]
+                    manifest = Path("Cargo.toml")
+                    manifest.write_text(
+                        manifest.read_text(encoding="utf-8")
+                        + f'durable-workflow = "{requirement}"\\n',
+                        encoding="utf-8",
+                    )
+                    Path("Cargo.lock").write_text(
+                        'version = 4\\n\\n'
+                        '[[package]]\\n'
+                        'name = "durable-workflow"\\n'
+                        f'version = "{requirement.removeprefix("=")}"\\n',
+                        encoding="utf-8",
+                    )
+                    """
+                ),
+                encoding="utf-8",
+            )
+            cargo.chmod(0o755)
+
+            version, direct_paths = QUALIFIER.qualify_cargo_resolution(
+                QUALIFIER.parse_document(self.html),
+                (ROOT / "README.md").read_text(encoding="utf-8"),
+                installer,
+                json.dumps(contract),
+                str(cargo),
+                5,
+            )
+
+        self.assertEqual("2.0.0-rc.7", version)
+        self.assertEqual(0, direct_paths)
 
 
 if __name__ == "__main__":

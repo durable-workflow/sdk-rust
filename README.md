@@ -45,15 +45,9 @@ crate requirement:
 curl -fsSL https://durable-workflow.com/install-sdk.sh | sh -s -- rust
 ```
 
-For a reproducible build, copy the exact requirement selected into
-`Cargo.toml` or retain it in `Cargo.lock`:
-
-```toml
-[dependencies]
-durable-workflow = "=<resolved-qualified-version>"
-```
-
-`Cargo.lock` records the exact crate selected for a reproducible build.
+Commit the resulting `Cargo.lock` when the application needs reproducible
+dependency resolution. The lockfile records the exact qualified crate selected
+by the public compatibility authority.
 
 ## Start with Rust Cloud
 
