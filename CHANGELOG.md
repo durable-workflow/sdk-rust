@@ -6,6 +6,9 @@
   schema with single-object framing the only public payload codec.
 - Reject JSON-tagged and unknown payload envelopes without transcoding or
   codec inference, qualified against Server `2.0.0-rc.32`.
+- Replace exact prerelease pins and Cloud-first documentation with account-free
+  Rust SDK onboarding through the public qualified versionless installer;
+  Cloud remains available as a clearly labeled limited early-access path.
 
 ## 2.0.0-rc.12
 
