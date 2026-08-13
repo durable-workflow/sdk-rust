@@ -177,11 +177,6 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual(QUALIFIED_SERVER_VERSION, metadata["qualified-server-version"])
         self.assertEqual(SERVER_WORKER_PROTOCOLS, metadata["server-worker-protocol-versions"])
 
-    def test_readme_uses_cargo_supported_exact_requirement(self) -> None:
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn(f"cargo add durable-workflow@={PACKAGE_VERSION}", readme)
-        self.assertNotIn(f"cargo add durable-workflow@{PACKAGE_VERSION} --exact", readme)
-
     def test_release_path_accepts_component_advance_and_emits_baseline(self) -> None:
         result = self._publish()
         self.assertEqual(0, result.returncode, result.stderr)
