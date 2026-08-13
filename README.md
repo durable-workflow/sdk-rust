@@ -163,8 +163,8 @@ Continue-as-new releases publish `continue-as-new`,
 
 `WorkflowContext::side_effect` evaluates its callback only when no matching
 `SideEffectRecorded` value exists at the current durable command sequence. It
-emits exactly one `record_side_effect` command with the workflow task's selected
-Avro or JSON envelope. Cold replay decodes the recorded value into the requested
+emits exactly one `record_side_effect` command with an Avro payload envelope.
+Cold replay decodes the recorded value into the requested
 Rust type without invoking the callback.
 
 ```rust

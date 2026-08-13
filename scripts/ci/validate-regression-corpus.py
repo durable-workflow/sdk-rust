@@ -59,7 +59,7 @@ ZERO_COMMIT = re.compile(r"^0+$")
 REPLAY_VALUE_IDENTITY_SCHEMA = "durable-workflow.replay-value-identity/v1"
 REPLAY_VALUE_IDENTITY_CONSUMER = (
     "replay_value_identity_consumer",
-    "canonical_replay_value_uses_official_avro_consumer",
+    "canonical_replay_value_uses_only_the_official_avro_consumer",
 )
 CODEC_VALUE_IDENTITY_SCHEMA = "durable-workflow.codec-value-identity/v1"
 CODEC_VALUE_IDENTITY_CONSUMER = (
@@ -517,8 +517,11 @@ def _consumer_replay_value(value: Any, fallback_codec: str, context: str) -> Any
         raise CorpusError(
             f"{context} must be a payload blob or published payload envelope"
         )
-    if codec == "avro":
-        _canonical_wire_bytes(blob, context)
+    if codec != "avro":
+        raise CorpusError(
+            f"{context} declares unsupported payload codec {codec!r}; expected 'avro'"
+        )
+    _canonical_wire_bytes(blob, context)
     return _official_replay_value_identity(value, fallback_codec, context)
 
 
@@ -872,6 +875,9 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     workflow = _object(document.get("workflow"), f"{path}.workflow")
     workflow_type = _string(workflow.get("type"), f"{path}.workflow.type")
     workflow_input = workflow.get("input", [])
+    fallback_codec = workflow.get("payload_codec", "avro")
+    if not isinstance(fallback_codec, str):
+        raise CorpusError(f"{path}.workflow.payload_codec must be a string")
     _list(workflow_input, f"{path}.workflow.input")
     declared_history = document.get("history")
     commands = document.get("command_sequence")
@@ -894,14 +900,28 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     # Keep identity aligned with effective values that execute_fixture consumes
     # or asserts. Protocol version, bindings, and extra workflow declarations
     # are validated metadata or ignored by the official replay path.
-    semantic = _replay_semantic(
-        workflow_type=workflow_type,
-        workflow_input=workflow_input,
-        history=history,
-        command_sequence=commands,
-        expected=expected,
-        fallback_codec="json",
-    )
+    if fallback_codec != "avro":
+        semantic = {
+            "workflow_type": workflow_type,
+            "expected_failure": "unsupported_payload_codec",
+        }
+    else:
+        try:
+            semantic = _replay_semantic(
+                workflow_type=workflow_type,
+                workflow_input=workflow_input,
+                history=history,
+                command_sequence=commands,
+                expected=expected,
+                fallback_codec=fallback_codec,
+            )
+        except CorpusError as error:
+            if "unsupported payload codec" not in str(error):
+                raise
+            semantic = {
+                "workflow_type": workflow_type,
+                "expected_failure": "unsupported_payload_codec",
+            }
     return [
         _fixture_evidence(
             category="replay",
@@ -1014,7 +1034,7 @@ def _golden_history_fixture(
             history=history,
             command_sequence=case.get("command_sequence"),
             expected=expected,
-            fallback_codec="json",
+            fallback_codec="avro",
         )
         evidence.append(
             _fixture_evidence(
@@ -1498,13 +1518,6 @@ def _rust_negative_controls(
             )
         _write_files(base_checkout, trusted_files)
         _write_files(candidate_checkout, trusted_files)
-        for category in controlled_categories:
-            _replace_consumer_sources(
-                checkouts=(base_checkout, candidate_checkout),
-                category=category,
-                known_paths=consumer_source_paths[category],
-                source_files=base_files,
-            )
 
         results: dict[str, int] = {}
         for category, new_paths in controlled_categories.items():
@@ -1532,10 +1545,19 @@ def _rust_negative_controls(
                 fixture_path=None,
                 category=category,
             )
-            for revision, checkout in (
-                ("base", base_checkout),
-                ("candidate", candidate_checkout),
-            ):
+            _replace_consumer_sources(
+                checkouts=(base_checkout,),
+                category=category,
+                known_paths=consumer_source_paths[category],
+                source_files=base_files,
+            )
+            _replace_consumer_sources(
+                checkouts=(candidate_checkout,),
+                category=category,
+                known_paths=consumer_source_paths[category],
+                source_files=current_files,
+            )
+            for revision, checkout in (("base", base_checkout), ("candidate", candidate_checkout)):
                 baseline = consumer_runner(checkout, category)
                 if baseline.returncode != 0:
                     raise _consumer_failure(
@@ -1545,17 +1567,16 @@ def _rust_negative_controls(
                         result=baseline,
                     )
 
-            if category == "replay":
-                # Replay scenarios are executable consumer code, so a newly
-                # registered workflow must accompany its fixture. Install the
-                # exact candidate consumer surface into both checkouts: only
-                # the production implementation differs between the controls.
-                _replace_consumer_sources(
-                    checkouts=(base_checkout, candidate_checkout),
-                    category=category,
-                    known_paths=consumer_source_paths[category],
-                    source_files=current_files,
-                )
+            # A newly added fixture always runs through one exact consumer on
+            # both revisions. Intentional breaking removals may make the base
+            # consumer unable to compile against the candidate API, while the
+            # production source remains the only counterfactual variable.
+            _replace_consumer_sources(
+                checkouts=(base_checkout, candidate_checkout),
+                category=category,
+                known_paths=consumer_source_paths[category],
+                source_files=current_files,
+            )
 
             for fixture_path in new_paths:
                 _configure_consumer_fixture(

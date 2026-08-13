@@ -133,7 +133,7 @@ REPLAY_POLICY = {
 REPLAY_FIXTURE = json.loads(
     (
         Path(__file__).resolve().parents[2]
-        / "tests/fixtures/replay-regressions/side-effect-version-cold-replay.json"
+        / "tests/fixtures/replay-regressions/side-effect-version-cold-replay-avro.json"
     ).read_text(encoding="utf-8")
 )
 CAPTURED_ONCE_AVRO = "wwHioz3/VYAiNwoaY2FwdHVyZWQtb25jZQ=="
@@ -197,8 +197,8 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
             side_effect=self._responding_consumer(),
         ) as run:
             identity = VALIDATOR._official_replay_value_identity(
-                {"codec": "json", "blob": '"captured-once"'},
-                "json",
+                {"codec": "avro", "blob": CAPTURED_ONCE_AVRO},
+                "avro",
                 "fixture.result",
             )
 
@@ -214,7 +214,7 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
                 "--quiet",
                 "--test",
                 "replay_value_identity_consumer",
-                "canonical_replay_value_uses_official_avro_consumer",
+                "canonical_replay_value_uses_only_the_official_avro_consumer",
             ],
         )
 
@@ -229,8 +229,8 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
                 "official Rust replay value consumer is unavailable",
             ):
                 VALIDATOR._official_replay_value_identity(
-                    {"codec": "json", "blob": '"captured-once"'},
-                    "json",
+                    {"codec": "avro", "blob": CAPTURED_ONCE_AVRO},
+                    "avro",
                     "fixture.result",
                 )
 
@@ -245,8 +245,8 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
                 "official Rust replay value consumer disagreed with the request",
             ):
                 VALIDATOR._official_replay_value_identity(
-                    {"codec": "json", "blob": '"captured-once"'},
-                    "json",
+                    {"codec": "avro", "blob": CAPTURED_ONCE_AVRO},
+                    "avro",
                     "fixture.result",
                 )
 
@@ -262,11 +262,21 @@ class ReplayValueIdentityConsumerTest(unittest.TestCase):
             ):
                 VALIDATOR._consumer_replay_value(
                     {"captured": "once"},
-                    "json",
+                    "avro",
                     "fixture.result",
                 )
-
         run.assert_not_called()
+
+    def test_json_tagged_replay_value_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError,
+            "declares unsupported payload codec 'json'; expected 'avro'",
+        ):
+            VALIDATOR._consumer_replay_value(
+                {"codec": "json", "blob": '"captured-once"'},
+                "avro",
+                "fixture.result",
+            )
 
 
 class CodecValueIdentityConsumerTest(unittest.TestCase):
@@ -801,9 +811,9 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
             changed_evidence.semantic_digest,
         )
 
-    def test_json_and_avro_side_effect_rewraps_are_duplicate_evidence(self) -> None:
+    def test_explicit_avro_side_effect_rewrap_is_duplicate_evidence(self) -> None:
         duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
-        duplicate["id"] = "rust-side-effect-version-cold-replay-avro"
+        duplicate["id"] = "rust-side-effect-version-cold-replay-avro-rewrap"
         duplicate["history"][0]["payload"]["result"] = {
             "codec": "avro",
             "blob": CAPTURED_ONCE_AVRO,
@@ -916,7 +926,7 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
     def test_explicit_fallback_payload_codec_is_duplicate_evidence(self) -> None:
         duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
         duplicate["id"] = "rust-side-effect-version-cold-replay-explicit-codec"
-        duplicate["history"][0]["payload"]["payload_codec"] = "json"
+        duplicate["history"][0]["payload"]["payload_codec"] = "avro"
         (self.fixture.parent / "explicit-payload-codec-rewrap.json").write_text(
             json.dumps(duplicate),
             encoding="utf-8",
@@ -932,7 +942,7 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
                 "HEAD",
             )
 
-    def test_legacy_side_effect_json_string_is_duplicate_evidence(self) -> None:
+    def test_side_effect_avro_blob_is_duplicate_evidence(self) -> None:
         duplicate = json.loads(json.dumps(REPLAY_FIXTURE))
         duplicate["id"] = "rust-side-effect-version-cold-replay-legacy-result"
         result = duplicate["history"][0]["payload"]["result"]
@@ -1039,7 +1049,10 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
             observed_consumers,
             [
                 ("base", "// trusted base replay consumer\n"),
-                ("candidate", "// trusted base replay consumer\n"),
+                (
+                    "candidate",
+                    "// candidate consumer registers corpus.continue-as-new\n",
+                ),
                 (
                     "candidate",
                     "// candidate consumer registers corpus.continue-as-new\n",
@@ -1086,7 +1099,8 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
             observed_consumers.append(consumer)
             expected_consumer = (
                 "// candidate consumer claims base production fails\n"
-                if (checkout / new_fixture.relative_to(self.root)).is_file()
+                if checkout.name == "candidate"
+                or (checkout / new_fixture.relative_to(self.root)).is_file()
                 else "// trusted base replay consumer\n"
             )
             self.assertEqual(consumer, expected_consumer)
@@ -1106,7 +1120,7 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
             observed_consumers,
             [
                 "// trusted base replay consumer\n",
-                "// trusted base replay consumer\n",
+                "// candidate consumer claims base production fails\n",
                 "// candidate consumer claims base production fails\n",
                 "// candidate consumer claims base production fails\n",
             ],
@@ -1157,7 +1171,7 @@ class ReplaySemanticIdentityTest(unittest.TestCase):
             observed_consumers,
             [
                 "// trusted base replay consumer\n",
-                "// trusted base replay consumer\n",
+                "// candidate consumer forces every new scenario to fail\n",
                 "// candidate consumer forces every new scenario to fail\n",
             ],
         )
@@ -1876,8 +1890,8 @@ mod tests {
         self.assertEqual(result["negative_controls"]["codec"], 1)
         self.assertEqual(
             observed_consumers,
-            ["// trusted base codec consumer\n"] * 4
-            + ["// candidate official codec consumer\n"],
+            ["// trusted base codec consumer\n"]
+            + ["// candidate official codec consumer\n"] * 4,
         )
 
     def test_already_passing_codec_fixture_rejects_candidate_consumer_trick(self) -> None:
@@ -1904,11 +1918,18 @@ mod tests {
             category: str,
         ) -> VALIDATOR.ConsumerResult:
             self.assertEqual(category, "codec")
+            consumer = (checkout / "tests/codec_regression_corpus.rs").read_text(
+                encoding="utf-8"
+            )
+            expected_consumer = (
+                "// candidate-only consumer manufactures a failure\n"
+                if checkout.name == "candidate"
+                or (checkout / "tests/fixtures/codec-regressions/already-passing.json").is_file()
+                else "// trusted base codec consumer\n"
+            )
             self.assertEqual(
-                (checkout / "tests/codec_regression_corpus.rs").read_text(
-                    encoding="utf-8"
-                ),
-                "// trusted base codec consumer\n",
+                consumer,
+                expected_consumer,
             )
             return VALIDATOR.ConsumerResult(0, "fixture passes")
 

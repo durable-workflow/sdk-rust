@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, env, hint::black_box, process::ExitCode, time::
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as Datum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use durable_workflow::{
-    decode_avro_value, encode_avro_value, AvroValue, PayloadEnvelope, DEFAULT_CODEC, JSON_CODEC,
+    decode_avro_value, encode_avro_value, AvroValue, PayloadEnvelope, DEFAULT_CODEC,
 };
 use serde_json::{json, Value};
 
@@ -155,7 +155,7 @@ fn main() -> ExitCode {
         "sizes_bytes": {
             "plain_json": {
                 "raw": json_bytes.len(),
-                "http_envelope": envelope_size(JSON_CODEC, String::from_utf8(json_bytes.clone()).unwrap()),
+                "http_envelope": envelope_size("http-json-transport", String::from_utf8(json_bytes.clone()).unwrap()),
             },
             "old_json_wrapper": {
                 "raw_datum": old_payload.len() - 1,

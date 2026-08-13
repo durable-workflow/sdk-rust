@@ -29,7 +29,6 @@ pub use uuid::Uuid;
 pub const WORKER_PROTOCOL_VERSION: &str = "1.2";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
-pub const JSON_CODEC: &str = "json";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
 /// Worker-registration capability for server-routed read-only queries.
 pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
@@ -1022,10 +1021,6 @@ impl PayloadEnvelope {
         encode_payload(value, DEFAULT_CODEC)
     }
 
-    pub fn json<T: Serialize>(value: &T) -> Result<Self> {
-        encode_payload(value, JSON_CODEC)
-    }
-
     /// Encode an explicit typed value, including the bytes branch that JSON
     /// serialization cannot represent.
     pub fn avro_value(value: &AvroValue) -> Result<Self> {
@@ -1221,19 +1216,15 @@ pub fn encode_avro_value(value: &AvroValue) -> Result<PayloadEnvelope> {
 
 pub fn decode_avro_value(envelope: &PayloadEnvelope) -> Result<AvroValue> {
     if envelope.codec != DEFAULT_CODEC {
-        return Err(Error::Codec(format!(
-            "unsupported payload codec {:?}",
-            envelope.codec
-        )));
+        return Err(unsupported_payload_codec(&envelope.codec));
     }
     decode_avro_value_blob(&envelope.blob)
 }
 
 pub fn encode_payload<T: Serialize>(value: &T, codec: &str) -> Result<PayloadEnvelope> {
     let blob = match codec {
-        JSON_CODEC => serde_json::to_string(value)?,
         DEFAULT_CODEC => encode_avro_value(&AvroValue::from_serialize(value)?)?.blob,
-        other => return Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+        other => return Err(unsupported_payload_codec(other)),
     };
 
     Ok(PayloadEnvelope {
@@ -1244,9 +1235,8 @@ pub fn encode_payload<T: Serialize>(value: &T, codec: &str) -> Result<PayloadEnv
 
 pub fn decode_payload<T: DeserializeOwned>(envelope: &PayloadEnvelope) -> Result<T> {
     match envelope.codec.as_str() {
-        JSON_CODEC => Ok(serde_json::from_str(&envelope.blob)?),
         DEFAULT_CODEC => decode_avro_value(envelope)?.deserialize(),
-        other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+        other => Err(unsupported_payload_codec(other)),
     }
 }
 
@@ -1273,17 +1263,13 @@ fn decode_wire_value(value: &Value, fallback_codec: &str) -> Result<Value> {
         return decode_blob(blob, fallback_codec);
     }
 
-    Ok(value.clone())
+    Err(untagged_payload_value())
 }
 
 fn encode_typed_envelope(value: &AvroValue, codec: &str) -> Result<Value> {
     let envelope = match codec {
         DEFAULT_CODEC => encode_avro_value(value)?,
-        JSON_CODEC => PayloadEnvelope {
-            codec: JSON_CODEC.to_string(),
-            blob: serde_json::to_string(&value.clone().into_json()?)?,
-        },
-        other => return Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+        other => return Err(unsupported_payload_codec(other)),
     };
     Ok(serde_json::to_value(envelope)?)
 }
@@ -1300,8 +1286,7 @@ fn decode_wire_avro_value(value: &Value, fallback_codec: &str) -> Result<AvroVal
         ) {
             return match codec {
                 DEFAULT_CODEC => decode_avro_value_blob(blob),
-                JSON_CODEC => AvroValue::from_serialize(&serde_json::from_str::<Value>(blob)?),
-                other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+                other => Err(unsupported_payload_codec(other)),
             };
         }
     }
@@ -1309,12 +1294,11 @@ fn decode_wire_avro_value(value: &Value, fallback_codec: &str) -> Result<AvroVal
     if let Some(blob) = value.as_str() {
         return match fallback_codec {
             DEFAULT_CODEC => decode_avro_value_blob(blob),
-            JSON_CODEC => AvroValue::from_serialize(&serde_json::from_str::<Value>(blob)?),
-            other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+            other => Err(unsupported_payload_codec(other)),
         };
     }
 
-    AvroValue::from_serialize(value)
+    Err(untagged_payload_value())
 }
 
 fn normalize_avro_arguments(value: AvroValue) -> AvroValue {
@@ -1327,10 +1311,22 @@ fn normalize_avro_arguments(value: AvroValue) -> AvroValue {
 
 fn decode_blob(blob: &str, codec: &str) -> Result<Value> {
     match codec {
-        JSON_CODEC => Ok(serde_json::from_str(blob)?),
         DEFAULT_CODEC => decode_avro_value_blob(blob)?.into_json(),
-        other => Err(Error::Codec(format!("unsupported payload codec {other:?}"))),
+        other => Err(unsupported_payload_codec(other)),
     }
+}
+
+fn unsupported_payload_codec(codec: &str) -> Error {
+    Error::Codec(format!(
+        "unsupported_payload_codec: workflow payload codec {codec:?} is not supported by Durable Workflow 2.0; use codec=\"avro\" with the fixed Avro Value schema and single-object framing. JSON remains the HTTP document transport, not a workflow payload codec"
+    ))
+}
+
+fn untagged_payload_value() -> Error {
+    Error::Codec(
+        "unsupported_payload_codec: untagged durable payload values are not supported by Durable Workflow 2.0; use codec=\"avro\" with the fixed Avro Value schema and single-object framing. JSON remains the HTTP document transport, not a workflow payload codec"
+            .to_string(),
+    )
 }
 
 fn decode_avro_value_blob(blob: &str) -> Result<AvroValue> {
@@ -1339,6 +1335,10 @@ fn decode_avro_value_blob(blob: &str) -> Result<AvroValue> {
             "invalid_payload_framing: expected strict base64 Avro single-object bytes: {err}"
         ))
     })?;
+
+    if serde_json::from_slice::<Value>(&bytes).is_ok() {
+        return Err(unsupported_payload_codec("json"));
+    }
 
     if bytes.len() < 10 || bytes[..2] != AVRO_SINGLE_OBJECT_MAGIC {
         return Err(Error::Codec(
@@ -5055,13 +5055,10 @@ impl Worker {
         &self,
         mut task: QueryTask,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
-        if !matches!(task.payload_codec.as_str(), DEFAULT_CODEC | JSON_CODEC) {
+        if task.payload_codec != DEFAULT_CODEC {
             return Err(QueryTaskExecutionFailure::new(
                 "query_payload_decode_failed",
-                format!(
-                    "cannot decode query payload with unsupported codec {:?}",
-                    task.payload_codec
-                ),
+                unsupported_payload_codec(&task.payload_codec).to_string(),
                 "QueryPayloadDecodeFailed",
             ));
         }
@@ -7443,6 +7440,10 @@ fn recorded_commands(
                     .and_then(Value::as_str)
                     .unwrap_or(fallback_codec);
                 let value = decode_wire_avro_value(result, codec).map_err(|error| {
+                    if error.to_string().contains("unsupported_payload_codec") {
+                        return error;
+                    }
+
                     invalid_recorded_history(
                         "side_effect_payload_incompatible",
                         sequence,
@@ -8336,6 +8337,16 @@ mod tests {
         thread,
     };
 
+    fn fixture_envelope(value: Value) -> Value {
+        encode_value_envelope(&value, DEFAULT_CODEC).expect("encode Avro test fixture")
+    }
+
+    fn fixture_blob(value: Value) -> String {
+        encode_payload(&value, DEFAULT_CODEC)
+            .expect("encode Avro test fixture")
+            .blob
+    }
+
     #[test]
     fn client_builder_rejects_the_sdk_owned_api_suffix() {
         for base_url in [
@@ -8498,13 +8509,14 @@ mod tests {
         history_events: Value,
         run_status: &str,
     ) -> QueryTask {
+        let arguments = fixture_envelope(json!([]));
         serde_json::from_value(json!({
             "query_task_id": format!("query-{query_name}"),
             "workflow_type": "replay-counter",
             "query_name": query_name,
-            "payload_codec": "json",
-            "workflow_arguments": {"codec": "json", "blob": "[]"},
-            "query_arguments": {"codec": "json", "blob": "[]"},
+            "payload_codec": DEFAULT_CODEC,
+            "workflow_arguments": arguments.clone(),
+            "query_arguments": arguments,
             "history_events": history_events,
             "run_status": run_status,
         }))
@@ -8512,7 +8524,7 @@ mod tests {
     }
 
     fn workflow_context(history: Vec<HistoryEvent>) -> WorkflowContext {
-        workflow_context_with_codec(history, JSON_CODEC)
+        workflow_context_with_codec(history, DEFAULT_CODEC)
     }
 
     fn workflow_context_with_codec(
@@ -8597,7 +8609,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["type"], "record_side_effect");
         assert_eq!(
-            decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("JSON result"),
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("Avro result"),
             serde_json::to_value(&value).expect("value")
         );
 
@@ -8688,8 +8700,8 @@ mod tests {
 
     #[test]
     fn ordered_side_effects_share_the_durable_command_stream() {
-        let first = encode_value_envelope(&json!("first"), JSON_CODEC).expect("first");
-        let second = encode_value_envelope(&json!(29), JSON_CODEC).expect("second");
+        let first = encode_value_envelope(&json!("first"), DEFAULT_CODEC).expect("first");
+        let second = encode_value_envelope(&json!(29), DEFAULT_CODEC).expect("second");
         let ctx = workflow_context(vec![
             history_event(
                 "SideEffectRecorded",
@@ -8819,7 +8831,7 @@ mod tests {
             let error = WorkflowState::new(
                 history,
                 "rust-workers".to_string(),
-                JSON_CODEC.to_string(),
+                DEFAULT_CODEC.to_string(),
                 None,
             )
             .expect_err("malformed history must fail");
@@ -8837,15 +8849,15 @@ mod tests {
             vec![
                 history_event(
                     "SideEffectRecorded",
-                    json!({"sequence": 1, "result": {"codec": "json", "blob": "1"}}),
+                    json!({"sequence": 1, "result": fixture_envelope(json!(1))}),
                 ),
                 history_event(
                     "SideEffectRecorded",
-                    json!({"sequence": 1, "result": {"codec": "json", "blob": "2"}}),
+                    json!({"sequence": 1, "result": fixture_envelope(json!(2))}),
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("duplicate side effect");
@@ -8870,7 +8882,7 @@ mod tests {
         let duplicate_marker = WorkflowState::new(
             vec![marker(1), marker(3)],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("duplicate marker");
@@ -8906,8 +8918,10 @@ mod tests {
                 workflow_id: Some("wf-side-effect-version".to_string()),
                 run_id: Some("run-side-effect-version".to_string()),
                 workflow_type: "rust.side-effect-version".to_string(),
-                payload_codec: JSON_CODEC.to_string(),
-                arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("arguments")),
+                payload_codec: DEFAULT_CODEC.to_string(),
+                arguments: Some(
+                    encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("arguments"),
+                ),
                 history_events,
                 total_history_events: None,
                 history_size_bytes: None,
@@ -8967,7 +8981,7 @@ mod tests {
 
     #[test]
     fn side_effect_replay_rejects_changed_rust_value_type() {
-        let result = encode_value_envelope(&json!({"value": 42}), JSON_CODEC).expect("result");
+        let result = encode_value_envelope(&json!({"value": 42}), DEFAULT_CODEC).expect("result");
         let ctx = workflow_context(vec![history_event(
             "SideEffectRecorded",
             json!({"sequence": 1, "result": result}),
@@ -9051,8 +9065,8 @@ mod tests {
                     "activity_execution_id": "act-1",
                     "activity_attempt_id": "attempt-2",
                     "attempt_number": 2,
-                    "payload_codec": "json",
-                    "result": {"codec": "json", "blob": "{\"status\":\"recovered\"}"}
+                    "payload_codec": DEFAULT_CODEC,
+                    "result": fixture_envelope(json!({"status":"recovered"}))
                 }),
             ),
         ]
@@ -9372,13 +9386,27 @@ mod tests {
     }
 
     #[test]
-    fn json_codec_remains_plain_json() {
-        let value = json!({"greeting": "hello", "count": 3, "ok": true});
-        let envelope = PayloadEnvelope::json(&value).expect("encode");
+    fn json_tagged_payload_fails_closed_with_actionable_diagnostic() {
+        let envelope = PayloadEnvelope {
+            codec: "json".to_string(),
+            blob: r#"{"greeting":"hello"}"#.to_string(),
+        };
 
-        assert_eq!(envelope.codec, JSON_CODEC);
-        assert_eq!(envelope.blob, serde_json::to_string(&value).expect("json"));
-        assert_eq!(decode_payload::<Value>(&envelope).expect("decode"), value);
+        let error = decode_payload::<Value>(&envelope).expect_err("JSON payload must fail");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("unsupported_payload_codec"));
+        assert!(diagnostic.contains("codec=\"avro\""));
+        assert!(diagnostic.contains("HTTP document transport"));
+    }
+
+    #[test]
+    fn untagged_json_payload_value_fails_closed() {
+        let error = decode_wire_value(&json!({"stale": true}), DEFAULT_CODEC)
+            .expect_err("untagged JSON payload values must fail");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("unsupported_payload_codec"));
+        assert!(diagnostic.contains("untagged durable payload"));
+        assert!(diagnostic.contains("HTTP document transport"));
     }
 
     #[test]
@@ -10063,7 +10091,7 @@ mod tests {
                 json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
             )],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("TimerFired requires TimerScheduled");
@@ -10085,7 +10113,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("fire must match scheduled timer identity");
@@ -10111,7 +10139,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("a durable timer cannot fire twice");
@@ -10133,7 +10161,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("timer schedule and fire delays must agree");
@@ -10160,8 +10188,8 @@ mod tests {
                 json!({
                     "sequence": 2,
                     "activity_type": "after-timer",
-                    "payload_codec": "json",
-                    "result": {"codec": "json", "blob": "\"done\""},
+                    "payload_codec": DEFAULT_CODEC,
+                    "result": fixture_envelope(json!("done")),
                 }),
             ),
         ]);
@@ -10242,7 +10270,7 @@ mod tests {
                 json!({
                     "sequence": 1,
                     "signal_name": "go",
-                    "value": {"codec": "json", "blob": "[\"now\"]"},
+                    "value": fixture_envelope(json!(["now"])),
                 }),
             ),
             history_event(
@@ -10299,7 +10327,7 @@ mod tests {
                 json!({
                     "sequence": 2,
                     "signal_name": "go",
-                    "value": {"codec": "json", "blob": "[]"},
+                    "value": fixture_envelope(json!([])),
                 }),
             ),
         ];
@@ -10329,7 +10357,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("one workflow sequence cannot schedule two timers");
@@ -10351,7 +10379,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("one workflow sequence cannot identify two command kinds");
@@ -10373,7 +10401,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("one workflow sequence cannot open two signal waits");
@@ -10386,7 +10414,7 @@ mod tests {
 
     #[test]
     fn workflow_history_accepts_a_first_command_after_global_sequence_gaps() {
-        let result = encode_value_envelope(&json!({"captured": true}), JSON_CODEC)
+        let result = encode_value_envelope(&json!({"captured": true}), DEFAULT_CODEC)
             .expect("side-effect result");
         let ctx = workflow_context(vec![history_event(
             "SideEffectRecorded",
@@ -10403,14 +10431,14 @@ mod tests {
     #[test]
     fn workflow_history_rejects_zero_and_descending_command_sequences() {
         let result =
-            encode_value_envelope(&json!("captured"), JSON_CODEC).expect("side-effect result");
+            encode_value_envelope(&json!("captured"), DEFAULT_CODEC).expect("side-effect result");
         let zero = WorkflowState::new(
             vec![history_event(
                 "SideEffectRecorded",
                 json!({"sequence": 0, "result": result.clone()}),
             )],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("durable command sequences must be positive");
@@ -10438,7 +10466,7 @@ mod tests {
                 ),
             ],
             "rust-workers".to_string(),
-            JSON_CODEC.to_string(),
+            DEFAULT_CODEC.to_string(),
             None,
         )
         .expect_err("new durable commands must remain strictly ordered");
@@ -10469,8 +10497,8 @@ mod tests {
             worker
         }
 
-        let marker =
-            encode_value_envelope(&json!("after-finish"), JSON_CODEC).expect("side-effect result");
+        let marker = encode_value_envelope(&json!("after-finish"), DEFAULT_CODEC)
+            .expect("side-effect result");
         let task = workflow_task(
             "rust.finish-after-gaps",
             vec![
@@ -10484,8 +10512,8 @@ mod tests {
                         "signal_id": "increment-3",
                         "signal_name": "increment",
                         "workflow_sequence": 2,
-                        "payload_codec": "json",
-                        "arguments": {"codec": "json", "blob": "[3]"},
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": fixture_envelope(json!([3])),
                     }),
                 ),
                 history_event(
@@ -10494,8 +10522,8 @@ mod tests {
                         "signal_id": "increment-5",
                         "signal_name": "increment",
                         "workflow_sequence": 3,
-                        "payload_codec": "json",
-                        "arguments": {"codec": "json", "blob": "[5]"},
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": fixture_envelope(json!([5])),
                     }),
                 ),
                 history_event(
@@ -10504,8 +10532,8 @@ mod tests {
                         "signal_id": "finish",
                         "signal_name": "finish",
                         "workflow_sequence": 4,
-                        "payload_codec": "json",
-                        "arguments": {"codec": "json", "blob": "[]"},
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": fixture_envelope(json!([])),
                     }),
                 ),
                 history_event(
@@ -10514,8 +10542,8 @@ mod tests {
                         "sequence": 1,
                         "signal_id": "finish",
                         "signal_name": "finish",
-                        "payload_codec": "json",
-                        "value": {"codec": "json", "blob": "[]"},
+                        "payload_codec": DEFAULT_CODEC,
+                        "value": fixture_envelope(json!([])),
                     }),
                 ),
                 history_event(
@@ -10523,7 +10551,7 @@ mod tests {
                     json!({"sequence": 5, "result": marker}),
                 ),
             ],
-            JSON_CODEC,
+            DEFAULT_CODEC,
         );
 
         for _original_or_cold_worker in 0..2 {
@@ -10533,7 +10561,7 @@ mod tests {
             assert_eq!(commands.len(), 1, "replay emits only terminal completion");
             assert_eq!(commands[0]["type"], "complete_workflow");
             assert_eq!(
-                decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("workflow output"),
+                decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("workflow output"),
                 json!("finished")
             );
         }
@@ -10565,8 +10593,10 @@ mod tests {
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer".to_string(),
-            payload_codec: JSON_CODEC.to_string(),
-            arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(
+                encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
+            ),
             history_events,
             total_history_events: None,
             history_size_bytes: None,
@@ -10590,6 +10620,8 @@ mod tests {
             vec![json!({"type": "start_timer", "delay_seconds": 5})]
         );
 
+        let activity_result =
+            encode_value_envelope(&json!("done"), DEFAULT_CODEC).expect("activity result");
         let replayed = worker
             .execute_workflow_task(task(vec![
                 history_event(
@@ -10605,8 +10637,8 @@ mod tests {
                     json!({
                         "sequence": 2,
                         "activity_type": "after-timer",
-                        "payload_codec": "json",
-                        "result": {"codec": "json", "blob": "\"done\""},
+                        "payload_codec": DEFAULT_CODEC,
+                        "result": activity_result,
                     }),
                 ),
             ]))
@@ -10614,7 +10646,7 @@ mod tests {
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0]["type"], "complete_workflow");
         assert_eq!(
-            decode_wire_value(&replayed[0]["result"], JSON_CODEC).expect("result"),
+            decode_wire_value(&replayed[0]["result"], DEFAULT_CODEC).expect("result"),
             json!("done")
         );
     }
@@ -10685,7 +10717,7 @@ mod tests {
                 "WorkflowContinuedAsNew",
                 json!({"sequence": 1, "continued_to_run_id": "run-next"}),
             )],
-            JSON_CODEC,
+            DEFAULT_CODEC,
         );
 
         for _worker_restart_or_redelivery in 0..2 {
@@ -10729,7 +10761,7 @@ mod tests {
         let task: WorkflowTask = serde_json::from_value(json!({
             "task_id": "task-history-budget",
             "workflow_type": "rust.history-budget",
-            "payload_codec": JSON_CODEC,
+            "payload_codec": DEFAULT_CODEC,
             "history_events": [],
             "total_history_events": 480,
             "history_size_bytes": 1_048_576,
@@ -10741,7 +10773,7 @@ mod tests {
         let commands = worker
             .execute_workflow_task(task)
             .expect("history-budget workflow");
-        let result = decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("result");
+        let result = decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("result");
         assert_eq!(result["events"], 480);
         assert_eq!(result["bytes"], 1_048_576);
         assert_eq!(result["recommended"], true);
@@ -10760,8 +10792,8 @@ mod tests {
             workflow_id: Some("wf-rust-failing".to_string()),
             run_id: Some("run-rust-failing".to_string()),
             workflow_type: "rust.failing".to_string(),
-            payload_codec: JSON_CODEC.to_string(),
-            arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("input")),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("input")),
             history_events: Vec::new(),
             total_history_events: Some(0),
             history_size_bytes: None,
@@ -10809,7 +10841,7 @@ mod tests {
             .execute_workflow_task(workflow_task(
                 "rust.failing-after-side-effect",
                 Vec::new(),
-                JSON_CODEC,
+                DEFAULT_CODEC,
             ))
             .expect("ordinary failure remains a workflow decision");
 
@@ -10826,7 +10858,7 @@ mod tests {
             Err(Error::WorkerLoop("application failure".to_string()))
         });
         let result =
-            encode_value_envelope(&json!("committed"), JSON_CODEC).expect("side-effect result");
+            encode_value_envelope(&json!("committed"), DEFAULT_CODEC).expect("side-effect result");
 
         let error = worker
             .execute_workflow_task(workflow_task(
@@ -10835,7 +10867,7 @@ mod tests {
                     "SideEffectRecorded",
                     json!({"sequence": 1, "result": result}),
                 )],
-                JSON_CODEC,
+                DEFAULT_CODEC,
             ))
             .expect_err("removed committed history must not become fail_workflow");
 
@@ -10874,7 +10906,7 @@ mod tests {
                         "max_supported": 1,
                     }),
                 )],
-                JSON_CODEC,
+                DEFAULT_CODEC,
             ))
             .expect_err("replay error must return no queued workflow commands");
 
@@ -10899,8 +10931,10 @@ mod tests {
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer.pending".to_string(),
-            payload_codec: JSON_CODEC.to_string(),
-            arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(
+                encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
+            ),
             history_events: vec![history_event(
                 "TimerScheduled",
                 json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
@@ -10942,8 +10976,10 @@ mod tests {
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer.removed".to_string(),
-            payload_codec: JSON_CODEC.to_string(),
-            arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(
+                encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
+            ),
             history_events: vec![
                 history_event(
                     "TimerScheduled",
@@ -10987,7 +11023,7 @@ mod tests {
                     Some("wf-parent".to_string()),
                     Some("run-parent".to_string()),
                     "parent-workers".to_string(),
-                    JSON_CODEC.to_string(),
+                    DEFAULT_CODEC.to_string(),
                     None,
                 )
                 .expect("workflow state"),
@@ -11024,7 +11060,7 @@ mod tests {
         assert_eq!(command["execution_timeout_seconds"], 600);
         assert_eq!(command["run_timeout_seconds"], 120);
         assert_eq!(
-            decode_wire_value(&command["arguments"], JSON_CODEC).expect("child args"),
+            decode_wire_value(&command["arguments"], DEFAULT_CODEC).expect("child args"),
             json!([{"order_id": "order-42"}])
         );
     }
@@ -11059,8 +11095,8 @@ mod tests {
             workflow_id: Some("wf-parent".to_string()),
             run_id: Some("run-parent".to_string()),
             workflow_type: "rust.parent".to_string(),
-            payload_codec: JSON_CODEC.to_string(),
-            arguments: Some(encode_value_envelope(&json!([]), JSON_CODEC).expect("input")),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("input")),
             history_events: vec![
                 HistoryEvent {
                     event_type: "ChildWorkflowScheduled".to_string(),
@@ -11105,8 +11141,8 @@ mod tests {
                 "child_workflow_instance_id": "wf-child",
                 "child_workflow_run_id": "run-child",
                 "child_workflow_type": "python.child",
-                "payload_codec": "json",
-                "result": {"codec": "json", "blob": "{\"from\":\"python\",\"ok\":true}"},
+                "payload_codec": DEFAULT_CODEC,
+                "result": fixture_envelope(json!({"from":"python","ok":true})),
             }),
         );
 
@@ -11120,7 +11156,7 @@ mod tests {
                 .iter()
                 .any(|command| command["type"] == "start_child_workflow"));
             let output =
-                decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("parent output");
+                decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("parent output");
             assert_eq!(output["parent_workflow_id"], "wf-parent");
             assert_eq!(output["parent_run_id"], "run-parent");
             assert_eq!(output["child_workflow_id"], "wf-child");
@@ -11296,7 +11332,8 @@ mod tests {
 
         let commands = worker.execute_workflow_task(task).expect("handled failure");
         assert_eq!(commands[0]["type"], "complete_workflow");
-        let output = decode_wire_value(&commands[0]["result"], JSON_CODEC).expect("parent output");
+        let output =
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("parent output");
         assert_eq!(output["reason"], "child_workflow");
         assert_eq!(output["failure_id"], "failure-child");
         assert_eq!(output["exception_class"], "payments.PaymentRejected");
@@ -11483,8 +11520,8 @@ mod tests {
                         "signal_id": "python-signal-2",
                         "signal_name": "increment",
                         "workflow_sequence": 2,
-                        "payload_codec": JSON_CODEC,
-                        "arguments": encode_value_envelope(&json!([5]), JSON_CODEC).expect("python json signal")
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": encode_value_envelope(&json!([5]), DEFAULT_CODEC).expect("python avro signal")
                     }),
                     raw: HashMap::new(),
                 },
@@ -11517,8 +11554,8 @@ mod tests {
                 "payload": {
                     "sequence": 1,
                     "activity_type": "load-counter",
-                    "payload_codec": "json",
-                    "result": {"codec": "json", "blob": "\"loaded\""}
+                    "payload_codec": DEFAULT_CODEC,
+                    "result": fixture_envelope(json!("loaded"))
                 }
             },
             {
@@ -11534,8 +11571,8 @@ mod tests {
                     "signal_id": "signal-3",
                     "signal_name": "increment",
                     "workflow_sequence": 2,
-                    "payload_codec": "json",
-                    "arguments": {"codec": "json", "blob": "[3]"}
+                    "payload_codec": DEFAULT_CODEC,
+                    "arguments": fixture_envelope(json!([3]))
                 }
             },
             {
@@ -11544,8 +11581,8 @@ mod tests {
                     "sequence": 3,
                     "signal_id": "signal-3",
                     "signal_name": "increment",
-                    "payload_codec": "json",
-                    "value": {"codec": "json", "blob": "[3]"}
+                    "payload_codec": DEFAULT_CODEC,
+                    "value": fixture_envelope(json!([3]))
                 }
             }
         ]);
@@ -11588,25 +11625,29 @@ mod tests {
         assert_eq!(unchanged, running);
 
         let restarted_worker = replay_counter_worker();
+        let empty_arguments = fixture_envelope(json!([]));
+        let loaded_result = fixture_envelope(json!("loaded"));
+        let signal_three = fixture_blob(json!([3]));
+        let signal_five = fixture_blob(json!([5]));
         let restarted_task: QueryTask = serde_json::from_value(json!({
             "query_task_id": "query-after-restart",
             "workflow_id": "counter-1",
             "run_id": "run-counter-1",
             "workflow_type": "replay-counter",
             "query_name": "current",
-            "payload_codec": "json",
-            "workflow_arguments": {"codec": "json", "blob": "[]"},
-            "query_arguments": {"codec": "json", "blob": "[]"},
+            "payload_codec": DEFAULT_CODEC,
+            "workflow_arguments": empty_arguments.clone(),
+            "query_arguments": empty_arguments,
             "history_events": [],
             "history_export": {
-                "payloads": {"codec": "json"},
+                "payloads": {"codec": DEFAULT_CODEC},
                 "history_events": [
                     {
                         "type": "ActivityCompleted",
                         "payload": {
                             "sequence": 1,
                             "activity_type": "load-counter",
-                            "payload_codec": "json",
+                            "payload_codec": DEFAULT_CODEC,
                             "result": null
                         }
                     },
@@ -11660,23 +11701,23 @@ mod tests {
                 "activities": [{
                     "sequence": 1,
                     "activity_type": "load-counter",
-                    "payload_codec": "json",
-                    "result": {"codec": "json", "blob": "\"loaded\""}
+                    "payload_codec": DEFAULT_CODEC,
+                    "result": loaded_result
                 }],
                 "signals": [
                     {
                         "id": "signal-3",
                         "name": "increment",
                         "workflow_sequence": 2,
-                        "payload_codec": "json",
-                        "arguments": "[3]"
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": signal_three
                     },
                     {
                         "id": "signal-5",
                         "name": "increment",
                         "workflow_sequence": 4,
-                        "payload_codec": "json",
-                        "arguments": "[5]"
+                        "payload_codec": DEFAULT_CODEC,
+                        "arguments": signal_five
                     }
                 ]
             },
@@ -11702,8 +11743,8 @@ mod tests {
                 "type": "ActivityCompleted",
                 "payload": {
                     "sequence": 1,
-                    "payload_codec": "json",
-                    "result": {"codec": "json", "blob": "{"}
+                    "payload_codec": DEFAULT_CODEC,
+                    "result": {"codec": DEFAULT_CODEC, "blob": "{"}
                 }
             }]),
             "running",
@@ -11724,16 +11765,18 @@ mod tests {
         worker.register_query("counter", "current", |ctx, _args| async move {
             Ok(json!(ctx.signals("increment")[0][0]))
         });
+        let empty_arguments = fixture_envelope(json!([]));
+        let exported_signal = fixture_blob(json!([9]));
         let task: QueryTask = serde_json::from_value(json!({
             "query_task_id": "query-export",
             "workflow_type": "counter",
             "query_name": "current",
-            "payload_codec": "json",
-            "workflow_arguments": {"codec": "json", "blob": "[]"},
-            "query_arguments": {"codec": "json", "blob": "[]"},
+            "payload_codec": DEFAULT_CODEC,
+            "workflow_arguments": empty_arguments.clone(),
+            "query_arguments": empty_arguments,
             "history_events": [],
             "history_export": {
-                "payloads": {"codec": "json"},
+                "payloads": {"codec": DEFAULT_CODEC},
                 "history_events": [{
                     "type": "SignalReceived",
                     "payload": {"signal_id": "signal-export", "signal_name": "increment"}
@@ -11743,8 +11786,8 @@ mod tests {
                     "name": "increment",
                     "status": "applied",
                     "workflow_sequence": 1,
-                    "payload_codec": "json",
-                    "arguments": "[9]"
+                    "payload_codec": DEFAULT_CODEC,
+                    "arguments": exported_signal
                 }]
             }
         }))
@@ -11773,9 +11816,9 @@ mod tests {
             run_id: Some("run-errors".to_string()),
             workflow_type: "counter".to_string(),
             query_name: "missing".to_string(),
-            payload_codec: JSON_CODEC.to_string(),
-            workflow_arguments: Some(json!({"codec": "json", "blob": "[]"})),
-            query_arguments: Some(json!({"codec": "json", "blob": "[]"})),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            workflow_arguments: Some(fixture_envelope(json!([]))),
+            query_arguments: Some(fixture_envelope(json!([]))),
             history_events: Vec::new(),
             history_export: None,
             run_status: Some("running".to_string()),
@@ -11789,7 +11832,7 @@ mod tests {
 
         let mut malformed = base_task;
         malformed.query_name = "current".to_string();
-        malformed.query_arguments = Some(json!({"codec": "json", "blob": "{"}));
+        malformed.query_arguments = Some(json!({"codec": DEFAULT_CODEC, "blob": "{"}));
         let malformed = worker
             .execute_query_task(malformed)
             .await
@@ -11800,13 +11843,14 @@ mod tests {
         let mut unavailable_worker = Worker::new(client, "rust-workers");
         unavailable_worker
             .register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        let empty_arguments = fixture_envelope(json!([]));
         let unavailable_task: QueryTask = serde_json::from_value(json!({
             "query_task_id": "query-unavailable",
             "workflow_type": "counter",
             "query_name": "current",
-            "payload_codec": "json",
-            "workflow_arguments": {"codec": "json", "blob": "[]"},
-            "query_arguments": {"codec": "json", "blob": "[]"}
+            "payload_codec": DEFAULT_CODEC,
+            "workflow_arguments": empty_arguments.clone(),
+            "query_arguments": empty_arguments
         }))
         .expect("query task");
         let unavailable = unavailable_worker
@@ -12335,7 +12379,7 @@ mod tests {
                 "attempt-cancel",
                 "rust-worker",
                 json!({"late":true}),
-                JSON_CODEC,
+                DEFAULT_CODEC,
             )
             .await
             .expect_err("late completion must be refused");
@@ -12773,7 +12817,13 @@ mod tests {
             .await
             .expect("query poll");
         client
-            .complete_query_task("query-capture", "capture-worker", 1, json!(8), JSON_CODEC)
+            .complete_query_task(
+                "query-capture",
+                "capture-worker",
+                1,
+                json!(8),
+                DEFAULT_CODEC,
+            )
             .await
             .expect("query complete");
         client
@@ -12960,7 +13010,7 @@ mod tests {
             .expect("client");
 
         let error = client
-            .complete_query_task("query-late", "late-worker", 1, json!(8), JSON_CODEC)
+            .complete_query_task("query-late", "late-worker", 1, json!(8), DEFAULT_CODEC)
             .await
             .expect_err("expired completion must be rejected");
         let Error::QueryFailed(failure) = error else {
@@ -14167,7 +14217,7 @@ mod tests {
             write_mock_response(
                 stream,
                 "200 OK",
-                r#"{"task":{"task_id":"workflow-timeout-task","workflow_id":"reused-workflow-id","run_id":"run-selected-timeout","workflow_type":"timeout.workflow","payload_codec":"json","arguments":{"codec":"json","blob":"[]"},"history_events":[],"workflow_task_attempt":3,"lease_owner":"timeout-worker"}}"#,
+                r#"{"task":{"task_id":"workflow-timeout-task","workflow_id":"reused-workflow-id","run_id":"run-selected-timeout","workflow_type":"timeout.workflow","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"history_events":[],"workflow_task_attempt":3,"lease_owner":"timeout-worker"}}"#,
             );
             return;
         }
@@ -14419,7 +14469,7 @@ mod tests {
             {
                 (
                     "200 OK",
-                    r#"{"task":{"task_id":"activity-cancel","activity_attempt_id":"attempt-cancel","activity_type":"cancel-aware","payload_codec":"json","arguments":{"codec":"json","blob":"[]"},"attempt_number":1,"lease_owner":"rust-cancel-worker"}}"#,
+                    r#"{"task":{"task_id":"activity-cancel","activity_attempt_id":"attempt-cancel","activity_type":"cancel-aware","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"attempt_number":1,"lease_owner":"rust-cancel-worker"}}"#,
                 )
             }
             "/api/worker/activity-tasks/poll" | "/api/worker/workflow-tasks/poll" => {
@@ -14430,7 +14480,7 @@ mod tests {
             {
                 (
                     "200 OK",
-                    r#"{"task":{"query_task_id":"query-late","query_task_attempt":1,"lease_owner":"late-worker","workflow_id":"counter-late","run_id":"run-late","workflow_type":"counter","query_name":"current","payload_codec":"json","workflow_arguments":{"codec":"json","blob":"[]"},"query_arguments":{"codec":"json","blob":"[]"},"history_events":[],"run_status":"running"}}"#,
+                    r#"{"task":{"query_task_id":"query-late","query_task_attempt":1,"lease_owner":"late-worker","workflow_id":"counter-late","run_id":"run-late","workflow_type":"counter","query_name":"current","payload_codec":"avro","workflow_arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"query_arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"history_events":[],"run_status":"running"}}"#,
                 )
             }
             "/api/worker/query-tasks/poll" => ("200 OK", r#"{"task":null}"#),
@@ -14449,7 +14499,7 @@ mod tests {
             | "/api/workflows/typed-1/signal/changed" => ("200 OK", "{}"),
             "/api/workflows/counter-1/query/current" => (
                 "200 OK",
-                r#"{"workflow_id":"counter-1","query_name":"current","result":{"count":8},"result_envelope":{"codec":"json","blob":"{\"count\":8}"}}"#,
+                r#"{"workflow_id":"counter-1","query_name":"current","result":{"count":8},"result_envelope":{"codec":"avro","blob":"wwHioz3/VYAiNw4CCmNvdW50BBAA"}}"#,
             ),
             "/api/workflows/counter-1/query/missing" => (
                 "404 Not Found",

@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.0-rc.12"
+version = "2.0.0-rc.30"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -14,10 +14,10 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.0-rc.12"
+product-train = "2.0.0-rc.30"
 compatibility-authority = "protocol-manifests"
-supported-server-versions = ">=2.0.0-rc.17,<2.0.0"
-qualified-server-version = "2.0.0-rc.17"
+supported-server-versions = ">=2.0.0-rc.32,<2.0.0"
+qualified-server-version = "2.0.0-rc.32"
 worker-protocol-version = "1.2"
 server-worker-protocol-versions = ">=1.2,<2.0"
 control-plane-version = "2"
@@ -37,7 +37,7 @@ workflow-lifecycle-commands = ["cancel", "terminate"]
 workflow-lifecycle-run-targeting = "current-run-guard"
 workflow-terminal-outcomes = ["failed", "cancelled", "terminated", "timed_out"]
 workflow-start-timeouts = ["execution_timeout_seconds", "run_timeout_seconds"]
-payload-codecs = ["avro", "json"]
+payload-codecs = ["avro"]
 durable-timers = true
 timer-command = "start_timer"
 timer-replay-validation = "command-order+sequence+timer-id+delay"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.0-rc.30
+
+- Remove the JSON payload-codecs feature and make the fixed typed Avro Value
+  schema with single-object framing the only public payload codec.
+- Reject JSON-tagged and unknown payload envelopes without transcoding or
+  codec inference, qualified against Server `2.0.0-rc.32`.
+
 ## 2.0.0-rc.12
 
 - Add a task-oriented Rust documentation landing page that leads with the

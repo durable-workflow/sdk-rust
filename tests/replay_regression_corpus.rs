@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-use durable_workflow::{encode_avro_value, json, AvroValue, Client, Value, Worker, JSON_CODEC};
+use durable_workflow::{
+    decode_payload, encode_avro_value, json, AvroValue, Client, PayloadEnvelope, Value, Worker,
+    DEFAULT_CODEC,
+};
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
 
@@ -240,12 +243,10 @@ fn normalize_command(command: &Value) -> Result<Value, String> {
         let Some(envelope) = command.get(field).and_then(Value::as_object) else {
             continue;
         };
-        if envelope.get("codec").and_then(Value::as_str) == Some(JSON_CODEC) {
-            let blob = envelope
-                .get("blob")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("{field} envelope has no blob"))?;
-            normalized[field] = serde_json::from_str(blob)
+        if envelope.get("codec").and_then(Value::as_str) == Some(DEFAULT_CODEC) {
+            let envelope: PayloadEnvelope = serde_json::from_value(Value::Object(envelope.clone()))
+                .map_err(|error| format!("parse replay command {field} envelope: {error}"))?;
+            normalized[field] = decode_payload(&envelope)
                 .map_err(|error| format!("decode replay command {field}: {error}"))?;
         }
     }
@@ -312,10 +313,24 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
         ));
     }
+    let payload_codec = workflow
+        .get("payload_codec")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_CODEC);
     let input = workflow.get("input").cloned().unwrap_or_else(|| json!([]));
     if !input.is_array() {
         return Err(format!("{fixture_id}.workflow.input must be an array"));
     }
+    if input != json!([]) {
+        return Err(format!(
+            "{fixture_id}.workflow.input must use the declared empty Avro corpus input"
+        ));
+    }
+    let input_envelope = serde_json::to_value(
+        encode_avro_value(&AvroValue::Array(Vec::new()))
+            .map_err(|error| format!("encode {fixture_id} Avro input: {error}"))?,
+    )
+    .map_err(|error| format!("serialize {fixture_id} Avro input: {error}"))?;
     let history = fixture.get("history").cloned().unwrap_or_else(|| json!([]));
     if !history.is_array() {
         return Err(format!("{fixture_id}.history must be an array"));
@@ -327,12 +342,8 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
         "workflow_id": format!("regression-corpus-{fixture_id}"),
         "run_id": "regression-corpus-run",
         "workflow_type": workflow_type,
-        "payload_codec": JSON_CODEC,
-        "arguments": {
-            "codec": JSON_CODEC,
-            "blob": serde_json::to_string(&input)
-                .map_err(|error| format!("encode {fixture_id} input: {error}"))?
-        },
+        "payload_codec": payload_codec,
+        "arguments": input_envelope,
         "history_events": history,
         "workflow_task_attempt": 1,
         "lease_owner": "regression-corpus-worker"
@@ -434,41 +445,42 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
         )
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
-        execute_fixture(&fixture)
-            .await
-            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let result = execute_fixture(&fixture).await;
+        if contains_json_payload_codec(&fixture) {
+            let error = result.expect_err("frozen JSON-tagged replay must fail closed");
+            assert!(error.contains("unsupported_payload_codec"), "{error}");
+            assert!(error.contains("HTTP document transport"), "{error}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
     }
 }
 
 #[tokio::test]
-async fn json_and_avro_side_effect_rewraps_execute_identically() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/replay-regressions/side-effect-version-cold-replay.json"
-    ))
-    .expect("parse checked-in replay fixture");
-    let mut avro_fixture = fixture.clone();
-    avro_fixture["id"] = json!("rust-side-effect-version-cold-replay-avro");
-    avro_fixture["history"][0]["payload"]["result"] = serde_json::to_value(
-        encode_avro_value(&AvroValue::String("captured-once".to_string()))
-            .expect("encode replayed side effect"),
+async fn avro_side_effect_replay_is_deterministic_across_cold_workers() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/side-effect-version-cold-replay-avro.json");
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in replay fixture"),
     )
-    .expect("serialize Avro replay envelope");
-
-    let json_result = execute_fixture(&fixture)
+    .expect("parse checked-in replay fixture");
+    let first = execute_fixture(&fixture)
         .await
-        .expect("JSON replay fixture must execute");
-    let avro_result = execute_fixture(&avro_fixture)
+        .expect("first Avro replay fixture must execute");
+    let second = execute_fixture(&fixture)
         .await
-        .expect("Avro replay rewrap must execute");
+        .expect("cold Avro replay fixture must execute");
 
-    assert_eq!(json_result, avro_result);
+    assert_eq!(first, second);
 }
 
 #[tokio::test]
 async fn non_envelope_side_effect_value_is_rejected_by_official_worker() {
-    let mut fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/replay-regressions/side-effect-version-cold-replay.json"
-    ))
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/side-effect-version-cold-replay-avro.json");
+    let mut fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in replay fixture"),
+    )
     .expect("parse checked-in replay fixture");
     fixture["id"] = json!("rust-side-effect-version-cold-replay-non-envelope");
     fixture["history"][0]["payload"]["result"] = json!({"captured": "once"});
@@ -478,6 +490,17 @@ async fn non_envelope_side_effect_value_is_rejected_by_official_worker() {
         .expect_err("raw side-effect values must not execute as published replay evidence");
 
     assert!(error.contains("side_effect_payload_malformed"), "{error}");
+}
+
+fn contains_json_payload_codec(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            (matches!(key.as_str(), "codec" | "payload_codec") && value == "json")
+                || contains_json_payload_codec(value)
+        }),
+        Value::Array(items) => items.iter().any(contains_json_payload_codec),
+        _ => false,
+    }
 }
 
 #[tokio::test]
