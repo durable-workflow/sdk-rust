@@ -41,6 +41,57 @@ class DocsLandingQualificationTest(unittest.TestCase):
             self.rust_version,
         )
 
+    def test_rejects_a_stale_machine_owned_crate_identity(self) -> None:
+        stale_identity = self.html.replace(
+            f'data-crate-version="{self.crate_version}"',
+            'data-crate-version="2.0.0-rc.1"',
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            QUALIFIER.QualificationError,
+            "landing crate identity is stale",
+        ):
+            QUALIFIER.validate_structure(
+                QUALIFIER.parse_document(stale_identity),
+                self.crate_version,
+                self.rust_version,
+            )
+
+    def test_rejects_an_exact_prerelease_version_in_visible_onboarding(self) -> None:
+        pinned_onboarding = self.html.replace(
+            'durable-workflow = "2.0.0-rc"',
+            f'durable-workflow = "={self.crate_version}"',
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            QUALIFIER.QualificationError,
+            "visible onboarding must not contain an exact prerelease version",
+        ):
+            QUALIFIER.validate_structure(
+                QUALIFIER.parse_document(pinned_onboarding),
+                self.crate_version,
+                self.rust_version,
+            )
+
+    def test_rejects_a_missing_versionless_installer(self) -> None:
+        pinned_installer = self.html.replace(
+            QUALIFIER.VERSIONLESS_INSTALLER,
+            f"cargo add durable-workflow@={self.crate_version}",
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            QUALIFIER.QualificationError,
+            "first task must use the versionless SDK installer",
+        ):
+            QUALIFIER.validate_structure(
+                QUALIFIER.parse_document(pinned_installer),
+                self.crate_version,
+                self.rust_version,
+            )
+
     def test_rejects_a_cloud_primary_action(self) -> None:
         cloud_primary = self.html.replace(
             'data-docs-priority="primary" data-access="general" href="durable_workflow/"',

@@ -42,6 +42,12 @@ VOID_ELEMENTS = frozenset(
         "wbr",
     }
 )
+VERSIONLESS_INSTALLER = (
+    "curl -fsSL https://durable-workflow.com/install-sdk.sh | sh -s -- rust"
+)
+EXACT_PRERELEASE_VERSION = re.compile(
+    r"\b\d+\.\d+\.\d+-(?:alpha|beta|rc)\.\d+\b"
+)
 
 
 class QualificationError(RuntimeError):
@@ -185,8 +191,12 @@ def validate_structure(root: Node, crate_version: str, rust_version: str) -> Non
             )
 
     first_task_text = visible_text(first_task)
-    if f"cargo add durable-workflow@={crate_version}" not in first_task_text:
-        raise QualificationError("first task must install the current crate identity")
+    if VERSIONLESS_INSTALLER not in first_task_text:
+        raise QualificationError("first task must use the versionless SDK installer")
+    if EXACT_PRERELEASE_VERSION.search(visible_text(body)):
+        raise QualificationError(
+            "visible onboarding must not contain an exact prerelease version"
+        )
     if "rustc --version" not in first_task_text:
         raise QualificationError("first task must expose the Rust requirement check")
     if "DURABLE_WORKFLOW_" in first_task_text:

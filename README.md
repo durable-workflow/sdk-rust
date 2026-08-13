@@ -37,21 +37,23 @@ owns and appends that suffix.
 
 ## Install
 
-Add the exact crates.io release with Cargo:
+Install the supported crate with the versionless resolver. It reads the last
+passing public quickstart contract, then invokes Cargo with that qualified
+crate requirement:
 
 ```sh
-cargo add durable-workflow@=2.0.0-rc.12
+curl -fsSL https://durable-workflow.com/install-sdk.sh | sh -s -- rust
 ```
 
-Or add the same exact requirement directly to `Cargo.toml`:
+For a reproducible build, copy the exact requirement selected into
+`Cargo.toml` or retain it in `Cargo.lock`:
 
 ```toml
 [dependencies]
-durable-workflow = "=2.0.0-rc.12"
+durable-workflow = "=<resolved-qualified-version>"
 ```
 
-Version `2.0.0-rc.12` includes the complete Durable Workflow 2.0 prerelease
-baseline described below.
+`Cargo.lock` records the exact crate selected for a reproducible build.
 
 ## Start with Rust Cloud
 
@@ -95,9 +97,9 @@ error before transport when only the opposite role is available.
 
 ## Compatibility
 
-Rust SDK `2.0.0-rc.12` supports Server `>=2.0.0-rc.17,<2.0.0`. The current
-qualification baseline is Server `2.0.0-rc.17`. Server build versions are
-identity, not the runtime negotiation mechanism: compatible servers must
+The installed crate's package metadata records its exact qualified Server
+range and baseline. Server build versions are identity, not the runtime
+negotiation mechanism: compatible servers must
 advertise control plane `2` and a
 same-major worker protocol in `>=1.2,<2.0`. The SDK sends worker protocol `1.2`;
 newer `1.x` server minors accept that header under the additive protocol
