@@ -4,11 +4,14 @@ from pathlib import Path
 
 build_directory = Path(sys.argv[1] if len(sys.argv) > 1 else "target/doc")
 runtime = Path("docs/analytics/analytics.js").read_text(encoding="utf-8")
+navigation = Path("docs/navigation.js").read_text(encoding="utf-8")
 styles = Path("docs/layout.css").read_text(encoding="utf-8")
 landing_styles = styles.split(".sidebar .sidebar-elems", maxsplit=1)[0]
 
 if (build_directory / "analytics/analytics.js").read_text(encoding="utf-8") != runtime:
     raise SystemExit("Rendered rustdoc analytics runtime is stale")
+if (build_directory / "navigation.js").read_text(encoding="utf-8") != navigation:
+    raise SystemExit("Rendered rustdoc navigation runtime is stale")
 if not re.search(r"\.dw-cloud-promotion__eyebrow\s*\{[^}]*letter-spacing:\s*0;", styles, re.DOTALL):
     raise SystemExit("Promotion eyebrow letter spacing must remain zero")
 if re.search(r"gradient|clamp\(|letter-spacing:\s*-|\b\d+(?:\.\d+)?vw\b", landing_styles):
@@ -49,10 +52,8 @@ if not html_files:
 for html_file in html_files:
     html = html_file.read_text(encoding="utf-8")
     if '<meta http-equiv="refresh"' in html:
-        if "/analytics/analytics.js" in html:
-            raise SystemExit(
-                f"{html_file} redirect must not emit an analytics page view"
-            )
+        if "/analytics/analytics.js" in html or "/navigation.js" in html:
+            raise SystemExit(f"{html_file} redirect must not emit browser runtimes")
         continue
     if len(re.findall(r'src="/analytics/analytics\.js"', html)) != 1:
         raise SystemExit(f"{html_file} must load one cookie-free analytics runtime")
@@ -63,6 +64,18 @@ for html_file in html_files:
         raise SystemExit(f"{html_file} must use module semantics for analytics")
     if "/analytics/analytics.css" in html:
         raise SystemExit(f"{html_file} still loads retired analytics UI styles")
+    if '<meta name="generator" content="rustdoc">' in html:
+        if len(re.findall(r'src="/navigation\.js"', html)) != 1:
+            raise SystemExit(
+                f"{html_file} must load one compact navigation runtime"
+            )
+        if not re.search(
+            r'<script(?=[^>]*\bsrc="/navigation\.js")(?=[^>]*\btype="module")[^>]*>',
+            html,
+        ):
+            raise SystemExit(
+                f"{html_file} must use module semantics for compact navigation"
+            )
     if forbidden.search(html):
         raise SystemExit(
             f"{html_file} contains retired Google analytics or consent state"

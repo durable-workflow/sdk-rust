@@ -48,10 +48,12 @@ jobs:
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
           cp docs/layout.css target/doc/layout.css
+          cp docs/navigation.js target/doc/navigation.js
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
           node scripts/ci/test-docs-analytics.mjs
+          node scripts/ci/test-docs-navigation.mjs
           python3 scripts/ci/qualify-docs-landing.py \
             --build-directory target/doc --check-external
 
@@ -159,10 +161,12 @@ jobs:
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
           cp docs/layout.css target/doc/layout.css
+          cp docs/navigation.js target/doc/navigation.js
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
           node scripts/ci/test-docs-analytics.mjs
+          node scripts/ci/test-docs-navigation.mjs
           python3 scripts/ci/qualify-docs-landing.py \
             --build-directory target/doc --check-external
 
@@ -200,11 +204,12 @@ jobs:
             local state=$1 width=$2 height=$3
             shift 3
             local capture_args=()
-            if [ "$width" = 640 ] && [ "$height" = 360 ]; then
+            if [ "$state" = analytics-ui-removed ] && \
+              [ "$width" = 640 ] && [ "$height" = 360 ]; then
               capture_args+=(--full-page)
             fi
             node visual-controller/scripts/pipeline_visual_capture.mjs \
-              --url http://127.0.0.1:4173/ \
+              --url http://127.0.0.1:4173/durable_workflow/ \
               --surface rust-sdk-reference --state "$state" \
               --width "$width" --height "$height" \
               --source-repository durable-workflow/sdk-rust \
@@ -212,12 +217,23 @@ jobs:
               --screenshot "visual-review/${state}-${width}x${height}.png" \
               --report "visual-review/${state}-${width}x${height}.json" \
               --manifest visual-review/manifest.json "${capture_args[@]}" "$@"
+            if [ "$state" = navigation-open ]; then
+              node candidate/scripts/ci/record-rustdoc-navigation-isolation.mjs \
+                --url http://127.0.0.1:4173/durable_workflow/ \
+                --width "$width" --height "$height" \
+                --report "visual-review/${state}-${width}x${height}.json" \
+                --controller-root visual-controller
+            fi
           }
           for viewport in 1440x900 800x900 390x844 640x360; do
             width=${viewport%x*}
             height=${viewport#*x}
             capture analytics-ui-removed "$width" "$height"
           done
+          capture navigation-open 390 844 \
+            --state-scope responsive --click '.sidebar-menu-toggle'
+          capture navigation-open 640 360 \
+            --state-scope responsive --click '.sidebar-menu-toggle'
 
       - name: Validate source-bound candidate evidence
         if: >-
@@ -247,6 +263,8 @@ jobs:
             done
           fi
           python visual-controller/scripts/visual_evidence.py validate "${validation_args[@]}"
+          python3 candidate/scripts/ci/validate-rustdoc-navigation-evidence.py \
+            visual-review/manifest.json
 
       - name: Retain candidate visual evidence
         if: >-

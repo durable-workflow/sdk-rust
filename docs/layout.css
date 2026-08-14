@@ -238,6 +238,24 @@ body.dw-landing {
   white-space: normal;
 }
 
+@media (max-width: 700px) {
+  body.dw-rustdoc-navigation-open {
+    overflow: hidden;
+  }
+
+  body.dw-rustdoc-navigation-open::before {
+    position: fixed;
+    z-index: 10;
+    inset: 45px 0 0 200px;
+    background: color-mix(in srgb, var(--main-background-color) 82%, transparent);
+    content: "";
+  }
+
+  body.dw-rustdoc-navigation-open .sidebar {
+    box-shadow: 2px 0 8px rgb(0 0 0 / 18%);
+  }
+}
+
 .dw-cloud-promotion {
   display: flex;
   align-items: center;

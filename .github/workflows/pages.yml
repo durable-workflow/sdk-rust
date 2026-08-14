@@ -53,10 +53,12 @@ jobs:
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
           cp docs/layout.css target/doc/layout.css
+          cp docs/navigation.js target/doc/navigation.js
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
           node scripts/ci/test-docs-analytics.mjs
+          node scripts/ci/test-docs-navigation.mjs
           python3 scripts/ci/qualify-docs-landing.py \
             --build-directory target/doc --check-external \
             --check-cargo-resolution
@@ -125,10 +127,12 @@ jobs:
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
           cp docs/layout.css target/doc/layout.css
+          cp docs/navigation.js target/doc/navigation.js
           mkdir -p target/doc/analytics
           cp docs/analytics/analytics.js target/doc/analytics/
           python3 scripts/check-docs-analytics.py target/doc
           node scripts/ci/test-docs-analytics.mjs
+          node scripts/ci/test-docs-navigation.mjs
           python3 scripts/ci/qualify-docs-landing.py \
             --build-directory target/doc --check-external
 
@@ -163,11 +167,12 @@ jobs:
             local state=$1 width=$2 height=$3
             shift 3
             local capture_args=()
-            if [ "$width" = 640 ] && [ "$height" = 360 ]; then
+            if [ "$state" = analytics-ui-removed ] && \
+              [ "$width" = 640 ] && [ "$height" = 360 ]; then
               capture_args+=(--full-page)
             fi
             node visual-controller/scripts/pipeline_visual_capture.mjs \
-              --url http://127.0.0.1:4173/ \
+              --url http://127.0.0.1:4173/durable_workflow/ \
               --surface rust-sdk-reference --state "$state" \
               --width "$width" --height "$height" \
               --source-repository durable-workflow/sdk-rust \
@@ -175,12 +180,23 @@ jobs:
               --screenshot "visual-review/${state}-${width}x${height}.png" \
               --report "visual-review/${state}-${width}x${height}.json" \
               --manifest visual-review/manifest.json "${capture_args[@]}" "$@"
+            if [ "$state" = navigation-open ]; then
+              node candidate/scripts/ci/record-rustdoc-navigation-isolation.mjs \
+                --url http://127.0.0.1:4173/durable_workflow/ \
+                --width "$width" --height "$height" \
+                --report "visual-review/${state}-${width}x${height}.json" \
+                --controller-root visual-controller
+            fi
           }
           for viewport in 1440x900 800x900 390x844 640x360; do
             width=${viewport%x*}
             height=${viewport#*x}
             capture analytics-ui-removed "$width" "$height"
           done
+          capture navigation-open 390 844 \
+            --state-scope responsive --click '.sidebar-menu-toggle'
+          capture navigation-open 640 360 \
+            --state-scope responsive --click '.sidebar-menu-toggle'
 
       - name: Validate trusted source-bound evidence
         env:
@@ -192,6 +208,8 @@ jobs:
             --expected-revision "$SOURCE_REVISION" \
             --manifest "$GITHUB_WORKSPACE/visual-review/manifest.json" \
             --changed-file docs/analytics/analytics.js
+          python3 candidate/scripts/ci/validate-rustdoc-navigation-evidence.py \
+            visual-review/manifest.json
 
       - name: Retain trusted visual evidence
         if: always()
@@ -260,80 +278,53 @@ jobs:
             --landing-url https://rust.durable-workflow.com/ \
             --attempts 30 --link-attempts 3 --retry-delay 10
 
-      - name: Capture deployed landing matrix
+      - name: Capture deployed reference matrix
         env:
           SOURCE_REVISION: ${{ github.sha }}
           TMPDIR: ${{ runner.temp }}/rust-docs-deployed-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           mkdir -p "$TMPDIR" deployed-visual-review
           capture() {
-            local width=$1 height=$2
-            shift 2
+            local state=$1 width=$2 height=$3
+            shift 3
+            local capture_args=()
+            if [ "$state" = analytics-ui-removed ] && \
+              [ "$width" = 640 ] && [ "$height" = 360 ]; then
+              capture_args+=(--full-page)
+            fi
             node visual-controller/scripts/pipeline_visual_capture.mjs \
-              --url https://rust.durable-workflow.com/ \
-              --surface rust-sdk-landing --state deployed-general-first \
+              --url https://rust.durable-workflow.com/durable_workflow/ \
+              --surface rust-sdk-reference --state "$state" \
               --width "$width" --height "$height" \
               --source-repository durable-workflow/sdk-rust \
               --source-revision "$SOURCE_REVISION" \
-              --screenshot "deployed-visual-review/${width}x${height}.png" \
-              --report "deployed-visual-review/${width}x${height}.json" \
-              --manifest deployed-visual-review/manifest.json "$@"
+              --screenshot "deployed-visual-review/${state}-${width}x${height}.png" \
+              --report "deployed-visual-review/${state}-${width}x${height}.json" \
+              --manifest deployed-visual-review/manifest.json "${capture_args[@]}" "$@"
+            if [ "$state" = navigation-open ]; then
+              node scripts/ci/record-rustdoc-navigation-isolation.mjs \
+                --url https://rust.durable-workflow.com/durable_workflow/ \
+                --width "$width" --height "$height" \
+                --report "deployed-visual-review/${state}-${width}x${height}.json" \
+                --controller-root visual-controller
+            fi
           }
-          capture 1440 900
-          capture 768 1024
-          capture 390 844
-          capture 640 360 --full-page
+          for viewport in 1440x900 800x900 390x844 640x360; do
+            width=${viewport%x*}
+            height=${viewport#*x}
+            capture analytics-ui-removed "$width" "$height"
+          done
+          capture navigation-open 390 844 \
+            --state-scope responsive --click '.sidebar-menu-toggle'
+          capture navigation-open 640 360 \
+            --state-scope responsive --click '.sidebar-menu-toggle'
 
-      - name: Validate deployed landing reports
+      - name: Validate deployed reference reports
         run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
+          python3 scripts/ci/validate-rustdoc-navigation-evidence.py \
+            deployed-visual-review/manifest.json
 
-          report_paths = sorted(
-              path
-              for path in Path("deployed-visual-review").glob("*.json")
-              if path.name != "manifest.json"
-          )
-          if len(report_paths) != 4:
-              raise SystemExit(
-                  f"deployed landing requires four capture reports; found {len(report_paths)}"
-              )
-
-          failures = []
-          empty_report_fields = (
-              "console_errors",
-              "console_warnings",
-              "page_errors",
-              "request_failures",
-              "http_errors",
-          )
-          empty_geometry_fields = (
-              "clipped_text",
-              "clipped_control_text",
-              "unreachable_controls",
-              "overlapping_floating_elements",
-              "displaced_primary_content",
-              "orphaned_body_controls",
-          )
-          for path in report_paths:
-              report = json.loads(path.read_text(encoding="utf-8"))
-              if not 200 <= report.get("page_status", 0) < 300:
-                  failures.append(f"{path}: page did not return HTTP 2xx")
-              geometry = report.get("geometry", {})
-              if geometry.get("horizontal_overflow"):
-                  failures.append(f"{path}: horizontal overflow detected")
-              for field in empty_report_fields:
-                  if report.get(field):
-                      failures.append(f"{path}: {field} is not empty")
-              for field in empty_geometry_fields:
-                  if geometry.get(field):
-                      failures.append(f"{path}: geometry.{field} is not empty")
-          if failures:
-              raise SystemExit("\n".join(failures))
-          PY
-
-      - name: Retain deployed landing evidence
+      - name: Retain deployed reference evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
