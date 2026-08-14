@@ -2,6 +2,9 @@
 
 ## 2.0.0-rc.31
 
+- Reject non-Avro and malformed payload envelopes across workflow, activity,
+  query, replay, and outbound command boundaries before handlers or transport
+  shortcuts can produce unrelated outcomes.
 - Require centrally approved immutable GitHub Action commits before target
   branch qualification can pass.
 - Keep dependency resolution compatible with the declared Rust 1.86 minimum.
