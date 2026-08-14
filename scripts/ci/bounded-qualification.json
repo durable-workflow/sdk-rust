@@ -37,6 +37,7 @@
     "shipped-example-base-url-contract",
     "warning-free-rustdoc",
     "publishable-package-content",
+    "fresh-msrv-consumer",
     "release-tooling"
   ]
 }

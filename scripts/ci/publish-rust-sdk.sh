@@ -12,7 +12,7 @@ release_commit="${RELEASE_COMMIT:-}"
 release_run_id="${RELEASE_RUN_ID:-}"
 release_run_attempt="${RELEASE_RUN_ATTEMPT:-}"
 
-for command in cargo curl git jq sha256sum tar; do
+for command in cargo curl git jq python3 rustc sha256sum tar; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "$command" >&2
         exit 1
@@ -134,6 +134,7 @@ published_at=""
 published_repository=""
 archive_vcs_commit=""
 archive_vcs_dirty=""
+fresh_consumer_verified="false"
 
 write_evidence() {
     local outcome="$1"
@@ -145,6 +146,7 @@ write_evidence() {
         --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg package "$package_name" \
         --arg version "$package_version" \
+        --arg rust_version "$package_rust_version" \
         --arg source "crates.io://${package_name}@${package_version}" \
         --arg download_url "$download_url" \
         --arg registry_checksum "$published_checksum" \
@@ -182,6 +184,7 @@ write_evidence() {
         --arg release_run_attempt "$release_run_attempt" \
         --arg archive_vcs_commit "$archive_vcs_commit" \
         --arg archive_vcs_dirty "$archive_vcs_dirty" \
+        --arg fresh_consumer_verified "$fresh_consumer_verified" \
         --arg outcome "$outcome" \
         --arg reason "$reason" \
         --arg registry_verified "$registry_verified" \
@@ -233,6 +236,12 @@ write_evidence() {
                 commit: $release_commit,
                 run_id: $release_run_id,
                 run_attempt: $release_run_attempt
+            },
+            fresh_consumer: {
+                rust_version: $rust_version,
+                exact_dependency: ($package + " = \"=" + $version + "\""),
+                fresh_lockfile: ($fresh_consumer_verified == "true"),
+                build_verified: ($fresh_consumer_verified == "true")
             },
             outcome: $outcome,
             reason: $reason,
@@ -353,6 +362,13 @@ if [[ "$local_checksum" != "$published_checksum" ]]; then
     printf 'published crate archive differs from the exact release checkout package\n' >&2
     exit 1
 fi
+
+if ! python3 "$script_dir/verify-fresh-consumer.py" \
+    registry --manifest "$manifest_path"; then
+    write_evidence "failed" "published_fresh_consumer_msrv_build_failed" "true"
+    exit 1
+fi
+fresh_consumer_verified="true"
 
 write_evidence "$publish_outcome" "$publish_reason" "true"
 printf 'Rust SDK %s %s is available from crates.io (%s).\n' "$package_name" "$package_version" "$publish_outcome"

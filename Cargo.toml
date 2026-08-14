@@ -65,6 +65,7 @@ base64 = "0.22"
 bon = { version = "=3.8.1", default-features = false }
 futures-util = "0.3"
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.
+icu_collections = { version = "=2.2.0", default-features = false }
 icu_locale_core = { version = "=2.2.0", default-features = false }
 icu_normalizer = { version = "=2.2.0", default-features = false }
 icu_properties = { version = "=2.2.0", default-features = false }

@@ -71,8 +71,35 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 archive = target / "package" / f'{package["name"]}-{package["version"]}.crate'
                 archive.parent.mkdir(parents=True, exist_ok=True)
                 archive.write_bytes(b"local crate")
+            elif command == "build":
+                if os.environ.get("MOCK_CONSUMER_BUILD_OUTCOME") == "fail":
+                    raise SystemExit("mock fresh consumer build failed")
+                dependency = tomllib.loads(manifest.read_text(encoding="utf-8"))["dependencies"]
+                exact_version = dependency["durable-workflow"]
+                if exact_version != f'={os.environ["MOCK_PACKAGE_VERSION"]}':
+                    raise SystemExit(f"consumer dependency is not exact: {exact_version}")
+                (manifest.parent / "Cargo.lock").write_text(
+                    'version = 4\n\n'
+                    '[[package]]\n'
+                    'name = "durable-workflow"\n'
+                    f'version = "{os.environ["MOCK_PACKAGE_VERSION"]}"\n'
+                    'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                    'checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n\n'
+                    '[[package]]\n'
+                    'name = "durable-workflow-msrv-consumer"\n'
+                    'version = "0.0.0"\n'
+                    'dependencies = [\n "durable-workflow",\n]\n',
+                    encoding="utf-8",
+                )
             else:
                 raise SystemExit(f"unexpected cargo command: {command}")
+            """,
+        )
+        self._write_executable(
+            "rustc",
+            r"""
+            #!/usr/bin/env python3
+            print("rustc 1.86.0 (05f9846f8 2025-03-31)")
             """,
         )
         self._write_executable(
@@ -138,18 +165,24 @@ class PublishRustSdkContractTest(unittest.TestCase):
             """,
         )
 
-    def _publish(self, manifest: Path = MANIFEST) -> subprocess.CompletedProcess[str]:
+    def _publish(
+        self,
+        manifest: Path = MANIFEST,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
             {
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
                 "CARGO_TARGET_DIR": str(self.temp / "target"),
                 "MOCK_RELEASE_COMMIT": RELEASE_COMMIT,
+                "MOCK_PACKAGE_VERSION": PACKAGE_VERSION,
                 "RELEASE_TAG": PACKAGE_VERSION,
                 "RUST_SDK_MANIFEST_PATH": str(manifest),
                 "RUST_SDK_RELEASE_EVIDENCE_PATH": str(self.evidence),
             }
         )
+        env.update(environment or {})
         return subprocess.run(
             ["bash", str(PUBLISH)],
             cwd=ROOT,
@@ -191,6 +224,25 @@ class PublishRustSdkContractTest(unittest.TestCase):
             evidence["protocol_compatibility"]["server_worker_protocol_versions"],
         )
         self.assertTrue(evidence["registry_verified"])
+        self.assertEqual("1.86", evidence["fresh_consumer"]["rust_version"])
+        self.assertEqual(
+            f'durable-workflow = "={PACKAGE_VERSION}"',
+            evidence["fresh_consumer"]["exact_dependency"],
+        )
+        self.assertTrue(evidence["fresh_consumer"]["fresh_lockfile"])
+        self.assertTrue(evidence["fresh_consumer"]["build_verified"])
+
+    def test_release_path_fails_closed_when_fresh_consumer_does_not_build(self) -> None:
+        result = self._publish(environment={"MOCK_CONSUMER_BUILD_OUTCOME": "fail"})
+        self.assertNotEqual(0, result.returncode)
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual("failed", evidence["outcome"])
+        self.assertEqual(
+            "published_fresh_consumer_msrv_build_failed", evidence["reason"]
+        )
+        self.assertTrue(evidence["registry_verified"])
+        self.assertFalse(evidence["fresh_consumer"]["fresh_lockfile"])
+        self.assertFalse(evidence["fresh_consumer"]["build_verified"])
 
     def test_release_path_rejects_a_divergent_product_train(self) -> None:
         manifest = self._manifest_with(

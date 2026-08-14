@@ -106,6 +106,8 @@ class SourceQualificationContractTest(unittest.TestCase):
             verify,
         )
         self.assertIn("cargo package", verify)
+        self.assertIn("python3 scripts/ci/verify-fresh-consumer.py package", verify)
+        self.assertIn("if: matrix.rust == '1.86.0'", verify)
         self.assertIn("Validate release tooling", verify)
         self.assertIn('test "$COMPLETE_RESULT" = success', qualification)
         self.assertEqual(
@@ -117,6 +119,7 @@ class SourceQualificationContractTest(unittest.TestCase):
                 "shipped-example-base-url-contract",
                 "warning-free-rustdoc",
                 "publishable-package-content",
+                "fresh-msrv-consumer",
                 "release-tooling",
             },
             set(self.contract["complete_checks"]),

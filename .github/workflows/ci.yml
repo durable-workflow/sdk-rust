@@ -107,10 +107,14 @@ jobs:
       - name: Verify publishable package
         run: cargo package
 
+      - name: Build a fresh Rust 1.86 package consumer
+        if: matrix.rust == '1.86.0'
+        run: python3 scripts/ci/verify-fresh-consumer.py package
+
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
           python -m py_compile scripts/ci/qualify-docs-landing.py scripts/ci/test-docs-workflow.py scripts/ci/test-qualify-docs-landing.py
           scripts/ci/test-crates-io-publish.sh
           arguments=()
