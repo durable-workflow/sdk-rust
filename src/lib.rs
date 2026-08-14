@@ -1246,17 +1246,14 @@ fn encode_value_envelope(value: &Value, codec: &str) -> Result<Value> {
 }
 
 fn decode_wire_value(value: &Value, fallback_codec: &str) -> Result<Value> {
+    validate_payload_codec(fallback_codec)?;
+
     if value.is_null() {
         return Ok(Value::Null);
     }
 
-    if let Some(object) = value.as_object() {
-        if let (Some(codec), Some(blob)) = (
-            object.get("codec").and_then(Value::as_str),
-            object.get("blob").and_then(Value::as_str),
-        ) {
-            return decode_blob(blob, codec);
-        }
+    if let Some((codec, blob)) = payload_envelope_parts(value)? {
+        return decode_blob(blob, codec);
     }
 
     if let Some(blob) = value.as_str() {
@@ -1275,20 +1272,15 @@ fn encode_typed_envelope(value: &AvroValue, codec: &str) -> Result<Value> {
 }
 
 fn decode_wire_avro_value(value: &Value, fallback_codec: &str) -> Result<AvroValue> {
+    validate_payload_codec(fallback_codec)?;
+
     if value.is_null() {
         return Ok(AvroValue::Null);
     }
 
-    if let Some(object) = value.as_object() {
-        if let (Some(codec), Some(blob)) = (
-            object.get("codec").and_then(Value::as_str),
-            object.get("blob").and_then(Value::as_str),
-        ) {
-            return match codec {
-                DEFAULT_CODEC => decode_avro_value_blob(blob),
-                other => Err(unsupported_payload_codec(other)),
-            };
-        }
+    if let Some((codec, blob)) = payload_envelope_parts(value)? {
+        validate_payload_codec(codec)?;
+        return decode_avro_value_blob(blob);
     }
 
     if let Some(blob) = value.as_str() {
@@ -1314,6 +1306,83 @@ fn decode_blob(blob: &str, codec: &str) -> Result<Value> {
         DEFAULT_CODEC => decode_avro_value_blob(blob)?.into_json(),
         other => Err(unsupported_payload_codec(other)),
     }
+}
+
+fn validate_payload_codec(codec: &str) -> Result<()> {
+    match codec {
+        DEFAULT_CODEC => Ok(()),
+        other => Err(unsupported_payload_codec(other)),
+    }
+}
+
+fn payload_envelope_parts(value: &Value) -> Result<Option<(&str, &str)>> {
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    if !object.contains_key("codec") && !object.contains_key("blob") {
+        return Ok(None);
+    }
+
+    let codec = object
+        .get("codec")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_payload_envelope)?;
+    validate_payload_codec(codec)?;
+    let blob = object
+        .get("blob")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_payload_envelope)?;
+    Ok(Some((codec, blob)))
+}
+
+fn invalid_payload_envelope() -> Error {
+    Error::Codec(
+        "invalid_payload_envelope: durable payloads must use an object with string codec=\"avro\" and blob fields"
+            .to_string(),
+    )
+}
+
+fn validate_workflow_task_commands(commands: &[Value]) -> Result<()> {
+    for command in commands {
+        let Some(command) = command.as_object() else {
+            continue;
+        };
+        let Some(command_type) = command.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(payload_field) = workflow_command_payload_field(command_type) else {
+            continue;
+        };
+
+        if let Some(codec) = command.get("payload_codec") {
+            let codec = codec.as_str().ok_or_else(invalid_payload_envelope)?;
+            validate_payload_codec(codec)?;
+        }
+
+        let payload = command
+            .get(payload_field)
+            .ok_or_else(invalid_payload_envelope)?;
+        validate_outbound_payload_envelope(payload)?;
+    }
+    Ok(())
+}
+
+fn workflow_command_payload_field(command_type: &str) -> Option<&'static str> {
+    match command_type {
+        "complete_workflow" | "complete_update" | "record_side_effect" => Some("result"),
+        "schedule_activity" | "start_child_workflow" | "continue_as_new" => Some("arguments"),
+        "start_service_operation" => Some("request_payload"),
+        _ => None,
+    }
+}
+
+fn validate_outbound_payload_envelope(value: &Value) -> Result<()> {
+    let Some((codec, blob)) = payload_envelope_parts(value)? else {
+        return Err(untagged_payload_value());
+    };
+    validate_payload_codec(codec)?;
+    decode_avro_value_blob(blob)?;
+    Ok(())
 }
 
 fn unsupported_payload_codec(codec: &str) -> Error {
@@ -2454,6 +2523,7 @@ impl Client {
         workflow_task_attempt: u64,
         commands: Vec<Value>,
     ) -> Result<Value> {
+        validate_workflow_task_commands(&commands)?;
         let body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
@@ -5055,13 +5125,13 @@ impl Worker {
         &self,
         mut task: QueryTask,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
-        if task.payload_codec != DEFAULT_CODEC {
-            return Err(QueryTaskExecutionFailure::new(
+        validate_query_task_payloads(&task).map_err(|error| {
+            QueryTaskExecutionFailure::new(
                 "query_payload_decode_failed",
-                unsupported_payload_codec(&task.payload_codec).to_string(),
+                error.to_string(),
                 "QueryPayloadDecodeFailed",
-            ));
-        }
+            )
+        })?;
 
         if !self.workflows.contains_key(&task.workflow_type) {
             return Err(QueryTaskExecutionFailure::new(
@@ -5264,6 +5334,8 @@ impl Worker {
     }
 
     fn execute_workflow_task(&self, task: WorkflowTask) -> Result<Vec<Value>> {
+        validate_workflow_task_payloads(&task)?;
+
         if let Some(update_id) = task
             .workflow_update_id
             .as_deref()
@@ -5411,6 +5483,8 @@ impl Worker {
     }
 
     async fn execute_activity_task(&self, task: ActivityTask) -> Result<AvroValue> {
+        validate_activity_task_payloads(&task)?;
+
         let handler = self
             .activities
             .get(&task.activity_type)
@@ -7016,6 +7090,7 @@ impl ActivityContext {
 }
 
 fn decode_task_avro_arguments(value: Option<&Value>, codec: &str) -> Result<AvroValue> {
+    validate_payload_codec(codec)?;
     match value {
         Some(value) => Ok(normalize_avro_arguments(decode_wire_avro_value(
             value, codec,
@@ -7032,11 +7107,7 @@ fn decode_resume_signal(task: &WorkflowTask) -> Result<Option<ResumeSignal>> {
     else {
         return Ok(None);
     };
-    let Some(arguments) = task.signal_arguments.as_ref() else {
-        return Ok(None);
-    };
-
-    let decoded = normalize_avro_arguments(decode_wire_avro_value(arguments, &task.payload_codec)?);
+    let decoded = decode_task_avro_arguments(task.signal_arguments.as_ref(), &task.payload_codec)?;
     let AvroValue::Array(arguments) = decoded else {
         unreachable!("normalize_avro_arguments always returns an array");
     };
@@ -7045,6 +7116,132 @@ fn decode_resume_signal(task: &WorkflowTask) -> Result<Option<ResumeSignal>> {
         signal_name: signal_name.to_string(),
         arguments,
     }))
+}
+
+fn validate_workflow_task_payloads(task: &WorkflowTask) -> Result<()> {
+    validate_payload_codec(&task.payload_codec)?;
+    validate_optional_inbound_payload(task.arguments.as_ref(), &task.payload_codec)?;
+    validate_optional_inbound_payload(task.signal_arguments.as_ref(), &task.payload_codec)?;
+    for event in &task.history_events {
+        validate_history_event_payloads(event, &task.payload_codec)?;
+    }
+    Ok(())
+}
+
+fn validate_activity_task_payloads(task: &ActivityTask) -> Result<()> {
+    validate_payload_codec(&task.payload_codec)?;
+    validate_optional_inbound_payload(task.arguments.as_ref(), &task.payload_codec)
+}
+
+fn validate_query_task_payloads(task: &QueryTask) -> Result<()> {
+    validate_payload_codec(&task.payload_codec)?;
+    validate_optional_inbound_payload(task.workflow_arguments.as_ref(), &task.payload_codec)?;
+    validate_optional_inbound_payload(task.query_arguments.as_ref(), &task.payload_codec)?;
+    for event in &task.history_events {
+        validate_history_event_payloads(event, &task.payload_codec)?;
+    }
+
+    let Some(export) = task.history_export.as_ref() else {
+        return Ok(());
+    };
+    let export_codec = match export.get("payloads") {
+        Some(payloads) => declared_payload_codec(payloads, "codec")?,
+        None => None,
+    }
+    .unwrap_or(&task.payload_codec);
+    validate_payload_codec(export_codec)?;
+
+    if let Some(events) = export.get("history_events").and_then(Value::as_array) {
+        for event in events {
+            let event_type = event
+                .get("event_type")
+                .or_else(|| event.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(payload) = event.get("payload") {
+                validate_history_payloads(event_type, payload, export_codec)?;
+            }
+        }
+    }
+    for signal in export
+        .get("signals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let codec = declared_payload_codec(signal, "payload_codec")?.unwrap_or(export_codec);
+        validate_payload_codec(codec)?;
+        validate_optional_inbound_payload(signal.get("arguments"), codec)?;
+    }
+    for activity in export
+        .get("activities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let codec = declared_payload_codec(activity, "payload_codec")?.unwrap_or(export_codec);
+        validate_payload_codec(codec)?;
+        validate_optional_inbound_payload(activity.get("arguments"), codec)?;
+        validate_optional_inbound_payload(activity.get("result"), codec)?;
+    }
+    Ok(())
+}
+
+fn validate_history_event_payloads(event: &HistoryEvent, fallback_codec: &str) -> Result<()> {
+    validate_history_payloads(&event.event_type, &event.payload, fallback_codec)
+}
+
+fn validate_history_payloads(
+    event_type: &str,
+    payload: &Value,
+    fallback_codec: &str,
+) -> Result<()> {
+    let codec = declared_payload_codec(payload, "payload_codec")?.unwrap_or(fallback_codec);
+    validate_payload_codec(codec)?;
+    for field in history_payload_fields(event_type) {
+        validate_optional_inbound_payload(payload.get(*field), codec)?;
+    }
+    Ok(())
+}
+
+const SIGNAL_HISTORY_PAYLOAD_FIELDS: &[&str] = &["value", "input", "arguments"];
+
+fn history_payload_fields(event_type: &str) -> &'static [&'static str] {
+    match event_type {
+        "ActivityCompleted" => &["result"],
+        "SignalReceived" | "SignalApplied" => SIGNAL_HISTORY_PAYLOAD_FIELDS,
+        "UpdateAccepted" | "UpdateRejected" | "UpdateApplied" => &["arguments"],
+        "UpdateCompleted" | "SideEffectRecorded" => &["result"],
+        "ChildRunCompleted" => &["result", "output"],
+        "WorkflowCompleted" => &["output"],
+        "ServiceCallStarted"
+        | "ServiceCallCompleted"
+        | "ServiceCallFailed"
+        | "ServiceCallCancelled" => &["request_payload", "response_payload"],
+        _ => &[],
+    }
+}
+
+fn signal_history_payload(payload: &Value) -> Option<&Value> {
+    SIGNAL_HISTORY_PAYLOAD_FIELDS
+        .iter()
+        .find_map(|field| payload.get(*field))
+}
+
+fn declared_payload_codec<'a>(value: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match value.get(field) {
+        None => Ok(None),
+        Some(Value::String(codec)) => Ok(Some(codec)),
+        Some(_) => Err(invalid_payload_envelope()),
+    }
+}
+
+fn validate_optional_inbound_payload(value: Option<&Value>, codec: &str) -> Result<()> {
+    validate_payload_codec(codec)?;
+    if let Some(value) = value.filter(|value| !value.is_null()) {
+        decode_wire_avro_value(value, codec)?;
+    }
+    Ok(())
 }
 
 fn recorded_commands(
@@ -7992,16 +8189,9 @@ fn decode_signal_event_arguments(
     event: &HistoryEvent,
     fallback_codec: &str,
 ) -> Result<Vec<AvroValue>> {
-    let codec = event
-        .payload
-        .get("payload_codec")
-        .and_then(Value::as_str)
-        .unwrap_or(fallback_codec);
-    let raw = event
-        .payload
-        .get("value")
-        .or_else(|| event.payload.get("input"))
-        .or_else(|| event.payload.get("arguments"));
+    let codec = declared_payload_codec(&event.payload, "payload_codec")?.unwrap_or(fallback_codec);
+    validate_payload_codec(codec)?;
+    let raw = signal_history_payload(&event.payload);
     let decoded = match raw.filter(|value| !value.is_null()) {
         Some(value) => decode_wire_avro_value(value, codec)?,
         None => AvroValue::Array(Vec::new()),
@@ -8242,11 +8432,7 @@ fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
                     .and_then(Value::as_str)
             })
             .unwrap_or(export_codec);
-        let raw_arguments = event
-            .payload
-            .get("value")
-            .or_else(|| event.payload.get("input"))
-            .or_else(|| event.payload.get("arguments"))
+        let raw_arguments = signal_history_payload(&event.payload)
             .filter(|value| !value.is_null())
             .or_else(|| matched_export.and_then(|signal| signal.get("arguments")));
         let (arguments, avro_arguments) = decode_query_signal_arguments(raw_arguments, codec)?;
@@ -8306,6 +8492,7 @@ fn decode_query_signal_arguments(
     raw: Option<&Value>,
     codec: &str,
 ) -> Result<(Vec<Value>, Vec<AvroValue>)> {
+    validate_payload_codec(codec)?;
     let decoded = match raw.filter(|value| !value.is_null()) {
         Some(value) => decode_wire_avro_value(value, codec)?,
         None => AvroValue::Array(Vec::new()),
@@ -9418,6 +9605,336 @@ mod tests {
 
         let error = decode_payload::<Value>(&envelope).expect_err("prerelease payload must fail");
         assert!(error.to_string().contains("invalid_payload_framing"));
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_rejects_invalid_payload_slots_without_transport() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let invalid_commands = [
+            json!({
+                "type": "complete_workflow",
+                "result": {"codec": "json", "blob": null}
+            }),
+            json!({
+                "type": "schedule_activity",
+                "arguments": {"codec": "yaml", "blob": "ignored"}
+            }),
+            json!({
+                "type": "start_child_workflow",
+                "arguments": {"codec": DEFAULT_CODEC, "blob": null}
+            }),
+            json!({"type": "continue_as_new", "arguments": []}),
+            json!({"type": "complete_update"}),
+            json!({"type": "record_side_effect", "result": null}),
+            json!({
+                "type": "start_service_operation",
+                "payload_codec": DEFAULT_CODEC,
+                "request_payload": "raw-avro-bytes"
+            }),
+        ];
+
+        for command in invalid_commands {
+            let error = client
+                .complete_workflow_task("invalid-codec", "rust-worker", 1, vec![command])
+                .await
+                .expect_err("invalid durable payload must fail locally");
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains("unsupported_payload_codec")
+                    || diagnostic.contains("invalid_payload_envelope")
+                    || diagnostic.contains("untagged durable payload"),
+                "unexpected validation diagnostic: {diagnostic}"
+            );
+        }
+
+        assert_eq!(
+            server.request_count("/api/worker/workflow-tasks/invalid-codec/complete"),
+            0,
+            "invalid command payloads must not reach HTTP transport"
+        );
+    }
+
+    #[test]
+    fn workflow_completion_validates_only_protocol_owned_payload_slots() {
+        let envelope = fixture_envelope(json!({"codec": "customer-value"}));
+        let commands = [
+            json!({"type": "complete_workflow", "result": envelope.clone()}),
+            json!({"type": "schedule_activity", "arguments": envelope.clone()}),
+            json!({"type": "start_child_workflow", "arguments": envelope.clone()}),
+            json!({"type": "continue_as_new", "arguments": envelope.clone()}),
+            json!({"type": "complete_update", "result": envelope.clone()}),
+            json!({"type": "record_side_effect", "result": envelope.clone()}),
+            json!({
+                "type": "start_service_operation",
+                "payload_codec": DEFAULT_CODEC,
+                "request_payload": envelope.clone()
+            }),
+            json!({
+                "type": "complete_workflow",
+                "result": envelope,
+                "metadata": {
+                    "codec": "json",
+                    "payload_codec": "customer-codec",
+                    "result": {"codec": "yaml", "blob": null}
+                }
+            }),
+        ];
+
+        validate_workflow_task_commands(&commands)
+            .expect("customer metadata must not become a protocol codec declaration");
+    }
+
+    #[test]
+    fn valid_avro_tasks_normalize_absent_and_null_arguments_to_empty_lists() {
+        assert_eq!(
+            decode_task_avro_arguments(None, DEFAULT_CODEC).expect("absent arguments"),
+            AvroValue::Array(Vec::new())
+        );
+        assert_eq!(
+            decode_task_avro_arguments(Some(&Value::Null), DEFAULT_CODEC).expect("null arguments"),
+            AvroValue::Array(Vec::new())
+        );
+
+        let mut signal = workflow_task("missing", Vec::new(), DEFAULT_CODEC);
+        signal.signal_name = Some("empty-signal".to_string());
+        signal.signal_arguments = None;
+        let decoded = decode_resume_signal(&signal)
+            .expect("valid Avro signal")
+            .expect("named signal resumes the workflow");
+        assert!(decoded.arguments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_inbound_codecs_precede_handlers_and_unrelated_outcomes() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+
+        let calls = Arc::clone(&handler_calls);
+        worker.register_workflow("codec.workflow", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+        let calls = Arc::clone(&handler_calls);
+        worker.register_activity("codec.activity", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+        let calls = Arc::clone(&handler_calls);
+        worker.register_update("codec.workflow", "known", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+        let calls = Arc::clone(&handler_calls);
+        worker.register_query("codec.workflow", "known", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+
+        let mut workflow = workflow_task("codec.workflow", Vec::new(), DEFAULT_CODEC);
+        workflow.payload_codec = "json".to_string();
+        workflow.arguments = None;
+        let error = worker
+            .execute_workflow_task(workflow)
+            .expect_err("task codec must be checked before workflow invocation");
+        assert!(error.to_string().contains("unsupported_payload_codec"));
+
+        let activity = ActivityTask {
+            task_id: "activity-invalid-codec".to_string(),
+            activity_attempt_id: None,
+            attempt_id: None,
+            activity_type: "codec.activity".to_string(),
+            payload_codec: "unknown".to_string(),
+            arguments: None,
+            attempt_number: 1,
+            lease_owner: None,
+        };
+        let error = worker
+            .execute_activity_task(activity)
+            .await
+            .expect_err("task codec must be checked before activity invocation");
+        assert!(error.to_string().contains("unsupported_payload_codec"));
+
+        let mut update = workflow_task("codec.workflow", Vec::new(), DEFAULT_CODEC);
+        update.workflow_update_id = Some("update-invalid-codec".to_string());
+        update.update_name = Some("known".to_string());
+        update.history_events.push(history_event(
+            "UpdateAccepted",
+            json!({
+                "update_id": "update-invalid-codec",
+                "update_name": "known",
+                "arguments": {"codec": "json", "blob": null}
+            }),
+        ));
+        let error = worker
+            .execute_workflow_task(update)
+            .expect_err("nested update codec must be checked before handler lookup");
+        assert!(error.to_string().contains("unsupported_payload_codec"));
+
+        let query: QueryTask = serde_json::from_value(json!({
+            "query_task_id": "query-invalid-codec",
+            "workflow_type": "codec.workflow",
+            "query_name": "known",
+            "payload_codec": DEFAULT_CODEC,
+            "workflow_arguments": null,
+            "query_arguments": null,
+            "history_export": {
+                "payloads": {"codec": DEFAULT_CODEC},
+                "signals": [{
+                    "name": "empty",
+                    "payload_codec": "json",
+                    "arguments": null
+                }]
+            }
+        }))
+        .expect("query task");
+        let failure = worker
+            .execute_query_task(query)
+            .await
+            .expect_err("exported signal codec must be checked before query invocation");
+        assert_eq!(failure.reason, "query_payload_decode_failed");
+        assert!(failure.message.contains("unsupported_payload_codec"));
+
+        let exported_history: QueryTask = serde_json::from_value(json!({
+            "query_task_id": "query-invalid-history-codec",
+            "workflow_type": "codec.workflow",
+            "query_name": "known",
+            "payload_codec": DEFAULT_CODEC,
+            "history_export": {
+                "payloads": {"codec": DEFAULT_CODEC},
+                "history_events": [{
+                    "type": "ActivityCompleted",
+                    "payload": {"payload_codec": "unknown", "result": null}
+                }]
+            }
+        }))
+        .expect("query task");
+        let failure = worker
+            .execute_query_task(exported_history)
+            .await
+            .expect_err("exported history codec must be checked before query invocation");
+        assert_eq!(failure.reason, "query_payload_decode_failed");
+        assert!(failure.message.contains("unsupported_payload_codec"));
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+
+        let mut unknown_workflow = workflow_task("missing", Vec::new(), DEFAULT_CODEC);
+        unknown_workflow.arguments = None;
+        unknown_workflow.history_events.push(history_event(
+            "SignalReceived",
+            json!({
+                "signal_name": "empty",
+                "payload_codec": "json",
+                "arguments": null
+            }),
+        ));
+        let error = worker
+            .execute_workflow_task(unknown_workflow)
+            .expect_err("history codec must precede unknown workflow outcome");
+        assert!(error.to_string().contains("unsupported_payload_codec"));
+
+        let unknown_activity = ActivityTask {
+            task_id: "activity-unknown".to_string(),
+            activity_attempt_id: None,
+            attempt_id: None,
+            activity_type: "missing".to_string(),
+            payload_codec: "json".to_string(),
+            arguments: None,
+            attempt_number: 1,
+            lease_owner: None,
+        };
+        let error = worker
+            .execute_activity_task(unknown_activity)
+            .await
+            .expect_err("codec must precede unknown activity outcome");
+        assert!(error.to_string().contains("unsupported_payload_codec"));
+
+        let mut unknown_update = workflow_task("codec.workflow", Vec::new(), DEFAULT_CODEC);
+        unknown_update.payload_codec = "json".to_string();
+        unknown_update.arguments = None;
+        unknown_update.workflow_update_id = Some("update-unknown".to_string());
+        unknown_update.update_name = Some("missing".to_string());
+        let error = worker
+            .execute_workflow_task(unknown_update)
+            .expect_err("codec must precede fail_update shortcut");
+        assert!(error.to_string().contains("unsupported_payload_codec"));
+
+        let unknown_query: QueryTask = serde_json::from_value(json!({
+            "query_task_id": "query-unknown",
+            "workflow_type": "missing",
+            "query_name": "missing",
+            "payload_codec": "json",
+            "workflow_arguments": null,
+            "query_arguments": null
+        }))
+        .expect("query task");
+        let failure = worker
+            .execute_query_task(unknown_query)
+            .await
+            .expect_err("codec must precede unknown query outcome");
+        assert_eq!(failure.reason, "query_payload_decode_failed");
+        assert!(failure.message.contains("unsupported_payload_codec"));
+    }
+
+    #[tokio::test]
+    async fn invalid_signal_history_payload_aliases_precede_shortcuts() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let worker = Worker::new(client, "rust-workers");
+
+        for event_type in ["SignalReceived", "SignalApplied"] {
+            for (payload_field, codec) in [
+                ("value", "json"),
+                ("input", "unknown"),
+                ("arguments", "json"),
+            ] {
+                let payload = json!({
+                    "signal_name": "empty",
+                    payload_field: {"codec": codec, "blob": null}
+                });
+                let workflow = workflow_task(
+                    "missing",
+                    vec![history_event(event_type, payload.clone())],
+                    DEFAULT_CODEC,
+                );
+                let error = worker
+                    .execute_workflow_task(workflow)
+                    .expect_err("signal payload codec must precede unknown workflow outcome");
+                assert!(
+                    error.to_string().contains("unsupported_payload_codec"),
+                    "{event_type}.{payload_field} returned an unrelated workflow error: {error}"
+                );
+
+                let query: QueryTask = serde_json::from_value(json!({
+                    "query_task_id": format!("query-{event_type}-{payload_field}"),
+                    "workflow_type": "missing",
+                    "query_name": "missing",
+                    "payload_codec": DEFAULT_CODEC,
+                    "workflow_arguments": null,
+                    "query_arguments": null,
+                    "history_events": [{
+                        "event_type": event_type,
+                        "payload": payload
+                    }]
+                }))
+                .expect("query task");
+                let failure = worker
+                    .execute_query_task(query)
+                    .await
+                    .expect_err("signal payload codec must precede unknown query outcome");
+                assert_eq!(
+                    failure.reason, "query_payload_decode_failed",
+                    "{event_type}.{payload_field} returned an unrelated query outcome"
+                );
+                assert!(
+                    failure.message.contains("unsupported_payload_codec"),
+                    "{event_type}.{payload_field} returned an unrelated query error: {}",
+                    failure.message
+                );
+            }
+        }
     }
 
     #[test]
@@ -11753,8 +12270,9 @@ mod tests {
             .execute_query_task(task)
             .await
             .expect_err("invalid replay history payload");
-        assert_eq!(failure.reason, "query_workflow_state_unavailable");
-        assert_eq!(failure.failure_type, "QueryWorkflowStateUnavailable");
+        assert_eq!(failure.reason, "query_payload_decode_failed");
+        assert_eq!(failure.failure_type, "QueryPayloadDecodeFailed");
+        assert!(failure.message.contains("invalid_payload_framing"));
     }
 
     #[tokio::test]
@@ -12451,7 +12969,10 @@ mod tests {
                 "workflow-timeout-task",
                 "timeout-worker",
                 3,
-                vec![json!({"type": "complete_workflow", "result": null})],
+                vec![json!({
+                    "type": "complete_workflow",
+                    "result": fixture_envelope(Value::Null)
+                })],
             )
             .await
             .expect_err("the low-level client preserves the completion rejection");

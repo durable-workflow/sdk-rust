@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-signal-null-json-codec-rejected",
+  "protocol_version": "1.2",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.side-effect-version",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "SignalApplied",
+      "payload": {
+        "sequence": 1,
+        "signal_name": "empty-signal",
+        "payload_codec": "json",
+        "input": null
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow"
+  }
+}

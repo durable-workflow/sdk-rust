@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, env, fs, path::Path};
+use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use durable_workflow::{
-    decode_avro_value, encode_avro_value, AvroValue, PayloadEnvelope,
+    decode_avro_value, encode_avro_value, AvroValue, Client, PayloadEnvelope,
     AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
 };
 use serde_json::Value;
@@ -130,6 +130,37 @@ fn process_identity_request(request_path: &Path, response_path: &Path) -> Result
     .map_err(|error| format!("write {}: {error}", response_path.display()))
 }
 
+fn check_task_boundary(fixture: &Value) {
+    let Some(boundary) = fixture.get("task_boundary") else {
+        return;
+    };
+    assert_eq!(
+        boundary["operation"], "complete_workflow_task",
+        "unsupported task-boundary corpus operation"
+    );
+    let command = boundary
+        .get("command")
+        .cloned()
+        .expect("task-boundary command");
+    let expected_error = boundary["error"]
+        .as_str()
+        .expect("task-boundary stable error");
+    let client = Client::builder("http://127.0.0.1:9")
+        .timeout(Duration::from_millis(100))
+        .build()
+        .expect("task-boundary client");
+    let error = tokio::runtime::Runtime::new()
+        .expect("task-boundary runtime")
+        .block_on(client.complete_workflow_task(
+            "codec-regression",
+            "codec-regression-worker",
+            1,
+            vec![command],
+        ))
+        .expect_err("invalid command must fail before transport");
+    assert!(error.to_string().contains(expected_error), "{error}");
+}
+
 fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
@@ -214,6 +245,8 @@ fn check_corpus() {
             }
             other => panic!("unsupported failure policy {other}"),
         }
+
+        check_task_boundary(&fixture);
     }
 }
 

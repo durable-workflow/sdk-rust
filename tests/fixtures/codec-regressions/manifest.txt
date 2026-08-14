@@ -1,2 +1,3 @@
 avro-value-v1-long-zero.json
+raw-json-null-payload-rejected.json
 raw-json-payload-rejected.json

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "raw-json-null-payload-rejected",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": [
+    "rust"
+  ],
+  "value": {
+    "type": "null"
+  },
+  "framing": {
+    "encoding": "utf8-json",
+    "wire_base64": "bnVsbA=="
+  },
+  "failure_policy": {
+    "operation": "decode_reject",
+    "error": "unsupported_payload_codec"
+  },
+  "task_boundary": {
+    "operation": "complete_workflow_task",
+    "command": {
+      "type": "complete_workflow",
+      "result": {
+        "codec": "json",
+        "blob": null
+      }
+    },
+    "error": "unsupported_payload_codec"
+  }
+}

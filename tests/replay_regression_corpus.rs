@@ -489,7 +489,8 @@ async fn non_envelope_side_effect_value_is_rejected_by_official_worker() {
         .await
         .expect_err("raw side-effect values must not execute as published replay evidence");
 
-    assert!(error.contains("side_effect_payload_malformed"), "{error}");
+    assert!(error.contains("unsupported_payload_codec"), "{error}");
+    assert!(error.contains("untagged durable payload"), "{error}");
 }
 
 fn contains_json_payload_codec(value: &Value) -> bool {
