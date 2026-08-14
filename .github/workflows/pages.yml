@@ -185,6 +185,7 @@ jobs:
                 --url http://127.0.0.1:4173/durable_workflow/ \
                 --width "$width" --height "$height" \
                 --report "visual-review/${state}-${width}x${height}.json" \
+                --manifest visual-review/manifest.json \
                 --controller-root visual-controller
             fi
           }
@@ -306,6 +307,7 @@ jobs:
                 --url https://rust.durable-workflow.com/durable_workflow/ \
                 --width "$width" --height "$height" \
                 --report "deployed-visual-review/${state}-${width}x${height}.json" \
+                --manifest deployed-visual-review/manifest.json \
                 --controller-root visual-controller
             fi
           }

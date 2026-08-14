@@ -17,6 +17,9 @@ DOCS_LANDING = ROOT / "docs/index.html"
 NAVIGATION_EVIDENCE_VALIDATOR = (
     ROOT / "scripts/ci/validate-rustdoc-navigation-evidence.py"
 )
+NAVIGATION_EVIDENCE_BINDER_TEST = (
+    ROOT / "scripts/ci/test-rustdoc-navigation-evidence.mjs"
+)
 VISUAL_CONTROLLER_REVISION = "0421c2e3a78ba4ca2adfe118e57db88d2264a62b"
 PAGES_CONDITION = (
     r"if: >-\n\s+github\.api_url == 'https://api\.github\.com' &&\n"
@@ -136,6 +139,7 @@ class DocsWorkflowContractTest(unittest.TestCase):
             "candidate/scripts/ci/record-rustdoc-navigation-isolation.mjs",
             capture,
         )
+        self.assertIn("--manifest visual-review/manifest.json", capture)
         self.assertIn('if [ "$state" = navigation-open ]; then', capture)
         self.assertIn("capture_args+=(--full-page)", capture)
         self.assertIn('if [ "$state" = analytics-ui-removed ]', capture)
@@ -267,6 +271,7 @@ class DocsWorkflowContractTest(unittest.TestCase):
             "candidate/scripts/ci/record-rustdoc-navigation-isolation.mjs",
             capture,
         )
+        self.assertIn("--manifest visual-review/manifest.json", capture)
         self.assertIn('if [ "$state" = navigation-open ]; then', capture)
         self.assertIn("capture_args+=(--full-page)", capture)
         self.assertIn('if [ "$state" = analytics-ui-removed ]', capture)
@@ -312,6 +317,7 @@ class DocsWorkflowContractTest(unittest.TestCase):
             "scripts/ci/record-rustdoc-navigation-isolation.mjs",
             capture,
         )
+        self.assertIn("--manifest deployed-visual-review/manifest.json", capture)
         self.assertIn('if [ "$state" = navigation-open ]; then', capture)
         self.assertIn('if [ "$state" = analytics-ui-removed ]', capture)
         self.assertIn("validate-rustdoc-navigation-evidence.py", validate)
@@ -418,6 +424,15 @@ class DocsWorkflowContractTest(unittest.TestCase):
                     "did not prove an isolated dw-rustdoc-navigation overlay"
                 ),
             )
+
+    def test_navigation_evidence_binds_legacy_controller_metadata(self) -> None:
+        result = subprocess.run(
+            ["node", str(NAVIGATION_EVIDENCE_BINDER_TEST)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
 
     def test_deployment_artifact_is_rebuilt_from_the_trusted_push(self) -> None:
         producer = job(self.publication, "build")

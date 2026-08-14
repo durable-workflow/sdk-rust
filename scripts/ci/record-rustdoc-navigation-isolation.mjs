@@ -5,6 +5,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { createRequire } from 'node:module';
 
+import { bindResponsiveNavigationCapture } from './rustdoc-navigation-evidence.mjs';
+
 const ALLOWED_PUBLIC_HOST = 'rust.durable-workflow.com';
 const TOGGLE_SELECTOR = '.sidebar-menu-toggle';
 const NAVIGATION_ID = 'dw-rustdoc-navigation';
@@ -22,7 +24,7 @@ function parseArguments(argv) {
     if (!argument?.startsWith('--') || !value) fail(`invalid argument: ${argument || ''}`);
     options[argument.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value;
   }
-  for (const name of ['url', 'width', 'height', 'report', 'controllerRoot']) {
+  for (const name of ['url', 'width', 'height', 'report', 'manifest', 'controllerRoot']) {
     if (!String(options[name] || '').trim()) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
   }
   options.width = Number.parseInt(options.width, 10);
@@ -231,6 +233,16 @@ try {
   report.geometry.intentional_overlays = [overlay];
   report.navigation_isolation = state;
   fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+  try {
+    bindResponsiveNavigationCapture({
+      manifestPath: path.resolve(options.manifest),
+      reportPath,
+      width: options.width,
+      height: options.height,
+    });
+  } catch (error) {
+    fail(error.message);
+  }
   await context.close();
 } finally {
   await browser.close();
