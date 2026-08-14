@@ -31,9 +31,23 @@ file_patterns=(
   "$(pattern_from_hex 466f7267656a6f)"
   "$(pattern_from_hex 666f7267656a6f)"
   "$(pattern_from_hex 7761726d2d6c6f63616c)"
-  "$(pattern_from_hex 6769746875622e7365727665725f75726c)"
   "$(pattern_from_hex 72756e6e65725f70726f66696c65)"
 )
+
+provider_context_pattern="$(pattern_from_hex 6769746875622e7365727665725f75726c)"
+
+reviewed_provider_context_reference() {
+  local file="$1"
+  local content="$2"
+  local trimmed="${content#"${content%%[![:space:]]*}"}"
+  local workflow_condition="if: \${{ ${provider_context_pattern} == 'https://github.com' }}"
+  local contract_assertion="self.assertIn(\"${provider_context_pattern} == 'https://github.com'\", action_policy)"
+  local contract_count="self.workflow.count(\"${provider_context_pattern} == 'https://github.com'\"),"
+
+  [[ "$file" == ".github/workflows/ci.yml" && "$trimmed" == "$workflow_condition" ]] ||
+    [[ "$file" == "scripts/ci/test-source-qualification.py" &&
+      ( "$trimmed" == "$contract_assertion" || "$trimmed" == "$contract_count" ) ]]
+}
 
 metadata_patterns=(
   "${file_patterns[@]}"
@@ -64,6 +78,15 @@ for pattern in "${file_patterns[@]}"; do
     status=1
   done < <(git grep -n -I -F -e "$pattern" -- "${pathspec[@]}" || true)
 done
+
+while IFS=: read -r file line content; do
+  [[ -n "${file:-}" ]] || continue
+  if reviewed_provider_context_reference "$file" "$content"; then
+    continue
+  fi
+  printf 'public-boundary: forbidden file content at %s:%s\n' "$file" "$line" >&2
+  status=1
+done < <(git grep -n -I -F -e "$provider_context_pattern" -- "${pathspec[@]}" || true)
 
 if [[ -n "${PUBLIC_BOUNDARY_GIT_RANGE:-}" ]]; then
   read -r -a rev_args <<< "$PUBLIC_BOUNDARY_GIT_RANGE"

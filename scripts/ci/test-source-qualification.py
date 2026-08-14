@@ -79,7 +79,15 @@ class SourceQualificationContractTest(unittest.TestCase):
         self.assertIn('case "${QUALIFICATION_MODE:-complete}" in', qualification)
         self.assertIn('test "$BOUNDED_RESULT" = success', qualification)
         self.assertIn("unsupported source qualification mode", qualification)
-        self.assertNotIn("server_url", self.workflow)
+        action_policy = job(self.workflow, "action-policy")
+        self.assertIn("github.server_url == 'https://github.com'", action_policy)
+        self.assertEqual(
+            2,
+            self.workflow.count("github.server_url == 'https://github.com'"),
+        )
+        self.assertNotIn("server_url", verify)
+        self.assertNotIn("server_url", bounded)
+        self.assertEqual(1, qualification.count("server_url"))
         self.assertNotIn("server_url", boundary)
 
     def test_default_route_keeps_the_complete_matrix(self) -> None:

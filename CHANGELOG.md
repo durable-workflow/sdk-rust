@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.0-rc.31
+
+- Require centrally approved immutable GitHub Action commits before target
+  branch qualification can pass.
+- Keep dependency resolution compatible with the declared Rust 1.86 minimum.
+
 ## 2.0.0-rc.30
 
 - Remove the JSON payload-codecs feature and make the fixed typed Avro Value
