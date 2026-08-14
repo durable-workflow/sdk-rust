@@ -5,6 +5,11 @@
 - Require centrally approved immutable GitHub Action commits before target
   branch qualification can pass.
 - Keep dependency resolution compatible with the declared Rust 1.86 minimum.
+- Align the crate README and generated API reference with the general-first
+  install, local Server, API reference, and SDK-guide journey. Keep Cloud
+  discoverable as a secondary limited early-access deployment path.
+- Qualify the documentation hierarchy in source, generated rustdoc, and the
+  packaged crate without binding the checks to Markdown prose or layout.
 
 ## 2.0.0-rc.30
 
@@ -18,8 +23,9 @@
 
 ## 2.0.0-rc.12
 
-- Add a task-oriented Rust documentation landing page that leads with the
-  supported Cloud quickstart before the generated API reference.
+- Add the initial task-oriented Rust documentation landing page and generated
+  API reference navigation. The current general-first hierarchy is described
+  in the `2.0.0-rc.31` entry.
 - Let the released `hello_world` example accept separate client and worker
   credentials for one namespace-scoped Cloud runtime URL.
 - Retain the qualified Server baseline at `2.0.0-rc.17` under the additive

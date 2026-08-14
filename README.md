@@ -10,6 +10,8 @@ platform's fixed typed Avro Value protocol. Workflow code can also wait on serve
 durable time, capture non-deterministic values exactly once, and evolve across
 deployments with durable version markers.
 
+<div data-documentation-path="general" data-access="generally-available"></div>
+
 ## Prerequisites
 
 Rust `1.86` or newer is required. On a clean machine, install
@@ -21,25 +23,17 @@ rustup default stable
 rustc --version
 ```
 
-You also need either a bootstrapped, authenticated self-hosted Server or a
-provisioned Durable Workflow Cloud namespace. Pass the Server base URL or the
-Cloud-provided runtime URL to `Client::builder(...)` without `/api`; the SDK
-owns and appends that suffix.
-
-<aside class="dw-cloud-promotion" aria-labelledby="dw-cloud-promotion-title" data-promotion-source="sdk-rust-reference">
-  <div>
-    <p class="dw-cloud-promotion__eyebrow">Managed Rust runtime · limited cohort</p>
-    <h2 id="dw-cloud-promotion-title">Durable Workflow Cloud launch cohort</h2>
-    <p>Run Rust clients and workers against a managed namespace while Durable Workflow operates the orchestration runtime.</p>
-  </div>
-  <a class="dw-cloud-promotion__action" data-promotion-action="early-access" href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-reference">Request early access</a>
-</aside>
+You also need a bootstrapped, authenticated Durable Workflow Server. Pass its
+base URL to `Client::builder(...)` without `/api`; the SDK owns and appends
+that suffix.
 
 ## Install
 
-Install the supported crate with the versionless resolver. It reads the last
-passing public quickstart contract, then invokes Cargo with that qualified
-crate requirement:
+<p data-docs-destination="crate-install" data-access="generally-available">
+Install the supported public crate with the versionless resolver. It reads the
+last passing public quickstart contract, then invokes Cargo with that qualified
+crate requirement.
+</p>
 
 ```sh
 curl -fsSL https://durable-workflow.com/install-sdk.sh | sh -s -- rust
@@ -49,28 +43,15 @@ Commit the resulting `Cargo.lock` when the application needs reproducible
 dependency resolution. The lockfile records the exact qualified crate selected
 by the public compatibility authority.
 
-## Start with Rust Cloud
-
-The task-oriented [Rust documentation landing
-page](https://rust.durable-workflow.com/) leads to the canonical
-[Rust Cloud quickstart](https://durable-workflow.com/docs/2.0/polyglot/rust-cloud-quickstart/).
-That path starts in a prepared Sample App Codespace, uses separate client and
-worker runtime credentials against one namespace URL, runs a Rust workflow and
-activity through the Cloud-aware `dw` CLI, retrieves the completed result,
-shuts the worker down cleanly, and verifies the run in Managed Waterline.
-
-The released `hello_world` example also accepts Cloud connection settings
-without a source edit: `DURABLE_WORKFLOW_RUNTIME_URL`,
-`DURABLE_WORKFLOW_RUNTIME_NAMESPACE`, `DURABLE_WORKFLOW_CLIENT_TOKEN`, and
-`DURABLE_WORKFLOW_WORKER_TOKEN`.
-
 ## First local run
 
+<p data-docs-destination="local-self-hosted" data-access="generally-available">
 First start and authenticate a source-free local Server using either the
-[published image and bootstrap path](https://durable-workflow.com/docs/2.0/polyglot/server/#published-image--sqlite)
+<a href="https://durable-workflow.com/docs/2.0/polyglot/server/#published-image--sqlite">published image and bootstrap path</a>
 or the
-[published Compose path](https://durable-workflow.com/docs/2.0/polyglot/server/#published-image--compose).
-Those setups create the `default` namespace used by the example.
+<a href="https://durable-workflow.com/docs/2.0/polyglot/server/#published-image--compose">published Compose path</a>.
+Those setups create the <code>default</code> namespace used by the example.
+</p>
 
 The single-file [`examples/hello_world.rs`](examples/hello_world.rs) uses one
 task queue, starts a uniquely identified workflow, bounds its worker lifetime,
@@ -88,6 +69,36 @@ cargo run --example hello_world
 Use `control_token` and `worker_token` for least-privilege credentials; the SDK
 never substitutes one scoped token for the other, and reports a configuration
 error before transport when only the opposite role is available.
+
+## API reference and SDK guide
+
+The task-oriented [Rust documentation landing
+page](https://rust.durable-workflow.com/) starts with the public crate,
+generated API reference, general SDK guide, and local Server path.
+
+Continue with the
+<a data-docs-destination="api-reference" data-access="generally-available" href="https://rust.durable-workflow.com/durable_workflow/">generated API reference</a>
+for modules, traits, structs, and methods, or use the
+<a data-docs-destination="sdk-guide" data-access="generally-available" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">general Rust SDK guide</a>
+for concepts, compatibility, runtime setup, and deployment.
+
+<aside class="dw-cloud-promotion" aria-labelledby="dw-cloud-promotion-title" data-documentation-path="cloud" data-access="limited-early-access" data-promotion-source="sdk-rust-reference">
+  <div>
+    <p class="dw-cloud-promotion__eyebrow" data-access-label="limited-early-access">Managed Rust runtime · limited early access</p>
+    <h2 id="dw-cloud-promotion-title">Durable Workflow Cloud</h2>
+    <p>Cloud is a secondary deployment option for teams with a provisioned namespace. Run Rust clients and workers against a managed namespace while Durable Workflow operates the orchestration runtime.</p>
+  </div>
+  <div class="dw-cloud-promotion__links">
+    <a class="dw-cloud-promotion__action" data-docs-destination="cloud-access" data-access="limited-early-access" data-promotion-action="early-access" href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-reference">Request early access</a>
+    <a data-docs-destination="cloud-guide" data-access="limited-early-access" href="https://durable-workflow.com/docs/2.0/polyglot/cloud-control-plane/">Read the Cloud runtime guide</a>
+  </div>
+</aside>
+
+The released `hello_world` example also accepts Cloud connection settings
+without a source edit: `DURABLE_WORKFLOW_RUNTIME_URL`,
+`DURABLE_WORKFLOW_RUNTIME_NAMESPACE`, `DURABLE_WORKFLOW_CLIENT_TOKEN`, and
+`DURABLE_WORKFLOW_WORKER_TOKEN`. Pass the Cloud-provided runtime URL to
+`Client::builder(...)` without `/api`.
 
 ## Compatibility
 

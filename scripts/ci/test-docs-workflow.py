@@ -80,6 +80,7 @@ class DocsWorkflowContractTest(unittest.TestCase):
         prepare = step(build_job, "Prepare Pages artifact")
 
         self.assertIn("cargo doc --all-features --no-deps", build)
+        self.assertIn("qualify-release-documentation.py", build)
         self.assertNotIn("if:", build)
         self.assertIn("CLOUDFLARE_WEB_ANALYTICS_TOKEN", build)
         self.assertIn("cp docs/analytics/analytics.js", prepare)
@@ -302,6 +303,10 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn(
             "--landing-url https://rust.durable-workflow.com/", qualify
         )
+        self.assertIn(
+            "--rustdoc-url https://rust.durable-workflow.com/durable_workflow/",
+            qualify,
+        )
         self.assertIn("--attempts 30", qualify)
         self.assertIn("--link-attempts 3", qualify)
         self.assertIn(
@@ -446,6 +451,7 @@ class DocsWorkflowContractTest(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", checkout)
         self.assertIn("persist-credentials: false", checkout)
         self.assertIn("cargo doc --all-features --no-deps", build)
+        self.assertIn("qualify-release-documentation.py", build)
         self.assertIn("CLOUDFLARE_WEB_ANALYTICS_TOKEN", build)
         self.assertIn("python3 scripts/check-docs-analytics.py target/doc", prepare)
         self.assertIn("node scripts/ci/test-docs-analytics.mjs", prepare)

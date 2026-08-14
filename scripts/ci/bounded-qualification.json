@@ -25,6 +25,10 @@
       "command": ["python3", "scripts/ci/validate-example-base-urls.py"]
     },
     {
+      "id": "release-documentation",
+      "command": ["python3", "scripts/ci/qualify-release-documentation.py"]
+    },
+    {
       "id": "compile",
       "command": ["cargo", "check", "--all-targets"]
     }
@@ -37,6 +41,7 @@
     "shipped-example-base-url-contract",
     "warning-free-rustdoc",
     "publishable-package-content",
+    "release-documentation-surfaces",
     "fresh-msrv-consumer",
     "release-tooling"
   ]

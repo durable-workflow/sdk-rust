@@ -49,6 +49,10 @@ class SourceQualificationContractTest(unittest.TestCase):
                 "python3",
                 "scripts/ci/validate-example-base-urls.py",
             ],
+            "release-documentation": [
+                "python3",
+                "scripts/ci/qualify-release-documentation.py",
+            ],
             "compile": ["cargo", "check", "--all-targets"],
         }
         self.assertEqual(
@@ -106,6 +110,8 @@ class SourceQualificationContractTest(unittest.TestCase):
             verify,
         )
         self.assertIn("cargo package", verify)
+        self.assertIn("--check-package", verify)
+        self.assertIn("--rustdoc target/doc/durable_workflow/index.html", verify)
         self.assertIn("python3 scripts/ci/verify-fresh-consumer.py package", verify)
         self.assertIn("if: matrix.rust == '1.86.0'", verify)
         self.assertIn("Validate release tooling", verify)
@@ -119,6 +125,7 @@ class SourceQualificationContractTest(unittest.TestCase):
                 "shipped-example-base-url-contract",
                 "warning-free-rustdoc",
                 "publishable-package-content",
+                "release-documentation-surfaces",
                 "fresh-msrv-consumer",
                 "release-tooling",
             },

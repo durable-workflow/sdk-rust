@@ -41,6 +41,8 @@ jobs:
               docs/analytics/analytics.js
           fi
           cargo doc --all-features --no-deps
+          python3 scripts/ci/qualify-release-documentation.py \
+            --rustdoc target/doc/durable_workflow/index.html
 
       - name: Prepare Pages artifact
         run: |
@@ -157,6 +159,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
         run: |
           cargo doc --all-features --no-deps
+          python3 scripts/ci/qualify-release-documentation.py \
+            --rustdoc target/doc/durable_workflow/index.html
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html

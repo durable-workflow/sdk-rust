@@ -46,6 +46,8 @@ jobs:
           sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
             docs/analytics/analytics.js
           cargo doc --all-features --no-deps
+          python3 scripts/ci/qualify-release-documentation.py \
+            --rustdoc target/doc/durable_workflow/index.html
 
       - name: Prepare Pages artifact
         run: |
@@ -123,6 +125,8 @@ jobs:
           sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
             docs/analytics/analytics.js
           cargo doc --all-features --no-deps
+          python3 scripts/ci/qualify-release-documentation.py \
+            --rustdoc target/doc/durable_workflow/index.html
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
@@ -278,6 +282,9 @@ jobs:
           python3 scripts/ci/qualify-docs-landing.py \
             --landing-url https://rust.durable-workflow.com/ \
             --attempts 30 --link-attempts 3 --retry-delay 10
+          python3 scripts/ci/qualify-release-documentation.py \
+            --rustdoc-url https://rust.durable-workflow.com/durable_workflow/ \
+            --attempts 30 --retry-delay 10
 
       - name: Capture deployed reference matrix
         env:

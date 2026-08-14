@@ -54,6 +54,12 @@ continue-as-new-routing-overrides = ["workflow_type", "queue"]
 workflow-history-budget = ["total_history_events", "history_size_bytes", "continue_as_new_recommended", "history_budget_pressure"]
 workflow-result-routing = "current-run-chain-with-selected-run-view"
 
+[package.metadata.durable-workflow.documentation]
+path-order = ["general", "cloud"]
+availability = { general = "generally-available", cloud = "limited-early-access" }
+general-destinations = ["crate-install", "local-self-hosted", "api-reference", "sdk-guide"]
+cloud-destinations = ["cloud-access", "cloud-guide"]
+
 [lib]
 name = "durable_workflow"
 path = "src/lib.rs"
