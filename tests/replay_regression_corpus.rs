@@ -337,17 +337,23 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
     }
 
     let task_id = format!("regression-corpus-{fixture_id}");
-    let task = json!({
+    let task_payload_codec = match fixture.get("worker_task") {
+        Some(worker_task) => worker_task.get("payload_codec").cloned(),
+        None => Some(json!(payload_codec)),
+    };
+    let mut task = json!({
         "task_id": task_id,
         "workflow_id": format!("regression-corpus-{fixture_id}"),
         "run_id": "regression-corpus-run",
         "workflow_type": workflow_type,
-        "payload_codec": payload_codec,
         "arguments": input_envelope,
         "history_events": history,
         "workflow_task_attempt": 1,
         "lease_owner": "regression-corpus-worker"
     });
+    if let Some(task_payload_codec) = task_payload_codec {
+        task["payload_codec"] = task_payload_codec;
+    }
     let server = FixtureServer::start(task);
     let client = Client::builder(server.base_url())
         .timeout(Duration::from_secs(2))
@@ -446,7 +452,10 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
         )
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
         let result = execute_fixture(&fixture).await;
-        if contains_json_payload_codec(&fixture) {
+        if let Some(expected_failure) = fixture["expected_failure"].as_str() {
+            let error = result.expect_err("frozen malformed task codec must fail closed");
+            assert!(error.contains(expected_failure), "{error}");
+        } else if contains_json_payload_codec(&fixture) {
             let error = result.expect_err("frozen JSON-tagged replay must fail closed");
             assert!(error.contains("unsupported_payload_codec"), "{error}");
             assert!(error.contains("HTTP document transport"), "{error}");

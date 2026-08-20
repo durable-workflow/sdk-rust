@@ -1,3 +1,4 @@
 avro-value-v1-long-zero.json
+malformed-task-payload-codecs-rejected.json
 raw-json-null-payload-rejected.json
 raw-json-payload-rejected.json

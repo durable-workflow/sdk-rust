@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use durable_workflow::{
-    decode_avro_value, encode_avro_value, AvroValue, Client, PayloadEnvelope,
-    AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
+    decode_avro_value, encode_avro_value, encode_payload, ActivityTask, AvroValue, Client,
+    PayloadEnvelope, QueryTask, WorkflowTask, AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
 };
 use serde_json::Value;
 
@@ -134,31 +134,63 @@ fn check_task_boundary(fixture: &Value) {
     let Some(boundary) = fixture.get("task_boundary") else {
         return;
     };
-    assert_eq!(
-        boundary["operation"], "complete_workflow_task",
-        "unsupported task-boundary corpus operation"
-    );
-    let command = boundary
-        .get("command")
-        .cloned()
-        .expect("task-boundary command");
     let expected_error = boundary["error"]
         .as_str()
         .expect("task-boundary stable error");
-    let client = Client::builder("http://127.0.0.1:9")
-        .timeout(Duration::from_millis(100))
-        .build()
-        .expect("task-boundary client");
-    let error = tokio::runtime::Runtime::new()
-        .expect("task-boundary runtime")
-        .block_on(client.complete_workflow_task(
-            "codec-regression",
-            "codec-regression-worker",
-            1,
-            vec![command],
-        ))
-        .expect_err("invalid command must fail before transport");
-    assert!(error.to_string().contains(expected_error), "{error}");
+
+    match boundary["operation"].as_str() {
+        Some("complete_workflow_task") => {
+            let command = boundary
+                .get("command")
+                .cloned()
+                .expect("task-boundary command");
+            let client = Client::builder("http://127.0.0.1:9")
+                .timeout(Duration::from_millis(100))
+                .build()
+                .expect("task-boundary client");
+            let error = tokio::runtime::Runtime::new()
+                .expect("task-boundary runtime")
+                .block_on(client.complete_workflow_task(
+                    "codec-regression",
+                    "codec-regression-worker",
+                    1,
+                    vec![command],
+                ))
+                .expect_err("invalid command must fail before transport");
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+        Some("deserialize_worker_tasks") => {
+            for case in boundary["cases"].as_array().expect("task-boundary cases") {
+                let task = case.get("task").cloned().expect("task-boundary task");
+                let codec = match case["family"].as_str() {
+                    Some("workflow") => {
+                        serde_json::from_value::<WorkflowTask>(task)
+                            .expect("workflow task must remain settleable")
+                            .payload_codec
+                    }
+                    Some("activity") => {
+                        serde_json::from_value::<ActivityTask>(task)
+                            .expect("activity task must remain settleable")
+                            .payload_codec
+                    }
+                    Some("query") => {
+                        serde_json::from_value::<QueryTask>(task)
+                            .expect("query task must remain settleable")
+                            .payload_codec
+                    }
+                    family => panic!("unsupported task family {family:?}"),
+                };
+                let error = encode_payload(&Value::Null, &codec)
+                    .expect_err("invalid task codec must reach the stable codec validator");
+                assert!(
+                    error.to_string().contains(expected_error),
+                    "{} returned an unrelated diagnostic: {error}",
+                    case["id"]
+                );
+            }
+        }
+        operation => panic!("unsupported task-boundary corpus operation {operation:?}"),
+    }
 }
 
 fn check_corpus() {

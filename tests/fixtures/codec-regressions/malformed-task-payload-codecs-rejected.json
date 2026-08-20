@@ -1,0 +1,119 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "malformed-task-payload-codecs-rejected",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": [
+    "rust"
+  ],
+  "value": {
+    "type": "long",
+    "value": "42"
+  },
+  "framing": {
+    "encoding": "utf8-json",
+    "wire_base64": "NDI="
+  },
+  "failure_policy": {
+    "operation": "decode_reject",
+    "error": "unsupported_payload_codec"
+  },
+  "task_boundary": {
+    "operation": "deserialize_worker_tasks",
+    "error": "unsupported_payload_codec",
+    "cases": [
+      {
+        "id": "workflow-missing-codec",
+        "family": "workflow",
+        "task": {
+          "task_id": "workflow-missing-codec",
+          "workflow_type": "codec.workflow",
+          "history_events": []
+        }
+      },
+      {
+        "id": "workflow-null-codec",
+        "family": "workflow",
+        "task": {
+          "task_id": "workflow-null-codec",
+          "workflow_type": "codec.workflow",
+          "payload_codec": null,
+          "history_events": []
+        }
+      },
+      {
+        "id": "workflow-non-string-codec",
+        "family": "workflow",
+        "task": {
+          "task_id": "workflow-non-string-codec",
+          "workflow_type": "codec.workflow",
+          "payload_codec": 42,
+          "history_events": []
+        }
+      },
+      {
+        "id": "activity-missing-codec",
+        "family": "activity",
+        "task": {
+          "task_id": "activity-missing-codec",
+          "activity_type": "codec.activity"
+        }
+      },
+      {
+        "id": "activity-null-codec",
+        "family": "activity",
+        "task": {
+          "task_id": "activity-null-codec",
+          "activity_type": "codec.activity",
+          "payload_codec": null
+        }
+      },
+      {
+        "id": "activity-non-string-codec",
+        "family": "activity",
+        "task": {
+          "task_id": "activity-non-string-codec",
+          "activity_type": "codec.activity",
+          "payload_codec": 42
+        }
+      },
+      {
+        "id": "query-missing-codec",
+        "family": "query",
+        "task": {
+          "query_task_id": "query-missing-codec",
+          "workflow_type": "codec.workflow",
+          "query_name": "known",
+          "history_events": []
+        }
+      },
+      {
+        "id": "query-null-codec",
+        "family": "query",
+        "task": {
+          "query_task_id": "query-null-codec",
+          "workflow_type": "codec.workflow",
+          "query_name": "known",
+          "payload_codec": null,
+          "history_events": []
+        }
+      },
+      {
+        "id": "query-non-string-codec",
+        "family": "query",
+        "task": {
+          "query_task_id": "query-non-string-codec",
+          "workflow_type": "codec.workflow",
+          "query_name": "known",
+          "payload_codec": 42,
+          "history_events": []
+        }
+      }
+    ]
+  }
+}

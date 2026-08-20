@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.0-rc.32
+
+- Require an explicit string `payload_codec="avro"` on polled workflow,
+  activity, and query tasks. Missing, null, and non-string declarations now
+  produce a controlled `unsupported_payload_codec` task failure before handler
+  execution.
+
 ## 2.0.0-rc.31
 
 - Reject non-Avro and malformed payload envelopes across workflow, activity,

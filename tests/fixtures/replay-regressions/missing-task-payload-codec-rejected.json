@@ -1,0 +1,55 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-missing-task-payload-codec-rejected",
+  "protocol_version": "1.2",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.side-effect-version",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "worker_task": {},
+  "history": [
+    {
+      "event_type": "SideEffectRecorded",
+      "payload": {
+        "sequence": 1,
+        "result": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwoaY2FwdHVyZWQtb25jZQ=="
+        }
+      }
+    },
+    {
+      "event_type": "VersionMarkerRecorded",
+      "payload": {
+        "sequence": 2,
+        "change_id": "cold-restart",
+        "version": 3,
+        "min_supported": 1,
+        "max_supported": 3
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "captured": "captured-once",
+        "version": 3
+      }
+    }
+  ],
+  "expected": {
+    "side_effect_callback_calls": 0,
+    "type": "complete_workflow",
+    "result": {
+      "captured": "captured-once",
+      "version": 3
+    }
+  },
+  "expected_failure": "unsupported_payload_codec"
+}

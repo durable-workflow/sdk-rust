@@ -20,7 +20,7 @@ use futures_util::{future::OptionFuture, task::noop_waker_ref};
 use serde::{
     de::DeserializeOwned,
     ser::{SerializeMap, SerializeSeq},
-    Deserialize, Serialize, Serializer,
+    Deserialize, Deserializer, Serialize, Serializer,
 };
 pub use serde_json::{json, Value};
 use thiserror::Error;
@@ -41,6 +41,9 @@ const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
 const WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE: &str =
     "Workflow task waiting for scheduled history.";
 const WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE: &str = "WorkflowTaskWaitingForHistory";
+const MISSING_TASK_PAYLOAD_CODEC: &str = "\0missing-task-payload-codec";
+const NULL_TASK_PAYLOAD_CODEC: &str = "\0null-task-payload-codec";
+const NON_STRING_TASK_PAYLOAD_CODEC: &str = "\0non-string-task-payload-codec";
 
 const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "lease_expired",
@@ -1311,8 +1314,21 @@ fn decode_blob(blob: &str, codec: &str) -> Result<Value> {
 fn validate_payload_codec(codec: &str) -> Result<()> {
     match codec {
         DEFAULT_CODEC => Ok(()),
+        MISSING_TASK_PAYLOAD_CODEC => {
+            Err(invalid_task_payload_codec("task payload_codec is missing"))
+        }
+        NULL_TASK_PAYLOAD_CODEC => Err(invalid_task_payload_codec("task payload_codec is null")),
+        NON_STRING_TASK_PAYLOAD_CODEC => Err(invalid_task_payload_codec(
+            "task payload_codec must be a string",
+        )),
         other => Err(unsupported_payload_codec(other)),
     }
+}
+
+fn invalid_task_payload_codec(reason: &str) -> Error {
+    Error::Codec(format!(
+        "unsupported_payload_codec: {reason}; Durable Workflow 2.0 requires an explicit string payload_codec=\"avro\" before worker task execution"
+    ))
 }
 
 fn payload_envelope_parts(value: &Value) -> Result<Option<(&str, &str)>> {
@@ -3855,7 +3871,10 @@ pub struct QueryTask {
     pub run_id: Option<String>,
     pub workflow_type: String,
     pub query_name: String,
-    #[serde(default = "default_payload_codec")]
+    #[serde(
+        default = "missing_task_payload_codec",
+        deserialize_with = "deserialize_task_payload_codec"
+    )]
     pub payload_codec: String,
     #[serde(default)]
     pub workflow_arguments: Option<Value>,
@@ -3877,7 +3896,10 @@ pub struct WorkflowTask {
     #[serde(default)]
     pub run_id: Option<String>,
     pub workflow_type: String,
-    #[serde(default = "default_payload_codec")]
+    #[serde(
+        default = "missing_task_payload_codec",
+        deserialize_with = "deserialize_task_payload_codec"
+    )]
     pub payload_codec: String,
     #[serde(default)]
     pub arguments: Option<Value>,
@@ -3941,7 +3963,10 @@ pub struct ActivityTask {
     #[serde(default)]
     pub attempt_id: Option<String>,
     pub activity_type: String,
-    #[serde(default = "default_payload_codec")]
+    #[serde(
+        default = "missing_task_payload_codec",
+        deserialize_with = "deserialize_task_payload_codec"
+    )]
     pub payload_codec: String,
     #[serde(default)]
     pub arguments: Option<Value>,
@@ -4062,8 +4087,19 @@ impl ActivityHeartbeatResponse {
     }
 }
 
-fn default_payload_codec() -> String {
-    DEFAULT_CODEC.to_string()
+fn missing_task_payload_codec() -> String {
+    MISSING_TASK_PAYLOAD_CODEC.to_string()
+}
+
+fn deserialize_task_payload_codec<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(codec) => codec,
+        Value::Null => NULL_TASK_PAYLOAD_CODEC.to_string(),
+        _ => NON_STRING_TASK_PAYLOAD_CODEC.to_string(),
+    })
 }
 
 fn default_workflow_task_attempt() -> u64 {
@@ -8524,6 +8560,38 @@ mod tests {
         thread,
     };
 
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidTaskPayloadCodec {
+        Missing,
+        Null,
+        NonString,
+    }
+
+    impl InvalidTaskPayloadCodec {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Missing => "missing",
+                Self::Null => "null",
+                Self::NonString => "non-string",
+            }
+        }
+
+        fn apply(self, task: &mut Value) {
+            let task = task.as_object_mut().expect("task fixture object");
+            match self {
+                Self::Missing => {
+                    task.remove("payload_codec");
+                }
+                Self::Null => {
+                    task.insert("payload_codec".to_string(), Value::Null);
+                }
+                Self::NonString => {
+                    task.insert("payload_codec".to_string(), json!(42));
+                }
+            }
+        }
+    }
+
     fn fixture_envelope(value: Value) -> Value {
         encode_value_envelope(&value, DEFAULT_CODEC).expect("encode Avro test fixture")
     }
@@ -9706,6 +9774,183 @@ mod tests {
             .expect("valid Avro signal")
             .expect("named signal resumes the workflow");
         assert!(decoded.arguments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_task_level_codecs_become_pre_handler_failures() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+
+        let calls = Arc::clone(&handler_calls);
+        worker.register_workflow("codec.workflow", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+        let calls = Arc::clone(&handler_calls);
+        worker.register_activity("codec.activity", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+        let calls = Arc::clone(&handler_calls);
+        worker.register_query("codec.workflow", "known", move |_ctx, _args| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Value::Null) }
+        });
+
+        let mut failures = Vec::new();
+        for codec_case in [
+            InvalidTaskPayloadCodec::Missing,
+            InvalidTaskPayloadCodec::Null,
+            InvalidTaskPayloadCodec::NonString,
+        ] {
+            let mut workflow = json!({
+                "task_id": format!("workflow-{}", codec_case.label()),
+                "workflow_type": "codec.workflow"
+            });
+            codec_case.apply(&mut workflow);
+            match serde_json::from_value::<WorkflowTask>(workflow) {
+                Ok(task) => match worker.execute_workflow_task(task) {
+                    Err(error) if error.to_string().contains("unsupported_payload_codec") => {}
+                    outcome => failures.push(format!(
+                        "workflow {} codec returned {outcome:?}",
+                        codec_case.label()
+                    )),
+                },
+                Err(error) => failures.push(format!(
+                    "workflow {} codec failed transport deserialization: {error}",
+                    codec_case.label()
+                )),
+            }
+
+            let mut activity = json!({
+                "task_id": format!("activity-{}", codec_case.label()),
+                "activity_attempt_id": format!("attempt-{}", codec_case.label()),
+                "activity_type": "codec.activity",
+                "attempt_number": 1
+            });
+            codec_case.apply(&mut activity);
+            match serde_json::from_value::<ActivityTask>(activity) {
+                Ok(task) => match worker.execute_activity_task(task).await {
+                    Err(error) if error.to_string().contains("unsupported_payload_codec") => {}
+                    outcome => failures.push(format!(
+                        "activity {} codec returned {outcome:?}",
+                        codec_case.label()
+                    )),
+                },
+                Err(error) => failures.push(format!(
+                    "activity {} codec failed transport deserialization: {error}",
+                    codec_case.label()
+                )),
+            }
+
+            let mut query = json!({
+                "query_task_id": format!("query-{}", codec_case.label()),
+                "workflow_type": "codec.workflow",
+                "query_name": "known"
+            });
+            codec_case.apply(&mut query);
+            match serde_json::from_value::<QueryTask>(query) {
+                Ok(task) => match worker.execute_query_task(task).await {
+                    Err(failure) if failure.message.contains("unsupported_payload_codec") => {}
+                    outcome => failures.push(format!(
+                        "query {} codec returned {outcome:?}",
+                        codec_case.label()
+                    )),
+                },
+                Err(error) => failures.push(format!(
+                    "query {} codec failed transport deserialization: {error}",
+                    codec_case.label()
+                )),
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            0,
+            "invalid task codecs must not invoke a handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn polled_malformed_task_codecs_are_settled_without_handler_execution() {
+        for codec_case in [
+            InvalidTaskPayloadCodec::Missing,
+            InvalidTaskPayloadCodec::Null,
+            InvalidTaskPayloadCodec::NonString,
+        ] {
+            let server = MockWorkerServer::invalid_task_payload_codec(codec_case);
+            let client = Client::builder(server.base_url())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client");
+            let mut worker = Worker::new(client, "rust-workers")
+                .worker_id("codec-worker")
+                .poll_timeout(Duration::from_millis(10));
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+
+            let calls = Arc::clone(&handler_calls);
+            worker.register_workflow("codec.workflow", move |_ctx, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Value::Null) }
+            });
+            let calls = Arc::clone(&handler_calls);
+            worker.register_activity("codec.activity", move |_ctx, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Value::Null) }
+            });
+            let calls = Arc::clone(&handler_calls);
+            worker.register_query("codec.workflow", "known", move |_ctx, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Value::Null) }
+            });
+
+            assert_eq!(
+                worker.run_once().await.expect("invalid tasks are settled"),
+                3,
+                "all {} codec tasks must be handled",
+                codec_case.label()
+            );
+            assert_eq!(
+                handler_calls.load(Ordering::SeqCst),
+                0,
+                "{} task codecs must fail before every handler",
+                codec_case.label()
+            );
+
+            for path in [
+                "/api/worker/workflow-tasks/codec-workflow/fail",
+                "/api/worker/activity-tasks/codec-activity/fail",
+                "/api/worker/query-tasks/codec-query/fail",
+            ] {
+                let body = server.request_body(path);
+                assert!(
+                    body["failure"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("unsupported_payload_codec")),
+                    "{path} must receive the stable codec diagnostic for the {} case: {body}",
+                    codec_case.label()
+                );
+            }
+            assert_eq!(
+                server.request_body("/api/worker/query-tasks/codec-query/fail")["failure"]
+                    ["reason"],
+                "query_payload_decode_failed"
+            );
+            for path in [
+                "/api/worker/workflow-tasks/codec-workflow/complete",
+                "/api/worker/activity-tasks/codec-activity/complete",
+                "/api/worker/query-tasks/codec-query/complete",
+            ] {
+                assert_eq!(
+                    server.request_count(path),
+                    0,
+                    "invalid {} codec task reached {path}",
+                    codec_case.label()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -14248,6 +14493,7 @@ mod tests {
         reject_deregistration_protocol: bool,
         cancelled_activity: bool,
         draining_polls: bool,
+        invalid_task_payload_codec: Option<InvalidTaskPayloadCodec>,
         workflow_completion_status: Option<&'static str>,
         workflow_completion_body: Option<&'static str>,
     }
@@ -14374,6 +14620,13 @@ mod tests {
         fn draining_polls() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 draining_polls: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn invalid_task_payload_codec(codec: InvalidTaskPayloadCodec) -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                invalid_task_payload_codec: Some(codec),
                 ..MockWorkerBehavior::default()
             })
         }
@@ -14710,6 +14963,50 @@ mod tests {
                 r#"{"task":null,"poll_status":"draining","reason":"worker_draining","worker_status":"draining","drain_intent":"draining"}"#,
             );
             return;
+        }
+
+        if let Some(codec_case) = behavior.invalid_task_payload_codec {
+            if is_poll && request_number == 1 {
+                let mut task = match path {
+                    "/api/worker/workflow-tasks/poll" => json!({
+                        "task_id": "codec-workflow",
+                        "workflow_type": "codec.workflow",
+                        "payload_codec": DEFAULT_CODEC,
+                        "workflow_task_attempt": 1,
+                        "lease_owner": "codec-worker"
+                    }),
+                    "/api/worker/activity-tasks/poll" => json!({
+                        "task_id": "codec-activity",
+                        "activity_attempt_id": "codec-activity-attempt",
+                        "activity_type": "codec.activity",
+                        "payload_codec": DEFAULT_CODEC,
+                        "attempt_number": 1,
+                        "lease_owner": "codec-worker"
+                    }),
+                    "/api/worker/query-tasks/poll" => json!({
+                        "query_task_id": "codec-query",
+                        "query_task_attempt": 1,
+                        "workflow_type": "codec.workflow",
+                        "query_name": "known",
+                        "payload_codec": DEFAULT_CODEC,
+                        "lease_owner": "codec-worker"
+                    }),
+                    _ => unreachable!("is_poll limits task codec probe paths"),
+                };
+                codec_case.apply(&mut task);
+                write_mock_response(stream, "200 OK", &json!({"task": task}).to_string());
+                return;
+            }
+
+            if matches!(
+                path,
+                "/api/worker/workflow-tasks/codec-workflow/fail"
+                    | "/api/worker/activity-tasks/codec-activity/fail"
+                    | "/api/worker/query-tasks/codec-query/fail"
+            ) {
+                write_mock_response(stream, "200 OK", r#"{"outcome":"failed"}"#);
+                return;
+            }
         }
 
         if behavior.reject_query_protocol && path.starts_with("/api/worker/query-tasks/") {
