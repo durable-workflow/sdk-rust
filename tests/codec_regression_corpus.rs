@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use durable_workflow::{
     decode_avro_value, encode_avro_value, encode_payload, ActivityTask, AvroValue, Client,
-    PayloadEnvelope, QueryTask, WorkflowTask, AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
+    PayloadEnvelope, QueryTask, WorkflowStreamAppendItem, WorkflowTask,
+    AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
 };
 use serde_json::Value;
 
@@ -193,6 +194,36 @@ fn check_task_boundary(fixture: &Value) {
     }
 }
 
+fn check_workflow_stream_encoding(fixture: &Value) {
+    let Some(contract) = fixture.get("workflow_stream") else {
+        return;
+    };
+    let payload = contract
+        .get("typed_payload")
+        .cloned()
+        .expect("workflow stream typed payload");
+    let item = WorkflowStreamAppendItem::new(payload.clone())
+        .expect("encode workflow stream typed payload");
+    let envelope: PayloadEnvelope = serde_json::from_value(
+        item.payload_envelope
+            .expect("workflow stream payload envelope"),
+    )
+    .expect("parse workflow stream payload envelope");
+    assert_eq!(envelope.codec, DEFAULT_CODEC);
+    assert_eq!(
+        durable_workflow::decode_payload::<Value>(&envelope)
+            .expect("decode workflow stream typed payload"),
+        payload,
+    );
+
+    let reference = contract["payload_reference"]
+        .as_str()
+        .expect("workflow stream payload reference");
+    let referenced = WorkflowStreamAppendItem::from_reference(reference);
+    assert_eq!(referenced.payload_reference.as_deref(), Some(reference));
+    assert!(referenced.payload_envelope.is_none());
+}
+
 fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
@@ -279,6 +310,7 @@ fn check_corpus() {
         }
 
         check_task_boundary(&fixture);
+        check_workflow_stream_encoding(&fixture);
     }
 }
 

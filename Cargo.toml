@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.0-rc.32"
+version = "2.0.0-rc.33"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -14,12 +14,12 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.0-rc.32"
+product-train = "2.0.0-rc.33"
 compatibility-authority = "protocol-manifests"
-supported-server-versions = ">=2.0.0-rc.32,<2.0.0"
-qualified-server-version = "2.0.0-rc.32"
-worker-protocol-version = "1.2"
-server-worker-protocol-versions = ">=1.2,<2.0"
+supported-server-versions = ">=2.0.0-rc.42,<2.0.0"
+qualified-server-version = "2.0.0-rc.42"
+worker-protocol-version = "1.15"
+server-worker-protocol-versions = ">=1.15,<2.0"
 control-plane-version = "2"
 query-tasks = true
 query-task-minimum-worker-protocol-version = "1.8"
@@ -53,6 +53,11 @@ continue-as-new-command = "continue_as_new"
 continue-as-new-routing-overrides = ["workflow_type", "queue"]
 workflow-history-budget = ["total_history_events", "history_size_bytes", "continue_as_new_recommended", "history_budget_pressure"]
 workflow-result-routing = "current-run-chain-with-selected-run-view"
+workflow-streams-contract = "durable-workflow.v2.workflow-streams.contract@1"
+workflow-streams-operations = ["list", "describe", "subscribe", "append", "close", "error"]
+workflow-streams-authoring-command = "record_side_effect.workflow_stream"
+workflow-streams-delivery = "at-least-once"
+workflow-streams-external-payload-references = "opaque-reference"
 
 [package.metadata.durable-workflow.documentation]
 path-order = ["general", "cloud"]

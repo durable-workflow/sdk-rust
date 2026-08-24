@@ -250,6 +250,22 @@ fn normalize_command(command: &Value) -> Result<Value, String> {
                 .map_err(|error| format!("decode replay command {field}: {error}"))?;
         }
     }
+    if let Some(items) = normalized
+        .get_mut("workflow_stream")
+        .and_then(|directive| directive.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    {
+        for (index, item) in items.iter_mut().enumerate() {
+            let Some(envelope) = item.get("payload").cloned() else {
+                continue;
+            };
+            let envelope: PayloadEnvelope = serde_json::from_value(envelope).map_err(|error| {
+                format!("parse replay workflow stream item {index} envelope: {error}")
+            })?;
+            item["payload"] = decode_payload(&envelope)
+                .map_err(|error| format!("decode replay workflow stream item {index}: {error}"))?;
+        }
+    }
     Ok(normalized)
 }
 
@@ -290,7 +306,7 @@ fn fixture_matches(expected: &Value, actual: &Value, context: &str) -> Result<()
     }
 }
 
-async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
+async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<Value, String> {
     if fixture["fixture_schema"] != FIXTURE_SCHEMA {
         return Err("fixture does not declare the replay-regression schema".to_string());
     }
@@ -308,7 +324,10 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{fixture_id}.workflow.type must be a string"))?;
-    if workflow_type != "corpus.side-effect-version" {
+    if !matches!(
+        workflow_type,
+        "corpus.side-effect-version" | "corpus.workflow-stream"
+    ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
         ));
@@ -336,7 +355,7 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
         return Err(format!("{fixture_id}.history must be an array"));
     }
 
-    let task_id = format!("regression-corpus-{fixture_id}");
+    let task_id = format!("regression-corpus-{fixture_id}-{delivery_id}");
     let task_payload_codec = match fixture.get("worker_task") {
         Some(worker_task) => worker_task.get("payload_codec").cloned(),
         None => Some(json!(payload_codec)),
@@ -354,6 +373,12 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
     if let Some(task_payload_codec) = task_payload_codec {
         task["payload_codec"] = task_payload_codec;
     }
+    if let Some(workflow_command_id) = fixture
+        .get("worker_task")
+        .and_then(|worker_task| worker_task.get("workflow_command_id"))
+    {
+        task["workflow_command_id"] = workflow_command_id.clone();
+    }
     let server = FixtureServer::start(task);
     let client = Client::builder(server.base_url())
         .timeout(Duration::from_secs(2))
@@ -364,17 +389,38 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
     let mut worker = Worker::new(client, "regression-corpus")
         .worker_id("regression-corpus-worker")
         .poll_timeout(Duration::from_millis(10));
-    worker.register_workflow(workflow_type, move |ctx, _input| {
-        let observed_calls = Arc::clone(&observed_calls);
-        async move {
-            let captured = ctx.side_effect(|| {
-                observed_calls.fetch_add(1, Ordering::SeqCst);
-                "captured-once".to_string()
-            })?;
-            let version = ctx.get_version("cold-restart", 1, 3)?;
-            Ok(json!({"captured": captured, "version": version}))
+    match workflow_type {
+        "corpus.side-effect-version" => {
+            worker.register_workflow(workflow_type, move |ctx, _input| {
+                let observed_calls = Arc::clone(&observed_calls);
+                async move {
+                    let captured = ctx.side_effect(|| {
+                        observed_calls.fetch_add(1, Ordering::SeqCst);
+                        "captured-once".to_string()
+                    })?;
+                    let version = ctx.get_version("cold-restart", 1, 3)?;
+                    Ok(json!({"captured": captured, "version": version}))
+                }
+            });
         }
-    });
+        "corpus.workflow-stream" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.append_workflow_stream(
+                    "tokens",
+                    &[
+                        durable_workflow::WorkflowStreamAppendItem::new(json!({"token": "hello"}))?,
+                        durable_workflow::WorkflowStreamAppendItem::from_reference(
+                            "s3://payloads/token-2",
+                        ),
+                    ],
+                    None,
+                )?;
+                ctx.close_workflow_stream("tokens", None)?;
+                Ok(json!("done"))
+            });
+        }
+        _ => unreachable!(),
+    }
     let handled = worker
         .run_once()
         .await
@@ -438,6 +484,10 @@ async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
     Ok(Value::Object(observed))
 }
 
+async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
+    execute_fixture_delivery(fixture, "default").await
+}
+
 #[tokio::test]
 async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
     let paths = fixture_paths().expect("discover declared Rust replay fixtures");
@@ -481,6 +531,50 @@ async fn avro_side_effect_replay_is_deterministic_across_cold_workers() {
         .expect("cold Avro replay fixture must execute");
 
     assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn workflow_stream_commands_are_stable_across_cold_worker_redelivery() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/workflow-stream-command-restart.json");
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in workflow stream fixture"),
+    )
+    .expect("parse checked-in workflow stream fixture");
+
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .expect("first workflow stream delivery must execute");
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .expect("cold workflow stream redelivery must execute");
+
+    assert_eq!(first, restarted);
+}
+
+#[tokio::test]
+async fn workflow_stream_command_without_durable_identity_fails_closed() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/workflow-stream-command-restart.json");
+    let mut fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in workflow stream fixture"),
+    )
+    .expect("parse checked-in workflow stream fixture");
+    fixture["id"] = json!("rust-workflow-stream-command-missing-identity");
+    fixture["worker_task"]
+        .as_object_mut()
+        .expect("workflow stream worker task")
+        .remove("workflow_command_id");
+
+    let error = execute_fixture_delivery(&fixture, "missing-identity")
+        .await
+        .expect_err("workflow stream command without durable identity must fail");
+
+    assert!(
+        error.contains("workflow_stream_command_identity_missing"),
+        "{error}"
+    );
+    assert!(error.contains("workflow_command_id"), "{error}");
 }
 
 #[tokio::test]

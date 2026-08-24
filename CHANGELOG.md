@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.0-rc.33
+
+- Add typed run-scoped Workflow Stream list, describe, resumable subscribe,
+  append, close, and errored lifecycle operations, including replay-stable
+  workflow-command authoring identity and opaque external payload references.
+
 ## 2.0.0-rc.32
 
 - Require an explicit string `payload_codec="avro"` on polled workflow,

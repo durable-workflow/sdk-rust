@@ -88,11 +88,11 @@ if [[ "$package_version" != "$product_train" ]]; then
     printf 'Rust SDK package version must match its product train metadata: %s, %s\n' "$package_version" "$product_train" >&2
     exit 1
 fi
-if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.32,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.32" || "$server_worker_protocols" != ">=1.2,<2.0" ]]; then
+if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.42,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.42" || "$server_worker_protocols" != ">=1.15,<2.0" ]]; then
     printf 'unexpected Rust SDK supported Server contract: %s, %s, %s, %s\n' "$compatibility_authority" "$server_compatibility" "$qualified_server_version" "$server_worker_protocols" >&2
     exit 1
 fi
-if [[ "$worker_protocol" != "1.2" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
+if [[ "$worker_protocol" != "1.15" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi

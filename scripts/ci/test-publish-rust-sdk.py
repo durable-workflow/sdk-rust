@@ -16,11 +16,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PACKAGE_VERSION = "2.0.0-rc.32"
+PACKAGE_VERSION = "2.0.0-rc.33"
 PRODUCT_TRAIN = PACKAGE_VERSION
-SERVER_VERSIONS = ">=2.0.0-rc.32,<2.0.0"
-QUALIFIED_SERVER_VERSION = "2.0.0-rc.32"
-SERVER_WORKER_PROTOCOLS = ">=1.2,<2.0"
+SERVER_VERSIONS = ">=2.0.0-rc.42,<2.0.0"
+QUALIFIED_SERVER_VERSION = "2.0.0-rc.42"
+WORKER_PROTOCOL_VERSION = "1.15"
+SERVER_WORKER_PROTOCOLS = ">=1.15,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -208,6 +209,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual("protocol-manifests", metadata["compatibility-authority"])
         self.assertEqual(SERVER_VERSIONS, metadata["supported-server-versions"])
         self.assertEqual(QUALIFIED_SERVER_VERSION, metadata["qualified-server-version"])
+        self.assertEqual(WORKER_PROTOCOL_VERSION, metadata["worker-protocol-version"])
         self.assertEqual(SERVER_WORKER_PROTOCOLS, metadata["server-worker-protocol-versions"])
 
     def test_release_path_accepts_component_advance_and_emits_baseline(self) -> None:
@@ -219,6 +221,10 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual("protocol-manifests", evidence["compatibility_authority"])
         self.assertEqual(SERVER_VERSIONS, evidence["supported_server_versions"])
         self.assertEqual(QUALIFIED_SERVER_VERSION, evidence["qualified_server_version"])
+        self.assertEqual(
+            WORKER_PROTOCOL_VERSION,
+            evidence["protocol_compatibility"]["worker_protocol"],
+        )
         self.assertEqual(
             SERVER_WORKER_PROTOCOLS,
             evidence["protocol_compatibility"]["server_worker_protocol_versions"],

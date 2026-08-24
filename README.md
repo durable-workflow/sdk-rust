@@ -106,7 +106,7 @@ The installed crate's package metadata records its exact qualified Server
 range and baseline. Server build versions are identity, not the runtime
 negotiation mechanism: compatible servers must
 advertise control plane `2` and a
-same-major worker protocol in `>=1.2,<2.0`. The SDK sends worker protocol `1.2`;
+same-major worker protocol in `>=1.15,<2.0`. The SDK sends worker protocol `1.15`;
 newer `1.x` server minors accept that header under the additive protocol
 contract.
 
@@ -126,9 +126,9 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 `activity-failure-reasons`. Lifecycle releases publish
 `workflow-lifecycle-commands`, `workflow-lifecycle-run-targeting`, and
 `workflow-terminal-outcomes`; releases with start deadline support also publish
-`workflow-start-timeouts`. Existing worker operations retain the `1.2`
-baseline; only query-task poll, complete, and fail requests use the additive
-`1.8` feature floor.
+`workflow-start-timeouts`. Workflow Stream authoring requires the `1.15`
+feature floor, while query-task poll, complete, and fail requests retain their
+`1.8` minimum.
 
 The Rust SDK does not expose update-validator authoring. High-level worker
 registration declares an empty `update_validators` list for every workflow type

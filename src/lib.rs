@@ -26,7 +26,7 @@ pub use serde_json::{json, Value};
 use thiserror::Error;
 pub use uuid::Uuid;
 
-pub const WORKER_PROTOCOL_VERSION: &str = "1.2";
+pub const WORKER_PROTOCOL_VERSION: &str = "1.15";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
@@ -114,6 +114,10 @@ pub enum Error {
     ActivityNotRegistered(String),
     #[error("workflow future yielded without emitting a durable command")]
     WorkflowYieldedWithoutCommand,
+    #[error(
+        "workflow_stream_command_identity_missing: workflow stream authoring requires a non-empty server-provided workflow_command_id"
+    )]
+    MissingWorkflowCommandIdentity,
     #[error("workflow state lock is poisoned")]
     WorkflowStatePoisoned,
     #[error("timer duration is too large for the worker protocol")]
@@ -2124,6 +2128,230 @@ impl Client {
         Ok(data)
     }
 
+    fn workflow_stream_path(workflow_id: &str, run_id: &str, stream_name: Option<&str>) -> String {
+        let mut path = format!(
+            "/workflows/{}/runs/{}/streams",
+            percent_encode_path_segment(workflow_id),
+            percent_encode_path_segment(run_id),
+        );
+        if let Some(stream_name) = stream_name {
+            path.push('/');
+            path.push_str(&percent_encode_path_segment(stream_name));
+        }
+        path
+    }
+
+    /// List the run-scoped output streams already opened by a workflow.
+    pub async fn list_workflow_streams(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowStreamDescription>> {
+        let response: WorkflowStreamListResponse = self
+            .request_json(
+                reqwest::Method::GET,
+                &Self::workflow_stream_path(workflow_id, run_id, None),
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+            )
+            .await?;
+        Ok(response.streams)
+    }
+
+    /// Describe stream lifecycle, offsets, pending count, and terminal error.
+    pub async fn describe_workflow_stream(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        stream_name: &str,
+    ) -> Result<WorkflowStreamDescription> {
+        let response: WorkflowStreamDescriptionResponse = self
+            .request_json(
+                reqwest::Method::GET,
+                &Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+            )
+            .await?;
+        Ok(response.stream)
+    }
+
+    /// Read one bounded page beginning at a zero-based offset.
+    ///
+    /// Delivery is at least once: persist `next_offset` only after processing
+    /// the page. The future is cancellation-safe; dropping it cancels the
+    /// in-flight request. Long polling is capped at 60 seconds by the SDK and
+    /// service contract.
+    pub async fn subscribe_workflow_stream(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        stream_name: &str,
+        from_offset: u64,
+        max_items: usize,
+        wait: Duration,
+    ) -> Result<WorkflowStreamPage> {
+        let max_items = max_items.clamp(1, 500);
+        let wait_seconds = wait.as_secs().min(MAX_LONG_POLL_TIMEOUT_SECONDS);
+        let path = format!(
+            "{}/items?from={from_offset}&max_items={max_items}&wait_seconds={wait_seconds}",
+            Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+        );
+        let response: WorkflowStreamPageResponse = self
+            .request_json_with_timeout(
+                reqwest::Method::GET,
+                &path,
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+                Duration::from_secs(wait_seconds.saturating_add(5).max(5)),
+            )
+            .await?;
+
+        let items = response
+            .items
+            .into_iter()
+            .map(|raw| {
+                let offset = raw.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let envelope = raw.get("payload").cloned();
+                let payload = envelope
+                    .as_ref()
+                    .filter(|value| value.get("blob").is_some())
+                    .map(|value| decode_wire_avro_value(value, DEFAULT_CODEC))
+                    .transpose()?
+                    .map(AvroValue::into_json)
+                    .transpose()?;
+                Ok(WorkflowStreamItem {
+                    offset,
+                    payload,
+                    payload_envelope: envelope,
+                    payload_reference: raw
+                        .get("payload_reference")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    payload_codec: raw
+                        .get("payload_codec")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    idempotency_key: raw
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    item_type: raw
+                        .get("item_type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    content_type: raw
+                        .get("content_type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    origin: raw
+                        .get("origin")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    origin_reference: raw
+                        .get("origin_reference")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    emitted_at: raw
+                        .get("emitted_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    raw,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(WorkflowStreamPage {
+            stream: response.stream,
+            items,
+            next_offset: response.next_offset,
+            terminal: response.terminal,
+        })
+    }
+
+    /// Append inline Avro envelopes or opaque external payload references.
+    pub async fn append_workflow_stream(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        stream_name: &str,
+        items: &[WorkflowStreamAppendItem],
+        max_pending_items: Option<u64>,
+    ) -> Result<WorkflowStreamAppendResult> {
+        if items.is_empty() {
+            return Err(Error::Codec(
+                "workflow_stream_items_empty: append requires at least one item".to_string(),
+            ));
+        }
+        let mut body = json!({
+            "items": items
+                .iter()
+                .map(|item| item.wire_value(None))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(max_pending_items) = max_pending_items {
+            if max_pending_items == 0 {
+                return Err(Error::Codec(
+                    "workflow_stream_pending_limit_invalid: max_pending_items must be positive"
+                        .to_string(),
+                ));
+            }
+            body["max_pending_items"] = json!(max_pending_items);
+        }
+        let response: WorkflowStreamAppendResponse = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!(
+                    "{}/items",
+                    Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+                ),
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        Ok(WorkflowStreamAppendResult {
+            stream: response.stream,
+            accepted_offsets: response.accepted_offsets,
+            accepted: response.accepted,
+            deduped: response.deduped,
+        })
+    }
+
+    /// Close a stream, or mark it errored when `error_reason` is supplied.
+    pub async fn close_workflow_stream(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        stream_name: &str,
+        error_reason: Option<&str>,
+        retention_seconds: Option<u64>,
+    ) -> Result<WorkflowStreamDescription> {
+        let mut body = json!({});
+        if let Some(error_reason) = error_reason {
+            body["error_reason"] = json!(error_reason);
+        }
+        if let Some(retention_seconds) = retention_seconds {
+            if retention_seconds == 0 {
+                return Err(Error::Codec(
+                    "workflow_stream_retention_invalid: retention_seconds must be positive"
+                        .to_string(),
+                ));
+            }
+            body["retention_seconds"] = json!(retention_seconds);
+        }
+        let response: WorkflowStreamDescriptionResponse = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!(
+                    "{}/close",
+                    Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+                ),
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        Ok(response.stream)
+    }
+
     pub async fn register_worker(
         &self,
         worker_id: &str,
@@ -3531,6 +3759,166 @@ pub struct WorkflowDescription {
     pub raw: HashMap<String, Value>,
 }
 
+/// Lifecycle and backlog metadata for one run-scoped Workflow Stream.
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkflowStreamDescription {
+    pub stream_name: String,
+    pub status: String,
+    pub last_offset: i64,
+    pub total_items: u64,
+    pub pending_items: u64,
+    #[serde(default)]
+    pub opened_at: Option<String>,
+    #[serde(default)]
+    pub last_appended_at: Option<String>,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    #[serde(default)]
+    pub error_reason: Option<String>,
+    #[serde(default)]
+    pub retention_seconds: Option<u64>,
+    #[serde(flatten)]
+    pub raw: HashMap<String, Value>,
+}
+
+impl WorkflowStreamDescription {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "closed" | "errored")
+    }
+}
+
+/// One item for direct or replay-safe append.
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowStreamAppendItem {
+    pub payload_envelope: Option<Value>,
+    pub payload_reference: Option<String>,
+    pub item_type: Option<String>,
+    pub content_type: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+impl WorkflowStreamAppendItem {
+    /// Encode an inline payload with the SDK's fixed Avro Value envelope.
+    pub fn new<T: Serialize>(payload: T) -> Result<Self> {
+        let value = AvroValue::from_serialize(&payload)?;
+        Ok(Self {
+            payload_envelope: Some(encode_typed_envelope(&value, DEFAULT_CODEC)?),
+            ..Self::default()
+        })
+    }
+
+    /// Preserve an external payload URI as an opaque service-contract reference.
+    pub fn from_reference(reference: impl Into<String>) -> Self {
+        Self {
+            payload_reference: Some(reference.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn item_type(mut self, item_type: impl Into<String>) -> Self {
+        self.item_type = Some(item_type.into());
+        self
+    }
+
+    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    pub fn idempotency_key(mut self, idempotency_key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(idempotency_key.into());
+        self
+    }
+
+    fn wire_value(&self, derived_idempotency_key: Option<String>) -> Value {
+        let mut item = serde_json::Map::new();
+        if let Some(payload) = &self.payload_envelope {
+            item.insert("payload".to_string(), payload.clone());
+            item.insert("payload_codec".to_string(), json!(DEFAULT_CODEC));
+        }
+        if let Some(reference) = &self.payload_reference {
+            item.insert("payload_reference".to_string(), json!(reference));
+        }
+        if let Some(item_type) = &self.item_type {
+            item.insert("item_type".to_string(), json!(item_type));
+        }
+        if let Some(content_type) = &self.content_type {
+            item.insert("content_type".to_string(), json!(content_type));
+        }
+        if let Some(key) = derived_idempotency_key
+            .as_ref()
+            .or(self.idempotency_key.as_ref())
+        {
+            item.insert("idempotency_key".to_string(), json!(key));
+        }
+        Value::Object(item)
+    }
+}
+
+/// One durable item at its stable zero-based offset.
+#[derive(Clone, Debug)]
+pub struct WorkflowStreamItem {
+    pub offset: u64,
+    pub payload: Option<Value>,
+    pub payload_envelope: Option<Value>,
+    pub payload_reference: Option<String>,
+    pub payload_codec: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub item_type: Option<String>,
+    pub content_type: Option<String>,
+    pub origin: Option<String>,
+    pub origin_reference: Option<String>,
+    pub emitted_at: Option<String>,
+    pub raw: Value,
+}
+
+/// One bounded at-least-once subscription page.
+#[derive(Clone, Debug)]
+pub struct WorkflowStreamPage {
+    pub stream: WorkflowStreamDescription,
+    pub items: Vec<WorkflowStreamItem>,
+    pub next_offset: u64,
+    pub terminal: bool,
+}
+
+/// Durable acceptance and deduplication outcome for an append request.
+#[derive(Clone, Debug)]
+pub struct WorkflowStreamAppendResult {
+    pub stream: WorkflowStreamDescription,
+    pub accepted_offsets: Vec<u64>,
+    pub accepted: u64,
+    pub deduped: u64,
+}
+
+#[derive(Deserialize)]
+struct WorkflowStreamListResponse {
+    #[serde(default)]
+    streams: Vec<WorkflowStreamDescription>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowStreamDescriptionResponse {
+    stream: WorkflowStreamDescription,
+}
+
+#[derive(Deserialize)]
+struct WorkflowStreamPageResponse {
+    stream: WorkflowStreamDescription,
+    #[serde(default)]
+    items: Vec<Value>,
+    next_offset: u64,
+    terminal: bool,
+}
+
+#[derive(Deserialize)]
+struct WorkflowStreamAppendResponse {
+    stream: WorkflowStreamDescription,
+    #[serde(default)]
+    accepted_offsets: Vec<u64>,
+    accepted: u64,
+    deduped: u64,
+}
+
 impl WorkflowDescription {
     pub fn is_completed(&self) -> bool {
         matches!(self.status.as_deref(), Some("completed" | "Completed"))
@@ -3891,6 +4279,8 @@ pub struct QueryTask {
 #[derive(Clone, Debug, Deserialize)]
 pub struct WorkflowTask {
     pub task_id: String,
+    #[serde(default)]
+    pub workflow_command_id: Option<String>,
     #[serde(default)]
     pub workflow_id: Option<String>,
     #[serde(default)]
@@ -5394,6 +5784,11 @@ impl Worker {
             continue_as_new_recommended: task.continue_as_new_recommended.unwrap_or(false),
             pressure: task.history_budget_pressure.clone(),
         };
+        let workflow_command_identity = task
+            .workflow_command_id
+            .clone()
+            .filter(|identity| !identity.is_empty())
+            .unwrap_or_default();
         let mut workflow_state = WorkflowState::new_with_identity(
             task.history_events,
             task.workflow_id,
@@ -5403,6 +5798,7 @@ impl Worker {
             resume_signal,
         )?;
         workflow_state.history_budget = history_budget;
+        workflow_state.workflow_command_identity = workflow_command_identity;
         let state = Arc::new(Mutex::new(workflow_state));
         let ctx = WorkflowContext { state };
         let mut future = (workflow.execute)(ctx.clone(), input);
@@ -5980,6 +6376,168 @@ impl WorkflowContext {
         Ok(value)
     }
 
+    /// Append output items at a deterministic workflow command boundary.
+    ///
+    /// Stable idempotency keys are derived from the server-provided durable
+    /// workflow command identity, command ordinal, and item index. Replay
+    /// consumes the recorded side effect and never emits another append.
+    pub fn append_workflow_stream(
+        &self,
+        stream_name: impl Into<String>,
+        items: &[WorkflowStreamAppendItem],
+        max_pending_items: Option<u64>,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Err(Error::Codec(
+                "workflow_stream_items_empty: append requires at least one item".to_string(),
+            ));
+        }
+        if max_pending_items == Some(0) {
+            return Err(Error::Codec(
+                "workflow_stream_pending_limit_invalid: max_pending_items must be positive"
+                    .to_string(),
+            ));
+        }
+        let stream_name = stream_name.into();
+        if stream_name.is_empty() {
+            return Err(Error::Codec(
+                "workflow_stream_name_invalid: stream name must not be empty".to_string(),
+            ));
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let command_ordinal = state.workflow_stream_command_counter;
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            state.workflow_stream_command_counter += 1;
+            return match recorded {
+                RecordedCommand::SideEffect { .. } => {
+                    state.command_cursor += 1;
+                    Ok(())
+                }
+                other => Err(command_mismatch(&other, "workflow stream append")),
+            };
+        }
+
+        let identity = Self::workflow_stream_command_identity(&state)?.to_string();
+        state.workflow_stream_command_counter += 1;
+        let wire_items = items
+            .iter()
+            .enumerate()
+            .map(|(item_index, item)| {
+                item.wire_value(Some(format!(
+                    "dw-stream:{identity}:{command_ordinal}:{item_index}"
+                )))
+            })
+            .collect::<Vec<_>>();
+        let mut directive = json!({
+            "operation": "append",
+            "stream_name": stream_name,
+            "command_identity": identity,
+            "command_ordinal": command_ordinal,
+            "items": wire_items,
+        });
+        if let Some(max_pending_items) = max_pending_items {
+            directive["max_pending_items"] = json!(max_pending_items);
+        }
+        let result = encode_typed_envelope(&AvroValue::Null, &state.payload_codec)?;
+        state.commands.push(json!({
+            "type": "record_side_effect",
+            "result": result,
+            "workflow_stream": directive,
+        }));
+        Ok(())
+    }
+
+    /// Close a run-scoped output stream at a deterministic command boundary.
+    pub fn close_workflow_stream(
+        &self,
+        stream_name: impl Into<String>,
+        retention_seconds: Option<u64>,
+    ) -> Result<()> {
+        self.finish_workflow_stream(stream_name.into(), None, retention_seconds)
+    }
+
+    /// Mark a run-scoped output stream errored at a deterministic command boundary.
+    pub fn error_workflow_stream(
+        &self,
+        stream_name: impl Into<String>,
+        error_reason: impl Into<String>,
+        retention_seconds: Option<u64>,
+    ) -> Result<()> {
+        let error_reason = error_reason.into();
+        if error_reason.is_empty() {
+            return Err(Error::Codec(
+                "workflow_stream_error_invalid: error reason must not be empty".to_string(),
+            ));
+        }
+        self.finish_workflow_stream(stream_name.into(), Some(error_reason), retention_seconds)
+    }
+
+    fn finish_workflow_stream(
+        &self,
+        stream_name: String,
+        error_reason: Option<String>,
+        retention_seconds: Option<u64>,
+    ) -> Result<()> {
+        if stream_name.is_empty() {
+            return Err(Error::Codec(
+                "workflow_stream_name_invalid: stream name must not be empty".to_string(),
+            ));
+        }
+        if retention_seconds == Some(0) {
+            return Err(Error::Codec(
+                "workflow_stream_retention_invalid: retention_seconds must be positive".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let command_ordinal = state.workflow_stream_command_counter;
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            state.workflow_stream_command_counter += 1;
+            return match recorded {
+                RecordedCommand::SideEffect { .. } => {
+                    state.command_cursor += 1;
+                    Ok(())
+                }
+                other => Err(command_mismatch(&other, "workflow stream close")),
+            };
+        }
+        let identity = Self::workflow_stream_command_identity(&state)?.to_string();
+        state.workflow_stream_command_counter += 1;
+        let mut directive = json!({
+            "operation": if error_reason.is_some() { "error" } else { "close" },
+            "stream_name": stream_name,
+            "command_identity": identity,
+            "command_ordinal": command_ordinal,
+        });
+        if let Some(error_reason) = error_reason {
+            directive["error_reason"] = json!(error_reason);
+        }
+        if let Some(retention_seconds) = retention_seconds {
+            directive["retention_seconds"] = json!(retention_seconds);
+        }
+        let result = encode_typed_envelope(&AvroValue::Null, &state.payload_codec)?;
+        state.commands.push(json!({
+            "type": "record_side_effect",
+            "result": result,
+            "workflow_stream": directive,
+        }));
+        Ok(())
+    }
+
+    fn workflow_stream_command_identity(state: &WorkflowState) -> Result<&str> {
+        let identity = state.workflow_command_identity.as_str();
+        if identity.is_empty() {
+            return Err(Error::MissingWorkflowCommandIdentity);
+        }
+        Ok(identity)
+    }
+
     /// Record a UUIDv4 once and return the same UUID on every replay.
     pub fn uuid_v4(&self) -> Result<Uuid> {
         self.side_effect(Uuid::new_v4)
@@ -6222,6 +6780,8 @@ struct WorkflowState {
     command_cursor: usize,
     matched_recorded_pending: bool,
     version_markers: HashMap<String, (i32, u64)>,
+    workflow_command_identity: String,
+    workflow_stream_command_counter: u64,
     commands: Vec<Value>,
 }
 
@@ -6294,6 +6854,8 @@ impl WorkflowState {
             .transpose()?;
         let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
         Ok(Self {
+            workflow_command_identity: String::new(),
+            workflow_stream_command_counter: 0,
             workflow_id,
             run_id,
             task_queue,
@@ -8217,7 +8779,10 @@ fn workflow_failure_command(error: &Error) -> Value {
 fn workflow_task_integrity_error(error: &Error) -> bool {
     matches!(
         error,
-        Error::NonDeterministicReplay(_) | Error::Protocol(_) | Error::WorkflowStatePoisoned
+        Error::NonDeterministicReplay(_)
+            | Error::Protocol(_)
+            | Error::MissingWorkflowCommandIdentity
+            | Error::WorkflowStatePoisoned
     )
 }
 
@@ -8816,6 +9381,7 @@ mod tests {
     ) -> WorkflowTask {
         WorkflowTask {
             task_id: format!("wft-{workflow_type}"),
+            workflow_command_id: None,
             workflow_id: Some(format!("wf-{workflow_type}")),
             run_id: Some(format!("run-{workflow_type}")),
             workflow_type: workflow_type.to_string(),
@@ -9149,6 +9715,89 @@ mod tests {
     }
 
     #[test]
+    fn workflow_stream_authoring_derives_identity_and_replay_skips_duplicate_append() {
+        let mut state = WorkflowState::new(
+            Vec::new(),
+            "rust-workers".to_string(),
+            DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect("workflow state");
+        state.workflow_command_identity = "command-7".to_string();
+        let context = WorkflowContext {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let item =
+            WorkflowStreamAppendItem::from_reference("s3://bucket/item.avro").item_type("receipt");
+
+        context
+            .append_workflow_stream("output", &[item], Some(10))
+            .expect("append command");
+        context
+            .error_workflow_stream("output", "producer failed", None)
+            .expect("error command");
+        let commands = context.take_commands().expect("commands");
+
+        assert_eq!(commands[0]["type"], "record_side_effect");
+        assert_eq!(
+            commands[0]["workflow_stream"]["command_identity"],
+            "command-7"
+        );
+        assert_eq!(commands[0]["workflow_stream"]["command_ordinal"], 0);
+        assert_eq!(
+            commands[0]["workflow_stream"]["items"][0]["idempotency_key"],
+            "dw-stream:command-7:0:0"
+        );
+        assert_eq!(commands[1]["workflow_stream"]["operation"], "error");
+
+        let recorded = history_event(
+            "SideEffectRecorded",
+            json!({"sequence": 1, "result": fixture_envelope(Value::Null)}),
+        );
+        let mut replay_state = WorkflowState::new(
+            vec![recorded],
+            "rust-workers".to_string(),
+            DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect("replay state");
+        replay_state.workflow_command_identity = "command-7".to_string();
+        let replay_context = WorkflowContext {
+            state: Arc::new(Mutex::new(replay_state)),
+        };
+        replay_context
+            .append_workflow_stream(
+                "output",
+                &[WorkflowStreamAppendItem::from_reference(
+                    "s3://bucket/item.avro",
+                )],
+                Some(10),
+            )
+            .expect("replayed append");
+        assert!(replay_context
+            .take_commands()
+            .expect("replayed commands")
+            .is_empty());
+    }
+
+    #[test]
+    fn workflow_stream_authoring_requires_server_durable_command_identity() {
+        let context = workflow_context(Vec::new());
+        let error = context
+            .append_workflow_stream(
+                "output",
+                &[WorkflowStreamAppendItem::from_reference(
+                    "s3://bucket/item.avro",
+                )],
+                None,
+            )
+            .expect_err("stream append without durable command identity must fail closed");
+
+        assert!(matches!(error, Error::MissingWorkflowCommandIdentity));
+        assert!(context.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
     fn cold_worker_replay_does_not_repeat_committed_side_effects_or_markers() {
         fn worker(calls: Arc<AtomicUsize>) -> Worker {
             let client = Client::new("http://127.0.0.1:8080").expect("client");
@@ -9170,6 +9819,7 @@ mod tests {
         fn task(history_events: Vec<HistoryEvent>) -> WorkflowTask {
             WorkflowTask {
                 task_id: "wft-side-effect-version".to_string(),
+                workflow_command_id: None,
                 workflow_id: Some("wf-side-effect-version".to_string()),
                 run_id: Some("run-side-effect-version".to_string()),
                 workflow_type: "rust.side-effect-version".to_string(),
@@ -11352,6 +12002,7 @@ mod tests {
 
         let task = |history_events| WorkflowTask {
             task_id: "wft-rust-timer-1".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer".to_string(),
@@ -11551,6 +12202,7 @@ mod tests {
         });
         let task = WorkflowTask {
             task_id: "wft-rust-failing-1".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-rust-failing".to_string()),
             run_id: Some("run-rust-failing".to_string()),
             workflow_type: "rust.failing".to_string(),
@@ -11690,6 +12342,7 @@ mod tests {
 
         let task = WorkflowTask {
             task_id: "wft-rust-timer-pending".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer.pending".to_string(),
@@ -11735,6 +12388,7 @@ mod tests {
         });
         let task = WorkflowTask {
             task_id: "wft-rust-timer-removed".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer.removed".to_string(),
@@ -11854,6 +12508,7 @@ mod tests {
     fn child_parent_task(event_type: &str, payload: Value) -> WorkflowTask {
         WorkflowTask {
             task_id: "wft-child-parent".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-parent".to_string()),
             run_id: Some("run-parent".to_string()),
             workflow_type: "rust.parent".to_string(),
@@ -12124,6 +12779,7 @@ mod tests {
             encode_value_envelope(&json!(["Rust"]), DEFAULT_CODEC).expect("signal arguments");
         let task = WorkflowTask {
             task_id: "wft-rust-signal-1".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-rust-hello".to_string()),
             run_id: Some("run-rust-hello".to_string()),
             workflow_type: "rust.hello_workflow".to_string(),
@@ -12166,6 +12822,7 @@ mod tests {
     fn workflow_task_appends_paginated_history_events() {
         let mut task = WorkflowTask {
             task_id: "wft-rust-pages-1".to_string(),
+            workflow_command_id: None,
             workflow_id: Some("wf-rust-pages".to_string()),
             run_id: Some("run-rust-pages".to_string()),
             workflow_type: "rust.hello_workflow".to_string(),
@@ -13947,7 +14604,10 @@ mod tests {
             panic!("expected typed protocol failure");
         };
         assert_eq!(failure.reason, "unsupported_protocol_version");
-        assert_eq!(failure.requested_version.as_deref(), Some("1.2"));
+        assert_eq!(
+            failure.requested_version.as_deref(),
+            Some(WORKER_PROTOCOL_VERSION)
+        );
         assert_eq!(
             server.request_count("/api/worker/registrations/mock-worker"),
             1
@@ -14908,7 +15568,7 @@ mod tests {
                 write_mock_response(
                     stream,
                     "400 Bad Request",
-                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.1","requested_version":"1.2"}"#,
+                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.14","requested_version":"1.15"}"#,
                 );
             } else if behavior.reject_deregistration {
                 write_mock_response(
