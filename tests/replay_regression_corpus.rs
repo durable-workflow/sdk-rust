@@ -12,11 +12,22 @@ use std::{
 };
 
 use durable_workflow::{
-    decode_payload, encode_avro_value, json, AvroValue, ChildWorkflowOptions, Client, Error,
-    ParallelOperation, ParallelResult, PayloadEnvelope, Value, Worker, DEFAULT_CODEC,
+    decode_payload, encode_payload, json, ChildWorkflowOptions, Client, Error, ParallelOperation,
+    ParallelResult, PayloadEnvelope, Value, Worker, WorkflowInstance, DEFAULT_CODEC,
 };
+use serde::{Deserialize, Serialize};
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TypedReplayContract {
+    message: String,
+}
+
+#[derive(Clone, Default)]
+struct TypedReplayState {
+    message: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 struct CapturedRequest {
@@ -326,7 +337,10 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         .ok_or_else(|| format!("{fixture_id}.workflow.type must be a string"))?;
     if !matches!(
         workflow_type,
-        "corpus.side-effect-version" | "corpus.workflow-stream" | "corpus.nested-parallel"
+        "corpus.side-effect-version"
+            | "corpus.workflow-stream"
+            | "corpus.nested-parallel"
+            | "corpus.typed-replayed"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -340,13 +354,13 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if !input.is_array() {
         return Err(format!("{fixture_id}.workflow.input must be an array"));
     }
-    if input != json!([]) {
+    if input != json!([]) && workflow_type != "corpus.typed-replayed" {
         return Err(format!(
             "{fixture_id}.workflow.input must use the declared empty Avro corpus input"
         ));
     }
     let input_envelope = serde_json::to_value(
-        encode_avro_value(&AvroValue::Array(Vec::new()))
+        encode_payload(&input, DEFAULT_CODEC)
             .map_err(|error| format!("encode {fixture_id} Avro input: {error}"))?,
     )
     .map_err(|error| format!("serialize {fixture_id} Avro input: {error}"))?;
@@ -455,6 +469,18 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 }
                 Ok(json!(["one", ["two", "three"]]))
             });
+        }
+        "corpus.typed-replayed" => {
+            worker.register_typed_replayed_workflow(
+                workflow_type,
+                TypedReplayState::default,
+                |ctx, input: TypedReplayContract, state: WorkflowInstance<TypedReplayState>| async move {
+                    let result: TypedReplayContract =
+                        ctx.activity_typed("corpus.typed.activity", input).await?;
+                    state.update(|current| current.message = Some(result.message.clone()))?;
+                    Ok(result)
+                },
+            );
         }
         _ => unreachable!(),
     }

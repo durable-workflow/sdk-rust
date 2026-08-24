@@ -6,7 +6,29 @@ use std::{
     time::Duration,
 };
 
-use durable_workflow::{json, Client, Error, Result, Uuid, Worker, WorkflowResultOptions};
+use durable_workflow::{
+    ActivityOptions, ActivityRetryPolicy, Client, Error, Result, Uuid, Worker,
+    WorkflowResultOptions,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GreetingRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GreetingActivityResult {
+    name: String,
+    greeting: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GreetingWorkflowResult {
+    name: String,
+    greeting: String,
+    intentional_activity_failure: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,29 +53,78 @@ async fn main() -> Result<()> {
         .worker_id(format!("rust-hello-{}", Uuid::new_v4()))
         .poll_timeout(Duration::from_secs(5));
 
-    worker.register_activity("rust.hello_activity", |_ctx, args| async move {
-        let name = args
-            .get(0)
-            .and_then(|value| value.as_str())
-            .unwrap_or("world");
-        Ok(json!({"greeting": format!("Hello, {name}!")}))
-    });
+    worker.register_typed_activity(
+        "rust.hello_activity",
+        |_ctx, request: GreetingRequest| async move {
+            Ok(GreetingActivityResult {
+                greeting: format!("Hello, {}!", request.name),
+                name: request.name,
+            })
+        },
+    );
+    worker.register_typed_activity(
+        "rust.intentional_failure",
+        |_ctx, request: GreetingRequest| async move {
+            Err::<GreetingActivityResult, _>(Error::WorkerLoop(format!(
+                "intentional greeting failure for {}",
+                request.name
+            )))
+        },
+    );
 
-    worker.register_workflow("rust.hello_workflow", |ctx, input| async move {
-        let name = input
-            .get(0)
-            .and_then(|value| value.as_str())
-            .unwrap_or("Rust");
-        ctx.activity("rust.hello_activity", json!([name])).await
-    });
+    let activity_queue = task_queue.clone();
+    worker.register_typed_workflow(
+        "rust.hello_workflow",
+        move |ctx, request: GreetingRequest| {
+            let activity_queue = activity_queue.clone();
+            async move {
+                let greeting: GreetingActivityResult = ctx
+                    .activity_typed_with_options(
+                        "rust.hello_activity",
+                        ActivityOptions::new()
+                            .task_queue(activity_queue.clone())
+                            .retry_policy(ActivityRetryPolicy::new(3))
+                            .start_to_close_timeout(Duration::from_secs(10))
+                            .schedule_to_close_timeout(Duration::from_secs(30)),
+                        request.clone(),
+                    )
+                    .await?;
+
+                let intentional_activity_failure = match ctx
+                    .activity_typed_with_options::<_, GreetingActivityResult>(
+                        "rust.intentional_failure",
+                        ActivityOptions::new()
+                            .task_queue(activity_queue)
+                            .retry_policy(ActivityRetryPolicy::new(1))
+                            .start_to_close_timeout(Duration::from_secs(10)),
+                        request,
+                    )
+                    .await
+                {
+                    Err(Error::ActivityFailed(_)) => true,
+                    Err(error) => return Err(error),
+                    Ok(_) => false,
+                };
+
+                Ok(GreetingWorkflowResult {
+                    name: greeting.name,
+                    greeting: greeting.greeting,
+                    intentional_activity_failure,
+                })
+            }
+        },
+    );
 
     let workflow_id = format!("rust-hello-{}", Uuid::new_v4());
+    let request = GreetingRequest {
+        name: std::env::var("GREETING_NAME").unwrap_or_else(|_| "Rust".to_string()),
+    };
     let handle = client
         .start_workflow(
             "rust.hello_workflow",
             &task_queue,
             &workflow_id,
-            json!(["Rust"]),
+            request.clone(),
         )
         .await?;
 
@@ -87,14 +158,20 @@ async fn main() -> Result<()> {
         return Err(Error::Timeout);
     }
 
-    let result = handle
-        .result(WorkflowResultOptions {
+    let result: GreetingWorkflowResult = handle
+        .result_typed(WorkflowResultOptions {
             poll_interval: Duration::from_millis(500),
             timeout: Duration::from_secs(30),
         })
         .await?;
 
+    if result.name != request.name || !result.intentional_activity_failure {
+        return Err(Error::WorkerLoop(
+            "typed workflow result did not preserve the request and failure path".to_string(),
+        ));
+    }
+
     println!("workflow_id={workflow_id}");
-    println!("result={result}");
+    println!("result={result:?}");
     Ok(())
 }

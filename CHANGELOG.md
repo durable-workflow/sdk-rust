@@ -2,6 +2,9 @@
 
 ## 2.0.0-rc.33
 
+- Add Serde-typed workflow, replayed-workflow, and activity handler adapters
+  over the fixed Avro Value protocol, with typed activity calls and workflow
+  results.
 - Add typed run-scoped Workflow Stream list, describe, resumable subscribe,
   append, close, and errored lifecycle operations, including replay-stable
   workflow-command authoring identity and opaque external payload references.

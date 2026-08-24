@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "rust-typed-handler-avro-request",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": [
+    "rust"
+  ],
+  "value": {
+    "type": "map",
+    "entries": [
+      {
+        "key": "message",
+        "value": {
+          "type": "string",
+          "value": "typed-handler"
+        }
+      }
+    ]
+  },
+  "framing": {
+    "encoding": "avro-single-object",
+    "wire_base64": "wwHioz3/VYAiNw4CDm1lc3NhZ2UKGnR5cGVkLWhhbmRsZXIA"
+  },
+  "failure_policy": {
+    "operation": "round_trip",
+    "error": null
+  },
+  "typed_handler": {
+    "workflow_type": "codec.typed.workflow",
+    "activity_type": "codec.typed.activity",
+    "message": "typed-handler"
+  }
+}

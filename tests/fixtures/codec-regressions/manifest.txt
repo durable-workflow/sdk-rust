@@ -3,4 +3,5 @@ malformed-task-payload-codecs-rejected.json
 nested-parallel-group-history-replay.json
 raw-json-null-payload-rejected.json
 raw-json-payload-rejected.json
+typed-handler-avro-request.json
 workflow-stream-typed-payload-reference.json

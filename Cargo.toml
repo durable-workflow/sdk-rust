@@ -99,4 +99,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+serde_bytes = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

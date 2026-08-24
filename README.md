@@ -53,10 +53,12 @@ or the
 Those setups create the <code>default</code> namespace used by the example.
 </p>
 
-The single-file [`examples/hello_world.rs`](examples/hello_world.rs) uses one
-task queue, starts a uniquely identified workflow, bounds its worker lifetime,
-and prints the completed greeting. Set the token to the value used while
-bootstrapping Server, then run:
+The single-file [`examples/hello_world.rs`](examples/hello_world.rs) defines
+Serde request and result structs for its workflow and activities. It uses one
+task queue, carries the caller-provided name through the completed workflow,
+applies retry and timeout options, handles one intentional activity failure,
+bounds its worker lifetime, and prints the typed result. Set the token to the
+value used while bootstrapping Server, then run:
 
 ```sh
 DURABLE_WORKFLOW_SERVER_URL=http://127.0.0.1:8080 \
@@ -64,7 +66,8 @@ DURABLE_WORKFLOW_TOKEN=dev-token \
 cargo run --example hello_world
 ```
 
-`TASK_QUEUE` optionally overrides the default `rust-workers` task queue.
+`TASK_QUEUE` optionally overrides the default `rust-workers` task queue and
+`GREETING_NAME` supplies the typed request field.
 `ClientBuilder::token` configures a shared credential for both protocol planes.
 Use `control_token` and `worker_token` for least-privilege credentials; the SDK
 never substitutes one scoped token for the other, and reports a configuration
@@ -150,6 +153,18 @@ bytes, UTF-8 strings, lists, and string-keyed maps distinct. The ordinary
 Serde adapter selects those fixed branches and rejects non-string map keys
 before encoding; use `PayloadEnvelope::avro_value()` and
 `decode_avro_value()` when the bytes branch must remain explicit.
+`Worker::register_typed_workflow`, `register_typed_replayed_workflow`, and
+`register_typed_activity` decode one request value into `DeserializeOwned`
+types and encode `Serialize` results without changing that wire contract.
+Use `WorkflowContext::activity_typed` (or its options variant) and
+`WorkflowHandle::result_typed` to keep application result types through the
+task-oriented path. Typed handlers accept a unit request from an empty argument
+list or one request value; multiple positional arguments are a shape mismatch.
+Serde byte-aware types such as `serde_bytes::ByteBuf` select the bytes branch;
+ordinary byte lists remain lists and are never silently coerced.
+Unsigned integers outside the signed 64-bit range, non-finite floats, and
+Serde values outside the fixed branches fail explicitly instead of coercing to
+another branch.
 JSON-safe values returned by inspection APIs are one-way display projections.
 Lossless query, update, result, activity, signal, and child-workflow code uses
 the corresponding `*_avro_value` API and requires the authoritative payload

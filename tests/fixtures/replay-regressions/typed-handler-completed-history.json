@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-typed-handler-completed-history",
+  "protocol_version": "1.15",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.typed-replayed",
+    "input": [
+      {
+        "message": "typed-handler"
+      }
+    ],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.typed.activity"
+      }
+    },
+    {
+      "event_type": "ActivityCompleted",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.typed.activity",
+        "result": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNw4CDm1lc3NhZ2UKGnR5cGVkLWhhbmRsZXIA"
+        },
+        "payload_codec": "avro"
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "message": "typed-handler"
+      }
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "message": "typed-handler"
+    }
+  }
+}

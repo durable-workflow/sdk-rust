@@ -2,9 +2,10 @@ use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use durable_workflow::{
     decode_avro_value, encode_avro_value, encode_payload, ActivityTask, AvroValue, Client,
-    ParallelGroupMetadata, PayloadEnvelope, QueryTask, WorkflowStreamAppendItem, WorkflowTask,
-    AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
+    ParallelGroupMetadata, PayloadEnvelope, QueryTask, Worker, WorkflowStreamAppendItem,
+    WorkflowTask, AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const FIXTURE_DIRECTORY: &str = "tests/fixtures/codec-regressions";
@@ -253,6 +254,48 @@ fn check_parallel_group_replay(fixture: &Value) {
     assert_eq!(replay["member_path"], serde_json::json!([1, 0]));
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct TypedHandlerRequest {
+    message: String,
+}
+
+fn check_typed_handler(fixture: &Value) {
+    let Some(contract) = fixture.get("typed_handler") else {
+        return;
+    };
+    let wire = fixture["framing"]["wire_base64"]
+        .as_str()
+        .expect("typed-handler Avro wire");
+    let envelope = PayloadEnvelope {
+        codec: DEFAULT_CODEC.to_string(),
+        blob: wire.to_string(),
+    };
+    let request: TypedHandlerRequest =
+        durable_workflow::decode_payload(&envelope).expect("decode typed-handler request");
+    assert_eq!(request.message, contract["message"]);
+    assert_eq!(
+        encode_payload(&request, DEFAULT_CODEC)
+            .expect("encode typed-handler result")
+            .blob,
+        wire,
+    );
+
+    let client = Client::new("http://127.0.0.1:8080").expect("typed-handler client");
+    let mut worker = Worker::new(client, "codec-regression");
+    worker.register_typed_workflow(
+        contract["workflow_type"]
+            .as_str()
+            .expect("typed workflow type"),
+        |_ctx, request: TypedHandlerRequest| async move { Ok(request) },
+    );
+    worker.register_typed_activity(
+        contract["activity_type"]
+            .as_str()
+            .expect("typed activity type"),
+        |_ctx, request: TypedHandlerRequest| async move { Ok(request) },
+    );
+}
+
 fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
@@ -341,6 +384,7 @@ fn check_corpus() {
         check_task_boundary(&fixture);
         check_workflow_stream_encoding(&fixture);
         check_parallel_group_replay(&fixture);
+        check_typed_handler(&fixture);
     }
 }
 

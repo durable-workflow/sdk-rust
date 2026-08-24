@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    any::{Any, TypeId},
+    any::{type_name, Any, TypeId},
     collections::{BTreeMap, HashMap},
     future::Future,
     io::{self, Read},
@@ -120,6 +120,16 @@ pub enum Error {
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
     ActivityNotRegistered(String),
+    #[error(
+        "{handler_kind} handler {handler_name:?} {value_kind} type {rust_type} is incompatible with the fixed Avro Value codec: {message}"
+    )]
+    HandlerType {
+        handler_kind: HandlerKind,
+        handler_name: String,
+        value_kind: HandlerValueKind,
+        rust_type: &'static str,
+        message: String,
+    },
     #[error("workflow future yielded without emitting a durable command")]
     WorkflowYieldedWithoutCommand,
     #[error(
@@ -159,6 +169,38 @@ pub enum Error {
     #[doc(hidden)]
     #[error("workflow requested continue as new")]
     ContinueAsNew(ContinueAsNewRequest),
+}
+
+/// The registered handler family reported by [`Error::HandlerType`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandlerKind {
+    Workflow,
+    Activity,
+}
+
+impl std::fmt::Display for HandlerKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        })
+    }
+}
+
+/// Whether a typed handler failed to adapt its input or result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandlerValueKind {
+    Input,
+    Result,
+}
+
+impl std::fmt::Display for HandlerValueKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Input => "input",
+            Self::Result => "result",
+        })
+    }
 }
 
 /// The lifecycle command sent to a workflow execution.
@@ -1415,6 +1457,85 @@ pub fn decode_payload<T: DeserializeOwned>(envelope: &PayloadEnvelope) -> Result
         DEFAULT_CODEC => decode_avro_value(envelope)?.deserialize(),
         other => Err(unsupported_payload_codec(other)),
     }
+}
+
+fn handler_type_error<T>(
+    handler_kind: HandlerKind,
+    handler_name: &str,
+    value_kind: HandlerValueKind,
+    message: impl Into<String>,
+) -> Error {
+    Error::HandlerType {
+        handler_kind,
+        handler_name: handler_name.to_string(),
+        value_kind,
+        rust_type: type_name::<T>(),
+        message: message.into(),
+    }
+}
+
+fn decode_handler_input<T: DeserializeOwned>(
+    arguments: AvroValue,
+    handler_kind: HandlerKind,
+    handler_name: &str,
+) -> Result<T> {
+    let argument = match arguments {
+        AvroValue::Array(mut arguments) if arguments.len() == 1 => {
+            arguments.pop().expect("one typed handler argument")
+        }
+        AvroValue::Array(arguments) if arguments.is_empty() => AvroValue::Null,
+        AvroValue::Array(arguments) => {
+            return Err(handler_type_error::<T>(
+                handler_kind,
+                handler_name,
+                HandlerValueKind::Input,
+                format!(
+                    "typed handlers accept one request value, but the task carried {} arguments",
+                    arguments.len()
+                ),
+            ));
+        }
+        argument => argument,
+    };
+
+    argument.deserialize().map_err(|error| {
+        handler_type_error::<T>(
+            handler_kind,
+            handler_name,
+            HandlerValueKind::Input,
+            error.to_string(),
+        )
+    })
+}
+
+fn encode_handler_result<T: Serialize>(
+    result: &T,
+    handler_kind: HandlerKind,
+    handler_name: &str,
+) -> Result<AvroValue> {
+    AvroValue::from_serialize(result).map_err(|error| {
+        handler_type_error::<T>(
+            handler_kind,
+            handler_name,
+            HandlerValueKind::Result,
+            error.to_string(),
+        )
+    })
+}
+
+fn decode_handler_result<T: DeserializeOwned>(
+    result: AvroValue,
+    handler_kind: HandlerKind,
+    handler_name: &str,
+) -> Result<T> {
+    result.deserialize().map_err(|error| {
+        handler_type_error::<T>(
+            handler_kind,
+            handler_name,
+            HandlerValueKind::Result,
+            error.to_string(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3766,6 +3887,15 @@ impl WorkflowHandle {
         self.result_avro_value_target(options, None).await
     }
 
+    /// Await the final result and decode it into a Serde application type.
+    pub async fn result_typed<T: DeserializeOwned>(
+        &self,
+        options: WorkflowResultOptions,
+    ) -> Result<T> {
+        let result = self.result_avro_value(options).await?;
+        decode_handler_result(result, HandlerKind::Workflow, &self.workflow_type)
+    }
+
     /// Await only the run identity originally selected by this handle.
     pub async fn result_selected_run(&self, options: WorkflowResultOptions) -> Result<Value> {
         let run_id = self.run_id.as_deref().ok_or_else(|| {
@@ -3783,6 +3913,15 @@ impl WorkflowHandle {
             Error::Codec("run_id is required for selected-run result".to_string())
         })?;
         self.result_avro_value_target(options, Some(run_id)).await
+    }
+
+    /// Await the selected run and decode its result into a Serde type.
+    pub async fn result_selected_run_typed<T: DeserializeOwned>(
+        &self,
+        options: WorkflowResultOptions,
+    ) -> Result<T> {
+        let result = self.result_selected_run_avro_value(options).await?;
+        decode_handler_result(result, HandlerKind::Workflow, &self.workflow_type)
     }
 
     async fn result_avro_value_target(
@@ -4855,6 +4994,48 @@ impl Worker {
         );
     }
 
+    /// Register a workflow with one Serde request value and a Serde result.
+    ///
+    /// This is an ergonomic adapter over the same fixed Avro Value protocol as
+    /// [`Worker::register_workflow_avro_value`]. It does not create or publish a
+    /// workflow-specific schema. A task must contain zero arguments for a unit
+    /// request or exactly one argument for every other request type.
+    ///
+    /// See the runnable
+    /// [`hello_world` example](https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs)
+    /// for typed workflow and activity contracts with retry and timeout policy.
+    pub fn register_typed_workflow<I, O, F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        handler: F,
+    ) where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(WorkflowContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        let workflow_type = workflow_type.into();
+        let handler_name = workflow_type.clone();
+        let handler = Arc::new(handler);
+        self.workflows.insert(
+            workflow_type,
+            RegisteredWorkflow {
+                execute: Arc::new(move |ctx, input| {
+                    let handler = Arc::clone(&handler);
+                    let handler_name = handler_name.clone();
+                    Box::pin(async move {
+                        let input =
+                            decode_handler_input::<I>(input, HandlerKind::Workflow, &handler_name)?;
+                        let result = handler(ctx, input).await?;
+                        encode_handler_result(&result, HandlerKind::Workflow, &handler_name)
+                    })
+                }),
+                replay: None,
+                state_type: None,
+            },
+        );
+    }
+
     /// Register a workflow on the lossless fixed Avro Value surface.
     pub fn register_workflow_avro_value<F, Fut>(
         &mut self,
@@ -4932,6 +5113,71 @@ impl Worker {
         );
     }
 
+    /// Register a replayable workflow with one Serde request value and result.
+    ///
+    /// Normal task execution and instance-state query replay both decode and
+    /// encode through the fixed Avro Value codec. The state factory and handler
+    /// otherwise follow [`Worker::register_replayed_workflow`].
+    pub fn register_typed_replayed_workflow<I, O, S, Factory, F, Fut>(
+        &mut self,
+        workflow_type: impl Into<String>,
+        state_factory: Factory,
+        handler: F,
+    ) where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        S: Clone + Send + Sync + 'static,
+        Factory: Fn() -> S + Send + Sync + 'static,
+        F: Fn(WorkflowContext, I, WorkflowInstance<S>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        let workflow_type = workflow_type.into();
+        let state_factory = Arc::new(state_factory);
+        let handler = Arc::new(handler);
+
+        let execute_name = workflow_type.clone();
+        let execute_factory = Arc::clone(&state_factory);
+        let execute_handler = Arc::clone(&handler);
+        let execute = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
+            let state = WorkflowInstance::new(execute_factory());
+            let handler = Arc::clone(&execute_handler);
+            let handler_name = execute_name.clone();
+            Box::pin(async move {
+                let input = decode_handler_input::<I>(input, HandlerKind::Workflow, &handler_name)?;
+                let result = handler(ctx, input, state).await?;
+                encode_handler_result(&result, HandlerKind::Workflow, &handler_name)
+            }) as WorkflowFuture
+        });
+
+        let replay_name = workflow_type.clone();
+        let replay = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
+            let state = WorkflowInstance::new(state_factory());
+            let snapshot_state = state.clone();
+            let snapshot: WorkflowStateSnapshot =
+                Arc::new(move || Ok(Arc::new(snapshot_state.snapshot()?) as ErasedWorkflowState));
+            let handler = Arc::clone(&handler);
+            let handler_name = replay_name.clone();
+            let future = async move {
+                let input = decode_handler_input::<I>(input, HandlerKind::Workflow, &handler_name)?;
+                let result = handler(ctx, input, state).await?;
+                encode_handler_result(&result, HandlerKind::Workflow, &handler_name)
+            };
+            ReplayedWorkflowInvocation {
+                future: Box::pin(future),
+                snapshot,
+            }
+        });
+
+        self.workflows.insert(
+            workflow_type,
+            RegisteredWorkflow {
+                execute,
+                replay: Some(replay),
+                state_type: Some(TypeId::of::<S>()),
+            },
+        );
+    }
+
     /// Register a replayable workflow on the lossless fixed Avro Value surface.
     pub fn register_replayed_workflow_avro_value<S, Factory, F, Fut>(
         &mut self,
@@ -4988,6 +5234,39 @@ impl Worker {
                 Box::pin(async move {
                     let result = handler(ctx, args.into_json()?).await?;
                     AvroValue::from_serialize(&result)
+                })
+            }),
+        );
+    }
+
+    /// Register an activity with one Serde request value and a Serde result.
+    ///
+    /// Inputs and results use the platform's fixed Avro Value schema. Shape
+    /// mismatches and unsupported Serde values return [`Error::HandlerType`]
+    /// with the activity name and Rust type.
+    pub fn register_typed_activity<I, O, F, Fut>(
+        &mut self,
+        activity_type: impl Into<String>,
+        handler: F,
+    ) where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(ActivityContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        let activity_type = activity_type.into();
+        let handler_name = activity_type.clone();
+        let handler = Arc::new(handler);
+        self.activities.insert(
+            activity_type,
+            Arc::new(move |ctx, input| {
+                let handler = Arc::clone(&handler);
+                let handler_name = handler_name.clone();
+                Box::pin(async move {
+                    let input =
+                        decode_handler_input::<I>(input, HandlerKind::Activity, &handler_name)?;
+                    let result = handler(ctx, input).await?;
+                    encode_handler_result(&result, HandlerKind::Activity, &handler_name)
                 })
             }),
         );
@@ -6411,6 +6690,52 @@ impl WorkflowContext {
     ) -> Result<AvroValue> {
         let mut call = self.activity_with_options(activity_type, options, args);
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
+    }
+
+    /// Schedule an activity with a Serde request and decode its Serde result.
+    pub async fn activity_typed<I, O>(&self, activity_type: impl Into<String>, args: I) -> Result<O>
+    where
+        I: Serialize,
+        O: DeserializeOwned,
+    {
+        self.activity_typed_with_options(activity_type, ActivityOptions::new(), args)
+            .await
+    }
+
+    /// Schedule an activity with options and decode its result into `O`.
+    ///
+    /// Both directions use the fixed Avro Value codec. In particular, this
+    /// method does not deserialize the JSON-safe inspection projection returned
+    /// by the dynamic [`ActivityCall`] future.
+    pub async fn activity_typed_with_options<I, O>(
+        &self,
+        activity_type: impl Into<String>,
+        options: ActivityOptions,
+        args: I,
+    ) -> Result<O>
+    where
+        I: Serialize,
+        O: DeserializeOwned,
+    {
+        let activity_type = activity_type.into();
+        let encoded = AvroValue::from_serialize(&args).map_err(|error| {
+            handler_type_error::<I>(
+                HandlerKind::Activity,
+                &activity_type,
+                HandlerValueKind::Input,
+                error.to_string(),
+            )
+        });
+        let mut call = ActivityCall {
+            ctx: self.clone(),
+            activity_type: activity_type.clone(),
+            options,
+            args: Some(encoded),
+            scheduled: false,
+            parallel_group_path: Vec::new(),
+        };
+        let result = std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await?;
+        decode_handler_result(result, HandlerKind::Activity, &activity_type)
     }
 
     /// Schedule and join a deterministic activity/child/timer group.
@@ -10424,6 +10749,48 @@ mod tests {
         ]
     }
 
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    struct TypedContract {
+        nested: TypedNested,
+        mode: TypedMode,
+        optional: Option<String>,
+        absent: Option<String>,
+        items: Vec<i64>,
+        labels: BTreeMap<String, String>,
+        bytes: serde_bytes::ByteBuf,
+        signed: i64,
+        finite: f64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    struct TypedNested {
+        enabled: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+    enum TypedMode {
+        Detailed { label: String },
+    }
+
+    fn typed_contract() -> TypedContract {
+        TypedContract {
+            nested: TypedNested { enabled: true },
+            mode: TypedMode::Detailed {
+                label: "compiler-checked".to_string(),
+            },
+            optional: Some("present".to_string()),
+            absent: None,
+            items: vec![i64::MIN, 0, i64::MAX],
+            labels: BTreeMap::from([
+                ("language".to_string(), "rust".to_string()),
+                ("wire".to_string(), "avro".to_string()),
+            ]),
+            bytes: serde_bytes::ByteBuf::from(vec![0, 0xff, 7]),
+            signed: -9_223_372_036_854_775_000,
+            finite: 12.5,
+        }
+    }
+
     #[derive(Clone, Debug, Default, PartialEq)]
     struct ReplayCounterState {
         loaded: Option<String>,
@@ -11568,6 +11935,199 @@ mod tests {
         let envelope = PayloadEnvelope::avro(&value).expect("encode");
         assert_eq!(envelope.codec, DEFAULT_CODEC);
         assert_eq!(decode_payload::<Value>(&envelope).expect("decode"), value);
+    }
+
+    #[tokio::test]
+    async fn typed_handler_adapters_round_trip_serde_contracts_on_the_fixed_wire() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_workflow(
+            "typed.contract.workflow",
+            |_ctx, input: TypedContract| async move { Ok(input) },
+        );
+        worker.register_typed_activity(
+            "typed.contract.activity",
+            |_ctx, input: TypedContract| async move { Ok(input) },
+        );
+
+        let expected = typed_contract();
+        let arguments = AvroValue::Array(vec![
+            AvroValue::from_serialize(&expected).expect("typed request")
+        ]);
+        let envelope = encode_typed_envelope(&arguments, DEFAULT_CODEC).expect("arguments");
+        let mut workflow = workflow_task("typed.contract.workflow", Vec::new(), DEFAULT_CODEC);
+        workflow.arguments = Some(envelope.clone());
+        let commands = worker
+            .execute_workflow_task(workflow)
+            .expect("typed workflow task");
+        let workflow_result: TypedContract =
+            decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                .expect("workflow result envelope")
+                .deserialize()
+                .expect("workflow result type");
+        assert_eq!(workflow_result, expected);
+
+        let activity = ActivityTask {
+            task_id: "typed-contract-activity".to_string(),
+            activity_attempt_id: Some("typed-contract-attempt".to_string()),
+            attempt_id: None,
+            activity_type: "typed.contract.activity".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(envelope),
+            attempt_number: 1,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+        let activity_result: TypedContract = worker
+            .execute_activity_task(activity)
+            .await
+            .expect("typed activity task")
+            .deserialize()
+            .expect("activity result type");
+        assert_eq!(activity_result, expected);
+    }
+
+    #[tokio::test]
+    async fn typed_handler_errors_include_handler_name_direction_and_rust_type() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_workflow(
+            "typed.shape.workflow",
+            |_ctx, input: TypedContract| async move { Ok(input) },
+        );
+        worker.register_typed_activity("typed.unsupported.activity", |_ctx, (): ()| async move {
+            Ok(f64::NAN)
+        });
+
+        let mut workflow = workflow_task("typed.shape.workflow", Vec::new(), DEFAULT_CODEC);
+        workflow.arguments = Some(
+            encode_typed_envelope(
+                &AvroValue::Array(vec![
+                    AvroValue::String("first".to_string()),
+                    AvroValue::String("second".to_string()),
+                ]),
+                DEFAULT_CODEC,
+            )
+            .expect("malformed typed arguments"),
+        );
+        let commands = worker
+            .execute_workflow_task(workflow)
+            .expect("shape mismatch becomes a workflow failure");
+        let message = commands[0]["message"].as_str().expect("failure message");
+        assert!(message.contains("workflow handler \"typed.shape.workflow\" input type"));
+        assert!(message.contains(type_name::<TypedContract>()));
+        assert!(message.contains("task carried 2 arguments"));
+
+        let activity = ActivityTask {
+            task_id: "typed-unsupported-activity".to_string(),
+            activity_attempt_id: Some("typed-unsupported-attempt".to_string()),
+            attempt_id: None,
+            activity_type: "typed.unsupported.activity".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            arguments: Some(
+                encode_typed_envelope(&AvroValue::Array(Vec::new()), DEFAULT_CODEC)
+                    .expect("unit arguments"),
+            ),
+            attempt_number: 1,
+            lease_owner: Some("rust-worker".to_string()),
+        };
+        let Error::HandlerType {
+            handler_kind,
+            handler_name,
+            value_kind,
+            rust_type,
+            message,
+        } = worker
+            .execute_activity_task(activity)
+            .await
+            .expect_err("non-finite handler output must fail")
+        else {
+            panic!("expected contextual handler type failure");
+        };
+        assert_eq!(handler_kind, HandlerKind::Activity);
+        assert_eq!(handler_name, "typed.unsupported.activity");
+        assert_eq!(value_kind, HandlerValueKind::Result);
+        assert_eq!(rust_type, type_name::<f64>());
+        assert!(message.contains("non_finite_float"));
+    }
+
+    #[tokio::test]
+    async fn typed_replayed_workflow_decodes_input_and_activity_result_losslessly() {
+        #[derive(Clone, Default)]
+        struct State {
+            observed: Option<TypedContract>,
+        }
+
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_replayed_workflow(
+            "typed.contract.replayed",
+            State::default,
+            |ctx, input: TypedContract, state| async move {
+                let result: TypedContract =
+                    ctx.activity_typed("typed.contract.activity", input).await?;
+                state.update(|current| current.observed = Some(result.clone()))?;
+                Ok(result)
+            },
+        );
+        worker.register_replayed_query::<State, _, _>(
+            "typed.contract.replayed",
+            "observed",
+            |_ctx, state, _args| async move {
+                Ok(json!(state.observed.as_ref().map(|value| value.signed)))
+            },
+        );
+
+        let expected = typed_contract();
+        let typed_value = AvroValue::from_serialize(&expected).expect("typed value");
+        let workflow_arguments =
+            encode_typed_envelope(&AvroValue::Array(vec![typed_value.clone()]), DEFAULT_CODEC)
+                .expect("workflow arguments");
+        let result = encode_typed_envelope(&typed_value, DEFAULT_CODEC).expect("activity result");
+        let task = QueryTask {
+            query_task_id: "typed-replay-query".to_string(),
+            query_task_attempt: 1,
+            lease_owner: Some("rust-worker".to_string()),
+            workflow_id: Some("typed-replay".to_string()),
+            run_id: Some("typed-replay-run".to_string()),
+            workflow_type: "typed.contract.replayed".to_string(),
+            query_name: "observed".to_string(),
+            payload_codec: DEFAULT_CODEC.to_string(),
+            workflow_arguments: Some(workflow_arguments),
+            query_arguments: Some(
+                encode_typed_envelope(&AvroValue::Array(Vec::new()), DEFAULT_CODEC)
+                    .expect("query arguments"),
+            ),
+            history_events: vec![
+                history_event(
+                    "ActivityScheduled",
+                    json!({
+                        "sequence": 1,
+                        "activity_type": "typed.contract.activity"
+                    }),
+                ),
+                history_event(
+                    "ActivityCompleted",
+                    json!({
+                        "sequence": 1,
+                        "activity_type": "typed.contract.activity",
+                        "payload_codec": DEFAULT_CODEC,
+                        "result": result
+                    }),
+                ),
+            ],
+            history_export: None,
+            run_status: Some("completed".to_string()),
+        };
+
+        assert_eq!(
+            worker
+                .execute_query_task(task)
+                .await
+                .expect("typed replay query")
+                .deserialize::<i64>()
+                .expect("query result"),
+            expected.signed
+        );
     }
 
     #[tokio::test]
