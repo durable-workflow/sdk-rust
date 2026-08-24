@@ -5,6 +5,13 @@
 - Add typed run-scoped Workflow Stream list, describe, resumable subscribe,
   append, close, and errored lifecycle operations, including replay-stable
   workflow-command authoring identity and opaque external payload references.
+- Add deterministic `WorkflowContext::parallel` / `join` composition for
+  nested activity, child-workflow, timer, and mixed groups. Results retain the
+  input shape and order; typed partial failures retain member paths, shared
+  protocol metadata, causes, and completed siblings across restart and replay.
+- Add `WorkflowContext::saga` with deterministic reverse-order activity
+  compensation after failure or cooperative cancellation. Compensation
+  failures preserve both the initiating and compensation errors.
 
 ## 2.0.0-rc.32
 

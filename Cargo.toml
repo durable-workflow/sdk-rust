@@ -58,6 +58,15 @@ workflow-streams-operations = ["list", "describe", "subscribe", "append", "close
 workflow-streams-authoring-command = "record_side_effect.workflow_stream"
 workflow-streams-delivery = "at-least-once"
 workflow-streams-external-payload-references = "opaque-reference"
+deterministic-parallel = true
+parallel-authoring = "parallel+join"
+parallel-members = ["activity", "child", "timer", "mixed", "nested"]
+parallel-result-order = "input-position"
+parallel-group-metadata = ["parallel_group_id", "parallel_group_kind", "parallel_group_base_sequence", "parallel_group_size", "parallel_group_index", "parallel_group_path"]
+saga-compensation = true
+saga-compensation-order = "reverse-registration-sequential"
+saga-compensation-failure-policy = "stop-first-preserve-initiating-and-compensation"
+saga-cancellation = "cooperative"
 
 [package.metadata.durable-workflow.documentation]
 path-order = ["general", "cloud"]

@@ -126,7 +126,11 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 `activity-failure-reasons`. Lifecycle releases publish
 `workflow-lifecycle-commands`, `workflow-lifecycle-run-targeting`, and
 `workflow-terminal-outcomes`; releases with start deadline support also publish
-`workflow-start-timeouts`. Workflow Stream authoring requires the `1.15`
+`workflow-start-timeouts`. Parallel and saga releases publish
+`deterministic-parallel`, `parallel-authoring`, `parallel-members`,
+`parallel-result-order`, `parallel-group-metadata`, `saga-compensation`, and
+the compensation order, failure-policy, and cancellation fields. Workflow
+Stream authoring requires the `1.15`
 feature floor, while query-task poll, complete, and fail requests retain their
 `1.8` minimum.
 
@@ -319,6 +323,69 @@ from the final run. Use `describe_selected_run`, `signal_selected_run`,
 `query_selected_run`, or `result_selected_run` when the handle's original run
 identity is intentional. Selected-run commands are rejected once that run is
 historical; selected description and result remain available for inspection.
+
+## Deterministic parallel groups
+
+`WorkflowContext::parallel` (also available as `join`) describes an entire
+activity, child-workflow, timer, or mixed barrier before suspension. Nested
+groups schedule every ordinary durable leaf and return the same nested shape
+in input order:
+
+```rust
+# use durable_workflow::{json, ChildWorkflowOptions, ParallelOperation, Result, WorkflowContext};
+# use std::time::Duration;
+# async fn quote(ctx: WorkflowContext) -> Result<usize> {
+let results = ctx.parallel(vec![
+    ParallelOperation::activity("load-profile", json!(["customer-42"])),
+    ParallelOperation::group(vec![
+        ParallelOperation::child_workflow(
+            "quote-shipping",
+            ChildWorkflowOptions::new("shipping-workers"),
+            json!(["customer-42"]),
+        ),
+        ParallelOperation::timer(Duration::from_secs(1)),
+    ]),
+]).await?;
+# Ok(results.len())
+# }
+```
+
+Each leaf uses the existing activity, child, or timer wire command and carries
+the shared `parallel_group_*` identity plus its full outer-to-inner path.
+`Error::ParallelFailed` reports a typed cause, deterministic member path, group
+metadata, and already completed siblings. Exact duplicate deliveries are
+ignored; restart, late completion, and completed-history replay keep positional
+result and failure selection stable.
+
+## Saga compensation
+
+Create a saga, register each compensation only after its forward step succeeds,
+then pass the forward result to `Saga::finish`:
+
+```rust
+# use durable_workflow::{json, Result, Value, WorkflowContext};
+# async fn book(ctx: WorkflowContext) -> Result<Value> {
+let mut saga = ctx.saga();
+let outcome = async {
+    let flight = ctx.activity("trip.reserve-flight", json!([])).await?;
+    saga.add_compensation("trip.cancel-flight", json!([flight]))?;
+
+    let hotel = ctx.activity("trip.reserve-hotel", json!([])).await?;
+    saga.add_compensation("trip.cancel-hotel", json!([hotel]))?;
+
+    ctx.throw_if_cancellation_requested()?;
+    ctx.activity("trip.charge", json!([])).await?;
+    Ok(json!({"status": "booked"}))
+}.await;
+
+saga.finish(outcome).await
+# }
+```
+
+Failure or cooperative cancellation runs ordinary compensation activities
+sequentially in reverse registration order. Compensation stops on its first
+failure; `Error::SagaCompensationFailed` retains both typed failures, the
+compensation activity type, and its deterministic registration order.
 
 ## Workflow cancellation, termination, and outcomes
 

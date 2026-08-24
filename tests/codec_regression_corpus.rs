@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use durable_workflow::{
     decode_avro_value, encode_avro_value, encode_payload, ActivityTask, AvroValue, Client,
-    PayloadEnvelope, QueryTask, WorkflowStreamAppendItem, WorkflowTask,
+    ParallelGroupMetadata, PayloadEnvelope, QueryTask, WorkflowStreamAppendItem, WorkflowTask,
     AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
 };
 use serde_json::Value;
@@ -224,6 +224,35 @@ fn check_workflow_stream_encoding(fixture: &Value) {
     assert!(referenced.payload_envelope.is_none());
 }
 
+fn check_parallel_group_replay(fixture: &Value) {
+    let Some(replay) = fixture.get("parallel_group_replay") else {
+        return;
+    };
+    let scheduled: Vec<ParallelGroupMetadata> = serde_json::from_value(
+        replay
+            .get("scheduled_path")
+            .cloned()
+            .expect("parallel-group scheduled path"),
+    )
+    .expect("parse parallel-group scheduled path");
+    let completed: Vec<ParallelGroupMetadata> = serde_json::from_value(
+        replay
+            .get("completed_path")
+            .cloned()
+            .expect("parallel-group completed path"),
+    )
+    .expect("parse parallel-group completed path");
+
+    assert_eq!(
+        scheduled, completed,
+        "schedule and completion paths must match"
+    );
+    assert_eq!(scheduled.len(), 2, "fixture must retain one nested path");
+    assert_eq!(scheduled[0].parallel_group_id, "parallel-calls:1:3");
+    assert_eq!(scheduled[1].parallel_group_id, "parallel-calls:2:2");
+    assert_eq!(replay["member_path"], serde_json::json!([1, 0]));
+}
+
 fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
@@ -311,6 +340,7 @@ fn check_corpus() {
 
         check_task_boundary(&fixture);
         check_workflow_stream_encoding(&fixture);
+        check_parallel_group_replay(&fixture);
     }
 }
 

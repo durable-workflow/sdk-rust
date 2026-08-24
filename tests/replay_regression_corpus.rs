@@ -12,8 +12,8 @@ use std::{
 };
 
 use durable_workflow::{
-    decode_payload, encode_avro_value, json, AvroValue, Client, PayloadEnvelope, Value, Worker,
-    DEFAULT_CODEC,
+    decode_payload, encode_avro_value, json, AvroValue, ChildWorkflowOptions, Client, Error,
+    ParallelOperation, ParallelResult, PayloadEnvelope, Value, Worker, DEFAULT_CODEC,
 };
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
@@ -326,7 +326,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         .ok_or_else(|| format!("{fixture_id}.workflow.type must be a string"))?;
     if !matches!(
         workflow_type,
-        "corpus.side-effect-version" | "corpus.workflow-stream"
+        "corpus.side-effect-version" | "corpus.workflow-stream" | "corpus.nested-parallel"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -417,6 +417,43 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 )?;
                 ctx.close_workflow_stream("tokens", None)?;
                 Ok(json!("done"))
+            });
+        }
+        "corpus.nested-parallel" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let results = ctx
+                    .parallel(vec![
+                        ParallelOperation::activity("first", json!([])),
+                        ParallelOperation::group(vec![
+                            ParallelOperation::child_workflow(
+                                "second",
+                                ChildWorkflowOptions::new("child-workers"),
+                                json!([]),
+                            ),
+                            ParallelOperation::activity("third", json!([])),
+                        ]),
+                    ])
+                    .await?;
+                let [ParallelResult::Activity(first), ParallelResult::Group(nested)] =
+                    results.as_slice()
+                else {
+                    return Err(Error::WorkerLoop(
+                        "nested parallel replay returned the wrong outer shape".to_string(),
+                    ));
+                };
+                let [ParallelResult::ChildWorkflow(second), ParallelResult::Activity(third)] =
+                    nested.as_slice()
+                else {
+                    return Err(Error::WorkerLoop(
+                        "nested parallel replay returned the wrong inner shape".to_string(),
+                    ));
+                };
+                if first != "one" || second.result != "two" || third != "three" {
+                    return Err(Error::WorkerLoop(
+                        "nested parallel replay did not preserve input-order results".to_string(),
+                    ));
+                }
+                Ok(json!(["one", ["two", "three"]]))
             });
         }
         _ => unreachable!(),

@@ -97,6 +97,14 @@ pub enum Error {
     #[error(transparent)]
     ActivityFailed(ActivityFailure),
     #[error(transparent)]
+    ParallelFailed(ParallelFailure),
+    #[error(transparent)]
+    SagaCompensationFailed(SagaCompensationFailure),
+    #[error(transparent)]
+    InvalidParallelGroup(ParallelGroupError),
+    #[error(transparent)]
+    WorkflowCancellationRequested(WorkflowCancellationRequested),
+    #[error(transparent)]
     WorkflowCommandRejected(WorkflowCommandRejection),
     #[error(transparent)]
     WorkflowFailed(WorkflowTerminalOutcome),
@@ -519,6 +527,110 @@ pub struct ChildWorkflowAvroResult {
     pub result: AvroValue,
 }
 
+/// Stable identity for one enclosing deterministic parallel group.
+///
+/// The same fields are attached to every ordinary activity, timer, or child
+/// workflow command in the group. Nested leaves carry an outer-to-inner path;
+/// no Rust-specific wire command is introduced.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ParallelGroupMetadata {
+    pub parallel_group_id: String,
+    pub parallel_group_kind: String,
+    pub parallel_group_base_sequence: u64,
+    pub parallel_group_size: usize,
+    pub parallel_group_index: usize,
+}
+
+/// One input-ordered result returned by [`WorkflowContext::parallel`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParallelResult {
+    Activity(Value),
+    ChildWorkflow(ChildWorkflowResult),
+    Timer,
+    Group(Vec<ParallelResult>),
+}
+
+/// Lossless fixed-Avro counterpart to [`ParallelResult`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParallelAvroResult {
+    Activity(AvroValue),
+    ChildWorkflow(ChildWorkflowAvroResult),
+    Timer,
+    Group(Vec<ParallelAvroResult>),
+}
+
+impl ParallelAvroResult {
+    fn into_json_result(self) -> Result<ParallelResult> {
+        match self {
+            Self::Activity(value) => Ok(ParallelResult::Activity(value.into_json()?)),
+            Self::ChildWorkflow(result) => Ok(ParallelResult::ChildWorkflow(ChildWorkflowResult {
+                parent: result.parent,
+                child: result.child,
+                child_workflow_type: result.child_workflow_type,
+                result: result.result.into_json()?,
+            })),
+            Self::Timer => Ok(ParallelResult::Timer),
+            Self::Group(results) => Ok(ParallelResult::Group(
+                results
+                    .into_iter()
+                    .map(Self::into_json_result)
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+        }
+    }
+}
+
+/// One successful leaf retained when another parallel member failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParallelCompletion {
+    pub member_path: Vec<usize>,
+    pub result: ParallelResult,
+}
+
+/// A deterministic join failed after some siblings had already completed.
+///
+/// `cause` retains the typed activity, child-workflow, cancellation, or codec
+/// error. `completed` is declaration ordered and contains only durable
+/// successes observed in the same replay. Late sibling completions can add
+/// entries on a later replay without changing `member_path` or the selected
+/// positional failure.
+#[derive(Debug, Error)]
+#[error("parallel group {group_id} member {member_path:?} failed: {cause}")]
+pub struct ParallelFailure {
+    pub group_id: String,
+    pub member_path: Vec<usize>,
+    pub group_path: Vec<ParallelGroupMetadata>,
+    pub completed: Vec<ParallelCompletion>,
+    #[source]
+    pub cause: Box<Error>,
+}
+
+/// Stable validation error returned before an invalid group emits commands.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("invalid deterministic parallel group ({reason}): {message}")]
+pub struct ParallelGroupError {
+    pub reason: &'static str,
+    pub member_path: Vec<usize>,
+    pub message: String,
+}
+
+/// Cooperative workflow cancellation observed at an author-controlled point.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workflow cancellation was requested")]
+pub struct WorkflowCancellationRequested;
+
+/// A forward saga failure followed by a terminal compensation failure.
+#[derive(Debug, Error)]
+#[error(
+    "saga forward execution failed; compensation activity {compensation_activity_type} (registration {compensation_registration_order}) also failed: {compensation_failure}"
+)]
+pub struct SagaCompensationFailure {
+    pub initiating_failure: Box<Error>,
+    pub compensation_failure: Box<Error>,
+    pub compensation_activity_type: String,
+    pub compensation_registration_order: usize,
+}
+
 /// Server behavior when a parent closes while its child is still open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParentClosePolicy {
@@ -772,6 +884,64 @@ impl ActivityOptions {
             )?,
             heartbeat_timeout: timeout_seconds("heartbeat_timeout", self.heartbeat_timeout)?,
         })
+    }
+}
+
+/// A deferred durable leaf or nested group for [`WorkflowContext::parallel`].
+///
+/// Constructors capture arguments but perform no I/O. The join validates the
+/// complete tree, attaches the existing parallel-group metadata to every
+/// ordinary command, schedules all leaves, and then suspends.
+pub enum ParallelOperation {
+    Activity {
+        activity_type: String,
+        options: ActivityOptions,
+        arguments: Result<AvroValue>,
+    },
+    ChildWorkflow {
+        workflow_type: String,
+        options: ChildWorkflowOptions,
+        arguments: Result<AvroValue>,
+    },
+    Timer(Duration),
+    Group(Vec<ParallelOperation>),
+}
+
+impl ParallelOperation {
+    pub fn activity<T: Serialize>(activity_type: impl Into<String>, args: T) -> Self {
+        Self::activity_with_options(activity_type, ActivityOptions::new(), args)
+    }
+
+    pub fn activity_with_options<T: Serialize>(
+        activity_type: impl Into<String>,
+        options: ActivityOptions,
+        args: T,
+    ) -> Self {
+        Self::Activity {
+            activity_type: activity_type.into(),
+            options,
+            arguments: AvroValue::from_serialize(&args),
+        }
+    }
+
+    pub fn child_workflow<T: Serialize>(
+        workflow_type: impl Into<String>,
+        options: ChildWorkflowOptions,
+        args: T,
+    ) -> Self {
+        Self::ChildWorkflow {
+            workflow_type: workflow_type.into(),
+            options,
+            arguments: AvroValue::from_serialize(&args),
+        }
+    }
+
+    pub fn timer(duration: Duration) -> Self {
+        Self::Timer(duration)
+    }
+
+    pub fn group(operations: Vec<ParallelOperation>) -> Self {
+        Self::Group(operations)
     }
 }
 
@@ -4286,6 +4456,8 @@ pub struct WorkflowTask {
     #[serde(default)]
     pub run_id: Option<String>,
     pub workflow_type: String,
+    #[serde(default)]
+    pub cancel_requested: bool,
     #[serde(
         default = "missing_task_payload_codec",
         deserialize_with = "deserialize_task_payload_codec"
@@ -5799,6 +5971,7 @@ impl Worker {
         )?;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
+        workflow_state.cancel_requested = task.cancel_requested;
         let state = Arc::new(Mutex::new(workflow_state));
         let ctx = WorkflowContext { state };
         let mut future = (workflow.execute)(ctx.clone(), input);
@@ -6217,6 +6390,7 @@ impl WorkflowContext {
             options,
             args: Some(AvroValue::from_serialize(&args)),
             scheduled: false,
+            parallel_group_path: Vec::new(),
         }
     }
 
@@ -6237,6 +6411,57 @@ impl WorkflowContext {
     ) -> Result<AvroValue> {
         let mut call = self.activity_with_options(activity_type, options, args);
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
+    }
+
+    /// Schedule and join a deterministic activity/child/timer group.
+    ///
+    /// Nested groups retain their input shape. Every durable leaf is scheduled
+    /// before this future yields, results are assembled by declaration order,
+    /// and a failure returns [`Error::ParallelFailed`] with typed cause,
+    /// declaration path, stable group metadata, and completed siblings.
+    pub fn parallel(&self, operations: Vec<ParallelOperation>) -> ParallelCall {
+        ParallelCall::new(self.clone(), operations)
+    }
+
+    /// Alias for [`WorkflowContext::parallel`].
+    pub fn join(&self, operations: Vec<ParallelOperation>) -> ParallelCall {
+        self.parallel(operations)
+    }
+
+    /// Lossless fixed-Avro variant of [`WorkflowContext::parallel`].
+    pub async fn parallel_avro_value(
+        &self,
+        operations: Vec<ParallelOperation>,
+    ) -> Result<Vec<ParallelAvroResult>> {
+        let mut call = self.parallel(operations);
+        std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
+    }
+
+    /// Create a workflow-local deterministic compensation registry.
+    pub fn saga(&self) -> Saga {
+        Saga::new(self.clone())
+    }
+
+    /// Whether the current workflow task carries a cooperative cancel request.
+    pub fn is_cancellation_requested(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(state.cancel_requested)
+    }
+
+    /// Raise a typed cooperative cancellation at an author-controlled point.
+    ///
+    /// Passing this result to [`Saga::finish`] compensates already registered
+    /// forward steps before the cancellation remains the initiating outcome.
+    pub fn throw_if_cancellation_requested(&self) -> Result<()> {
+        if self.is_cancellation_requested()? {
+            return Err(Error::WorkflowCancellationRequested(
+                WorkflowCancellationRequested,
+            ));
+        }
+        Ok(())
     }
 
     pub fn wait_signal(&self, signal_name: impl Into<String>) -> SignalCall {
@@ -6285,6 +6510,7 @@ impl WorkflowContext {
             delay_seconds,
             scheduled: false,
             matched_pending: false,
+            parallel_group_path: Vec::new(),
         }
     }
 
@@ -6678,6 +6904,7 @@ impl WorkflowContext {
             args: Some(AvroValue::from_serialize(&args)),
             scheduled: false,
             matched_pending: false,
+            parallel_group_path: Vec::new(),
         }
     }
 
@@ -6773,6 +7000,7 @@ struct WorkflowState {
     task_queue: String,
     payload_codec: String,
     history_budget: WorkflowHistoryBudget,
+    cancel_requested: bool,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
     recorded_continue_as_new_sequence: Option<u64>,
@@ -6864,6 +7092,12 @@ impl WorkflowState {
                 event_count,
                 ..WorkflowHistoryBudget::default()
             },
+            cancel_requested: history.iter().any(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "WorkflowCancellationRequested" | "WorkflowCancelRequested"
+                )
+            }),
             resume_signal,
             recorded_commands,
             recorded_continue_as_new_sequence,
@@ -6883,16 +7117,19 @@ enum RecordedCommand {
         activity_type: Option<String>,
         options: Option<RecordedActivityOptions>,
         outcome: Option<ActivityOutcome>,
+        parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
     Timer {
         sequence: u64,
         delay_seconds: u64,
         fired: bool,
+        parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
     ChildWorkflow {
         sequence: u64,
         workflow_type: Option<String>,
         outcome: Option<ChildWorkflowOutcome>,
+        parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
     SignalWait {
         sequence: u64,
@@ -7122,12 +7359,662 @@ struct ResumeSignal {
     arguments: Vec<AvroValue>,
 }
 
+const MAX_PARALLEL_OPERATIONS: usize = 1000;
+
+fn parallel_group_prefix(kind: &str) -> &'static str {
+    match kind {
+        "activity" => "parallel-activities",
+        "child" => "parallel-children",
+        "timer" => "parallel-timers",
+        _ => "parallel-calls",
+    }
+}
+
+fn parallel_group_entry(
+    base_sequence: u64,
+    size: usize,
+    index: usize,
+    kind: &str,
+) -> ParallelGroupMetadata {
+    ParallelGroupMetadata {
+        parallel_group_id: format!("{}:{base_sequence}:{size}", parallel_group_prefix(kind)),
+        parallel_group_kind: kind.to_string(),
+        parallel_group_base_sequence: base_sequence,
+        parallel_group_size: size,
+        parallel_group_index: index,
+    }
+}
+
+fn apply_parallel_group_path(
+    command: &mut serde_json::Map<String, Value>,
+    path: &[ParallelGroupMetadata],
+) {
+    let Some(inner) = path.last() else {
+        return;
+    };
+    command.insert(
+        "parallel_group_id".to_string(),
+        json!(inner.parallel_group_id),
+    );
+    command.insert(
+        "parallel_group_kind".to_string(),
+        json!(inner.parallel_group_kind),
+    );
+    command.insert(
+        "parallel_group_base_sequence".to_string(),
+        json!(inner.parallel_group_base_sequence),
+    );
+    command.insert(
+        "parallel_group_size".to_string(),
+        json!(inner.parallel_group_size),
+    );
+    command.insert(
+        "parallel_group_index".to_string(),
+        json!(inner.parallel_group_index),
+    );
+    command.insert("parallel_group_path".to_string(), json!(path));
+}
+
+fn ensure_parallel_path_matches(
+    sequence: u64,
+    recorded: Option<&[ParallelGroupMetadata]>,
+    expected: &[ParallelGroupMetadata],
+) -> Result<()> {
+    match (recorded, expected.is_empty()) {
+        (None, true) => Ok(()),
+        (Some(recorded), false) if recorded == expected => Ok(()),
+        (None, false) => Err(invalid_recorded_history(
+            "parallel_group_metadata_missing",
+            sequence,
+            &serde_json::to_string(expected).unwrap_or_default(),
+            "<missing>",
+            "recorded parallel member is missing its durable group path",
+        )),
+        (Some(recorded), true) => Err(invalid_recorded_history(
+            "parallel_group_shape_mismatch",
+            sequence,
+            "sequential command",
+            &serde_json::to_string(recorded).unwrap_or_default(),
+            "recorded command belonged to a parallel group but current code schedules it sequentially",
+        )),
+        (Some(recorded), false) => Err(invalid_recorded_history(
+            "parallel_group_shape_mismatch",
+            sequence,
+            &serde_json::to_string(recorded).unwrap_or_default(),
+            &serde_json::to_string(expected).unwrap_or_default(),
+            "recorded parallel-group identity or path changed during replay",
+        )),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ParallelShape {
+    Leaf,
+    Group(Vec<ParallelShape>),
+}
+
+struct ParallelDescriptor {
+    operation: ParallelOperation,
+    offset: usize,
+    member_path: Vec<usize>,
+    group_path: Vec<ParallelGroupMetadata>,
+}
+
+fn parallel_leaf_count(operations: &[ParallelOperation]) -> usize {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            ParallelOperation::Group(children) => parallel_leaf_count(children),
+            _ => 1,
+        })
+        .sum()
+}
+
+fn parallel_operation_kind(operation: &ParallelOperation) -> Option<&'static str> {
+    match operation {
+        ParallelOperation::Activity { .. } => Some("activity"),
+        ParallelOperation::ChildWorkflow { .. } => Some("child"),
+        ParallelOperation::Timer(_) => Some("timer"),
+        ParallelOperation::Group(children) => parallel_group_kind(children),
+    }
+}
+
+fn parallel_group_kind(operations: &[ParallelOperation]) -> Option<&'static str> {
+    let mut kind = None;
+    for operation in operations {
+        let Some(operation_kind) = parallel_operation_kind(operation) else {
+            continue;
+        };
+        match kind {
+            None => kind = Some(operation_kind),
+            Some(current) if current == operation_kind => {}
+            Some(_) => return Some("mixed"),
+        }
+    }
+    kind
+}
+
+fn validate_parallel_operations(
+    operations: &[ParallelOperation],
+    member_path: &mut Vec<usize>,
+    root: bool,
+) -> Result<()> {
+    let leaves = parallel_leaf_count(operations);
+    if leaves > MAX_PARALLEL_OPERATIONS {
+        return Err(Error::InvalidParallelGroup(ParallelGroupError {
+            reason: "fan_out_limit_exceeded",
+            member_path: member_path.clone(),
+            message: format!(
+                "group contains {leaves} durable leaves; the limit is {MAX_PARALLEL_OPERATIONS}"
+            ),
+        }));
+    }
+    if !root && operations.is_empty() {
+        return Err(Error::InvalidParallelGroup(ParallelGroupError {
+            reason: "nested_group_empty",
+            member_path: member_path.clone(),
+            message: "a nested group must contain at least one durable leaf".to_string(),
+        }));
+    }
+
+    for (index, operation) in operations.iter().enumerate() {
+        member_path.push(index);
+        match operation {
+            ParallelOperation::Activity {
+                options, arguments, ..
+            } => {
+                options
+                    .validate()
+                    .map_err(|error| Error::InvalidActivityOptions(error))?;
+                if let Err(error) = arguments {
+                    return Err(Error::InvalidParallelGroup(ParallelGroupError {
+                        reason: "arguments_invalid",
+                        member_path: member_path.clone(),
+                        message: error.to_string(),
+                    }));
+                }
+            }
+            ParallelOperation::ChildWorkflow {
+                options, arguments, ..
+            } => {
+                validate_parallel_child_options(options)?;
+                if let Err(error) = arguments {
+                    return Err(Error::InvalidParallelGroup(ParallelGroupError {
+                        reason: "arguments_invalid",
+                        member_path: member_path.clone(),
+                        message: error.to_string(),
+                    }));
+                }
+            }
+            ParallelOperation::Timer(duration)
+                if duration.as_secs() == u64::MAX && duration.subsec_nanos() > 0 =>
+            {
+                return Err(Error::TimerDurationOverflow);
+            }
+            ParallelOperation::Timer(_) => {}
+            ParallelOperation::Group(children) => {
+                validate_parallel_operations(children, member_path, false)?;
+            }
+        }
+        member_path.pop();
+    }
+    Ok(())
+}
+
+fn validate_parallel_child_options(options: &ChildWorkflowOptions) -> Result<()> {
+    if options.task_queue.trim().is_empty() {
+        return Err(Error::InvalidChildWorkflowOptions(
+            "task_queue must not be empty".to_string(),
+        ));
+    }
+    for (name, value) in [
+        (
+            "execution_timeout_seconds",
+            options.execution_timeout_seconds,
+        ),
+        ("run_timeout_seconds", options.run_timeout_seconds),
+    ] {
+        if value == Some(0) {
+            return Err(Error::InvalidChildWorkflowOptions(format!(
+                "{name} must be at least 1"
+            )));
+        }
+    }
+    if options
+        .retry_policy
+        .as_ref()
+        .is_some_and(|policy| policy.max_attempts == Some(0))
+    {
+        return Err(Error::InvalidChildWorkflowOptions(
+            "retry_policy.max_attempts must be at least 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parallel_shape(operations: &[ParallelOperation]) -> ParallelShape {
+    ParallelShape::Group(
+        operations
+            .iter()
+            .map(|operation| match operation {
+                ParallelOperation::Group(children) => parallel_shape(children),
+                _ => ParallelShape::Leaf,
+            })
+            .collect(),
+    )
+}
+
+fn parallel_descriptors(
+    operations: Vec<ParallelOperation>,
+    base_sequence: u64,
+) -> Result<Vec<ParallelDescriptor>> {
+    let size = parallel_leaf_count(&operations);
+    let kind = parallel_group_kind(&operations).unwrap_or("activity");
+    let mut descriptors = Vec::with_capacity(size);
+    let mut cursor = 0;
+
+    for (index, operation) in operations.into_iter().enumerate() {
+        match operation {
+            ParallelOperation::Group(children) => {
+                let child_base = base_sequence
+                    .checked_add(u64::try_from(cursor).unwrap_or(u64::MAX))
+                    .ok_or(Error::TimerDurationOverflow)?;
+                for mut descriptor in parallel_descriptors(children, child_base)? {
+                    let outer_index = cursor + descriptor.offset;
+                    descriptor.group_path.insert(
+                        0,
+                        parallel_group_entry(base_sequence, size, outer_index, kind),
+                    );
+                    descriptor.member_path.insert(0, index);
+                    descriptor.offset = outer_index;
+                    descriptors.push(descriptor);
+                }
+                cursor = descriptors.len();
+            }
+            operation => {
+                descriptors.push(ParallelDescriptor {
+                    operation,
+                    offset: cursor,
+                    member_path: vec![index],
+                    group_path: vec![parallel_group_entry(base_sequence, size, cursor, kind)],
+                });
+                cursor += 1;
+            }
+        }
+    }
+    Ok(descriptors)
+}
+
+enum ParallelLeafCall {
+    Activity(ActivityCall),
+    ChildWorkflow(ChildWorkflowCall),
+    Timer(TimerCall),
+}
+
+impl ParallelLeafCall {
+    fn poll_avro_value(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<ParallelAvroResult>> {
+        match self {
+            Self::Activity(call) => Pin::new(call)
+                .poll_avro_value(cx)
+                .map_ok(ParallelAvroResult::Activity),
+            Self::ChildWorkflow(call) => Pin::new(call)
+                .poll_avro_value(cx)
+                .map_ok(ParallelAvroResult::ChildWorkflow),
+            Self::Timer(call) => Pin::new(call)
+                .poll(cx)
+                .map_ok(|()| ParallelAvroResult::Timer),
+        }
+    }
+}
+
+struct ParallelLeaf {
+    call: ParallelLeafCall,
+    member_path: Vec<usize>,
+    group_path: Vec<ParallelGroupMetadata>,
+    result: Option<ParallelAvroResult>,
+}
+
+/// Future returned by [`WorkflowContext::parallel`].
+pub struct ParallelCall {
+    ctx: WorkflowContext,
+    operations: Option<Vec<ParallelOperation>>,
+    shape: Option<ParallelShape>,
+    leaves: Vec<ParallelLeaf>,
+}
+
+impl ParallelCall {
+    fn new(ctx: WorkflowContext, operations: Vec<ParallelOperation>) -> Self {
+        Self {
+            ctx,
+            operations: Some(operations),
+            shape: None,
+            leaves: Vec::new(),
+        }
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let operations = self.operations.take().unwrap_or_default();
+        validate_parallel_operations(&operations, &mut Vec::new(), true)?;
+        self.shape = Some(parallel_shape(&operations));
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        let base_sequence = {
+            let state = self
+                .ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            if let Some(recorded) = state.recorded_commands.get(state.command_cursor) {
+                recorded.sequence()
+            } else {
+                let last = state
+                    .recorded_commands
+                    .last()
+                    .map(RecordedCommand::sequence)
+                    .unwrap_or(0);
+                last.checked_add(u64::try_from(state.commands.len()).unwrap_or(u64::MAX))
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .ok_or_else(|| {
+                        Error::InvalidParallelGroup(ParallelGroupError {
+                            reason: "sequence_overflow",
+                            member_path: Vec::new(),
+                            message: "parallel group sequence identity overflowed u64".to_string(),
+                        })
+                    })?
+            }
+        };
+
+        self.leaves = parallel_descriptors(operations, base_sequence)?
+            .into_iter()
+            .map(|descriptor| {
+                let path = descriptor.group_path.clone();
+                let call = match descriptor.operation {
+                    ParallelOperation::Activity {
+                        activity_type,
+                        options,
+                        arguments,
+                    } => ParallelLeafCall::Activity(ActivityCall {
+                        ctx: self.ctx.clone(),
+                        activity_type,
+                        options,
+                        args: Some(arguments),
+                        scheduled: false,
+                        parallel_group_path: path,
+                    }),
+                    ParallelOperation::ChildWorkflow {
+                        workflow_type,
+                        options,
+                        arguments,
+                    } => ParallelLeafCall::ChildWorkflow(ChildWorkflowCall {
+                        ctx: self.ctx.clone(),
+                        workflow_type,
+                        options,
+                        args: Some(arguments),
+                        scheduled: false,
+                        matched_pending: false,
+                        parallel_group_path: path,
+                    }),
+                    ParallelOperation::Timer(duration) => {
+                        let delay_seconds = duration
+                            .as_secs()
+                            .checked_add(u64::from(duration.subsec_nanos() > 0));
+                        ParallelLeafCall::Timer(TimerCall {
+                            ctx: self.ctx.clone(),
+                            delay_seconds,
+                            scheduled: false,
+                            matched_pending: false,
+                            parallel_group_path: path,
+                        })
+                    }
+                    ParallelOperation::Group(_) => {
+                        unreachable!("parallel descriptors contain only durable leaves")
+                    }
+                };
+                ParallelLeaf {
+                    call,
+                    member_path: descriptor.member_path,
+                    group_path: descriptor.group_path,
+                    result: None,
+                }
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn poll_avro_value(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<Vec<ParallelAvroResult>>> {
+        if self.operations.is_some() {
+            if let Err(error) = self.initialize() {
+                return Poll::Ready(Err(error));
+            }
+        }
+        if self.leaves.is_empty() {
+            return Poll::Ready(Ok(Vec::new()));
+        }
+
+        let mut failures = Vec::new();
+        let mut pending = false;
+        for (index, leaf) in self.leaves.iter_mut().enumerate() {
+            if leaf.result.is_some() {
+                continue;
+            }
+            match leaf.call.poll_avro_value(cx) {
+                Poll::Ready(Ok(result)) => leaf.result = Some(result),
+                Poll::Ready(Err(error)) => failures.push((index, error)),
+                Poll::Pending => pending = true,
+            }
+        }
+
+        if !failures.is_empty() {
+            if let Some(position) = failures
+                .iter()
+                .position(|(_, error)| workflow_task_integrity_error(error))
+            {
+                return Poll::Ready(Err(failures.remove(position).1));
+            }
+            failures.sort_by_key(|(index, _)| *index);
+            let (failed_index, cause) = failures.remove(0);
+            let failed = &self.leaves[failed_index];
+            let completed = self
+                .leaves
+                .iter()
+                .filter_map(|leaf| {
+                    leaf.result
+                        .clone()
+                        .and_then(|result| result.into_json_result().ok())
+                        .map(|result| ParallelCompletion {
+                            member_path: leaf.member_path.clone(),
+                            result,
+                        })
+                })
+                .collect();
+            let group_id = failed
+                .group_path
+                .first()
+                .map(|entry| entry.parallel_group_id.clone())
+                .unwrap_or_default();
+            return Poll::Ready(Err(Error::ParallelFailed(ParallelFailure {
+                group_id,
+                member_path: failed.member_path.clone(),
+                group_path: failed.group_path.clone(),
+                completed,
+                cause: Box::new(cause),
+            })));
+        }
+        if pending {
+            return Poll::Pending;
+        }
+
+        let mut flat_results = self
+            .leaves
+            .iter_mut()
+            .map(|leaf| leaf.result.take().expect("completed parallel leaf"))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let results = parallel_results_for_shape(
+            self.shape.as_ref().expect("initialized parallel shape"),
+            &mut flat_results,
+        );
+        Poll::Ready(Ok(match results {
+            ParallelAvroResult::Group(results) => results,
+            ParallelAvroResult::Activity(_)
+            | ParallelAvroResult::ChildWorkflow(_)
+            | ParallelAvroResult::Timer => unreachable!("root parallel shape is a group"),
+        }))
+    }
+}
+
+fn parallel_results_for_shape(
+    shape: &ParallelShape,
+    flat_results: &mut impl Iterator<Item = ParallelAvroResult>,
+) -> ParallelAvroResult {
+    match shape {
+        ParallelShape::Leaf => flat_results.next().expect("one result per parallel leaf"),
+        ParallelShape::Group(children) => ParallelAvroResult::Group(
+            children
+                .iter()
+                .map(|child| parallel_results_for_shape(child, flat_results))
+                .collect(),
+        ),
+    }
+}
+
+impl Future for ParallelCall {
+    type Output = Result<Vec<ParallelResult>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        self.poll_avro_value(cx)
+            .map_ok(|results| {
+                results
+                    .into_iter()
+                    .map(ParallelAvroResult::into_json_result)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .map_ok(|result| result)
+            .flatten_result()
+    }
+}
+
+trait PollNestedResultExt<T> {
+    fn flatten_result(self) -> Poll<Result<T>>;
+}
+
+impl<T> PollNestedResultExt<T> for Poll<Result<Result<T>>> {
+    fn flatten_result(self) -> Poll<Result<T>> {
+        match self {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct SagaCompensation {
+    activity_type: String,
+    options: ActivityOptions,
+    arguments: AvroValue,
+    registration_order: usize,
+}
+
+/// Workflow-local deterministic saga compensation helper.
+///
+/// Register each compensation only after its forward step succeeds. Passing
+/// the forward `Result` to [`Saga::finish`] runs compensations sequentially in
+/// reverse registration order after any failure, including cooperative
+/// cancellation. Each compensation is an ordinary durable activity, so replay,
+/// duplicate delivery, and worker restart use existing history semantics.
+pub struct Saga {
+    ctx: WorkflowContext,
+    compensations: Vec<SagaCompensation>,
+}
+
+impl Saga {
+    fn new(ctx: WorkflowContext) -> Self {
+        Self {
+            ctx,
+            compensations: Vec::new(),
+        }
+    }
+
+    pub fn add_compensation<T: Serialize>(
+        &mut self,
+        activity_type: impl Into<String>,
+        args: T,
+    ) -> Result<&mut Self> {
+        self.add_compensation_with_options(activity_type, ActivityOptions::new(), args)
+    }
+
+    pub fn add_compensation_with_options<T: Serialize>(
+        &mut self,
+        activity_type: impl Into<String>,
+        options: ActivityOptions,
+        args: T,
+    ) -> Result<&mut Self> {
+        let activity_type = activity_type.into();
+        if activity_type.trim().is_empty() || activity_type.trim() != activity_type {
+            return Err(Error::Codec(
+                "saga compensation activity type must be non-empty without surrounding whitespace"
+                    .to_string(),
+            ));
+        }
+        options.validate().map_err(Error::InvalidActivityOptions)?;
+        let arguments = AvroValue::from_serialize(&args)?;
+        let registration_order = self.compensations.len() + 1;
+        self.compensations.push(SagaCompensation {
+            activity_type,
+            options,
+            arguments,
+            registration_order,
+        });
+        Ok(self)
+    }
+
+    /// Compensate `initiating_failure` and return the failure that must remain.
+    pub async fn compensate(mut self, initiating_failure: Error) -> Error {
+        while let Some(compensation) = self.compensations.pop() {
+            if let Err(compensation_failure) = self
+                .ctx
+                .activity_with_options(
+                    compensation.activity_type.clone(),
+                    compensation.options,
+                    compensation.arguments,
+                )
+                .await
+            {
+                if workflow_task_integrity_error(&compensation_failure) {
+                    return compensation_failure;
+                }
+                return Error::SagaCompensationFailed(SagaCompensationFailure {
+                    initiating_failure: Box::new(initiating_failure),
+                    compensation_failure: Box::new(compensation_failure),
+                    compensation_activity_type: compensation.activity_type,
+                    compensation_registration_order: compensation.registration_order,
+                });
+            }
+        }
+        initiating_failure
+    }
+
+    /// Return a successful forward value or compensate and preserve its failure.
+    pub async fn finish<T>(self, outcome: Result<T>) -> Result<T> {
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.compensate(error).await),
+        }
+    }
+}
+
 pub struct ActivityCall {
     ctx: WorkflowContext,
     activity_type: String,
     options: ActivityOptions,
     args: Option<Result<AvroValue>>,
     scheduled: bool,
+    parallel_group_path: Vec<ParallelGroupMetadata>,
 }
 
 impl ActivityCall {
@@ -7170,8 +8057,16 @@ impl ActivityCall {
                     activity_type,
                     options: recorded_options,
                     outcome,
+                    parallel_group_path,
                     ..
                 } => {
+                    if let Err(error) = ensure_parallel_path_matches(
+                        sequence,
+                        parallel_group_path.as_deref(),
+                        &self.parallel_group_path,
+                    ) {
+                        return Poll::Ready(Err(error));
+                    }
                     if let Some(recorded_type) = activity_type {
                         if recorded_type != self.activity_type {
                             return Poll::Ready(Err(Error::NonDeterministicReplay(
@@ -7285,6 +8180,7 @@ impl ActivityCall {
             if let Some(retry_policy) = options.retry_policy {
                 command.insert("retry_policy".to_string(), retry_policy);
             }
+            apply_parallel_group_path(&mut command, &self.parallel_group_path);
             state.commands.push(Value::Object(command));
             self.scheduled = true;
         }
@@ -7311,6 +8207,7 @@ pub struct TimerCall {
     delay_seconds: Option<u64>,
     scheduled: bool,
     matched_pending: bool,
+    parallel_group_path: Vec<ParallelGroupMetadata>,
 }
 
 impl Future for TimerCall {
@@ -7336,8 +8233,16 @@ impl Future for TimerCall {
                     sequence,
                     delay_seconds,
                     fired,
+                    parallel_group_path,
                     ..
                 } => {
+                    if let Err(error) = ensure_parallel_path_matches(
+                        sequence,
+                        parallel_group_path.as_deref(),
+                        &self.parallel_group_path,
+                    ) {
+                        return Poll::Ready(Err(error));
+                    }
                     if delay_seconds != requested_delay {
                         return Poll::Ready(Err(Error::NonDeterministicReplay(
                             ReplayFailure::new(
@@ -7363,10 +8268,12 @@ impl Future for TimerCall {
         }
 
         if !self.scheduled {
-            state.commands.push(json!({
-                "type": "start_timer",
-                "delay_seconds": requested_delay,
-            }));
+            let mut command = serde_json::Map::from_iter([
+                ("type".to_string(), json!("start_timer")),
+                ("delay_seconds".to_string(), json!(requested_delay)),
+            ]);
+            apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            state.commands.push(Value::Object(command));
             self.scheduled = true;
         }
 
@@ -7382,6 +8289,7 @@ pub struct ChildWorkflowCall {
     args: Option<Result<AvroValue>>,
     scheduled: bool,
     matched_pending: bool,
+    parallel_group_path: Vec<ParallelGroupMetadata>,
 }
 
 impl ChildWorkflowCall {
@@ -7405,8 +8313,16 @@ impl ChildWorkflowCall {
                 RecordedCommand::ChildWorkflow {
                     workflow_type,
                     outcome,
+                    parallel_group_path,
                     ..
                 } => {
+                    if let Err(error) = ensure_parallel_path_matches(
+                        sequence,
+                        parallel_group_path.as_deref(),
+                        &self.parallel_group_path,
+                    ) {
+                        return Poll::Ready(Err(error));
+                    }
                     if let Some(recorded_type) = workflow_type {
                         if recorded_type != self.workflow_type {
                             return Poll::Ready(Err(Error::NonDeterministicReplay(
@@ -7512,6 +8428,7 @@ impl ChildWorkflowCall {
             if let Some(seconds) = self.options.run_timeout_seconds {
                 object.insert("run_timeout_seconds".to_string(), json!(seconds));
             }
+            apply_parallel_group_path(object, &self.parallel_group_path);
             state.commands.push(command);
             self.scheduled = true;
         }
@@ -7842,6 +8759,160 @@ fn validate_optional_inbound_payload(value: Option<&Value>, codec: &str) -> Resu
     Ok(())
 }
 
+fn recorded_parallel_group_entry(payload: &Value, sequence: u64) -> Result<ParallelGroupMetadata> {
+    let group_id = payload_string(payload, "parallel_group_id").ok_or_else(|| {
+        invalid_recorded_history(
+            "parallel_group_metadata_invalid",
+            sequence,
+            "non-empty parallel_group_id",
+            &payload.to_string(),
+            "parallel-group history is missing its stable identity",
+        )
+    })?;
+    let kind = payload_string(payload, "parallel_group_kind").ok_or_else(|| {
+        invalid_recorded_history(
+            "parallel_group_metadata_invalid",
+            sequence,
+            "activity, child, timer, or mixed group kind",
+            &payload.to_string(),
+            "parallel-group history is missing its group kind",
+        )
+    })?;
+    if !matches!(kind.as_str(), "activity" | "child" | "timer" | "mixed") {
+        return Err(invalid_recorded_history(
+            "parallel_group_metadata_invalid",
+            sequence,
+            "activity, child, timer, or mixed group kind",
+            &kind,
+            "parallel-group history contains an unsupported group kind",
+        ));
+    }
+    let base_sequence = payload
+        .get("parallel_group_base_sequence")
+        .and_then(value_as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "positive parallel_group_base_sequence",
+                &payload.to_string(),
+                "parallel-group history contains an invalid base sequence",
+            )
+        })?;
+    let size = payload
+        .get("parallel_group_size")
+        .and_then(value_as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=MAX_PARALLEL_OPERATIONS).contains(value))
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "bounded positive parallel_group_size",
+                &payload.to_string(),
+                "parallel-group history contains an invalid group size",
+            )
+        })?;
+    let index = payload
+        .get("parallel_group_index")
+        .and_then(value_as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value < size)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "parallel_group_index within group bounds",
+                &payload.to_string(),
+                "parallel-group history contains an invalid member index",
+            )
+        })?;
+    if base_sequence.checked_add(u64::try_from(index).unwrap_or(u64::MAX)) != Some(sequence) {
+        return Err(invalid_recorded_history(
+            "parallel_group_metadata_invalid",
+            sequence,
+            "base sequence plus member index equals workflow sequence",
+            &payload.to_string(),
+            "parallel-group path does not preserve durable workflow position",
+        ));
+    }
+    let expected_id = format!("{}:{base_sequence}:{size}", parallel_group_prefix(&kind));
+    if group_id != expected_id {
+        return Err(invalid_recorded_history(
+            "parallel_group_metadata_invalid",
+            sequence,
+            &expected_id,
+            &group_id,
+            "parallel-group history contains an incompatible stable group ID",
+        ));
+    }
+    Ok(ParallelGroupMetadata {
+        parallel_group_id: group_id,
+        parallel_group_kind: kind,
+        parallel_group_base_sequence: base_sequence,
+        parallel_group_size: size,
+        parallel_group_index: index,
+    })
+}
+
+fn recorded_parallel_group_path(
+    events: &[&HistoryEvent],
+    sequence: u64,
+) -> Result<Option<Vec<ParallelGroupMetadata>>> {
+    let mut recorded: Option<Vec<ParallelGroupMetadata>> = None;
+    for event in events {
+        let payload = &event.payload;
+        let has_metadata = payload.get("parallel_group_path").is_some()
+            || payload.get("parallel_group_id").is_some()
+            || payload.get("parallel_group_kind").is_some()
+            || payload.get("parallel_group_base_sequence").is_some()
+            || payload.get("parallel_group_size").is_some()
+            || payload.get("parallel_group_index").is_some();
+        if !has_metadata {
+            continue;
+        }
+
+        let top_level = recorded_parallel_group_entry(payload, sequence)?;
+        let path = match payload.get("parallel_group_path") {
+            None => vec![top_level.clone()],
+            Some(Value::Array(entries)) if !entries.is_empty() => entries
+                .iter()
+                .map(|entry| recorded_parallel_group_entry(entry, sequence))
+                .collect::<Result<Vec<_>>>()?,
+            Some(value) => {
+                return Err(invalid_recorded_history(
+                    "parallel_group_metadata_invalid",
+                    sequence,
+                    "non-empty parallel_group_path list",
+                    &value.to_string(),
+                    "parallel-group history contains an invalid group path",
+                ));
+            }
+        };
+        if path.last() != Some(&top_level) {
+            return Err(invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                &serde_json::to_string(&path.last()).unwrap_or_default(),
+                &serde_json::to_string(&top_level).unwrap_or_default(),
+                "parallel-group top-level fields do not match the innermost path entry",
+            ));
+        }
+        if recorded.as_ref().is_some_and(|existing| existing != &path) {
+            return Err(invalid_recorded_history(
+                "parallel_group_history_conflict",
+                sequence,
+                &serde_json::to_string(&recorded.as_ref()).unwrap_or_default(),
+                &serde_json::to_string(&path).unwrap_or_default(),
+                "parallel-group metadata changed between scheduling and resolution history",
+            ));
+        }
+        recorded = Some(path);
+    }
+    Ok(recorded)
+}
+
 fn recorded_commands(
     events: &[HistoryEvent],
     fallback_codec: &str,
@@ -7988,6 +9059,8 @@ fn recorded_commands(
             }
 
             if !activity_events.is_empty() {
+                let parallel_group_path =
+                    recorded_parallel_group_path(&activity_events, sequence)?;
                 let scheduled_count = activity_events
                     .iter()
                     .filter(|event| event.event_type == "ActivityScheduled")
@@ -8037,7 +9110,12 @@ fn recorded_commands(
                         )
                     })
                     .collect();
-                if terminal.len() > 1 {
+                let duplicate_delivery = terminal.first().is_some_and(|first| {
+                    terminal.iter().all(|event| {
+                        event.event_type == first.event_type && event.payload == first.payload
+                    })
+                });
+                if terminal.len() > 1 && !duplicate_delivery {
                     return Err(invalid_recorded_history(
                         "duplicate_activity_terminal_event",
                         sequence,
@@ -8067,10 +9145,12 @@ fn recorded_commands(
                     activity_type,
                     options,
                     outcome,
+                    parallel_group_path,
                 });
             }
 
             if !child_events.is_empty() {
+                let parallel_group_path = recorded_parallel_group_path(&child_events, sequence)?;
                 let scheduled: Vec<_> = child_events
                     .iter()
                     .copied()
@@ -8120,7 +9200,17 @@ fn recorded_commands(
                     fallback_codec,
                     parent.clone(),
                 )?;
-                if outcomes.len() > 1 {
+                let terminal_events = child_events
+                    .iter()
+                    .copied()
+                    .filter(|event| event.event_type.starts_with("ChildRun"))
+                    .collect::<Vec<_>>();
+                let duplicate_delivery = terminal_events.first().is_some_and(|first| {
+                    terminal_events.iter().all(|event| {
+                        event.event_type == first.event_type && event.payload == first.payload
+                    })
+                });
+                if outcomes.len() > 1 && !duplicate_delivery {
                     return Err(invalid_recorded_history(
                         "duplicate_child_workflow_terminal_event",
                         sequence,
@@ -8133,6 +9223,7 @@ fn recorded_commands(
                     sequence,
                     workflow_type,
                     outcome: outcomes.pop(),
+                    parallel_group_path,
                 });
             }
 
@@ -8353,6 +9444,7 @@ fn recorded_commands(
                 sequence,
                 delay_seconds,
                 fired: !fired.is_empty(),
+                parallel_group_path: recorded_parallel_group_path(&timer_events, sequence)?,
             })
         })
         .collect::<Result<_>>()?;
@@ -8747,6 +9839,35 @@ fn workflow_failure_command(error: &Error) -> Value {
                 "child_exception": failure.exception,
             }),
         ),
+        Error::ParallelFailed(failure) => (
+            "ParallelFailed",
+            "durable_workflow::ParallelFailure",
+            json!({
+                "parallel_group_id": failure.group_id,
+                "parallel_member_path": failure.member_path,
+                "parallel_group_path": failure.group_path,
+                "completed_members": failure.completed.iter().map(|completion| &completion.member_path).collect::<Vec<_>>(),
+                "cause_type": workflow_error_type(&failure.cause),
+                "cause_message": failure.cause.to_string(),
+            }),
+        ),
+        Error::SagaCompensationFailed(failure) => (
+            "SagaCompensationFailed",
+            "durable_workflow::SagaCompensationFailure",
+            json!({
+                "initiating_failure_type": workflow_error_type(&failure.initiating_failure),
+                "initiating_failure_message": failure.initiating_failure.to_string(),
+                "compensation_activity_type": failure.compensation_activity_type,
+                "compensation_registration_order": failure.compensation_registration_order,
+                "compensation_failure_type": workflow_error_type(&failure.compensation_failure),
+                "compensation_failure_message": failure.compensation_failure.to_string(),
+            }),
+        ),
+        Error::WorkflowCancellationRequested(_) => (
+            "WorkflowCancellationRequested",
+            "durable_workflow::WorkflowCancellationRequested",
+            json!({"reason": "cancelled"}),
+        ),
         Error::NonDeterministicReplay(_) => (
             "NonDeterministicReplay",
             "durable_workflow::Error",
@@ -8757,6 +9878,11 @@ fn workflow_failure_command(error: &Error) -> Value {
     let non_retryable = match error {
         Error::ActivityFailed(failure) => failure.non_retryable,
         Error::ChildWorkflowFailed(failure) => failure.non_retryable,
+        Error::ParallelFailed(failure) => workflow_error_non_retryable(&failure.cause),
+        Error::SagaCompensationFailed(failure) => {
+            workflow_error_non_retryable(&failure.compensation_failure)
+        }
+        Error::WorkflowCancellationRequested(_) => true,
         Error::NonDeterministicReplay(_) => true,
         _ => false,
     };
@@ -8774,6 +9900,39 @@ fn workflow_failure_command(error: &Error) -> Value {
             "properties": properties,
         }
     })
+}
+
+fn workflow_error_type(error: &Error) -> &'static str {
+    match error {
+        Error::ActivityFailed(failure) => match failure.kind {
+            ActivityFailureKind::Failed => "ActivityFailed",
+            ActivityFailureKind::Cancelled => "ActivityCancelled",
+            ActivityFailureKind::TimedOut => "ActivityTimedOut",
+        },
+        Error::ChildWorkflowFailed(failure) => match failure.kind {
+            ChildWorkflowFailureKind::Failed => "ChildWorkflowFailed",
+            ChildWorkflowFailureKind::Cancelled => "ChildWorkflowCancelled",
+            ChildWorkflowFailureKind::Terminated => "ChildWorkflowTerminated",
+        },
+        Error::ParallelFailed(_) => "ParallelFailed",
+        Error::SagaCompensationFailed(_) => "SagaCompensationFailed",
+        Error::WorkflowCancellationRequested(_) => "WorkflowCancellationRequested",
+        Error::NonDeterministicReplay(_) => "NonDeterministicReplay",
+        _ => "RustWorkflowError",
+    }
+}
+
+fn workflow_error_non_retryable(error: &Error) -> bool {
+    match error {
+        Error::ActivityFailed(failure) => failure.non_retryable,
+        Error::ChildWorkflowFailed(failure) => failure.non_retryable,
+        Error::ParallelFailed(failure) => workflow_error_non_retryable(&failure.cause),
+        Error::SagaCompensationFailed(failure) => {
+            workflow_error_non_retryable(&failure.compensation_failure)
+        }
+        Error::WorkflowCancellationRequested(_) | Error::NonDeterministicReplay(_) => true,
+        _ => false,
+    }
 }
 
 fn workflow_task_integrity_error(error: &Error) -> bool {
@@ -9374,6 +10533,416 @@ mod tests {
         }
     }
 
+    fn parallel_path_entry(
+        kind: &str,
+        base: u64,
+        size: usize,
+        index: usize,
+    ) -> ParallelGroupMetadata {
+        parallel_group_entry(base, size, index, kind)
+    }
+
+    fn parallel_history_event(
+        event_type: &str,
+        sequence: u64,
+        identity_field: &str,
+        identity: &str,
+        path: Vec<ParallelGroupMetadata>,
+        result: Option<Value>,
+    ) -> HistoryEvent {
+        let mut payload = serde_json::Map::from_iter([
+            ("sequence".to_string(), json!(sequence)),
+            (identity_field.to_string(), json!(identity)),
+        ]);
+        let inner = path.last().expect("parallel history path");
+        apply_parallel_group_path(&mut payload, std::slice::from_ref(inner));
+        payload.insert("parallel_group_path".to_string(), json!(path));
+        if let Some(result) = result {
+            let field = if event_type == "ChildRunCompleted" {
+                "result"
+            } else {
+                "result"
+            };
+            payload.insert(field.to_string(), fixture_envelope(result));
+            payload.insert("payload_codec".to_string(), json!(DEFAULT_CODEC));
+        }
+        history_event(event_type, Value::Object(payload))
+    }
+
+    fn nested_parallel_operations() -> Vec<ParallelOperation> {
+        vec![
+            ParallelOperation::activity("first", json!([])),
+            ParallelOperation::group(vec![
+                ParallelOperation::child_workflow(
+                    "second",
+                    ChildWorkflowOptions::new("child-workers"),
+                    json!([]),
+                ),
+                ParallelOperation::activity("third", json!([])),
+            ]),
+        ]
+    }
+
+    fn nested_parallel_paths() -> [Vec<ParallelGroupMetadata>; 3] {
+        let outer = [
+            parallel_path_entry("mixed", 1, 3, 0),
+            parallel_path_entry("mixed", 1, 3, 1),
+            parallel_path_entry("mixed", 1, 3, 2),
+        ];
+        [
+            vec![outer[0].clone()],
+            vec![outer[1].clone(), parallel_path_entry("mixed", 2, 2, 0)],
+            vec![outer[2].clone(), parallel_path_entry("mixed", 2, 2, 1)],
+        ]
+    }
+
+    #[test]
+    fn parallel_schedules_every_nested_mixed_leaf_with_stable_metadata() {
+        let ctx = workflow_context(Vec::new());
+        let mut call = Box::pin(ctx.parallel(nested_parallel_operations()));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("parallel commands");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "schedule_activity",
+                "start_child_workflow",
+                "schedule_activity"
+            ]
+        );
+        let paths = nested_parallel_paths();
+        for (command, path) in commands.iter().zip(paths) {
+            assert_eq!(command["parallel_group_path"], json!(path));
+            assert_eq!(
+                command["parallel_group_id"],
+                json!(path.last().expect("inner group").parallel_group_id)
+            );
+        }
+    }
+
+    fn completed_nested_parallel_history() -> Vec<HistoryEvent> {
+        let paths = nested_parallel_paths();
+        let third = parallel_history_event(
+            "ActivityCompleted",
+            3,
+            "activity_type",
+            "third",
+            paths[2].clone(),
+            Some(json!("three")),
+        );
+        vec![
+            parallel_history_event(
+                "ActivityCompleted",
+                1,
+                "activity_type",
+                "first",
+                paths[0].clone(),
+                Some(json!("one")),
+            ),
+            parallel_history_event(
+                "ChildWorkflowScheduled",
+                2,
+                "child_workflow_type",
+                "second",
+                paths[1].clone(),
+                None,
+            ),
+            parallel_history_event(
+                "ChildRunCompleted",
+                2,
+                "child_workflow_type",
+                "second",
+                paths[1].clone(),
+                Some(json!("two")),
+            ),
+            third.clone(),
+            third,
+        ]
+    }
+
+    #[test]
+    fn parallel_replay_rebuilds_input_order_and_tolerates_duplicate_delivery() {
+        for _restart_or_completed_replay in 0..2 {
+            let ctx = workflow_context(completed_nested_parallel_history());
+            let mut call = Box::pin(ctx.parallel(nested_parallel_operations()));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Ok(results)) = call.as_mut().poll(&mut task_context) else {
+                panic!("completed nested parallel history must replay");
+            };
+            assert_eq!(
+                results,
+                vec![
+                    ParallelResult::Activity(json!("one")),
+                    ParallelResult::Group(vec![
+                        ParallelResult::ChildWorkflow(ChildWorkflowResult {
+                            parent: WorkflowIdentity {
+                                workflow_id: None,
+                                run_id: None,
+                            },
+                            child: WorkflowIdentity {
+                                workflow_id: None,
+                                run_id: None,
+                            },
+                            child_workflow_type: Some("second".to_string()),
+                            result: json!("two"),
+                        }),
+                        ParallelResult::Activity(json!("three")),
+                    ]),
+                ]
+            );
+            assert!(ctx.take_commands().expect("commands").is_empty());
+            ctx.ensure_history_consumed().expect("history consumed");
+        }
+    }
+
+    #[test]
+    fn parallel_failure_keeps_typed_cause_path_and_late_completions() {
+        let paths = nested_parallel_paths();
+        let history = vec![
+            parallel_history_event(
+                "ActivityCompleted",
+                1,
+                "activity_type",
+                "first",
+                paths[0].clone(),
+                Some(json!("one")),
+            ),
+            parallel_history_event(
+                "ChildWorkflowScheduled",
+                2,
+                "child_workflow_type",
+                "second",
+                paths[1].clone(),
+                None,
+            ),
+            parallel_history_event(
+                "ChildRunFailed",
+                2,
+                "child_workflow_type",
+                "second",
+                paths[1].clone(),
+                None,
+            ),
+            parallel_history_event(
+                "ActivityCompleted",
+                3,
+                "activity_type",
+                "third",
+                paths[2].clone(),
+                Some(json!("late")),
+            ),
+        ];
+        let ctx = workflow_context(history);
+        let mut call = Box::pin(ctx.parallel(nested_parallel_operations()));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let outcome = call.as_mut().poll(&mut task_context);
+        let Poll::Ready(Err(Error::ParallelFailed(failure))) = outcome else {
+            panic!("one failed child must return a typed partial failure: {outcome:?}");
+        };
+        assert_eq!(failure.member_path, [1, 0]);
+        assert_eq!(failure.group_id, "parallel-calls:1:3");
+        assert!(matches!(*failure.cause, Error::ChildWorkflowFailed(_)));
+        assert_eq!(
+            failure
+                .completed
+                .iter()
+                .map(|completion| completion.member_path.clone())
+                .collect::<Vec<_>>(),
+            [vec![0], vec![1, 1]]
+        );
+    }
+
+    #[test]
+    fn pending_parallel_history_restarts_without_rescheduling_any_leaf() {
+        let paths = nested_parallel_paths();
+        let history = vec![
+            parallel_history_event(
+                "ActivityScheduled",
+                1,
+                "activity_type",
+                "first",
+                paths[0].clone(),
+                None,
+            ),
+            parallel_history_event(
+                "ChildWorkflowScheduled",
+                2,
+                "child_workflow_type",
+                "second",
+                paths[1].clone(),
+                None,
+            ),
+            parallel_history_event(
+                "ActivityScheduled",
+                3,
+                "activity_type",
+                "third",
+                paths[2].clone(),
+                None,
+            ),
+        ];
+        for _restart in 0..2 {
+            let ctx = workflow_context(history.clone());
+            let mut call = Box::pin(ctx.parallel(nested_parallel_operations()));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let outcome = call.as_mut().poll(&mut task_context);
+            assert!(matches!(outcome, Poll::Pending), "{outcome:?}");
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    async fn trip_saga(ctx: WorkflowContext) -> Result<Value> {
+        let mut saga = ctx.saga();
+        let outcome = async {
+            let flight = ctx.activity("trip.reserve-flight", json!([])).await?;
+            saga.add_compensation("trip.cancel-flight", json!([flight]))?;
+            let hotel = ctx.activity("trip.reserve-hotel", json!([])).await?;
+            saga.add_compensation("trip.cancel-hotel", json!([hotel]))?;
+            ctx.activity("trip.charge", json!([])).await?;
+            Ok(json!({"status": "booked"}))
+        }
+        .await;
+        saga.finish(outcome).await
+    }
+
+    fn saga_activity(
+        event_type: &str,
+        sequence: u64,
+        activity_type: &str,
+        result: Option<Value>,
+    ) -> HistoryEvent {
+        let mut payload = json!({
+            "sequence": sequence,
+            "activity_type": activity_type,
+            "message": format!("{activity_type} failed"),
+            "exception_type": "PlannedFailure",
+            "non_retryable": true,
+        });
+        if let Some(result) = result {
+            payload["result"] = fixture_envelope(result);
+        }
+        history_event(event_type, payload)
+    }
+
+    #[test]
+    fn saga_replays_reverse_compensation_across_restart_and_duplicate_delivery() {
+        let completed_hotel_compensation = saga_activity(
+            "ActivityCompleted",
+            4,
+            "trip.cancel-hotel",
+            Some(Value::Null),
+        );
+        let history = vec![
+            saga_activity(
+                "ActivityCompleted",
+                1,
+                "trip.reserve-flight",
+                Some(json!("flight-1")),
+            ),
+            saga_activity(
+                "ActivityCompleted",
+                2,
+                "trip.reserve-hotel",
+                Some(json!("hotel-1")),
+            ),
+            saga_activity("ActivityFailed", 3, "trip.charge", None),
+            completed_hotel_compensation.clone(),
+            completed_hotel_compensation,
+        ];
+
+        for _restart in 0..2 {
+            let ctx = workflow_context(history.clone());
+            let mut future = Box::pin(trip_saga(ctx.clone()));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                future.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            let commands = ctx.take_commands().expect("compensation command");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["activity_type"], "trip.cancel-flight");
+        }
+    }
+
+    #[test]
+    fn saga_compensation_failure_preserves_both_typed_failures() {
+        let history = vec![
+            saga_activity(
+                "ActivityCompleted",
+                1,
+                "trip.reserve-flight",
+                Some(json!("flight-1")),
+            ),
+            saga_activity(
+                "ActivityCompleted",
+                2,
+                "trip.reserve-hotel",
+                Some(json!("hotel-1")),
+            ),
+            saga_activity("ActivityFailed", 3, "trip.charge", None),
+            saga_activity("ActivityFailed", 4, "trip.cancel-hotel", None),
+        ];
+        let ctx = workflow_context(history);
+        let mut future = Box::pin(trip_saga(ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Err(Error::SagaCompensationFailed(failure))) =
+            future.as_mut().poll(&mut task_context)
+        else {
+            panic!("compensation failure must remain structured");
+        };
+        assert!(matches!(
+            *failure.initiating_failure,
+            Error::ActivityFailed(_)
+        ));
+        assert!(matches!(
+            *failure.compensation_failure,
+            Error::ActivityFailed(_)
+        ));
+        assert_eq!(failure.compensation_activity_type, "trip.cancel-hotel");
+        assert_eq!(failure.compensation_registration_order, 2);
+    }
+
+    #[test]
+    fn saga_compensates_cooperative_cancellation() {
+        let ctx = workflow_context(vec![saga_activity(
+            "ActivityCompleted",
+            1,
+            "trip.reserve-flight",
+            Some(json!("flight-1")),
+        )]);
+        ctx.state.lock().expect("state").cancel_requested = true;
+        let run = {
+            let ctx = ctx.clone();
+            async move {
+                let mut saga = ctx.saga();
+                let outcome = async {
+                    let flight = ctx.activity("trip.reserve-flight", json!([])).await?;
+                    saga.add_compensation("trip.cancel-flight", json!([flight]))?;
+                    ctx.throw_if_cancellation_requested()?;
+                    Ok(json!("unexpected"))
+                }
+                .await;
+                saga.finish(outcome).await
+            }
+        };
+        let mut future = Box::pin(run);
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            future.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("cancellation compensation");
+        assert_eq!(commands[0]["activity_type"], "trip.cancel-flight");
+    }
+
     fn workflow_task(
         workflow_type: &str,
         history_events: Vec<HistoryEvent>,
@@ -9385,6 +10954,7 @@ mod tests {
             workflow_id: Some(format!("wf-{workflow_type}")),
             run_id: Some(format!("run-{workflow_type}")),
             workflow_type: workflow_type.to_string(),
+            cancel_requested: false,
             payload_codec: payload_codec.to_string(),
             arguments: Some(
                 encode_value_envelope(&json!([]), payload_codec).expect("workflow arguments"),
@@ -9823,6 +11393,7 @@ mod tests {
                 workflow_id: Some("wf-side-effect-version".to_string()),
                 run_id: Some("run-side-effect-version".to_string()),
                 workflow_type: "rust.side-effect-version".to_string(),
+                cancel_requested: false,
                 payload_codec: DEFAULT_CODEC.to_string(),
                 arguments: Some(
                     encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("arguments"),
@@ -12006,6 +13577,7 @@ mod tests {
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(
                 encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
@@ -12206,6 +13778,7 @@ mod tests {
             workflow_id: Some("wf-rust-failing".to_string()),
             run_id: Some("run-rust-failing".to_string()),
             workflow_type: "rust.failing".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("input")),
             history_events: Vec::new(),
@@ -12346,6 +13919,7 @@ mod tests {
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer.pending".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(
                 encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
@@ -12392,6 +13966,7 @@ mod tests {
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
             workflow_type: "rust.timer.removed".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(
                 encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("workflow input"),
@@ -12512,6 +14087,7 @@ mod tests {
             workflow_id: Some("wf-parent".to_string()),
             run_id: Some("run-parent".to_string()),
             workflow_type: "rust.parent".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("input")),
             history_events: vec![
@@ -12783,6 +14359,7 @@ mod tests {
             workflow_id: Some("wf-rust-hello".to_string()),
             run_id: Some("run-rust-hello".to_string()),
             workflow_type: "rust.hello_workflow".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("input")),
             history_events: vec![HistoryEvent {
@@ -12826,6 +14403,7 @@ mod tests {
             workflow_id: Some("wf-rust-pages".to_string()),
             run_id: Some("run-rust-pages".to_string()),
             workflow_type: "rust.hello_workflow".to_string(),
+            cancel_requested: false,
             payload_codec: DEFAULT_CODEC.to_string(),
             arguments: Some(encode_value_envelope(&json!([]), DEFAULT_CODEC).expect("input")),
             history_events: vec![HistoryEvent {
