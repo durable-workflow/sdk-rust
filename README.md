@@ -123,7 +123,11 @@ Query-capable releases also publish `query-tasks`,
 `query-task-minimum-worker-protocol-version`, `replayed-instance-state-queries`,
 `query-state-model`, `snapshot-inspection-queries`, and `payload-codecs`.
 Timer-capable releases additionally publish `durable-timers`, `timer-command`,
-and `timer-replay-validation`. Child-capable releases additionally publish
+and `timer-replay-validation`. Condition and operator-metadata releases publish
+`durable-condition-waits`, `condition-wait-command`,
+`condition-wait-minimum-worker-protocol-version`,
+`workflow-search-attribute-updates`, `search-attribute-update-command`, and
+their replay/type contracts. Child-capable releases additionally publish
 `child-workflows`, `child-workflow-command`, and
 `child-workflow-failure-reasons`. Activity-options releases publish
 `activity-options`, `activity-retry-policy`, `activity-timeouts`, and
@@ -134,9 +138,9 @@ and `timer-replay-validation`. Child-capable releases additionally publish
 `deterministic-parallel`, `parallel-authoring`, `parallel-members`,
 `parallel-result-order`, `parallel-group-metadata`, `saga-compensation`, and
 the compensation order, failure-policy, and cancellation fields. Workflow
-Stream authoring requires the `1.15`
-feature floor, while query-task poll, complete, and fail requests retain their
-`1.8` minimum.
+Stream authoring requires the `1.15` feature floor. Query-task requests and
+search-attribute updates use the additive `1.8` floor; condition-wait
+completions use `1.9`.
 
 Typed search-attribute updates require worker protocol `1.16`. The SDK records
 canonical declarations with each command and compares both the JSON value and
@@ -298,6 +302,61 @@ remain `Error::Protocol(ProtocolFailure)`, including stable `reason`, `status`,
 and requested/supported version fields. Activity settlement rejections are
 typed `Error::ActivityTaskRejected`; other rejected worker requests remain
 `Error::Http` values with the response status and body.
+
+## Durable conditions and workflow search attributes
+
+`wait_condition!` suspends one workflow until its inline predicate becomes
+true or its optional Server-backed timeout fires. The macro fingerprints the
+predicate tokens and records the caller-provided key, so a renamed condition or
+changed predicate fails replay instead of silently changing an open run.
+`ConditionWaitResult` distinguishes `Satisfied` from `TimedOut` without a
+sentinel value.
+
+Condition predicates can inspect committed signals and updates through
+`WorkflowContext::signals` and `WorkflowContext::updates`. Server delivery of a
+signal or update creates the next workflow task, which replays and evaluates the
+predicate once; there is no application timer loop or busy poll. Open and
+terminal condition history remains authoritative after worker and Server
+restarts.
+
+After the gate opens, `upsert_search_attributes` emits the published typed
+operator-metadata command. The builder validates keys, value types, finite
+numbers, lengths, datetimes, and payload size before the command can leave the
+worker. A `Delete` value removes an attribute, and replay requires the same
+normalized mutation at the same command position.
+
+```rust
+# use durable_workflow::{json, wait_condition, Client, ConditionWaitResult, SearchAttributeUpdate, Worker};
+# use std::time::Duration;
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "approval-workers");
+worker.register_workflow("approve-order", |ctx, _input| async move {
+    let predicate_ctx = ctx.clone();
+    let outcome = wait_condition!(
+        ctx,
+        "approval-received",
+        timeout: Duration::from_secs(300),
+        move || Ok(!predicate_ctx.signals("approve")?.is_empty()),
+    )
+    .await?;
+
+    let status = match outcome {
+        ConditionWaitResult::Satisfied => "approved",
+        ConditionWaitResult::TimedOut => "approval_timed_out",
+    };
+    let attributes = SearchAttributeUpdate::new()
+        .keyword("OrderStatus", status)?
+        .bool("NeedsAttention", outcome.is_timed_out())?;
+    ctx.upsert_search_attributes(attributes)?;
+
+    Ok(json!({"status": status}))
+});
+# }
+```
+
+This example uses the standalone Server origin accepted by `Client`, such as
+`http://127.0.0.1:8080`. Run `cargo test --doc` to compile the workflow locally;
+no managed Cloud account is needed to understand or test the authoring API.
 
 ## Bounded workflows with continue-as-new
 

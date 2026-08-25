@@ -16,6 +16,7 @@ use std::{
 
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use chrono::DateTime;
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
 use serde::{
     de::DeserializeOwned,
@@ -23,6 +24,7 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 pub use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 pub use uuid::Uuid;
 
@@ -36,6 +38,10 @@ pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
 pub const WORKFLOW_UPDATES_CAPABILITY: &str = "workflow_updates";
 /// First additive worker protocol that defines query-task transport.
 pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
+/// First additive worker protocol that defines typed search-attribute upserts.
+pub const SEARCH_ATTRIBUTE_UPDATE_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
+/// First additive worker protocol that defines external durable condition waits.
+pub const CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.9";
 
 const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
 const WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE: &str =
@@ -140,6 +146,10 @@ pub enum Error {
     WorkflowStatePoisoned,
     #[error("timer duration is too large for the worker protocol")]
     TimerDurationOverflow,
+    #[error(transparent)]
+    InvalidConditionWaitOptions(#[from] ConditionWaitOptionsError),
+    #[error(transparent)]
+    InvalidSearchAttributeUpdate(#[from] SearchAttributeUpdateError),
     #[error("operation timed out")]
     Timeout,
     #[error(
@@ -162,8 +172,6 @@ pub enum Error {
     },
     #[error("invalid child workflow options: {0}")]
     InvalidChildWorkflowOptions(String),
-    #[error("invalid search attribute update: {0}")]
-    InvalidSearchAttributes(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -171,6 +179,420 @@ pub enum Error {
     #[doc(hidden)]
     #[error("workflow requested continue as new")]
     ContinueAsNew(ContinueAsNewRequest),
+}
+
+/// Validation failure for a durable condition-wait definition.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ConditionWaitOptionsError {
+    #[error("condition_key must be non-empty")]
+    EmptyKey,
+    #[error("condition_definition_fingerprint must be non-empty")]
+    EmptyPredicateIdentity,
+    #[error("condition timeout is too large for the worker protocol")]
+    TimeoutOverflow,
+}
+
+/// Stable identity and optional durable timeout for a condition wait.
+///
+/// `predicate_identity` is recorded as the worker protocol's
+/// `condition_definition_fingerprint` and must change whenever predicate
+/// behavior changes. Prefer the [`wait_condition!`] macro when the predicate
+/// is written inline; it derives this identity from the predicate tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConditionWaitOptions {
+    condition_key: String,
+    predicate_identity: String,
+    timeout: Option<Duration>,
+}
+
+impl ConditionWaitOptions {
+    pub fn new(condition_key: impl Into<String>, predicate_identity: impl Into<String>) -> Self {
+        Self {
+            condition_key: condition_key.into(),
+            predicate_identity: predicate_identity.into(),
+            timeout: None,
+        }
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    fn validate(
+        &self,
+    ) -> std::result::Result<ValidatedConditionWaitOptions, ConditionWaitOptionsError> {
+        let condition_key = self.condition_key.trim();
+        if condition_key.is_empty() {
+            return Err(ConditionWaitOptionsError::EmptyKey);
+        }
+        let predicate_identity = self.predicate_identity.trim();
+        if predicate_identity.is_empty() {
+            return Err(ConditionWaitOptionsError::EmptyPredicateIdentity);
+        }
+        let timeout_seconds = self
+            .timeout
+            .map(|timeout| {
+                timeout
+                    .as_secs()
+                    .checked_add(u64::from(timeout.subsec_nanos() > 0))
+                    .ok_or(ConditionWaitOptionsError::TimeoutOverflow)
+            })
+            .transpose()?;
+
+        Ok(ValidatedConditionWaitOptions {
+            condition_key: condition_key.to_string(),
+            predicate_identity: predicate_identity.to_string(),
+            timeout_seconds,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValidatedConditionWaitOptions {
+    condition_key: String,
+    predicate_identity: String,
+    timeout_seconds: Option<u64>,
+}
+
+/// Unambiguous terminal result of a durable condition wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionWaitResult {
+    Satisfied,
+    TimedOut,
+}
+
+impl ConditionWaitResult {
+    pub fn is_satisfied(self) -> bool {
+        self == Self::Satisfied
+    }
+
+    pub fn is_timed_out(self) -> bool {
+        self == Self::TimedOut
+    }
+}
+
+/// Build the stable condition definition identity used by [`wait_condition!`].
+#[doc(hidden)]
+pub fn __condition_definition_fingerprint(source: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"durable-workflow-rust.wait-condition.v1\0");
+    digest.update(source.as_bytes());
+    format!("sha256:{:x}", digest.finalize())
+}
+
+/// Create a durable condition wait whose predicate definition is fingerprinted
+/// from its inline Rust tokens.
+///
+/// The returned [`ConditionWaitCall`] must be awaited. The timeout form is
+/// `wait_condition!(ctx, "approval", timeout: duration, || predicate)`.
+#[macro_export]
+macro_rules! wait_condition {
+    ($ctx:expr, $key:expr, timeout: $timeout:expr, $predicate:expr $(,)?) => {{
+        $ctx.wait_condition(
+            $crate::ConditionWaitOptions::new(
+                $key,
+                $crate::__condition_definition_fingerprint(concat!(
+                    module_path!(),
+                    "\0",
+                    stringify!($predicate)
+                )),
+            )
+            .timeout($timeout),
+            $predicate,
+        )
+    }};
+    ($ctx:expr, $key:expr, $predicate:expr $(,)?) => {{
+        $ctx.wait_condition(
+            $crate::ConditionWaitOptions::new(
+                $key,
+                $crate::__condition_definition_fingerprint(concat!(
+                    module_path!(),
+                    "\0",
+                    stringify!($predicate)
+                )),
+            ),
+            $predicate,
+        )
+    }};
+}
+
+const MAX_SEARCH_ATTRIBUTES_PER_UPDATE: usize = 100;
+const MAX_SEARCH_ATTRIBUTE_KEY_LENGTH: usize = 64;
+const MAX_SEARCH_ATTRIBUTE_STRING_LENGTH: usize = 255;
+const MAX_SEARCH_ATTRIBUTE_KEYWORD_LENGTH: usize = 255;
+const MAX_SEARCH_ATTRIBUTE_UPDATE_BYTES: usize = 65_536;
+
+/// Validation failure for a typed workflow search-attribute update.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SearchAttributeUpdateError {
+    #[error("search-attribute update requires at least one attribute")]
+    Empty,
+    #[error("search attribute key {0:?} must be 1-64 URL-safe ASCII characters")]
+    InvalidKey(String),
+    #[error("search-attribute update exceeds the limit of 100 attributes")]
+    TooManyAttributes,
+    #[error("search attribute {key:?} {kind} value exceeds {limit} bytes")]
+    ValueTooLong {
+        key: String,
+        kind: &'static str,
+        limit: usize,
+    },
+    #[error(
+        "search attribute {0:?} must not contain an empty string value; use delete() to remove it"
+    )]
+    EmptyString(String),
+    #[error("search attribute {0:?} has a non-finite float value")]
+    NonFiniteFloat(String),
+    #[error("search attribute {0:?} must use an RFC 3339 datetime with an explicit timezone")]
+    InvalidDateTime(String),
+    #[error("search-attribute update exceeds the 65536-byte protocol limit")]
+    PayloadTooLarge,
+}
+
+/// One public typed search-attribute value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SearchAttributeValue {
+    String(String),
+    Keyword(String),
+    KeywordList(Vec<String>),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    DateTime(String),
+    Delete,
+}
+
+impl SearchAttributeValue {
+    fn type_name(&self) -> Option<&'static str> {
+        match self {
+            Self::String(_) => Some("string"),
+            Self::Keyword(_) => Some("keyword"),
+            Self::KeywordList(_) => Some("keyword_list"),
+            Self::Int(_) => Some("int"),
+            Self::Float(_) => Some("float"),
+            Self::Bool(_) => Some("bool"),
+            Self::DateTime(_) => Some("datetime"),
+            Self::Delete => None,
+        }
+    }
+
+    fn normalized(self, key: &str) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        let normalize_string = |value: String, kind: &'static str, limit: usize| {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                return Err(SearchAttributeUpdateError::EmptyString(key.to_string()));
+            }
+            if value.len() > limit {
+                return Err(SearchAttributeUpdateError::ValueTooLong {
+                    key: key.to_string(),
+                    kind,
+                    limit,
+                });
+            }
+            Ok(value)
+        };
+
+        match self {
+            Self::String(value) => Ok(Self::String(normalize_string(
+                value,
+                "string",
+                MAX_SEARCH_ATTRIBUTE_STRING_LENGTH,
+            )?)),
+            Self::Keyword(value) => Ok(Self::Keyword(normalize_string(
+                value,
+                "keyword",
+                MAX_SEARCH_ATTRIBUTE_KEYWORD_LENGTH,
+            )?)),
+            Self::KeywordList(values) => {
+                let values = values
+                    .into_iter()
+                    .map(|value| {
+                        let value = value.trim().to_string();
+                        if value.len() > MAX_SEARCH_ATTRIBUTE_KEYWORD_LENGTH {
+                            return Err(SearchAttributeUpdateError::ValueTooLong {
+                                key: key.to_string(),
+                                kind: "keyword-list entry",
+                                limit: MAX_SEARCH_ATTRIBUTE_KEYWORD_LENGTH,
+                            });
+                        }
+                        Ok(value)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(Self::KeywordList(values))
+            }
+            Self::Float(value) if !value.is_finite() => {
+                Err(SearchAttributeUpdateError::NonFiniteFloat(key.to_string()))
+            }
+            Self::DateTime(value) => {
+                let value =
+                    normalize_string(value, "datetime", MAX_SEARCH_ATTRIBUTE_STRING_LENGTH)?;
+                if DateTime::parse_from_rfc3339(&value).is_err() {
+                    return Err(SearchAttributeUpdateError::InvalidDateTime(key.to_string()));
+                }
+                Ok(Self::DateTime(value))
+            }
+            value => Ok(value),
+        }
+    }
+
+    fn into_json(self) -> Value {
+        match self {
+            Self::String(value) | Self::Keyword(value) | Self::DateTime(value) => {
+                Value::String(value)
+            }
+            Self::KeywordList(values) => {
+                Value::Array(values.into_iter().map(Value::String).collect())
+            }
+            Self::Int(value) => json!(value),
+            Self::Float(value) => json!(value),
+            Self::Bool(value) => json!(value),
+            Self::Delete => Value::Null,
+        }
+    }
+}
+
+/// Validated typed workflow-side search-attribute mutation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SearchAttributeUpdate {
+    attributes: BTreeMap<String, SearchAttributeValue>,
+}
+
+impl SearchAttributeUpdate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(
+        mut self,
+        key: impl Into<String>,
+        value: SearchAttributeValue,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        let key = key.into();
+        validate_search_attribute_key(&key)?;
+        if !self.attributes.contains_key(&key)
+            && self.attributes.len() >= MAX_SEARCH_ATTRIBUTES_PER_UPDATE
+        {
+            return Err(SearchAttributeUpdateError::TooManyAttributes);
+        }
+        self.attributes.insert(key.clone(), value.normalized(&key)?);
+        self.validate_size()?;
+        Ok(self)
+    }
+
+    pub fn string(
+        self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::String(value.into()))
+    }
+
+    pub fn keyword(
+        self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::Keyword(value.into()))
+    }
+
+    pub fn keyword_list<I, V>(
+        self,
+        key: impl Into<String>,
+        values: I,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.set(
+            key,
+            SearchAttributeValue::KeywordList(values.into_iter().map(Into::into).collect()),
+        )
+    }
+
+    pub fn int(
+        self,
+        key: impl Into<String>,
+        value: i64,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::Int(value))
+    }
+
+    pub fn float(
+        self,
+        key: impl Into<String>,
+        value: f64,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::Float(value))
+    }
+
+    pub fn bool(
+        self,
+        key: impl Into<String>,
+        value: bool,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::Bool(value))
+    }
+
+    pub fn datetime(
+        self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::DateTime(value.into()))
+    }
+
+    pub fn delete(
+        self,
+        key: impl Into<String>,
+    ) -> std::result::Result<Self, SearchAttributeUpdateError> {
+        self.set(key, SearchAttributeValue::Delete)
+    }
+
+    fn validate_size(&self) -> std::result::Result<(), SearchAttributeUpdateError> {
+        let (attributes, _) = self.clone().into_wire_parts();
+        if serde_json::to_vec(&attributes)
+            .map(|payload| payload.len() > MAX_SEARCH_ATTRIBUTE_UPDATE_BYTES)
+            .unwrap_or(true)
+        {
+            return Err(SearchAttributeUpdateError::PayloadTooLarge);
+        }
+        Ok(())
+    }
+
+    fn into_wire_parts(self) -> (Value, BTreeMap<String, String>) {
+        let mut attributes = serde_json::Map::new();
+        let mut attribute_types = BTreeMap::new();
+        for (key, value) in self.attributes {
+            if let Some(type_name) = value.type_name() {
+                attribute_types.insert(key.clone(), type_name.to_string());
+            }
+            attributes.insert(key, value.into_json());
+        }
+        (Value::Object(attributes), attribute_types)
+    }
+
+    fn validate(&self) -> std::result::Result<(), SearchAttributeUpdateError> {
+        if self.attributes.is_empty() {
+            return Err(SearchAttributeUpdateError::Empty);
+        }
+        self.validate_size()
+    }
+}
+
+fn validate_search_attribute_key(key: &str) -> std::result::Result<(), SearchAttributeUpdateError> {
+    let valid = !key.is_empty()
+        && key.len() <= MAX_SEARCH_ATTRIBUTE_KEY_LENGTH
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'));
+    if valid {
+        Ok(())
+    } else {
+        Err(SearchAttributeUpdateError::InvalidKey(key.to_string()))
+    }
 }
 
 /// The registered handler family reported by [`Error::HandlerType`].
@@ -712,102 +1134,6 @@ pub struct ChildWorkflowOptions {
     pub retry_policy: Option<ChildWorkflowRetryPolicy>,
     pub execution_timeout_seconds: Option<u64>,
     pub run_timeout_seconds: Option<u64>,
-}
-
-/// Canonical search-attribute type names carried on the worker protocol and
-/// persisted in `SearchAttributesUpserted` history.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchAttributeType {
-    String,
-    Keyword,
-    KeywordList,
-    Int,
-    Float,
-    Bool,
-    Datetime,
-}
-
-impl SearchAttributeType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::String => "string",
-            Self::Keyword => "keyword",
-            Self::KeywordList => "keyword_list",
-            Self::Int => "int",
-            Self::Float => "float",
-            Self::Bool => "bool",
-            Self::Datetime => "datetime",
-        }
-    }
-}
-
-/// One typed value or deletion in a durable search-attribute upsert.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SearchAttributeUpdate {
-    value: Value,
-    attribute_type: Option<SearchAttributeType>,
-}
-
-impl SearchAttributeUpdate {
-    pub fn string(value: impl Into<String>) -> Self {
-        Self::typed(SearchAttributeType::String, Value::String(value.into()))
-    }
-
-    pub fn keyword(value: impl Into<String>) -> Self {
-        Self::typed(SearchAttributeType::Keyword, Value::String(value.into()))
-    }
-
-    pub fn keyword_list<I, S>(values: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::typed(
-            SearchAttributeType::KeywordList,
-            Value::Array(
-                values
-                    .into_iter()
-                    .map(|value| Value::String(value.into()))
-                    .collect(),
-            ),
-        )
-    }
-
-    pub fn int(value: i64) -> Self {
-        Self::typed(SearchAttributeType::Int, Value::Number(value.into()))
-    }
-
-    pub fn float(value: f64) -> Result<Self> {
-        let value = serde_json::Number::from_f64(value).ok_or_else(|| {
-            Error::InvalidSearchAttributes("float values must be finite".to_string())
-        })?;
-        Ok(Self::typed(
-            SearchAttributeType::Float,
-            Value::Number(value),
-        ))
-    }
-
-    pub fn bool(value: bool) -> Self {
-        Self::typed(SearchAttributeType::Bool, Value::Bool(value))
-    }
-
-    pub fn datetime(value: impl Into<String>) -> Self {
-        Self::typed(SearchAttributeType::Datetime, Value::String(value.into()))
-    }
-
-    pub fn delete() -> Self {
-        Self {
-            value: Value::Null,
-            attribute_type: None,
-        }
-    }
-
-    fn typed(attribute_type: SearchAttributeType, value: Value) -> Self {
-        Self {
-            value,
-            attribute_type: Some(attribute_type),
-        }
-    }
 }
 
 impl ChildWorkflowOptions {
@@ -1774,6 +2100,21 @@ fn validate_workflow_task_commands(commands: &[Value]) -> Result<()> {
         validate_outbound_payload_envelope(payload)?;
     }
     Ok(())
+}
+
+fn workflow_completion_protocol_version(commands: &[Value]) -> &'static str {
+    if commands
+        .iter()
+        .any(|command| command.get("type").and_then(Value::as_str) == Some("open_condition_wait"))
+    {
+        CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION
+    } else if commands.iter().any(|command| {
+        command.get("type").and_then(Value::as_str) == Some("upsert_search_attributes")
+    }) {
+        SEARCH_ATTRIBUTE_UPDATE_MINIMUM_WORKER_PROTOCOL_VERSION
+    } else {
+        WORKER_PROTOCOL_VERSION
+    }
 }
 
 fn workflow_command_payload_field(command_type: &str) -> Option<&'static str> {
@@ -3157,6 +3498,7 @@ impl Client {
         commands: Vec<Value>,
     ) -> Result<Value> {
         validate_workflow_task_commands(&commands)?;
+        let protocol_version = workflow_completion_protocol_version(&commands);
         let body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
@@ -3166,7 +3508,7 @@ impl Client {
         self.request_json(
             reqwest::Method::POST,
             &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::Worker(protocol_version),
             Some(&body),
         )
         .await
@@ -6673,83 +7015,6 @@ impl WorkflowContext {
         Ok(state.history_budget.clone())
     }
 
-    /// Upsert typed operator-visible search attributes as one durable command.
-    ///
-    /// Replays compare both the JSON values and their canonical declared types.
-    /// History written before type metadata existed compares values only; its
-    /// absent metadata remains unknown and is never treated as proof of a typed
-    /// match.
-    pub fn upsert_search_attributes(
-        &self,
-        attributes: BTreeMap<String, SearchAttributeUpdate>,
-    ) -> Result<()> {
-        if attributes.is_empty() {
-            return Err(Error::InvalidSearchAttributes(
-                "at least one attribute is required".to_string(),
-            ));
-        }
-
-        let mut values = serde_json::Map::new();
-        let mut attribute_types = BTreeMap::new();
-        for (key, update) in attributes {
-            if !valid_search_attribute_key(&key) {
-                return Err(Error::InvalidSearchAttributes(format!(
-                    "attribute key {key:?} must start with a letter, contain only letters, numbers, and underscores, and be at most 128 bytes"
-                )));
-            }
-            values.insert(key.clone(), update.value);
-            if let Some(attribute_type) = update.attribute_type {
-                attribute_types.insert(key, attribute_type.as_str().to_string());
-            }
-        }
-        let values = Value::Object(values);
-
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::WorkflowStatePoisoned)?;
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
-            return match recorded {
-                RecordedCommand::SearchAttributesUpserted {
-                    sequence,
-                    attributes: recorded_attributes,
-                    attribute_types: recorded_types,
-                } => {
-                    if recorded_attributes != values {
-                        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
-                            "search_attribute_value_mismatch",
-                            Some(sequence),
-                            Some(recorded_attributes.to_string()),
-                            Some(values.to_string()),
-                            "search-attribute values differ from the recorded durable command",
-                        )));
-                    }
-                    if let RecordedSnapshotValue::Known(recorded_types) = recorded_types {
-                        if recorded_types != attribute_types {
-                            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
-                                "search_attribute_type_mismatch",
-                                Some(sequence),
-                                Some(search_attribute_types_description(&recorded_types)),
-                                Some(search_attribute_types_description(&attribute_types)),
-                                "search-attribute declared types differ from the recorded durable command",
-                            )));
-                        }
-                    }
-                    state.command_cursor += 1;
-                    Ok(())
-                }
-                other => Err(command_mismatch(&other, "search attributes upsert")),
-            };
-        }
-
-        state.commands.push(json!({
-            "type": "upsert_search_attributes",
-            "attributes": values,
-            "attribute_types": attribute_types,
-        }));
-        Ok(())
-    }
-
     /// Continue this workflow instance as a fresh run with replacement arguments.
     ///
     /// Return this value directly from the workflow handler. The worker converts
@@ -6979,6 +7244,108 @@ impl WorkflowContext {
     ) -> Result<Vec<AvroValue>> {
         let mut call = self.wait_signal(signal_name);
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
+    }
+
+    /// Return every committed signal argument list with the given name.
+    ///
+    /// This history-backed view is deterministic and is intended for
+    /// condition predicates that must be re-evaluated after a signal while the
+    /// workflow is blocked on [`WorkflowContext::wait_condition`].
+    pub fn signals(&self, signal_name: &str) -> Result<Vec<Vec<Value>>> {
+        self.signals_avro_value(signal_name)?
+            .into_iter()
+            .map(|arguments| {
+                arguments
+                    .into_iter()
+                    .map(AvroValue::into_json)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    }
+
+    /// Lossless fixed Avro Value view of committed signals with the given name.
+    pub fn signals_avro_value(&self, signal_name: &str) -> Result<Vec<Vec<AvroValue>>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        state
+            .history_events
+            .iter()
+            .filter(|event| {
+                event.event_type == "SignalReceived"
+                    && event.payload.get("signal_name").and_then(Value::as_str) == Some(signal_name)
+            })
+            .map(|event| decode_signal_event_arguments(event, &state.payload_codec))
+            .collect()
+    }
+
+    /// Return every committed update argument list with the given name.
+    ///
+    /// Accepted and applied records for the same update ID are de-duplicated.
+    /// A Server task created after an update therefore replays the workflow and
+    /// re-evaluates an open condition without application polling.
+    pub fn updates(&self, update_name: &str) -> Result<Vec<Vec<Value>>> {
+        self.updates_avro_value(update_name)?
+            .into_iter()
+            .map(|arguments| {
+                arguments
+                    .into_iter()
+                    .map(AvroValue::into_json)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    }
+
+    /// Lossless fixed Avro Value view of committed updates with the given name.
+    pub fn updates_avro_value(&self, update_name: &str) -> Result<Vec<Vec<AvroValue>>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let mut seen = Vec::new();
+        let mut updates = Vec::new();
+        for event in state.history_events.iter() {
+            if !matches!(
+                event.event_type.as_str(),
+                "UpdateAccepted" | "UpdateApplied"
+            ) || event.payload.get("update_name").and_then(Value::as_str) != Some(update_name)
+                || event.payload.get("arguments").is_none()
+            {
+                continue;
+            }
+            if let Some(update_id) = event.payload.get("update_id").and_then(Value::as_str) {
+                if seen.iter().any(|recorded| recorded == update_id) {
+                    continue;
+                }
+                seen.push(update_id.to_string());
+            }
+            updates.push(decode_update_event_arguments(event, &state.payload_codec)?);
+        }
+        Ok(updates)
+    }
+
+    /// Wait for a deterministic predicate to become true or for its durable
+    /// timeout to elapse.
+    ///
+    /// Prefer [`wait_condition!`] for inline predicates so changes to the Rust
+    /// predicate tokens automatically change the recorded definition
+    /// fingerprint. Direct callers must provide an equally stable identity in
+    /// [`ConditionWaitOptions`].
+    pub fn wait_condition<F>(
+        &self,
+        options: ConditionWaitOptions,
+        predicate: F,
+    ) -> ConditionWaitCall
+    where
+        F: Fn() -> Result<bool> + Send + 'static,
+    {
+        ConditionWaitCall {
+            ctx: self.clone(),
+            options,
+            predicate: Box::new(predicate),
+            opened_wait: false,
+        }
     }
 
     /// Wait for server-backed durable time without blocking the worker executor.
@@ -7264,6 +7631,64 @@ impl WorkflowContext {
         Ok(identity)
     }
 
+    /// Validate, emit, or replay a typed workflow search-attribute update.
+    ///
+    /// The command is non-blocking within a workflow decision, but its
+    /// `SearchAttributesUpserted` event occupies the same deterministic command
+    /// stream as activities, timers, conditions, and other durable operations.
+    pub fn upsert_search_attributes(&self, update: SearchAttributeUpdate) -> Result<()> {
+        update.validate()?;
+        let (attributes, attribute_types) = update.into_wire_parts();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            return match recorded {
+                RecordedCommand::SearchAttributes {
+                    sequence,
+                    attributes: recorded_attributes,
+                    attribute_types: recorded_attribute_types,
+                } => {
+                    if recorded_attributes != attributes {
+                        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                            "search_attribute_value_mismatch",
+                            Some(sequence),
+                            Some(recorded_attributes.to_string()),
+                            Some(attributes.to_string()),
+                            "search-attribute values differ from the recorded durable command",
+                        )));
+                    }
+                    if let RecordedSnapshotValue::Known(recorded_types) = recorded_attribute_types {
+                        if recorded_types != attribute_types {
+                            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                                "search_attribute_type_mismatch",
+                                Some(sequence),
+                                Some(json!(recorded_types).to_string()),
+                                Some(json!(attribute_types).to_string()),
+                                "search-attribute declared types differ from the recorded durable command",
+                            )));
+                        }
+                    }
+                    state.command_cursor += 1;
+                    Ok(())
+                }
+                other => Err(command_mismatch(&other, "search-attribute update")),
+            };
+        }
+
+        let mut command = serde_json::Map::from_iter([
+            ("type".to_string(), json!("upsert_search_attributes")),
+            ("attributes".to_string(), attributes),
+        ]);
+        if !attribute_types.is_empty() {
+            command.insert("attribute_types".to_string(), json!(attribute_types));
+        }
+        state.commands.push(Value::Object(command));
+        Ok(())
+    }
+
     /// Record a UUIDv4 once and return the same UUID on every replay.
     pub fn uuid_v4(&self) -> Result<Uuid> {
         self.side_effect(Uuid::new_v4)
@@ -7499,6 +7924,7 @@ struct WorkflowState {
     run_id: Option<String>,
     task_queue: String,
     payload_codec: String,
+    history_events: Arc<Vec<HistoryEvent>>,
     history_budget: WorkflowHistoryBudget,
     cancel_requested: bool,
     resume_signal: Option<ResumeSignal>,
@@ -7581,6 +8007,12 @@ impl WorkflowState {
             })
             .transpose()?;
         let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
+        let cancel_requested = history.iter().any(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "WorkflowCancellationRequested" | "WorkflowCancelRequested"
+            )
+        });
         Ok(Self {
             workflow_command_identity: String::new(),
             workflow_stream_command_counter: 0,
@@ -7588,16 +8020,12 @@ impl WorkflowState {
             run_id,
             task_queue,
             payload_codec,
+            history_events: Arc::new(history),
             history_budget: WorkflowHistoryBudget {
                 event_count,
                 ..WorkflowHistoryBudget::default()
             },
-            cancel_requested: history.iter().any(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "WorkflowCancellationRequested" | "WorkflowCancelRequested"
-                )
-            }),
+            cancel_requested,
             resume_signal,
             recorded_commands,
             recorded_continue_as_new_sequence,
@@ -7636,6 +8064,18 @@ enum RecordedCommand {
         signal_name: String,
         value: Option<Vec<AvroValue>>,
     },
+    ConditionWait {
+        sequence: u64,
+        condition_key: Option<String>,
+        predicate_identity: String,
+        timeout_seconds: Option<u64>,
+        result: Option<ConditionWaitResult>,
+    },
+    SearchAttributes {
+        sequence: u64,
+        attributes: Value,
+        attribute_types: RecordedSnapshotValue<BTreeMap<String, String>>,
+    },
     SideEffect {
         sequence: u64,
         value: AvroValue,
@@ -7644,11 +8084,6 @@ enum RecordedCommand {
         sequence: u64,
         change_id: String,
         version: i32,
-    },
-    SearchAttributesUpserted {
-        sequence: u64,
-        attributes: Value,
-        attribute_types: RecordedSnapshotValue<BTreeMap<String, String>>,
     },
 }
 
@@ -7822,9 +8257,10 @@ impl RecordedCommand {
             | Self::Timer { sequence, .. }
             | Self::ChildWorkflow { sequence, .. }
             | Self::SignalWait { sequence, .. }
+            | Self::ConditionWait { sequence, .. }
+            | Self::SearchAttributes { sequence, .. }
             | Self::SideEffect { sequence, .. }
-            | Self::VersionMarker { sequence, .. }
-            | Self::SearchAttributesUpserted { sequence, .. } => *sequence,
+            | Self::VersionMarker { sequence, .. } => *sequence,
         }
     }
 
@@ -7834,25 +8270,12 @@ impl RecordedCommand {
             Self::Timer { .. } => "timer",
             Self::ChildWorkflow { .. } => "child workflow",
             Self::SignalWait { .. } => "signal wait",
+            Self::ConditionWait { .. } => "condition wait",
+            Self::SearchAttributes { .. } => "search-attribute update",
             Self::SideEffect { .. } => "side effect",
             Self::VersionMarker { .. } => "version marker",
-            Self::SearchAttributesUpserted { .. } => "search attributes upsert",
         }
     }
-}
-
-fn valid_search_attribute_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 128
-        && key.as_bytes()[0].is_ascii_alphabetic()
-        && key
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-}
-
-fn search_attribute_types_description(types: &BTreeMap<String, String>) -> String {
-    serde_json::to_string(types).unwrap_or_else(|_| format!("{types:?}"))
 }
 
 fn ensure_version_supported(
@@ -8802,6 +9225,188 @@ impl Future for TimerCall {
     }
 }
 
+/// Future returned by [`WorkflowContext::wait_condition`].
+pub struct ConditionWaitCall {
+    ctx: WorkflowContext,
+    options: ConditionWaitOptions,
+    predicate: Box<dyn Fn() -> Result<bool> + Send + 'static>,
+    opened_wait: bool,
+}
+
+impl Future for ConditionWaitCall {
+    type Output = Result<ConditionWaitResult>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if self.opened_wait {
+            return Poll::Pending;
+        }
+
+        let options = match self.options.validate() {
+            Ok(options) => options,
+            Err(error) => return Poll::Ready(Err(Error::InvalidConditionWaitOptions(error))),
+        };
+        let ctx = self.ctx.clone();
+
+        let recorded_result = {
+            let mut state = match ctx.state.lock() {
+                Ok(state) => state,
+                Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+            };
+            let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() else {
+                drop(state);
+                return self.poll_new_condition(options);
+            };
+            if !matches!(recorded, RecordedCommand::ConditionWait { .. }) {
+                return Poll::Ready(Err(command_mismatch(&recorded, "condition wait")));
+            }
+
+            let mut cursor = state.command_cursor;
+            let mut result = None;
+            loop {
+                let Some(RecordedCommand::ConditionWait {
+                    sequence,
+                    condition_key,
+                    predicate_identity,
+                    timeout_seconds,
+                    result: recorded_result,
+                    ..
+                }) = state.recorded_commands.get(cursor)
+                else {
+                    break;
+                };
+
+                if cursor > state.command_cursor
+                    && !same_logical_condition_wait(
+                        condition_key.as_deref(),
+                        predicate_identity,
+                        &options,
+                    )
+                {
+                    break;
+                }
+                if let Err(error) = validate_recorded_condition_wait(
+                    *sequence,
+                    condition_key.as_deref(),
+                    predicate_identity,
+                    *timeout_seconds,
+                    &options,
+                ) {
+                    return Poll::Ready(Err(error));
+                }
+                if result == Some(ConditionWaitResult::TimedOut) {
+                    return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                        "condition_wait_reopened_after_timeout",
+                        Some(*sequence),
+                        Some("timed-out condition is terminal".to_string()),
+                        Some("another physical wait-open".to_string()),
+                        "condition history reopened one logical wait after its durable timeout",
+                    ))));
+                }
+                result = *recorded_result;
+                cursor += 1;
+            }
+            state.command_cursor = cursor;
+            result
+        };
+
+        if let Some(result) = recorded_result {
+            return Poll::Ready(Ok(result));
+        }
+
+        self.poll_open_condition(options)
+    }
+}
+
+impl ConditionWaitCall {
+    fn poll_new_condition(
+        self: Pin<&mut Self>,
+        options: ValidatedConditionWaitOptions,
+    ) -> Poll<Result<ConditionWaitResult>> {
+        self.poll_open_condition(options)
+    }
+
+    fn poll_open_condition(
+        mut self: Pin<&mut Self>,
+        options: ValidatedConditionWaitOptions,
+    ) -> Poll<Result<ConditionWaitResult>> {
+        match (self.predicate)() {
+            Ok(true) => return Poll::Ready(Ok(ConditionWaitResult::Satisfied)),
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        if options.timeout_seconds == Some(0) {
+            return Poll::Ready(Ok(ConditionWaitResult::TimedOut));
+        }
+
+        let ctx = self.ctx.clone();
+        let mut state = match ctx.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+        };
+        let mut command = serde_json::Map::from_iter([
+            ("type".to_string(), json!("open_condition_wait")),
+            ("condition_key".to_string(), json!(options.condition_key)),
+            (
+                "condition_definition_fingerprint".to_string(),
+                json!(options.predicate_identity),
+            ),
+        ]);
+        if let Some(timeout_seconds) = options.timeout_seconds {
+            command.insert("timeout_seconds".to_string(), json!(timeout_seconds));
+        }
+        state.commands.push(Value::Object(command));
+        drop(state);
+        self.opened_wait = true;
+        Poll::Pending
+    }
+}
+
+fn same_logical_condition_wait(
+    recorded_key: Option<&str>,
+    recorded_predicate_identity: &str,
+    current: &ValidatedConditionWaitOptions,
+) -> bool {
+    recorded_key == Some(current.condition_key.as_str())
+        || recorded_predicate_identity == current.predicate_identity
+}
+
+fn validate_recorded_condition_wait(
+    sequence: u64,
+    recorded_key: Option<&str>,
+    recorded_predicate_identity: &str,
+    recorded_timeout_seconds: Option<u64>,
+    current: &ValidatedConditionWaitOptions,
+) -> Result<()> {
+    if recorded_key != Some(current.condition_key.as_str()) {
+        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+            "condition_wait_key_mismatch",
+            Some(sequence),
+            recorded_key.map(str::to_string),
+            Some(current.condition_key.clone()),
+            "recorded condition identity differs from the current workflow wait",
+        )));
+    }
+    if recorded_predicate_identity != current.predicate_identity {
+        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+            "condition_wait_predicate_mismatch",
+            Some(sequence),
+            Some(recorded_predicate_identity.to_string()),
+            Some(current.predicate_identity.clone()),
+            "recorded condition predicate behavior differs from current workflow code",
+        )));
+    }
+    if recorded_timeout_seconds != current.timeout_seconds {
+        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+            "condition_wait_timeout_mismatch",
+            Some(sequence),
+            recorded_timeout_seconds.map(|seconds| format!("{seconds}s")),
+            current.timeout_seconds.map(|seconds| format!("{seconds}s")),
+            "recorded condition timeout differs from the current workflow wait",
+        )));
+    }
+    Ok(())
+}
+
 /// Future returned by [`WorkflowContext::start_child_workflow`].
 pub struct ChildWorkflowCall {
     ctx: WorkflowContext,
@@ -9467,16 +10072,18 @@ fn recorded_commands(
                 | "ChildRunTerminated"
         );
         let is_signal_wait = is_recorded_signal_wait_event(event);
+        let is_condition_wait = is_recorded_condition_wait_event(event);
+        let is_search_attributes = event.event_type == "SearchAttributesUpserted";
         let is_side_effect = event.event_type == "SideEffectRecorded";
         let is_version_marker = event.event_type == "VersionMarkerRecorded";
-        let is_search_attributes = event.event_type == "SearchAttributesUpserted";
         if !is_activity
             && !is_workflow_timer
             && !is_child_workflow
             && !is_signal_wait
+            && !is_condition_wait
+            && !is_search_attributes
             && !is_side_effect
             && !is_version_marker
-            && !is_search_attributes
         {
             continue;
         }
@@ -9542,6 +10149,16 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| is_recorded_signal_wait_event(event))
                 .collect();
+            let condition_wait_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| is_recorded_condition_wait_event(event))
+                .collect();
+            let search_attribute_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "SearchAttributesUpserted")
+                .collect();
             let side_effect_events: Vec<_> = sequence_events
                 .iter()
                 .copied()
@@ -9552,28 +10169,25 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| event.event_type == "VersionMarkerRecorded")
                 .collect();
-            let search_attribute_events: Vec<_> = sequence_events
-                .iter()
-                .copied()
-                .filter(|event| event.event_type == "SearchAttributesUpserted")
-                .collect();
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
                 + usize::from(!child_events.is_empty())
                 + usize::from(!signal_wait_events.is_empty())
+                + usize::from(!condition_wait_events.is_empty())
+                + usize::from(!search_attribute_events.is_empty())
                 + usize::from(!side_effect_events.is_empty())
-                + usize::from(!version_marker_events.is_empty())
-                + usize::from(!search_attribute_events.is_empty());
+                + usize::from(!version_marker_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
                     (!timer_events.is_empty()).then_some("timer"),
                     (!child_events.is_empty()).then_some("child workflow"),
                     (!signal_wait_events.is_empty()).then_some("signal wait"),
+                    (!condition_wait_events.is_empty()).then_some("condition wait"),
+                    (!search_attribute_events.is_empty()).then_some("search-attribute update"),
                     (!side_effect_events.is_empty()).then_some("side effect"),
                     (!version_marker_events.is_empty()).then_some("version marker"),
-                    (!search_attribute_events.is_empty()).then_some("search attributes upsert"),
                 ]
                 .into_iter()
                 .flatten()
@@ -9816,6 +10430,50 @@ fn recorded_commands(
                 });
             }
 
+            if !condition_wait_events.is_empty() {
+                return recorded_condition_wait(
+                    sequence,
+                    &condition_wait_events,
+                    events,
+                );
+            }
+
+            if !search_attribute_events.is_empty() {
+                if search_attribute_events.len() != 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_search_attribute_update",
+                        sequence,
+                        "one SearchAttributesUpserted event",
+                        &format!(
+                            "{} SearchAttributesUpserted events",
+                            search_attribute_events.len()
+                        ),
+                        "search-attribute history records one workflow command more than once",
+                    ));
+                }
+                let payload = &search_attribute_events[0].payload;
+                let attributes = payload
+                    .get("attributes")
+                    .filter(|value| value.as_object().is_some_and(|values| !values.is_empty()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid_recorded_history(
+                            "search_attribute_update_missing",
+                            sequence,
+                            "non-empty attributes object",
+                            "missing or invalid attributes",
+                            "search-attribute history is missing its recorded mutation",
+                        )
+                    })?;
+                let attribute_types =
+                    recorded_search_attribute_types(payload, &attributes, sequence)?;
+                return Ok(RecordedCommand::SearchAttributes {
+                    sequence,
+                    attributes,
+                    attribute_types,
+                });
+            }
+
             if !side_effect_events.is_empty() {
                 if side_effect_events.len() != 1 {
                     return Err(invalid_recorded_history(
@@ -9912,38 +10570,6 @@ fn recorded_commands(
                     sequence,
                     change_id,
                     version,
-                });
-            }
-
-            if !search_attribute_events.is_empty() {
-                if search_attribute_events.len() != 1 {
-                    return Err(invalid_recorded_history(
-                        "duplicate_search_attribute_upsert",
-                        sequence,
-                        "one SearchAttributesUpserted event",
-                        &format!("{} SearchAttributesUpserted events", search_attribute_events.len()),
-                        "search-attribute history records one workflow command more than once",
-                    ));
-                }
-                let payload = &search_attribute_events[0].payload;
-                let attributes = payload
-                    .get("attributes")
-                    .filter(|attributes| attributes.is_object())
-                    .cloned()
-                    .ok_or_else(|| {
-                        invalid_recorded_history(
-                            "search_attribute_values_missing",
-                            sequence,
-                            "attribute value map",
-                            "missing or invalid attributes",
-                            "search-attribute history is missing its recorded value map",
-                        )
-                    })?;
-                let attribute_types = recorded_search_attribute_types(payload, &attributes, sequence)?;
-                return Ok(RecordedCommand::SearchAttributesUpserted {
-                    sequence,
-                    attributes,
-                    attribute_types,
                 });
             }
 
@@ -10069,6 +10695,259 @@ fn is_internal_timer_event(event: &HistoryEvent) -> bool {
             .and_then(Value::as_str),
         Some("condition_timeout" | "signal_timeout")
     )
+}
+
+fn is_recorded_condition_wait_event(event: &HistoryEvent) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "ConditionWaitOpened" | "ConditionWaitSatisfied" | "ConditionWaitTimedOut"
+    )
+}
+
+fn recorded_condition_wait(
+    sequence: u64,
+    condition_events: &[&HistoryEvent],
+    all_events: &[HistoryEvent],
+) -> Result<RecordedCommand> {
+    let opened = condition_events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type == "ConditionWaitOpened")
+        .collect::<Vec<_>>();
+    if opened.len() != 1 {
+        return Err(invalid_recorded_history(
+            "condition_wait_open_missing_or_duplicate",
+            sequence,
+            "one ConditionWaitOpened event",
+            &format!("{} ConditionWaitOpened events", opened.len()),
+            "condition replay requires exactly one canonical wait-open event",
+        ));
+    }
+    let terminal = condition_events
+        .iter()
+        .copied()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "ConditionWaitSatisfied" | "ConditionWaitTimedOut"
+            )
+        })
+        .collect::<Vec<_>>();
+    if terminal.len() > 1 {
+        return Err(invalid_recorded_history(
+            "duplicate_condition_wait_terminal_event",
+            sequence,
+            "at most one condition terminal event",
+            "multiple condition terminal events",
+            "condition history settles one durable wait more than once",
+        ));
+    }
+
+    let opened = opened[0];
+    let condition_wait_id = required_condition_wait_id(opened, sequence)?;
+    for event in condition_events
+        .iter()
+        .copied()
+        .filter(|event| !std::ptr::eq(*event, opened))
+    {
+        let event_wait_id = required_condition_wait_id(event, sequence)?;
+        if event_wait_id != condition_wait_id {
+            return Err(invalid_recorded_history(
+                "condition_wait_id_mismatch",
+                sequence,
+                &condition_wait_id,
+                &event_wait_id,
+                "condition lifecycle events at one sequence disagree on wait identity",
+            ));
+        }
+    }
+
+    let condition_key = optional_non_empty_history_string(opened, "condition_key");
+    let predicate_identity = opened
+        .payload
+        .get("condition_definition_fingerprint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "condition_wait_predicate_fingerprint_missing",
+                sequence,
+                "non-empty condition_definition_fingerprint",
+                &opened.event_type,
+                "canonical condition history is missing its predicate identity",
+            )
+        })?;
+    let timeout_seconds = optional_history_u64(opened, "timeout_seconds", sequence)?;
+    for event in condition_events
+        .iter()
+        .copied()
+        .filter(|event| !std::ptr::eq(*event, opened))
+    {
+        for (field, opened_value) in [
+            ("condition_key", condition_key.as_deref()),
+            (
+                "condition_definition_fingerprint",
+                Some(predicate_identity.as_str()),
+            ),
+        ] {
+            if let Some(value) = optional_non_empty_history_string(event, field) {
+                if opened_value.is_some_and(|opened_value| opened_value != value) {
+                    return Err(invalid_recorded_history(
+                        "condition_wait_definition_history_mismatch",
+                        sequence,
+                        opened_value.unwrap_or_default(),
+                        &value,
+                        "condition lifecycle events disagree on the recorded definition",
+                    ));
+                }
+            }
+        }
+        if let Some(event_timeout) = optional_history_u64(event, "timeout_seconds", sequence)? {
+            if timeout_seconds.is_some_and(|opened_timeout| opened_timeout != event_timeout) {
+                return Err(invalid_recorded_history(
+                    "condition_wait_definition_history_mismatch",
+                    sequence,
+                    &format!("{}s", timeout_seconds.unwrap_or_default()),
+                    &format!("{event_timeout}s"),
+                    "condition lifecycle events disagree on the recorded timeout",
+                ));
+            }
+        }
+    }
+
+    let timeout_timer_events = all_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "TimerScheduled" | "TimerCancelled" | "TimerFired"
+            ) && event.payload.get("timer_kind").and_then(Value::as_str)
+                == Some("condition_timeout")
+                && event
+                    .payload
+                    .get("condition_wait_id")
+                    .and_then(Value::as_str)
+                    == Some(condition_wait_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let scheduled = timeout_timer_events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type == "TimerScheduled")
+        .collect::<Vec<_>>();
+    let fired = timeout_timer_events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type == "TimerFired")
+        .collect::<Vec<_>>();
+    if scheduled.len() > 1 || fired.len() > 1 || (!fired.is_empty() && scheduled.len() != 1) {
+        return Err(invalid_recorded_history(
+            "condition_wait_timeout_history_invalid",
+            sequence,
+            "one timeout schedule and at most one fire",
+            &format!("{} schedules and {} fires", scheduled.len(), fired.len()),
+            "condition timeout history has a missing or duplicate lifecycle event",
+        ));
+    }
+    if let Some(scheduled) = scheduled.first() {
+        let timer_id = required_history_string(scheduled, "timer_id", sequence)?;
+        let delay_seconds = required_history_u64(scheduled, "delay_seconds", sequence)?;
+        if timeout_seconds.is_some_and(|timeout| timeout != delay_seconds) {
+            return Err(invalid_recorded_history(
+                "condition_wait_timeout_delay_mismatch",
+                sequence,
+                &format!("{}s", timeout_seconds.unwrap_or_default()),
+                &format!("{delay_seconds}s"),
+                "condition timeout timer differs from the wait definition",
+            ));
+        }
+        if let Some(fired) = fired.first() {
+            let fired_timer_id = required_history_string(fired, "timer_id", sequence)?;
+            let fired_delay = required_history_u64(fired, "delay_seconds", sequence)?;
+            if fired_timer_id != timer_id || fired_delay != delay_seconds {
+                return Err(invalid_recorded_history(
+                    "condition_wait_timeout_identity_mismatch",
+                    sequence,
+                    &format!("{timer_id}:{delay_seconds}s"),
+                    &format!("{fired_timer_id}:{fired_delay}s"),
+                    "condition timeout fire does not match its durable schedule",
+                ));
+            }
+        }
+    }
+
+    let result = terminal.first().map(|event| {
+        if event.event_type == "ConditionWaitTimedOut" {
+            ConditionWaitResult::TimedOut
+        } else {
+            ConditionWaitResult::Satisfied
+        }
+    });
+    let result = if !fired.is_empty() {
+        if result == Some(ConditionWaitResult::Satisfied) {
+            return Err(invalid_recorded_history(
+                "condition_wait_terminal_conflict",
+                sequence,
+                "one satisfied or timed-out outcome",
+                "satisfied event and fired timeout",
+                "condition history records conflicting terminal outcomes",
+            ));
+        }
+        Some(ConditionWaitResult::TimedOut)
+    } else {
+        result
+    };
+
+    Ok(RecordedCommand::ConditionWait {
+        sequence,
+        condition_key,
+        predicate_identity,
+        timeout_seconds,
+        result,
+    })
+}
+
+fn required_condition_wait_id(event: &HistoryEvent, sequence: u64) -> Result<String> {
+    event
+        .payload
+        .get("condition_wait_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "condition_wait_id_missing",
+                sequence,
+                "non-empty condition_wait_id",
+                &event.event_type,
+                "canonical condition history is missing its durable wait identity",
+            )
+        })
+}
+
+fn optional_non_empty_history_string(event: &HistoryEvent, field: &str) -> Option<String> {
+    event
+        .payload
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn optional_history_u64(event: &HistoryEvent, field: &str, sequence: u64) -> Result<Option<u64>> {
+    match event.payload.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value_as_u64(value).map(Some).ok_or_else(|| {
+            invalid_recorded_history(
+                "condition_wait_definition_invalid",
+                sequence,
+                &format!("non-negative integer {field}"),
+                &value.to_string(),
+                "condition history contains an invalid numeric definition field",
+            )
+        }),
+    }
 }
 
 fn required_signal_wait_name(event: &HistoryEvent, sequence: u64) -> Result<String> {
@@ -10577,6 +11456,26 @@ fn decode_signal_event_arguments(
     Ok(arguments)
 }
 
+fn decode_update_event_arguments(
+    event: &HistoryEvent,
+    fallback_codec: &str,
+) -> Result<Vec<AvroValue>> {
+    let codec = declared_payload_codec(&event.payload, "payload_codec")?.unwrap_or(fallback_codec);
+    validate_payload_codec(codec)?;
+    let decoded = match event
+        .payload
+        .get("arguments")
+        .filter(|value| !value.is_null())
+    {
+        Some(value) => decode_wire_avro_value(value, codec)?,
+        None => AvroValue::Array(Vec::new()),
+    };
+    let AvroValue::Array(arguments) = normalize_avro_arguments(decoded) else {
+        unreachable!("normalize_avro_arguments always returns an array");
+    };
+    Ok(arguments)
+}
+
 fn hydrate_query_history_from_export(task: &mut QueryTask) -> Result<()> {
     let Some(export_events) = task
         .history_export
@@ -10987,6 +11886,28 @@ mod tests {
 
             assert_eq!(client.base_url, expected);
         }
+    }
+
+    #[test]
+    fn workflow_completion_uses_the_additive_command_protocol_floor() {
+        assert_eq!(
+            workflow_completion_protocol_version(&[json!({"type": "complete_workflow"})]),
+            WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            workflow_completion_protocol_version(&[json!({
+                "type": "upsert_search_attributes",
+                "attributes": {"OrderStatus": "waiting"},
+            })]),
+            SEARCH_ATTRIBUTE_UPDATE_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            workflow_completion_protocol_version(&[
+                json!({"type": "upsert_search_attributes", "attributes": {"State": "waiting"}}),
+                json!({"type": "open_condition_wait", "condition_key": "ready"}),
+            ]),
+            CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
     }
 
     fn typed_fidelity_probe() -> AvroValue {
@@ -11905,10 +12826,11 @@ mod tests {
 
         let matching = workflow_context(history.clone());
         matching
-            .upsert_search_attributes(BTreeMap::from([(
-                "customer_tier".to_string(),
-                SearchAttributeUpdate::keyword("gold"),
-            )]))
+            .upsert_search_attributes(
+                SearchAttributeUpdate::new()
+                    .keyword("customer_tier", "gold")
+                    .expect("keyword update"),
+            )
             .expect("matching typed update must replay");
         matching
             .ensure_history_consumed()
@@ -11916,10 +12838,11 @@ mod tests {
 
         let changed_type = workflow_context(history.clone());
         let error = changed_type
-            .upsert_search_attributes(BTreeMap::from([(
-                "customer_tier".to_string(),
-                SearchAttributeUpdate::string("gold"),
-            )]))
+            .upsert_search_attributes(
+                SearchAttributeUpdate::new()
+                    .string("customer_tier", "gold")
+                    .expect("string update"),
+            )
             .expect_err("same JSON value with a different declaration must be nondeterministic");
         let Error::NonDeterministicReplay(failure) = error else {
             panic!("typed identity drift must be a replay failure");
@@ -11929,10 +12852,11 @@ mod tests {
 
         let changed_value = workflow_context(history);
         let error = changed_value
-            .upsert_search_attributes(BTreeMap::from([(
-                "customer_tier".to_string(),
-                SearchAttributeUpdate::keyword("platinum"),
-            )]))
+            .upsert_search_attributes(
+                SearchAttributeUpdate::new()
+                    .keyword("customer_tier", "platinum")
+                    .expect("keyword update"),
+            )
             .expect_err("changed values must be nondeterministic");
         let Error::NonDeterministicReplay(failure) = error else {
             panic!("value drift must be a replay failure");
@@ -11952,12 +12876,16 @@ mod tests {
         )];
 
         for update in [
-            SearchAttributeUpdate::keyword("gold"),
-            SearchAttributeUpdate::string("gold"),
+            SearchAttributeUpdate::new()
+                .keyword("customer_tier", "gold")
+                .expect("keyword update"),
+            SearchAttributeUpdate::new()
+                .string("customer_tier", "gold")
+                .expect("string update"),
         ] {
             let restarted = workflow_context(history.clone());
             restarted
-                .upsert_search_attributes(BTreeMap::from([("customer_tier".to_string(), update)]))
+                .upsert_search_attributes(update)
                 .expect("legacy history constrains values but has unknown type identity");
             restarted
                 .ensure_history_consumed()
@@ -11968,14 +12896,15 @@ mod tests {
     #[test]
     fn search_attribute_command_emits_canonical_types() {
         let ctx = workflow_context(Vec::new());
-        ctx.upsert_search_attributes(BTreeMap::from([
-            (
-                "customer_tier".to_string(),
-                SearchAttributeUpdate::keyword("gold"),
-            ),
-            ("attempts".to_string(), SearchAttributeUpdate::int(3)),
-            ("obsolete".to_string(), SearchAttributeUpdate::delete()),
-        ]))
+        ctx.upsert_search_attributes(
+            SearchAttributeUpdate::new()
+                .keyword("customer_tier", "gold")
+                .expect("keyword update")
+                .int("attempts", 3)
+                .expect("int update")
+                .delete("obsolete")
+                .expect("delete update"),
+        )
         .expect("valid search attributes");
 
         assert_eq!(
@@ -14021,6 +14950,538 @@ mod tests {
     }
 
     #[test]
+    fn workflow_condition_wait_emits_published_identity_and_timeout_contract() {
+        let ctx = workflow_context(Vec::new());
+        let mut wait = Box::pin(
+            ctx.wait_condition(
+                ConditionWaitOptions::new("approval.ready", "sha256:approval-v1")
+                    .timeout(Duration::from_millis(60_001)),
+                || Ok(false),
+            ),
+        );
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            wait.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            wait.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert_eq!(
+            ctx.take_commands().expect("condition command"),
+            vec![json!({
+                "type": "open_condition_wait",
+                "condition_key": "approval.ready",
+                "condition_definition_fingerprint": "sha256:approval-v1",
+                "timeout_seconds": 61,
+            })]
+        );
+    }
+
+    #[test]
+    fn workflow_condition_wait_returns_explicit_immediate_results_without_commands() {
+        let ctx = workflow_context(Vec::new());
+        let mut satisfied = Box::pin(wait_condition!(ctx, "already-ready", || Ok(true)));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            satisfied.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+        ));
+
+        let mut timed_out = Box::pin(wait_condition!(
+            ctx,
+            "no-wait",
+            timeout: Duration::ZERO,
+            || Ok(false),
+        ));
+        assert!(matches!(
+            timed_out.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::TimedOut))
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn signal_and_update_history_reevaluate_open_conditions_after_restart() {
+        let signal_history = vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 4,
+                    "condition_wait_id": "condition:4",
+                    "condition_key": "approval",
+                    "condition_definition_fingerprint": "sha256:approval-v1",
+                    "timeout_seconds": 30,
+                }),
+            ),
+            history_event(
+                "SignalReceived",
+                json!({
+                    "workflow_sequence": 4,
+                    "signal_name": "approve",
+                    "arguments": fixture_envelope(json!(["Ada"])),
+                }),
+            ),
+        ];
+        for _worker_before_or_after_restart in 0..2 {
+            let ctx = workflow_context(signal_history.clone());
+            let predicate_ctx = ctx.clone();
+            let mut wait = Box::pin(
+                ctx.wait_condition(
+                    ConditionWaitOptions::new("approval", "sha256:approval-v1")
+                        .timeout(Duration::from_secs(30)),
+                    move || Ok(!predicate_ctx.signals("approve")?.is_empty()),
+                ),
+            );
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                wait.as_mut().poll(&mut task_context),
+                Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+            ));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+            ctx.ensure_history_consumed().expect("condition consumed");
+        }
+
+        let update_history = vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 7,
+                    "condition_wait_id": "condition:7",
+                    "condition_key": "update-approval",
+                    "condition_definition_fingerprint": "sha256:update-approval-v1",
+                }),
+            ),
+            history_event(
+                "UpdateApplied",
+                json!({
+                    "sequence": 7,
+                    "update_id": "update-1",
+                    "update_name": "approve",
+                    "arguments": fixture_envelope(json!([true])),
+                }),
+            ),
+        ];
+        let ctx = workflow_context(update_history);
+        let predicate_ctx = ctx.clone();
+        let mut wait = Box::pin(ctx.wait_condition(
+            ConditionWaitOptions::new("update-approval", "sha256:update-approval-v1"),
+            move || {
+                Ok(predicate_ctx
+                    .updates("approve")?
+                    .first()
+                    .and_then(|arguments| arguments.first())
+                    .and_then(Value::as_bool)
+                    == Some(true))
+            },
+        ));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            wait.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+        ctx.ensure_history_consumed().expect("condition consumed");
+    }
+
+    #[test]
+    fn condition_wait_preserves_open_satisfied_and_timed_out_replay_states() {
+        let open_history = vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 3,
+                    "condition_wait_id": "condition:3",
+                    "condition_key": "two-votes",
+                    "condition_definition_fingerprint": "sha256:two-votes-v1",
+                    "timeout_seconds": 120,
+                }),
+            ),
+            history_event(
+                "SignalReceived",
+                json!({
+                    "workflow_sequence": 3,
+                    "signal_name": "vote",
+                    "arguments": fixture_envelope(json!(["first"])),
+                }),
+            ),
+        ];
+        for _worker_before_or_after_restart in 0..2 {
+            let ctx = workflow_context(open_history.clone());
+            let predicate_ctx = ctx.clone();
+            let mut wait = Box::pin(
+                ctx.wait_condition(
+                    ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                        .timeout(Duration::from_secs(120)),
+                    move || Ok(predicate_ctx.signals("vote")?.len() >= 2),
+                ),
+            );
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                wait.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            assert_eq!(
+                ctx.take_commands().expect("reopened condition"),
+                vec![json!({
+                    "type": "open_condition_wait",
+                    "condition_key": "two-votes",
+                    "condition_definition_fingerprint": "sha256:two-votes-v1",
+                    "timeout_seconds": 120,
+                })]
+            );
+        }
+
+        let satisfied_ctx = workflow_context(vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 5,
+                    "condition_wait_id": "condition:5",
+                    "condition_key": "approval",
+                    "condition_definition_fingerprint": "sha256:approval-v1",
+                }),
+            ),
+            history_event(
+                "ConditionWaitSatisfied",
+                json!({
+                    "sequence": 5,
+                    "condition_wait_id": "condition:5",
+                    "condition_key": "approval",
+                    "condition_definition_fingerprint": "sha256:approval-v1",
+                }),
+            ),
+        ]);
+        let mut satisfied = Box::pin(satisfied_ctx.wait_condition(
+            ConditionWaitOptions::new("approval", "sha256:approval-v1"),
+            || Ok(false),
+        ));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            satisfied.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+        ));
+
+        let timed_out_ctx = workflow_context(vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 8,
+                    "condition_wait_id": "condition:8",
+                    "condition_key": "approval-timeout",
+                    "condition_definition_fingerprint": "sha256:approval-timeout-v1",
+                    "timeout_seconds": 5,
+                }),
+            ),
+            history_event(
+                "TimerScheduled",
+                json!({
+                    "sequence": 9,
+                    "timer_id": "condition-timer:9",
+                    "timer_kind": "condition_timeout",
+                    "condition_wait_id": "condition:8",
+                    "delay_seconds": 5,
+                }),
+            ),
+            history_event(
+                "TimerFired",
+                json!({
+                    "sequence": 9,
+                    "timer_id": "condition-timer:9",
+                    "timer_kind": "condition_timeout",
+                    "condition_wait_id": "condition:8",
+                    "delay_seconds": 5,
+                }),
+            ),
+        ]);
+        let mut timed_out = Box::pin(
+            timed_out_ctx.wait_condition(
+                ConditionWaitOptions::new("approval-timeout", "sha256:approval-timeout-v1")
+                    .timeout(Duration::from_secs(5)),
+                || Ok(true),
+            ),
+        );
+        assert!(matches!(
+            timed_out.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::TimedOut))
+        ));
+    }
+
+    #[test]
+    fn condition_wait_replays_repeated_physical_opens_as_one_logical_wait() {
+        let ctx = workflow_context(vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 3,
+                    "condition_wait_id": "condition:3",
+                    "condition_key": "two-votes",
+                    "condition_definition_fingerprint": "sha256:two-votes-v1",
+                }),
+            ),
+            history_event(
+                "SignalReceived",
+                json!({
+                    "workflow_sequence": 3,
+                    "signal_name": "vote",
+                    "arguments": fixture_envelope(json!(["first"])),
+                }),
+            ),
+            history_event(
+                "ConditionWaitSatisfied",
+                json!({
+                    "sequence": 3,
+                    "condition_wait_id": "condition:3",
+                    "condition_key": "two-votes",
+                    "condition_definition_fingerprint": "sha256:two-votes-v1",
+                }),
+            ),
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 5,
+                    "condition_wait_id": "condition:5",
+                    "condition_key": "two-votes",
+                    "condition_definition_fingerprint": "sha256:two-votes-v1",
+                }),
+            ),
+            history_event(
+                "SignalReceived",
+                json!({
+                    "workflow_sequence": 5,
+                    "signal_name": "vote",
+                    "arguments": fixture_envelope(json!(["second"])),
+                }),
+            ),
+            history_event(
+                "ConditionWaitSatisfied",
+                json!({
+                    "sequence": 5,
+                    "condition_wait_id": "condition:5",
+                    "condition_key": "two-votes",
+                    "condition_definition_fingerprint": "sha256:two-votes-v1",
+                }),
+            ),
+        ]);
+        let predicate_ctx = ctx.clone();
+        let mut wait = Box::pin(ctx.wait_condition(
+            ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+            move || Ok(predicate_ctx.signals("vote")?.len() >= 2),
+        ));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            wait.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+        ));
+        ctx.ensure_history_consumed()
+            .expect("every physical wait-open is consumed");
+    }
+
+    #[test]
+    fn condition_wait_replay_rejects_identity_predicate_and_timeout_changes() {
+        let history = vec![history_event(
+            "ConditionWaitOpened",
+            json!({
+                "sequence": 12,
+                "condition_wait_id": "condition:12",
+                "condition_key": "approval",
+                "condition_definition_fingerprint": "sha256:approval-v1",
+                "timeout_seconds": 30,
+            }),
+        )];
+        for (options, expected_reason) in [
+            (
+                ConditionWaitOptions::new("changed", "sha256:approval-v1")
+                    .timeout(Duration::from_secs(30)),
+                "condition_wait_key_mismatch",
+            ),
+            (
+                ConditionWaitOptions::new("approval", "sha256:approval-v2")
+                    .timeout(Duration::from_secs(30)),
+                "condition_wait_predicate_mismatch",
+            ),
+            (
+                ConditionWaitOptions::new("approval", "sha256:approval-v1")
+                    .timeout(Duration::from_secs(29)),
+                "condition_wait_timeout_mismatch",
+            ),
+        ] {
+            let ctx = workflow_context(history.clone());
+            let mut wait = Box::pin(ctx.wait_condition(options, || Ok(false)));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                wait.as_mut().poll(&mut task_context)
+            else {
+                panic!("changed condition definition must fail replay");
+            };
+            assert_eq!(failure.reason, expected_reason);
+            assert_eq!(failure.sequence, Some(12));
+        }
+    }
+
+    #[test]
+    fn condition_wait_history_requires_the_canonical_predicate_fingerprint() {
+        let error = WorkflowState::new(
+            vec![history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 12,
+                    "condition_wait_id": "condition:12",
+                    "condition_key": "approval",
+                }),
+            )],
+            "rust-workers".to_string(),
+            DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect_err("condition history without a predicate fingerprint must fail");
+
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "condition_wait_predicate_fingerprint_missing"
+        ));
+    }
+
+    #[test]
+    fn typed_search_attribute_updates_validate_emit_and_replay() {
+        let update = SearchAttributeUpdate::new()
+            .keyword("OrderStatus", " waiting ")
+            .expect("keyword")
+            .int("Attempt", 3)
+            .expect("int")
+            .bool("Escalated", false)
+            .expect("bool")
+            .keyword_list("Regions", ["us-east", "eu-west"])
+            .expect("list")
+            .datetime("UpdatedAt", "2026-08-22T04:00:00Z")
+            .expect("datetime")
+            .delete("LegacyStatus")
+            .expect("delete");
+        let ctx = workflow_context(Vec::new());
+        ctx.upsert_search_attributes(update.clone())
+            .expect("typed update");
+        assert_eq!(
+            ctx.take_commands().expect("search-attribute command"),
+            vec![json!({
+                "type": "upsert_search_attributes",
+                "attributes": {
+                    "Attempt": 3,
+                    "Escalated": false,
+                    "LegacyStatus": null,
+                    "OrderStatus": "waiting",
+                    "Regions": ["us-east", "eu-west"],
+                    "UpdatedAt": "2026-08-22T04:00:00Z",
+                },
+                "attribute_types": {
+                    "Attempt": "int",
+                    "Escalated": "bool",
+                    "OrderStatus": "keyword",
+                    "Regions": "keyword_list",
+                    "UpdatedAt": "datetime",
+                },
+            })]
+        );
+
+        let replay = workflow_context(vec![history_event(
+            "SearchAttributesUpserted",
+            json!({
+                "sequence": 6,
+                "attributes": {
+                    "Attempt": 3,
+                    "Escalated": false,
+                    "LegacyStatus": null,
+                    "OrderStatus": "waiting",
+                    "Regions": ["us-east", "eu-west"],
+                    "UpdatedAt": "2026-08-22T04:00:00Z",
+                },
+                "attribute_types": {
+                    "Attempt": "int",
+                    "Escalated": "bool",
+                    "OrderStatus": "keyword",
+                    "Regions": "keyword_list",
+                    "UpdatedAt": "datetime",
+                },
+                "merged": {},
+            }),
+        )]);
+        replay
+            .upsert_search_attributes(update)
+            .expect("matching update replays");
+        assert!(replay.take_commands().expect("commands").is_empty());
+        replay.ensure_history_consumed().expect("history consumed");
+
+        let type_drift = workflow_context(vec![history_event(
+            "SearchAttributesUpserted",
+            json!({
+                "sequence": 7,
+                "attributes": {"OrderStatus": "waiting"},
+                "attribute_types": {"OrderStatus": "keyword"},
+                "merged": {"OrderStatus": "waiting"},
+            }),
+        )]);
+        let error = type_drift
+            .upsert_search_attributes(
+                SearchAttributeUpdate::new()
+                    .string("OrderStatus", "waiting")
+                    .expect("string update"),
+            )
+            .expect_err("same JSON value with a changed type must fail replay");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "search_attribute_type_mismatch"
+        ));
+
+        let malformed_types = WorkflowState::new(
+            vec![history_event(
+                "SearchAttributesUpserted",
+                json!({
+                    "sequence": 8,
+                    "attributes": {"OrderStatus": "waiting"},
+                    "attribute_types": {"OrderStatus": "unsupported"},
+                    "merged": {"OrderStatus": "waiting"},
+                }),
+            )],
+            "rust-workers".to_string(),
+            DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect_err("unsupported search-attribute type metadata must fail");
+        assert!(matches!(
+            malformed_types,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "search_attribute_types_malformed"
+        ));
+
+        assert!(matches!(
+            SearchAttributeUpdate::new().keyword("bad key", "value"),
+            Err(SearchAttributeUpdateError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            SearchAttributeUpdate::new().float("Ratio", f64::NAN),
+            Err(SearchAttributeUpdateError::NonFiniteFloat(_))
+        ));
+        assert!(matches!(
+            SearchAttributeUpdate::new().keyword("UnicodeKeyword", "é".repeat(128)),
+            Err(SearchAttributeUpdateError::ValueTooLong { .. })
+        ));
+        assert!(matches!(
+            SearchAttributeUpdate::new().datetime("UpdatedAt", "2026-02-30T04:00:00Z"),
+            Err(SearchAttributeUpdateError::InvalidDateTime(_))
+        ));
+        assert!(matches!(
+            workflow_context(Vec::new()).upsert_search_attributes(SearchAttributeUpdate::new()),
+            Err(Error::InvalidSearchAttributeUpdate(
+                SearchAttributeUpdateError::Empty
+            ))
+        ));
+    }
+
+    #[test]
     fn workflow_history_rejects_unpaired_or_mismatched_timer_events() {
         let lone_fire = WorkflowState::new(
             vec![history_event(
@@ -14164,15 +15625,25 @@ mod tests {
     }
 
     #[test]
-    fn condition_wait_history_does_not_resolve_a_typed_signal_wait() {
+    fn condition_wait_history_cannot_be_consumed_as_a_typed_signal_wait() {
         let ctx = workflow_context(vec![
             history_event(
                 "ConditionWaitOpened",
-                json!({"sequence": 1, "condition_key": "signal:finish"}),
+                json!({
+                    "sequence": 1,
+                    "condition_wait_id": "condition:1",
+                    "condition_key": "signal:finish",
+                    "condition_definition_fingerprint": "sha256:signal-finish-v1",
+                }),
             ),
             history_event(
                 "ConditionWaitSatisfied",
-                json!({"sequence": 1, "condition_key": "signal:finish"}),
+                json!({
+                    "sequence": 1,
+                    "condition_wait_id": "condition:1",
+                    "condition_key": "signal:finish",
+                    "condition_definition_fingerprint": "sha256:signal-finish-v1",
+                }),
             ),
             history_event(
                 "SignalReceived",
@@ -14182,17 +15653,13 @@ mod tests {
         let mut signal = Box::pin(ctx.wait_signal("finish"));
         let mut task_context = TaskContext::from_waker(noop_waker_ref());
 
-        assert!(matches!(
-            signal.as_mut().poll(&mut task_context),
-            Poll::Pending
-        ));
-        assert_eq!(
-            ctx.take_commands().expect("typed signal-wait command"),
-            vec![json!({
-                "type": "open_signal_wait",
-                "signal_name": "finish",
-            })]
-        );
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            signal.as_mut().poll(&mut task_context)
+        else {
+            panic!("condition history must not resolve as a typed signal wait");
+        };
+        assert_eq!(failure.reason, "recorded_command_mismatch");
+        assert_eq!(failure.expected.as_deref(), Some("condition wait"));
     }
 
     #[test]

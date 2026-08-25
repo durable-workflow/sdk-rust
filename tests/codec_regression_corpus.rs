@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use durable_workflow::{
     decode_avro_value, encode_avro_value, encode_payload, ActivityTask, AvroValue, Client,
-    ParallelGroupMetadata, PayloadEnvelope, QueryTask, Worker, WorkflowStreamAppendItem,
-    WorkflowTask, AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
+    ParallelGroupMetadata, PayloadEnvelope, QueryTask, SearchAttributeUpdate,
+    SearchAttributeUpdateError, Worker, WorkflowStreamAppendItem, WorkflowTask,
+    AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -136,12 +137,12 @@ fn check_task_boundary(fixture: &Value) {
     let Some(boundary) = fixture.get("task_boundary") else {
         return;
     };
-    let expected_error = boundary["error"]
-        .as_str()
-        .expect("task-boundary stable error");
 
     match boundary["operation"].as_str() {
         Some("complete_workflow_task") => {
+            let expected_error = boundary["error"]
+                .as_str()
+                .expect("task-boundary stable error");
             let command = boundary
                 .get("command")
                 .cloned()
@@ -162,6 +163,9 @@ fn check_task_boundary(fixture: &Value) {
             assert!(error.to_string().contains(expected_error), "{error}");
         }
         Some("deserialize_worker_tasks") => {
+            let expected_error = boundary["error"]
+                .as_str()
+                .expect("task-boundary stable error");
             for case in boundary["cases"].as_array().expect("task-boundary cases") {
                 let task = case.get("task").cloned().expect("task-boundary task");
                 let codec = match case["family"].as_str() {
@@ -190,6 +194,22 @@ fn check_task_boundary(fixture: &Value) {
                     case["id"]
                 );
             }
+        }
+        Some("typed_search_attribute_update") => {
+            let invalid_key = boundary["invalid_key"]
+                .as_str()
+                .expect("invalid search-attribute key");
+            assert!(matches!(
+                SearchAttributeUpdate::new().keyword(invalid_key, "waiting"),
+                Err(SearchAttributeUpdateError::InvalidKey(_))
+            ));
+            let non_finite_key = boundary["non_finite_key"]
+                .as_str()
+                .expect("non-finite search-attribute key");
+            assert!(matches!(
+                SearchAttributeUpdate::new().float(non_finite_key, f64::NAN),
+                Err(SearchAttributeUpdateError::NonFiniteFloat(_))
+            ));
         }
         operation => panic!("unsupported task-boundary corpus operation {operation:?}"),
     }

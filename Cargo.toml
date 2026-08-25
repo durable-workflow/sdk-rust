@@ -41,6 +41,15 @@ payload-codecs = ["avro"]
 durable-timers = true
 timer-command = "start_timer"
 timer-replay-validation = "command-order+sequence+timer-id+delay"
+durable-condition-waits = true
+condition-wait-command = "open_condition_wait"
+condition-wait-minimum-worker-protocol-version = "1.9"
+condition-wait-result = ["satisfied", "timed_out"]
+condition-wait-replay-validation = "command-order+sequence+key+predicate-fingerprint+timeout"
+workflow-search-attribute-updates = true
+search-attribute-update-command = "upsert_search_attributes"
+search-attribute-update-minimum-worker-protocol-version = "1.8"
+search-attribute-types = ["string", "keyword", "keyword_list", "int", "float", "bool", "datetime"]
 deterministic-side-effects = true
 side-effect-command = "record_side_effect"
 side-effect-history-event = "SideEffectRecorded"
@@ -87,6 +96,7 @@ apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
 # Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
 bon = { version = "=3.8.1", default-features = false }
+chrono = { version = "0.4", default-features = false }
 futures-util = "0.3"
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.
 icu_collections = { version = "=2.2.0", default-features = false }
@@ -98,6 +108,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-value = "0.7"
+sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }

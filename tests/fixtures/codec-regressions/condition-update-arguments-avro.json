@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "condition-update-arguments-avro",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": [
+    "rust"
+  ],
+  "value": {
+    "type": "array",
+    "items": [
+      {
+        "type": "boolean",
+        "value": true
+      }
+    ]
+  },
+  "framing": {
+    "encoding": "avro-single-object",
+    "wire_base64": "wwHioz3/VYAiNwwCAgEA"
+  },
+  "failure_policy": {
+    "operation": "round_trip"
+  },
+  "task_boundary": {
+    "operation": "typed_search_attribute_update",
+    "invalid_key": "bad key",
+    "non_finite_key": "Ratio"
+  }
+}

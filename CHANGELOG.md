@@ -20,6 +20,13 @@
   and value-only compatibility for legacy history without type metadata.
   Require Server `>=2.0.0-rc.47,<2.0.0`, the first release line that supports
   worker protocol `1.16`.
+- Add deterministic durable condition waits with typed satisfied/timed-out
+  results, signal/update re-evaluation, timeout preservation, and definition
+  drift detection across replay and restarts.
+- Add validated typed workflow search-attribute updates on the public worker
+  protocol and consume their committed mutations during replay.
+- Ship a standalone, task-oriented condition and operator-metadata example in
+  the generated Rust guidance.
 
 ## 2.0.0-rc.32
 

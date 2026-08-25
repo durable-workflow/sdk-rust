@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -13,9 +12,9 @@ use std::{
 };
 
 use durable_workflow::{
-    decode_payload, encode_payload, json, ChildWorkflowOptions, Client, Error, ParallelOperation,
-    ParallelResult, PayloadEnvelope, SearchAttributeUpdate, Value, Worker, WorkflowInstance,
-    DEFAULT_CODEC,
+    decode_payload, encode_payload, json, ChildWorkflowOptions, Client, ConditionWaitOptions,
+    ConditionWaitResult, Error, ParallelOperation, ParallelResult, PayloadEnvelope,
+    SearchAttributeUpdate, Value, Worker, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 
@@ -344,6 +343,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.nested-parallel"
             | "corpus.typed-replayed"
             | "corpus.search-attribute-type-mismatch"
+            | "corpus.condition-search"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -487,14 +487,35 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         }
         "corpus.search-attribute-type-mismatch" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
-                ctx.upsert_search_attributes(BTreeMap::from([(
-                    "customer_tier".to_string(),
-                    SearchAttributeUpdate::string("gold"),
-                )]))?;
+                ctx.upsert_search_attributes(
+                    SearchAttributeUpdate::new().string("customer_tier", "gold")?,
+                )?;
                 Ok(json!("unreachable"))
             });
         }
-        _ => unreachable!(),
+        "corpus.condition-search" => {
+            worker.register_workflow(workflow_type, move |ctx, _input| async move {
+                let predicate_ctx = ctx.clone();
+                let outcome = ctx
+                    .wait_condition(
+                        ConditionWaitOptions::new("approval", "sha256:corpus-approval-v1")
+                            .timeout(Duration::from_secs(30)),
+                        move || Ok(!predicate_ctx.signals("approve")?.is_empty()),
+                    )
+                    .await?;
+                let status = match outcome {
+                    ConditionWaitResult::Satisfied => "approved",
+                    ConditionWaitResult::TimedOut => "approval_timed_out",
+                };
+                ctx.upsert_search_attributes(
+                    SearchAttributeUpdate::new()
+                        .keyword("OrderStatus", status)?
+                        .bool("NeedsAttention", outcome.is_timed_out())?,
+                )?;
+                Ok(json!({"status": status}))
+            });
+        }
+        _ => unreachable!("workflow type was validated above"),
     }
     let handled = worker
         .run_once()
@@ -671,6 +692,24 @@ async fn workflow_stream_command_without_durable_identity_fails_closed() {
         "{error}"
     );
     assert!(error.contains("workflow_command_id"), "{error}");
+}
+
+#[tokio::test]
+async fn condition_and_search_replay_is_deterministic_across_cold_workers() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/condition-search-signal-cold-replay-avro.json");
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in condition replay fixture"),
+    )
+    .expect("parse checked-in condition replay fixture");
+    let first = execute_fixture(&fixture)
+        .await
+        .expect("first condition replay fixture must execute");
+    let second = execute_fixture(&fixture)
+        .await
+        .expect("cold condition replay fixture must execute");
+
+    assert_eq!(first, second);
 }
 
 #[tokio::test]

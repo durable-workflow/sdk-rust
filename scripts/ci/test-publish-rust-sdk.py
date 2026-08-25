@@ -213,6 +213,19 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual(
             SERVER_WORKER_PROTOCOLS, metadata["server-worker-protocol-versions"]
         )
+        self.assertTrue(metadata["durable-condition-waits"])
+        self.assertEqual("open_condition_wait", metadata["condition-wait-command"])
+        self.assertEqual(
+            "1.9", metadata["condition-wait-minimum-worker-protocol-version"]
+        )
+        self.assertTrue(metadata["workflow-search-attribute-updates"])
+        self.assertEqual(
+            "upsert_search_attributes", metadata["search-attribute-update-command"]
+        )
+        self.assertEqual(
+            "1.8",
+            metadata["search-attribute-update-minimum-worker-protocol-version"],
+        )
         self.assertTrue(metadata["typed-search-attributes"])
         self.assertEqual(
             WORKER_PROTOCOL_VERSION,
@@ -244,20 +257,42 @@ class PublishRustSdkContractTest(unittest.TestCase):
             SERVER_WORKER_PROTOCOLS,
             evidence["protocol_compatibility"]["server_worker_protocol_versions"],
         )
-        self.assertTrue(evidence["protocol_compatibility"]["typed_search_attributes"])
+        protocol = evidence["protocol_compatibility"]
+        self.assertTrue(protocol["durable_condition_waits"])
+        self.assertEqual("open_condition_wait", protocol["condition_wait_command"])
+        self.assertEqual("1.9", protocol["condition_wait_minimum_worker_protocol"])
+        self.assertEqual(["satisfied", "timed_out"], protocol["condition_wait_result"])
+        self.assertTrue(protocol["workflow_search_attribute_updates"])
+        self.assertEqual(
+            "upsert_search_attributes", protocol["search_attribute_update_command"]
+        )
+        self.assertEqual(
+            "1.8", protocol["search_attribute_update_minimum_worker_protocol"]
+        )
+        self.assertEqual(
+            [
+                "string",
+                "keyword",
+                "keyword_list",
+                "int",
+                "float",
+                "bool",
+                "datetime",
+            ],
+            protocol["search_attribute_types"],
+        )
+        self.assertTrue(protocol["typed_search_attributes"])
         self.assertEqual(
             WORKER_PROTOCOL_VERSION,
-            evidence["protocol_compatibility"][
-                "typed_search_attributes_minimum_worker_protocol"
-            ],
+            protocol["typed_search_attributes_minimum_worker_protocol"],
         )
         self.assertEqual(
             "json-value+canonical-declared-type",
-            evidence["protocol_compatibility"]["search_attribute_replay_identity"],
+            protocol["search_attribute_replay_identity"],
         )
         self.assertEqual(
             "value-only+unknown-type-identity",
-            evidence["protocol_compatibility"]["legacy_search_attribute_history"],
+            protocol["legacy_search_attribute_history"],
         )
         self.assertTrue(evidence["registry_verified"])
         self.assertEqual("1.86", evidence["fresh_consumer"]["rust_version"])
@@ -321,6 +356,14 @@ class PublishRustSdkContractTest(unittest.TestCase):
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
         self.assertIn("supported Server contract", result.stderr)
+
+    def test_release_path_rejects_missing_condition_capability(self) -> None:
+        manifest = self._manifest_with(
+            "durable-condition-waits = true",
+            "durable-condition-waits = false",
+        )
+        result = self._publish(manifest)
+        self.assertNotEqual(0, result.returncode)
 
 
 if __name__ == "__main__":
