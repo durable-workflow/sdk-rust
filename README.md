@@ -107,9 +107,10 @@ without a source edit: `DURABLE_WORKFLOW_RUNTIME_URL`,
 
 The installed crate's package metadata records its exact qualified Server
 range and baseline. Server build versions are identity, not the runtime
-negotiation mechanism: compatible servers must
-advertise control plane `2` and a
-same-major worker protocol in `>=1.15,<2.0`. The SDK sends worker protocol `1.15`;
+negotiation mechanism: this release starts with the first Server release line
+that advertises worker protocol `1.16`, as identified by the package metadata.
+Compatible servers must advertise control plane `2` and a
+same-major worker protocol in `>=1.16,<2.0`. The SDK sends worker protocol `1.16`;
 newer `1.x` server minors accept that header under the additive protocol
 contract.
 
@@ -136,6 +137,12 @@ the compensation order, failure-policy, and cancellation fields. Workflow
 Stream authoring requires the `1.15`
 feature floor, while query-task poll, complete, and fail requests retain their
 `1.8` minimum.
+
+Typed search-attribute updates require worker protocol `1.16`. The SDK records
+canonical declarations with each command and compares both the JSON value and
+the declaration during replay. Histories created before that metadata existed
+remain replayable by value, while the absent type is treated as unknown rather
+than as evidence of a typed match.
 
 The Rust SDK does not expose update-validator authoring. High-level worker
 registration declares an empty `update_validators` list for every workflow type

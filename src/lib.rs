@@ -26,7 +26,7 @@ pub use serde_json::{json, Value};
 use thiserror::Error;
 pub use uuid::Uuid;
 
-pub const WORKER_PROTOCOL_VERSION: &str = "1.15";
+pub const WORKER_PROTOCOL_VERSION: &str = "1.16";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
@@ -162,6 +162,8 @@ pub enum Error {
     },
     #[error("invalid child workflow options: {0}")]
     InvalidChildWorkflowOptions(String),
+    #[error("invalid search attribute update: {0}")]
+    InvalidSearchAttributes(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -710,6 +712,102 @@ pub struct ChildWorkflowOptions {
     pub retry_policy: Option<ChildWorkflowRetryPolicy>,
     pub execution_timeout_seconds: Option<u64>,
     pub run_timeout_seconds: Option<u64>,
+}
+
+/// Canonical search-attribute type names carried on the worker protocol and
+/// persisted in `SearchAttributesUpserted` history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchAttributeType {
+    String,
+    Keyword,
+    KeywordList,
+    Int,
+    Float,
+    Bool,
+    Datetime,
+}
+
+impl SearchAttributeType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Keyword => "keyword",
+            Self::KeywordList => "keyword_list",
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::Bool => "bool",
+            Self::Datetime => "datetime",
+        }
+    }
+}
+
+/// One typed value or deletion in a durable search-attribute upsert.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchAttributeUpdate {
+    value: Value,
+    attribute_type: Option<SearchAttributeType>,
+}
+
+impl SearchAttributeUpdate {
+    pub fn string(value: impl Into<String>) -> Self {
+        Self::typed(SearchAttributeType::String, Value::String(value.into()))
+    }
+
+    pub fn keyword(value: impl Into<String>) -> Self {
+        Self::typed(SearchAttributeType::Keyword, Value::String(value.into()))
+    }
+
+    pub fn keyword_list<I, S>(values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::typed(
+            SearchAttributeType::KeywordList,
+            Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| Value::String(value.into()))
+                    .collect(),
+            ),
+        )
+    }
+
+    pub fn int(value: i64) -> Self {
+        Self::typed(SearchAttributeType::Int, Value::Number(value.into()))
+    }
+
+    pub fn float(value: f64) -> Result<Self> {
+        let value = serde_json::Number::from_f64(value).ok_or_else(|| {
+            Error::InvalidSearchAttributes("float values must be finite".to_string())
+        })?;
+        Ok(Self::typed(
+            SearchAttributeType::Float,
+            Value::Number(value),
+        ))
+    }
+
+    pub fn bool(value: bool) -> Self {
+        Self::typed(SearchAttributeType::Bool, Value::Bool(value))
+    }
+
+    pub fn datetime(value: impl Into<String>) -> Self {
+        Self::typed(SearchAttributeType::Datetime, Value::String(value.into()))
+    }
+
+    pub fn delete() -> Self {
+        Self {
+            value: Value::Null,
+            attribute_type: None,
+        }
+    }
+
+    fn typed(attribute_type: SearchAttributeType, value: Value) -> Self {
+        Self {
+            value,
+            attribute_type: Some(attribute_type),
+        }
+    }
 }
 
 impl ChildWorkflowOptions {
@@ -6276,16 +6374,16 @@ impl Worker {
                     ctx.ensure_history_consumed()?;
                     return Ok(commands);
                 }
+                if workflow_task_integrity_error(&error) {
+                    // Replay and protocol failures describe the workflow-task
+                    // decision itself. Preserve their specific failure reason
+                    // instead of replacing it with the derivative fact that
+                    // recorded commands remain unconsumed.
+                    return Err(error);
+                }
                 // A handler error must not hide a committed durable command that
                 // upgraded workflow code no longer consumes.
                 ctx.ensure_history_consumed()?;
-                if workflow_task_integrity_error(&error) {
-                    // Replay and protocol failures describe the workflow-task
-                    // decision itself. Do not let commands queued earlier in
-                    // this uncommitted decision escape alongside a terminal
-                    // workflow failure.
-                    return Err(error);
-                }
                 let mut commands = ctx.take_commands()?;
                 commands.push(workflow_failure_command(&error));
                 Ok(commands)
@@ -6573,6 +6671,83 @@ impl WorkflowContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
         Ok(state.history_budget.clone())
+    }
+
+    /// Upsert typed operator-visible search attributes as one durable command.
+    ///
+    /// Replays compare both the JSON values and their canonical declared types.
+    /// History written before type metadata existed compares values only; its
+    /// absent metadata remains unknown and is never treated as proof of a typed
+    /// match.
+    pub fn upsert_search_attributes(
+        &self,
+        attributes: BTreeMap<String, SearchAttributeUpdate>,
+    ) -> Result<()> {
+        if attributes.is_empty() {
+            return Err(Error::InvalidSearchAttributes(
+                "at least one attribute is required".to_string(),
+            ));
+        }
+
+        let mut values = serde_json::Map::new();
+        let mut attribute_types = BTreeMap::new();
+        for (key, update) in attributes {
+            if !valid_search_attribute_key(&key) {
+                return Err(Error::InvalidSearchAttributes(format!(
+                    "attribute key {key:?} must start with a letter, contain only letters, numbers, and underscores, and be at most 128 bytes"
+                )));
+            }
+            values.insert(key.clone(), update.value);
+            if let Some(attribute_type) = update.attribute_type {
+                attribute_types.insert(key, attribute_type.as_str().to_string());
+            }
+        }
+        let values = Value::Object(values);
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            return match recorded {
+                RecordedCommand::SearchAttributesUpserted {
+                    sequence,
+                    attributes: recorded_attributes,
+                    attribute_types: recorded_types,
+                } => {
+                    if recorded_attributes != values {
+                        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                            "search_attribute_value_mismatch",
+                            Some(sequence),
+                            Some(recorded_attributes.to_string()),
+                            Some(values.to_string()),
+                            "search-attribute values differ from the recorded durable command",
+                        )));
+                    }
+                    if let RecordedSnapshotValue::Known(recorded_types) = recorded_types {
+                        if recorded_types != attribute_types {
+                            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                                "search_attribute_type_mismatch",
+                                Some(sequence),
+                                Some(search_attribute_types_description(&recorded_types)),
+                                Some(search_attribute_types_description(&attribute_types)),
+                                "search-attribute declared types differ from the recorded durable command",
+                            )));
+                        }
+                    }
+                    state.command_cursor += 1;
+                    Ok(())
+                }
+                other => Err(command_mismatch(&other, "search attributes upsert")),
+            };
+        }
+
+        state.commands.push(json!({
+            "type": "upsert_search_attributes",
+            "attributes": values,
+            "attribute_types": attribute_types,
+        }));
+        Ok(())
     }
 
     /// Continue this workflow instance as a fresh run with replacement arguments.
@@ -7470,6 +7645,11 @@ enum RecordedCommand {
         change_id: String,
         version: i32,
     },
+    SearchAttributesUpserted {
+        sequence: u64,
+        attributes: Value,
+        attribute_types: RecordedSnapshotValue<BTreeMap<String, String>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -7643,7 +7823,8 @@ impl RecordedCommand {
             | Self::ChildWorkflow { sequence, .. }
             | Self::SignalWait { sequence, .. }
             | Self::SideEffect { sequence, .. }
-            | Self::VersionMarker { sequence, .. } => *sequence,
+            | Self::VersionMarker { sequence, .. }
+            | Self::SearchAttributesUpserted { sequence, .. } => *sequence,
         }
     }
 
@@ -7655,8 +7836,23 @@ impl RecordedCommand {
             Self::SignalWait { .. } => "signal wait",
             Self::SideEffect { .. } => "side effect",
             Self::VersionMarker { .. } => "version marker",
+            Self::SearchAttributesUpserted { .. } => "search attributes upsert",
         }
     }
+}
+
+fn valid_search_attribute_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key.as_bytes()[0].is_ascii_alphabetic()
+        && key
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn search_attribute_types_description(types: &BTreeMap<String, String>) -> String {
+    serde_json::to_string(types).unwrap_or_else(|_| format!("{types:?}"))
 }
 
 fn ensure_version_supported(
@@ -9273,12 +9469,14 @@ fn recorded_commands(
         let is_signal_wait = is_recorded_signal_wait_event(event);
         let is_side_effect = event.event_type == "SideEffectRecorded";
         let is_version_marker = event.event_type == "VersionMarkerRecorded";
+        let is_search_attributes = event.event_type == "SearchAttributesUpserted";
         if !is_activity
             && !is_workflow_timer
             && !is_child_workflow
             && !is_signal_wait
             && !is_side_effect
             && !is_version_marker
+            && !is_search_attributes
         {
             continue;
         }
@@ -9354,13 +9552,19 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| event.event_type == "VersionMarkerRecorded")
                 .collect();
+            let search_attribute_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "SearchAttributesUpserted")
+                .collect();
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
                 + usize::from(!child_events.is_empty())
                 + usize::from(!signal_wait_events.is_empty())
                 + usize::from(!side_effect_events.is_empty())
-                + usize::from(!version_marker_events.is_empty());
+                + usize::from(!version_marker_events.is_empty())
+                + usize::from(!search_attribute_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
@@ -9369,6 +9573,7 @@ fn recorded_commands(
                     (!signal_wait_events.is_empty()).then_some("signal wait"),
                     (!side_effect_events.is_empty()).then_some("side effect"),
                     (!version_marker_events.is_empty()).then_some("version marker"),
+                    (!search_attribute_events.is_empty()).then_some("search attributes upsert"),
                 ]
                 .into_iter()
                 .flatten()
@@ -9710,6 +9915,38 @@ fn recorded_commands(
                 });
             }
 
+            if !search_attribute_events.is_empty() {
+                if search_attribute_events.len() != 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_search_attribute_upsert",
+                        sequence,
+                        "one SearchAttributesUpserted event",
+                        &format!("{} SearchAttributesUpserted events", search_attribute_events.len()),
+                        "search-attribute history records one workflow command more than once",
+                    ));
+                }
+                let payload = &search_attribute_events[0].payload;
+                let attributes = payload
+                    .get("attributes")
+                    .filter(|attributes| attributes.is_object())
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid_recorded_history(
+                            "search_attribute_values_missing",
+                            sequence,
+                            "attribute value map",
+                            "missing or invalid attributes",
+                            "search-attribute history is missing its recorded value map",
+                        )
+                    })?;
+                let attribute_types = recorded_search_attribute_types(payload, &attributes, sequence)?;
+                return Ok(RecordedCommand::SearchAttributesUpserted {
+                    sequence,
+                    attributes,
+                    attribute_types,
+                });
+            }
+
             let scheduled: Vec<_> = timer_events
                 .iter()
                 .copied()
@@ -9892,6 +10129,59 @@ fn required_history_u64(event: &HistoryEvent, field: &str, sequence: u64) -> Res
                 "timer history is missing a required numeric field",
             )
         })
+}
+
+fn recorded_search_attribute_types(
+    payload: &Value,
+    attributes: &Value,
+    sequence: u64,
+) -> Result<RecordedSnapshotValue<BTreeMap<String, String>>> {
+    let Some(raw_types) = payload.get("attribute_types") else {
+        // This is the explicit compatibility rule for histories recorded
+        // before typed identity was persisted. Values still constrain replay;
+        // the unknown type snapshot does not assert a typed match.
+        return Ok(RecordedSnapshotValue::Unknown);
+    };
+    let Some(raw_types) = raw_types.as_object() else {
+        return Err(invalid_recorded_history(
+            "search_attribute_types_malformed",
+            sequence,
+            "canonical attribute type map",
+            &raw_types.to_string(),
+            "search-attribute history contains malformed type identity",
+        ));
+    };
+    let attribute_keys = attributes
+        .as_object()
+        .expect("recorded search attributes were validated as an object");
+    let mut types = BTreeMap::new();
+    for (key, value) in raw_types {
+        let Some(attribute_type) = value.as_str() else {
+            return Err(invalid_recorded_history(
+                "search_attribute_types_malformed",
+                sequence,
+                "canonical string type name",
+                &value.to_string(),
+                "search-attribute history contains a non-string type identity",
+            ));
+        };
+        if !attribute_keys.contains_key(key)
+            || !matches!(
+                attribute_type,
+                "string" | "keyword" | "keyword_list" | "int" | "float" | "bool" | "datetime"
+            )
+        {
+            return Err(invalid_recorded_history(
+                "search_attribute_types_malformed",
+                sequence,
+                "canonical types for keys present in attributes",
+                &format!("{key}:{attribute_type}"),
+                "search-attribute history contains unsupported or orphaned type identity",
+            ));
+        }
+        types.insert(key.clone(), attribute_type.to_string());
+    }
+    Ok(RecordedSnapshotValue::Known(types))
 }
 
 fn invalid_recorded_history(
@@ -11599,6 +11889,110 @@ mod tests {
                     if actual == reason
             ));
         }
+    }
+
+    #[test]
+    fn typed_search_attributes_replay_value_and_type_identity_after_restart() {
+        let history = vec![history_event(
+            "SearchAttributesUpserted",
+            json!({
+                "sequence": 1,
+                "attributes": {"customer_tier": "gold"},
+                "attribute_types": {"customer_tier": "keyword"},
+                "merged": {"customer_tier": "gold"}
+            }),
+        )];
+
+        let matching = workflow_context(history.clone());
+        matching
+            .upsert_search_attributes(BTreeMap::from([(
+                "customer_tier".to_string(),
+                SearchAttributeUpdate::keyword("gold"),
+            )]))
+            .expect("matching typed update must replay");
+        matching
+            .ensure_history_consumed()
+            .expect("history consumed");
+
+        let changed_type = workflow_context(history.clone());
+        let error = changed_type
+            .upsert_search_attributes(BTreeMap::from([(
+                "customer_tier".to_string(),
+                SearchAttributeUpdate::string("gold"),
+            )]))
+            .expect_err("same JSON value with a different declaration must be nondeterministic");
+        let Error::NonDeterministicReplay(failure) = error else {
+            panic!("typed identity drift must be a replay failure");
+        };
+        assert_eq!(failure.reason, "search_attribute_type_mismatch");
+        assert_eq!(failure.sequence, Some(1));
+
+        let changed_value = workflow_context(history);
+        let error = changed_value
+            .upsert_search_attributes(BTreeMap::from([(
+                "customer_tier".to_string(),
+                SearchAttributeUpdate::keyword("platinum"),
+            )]))
+            .expect_err("changed values must be nondeterministic");
+        let Error::NonDeterministicReplay(failure) = error else {
+            panic!("value drift must be a replay failure");
+        };
+        assert_eq!(failure.reason, "search_attribute_value_mismatch");
+    }
+
+    #[test]
+    fn legacy_search_attribute_history_keeps_type_identity_unknown() {
+        let history = vec![history_event(
+            "SearchAttributesUpserted",
+            json!({
+                "sequence": 1,
+                "attributes": {"customer_tier": "gold"},
+                "merged": {"customer_tier": "gold"}
+            }),
+        )];
+
+        for update in [
+            SearchAttributeUpdate::keyword("gold"),
+            SearchAttributeUpdate::string("gold"),
+        ] {
+            let restarted = workflow_context(history.clone());
+            restarted
+                .upsert_search_attributes(BTreeMap::from([("customer_tier".to_string(), update)]))
+                .expect("legacy history constrains values but has unknown type identity");
+            restarted
+                .ensure_history_consumed()
+                .expect("history consumed");
+        }
+    }
+
+    #[test]
+    fn search_attribute_command_emits_canonical_types() {
+        let ctx = workflow_context(Vec::new());
+        ctx.upsert_search_attributes(BTreeMap::from([
+            (
+                "customer_tier".to_string(),
+                SearchAttributeUpdate::keyword("gold"),
+            ),
+            ("attempts".to_string(), SearchAttributeUpdate::int(3)),
+            ("obsolete".to_string(), SearchAttributeUpdate::delete()),
+        ]))
+        .expect("valid search attributes");
+
+        assert_eq!(
+            ctx.take_commands().expect("commands"),
+            vec![json!({
+                "type": "upsert_search_attributes",
+                "attributes": {
+                    "attempts": 3,
+                    "customer_tier": "gold",
+                    "obsolete": null
+                },
+                "attribute_types": {
+                    "attempts": "int",
+                    "customer_tier": "keyword"
+                }
+            })]
+        );
     }
 
     #[test]
@@ -17706,7 +18100,7 @@ mod tests {
                 write_mock_response(
                     stream,
                     "400 Bad Request",
-                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.14","requested_version":"1.15"}"#,
+                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.15","requested_version":"1.16"}"#,
                 );
             } else if behavior.reject_deregistration {
                 write_mock_response(

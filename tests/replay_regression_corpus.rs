@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -13,7 +14,8 @@ use std::{
 
 use durable_workflow::{
     decode_payload, encode_payload, json, ChildWorkflowOptions, Client, Error, ParallelOperation,
-    ParallelResult, PayloadEnvelope, Value, Worker, WorkflowInstance, DEFAULT_CODEC,
+    ParallelResult, PayloadEnvelope, SearchAttributeUpdate, Value, Worker, WorkflowInstance,
+    DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 
@@ -341,6 +343,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.workflow-stream"
             | "corpus.nested-parallel"
             | "corpus.typed-replayed"
+            | "corpus.search-attribute-type-mismatch"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -482,6 +485,15 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 },
             );
         }
+        "corpus.search-attribute-type-mismatch" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.upsert_search_attributes(BTreeMap::from([(
+                    "customer_tier".to_string(),
+                    SearchAttributeUpdate::string("gold"),
+                )]))?;
+                Ok(json!("unreachable"))
+            });
+        }
         _ => unreachable!(),
     }
     let handled = worker
@@ -613,6 +625,27 @@ async fn workflow_stream_commands_are_stable_across_cold_worker_redelivery() {
         .expect("cold workflow stream redelivery must execute");
 
     assert_eq!(first, restarted);
+}
+
+#[tokio::test]
+async fn typed_search_attribute_type_mismatch_is_stable_across_cold_workers() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/replay-regressions/typed-search-attribute-keyword-string-mismatch.json",
+    );
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in typed search fixture"),
+    )
+    .expect("parse checked-in typed search fixture");
+
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .expect_err("same-value type drift must fail the first replay");
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .expect_err("same-value type drift must fail after a cold worker reload");
+
+    assert_eq!(first, restarted);
+    assert!(first.contains("search_attribute_type_mismatch"), "{first}");
 }
 
 #[tokio::test]

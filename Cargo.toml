@@ -16,10 +16,10 @@ include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md",
 [package.metadata.durable-workflow]
 product-train = "2.0.0-rc.33"
 compatibility-authority = "protocol-manifests"
-supported-server-versions = ">=2.0.0-rc.42,<2.0.0"
-qualified-server-version = "2.0.0-rc.42"
-worker-protocol-version = "1.15"
-server-worker-protocol-versions = ">=1.15,<2.0"
+supported-server-versions = ">=2.0.0-rc.47,<2.0.0"
+qualified-server-version = "2.0.0-rc.47"
+worker-protocol-version = "1.16"
+server-worker-protocol-versions = ">=1.16,<2.0"
 control-plane-version = "2"
 query-tasks = true
 query-task-minimum-worker-protocol-version = "1.8"
@@ -58,6 +58,10 @@ workflow-streams-operations = ["list", "describe", "subscribe", "append", "close
 workflow-streams-authoring-command = "record_side_effect.workflow_stream"
 workflow-streams-delivery = "at-least-once"
 workflow-streams-external-payload-references = "opaque-reference"
+typed-search-attributes = true
+typed-search-attributes-minimum-worker-protocol-version = "1.16"
+search-attribute-replay-identity = "json-value+canonical-declared-type"
+legacy-search-attribute-history = "value-only+unknown-type-identity"
 deterministic-parallel = true
 parallel-authoring = "parallel+join"
 parallel-members = ["activity", "child", "timer", "mixed", "nested"]

@@ -58,6 +58,10 @@ version_markers="$(jq -er '.packages[0].metadata["durable-workflow"]["version-ma
 version_marker_command="$(jq -er '.packages[0].metadata["durable-workflow"]["version-marker-command"]' <<<"$metadata")"
 version_marker_history_event="$(jq -er '.packages[0].metadata["durable-workflow"]["version-marker-history-event"]' <<<"$metadata")"
 version_marker_helpers="$(jq -cer '.packages[0].metadata["durable-workflow"]["version-marker-helpers"]' <<<"$metadata")"
+typed_search_attributes="$(jq -er '.packages[0].metadata["durable-workflow"]["typed-search-attributes"]' <<<"$metadata")"
+typed_search_attributes_minimum_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["typed-search-attributes-minimum-worker-protocol-version"]' <<<"$metadata")"
+search_attribute_replay_identity="$(jq -er '.packages[0].metadata["durable-workflow"]["search-attribute-replay-identity"]' <<<"$metadata")"
+legacy_search_attribute_history="$(jq -er '.packages[0].metadata["durable-workflow"]["legacy-search-attribute-history"]' <<<"$metadata")"
 
 if [[ "$package_name" != "durable-workflow" ]]; then
     printf 'unexpected Rust SDK package name: %s\n' "$package_name" >&2
@@ -88,11 +92,11 @@ if [[ "$package_version" != "$product_train" ]]; then
     printf 'Rust SDK package version must match its product train metadata: %s, %s\n' "$package_version" "$product_train" >&2
     exit 1
 fi
-if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.42,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.42" || "$server_worker_protocols" != ">=1.15,<2.0" ]]; then
+if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.47,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.47" || "$server_worker_protocols" != ">=1.16,<2.0" ]]; then
     printf 'unexpected Rust SDK supported Server contract: %s, %s, %s, %s\n' "$compatibility_authority" "$server_compatibility" "$qualified_server_version" "$server_worker_protocols" >&2
     exit 1
 fi
-if [[ "$worker_protocol" != "1.15" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' ]]; then
+if [[ "$worker_protocol" != "1.16" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' || "$typed_search_attributes" != "true" || "$typed_search_attributes_minimum_protocol" != "1.16" || "$search_attribute_replay_identity" != "json-value+canonical-declared-type" || "$legacy_search_attribute_history" != "value-only+unknown-type-identity" ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi
@@ -178,6 +182,10 @@ write_evidence() {
         --arg version_marker_command "$version_marker_command" \
         --arg version_marker_history_event "$version_marker_history_event" \
         --argjson version_marker_helpers "$version_marker_helpers" \
+        --arg typed_search_attributes "$typed_search_attributes" \
+        --arg typed_search_attributes_minimum_protocol "$typed_search_attributes_minimum_protocol" \
+        --arg search_attribute_replay_identity "$search_attribute_replay_identity" \
+        --arg legacy_search_attribute_history "$legacy_search_attribute_history" \
         --arg release_tag "$release_tag" \
         --arg release_commit "$release_commit" \
         --arg release_run_id "$release_run_id" \
@@ -229,7 +237,11 @@ write_evidence() {
                 version_markers: ($version_markers == "true"),
                 version_marker_command: $version_marker_command,
                 version_marker_history_event: $version_marker_history_event,
-                version_marker_helpers: $version_marker_helpers
+                version_marker_helpers: $version_marker_helpers,
+                typed_search_attributes: ($typed_search_attributes == "true"),
+                typed_search_attributes_minimum_worker_protocol: $typed_search_attributes_minimum_protocol,
+                search_attribute_replay_identity: $search_attribute_replay_identity,
+                legacy_search_attribute_history: $legacy_search_attribute_history
             },
             release: {
                 sdk_tag: $release_tag,

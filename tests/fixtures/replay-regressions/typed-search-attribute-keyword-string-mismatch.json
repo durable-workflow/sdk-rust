@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-typed-search-attribute-keyword-string-mismatch",
+  "protocol_version": "1.16",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.search-attribute-type-mismatch",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "SearchAttributesUpserted",
+      "payload": {
+        "sequence": 1,
+        "attributes": {
+          "customer_tier": "gold"
+        },
+        "attribute_types": {
+          "customer_tier": "keyword"
+        },
+        "merged": {
+          "customer_tier": "gold"
+        }
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": "unreachable"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": "unreachable"
+  },
+  "expected_failure": "search_attribute_type_mismatch"
+}

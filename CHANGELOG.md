@@ -15,6 +15,11 @@
 - Add `WorkflowContext::saga` with deterministic reverse-order activity
   compensation after failure or cooperative cancellation. Compensation
   failures preserve both the initiating and compensation errors.
+- Preserve canonical declared search-attribute types in worker commands and
+  replay identity, including deterministic same-value type mismatch detection
+  and value-only compatibility for legacy history without type metadata.
+  Require Server `>=2.0.0-rc.47,<2.0.0`, the first release line that supports
+  worker protocol `1.16`.
 
 ## 2.0.0-rc.32
 
