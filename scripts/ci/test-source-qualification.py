@@ -45,6 +45,10 @@ class SourceQualificationContractTest(unittest.TestCase):
             "rustfmt": ["cargo", "fmt", "--all", "--check"],
             "diff-boundary": ["git", "diff", "--check", "{candidate_range}"],
             "public-boundary": ["scripts/check-public-boundary.sh"],
+            "official-avro-encoder": [
+                "python3",
+                "scripts/ci/verify-official-avro-encoder.py",
+            ],
             "example-base-urls": [
                 "python3",
                 "scripts/ci/validate-example-base-urls.py",
@@ -101,6 +105,10 @@ class SourceQualificationContractTest(unittest.TestCase):
         self.assertIn("rust: ['1.86.0', 'stable']", verify)
         self.assertIn("cargo test --all-targets", verify)
         self.assertIn(
+            "scripts/ci/qualify-cross-language-avro-consumers.sh", verify
+        )
+        self.assertIn("if: matrix.rust == 'stable'", verify)
+        self.assertIn(
             "cargo run --release --example avro_value_benchmark -- --enforce", verify
         )
         self.assertIn("cargo doc --all-features --no-deps", verify)
@@ -121,6 +129,8 @@ class SourceQualificationContractTest(unittest.TestCase):
                 "msrv-all-target-tests",
                 "stable-all-target-tests",
                 "typed-avro-compatibility",
+                "official-avro-encoder-authority",
+                "official-php-python-avro-consumers",
                 "typed-avro-regression-budget",
                 "shipped-example-base-url-contract",
                 "warning-free-rustdoc",

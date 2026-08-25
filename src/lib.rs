@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use apache_avro::{from_avro_datum, types::Value as AvroDatum, Schema};
+use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
@@ -82,6 +82,8 @@ pub const AVRO_VALUE_SCHEMA_FINGERPRINT: [u8; 8] = [0xe2, 0xa3, 0x3d, 0xff, 0x55
 const AVRO_SINGLE_OBJECT_MAGIC: [u8; 2] = [0xc3, 0x01];
 
 static AVRO_VALUE_SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
+static AVRO_VALUE_ORDERED_MAP_ENCODING_SCHEMA: OnceLock<std::result::Result<Schema, String>> =
+    OnceLock::new();
 
 #[derive(Clone, Copy)]
 enum RequestProtocol {
@@ -1884,10 +1886,13 @@ impl Serialize for AvroValue {
 }
 
 pub fn encode_avro_value(value: &AvroValue) -> Result<PayloadEnvelope> {
-    let mut bytes = Vec::new();
+    let datum = avro_value_to_datum(value)?;
+    let datum = to_avro_datum(avro_value_ordered_map_encoding_schema()?, datum)
+        .map_err(|err| Error::Codec(format!("avro_value_encode_failed: {err}")))?;
+    let mut bytes = Vec::with_capacity(datum.len() + 10);
     bytes.extend_from_slice(&AVRO_SINGLE_OBJECT_MAGIC);
     bytes.extend_from_slice(&AVRO_VALUE_SCHEMA_FINGERPRINT);
-    encode_avro_value_datum(&mut bytes, value)?;
+    bytes.extend_from_slice(&datum);
     Ok(PayloadEnvelope {
         codec: DEFAULT_CODEC.to_string(),
         blob: BASE64.encode(bytes),
@@ -2291,86 +2296,82 @@ impl Read for StrictAvroDatumReader<'_> {
     }
 }
 
-fn encode_avro_long(bytes: &mut Vec<u8>, value: i64) {
-    let mut value = ((value as u64) << 1) ^ ((value >> 63) as u64);
-    loop {
-        if value & !0x7f == 0 {
-            bytes.push(value as u8);
-            break;
-        }
-        bytes.push(((value & 0x7f) | 0x80) as u8);
-        value >>= 7;
-    }
-}
-
-fn encode_avro_size(bytes: &mut Vec<u8>, size: usize) -> Result<()> {
-    let size = i64::try_from(size)
-        .map_err(|_| Error::Codec("avro_value_encode_failed: collection too large".to_string()))?;
-    encode_avro_long(bytes, size);
-    Ok(())
-}
-
-fn encode_avro_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<()> {
-    encode_avro_size(bytes, value.len())?;
-    bytes.extend_from_slice(value);
-    Ok(())
-}
-
-fn encode_avro_string(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
-    encode_avro_bytes(bytes, value.as_bytes())
-}
-
-fn encode_avro_value_datum(bytes: &mut Vec<u8>, value: &AvroValue) -> Result<()> {
-    match value {
-        AvroValue::Null => encode_avro_long(bytes, 0),
-        AvroValue::Boolean(value) => {
-            encode_avro_long(bytes, 1);
-            bytes.push(u8::from(*value));
-        }
-        AvroValue::Long(value) => {
-            encode_avro_long(bytes, 2);
-            encode_avro_long(bytes, *value);
-        }
+fn avro_value_to_datum(value: &AvroValue) -> Result<AvroDatum> {
+    let branch = match value {
+        AvroValue::Null => AvroDatum::Union(0, Box::new(AvroDatum::Null)),
+        AvroValue::Boolean(value) => AvroDatum::Union(
+            1,
+            Box::new(AvroDatum::Record(vec![(
+                "boolean".to_string(),
+                AvroDatum::Boolean(*value),
+            )])),
+        ),
+        AvroValue::Long(value) => AvroDatum::Union(
+            2,
+            Box::new(AvroDatum::Record(vec![(
+                "long".to_string(),
+                AvroDatum::Long(*value),
+            )])),
+        ),
         AvroValue::Double(value) => {
             if !value.is_finite() {
                 return Err(Error::Codec(
                     "non_finite_float: Avro Value doubles must be finite".to_string(),
                 ));
             }
-            encode_avro_long(bytes, 3);
-            bytes.extend_from_slice(&value.to_le_bytes());
+            AvroDatum::Union(
+                3,
+                Box::new(AvroDatum::Record(vec![(
+                    "double".to_string(),
+                    AvroDatum::Double(*value),
+                )])),
+            )
         }
-        AvroValue::Bytes(value) => {
-            encode_avro_long(bytes, 4);
-            encode_avro_bytes(bytes, value)?;
-        }
-        AvroValue::String(value) => {
-            encode_avro_long(bytes, 5);
-            encode_avro_string(bytes, value)?;
-        }
-        AvroValue::Array(values) => {
-            encode_avro_long(bytes, 6);
-            if !values.is_empty() {
-                encode_avro_size(bytes, values.len())?;
-                for value in values {
-                    encode_avro_value_datum(bytes, value)?;
-                }
-            }
-            encode_avro_long(bytes, 0);
-        }
-        AvroValue::Map(values) => {
-            encode_avro_long(bytes, 7);
-            if !values.is_empty() {
-                encode_avro_size(bytes, values.len())?;
-                for (key, value) in values {
-                    encode_avro_string(bytes, key)?;
-                    encode_avro_value_datum(bytes, value)?;
-                }
-            }
-            encode_avro_long(bytes, 0);
-        }
-    }
-    Ok(())
+        AvroValue::Bytes(value) => AvroDatum::Union(
+            4,
+            Box::new(AvroDatum::Record(vec![(
+                "bytes".to_string(),
+                AvroDatum::Bytes(value.clone()),
+            )])),
+        ),
+        AvroValue::String(value) => AvroDatum::Union(
+            5,
+            Box::new(AvroDatum::Record(vec![(
+                "string".to_string(),
+                AvroDatum::String(value.clone()),
+            )])),
+        ),
+        AvroValue::Array(values) => AvroDatum::Union(
+            6,
+            Box::new(AvroDatum::Record(vec![(
+                "items".to_string(),
+                AvroDatum::Array(
+                    values
+                        .iter()
+                        .map(avro_value_to_datum)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            )])),
+        ),
+        AvroValue::Map(values) => AvroDatum::Union(
+            7,
+            Box::new(AvroDatum::Record(vec![(
+                "entries".to_string(),
+                AvroDatum::Array(
+                    values
+                        .iter()
+                        .map(|(key, value)| {
+                            Ok(AvroDatum::Record(vec![
+                                ("key".to_string(), AvroDatum::String(key.clone())),
+                                ("value".to_string(), avro_value_to_datum(value)?),
+                            ]))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            )])),
+        ),
+    };
+    Ok(AvroDatum::Record(vec![("value".to_string(), branch)]))
 }
 
 fn avro_value_from_datum(datum: AvroDatum) -> Result<AvroValue> {
@@ -2427,6 +2428,39 @@ fn avro_value_schema() -> Result<&'static Schema> {
     match AVRO_VALUE_SCHEMA.get_or_init(|| {
         Schema::parse_str(AVRO_VALUE_SCHEMA_JSON)
             .map_err(|err| format!("could not parse Avro Value schema: {err}"))
+    }) {
+        Ok(schema) => Ok(schema),
+        Err(message) => Err(Error::Codec(message.clone())),
+    }
+}
+
+fn avro_value_ordered_map_encoding_schema() -> Result<&'static Schema> {
+    match AVRO_VALUE_ORDERED_MAP_ENCODING_SCHEMA.get_or_init(|| {
+        // Apache Avro's Value::Map uses a randomized HashMap. Arrays and maps
+        // have the same block representation when each ordered array record
+        // contains the map key followed by its value, so this encoding-only
+        // adaptation lets the official encoder retain BTreeMap wire order.
+        let mut schema: Value = serde_json::from_str(AVRO_VALUE_SCHEMA_JSON)
+            .map_err(|err| format!("could not read packaged Avro Value schema: {err}"))?;
+        let entries_schema = schema
+            .pointer_mut("/fields/0/type/7/fields/0/type")
+            .ok_or_else(|| "packaged Avro Value map schema is missing".to_string())?;
+        if *entries_schema != json!({"type": "map", "values": "Value"}) {
+            return Err("packaged Avro Value map schema changed unexpectedly".to_string());
+        }
+        *entries_schema = json!({
+            "type": "array",
+            "items": {
+                "type": "record",
+                "name": "MapEntry",
+                "fields": [
+                    {"name": "key", "type": "string"},
+                    {"name": "value", "type": "Value"}
+                ]
+            }
+        });
+        Schema::parse_str(&schema.to_string())
+            .map_err(|err| format!("could not parse ordered-map Avro Value schema: {err}"))
     }) {
         Ok(schema) => Ok(schema),
         Err(message) => Err(Error::Codec(message.clone())),

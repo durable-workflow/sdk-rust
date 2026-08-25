@@ -89,8 +89,25 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Require the official Apache Avro encoder
+        run: |
+          python3 scripts/ci/verify-official-avro-encoder.py
+          python3 scripts/ci/test-official-avro-encoder.py
+
       - name: Test all targets
         run: cargo test --all-targets
+
+      - name: Verify Rust payloads with official PHP and Python Avro consumers
+        if: matrix.rust == 'stable'
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/official-avro-python"
+          "${RUNNER_TEMP}/official-avro-python/bin/pip" install \
+            --requirement scripts/ci/official-avro-consumers/requirements.txt
+          composer install \
+            --working-dir=scripts/ci/official-avro-consumers \
+            --no-interaction --no-progress --prefer-dist
+          OFFICIAL_AVRO_PYTHON="${RUNNER_TEMP}/official-avro-python/bin/python" \
+            scripts/ci/qualify-cross-language-avro-consumers.sh
 
       - name: Enforce Avro Value regression budget
         if: matrix.rust == 'stable'
@@ -118,7 +135,7 @@ jobs:
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/verify-official-avro-encoder.py scripts/ci/official-avro-consumers/consume.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-official-avro-encoder.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
           python -m py_compile scripts/ci/qualify-docs-landing.py scripts/ci/qualify-release-documentation.py scripts/ci/test-docs-workflow.py scripts/ci/test-qualify-docs-landing.py scripts/ci/test-qualify-release-documentation.py
           scripts/ci/test-crates-io-publish.sh
           arguments=()

@@ -175,9 +175,7 @@ fn rust_matches_cross_language_golden_single_object_bytes() {
             "{name}"
         );
         let encoded = encode_avro_value(&value).unwrap_or_else(|error| panic!("{name}: {error}"));
-        if !matches!(value, AvroValue::Map(_)) {
-            assert_eq!(encoded.blob, expected, "{name}");
-        }
+        assert_eq!(encoded.blob, expected, "{name}");
         let decoded = decode_avro_value(&encoded).unwrap_or_else(|error| panic!("{name}: {error}"));
         assert_eq!(decoded, value, "{name}");
         let reencoded =
@@ -193,6 +191,43 @@ fn rust_matches_cross_language_golden_single_object_bytes() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn official_encoder_is_deterministic_for_nested_empty_and_boundary_collections() {
+    let value = AvroValue::Map(BTreeMap::from([
+        ("empty_array".to_string(), AvroValue::Array(Vec::new())),
+        ("empty_map".to_string(), AvroValue::Map(BTreeMap::new())),
+        (
+            "nested".to_string(),
+            AvroValue::Array(vec![
+                AvroValue::Map(BTreeMap::from([
+                    ("maximum".to_string(), AvroValue::Long(i64::MAX)),
+                    ("minimum".to_string(), AvroValue::Long(i64::MIN)),
+                ])),
+                AvroValue::Array(vec![
+                    AvroValue::Bytes(vec![0, 0xff]),
+                    AvroValue::Double(-0.0),
+                ]),
+            ]),
+        ),
+    ]));
+    let expected = encode_avro_value(&value).expect("encode nested boundary value");
+    assert_eq!(
+        expected.blob,
+        "wwHioz3/VYAiNw4GFmVtcHR5X2FycmF5DAASZW1wdHlfbWFwDgAMbmVzdGVkDAQOBA5tYXhpbXVtBP7//////////wEObWluaW11bQT///////////8BAAwECAQA/wYAAAAAAAAAgAAAAA=="
+    );
+
+    for _ in 0..64 {
+        assert_eq!(
+            encode_avro_value(&value).expect("repeat official encoding"),
+            expected
+        );
+    }
+    assert_eq!(
+        decode_avro_value(&expected).expect("decode official nested boundary encoding"),
+        value
+    );
 }
 
 #[test]

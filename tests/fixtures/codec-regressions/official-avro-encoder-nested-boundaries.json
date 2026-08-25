@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "rust-official-avro-encoder-nested-boundaries",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": [
+    "php",
+    "python",
+    "rust"
+  ],
+  "value": {
+    "type": "map",
+    "entries": [
+      {
+        "key": "empty_array",
+        "value": {
+          "type": "array",
+          "items": []
+        }
+      },
+      {
+        "key": "empty_map",
+        "value": {
+          "type": "map",
+          "entries": []
+        }
+      },
+      {
+        "key": "nested",
+        "value": {
+          "type": "array",
+          "items": [
+            {
+              "type": "map",
+              "entries": [
+                {
+                  "key": "maximum",
+                  "value": {
+                    "type": "long",
+                    "value": "9223372036854775807"
+                  }
+                },
+                {
+                  "key": "minimum",
+                  "value": {
+                    "type": "long",
+                    "value": "-9223372036854775808"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "array",
+              "items": [
+                {
+                  "type": "bytes",
+                  "base64": "AP8="
+                },
+                {
+                  "type": "double",
+                  "value": "-0.0"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "framing": {
+    "encoding": "avro-single-object",
+    "wire_base64": "wwHioz3/VYAiNw4GFmVtcHR5X2FycmF5DAASZW1wdHlfbWFwDgAMbmVzdGVkDAQOBA5tYXhpbXVtBP7//////////wEObWluaW11bQT///////////8BAAwECAQA/wYAAAAAAAAAgAAAAA=="
+  },
+  "failure_policy": {
+    "operation": "round_trip",
+    "error": null
+  },
+  "encoder_authority": {
+    "crate": "apache-avro",
+    "entrypoint": "to_avro_datum",
+    "handwritten_fallback": false
+  }
+}

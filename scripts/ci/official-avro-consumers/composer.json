@@ -1,0 +1,13 @@
+{
+    "name": "durable-workflow/rust-avro-consumer-qualification",
+    "description": "Independent official Apache Avro consumer qualification for Rust payloads",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "apache/avro": "^1.12.2"
+    },
+    "config": {
+        "allow-plugins": false,
+        "sort-packages": true
+    }
+}

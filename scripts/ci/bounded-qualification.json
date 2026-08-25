@@ -21,6 +21,10 @@
       "command": ["scripts/check-public-boundary.sh"]
     },
     {
+      "id": "official-avro-encoder",
+      "command": ["python3", "scripts/ci/verify-official-avro-encoder.py"]
+    },
+    {
       "id": "example-base-urls",
       "command": ["python3", "scripts/ci/validate-example-base-urls.py"]
     },
@@ -37,6 +41,8 @@
     "msrv-all-target-tests",
     "stable-all-target-tests",
     "typed-avro-compatibility",
+    "official-avro-encoder-authority",
+    "official-php-python-avro-consumers",
     "typed-avro-regression-budget",
     "shipped-example-base-url-contract",
     "warning-free-rustdoc",

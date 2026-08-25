@@ -14,6 +14,7 @@ const FIXTURE_MANIFEST: &str = include_str!("fixtures/codec-regressions/manifest
 const IDENTITY_SCHEMA: &str = "durable-workflow.codec-value-identity/v1";
 const IDENTITY_REQUEST_ENV: &str = "DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_REQUEST";
 const IDENTITY_RESPONSE_ENV: &str = "DURABLE_WORKFLOW_CODEC_VALUE_IDENTITY_RESPONSE";
+const CROSS_LANGUAGE_AVRO_OUTPUT_ENV: &str = "DURABLE_WORKFLOW_CROSS_LANGUAGE_AVRO_OUTPUT";
 
 fn tagged_value(value: &Value) -> AvroValue {
     match value["type"].as_str().expect("tagged value type") {
@@ -349,6 +350,46 @@ fn check_signed_zero_identity(fixture: &Value) {
     );
 }
 
+fn check_encoder_authority(fixture: &Value) {
+    let Some(contract) = fixture.get("encoder_authority") else {
+        return;
+    };
+    assert_eq!(contract["crate"], "apache-avro");
+    assert_eq!(contract["entrypoint"], "to_avro_datum");
+    assert_eq!(contract["handwritten_fallback"], false);
+
+    let product_source = include_str!("../src/lib.rs");
+    assert!(
+        product_source.contains("let datum = to_avro_datum("),
+        "the outbound payload path must call the official Apache Avro encoder"
+    );
+    for forbidden in [
+        "fn encode_avro_long",
+        "fn encode_avro_size",
+        "fn encode_avro_bytes",
+        "fn encode_avro_string",
+        "fn encode_avro_value_datum",
+    ] {
+        assert!(
+            !product_source.contains(forbidden),
+            "handwritten Avro encoder returned at {forbidden}"
+        );
+    }
+
+    if let Some(output) = env::var_os(CROSS_LANGUAGE_AVRO_OUTPUT_ENV) {
+        let encoded = encode_avro_value(&tagged_value(&fixture["value"]))
+            .expect("encode cross-language Avro consumer fixture");
+        assert_eq!(
+            encoded.blob, fixture["framing"]["wire_base64"],
+            "Rust-produced consumer bytes must retain the checked-in golden identity"
+        );
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded.blob)
+                .expect("decode Rust-produced cross-language Avro bytes");
+        fs::write(Path::new(&output), bytes).expect("write cross-language Avro consumer fixture");
+    }
+}
+
 fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
@@ -439,6 +480,7 @@ fn check_corpus() {
         check_parallel_group_replay(&fixture);
         check_typed_handler(&fixture);
         check_signed_zero_identity(&fixture);
+        check_encoder_authority(&fixture);
     }
 }
 

@@ -1,0 +1,81 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "3a6193680b9769d228fc5a5a7db5571c",
+    "packages": [
+        {
+            "name": "apache/avro",
+            "version": "1.12.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/apache/avro.git",
+                "reference": "8fa2067f70e3012cb3fd9a8839cd97e8c7cc1772"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/apache/avro/zipball/8fa2067f70e3012cb3fd9a8839cd97e8c7cc1772",
+                "reference": "8fa2067f70e3012cb3fd9a8839cd97e8c7cc1772",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.1 || ^8.0"
+            },
+            "require-dev": {
+                "ext-curl": "*",
+                "ext-json": "*",
+                "ext-pcntl": "*",
+                "ext-xml": "*",
+                "php-mock/php-mock-phpunit": "^2.10",
+                "phpunit/phpunit": "^7.5 || ^8.5 || ^9.5",
+                "squizlabs/php_codesniffer": "3.*"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Apache\\Avro\\": "lang/php/lib/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "Apache-2.0"
+            ],
+            "authors": [
+                {
+                    "name": "Apache Avro Developers",
+                    "email": "dev@avro.apache.org",
+                    "homepage": "http://avro.apache.org"
+                }
+            ],
+            "description": "Apache Avro™ is a data serialization system.",
+            "homepage": "http://avro.apache.org",
+            "keywords": [
+                "avro",
+                "data",
+                "serialization"
+            ],
+            "support": {
+                "email": "dev@avro.apache.org",
+                "issues": "https://issues.apache.org/jira/browse/AVRO",
+                "source": "https://github.com/apache/avro/tree/release-1.12.2"
+            },
+            "time": "2026-08-07T12:56:37+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {},
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
+}

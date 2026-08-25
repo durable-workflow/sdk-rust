@@ -2,6 +2,9 @@
 
 ## 2.0.0-rc.34
 
+- Restore `apache-avro` as the authoritative outbound datum encoder while
+  retaining canonical string-map order, the fixed single-object frame, typed
+  value identity, and the existing cross-language protocol bytes.
 - Preserve one-to-one authored condition-wait occurrences with an explicit
   deterministic identity. Adjacent waits at the same call site now replay
   independently, while signal- and update-driven physical re-evaluations keep
