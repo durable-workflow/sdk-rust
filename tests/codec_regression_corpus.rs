@@ -316,6 +316,39 @@ fn check_typed_handler(fixture: &Value) {
     );
 }
 
+fn check_signed_zero_identity(fixture: &Value) {
+    let Some(contract) = fixture.get("signed_zero_identity") else {
+        return;
+    };
+    let map_key = contract["map_key"].as_str().expect("signed-zero map key");
+    let negative = tagged_value(&fixture["value"]);
+    let AvroValue::Map(mut positive_entries) = negative.clone() else {
+        panic!("signed-zero identity fixture must contain a map");
+    };
+    assert_eq!(
+        positive_entries.get(map_key),
+        Some(&AvroValue::Double(-0.0)),
+        "signed-zero fixture must retain negative-zero bits"
+    );
+    positive_entries.insert(map_key.to_string(), AvroValue::Double(0.0));
+    let positive = AvroValue::Map(positive_entries);
+
+    assert_ne!(
+        negative, positive,
+        "canonical typed Avro identity must distinguish signed zero"
+    );
+    assert_eq!(
+        encode_avro_value(&positive)
+            .expect("encode positive-zero counterpart")
+            .blob,
+        contract["positive_wire_base64"]
+    );
+    assert_ne!(
+        fixture["framing"]["wire_base64"], contract["positive_wire_base64"],
+        "signed-zero identities must use distinct public envelopes"
+    );
+}
+
 fn check_corpus() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIRECTORY);
     let mut manifest = FIXTURE_MANIFEST
@@ -405,6 +438,7 @@ fn check_corpus() {
         check_workflow_stream_encoding(&fixture);
         check_parallel_group_replay(&fixture);
         check_typed_handler(&fixture);
+        check_signed_zero_identity(&fixture);
     }
 }
 

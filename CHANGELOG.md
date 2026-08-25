@@ -2,6 +2,10 @@
 
 ## 2.0.0-rc.33
 
+- Added `WorkflowContext::upsert_memo` with bounded canonical Avro map patches,
+  `MemoUpserted` replay identity, opaque payload-envelope transport, and a
+  fail-closed runtime capability check before worker-task completion. Replay
+  identity compares double bit patterns, including the sign of zero.
 - Add Serde-typed workflow, replayed-workflow, and activity handler adapters
   over the fixed Avro Value protocol, with typed activity calls and workflow
   results.

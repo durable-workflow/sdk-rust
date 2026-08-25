@@ -469,6 +469,7 @@ RUST_RECORDED_EVENT_TYPES = {
     "SignalApplied",
     "SideEffectRecorded",
     "VersionMarkerRecorded",
+    "MemoUpserted",
     "WorkflowContinuedAsNew",
 }
 
@@ -622,6 +623,30 @@ def _canonical_replay_history(
                 "sequence": sequence,
                 "change_id": change_id,
                 "version": version,
+            }
+        elif event_type == "MemoUpserted":
+            entries = payload.get("entries")
+            merged = payload.get("merged")
+            if entries is None or merged is None:
+                raise CorpusError(
+                    f"{context}.payload must contain entries and merged envelopes"
+                )
+            codec = payload.get("payload_codec")
+            if not isinstance(codec, str):
+                codec = fallback_codec
+            canonical_event = {
+                "kind": "memo_upsert",
+                "sequence": sequence,
+                "entries": _consumer_replay_value(
+                    entries,
+                    codec,
+                    f"{context}.payload.entries",
+                ),
+                "merged": _consumer_replay_value(
+                    merged,
+                    codec,
+                    f"{context}.payload.merged",
+                ),
             }
         elif event_type == "WorkflowContinuedAsNew":
             canonical_event = {

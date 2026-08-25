@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-workflow-memo-signed-zero-mismatch",
+  "protocol_version": "1.15",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.memo-signed-zero",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "MemoUpserted",
+      "payload": {
+        "sequence": 1,
+        "entries": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNw4CDnJlYWRpbmcGAAAAAAAAAIAA"
+        },
+        "merged": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNw4CDnJlYWRpbmcGAAAAAAAAAIAA"
+        }
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": "signed-zero replay unexpectedly matched"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": "signed-zero replay unexpectedly matched"
+  },
+  "expected_failure": "memo_update_mismatch"
+}

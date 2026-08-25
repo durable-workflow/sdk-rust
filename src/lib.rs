@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
+use apache_avro::{from_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
@@ -50,6 +50,9 @@ const WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE: &str = "WorkflowTaskWaitingForHist
 const MISSING_TASK_PAYLOAD_CODEC: &str = "\0missing-task-payload-codec";
 const NULL_TASK_PAYLOAD_CODEC: &str = "\0null-task-payload-codec";
 const NON_STRING_TASK_PAYLOAD_CODEC: &str = "\0non-string-task-payload-codec";
+const MAX_MEMO_ENTRIES: usize = 100;
+const MAX_MEMO_VALUE_SIZE_BYTES: usize = 10_240;
+const MAX_MEMO_TOTAL_SIZE_BYTES: usize = 65_536;
 
 const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "lease_expired",
@@ -172,6 +175,12 @@ pub enum Error {
     },
     #[error("invalid child workflow options: {0}")]
     InvalidChildWorkflowOptions(String),
+    #[error("invalid workflow memo update: {0}")]
+    InvalidMemoUpdate(String),
+    #[error(
+        "workflow_memo_updates_unavailable: the connected runtime did not advertise workflow memo update support"
+    )]
+    WorkflowMemoUpdatesUnavailable,
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -1672,7 +1681,7 @@ impl PayloadEnvelope {
 }
 
 /// Native adapter for the fixed language-neutral Avro Value schema.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum AvroValue {
     Null,
     Boolean(bool),
@@ -1682,6 +1691,22 @@ pub enum AvroValue {
     String(String),
     Array(Vec<AvroValue>),
     Map(BTreeMap<String, AvroValue>),
+}
+
+impl PartialEq for AvroValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Boolean(left), Self::Boolean(right)) => left == right,
+            (Self::Long(left), Self::Long(right)) => left == right,
+            (Self::Double(left), Self::Double(right)) => left.to_bits() == right.to_bits(),
+            (Self::Bytes(left), Self::Bytes(right)) => left == right,
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Array(left), Self::Array(right)) => left == right,
+            (Self::Map(left), Self::Map(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 impl AvroValue {
@@ -1844,13 +1869,10 @@ impl Serialize for AvroValue {
 }
 
 pub fn encode_avro_value(value: &AvroValue) -> Result<PayloadEnvelope> {
-    let datum = avro_value_to_datum(value)?;
-    let datum = to_avro_datum(avro_value_schema()?, datum)
-        .map_err(|err| Error::Codec(format!("avro_value_encode_failed: {err}")))?;
-    let mut bytes = Vec::with_capacity(datum.len() + 10);
+    let mut bytes = Vec::new();
     bytes.extend_from_slice(&AVRO_SINGLE_OBJECT_MAGIC);
     bytes.extend_from_slice(&AVRO_VALUE_SCHEMA_FINGERPRINT);
-    bytes.extend_from_slice(&datum);
+    encode_avro_value_datum(&mut bytes, value)?;
     Ok(PayloadEnvelope {
         codec: DEFAULT_CODEC.to_string(),
         blob: BASE64.encode(bytes),
@@ -2122,6 +2144,7 @@ fn workflow_command_payload_field(command_type: &str) -> Option<&'static str> {
         "complete_workflow" | "complete_update" | "record_side_effect" => Some("result"),
         "schedule_activity" | "start_child_workflow" | "continue_as_new" => Some("arguments"),
         "start_service_operation" => Some("request_payload"),
+        "upsert_memo" => Some("entries"),
         _ => None,
     }
 }
@@ -2235,77 +2258,86 @@ impl Read for StrictAvroDatumReader<'_> {
     }
 }
 
-fn avro_value_to_datum(value: &AvroValue) -> Result<AvroDatum> {
-    let branch = match value {
-        AvroValue::Null => AvroDatum::Union(0, Box::new(AvroDatum::Null)),
-        AvroValue::Boolean(value) => AvroDatum::Union(
-            1,
-            Box::new(AvroDatum::Record(vec![(
-                "boolean".to_string(),
-                AvroDatum::Boolean(*value),
-            )])),
-        ),
-        AvroValue::Long(value) => AvroDatum::Union(
-            2,
-            Box::new(AvroDatum::Record(vec![(
-                "long".to_string(),
-                AvroDatum::Long(*value),
-            )])),
-        ),
+fn encode_avro_long(bytes: &mut Vec<u8>, value: i64) {
+    let mut value = ((value as u64) << 1) ^ ((value >> 63) as u64);
+    loop {
+        if value & !0x7f == 0 {
+            bytes.push(value as u8);
+            break;
+        }
+        bytes.push(((value & 0x7f) | 0x80) as u8);
+        value >>= 7;
+    }
+}
+
+fn encode_avro_size(bytes: &mut Vec<u8>, size: usize) -> Result<()> {
+    let size = i64::try_from(size)
+        .map_err(|_| Error::Codec("avro_value_encode_failed: collection too large".to_string()))?;
+    encode_avro_long(bytes, size);
+    Ok(())
+}
+
+fn encode_avro_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    encode_avro_size(bytes, value.len())?;
+    bytes.extend_from_slice(value);
+    Ok(())
+}
+
+fn encode_avro_string(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
+    encode_avro_bytes(bytes, value.as_bytes())
+}
+
+fn encode_avro_value_datum(bytes: &mut Vec<u8>, value: &AvroValue) -> Result<()> {
+    match value {
+        AvroValue::Null => encode_avro_long(bytes, 0),
+        AvroValue::Boolean(value) => {
+            encode_avro_long(bytes, 1);
+            bytes.push(u8::from(*value));
+        }
+        AvroValue::Long(value) => {
+            encode_avro_long(bytes, 2);
+            encode_avro_long(bytes, *value);
+        }
         AvroValue::Double(value) => {
             if !value.is_finite() {
                 return Err(Error::Codec(
                     "non_finite_float: Avro Value doubles must be finite".to_string(),
                 ));
             }
-            AvroDatum::Union(
-                3,
-                Box::new(AvroDatum::Record(vec![(
-                    "double".to_string(),
-                    AvroDatum::Double(*value),
-                )])),
-            )
+            encode_avro_long(bytes, 3);
+            bytes.extend_from_slice(&value.to_le_bytes());
         }
-        AvroValue::Bytes(value) => AvroDatum::Union(
-            4,
-            Box::new(AvroDatum::Record(vec![(
-                "bytes".to_string(),
-                AvroDatum::Bytes(value.clone()),
-            )])),
-        ),
-        AvroValue::String(value) => AvroDatum::Union(
-            5,
-            Box::new(AvroDatum::Record(vec![(
-                "string".to_string(),
-                AvroDatum::String(value.clone()),
-            )])),
-        ),
-        AvroValue::Array(values) => AvroDatum::Union(
-            6,
-            Box::new(AvroDatum::Record(vec![(
-                "items".to_string(),
-                AvroDatum::Array(
-                    values
-                        .iter()
-                        .map(avro_value_to_datum)
-                        .collect::<Result<Vec<_>>>()?,
-                ),
-            )])),
-        ),
-        AvroValue::Map(values) => AvroDatum::Union(
-            7,
-            Box::new(AvroDatum::Record(vec![(
-                "entries".to_string(),
-                AvroDatum::Map(
-                    values
-                        .iter()
-                        .map(|(key, value)| Ok((key.clone(), avro_value_to_datum(value)?)))
-                        .collect::<Result<HashMap<_, _>>>()?,
-                ),
-            )])),
-        ),
-    };
-    Ok(AvroDatum::Record(vec![("value".to_string(), branch)]))
+        AvroValue::Bytes(value) => {
+            encode_avro_long(bytes, 4);
+            encode_avro_bytes(bytes, value)?;
+        }
+        AvroValue::String(value) => {
+            encode_avro_long(bytes, 5);
+            encode_avro_string(bytes, value)?;
+        }
+        AvroValue::Array(values) => {
+            encode_avro_long(bytes, 6);
+            if !values.is_empty() {
+                encode_avro_size(bytes, values.len())?;
+                for value in values {
+                    encode_avro_value_datum(bytes, value)?;
+                }
+            }
+            encode_avro_long(bytes, 0);
+        }
+        AvroValue::Map(values) => {
+            encode_avro_long(bytes, 7);
+            if !values.is_empty() {
+                encode_avro_size(bytes, values.len())?;
+                for (key, value) in values {
+                    encode_avro_string(bytes, key)?;
+                    encode_avro_value_datum(bytes, value)?;
+                }
+            }
+            encode_avro_long(bytes, 0);
+        }
+    }
+    Ok(())
 }
 
 fn avro_value_from_datum(datum: AvroDatum) -> Result<AvroValue> {
@@ -4907,6 +4939,33 @@ impl PollWorkflowTaskResponse {
     }
 }
 
+fn runtime_supports_workflow_memo_updates(capabilities: Option<&Value>) -> bool {
+    let Some(capabilities) = capabilities.and_then(Value::as_object) else {
+        return false;
+    };
+    let supported = capabilities
+        .get("workflow_memo_updates")
+        .and_then(Value::as_object)
+        .and_then(|memo| memo.get("supported"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let command_advertised = capabilities
+        .get("supported_workflow_task_commands")
+        .and_then(Value::as_array)
+        .is_some_and(|commands| {
+            commands
+                .iter()
+                .any(|command| command.as_str() == Some("upsert_memo"))
+        });
+    supported && command_advertised
+}
+
+fn commands_use_workflow_memo_updates(commands: &[Value]) -> bool {
+    commands
+        .iter()
+        .any(|command| command.get("type").and_then(Value::as_str) == Some("upsert_memo"))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct PollActivityTaskResponse {
     #[serde(default)]
@@ -6171,6 +6230,8 @@ impl Worker {
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
         }
+        let memo_updates_supported =
+            runtime_supports_workflow_memo_updates(response.server_capabilities.as_ref());
         let Some(task) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -6184,6 +6245,18 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
 
         match self.execute_workflow_task(task) {
+            Ok(commands)
+                if commands_use_workflow_memo_updates(&commands) && !memo_updates_supported =>
+            {
+                self.client
+                    .fail_workflow_task(
+                        &task_id,
+                        &lease_owner,
+                        attempt,
+                        Error::WorkflowMemoUpdatesUnavailable.to_string(),
+                    )
+                    .await?;
+            }
             Ok(commands) if commands.is_empty() => {
                 // A replay can consume a recorded pending durable command
                 // without producing a new command. The standalone protocol
@@ -6993,6 +7066,82 @@ pub struct WorkflowContext {
     state: Arc<Mutex<WorkflowState>>,
 }
 
+fn valid_memo_key(key: &str) -> bool {
+    let numeric_candidate = key.strip_prefix('-').unwrap_or(key);
+
+    !key.is_empty()
+        && key.len() <= 64
+        && (numeric_candidate.is_empty()
+            || !numeric_candidate.bytes().all(|byte| byte.is_ascii_digit()))
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn avro_encoded_size(value: &AvroValue) -> Result<usize> {
+    BASE64
+        .decode(encode_avro_value(value)?.blob)
+        .map(|bytes| bytes.len())
+        .map_err(|error| Error::Codec(format!("memo Avro encoding was not strict base64: {error}")))
+}
+
+fn canonical_memo_entries(value: AvroValue, require_entries: bool) -> Result<AvroValue> {
+    let AvroValue::Map(entries) = value else {
+        return Err(Error::InvalidMemoUpdate(
+            "entries must serialize to an Avro string-keyed map".to_string(),
+        ));
+    };
+    if require_entries && entries.is_empty() {
+        return Err(Error::InvalidMemoUpdate(
+            "at least one entry is required".to_string(),
+        ));
+    }
+    if entries.len() > MAX_MEMO_ENTRIES {
+        return Err(Error::InvalidMemoUpdate(format!(
+            "at most {MAX_MEMO_ENTRIES} entries are allowed"
+        )));
+    }
+
+    for (key, value) in &entries {
+        if !valid_memo_key(&key) {
+            return Err(Error::InvalidMemoUpdate(
+                "keys must match ^(?!-?[0-9]+$)[A-Za-z0-9_.:-]{1,64}$".to_string(),
+            ));
+        }
+        if avro_encoded_size(value)? > MAX_MEMO_VALUE_SIZE_BYTES {
+            return Err(Error::InvalidMemoUpdate(format!(
+                "value {key:?} exceeds the {MAX_MEMO_VALUE_SIZE_BYTES}-byte limit"
+            )));
+        }
+    }
+
+    let value = AvroValue::Map(entries);
+    if avro_encoded_size(&value)? > MAX_MEMO_TOTAL_SIZE_BYTES {
+        return Err(Error::InvalidMemoUpdate(format!(
+            "update exceeds the {MAX_MEMO_TOTAL_SIZE_BYTES}-byte total limit"
+        )));
+    }
+    Ok(value)
+}
+
+fn decode_memo_history_map(envelope: &Value, require_entries: bool) -> Result<AvroValue> {
+    let object = envelope.as_object().ok_or_else(|| {
+        Error::InvalidMemoUpdate(
+            "history field must use the public {codec, blob} payload envelope".to_string(),
+        )
+    })?;
+    if object.len() != 2 || !object.contains_key("codec") || !object.contains_key("blob") {
+        return Err(Error::InvalidMemoUpdate(
+            "history field must use exactly the public {codec, blob} payload envelope".to_string(),
+        ));
+    }
+
+    canonical_memo_entries(
+        decode_wire_avro_value(envelope, DEFAULT_CODEC)?,
+        require_entries,
+    )
+}
+
 impl WorkflowContext {
     /// Identity of the parent workflow currently being replayed.
     pub fn workflow_identity(&self) -> Result<WorkflowIdentity> {
@@ -7790,6 +7939,47 @@ impl WorkflowContext {
         self.get_version(change_id, -1, 1).map(|_| ())
     }
 
+    /// Merge non-indexed workflow memo metadata through durable history.
+    ///
+    /// Avro `null` deletes a key. The SDK encodes the complete patch in the
+    /// public Avro payload envelope consumed by Server and Cloud runtimes.
+    pub fn upsert_memo<T: Serialize>(&self, entries: T) -> Result<()> {
+        let entries = canonical_memo_entries(AvroValue::from_serialize(&entries)?, true)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            return match recorded {
+                RecordedCommand::Memo {
+                    sequence,
+                    entries: recorded_entries,
+                } => {
+                    if recorded_entries != entries {
+                        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                            "memo_update_mismatch",
+                            Some(sequence),
+                            Some(format!("{recorded_entries:?}")),
+                            Some(format!("{entries:?}")),
+                            "recorded memo entries differ from the current workflow update",
+                        )));
+                    }
+                    state.command_cursor += 1;
+                    Ok(())
+                }
+                other => Err(command_mismatch(&other, "memo upsert")),
+            };
+        }
+
+        let entries_envelope = encode_typed_envelope(&entries, DEFAULT_CODEC)?;
+        state.commands.push(json!({
+            "type": "upsert_memo",
+            "entries": entries_envelope,
+        }));
+        Ok(())
+    }
+
     /// Start a named durable child on an explicit queue and await its result.
     ///
     /// The command is recorded in the parent's sequence-ordered durable command
@@ -8085,6 +8275,10 @@ enum RecordedCommand {
         change_id: String,
         version: i32,
     },
+    Memo {
+        sequence: u64,
+        entries: AvroValue,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -8260,7 +8454,8 @@ impl RecordedCommand {
             | Self::ConditionWait { sequence, .. }
             | Self::SearchAttributes { sequence, .. }
             | Self::SideEffect { sequence, .. }
-            | Self::VersionMarker { sequence, .. } => *sequence,
+            | Self::VersionMarker { sequence, .. }
+            | Self::Memo { sequence, .. } => *sequence,
         }
     }
 
@@ -8274,6 +8469,7 @@ impl RecordedCommand {
             Self::SearchAttributes { .. } => "search-attribute update",
             Self::SideEffect { .. } => "side effect",
             Self::VersionMarker { .. } => "version marker",
+            Self::Memo { .. } => "memo upsert",
         }
     }
 }
@@ -10076,6 +10272,7 @@ fn recorded_commands(
         let is_search_attributes = event.event_type == "SearchAttributesUpserted";
         let is_side_effect = event.event_type == "SideEffectRecorded";
         let is_version_marker = event.event_type == "VersionMarkerRecorded";
+        let is_memo = event.event_type == "MemoUpserted";
         if !is_activity
             && !is_workflow_timer
             && !is_child_workflow
@@ -10084,6 +10281,7 @@ fn recorded_commands(
             && !is_search_attributes
             && !is_side_effect
             && !is_version_marker
+            && !is_memo
         {
             continue;
         }
@@ -10169,6 +10367,11 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| event.event_type == "VersionMarkerRecorded")
                 .collect();
+            let memo_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| event.event_type == "MemoUpserted")
+                .collect();
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
@@ -10177,7 +10380,8 @@ fn recorded_commands(
                 + usize::from(!condition_wait_events.is_empty())
                 + usize::from(!search_attribute_events.is_empty())
                 + usize::from(!side_effect_events.is_empty())
-                + usize::from(!version_marker_events.is_empty());
+                + usize::from(!version_marker_events.is_empty())
+                + usize::from(!memo_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
@@ -10188,6 +10392,7 @@ fn recorded_commands(
                     (!search_attribute_events.is_empty()).then_some("search-attribute update"),
                     (!side_effect_events.is_empty()).then_some("side effect"),
                     (!version_marker_events.is_empty()).then_some("version marker"),
+                    (!memo_events.is_empty()).then_some("memo upsert"),
                 ]
                 .into_iter()
                 .flatten()
@@ -10573,6 +10778,56 @@ fn recorded_commands(
                 });
             }
 
+            if !memo_events.is_empty() {
+                if memo_events.len() != 1 {
+                    return Err(invalid_recorded_history(
+                        "duplicate_memo_upsert_record",
+                        sequence,
+                        "one MemoUpserted event",
+                        &format!("{} MemoUpserted events", memo_events.len()),
+                        "memo history records one workflow update more than once",
+                    ));
+                }
+                let payload = &memo_events[0].payload;
+                let entries = payload.get("entries").cloned().ok_or_else(|| {
+                    invalid_recorded_history(
+                        "memo_entries_missing",
+                        sequence,
+                        "memo entries object",
+                        "missing entries",
+                        "MemoUpserted history is missing replay identity entries",
+                    )
+                })?;
+                let entries = decode_memo_history_map(&entries, true).map_err(|error| {
+                    invalid_recorded_history(
+                        "memo_entries_invalid",
+                        sequence,
+                        "valid canonical memo entries",
+                        &error.to_string(),
+                        "MemoUpserted history contains invalid replay identity entries",
+                    )
+                })?;
+                let merged = payload.get("merged").cloned().ok_or_else(|| {
+                    invalid_recorded_history(
+                        "memo_merged_projection_missing",
+                        sequence,
+                        "merged memo projection",
+                        "missing merged",
+                        "MemoUpserted history is missing its merged projection",
+                    )
+                })?;
+                decode_memo_history_map(&merged, false).map_err(|error| {
+                    invalid_recorded_history(
+                        "memo_merged_projection_invalid",
+                        sequence,
+                        "valid merged memo projection",
+                        &error.to_string(),
+                        "MemoUpserted history contains an invalid merged projection",
+                    )
+                })?;
+
+                return Ok(RecordedCommand::Memo { sequence, entries });
+            }
             let scheduled: Vec<_> = timer_events
                 .iter()
                 .copied()
@@ -15981,6 +16236,158 @@ mod tests {
             Poll::Ready(Err(Error::TimerDurationOverflow))
         ));
         assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn workflow_memo_update_emits_canonical_command_and_replays_once() {
+        let entries = AvroValue::Map(BTreeMap::from([
+            ("text".to_string(), AvroValue::String("same".to_string())),
+            (
+                "nested".to_string(),
+                AvroValue::Map(BTreeMap::from([
+                    ("beta".to_string(), AvroValue::Long(2)),
+                    ("alpha".to_string(), AvroValue::Long(1)),
+                ])),
+            ),
+            ("long".to_string(), AvroValue::Long(7)),
+            ("double".to_string(), AvroValue::Double(7.0)),
+            ("binary".to_string(), AvroValue::Bytes(b"same".to_vec())),
+        ]));
+        let ctx = workflow_context(Vec::new());
+        ctx.upsert_memo(entries.clone()).expect("valid memo update");
+        let commands = ctx.take_commands().expect("commands");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], "upsert_memo");
+        let server_entries = json!({
+            "codec": "avro",
+            "blob": "wwHioz3/VYAiNw4KDGJpbmFyeQgIc2FtZQxkb3VibGUGAAAAAAAAHEAIbG9uZwQODG5lc3RlZA4ECmFscGhhBAIIYmV0YQQEAAh0ZXh0CghzYW1lAA==",
+        });
+        assert_eq!(
+            commands[0]["entries"]
+                .as_object()
+                .expect("entries envelope")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["blob", "codec"]
+        );
+        assert_eq!(commands[0]["entries"], server_entries);
+        let wire_entries =
+            decode_wire_avro_value(&commands[0]["entries"], DEFAULT_CODEC).expect("memo entries");
+        assert_eq!(wire_entries, entries);
+
+        let history = vec![history_event(
+            "MemoUpserted",
+            json!({
+                "sequence": 1,
+                "entries": server_entries.clone(),
+                "merged": server_entries,
+            }),
+        )];
+        let replay = workflow_context(history.clone());
+        replay
+            .upsert_memo(entries.clone())
+            .expect("matching replay identity");
+        assert!(replay.take_commands().expect("replay commands").is_empty());
+
+        let changed_types = AvroValue::Map(BTreeMap::from([
+            ("text".to_string(), AvroValue::Bytes(b"same".to_vec())),
+            (
+                "nested".to_string(),
+                AvroValue::Map(BTreeMap::from([
+                    ("alpha".to_string(), AvroValue::Long(1)),
+                    ("beta".to_string(), AvroValue::Long(2)),
+                ])),
+            ),
+            ("long".to_string(), AvroValue::Double(7.0)),
+            ("double".to_string(), AvroValue::Long(7)),
+            ("binary".to_string(), AvroValue::String("same".to_string())),
+        ]));
+        let error = workflow_context(history)
+            .upsert_memo(changed_types)
+            .expect_err("memo replay identity must preserve Avro value types");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ref failure) if failure.reason == "memo_update_mismatch"
+        ));
+    }
+
+    #[test]
+    fn workflow_memo_update_rejects_changed_replay_identity_and_invalid_keys() {
+        let original = encode_value_envelope(&json!({"stage": "original"}), DEFAULT_CODEC)
+            .expect("memo envelope");
+        let replay = workflow_context(vec![history_event(
+            "MemoUpserted",
+            json!({
+                "sequence": 1,
+                "entries": original.clone(),
+                "merged": original
+            }),
+        )]);
+        let error = replay
+            .upsert_memo(json!({"stage": "changed"}))
+            .expect_err("changed memo update must fail replay");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ref failure) if failure.reason == "memo_update_mismatch"
+        ));
+
+        let invalid = workflow_context(Vec::new())
+            .upsert_memo(
+                json!({"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": true}),
+            )
+            .expect_err("oversized key");
+        assert!(matches!(invalid, Error::InvalidMemoUpdate(_)));
+    }
+
+    #[test]
+    fn workflow_memo_replay_distinguishes_signed_zero_identity() {
+        let negative_zero = AvroValue::Map(BTreeMap::from([(
+            "reading".to_string(),
+            AvroValue::Double(-0.0),
+        )]));
+        let negative_zero_envelope =
+            encode_typed_envelope(&negative_zero, DEFAULT_CODEC).expect("negative zero envelope");
+        let history = vec![history_event(
+            "MemoUpserted",
+            json!({
+                "sequence": 1,
+                "entries": negative_zero_envelope.clone(),
+                "merged": negative_zero_envelope,
+            }),
+        )];
+
+        workflow_context(history.clone())
+            .upsert_memo(negative_zero)
+            .expect("matching negative-zero history identity");
+
+        let error = workflow_context(history)
+            .upsert_memo(AvroValue::Map(BTreeMap::from([(
+                "reading".to_string(),
+                AvroValue::Double(0.0),
+            )])))
+            .expect_err("positive zero must not consume negative-zero memo history");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ref failure) if failure.reason == "memo_update_mismatch"
+        ));
+    }
+
+    #[test]
+    fn workflow_memo_capability_requires_flag_and_command_advertisement() {
+        let supported = json!({
+            "workflow_memo_updates": {"supported": true, "minimum_protocol_version": "1.14"},
+            "supported_workflow_task_commands": ["complete_workflow", "upsert_memo"]
+        });
+        assert!(runtime_supports_workflow_memo_updates(Some(&supported)));
+        assert!(!runtime_supports_workflow_memo_updates(Some(&json!({
+            "workflow_memo_updates": {"supported": false},
+            "supported_workflow_task_commands": ["upsert_memo"]
+        }))));
+        assert!(commands_use_workflow_memo_updates(&[json!({
+            "type": "upsert_memo",
+            "entries": {"stage": "processing"}
+        })]));
     }
 
     #[test]

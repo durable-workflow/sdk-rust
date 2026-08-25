@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -12,9 +13,9 @@ use std::{
 };
 
 use durable_workflow::{
-    decode_payload, encode_payload, json, ChildWorkflowOptions, Client, ConditionWaitOptions,
-    ConditionWaitResult, Error, ParallelOperation, ParallelResult, PayloadEnvelope,
-    SearchAttributeUpdate, Value, Worker, WorkflowInstance, DEFAULT_CODEC,
+    decode_payload, encode_payload, json, AvroValue, ChildWorkflowOptions, Client,
+    ConditionWaitOptions, ConditionWaitResult, Error, ParallelOperation, ParallelResult,
+    PayloadEnvelope, SearchAttributeUpdate, Value, Worker, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 
@@ -342,6 +343,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.workflow-stream"
             | "corpus.nested-parallel"
             | "corpus.typed-replayed"
+            | "corpus.memo-signed-zero"
             | "corpus.search-attribute-type-mismatch"
             | "corpus.condition-search"
     ) {
@@ -484,6 +486,15 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     Ok(result)
                 },
             );
+        }
+        "corpus.memo-signed-zero" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.upsert_memo(AvroValue::Map(BTreeMap::from([(
+                    "reading".to_string(),
+                    AvroValue::Double(0.0),
+                )])))?;
+                Ok(json!("signed-zero replay unexpectedly matched"))
+            });
         }
         "corpus.search-attribute-type-mismatch" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {

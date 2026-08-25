@@ -14,7 +14,9 @@ fn canonical_avro_value(value: AvroValue) -> Value {
         AvroValue::Null => json!({"type": "null"}),
         AvroValue::Boolean(value) => json!({"type": "boolean", "value": value}),
         AvroValue::Long(value) => json!({"type": "long", "value": value}),
-        AvroValue::Double(value) => json!({"type": "double", "value": value}),
+        AvroValue::Double(value) => {
+            json!({"type": "double", "bits": format!("{:016x}", value.to_bits())})
+        }
         AvroValue::Bytes(value) => json!({"type": "bytes", "value_base64": BASE64.encode(value)}),
         AvroValue::String(value) => json!({"type": "string", "value": value}),
         AvroValue::Array(values) => json!({
