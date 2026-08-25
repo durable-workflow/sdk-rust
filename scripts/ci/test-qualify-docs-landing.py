@@ -32,33 +32,78 @@ QUALIFIER = _load_qualifier()
 class DocsLandingQualificationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.html = (ROOT / "docs/index.html").read_text(encoding="utf-8")
-        self.crate_version, self.rust_version = QUALIFIER.manifest_identity(
+        self.source_version, self.rust_version = QUALIFIER.manifest_identity(
             ROOT / "Cargo.toml"
         )
 
     def test_current_landing_satisfies_the_general_first_contract(self) -> None:
-        QUALIFIER.validate_structure(
-            QUALIFIER.parse_document(self.html),
-            self.crate_version,
-            self.rust_version,
-        )
+            QUALIFIER.validate_structure(
+                QUALIFIER.parse_document(self.html),
+                self.source_version,
+                self.rust_version,
+            )
 
-    def test_rejects_a_stale_machine_owned_crate_identity(self) -> None:
+    def test_rejects_a_stale_machine_owned_source_identity(self) -> None:
         stale_identity = self.html.replace(
-            f'data-crate-version="{self.crate_version}"',
-            'data-crate-version="2.0.0-rc.1"',
+            f'data-source-version="{self.source_version}"',
+            'data-source-version="2.0.0-rc.1"',
             1,
         )
 
         with self.assertRaisesRegex(
             QUALIFIER.QualificationError,
-            "landing crate identity is stale",
+            "landing source provenance is stale",
         ):
             QUALIFIER.validate_structure(
                 QUALIFIER.parse_document(stale_identity),
-                self.crate_version,
+                self.source_version,
                 self.rust_version,
             )
+
+    def test_rejects_source_provenance_labeled_as_current_crate_version(self) -> None:
+        misleading_identity = self.html.replace(
+            "data-source-version=",
+            "data-crate-version=",
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            QUALIFIER.QualificationError,
+            "source provenance as the current crate version",
+        ):
+            QUALIFIER.validate_structure(
+                QUALIFIER.parse_document(misleading_identity),
+                self.source_version,
+                self.rust_version,
+            )
+
+    def test_source_ahead_of_public_authority_keeps_install_guidance_truthful(self) -> None:
+        root = QUALIFIER.parse_document(self.html)
+        public_version = QUALIFIER.qualified_rust_version(
+            json.dumps(
+                {
+                    "schema": QUALIFIER.QUICKSTART_CONTRACT_SCHEMA,
+                    "artifacts": {"sdk-rust": {"version": "2.0.0-rc.33"}},
+                }
+            )
+        )
+
+        self.assertEqual("2.0.0-rc.33", public_version)
+        self.assertNotEqual(self.source_version, public_version)
+        self.assertEqual(
+            0,
+            QUALIFIER.validate_visible_cargo_paths(
+                root,
+                (ROOT / "README.md").read_text(encoding="utf-8"),
+                public_version,
+            ),
+        )
+        body = QUALIFIER.one(
+            [node for node in QUALIFIER.walk(root) if node.tag == "body"],
+            "body",
+        )
+        self.assertEqual(self.source_version, body.attrs.get("data-source-version"))
+        self.assertNotIn("data-crate-version", body.attrs)
 
     def test_rejects_a_floating_cargo_requirement_in_visible_onboarding(self) -> None:
         floating_onboarding = self.html.replace(
@@ -73,14 +118,14 @@ class DocsLandingQualificationTest(unittest.TestCase):
         ):
             QUALIFIER.validate_structure(
                 QUALIFIER.parse_document(floating_onboarding),
-                self.crate_version,
+                self.source_version,
                 self.rust_version,
             )
 
     def test_rejects_an_exact_prerelease_version_in_visible_onboarding(self) -> None:
         pinned_onboarding = self.html.replace(
             '<p class="dw-version">',
-            f'<p class="dw-version"><span>Qualified crate {self.crate_version}</span>',
+            f'<p class="dw-version"><span>Qualified crate {self.source_version}</span>',
             1,
         )
 
@@ -90,14 +135,14 @@ class DocsLandingQualificationTest(unittest.TestCase):
         ):
             QUALIFIER.validate_structure(
                 QUALIFIER.parse_document(pinned_onboarding),
-                self.crate_version,
+                self.source_version,
                 self.rust_version,
             )
 
     def test_rejects_a_missing_versionless_installer(self) -> None:
         pinned_installer = self.html.replace(
             QUALIFIER.VERSIONLESS_INSTALLER,
-            f"cargo add durable-workflow@={self.crate_version}",
+            f"cargo add durable-workflow@={self.source_version}",
             1,
         )
 
@@ -107,7 +152,7 @@ class DocsLandingQualificationTest(unittest.TestCase):
         ):
             QUALIFIER.validate_structure(
                 QUALIFIER.parse_document(pinned_installer),
-                self.crate_version,
+                self.source_version,
                 self.rust_version,
             )
 
@@ -125,7 +170,7 @@ class DocsLandingQualificationTest(unittest.TestCase):
         ):
             QUALIFIER.validate_structure(
                 QUALIFIER.parse_document(cloud_primary),
-                self.crate_version,
+                self.source_version,
                 self.rust_version,
             )
 

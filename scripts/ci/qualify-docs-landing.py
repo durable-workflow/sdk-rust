@@ -169,12 +169,16 @@ def manifest_identity(manifest: Path) -> tuple[str, str]:
     return version.group(1), rust_version.group(1)
 
 
-def validate_structure(root: Node, crate_version: str, rust_version: str) -> None:
+def validate_structure(root: Node, source_version: str, rust_version: str) -> None:
     body = one([node for node in walk(root) if node.tag == "body"], "body")
     if body.attrs.get("data-landing-contract") != "general-rust-first":
         raise QualificationError("landing is missing the general-first contract marker")
-    if body.attrs.get("data-crate-version") != crate_version:
-        raise QualificationError("landing crate identity is stale")
+    if "data-crate-version" in body.attrs:
+        raise QualificationError(
+            "landing must not describe source provenance as the current crate version"
+        )
+    if body.attrs.get("data-source-version") != source_version:
+        raise QualificationError("landing source provenance is stale")
     if body.attrs.get("data-rust-version") != rust_version:
         raise QualificationError("landing Rust requirement is stale")
 
@@ -622,12 +626,12 @@ def main() -> int:
         return 2
 
     try:
-        crate_version, rust_version = manifest_identity(arguments.manifest)
+        source_version, rust_version = manifest_identity(arguments.manifest)
         if arguments.build_directory is not None:
             landing_path = arguments.build_directory / "index.html"
             html = landing_path.read_text(encoding="utf-8")
             root = parse_document(html)
-            validate_structure(root, crate_version, rust_version)
+            validate_structure(root, source_version, rust_version)
             qualify_local_links(root, arguments.build_directory)
             destinations: tuple[str, ...] = ()
             if arguments.check_external:
@@ -644,7 +648,7 @@ def main() -> int:
 
             def fetch_qualified_landing() -> str:
                 html = read_2xx(landing_url, arguments.timeout)
-                validate_structure(parse_document(html), crate_version, rust_version)
+                validate_structure(parse_document(html), source_version, rust_version)
                 return html
 
             html = retry(

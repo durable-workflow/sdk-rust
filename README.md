@@ -108,9 +108,9 @@ without a source edit: `DURABLE_WORKFLOW_RUNTIME_URL`,
 The installed crate's package metadata records its exact qualified Server
 range and baseline. Server build versions are identity, not the runtime
 negotiation mechanism: this release starts with the first Server release line
-that advertises worker protocol `1.16`, as identified by the package metadata.
+that advertises worker protocol `1.17`, as identified by the package metadata.
 Compatible servers must advertise control plane `2` and a
-same-major worker protocol in `>=1.16,<2.0`. The SDK sends worker protocol `1.16`;
+same-major worker protocol in `>=1.17,<2.0`. The SDK sends worker protocol `1.17`;
 newer `1.x` server minors accept that header under the additive protocol
 contract.
 
@@ -126,6 +126,8 @@ Timer-capable releases additionally publish `durable-timers`, `timer-command`,
 and `timer-replay-validation`. Condition and operator-metadata releases publish
 `durable-condition-waits`, `condition-wait-command`,
 `condition-wait-minimum-worker-protocol-version`,
+`condition-wait-occurrence-capability`,
+`condition-wait-occurrence-minimum-worker-protocol-version`,
 `workflow-search-attribute-updates`, `search-attribute-update-command`, and
 their replay/type contracts. Child-capable releases additionally publish
 `child-workflows`, `child-workflow-command`, and
@@ -140,7 +142,8 @@ their replay/type contracts. Child-capable releases additionally publish
 the compensation order, failure-policy, and cancellation fields. Workflow
 Stream authoring requires the `1.15` feature floor. Query-task requests and
 search-attribute updates use the additive `1.8` floor; condition-wait
-completions use `1.9`.
+completions use `1.9`, while authored condition-wait occurrence identity uses
+`1.17` and is advertised explicitly during high-level worker registration.
 
 Typed search-attribute updates require worker protocol `1.16`. The SDK records
 canonical declarations with each command and compares both the JSON value and

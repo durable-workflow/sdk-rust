@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.0-rc.34
+
+- Preserve one-to-one authored condition-wait occurrences with an explicit
+  deterministic identity. Adjacent waits at the same call site now replay
+  independently, while signal- and update-driven physical re-evaluations keep
+  the identity of their open wait and continue to replay as one occurrence.
+- Require Server `>=2.0.0-rc.50,<2.0.0`, the first release line that preserves
+  condition-wait occurrence identity throughout open, terminal, and timeout
+  history.
+- Advance the worker protocol to `1.17` and advertise condition-wait occurrence
+  identity, memo upserts, and typed search attributes explicitly from
+  high-level worker registration.
+
 ## 2.0.0-rc.33
 
 - Added `WorkflowContext::upsert_memo` with bounded canonical Avro map patches,

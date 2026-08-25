@@ -1487,6 +1487,7 @@ def _rust_negative_controls(
     base_files: Mapping[str, bytes],
     current_files: Mapping[str, bytes],
     fixtures: Mapping[str, Sequence[str]],
+    superseded_fixture_paths: Mapping[str, Sequence[str]],
     consumer_runner: ConsumerRunner,
 ) -> dict[str, int]:
     if policy.get("binding") != "rust":
@@ -1563,13 +1564,25 @@ def _rust_negative_controls(
                 )
             )
             _configure_consumer_fixture(
-                checkouts=(base_checkout, candidate_checkout),
+                checkouts=(base_checkout,),
                 selected_paths=selected_paths,
                 base_files=base_files,
                 current_files=current_files,
                 fixture_path=None,
                 category=category,
             )
+            _configure_consumer_fixture(
+                checkouts=(candidate_checkout,),
+                selected_paths=selected_paths,
+                base_files=base_files,
+                current_files=current_files,
+                fixture_path=None,
+                category=category,
+            )
+            for path in superseded_fixture_paths.get(category, ()):
+                candidate = candidate_checkout / path
+                if candidate.is_file() or candidate.is_symlink():
+                    candidate.unlink()
             _replace_consumer_sources(
                 checkouts=(base_checkout,),
                 category=category,
@@ -1612,6 +1625,11 @@ def _rust_negative_controls(
                     fixture_path=fixture_path,
                     category=category,
                 )
+                for path in superseded_fixture_paths.get(category, ()):
+                    for checkout in (base_checkout, candidate_checkout):
+                        candidate = checkout / path
+                        if candidate.is_file() or candidate.is_symlink():
+                            candidate.unlink()
                 candidate_result = consumer_runner(candidate_checkout, category)
                 if candidate_result.returncode != 0:
                     raise _consumer_failure(
@@ -1845,6 +1863,14 @@ def validate(
                     f"{item.identity} must supersede evidence in the same category at an older protocol version"
                 )
 
+    superseded_fixture_paths: dict[str, set[str]] = {}
+    for item in current_evidence:
+        for superseded in item.supersedes:
+            previous = current_by_id[superseded]
+            superseded_fixture_paths.setdefault(previous.category, set()).add(
+                previous.path
+            )
+
     counts: dict[str, dict[str, int | bool]] = {}
     negative_control_fixtures: dict[str, list[str]] = {}
     for category_name, raw_category in _object(policy["categories"], "categories").items():
@@ -1891,6 +1917,7 @@ def validate(
         base_files=base_files,
         current_files=current_files,
         fixtures=negative_control_fixtures,
+        superseded_fixture_paths=superseded_fixture_paths,
         consumer_runner=consumer_runner,
     )
     return {

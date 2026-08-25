@@ -52,6 +52,9 @@ durable_condition_waits="$(jq -er '.packages[0].metadata["durable-workflow"]["du
 condition_wait_command="$(jq -er '.packages[0].metadata["durable-workflow"]["condition-wait-command"]' <<<"$metadata")"
 condition_wait_minimum_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["condition-wait-minimum-worker-protocol-version"]' <<<"$metadata")"
 condition_wait_result="$(jq -cer '.packages[0].metadata["durable-workflow"]["condition-wait-result"]' <<<"$metadata")"
+condition_wait_occurrence_capability="$(jq -er '.packages[0].metadata["durable-workflow"]["condition-wait-occurrence-capability"]' <<<"$metadata")"
+condition_wait_occurrence_identity="$(jq -er '.packages[0].metadata["durable-workflow"]["condition-wait-occurrence-identity"]' <<<"$metadata")"
+condition_wait_occurrence_minimum_protocol="$(jq -er '.packages[0].metadata["durable-workflow"]["condition-wait-occurrence-minimum-worker-protocol-version"]' <<<"$metadata")"
 condition_wait_replay_validation="$(jq -er '.packages[0].metadata["durable-workflow"]["condition-wait-replay-validation"]' <<<"$metadata")"
 workflow_search_attribute_updates="$(jq -er '.packages[0].metadata["durable-workflow"]["workflow-search-attribute-updates"]' <<<"$metadata")"
 search_attribute_update_command="$(jq -er '.packages[0].metadata["durable-workflow"]["search-attribute-update-command"]' <<<"$metadata")"
@@ -101,11 +104,11 @@ if [[ "$package_version" != "$product_train" ]]; then
     printf 'Rust SDK package version must match its product train metadata: %s, %s\n' "$package_version" "$product_train" >&2
     exit 1
 fi
-if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.47,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.47" || "$server_worker_protocols" != ">=1.16,<2.0" ]]; then
+if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibility" != ">=2.0.0-rc.50,<2.0.0" || "$qualified_server_version" != "2.0.0-rc.50" || "$server_worker_protocols" != ">=1.17,<2.0" ]]; then
     printf 'unexpected Rust SDK supported Server contract: %s, %s, %s, %s\n' "$compatibility_authority" "$server_compatibility" "$qualified_server_version" "$server_worker_protocols" >&2
     exit 1
 fi
-if [[ "$worker_protocol" != "1.16" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$durable_condition_waits" != "true" || "$condition_wait_command" != "open_condition_wait" || "$condition_wait_minimum_protocol" != "1.9" || "$condition_wait_result" != '["satisfied","timed_out"]' || "$condition_wait_replay_validation" != "command-order+sequence+key+predicate-fingerprint+timeout" || "$workflow_search_attribute_updates" != "true" || "$search_attribute_update_command" != "upsert_search_attributes" || "$search_attribute_update_minimum_protocol" != "1.8" || "$search_attribute_types" != '["string","keyword","keyword_list","int","float","bool","datetime"]' || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' || "$typed_search_attributes" != "true" || "$typed_search_attributes_minimum_protocol" != "1.16" || "$search_attribute_replay_identity" != "json-value+canonical-declared-type" || "$legacy_search_attribute_history" != "value-only+unknown-type-identity" ]]; then
+if [[ "$worker_protocol" != "1.17" || "$control_plane" != "2" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$durable_condition_waits" != "true" || "$condition_wait_command" != "open_condition_wait" || "$condition_wait_minimum_protocol" != "1.9" || "$condition_wait_result" != '["satisfied","timed_out"]' || "$condition_wait_occurrence_capability" != "condition_wait_occurrence_identity" || "$condition_wait_occurrence_identity" != "explicit-deterministic-authored-ordinal" || "$condition_wait_occurrence_minimum_protocol" != "1.17" || "$condition_wait_replay_validation" != "command-order+authored-occurrence+sequence+key+predicate-fingerprint+timeout" || "$workflow_search_attribute_updates" != "true" || "$search_attribute_update_command" != "upsert_search_attributes" || "$search_attribute_update_minimum_protocol" != "1.8" || "$search_attribute_types" != '["string","keyword","keyword_list","int","float","bool","datetime"]' || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' || "$typed_search_attributes" != "true" || "$typed_search_attributes_minimum_protocol" != "1.16" || "$search_attribute_replay_identity" != "json-value+canonical-declared-type" || "$legacy_search_attribute_history" != "value-only+unknown-type-identity" ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
 fi
@@ -185,6 +188,9 @@ write_evidence() {
         --arg condition_wait_command "$condition_wait_command" \
         --arg condition_wait_minimum_protocol "$condition_wait_minimum_protocol" \
         --argjson condition_wait_result "$condition_wait_result" \
+        --arg condition_wait_occurrence_capability "$condition_wait_occurrence_capability" \
+        --arg condition_wait_occurrence_identity "$condition_wait_occurrence_identity" \
+        --arg condition_wait_occurrence_minimum_protocol "$condition_wait_occurrence_minimum_protocol" \
         --arg condition_wait_replay_validation "$condition_wait_replay_validation" \
         --arg workflow_search_attribute_updates "$workflow_search_attribute_updates" \
         --arg search_attribute_update_command "$search_attribute_update_command" \
@@ -250,6 +256,9 @@ write_evidence() {
                 condition_wait_command: $condition_wait_command,
                 condition_wait_minimum_worker_protocol: $condition_wait_minimum_protocol,
                 condition_wait_result: $condition_wait_result,
+                condition_wait_occurrence_capability: $condition_wait_occurrence_capability,
+                condition_wait_occurrence_identity: $condition_wait_occurrence_identity,
+                condition_wait_occurrence_minimum_worker_protocol: $condition_wait_occurrence_minimum_protocol,
                 condition_wait_replay_validation: $condition_wait_replay_validation,
                 workflow_search_attribute_updates: ($workflow_search_attribute_updates == "true"),
                 search_attribute_update_command: $search_attribute_update_command,

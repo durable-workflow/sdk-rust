@@ -16,12 +16,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
-PACKAGE_VERSION = "2.0.0-rc.33"
+PACKAGE_VERSION = "2.0.0-rc.34"
 PRODUCT_TRAIN = PACKAGE_VERSION
-SERVER_VERSIONS = ">=2.0.0-rc.47,<2.0.0"
-QUALIFIED_SERVER_VERSION = "2.0.0-rc.47"
-WORKER_PROTOCOL_VERSION = "1.16"
-SERVER_WORKER_PROTOCOLS = ">=1.16,<2.0"
+SERVER_VERSIONS = ">=2.0.0-rc.50,<2.0.0"
+QUALIFIED_SERVER_VERSION = "2.0.0-rc.50"
+WORKER_PROTOCOL_VERSION = "1.17"
+SERVER_WORKER_PROTOCOLS = ">=1.17,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -218,6 +218,18 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual(
             "1.9", metadata["condition-wait-minimum-worker-protocol-version"]
         )
+        self.assertEqual(
+            "condition_wait_occurrence_identity",
+            metadata["condition-wait-occurrence-capability"],
+        )
+        self.assertEqual(
+            "explicit-deterministic-authored-ordinal",
+            metadata["condition-wait-occurrence-identity"],
+        )
+        self.assertEqual(
+            WORKER_PROTOCOL_VERSION,
+            metadata["condition-wait-occurrence-minimum-worker-protocol-version"],
+        )
         self.assertTrue(metadata["workflow-search-attribute-updates"])
         self.assertEqual(
             "upsert_search_attributes", metadata["search-attribute-update-command"]
@@ -228,7 +240,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         self.assertTrue(metadata["typed-search-attributes"])
         self.assertEqual(
-            WORKER_PROTOCOL_VERSION,
+            "1.16",
             metadata["typed-search-attributes-minimum-worker-protocol-version"],
         )
         self.assertEqual(
@@ -262,6 +274,18 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual("open_condition_wait", protocol["condition_wait_command"])
         self.assertEqual("1.9", protocol["condition_wait_minimum_worker_protocol"])
         self.assertEqual(["satisfied", "timed_out"], protocol["condition_wait_result"])
+        self.assertEqual(
+            "condition_wait_occurrence_identity",
+            protocol["condition_wait_occurrence_capability"],
+        )
+        self.assertEqual(
+            "explicit-deterministic-authored-ordinal",
+            protocol["condition_wait_occurrence_identity"],
+        )
+        self.assertEqual(
+            WORKER_PROTOCOL_VERSION,
+            protocol["condition_wait_occurrence_minimum_worker_protocol"],
+        )
         self.assertTrue(protocol["workflow_search_attribute_updates"])
         self.assertEqual(
             "upsert_search_attributes", protocol["search_attribute_update_command"]
@@ -283,7 +307,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         self.assertTrue(protocol["typed_search_attributes"])
         self.assertEqual(
-            WORKER_PROTOCOL_VERSION,
+            "1.16",
             protocol["typed_search_attributes_minimum_worker_protocol"],
         )
         self.assertEqual(

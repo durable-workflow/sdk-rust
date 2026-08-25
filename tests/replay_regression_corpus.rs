@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -247,7 +247,38 @@ fn fixture_paths() -> Result<Vec<PathBuf>, String> {
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+
+    let fixtures = paths
+        .into_iter()
+        .map(|path| {
+            let fixture: Value = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| format!("read {}: {error}", path.display()))?,
+            )
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+            let identity = fixture["id"]
+                .as_str()
+                .ok_or_else(|| format!("{} has no fixture identity", path.display()))?
+                .to_string();
+            let supersedes = fixture
+                .get("supersedes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            Ok((path, identity, supersedes))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let superseded = fixtures
+        .iter()
+        .flat_map(|(_, _, supersedes)| supersedes.iter().cloned())
+        .collect::<HashSet<_>>();
+    Ok(fixtures
+        .into_iter()
+        .filter_map(|(path, identity, _)| (!superseded.contains(&identity)).then_some(path))
+        .collect())
 }
 
 fn normalize_command(command: &Value) -> Result<Value, String> {
@@ -346,6 +377,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.memo-signed-zero"
             | "corpus.search-attribute-type-mismatch"
             | "corpus.condition-search"
+            | "corpus.condition-search-adjacent"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -524,6 +556,41 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                         .bool("NeedsAttention", outcome.is_timed_out())?,
                 )?;
                 Ok(json!({"status": status}))
+            });
+        }
+        "corpus.condition-search-adjacent" => {
+            worker.register_workflow(workflow_type, move |ctx, _input| async move {
+                let mut outcomes = Vec::new();
+                for occurrence in 0..2 {
+                    let predicate_ctx = ctx.clone();
+                    outcomes.push(
+                        ctx.wait_condition(
+                            ConditionWaitOptions::new("approval", "sha256:corpus-approval-v1")
+                                .timeout(Duration::from_secs(30)),
+                            move || {
+                                Ok(
+                                    occurrence == 0
+                                        && !predicate_ctx.signals("approve")?.is_empty(),
+                                )
+                            },
+                        )
+                        .await?,
+                    );
+                }
+                let status = if outcomes
+                    .first()
+                    .is_some_and(|outcome| outcome.is_satisfied())
+                {
+                    "approved"
+                } else {
+                    "approval_timed_out"
+                };
+                ctx.upsert_search_attributes(
+                    SearchAttributeUpdate::new()
+                        .keyword("OrderStatus", status)?
+                        .bool("NeedsAttention", status != "approved")?,
+                )?;
+                Ok(json!({"status": status, "waits": outcomes}))
             });
         }
         _ => unreachable!("workflow type was validated above"),
@@ -706,9 +773,9 @@ async fn workflow_stream_command_without_durable_identity_fails_closed() {
 }
 
 #[tokio::test]
-async fn condition_and_search_replay_is_deterministic_across_cold_workers() {
+async fn adjacent_condition_wait_occurrences_are_deterministic_across_cold_workers() {
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/replay-regressions/condition-search-signal-cold-replay-avro.json");
+        .join("tests/fixtures/replay-regressions/condition-wait-occurrence-adjacent-cold-replay-avro.json");
     let fixture: Value = serde_json::from_str(
         &fs::read_to_string(fixture_path).expect("read checked-in condition replay fixture"),
     )

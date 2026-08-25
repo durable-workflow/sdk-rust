@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.0-rc.33"
+version = "2.0.0-rc.34"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -14,12 +14,12 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.0-rc.33"
+product-train = "2.0.0-rc.34"
 compatibility-authority = "protocol-manifests"
-supported-server-versions = ">=2.0.0-rc.47,<2.0.0"
-qualified-server-version = "2.0.0-rc.47"
-worker-protocol-version = "1.16"
-server-worker-protocol-versions = ">=1.16,<2.0"
+supported-server-versions = ">=2.0.0-rc.50,<2.0.0"
+qualified-server-version = "2.0.0-rc.50"
+worker-protocol-version = "1.17"
+server-worker-protocol-versions = ">=1.17,<2.0"
 control-plane-version = "2"
 query-tasks = true
 query-task-minimum-worker-protocol-version = "1.8"
@@ -45,7 +45,10 @@ durable-condition-waits = true
 condition-wait-command = "open_condition_wait"
 condition-wait-minimum-worker-protocol-version = "1.9"
 condition-wait-result = ["satisfied", "timed_out"]
-condition-wait-replay-validation = "command-order+sequence+key+predicate-fingerprint+timeout"
+condition-wait-occurrence-capability = "condition_wait_occurrence_identity"
+condition-wait-occurrence-identity = "explicit-deterministic-authored-ordinal"
+condition-wait-occurrence-minimum-worker-protocol-version = "1.17"
+condition-wait-replay-validation = "command-order+authored-occurrence+sequence+key+predicate-fingerprint+timeout"
 workflow-search-attribute-updates = true
 search-attribute-update-command = "upsert_search_attributes"
 search-attribute-update-minimum-worker-protocol-version = "1.8"

@@ -28,20 +28,33 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 pub use uuid::Uuid;
 
-pub const WORKER_PROTOCOL_VERSION: &str = "1.16";
+pub const WORKER_PROTOCOL_VERSION: &str = "1.17";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
+/// Worker-registration capability for authored condition-wait occurrence identity.
+pub const CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY: &str =
+    "condition_wait_occurrence_identity";
+/// Worker-registration capability for portable memo upserts.
+pub const MEMO_UPSERTS_CAPABILITY: &str = "memo_upserts";
 /// Worker-registration capability for server-routed read-only queries.
 pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
+/// Worker-registration capability for canonical typed search attributes.
+pub const TYPED_SEARCH_ATTRIBUTES_CAPABILITY: &str = "typed_search_attributes";
 /// Worker-registration capability for synchronous workflow updates.
 pub const WORKFLOW_UPDATES_CAPABILITY: &str = "workflow_updates";
 /// First additive worker protocol that defines query-task transport.
 pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
 /// First additive worker protocol that defines typed search-attribute upserts.
 pub const SEARCH_ATTRIBUTE_UPDATE_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
+/// First additive worker protocol that defines portable memo upserts.
+pub const MEMO_UPSERT_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.14";
+/// First additive worker protocol that preserves declared search-attribute types.
+pub const TYPED_SEARCH_ATTRIBUTES_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.16";
 /// First additive worker protocol that defines external durable condition waits.
 pub const CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.9";
+/// First additive worker protocol that preserves authored condition-wait occurrences.
+pub const CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.17";
 
 const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
 const WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE: &str =
@@ -263,6 +276,8 @@ struct ValidatedConditionWaitOptions {
     predicate_identity: String,
     timeout_seconds: Option<u64>,
 }
+
+const CONDITION_WAIT_OCCURRENCE_PREFIX: &str = "rust:condition-wait:";
 
 /// Unambiguous terminal result of a durable condition wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2125,7 +2140,25 @@ fn validate_workflow_task_commands(commands: &[Value]) -> Result<()> {
 }
 
 fn workflow_completion_protocol_version(commands: &[Value]) -> &'static str {
-    if commands
+    if commands.iter().any(|command| {
+        command.get("type").and_then(Value::as_str) == Some("open_condition_wait")
+            && command
+                .get("condition_wait_occurrence_id")
+                .and_then(Value::as_str)
+                .is_some_and(|occurrence_id| !occurrence_id.is_empty())
+    }) {
+        CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION
+    } else if commands.iter().any(|command| {
+        command.get("type").and_then(Value::as_str) == Some("upsert_search_attributes")
+            && command.get("attribute_types").is_some()
+    }) {
+        TYPED_SEARCH_ATTRIBUTES_MINIMUM_WORKER_PROTOCOL_VERSION
+    } else if commands
+        .iter()
+        .any(|command| command.get("type").and_then(Value::as_str) == Some("upsert_memo"))
+    {
+        MEMO_UPSERT_MINIMUM_WORKER_PROTOCOL_VERSION
+    } else if commands
         .iter()
         .any(|command| command.get("type").and_then(Value::as_str) == Some("open_condition_wait"))
     {
@@ -5987,6 +6020,9 @@ impl Worker {
                 self.max_concurrent_workflow_tasks,
                 self.max_concurrent_activity_tasks,
                 [
+                    Some(CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY.to_string()),
+                    Some(MEMO_UPSERTS_CAPABILITY.to_string()),
+                    Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
                 ]
@@ -7493,6 +7529,7 @@ impl WorkflowContext {
             ctx: self.clone(),
             options,
             predicate: Box::new(predicate),
+            occurrence_id: None,
             opened_wait: false,
         }
     }
@@ -8122,6 +8159,7 @@ struct WorkflowState {
     recorded_continue_as_new_sequence: Option<u64>,
     continue_as_new_consumed: bool,
     command_cursor: usize,
+    condition_wait_occurrence_counter: u64,
     matched_recorded_pending: bool,
     version_markers: HashMap<String, (i32, u64)>,
     workflow_command_identity: String,
@@ -8221,6 +8259,7 @@ impl WorkflowState {
             recorded_continue_as_new_sequence,
             continue_as_new_consumed: false,
             command_cursor: 0,
+            condition_wait_occurrence_counter: 0,
             matched_recorded_pending: false,
             version_markers: HashMap::new(),
             commands: Vec::new(),
@@ -8256,6 +8295,7 @@ enum RecordedCommand {
     },
     ConditionWait {
         sequence: u64,
+        occurrence_id: String,
         condition_key: Option<String>,
         predicate_identity: String,
         timeout_seconds: Option<u64>,
@@ -9426,13 +9466,14 @@ pub struct ConditionWaitCall {
     ctx: WorkflowContext,
     options: ConditionWaitOptions,
     predicate: Box<dyn Fn() -> Result<bool> + Send + 'static>,
+    occurrence_id: Option<String>,
     opened_wait: bool,
 }
 
 impl Future for ConditionWaitCall {
     type Output = Result<ConditionWaitResult>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         if self.opened_wait {
             return Poll::Pending;
         }
@@ -9442,6 +9483,28 @@ impl Future for ConditionWaitCall {
             Err(error) => return Poll::Ready(Err(Error::InvalidConditionWaitOptions(error))),
         };
         let ctx = self.ctx.clone();
+        let occurrence_id = match self.occurrence_id.as_ref() {
+            Some(occurrence_id) => occurrence_id.clone(),
+            None => {
+                let mut state = match ctx.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+                };
+                let ordinal = state.condition_wait_occurrence_counter;
+                state.condition_wait_occurrence_counter = match ordinal.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return Poll::Ready(Err(Error::WorkerLoop(
+                            "condition wait occurrence counter overflowed".to_string(),
+                        )))
+                    }
+                };
+                let occurrence_id = format!("{CONDITION_WAIT_OCCURRENCE_PREFIX}{ordinal}");
+                drop(state);
+                self.occurrence_id = Some(occurrence_id.clone());
+                occurrence_id
+            }
+        };
 
         let recorded_result = {
             let mut state = match ctx.state.lock() {
@@ -9461,6 +9524,7 @@ impl Future for ConditionWaitCall {
             loop {
                 let Some(RecordedCommand::ConditionWait {
                     sequence,
+                    occurrence_id: recorded_occurrence_id,
                     condition_key,
                     predicate_identity,
                     timeout_seconds,
@@ -9471,20 +9535,16 @@ impl Future for ConditionWaitCall {
                     break;
                 };
 
-                if cursor > state.command_cursor
-                    && !same_logical_condition_wait(
-                        condition_key.as_deref(),
-                        predicate_identity,
-                        &options,
-                    )
-                {
+                if cursor > state.command_cursor && recorded_occurrence_id != &occurrence_id {
                     break;
                 }
                 if let Err(error) = validate_recorded_condition_wait(
                     *sequence,
+                    recorded_occurrence_id,
                     condition_key.as_deref(),
                     predicate_identity,
                     *timeout_seconds,
+                    &occurrence_id,
                     &options,
                 ) {
                     return Poll::Ready(Err(error));
@@ -9541,6 +9601,10 @@ impl ConditionWaitCall {
         };
         let mut command = serde_json::Map::from_iter([
             ("type".to_string(), json!("open_condition_wait")),
+            (
+                "condition_wait_occurrence_id".to_string(),
+                json!(self.occurrence_id.as_deref().unwrap_or_default()),
+            ),
             ("condition_key".to_string(), json!(options.condition_key)),
             (
                 "condition_definition_fingerprint".to_string(),
@@ -9557,22 +9621,24 @@ impl ConditionWaitCall {
     }
 }
 
-fn same_logical_condition_wait(
-    recorded_key: Option<&str>,
-    recorded_predicate_identity: &str,
-    current: &ValidatedConditionWaitOptions,
-) -> bool {
-    recorded_key == Some(current.condition_key.as_str())
-        || recorded_predicate_identity == current.predicate_identity
-}
-
 fn validate_recorded_condition_wait(
     sequence: u64,
+    recorded_occurrence_id: &str,
     recorded_key: Option<&str>,
     recorded_predicate_identity: &str,
     recorded_timeout_seconds: Option<u64>,
+    current_occurrence_id: &str,
     current: &ValidatedConditionWaitOptions,
 ) -> Result<()> {
+    if recorded_occurrence_id != current_occurrence_id {
+        return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+            "condition_wait_occurrence_mismatch",
+            Some(sequence),
+            Some(recorded_occurrence_id.to_string()),
+            Some(current_occurrence_id.to_string()),
+            "recorded condition occurrence differs from the current authored wait position",
+        )));
+    }
     if recorded_key != Some(current.condition_key.as_str()) {
         return Err(Error::NonDeterministicReplay(ReplayFailure::new(
             "condition_wait_key_mismatch",
@@ -11000,6 +11066,7 @@ fn recorded_condition_wait(
 
     let opened = opened[0];
     let condition_wait_id = required_condition_wait_id(opened, sequence)?;
+    let occurrence_id = required_condition_wait_occurrence_id(opened, sequence)?;
     for event in condition_events
         .iter()
         .copied()
@@ -11013,6 +11080,16 @@ fn recorded_condition_wait(
                 &condition_wait_id,
                 &event_wait_id,
                 "condition lifecycle events at one sequence disagree on wait identity",
+            ));
+        }
+        let event_occurrence_id = required_condition_wait_occurrence_id(event, sequence)?;
+        if event_occurrence_id != occurrence_id {
+            return Err(invalid_recorded_history(
+                "condition_wait_occurrence_history_mismatch",
+                sequence,
+                &occurrence_id,
+                &event_occurrence_id,
+                "condition lifecycle events at one sequence disagree on authored occurrence identity",
             ));
         }
     }
@@ -11156,11 +11233,30 @@ fn recorded_condition_wait(
 
     Ok(RecordedCommand::ConditionWait {
         sequence,
+        occurrence_id,
         condition_key,
         predicate_identity,
         timeout_seconds,
         result,
     })
+}
+
+fn required_condition_wait_occurrence_id(event: &HistoryEvent, sequence: u64) -> Result<String> {
+    event
+        .payload
+        .get("condition_wait_occurrence_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "condition_wait_occurrence_id_missing",
+                sequence,
+                "non-empty condition_wait_occurrence_id",
+                &event.event_type,
+                "condition history is missing authored occurrence identity",
+            )
+        })
 }
 
 fn required_condition_wait_id(event: &HistoryEvent, sequence: u64) -> Result<String> {
@@ -12157,11 +12253,34 @@ mod tests {
             SEARCH_ATTRIBUTE_UPDATE_MINIMUM_WORKER_PROTOCOL_VERSION
         );
         assert_eq!(
+            workflow_completion_protocol_version(&[json!({
+                "type": "upsert_search_attributes",
+                "attributes": {"OrderStatus": "waiting"},
+                "attribute_types": {"OrderStatus": "keyword"},
+            })]),
+            TYPED_SEARCH_ATTRIBUTES_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            workflow_completion_protocol_version(&[
+                json!({"type": "upsert_memo", "entries": {"status": "waiting"}}),
+                json!({"type": "open_condition_wait", "condition_key": "ready"}),
+            ]),
+            MEMO_UPSERT_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
             workflow_completion_protocol_version(&[
                 json!({"type": "upsert_search_attributes", "attributes": {"State": "waiting"}}),
                 json!({"type": "open_condition_wait", "condition_key": "ready"}),
             ]),
             CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            workflow_completion_protocol_version(&[json!({
+                "type": "open_condition_wait",
+                "condition_wait_occurrence_id": "rust:condition-wait:0",
+                "condition_key": "ready",
+            })]),
+            CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION
         );
     }
 
@@ -15228,6 +15347,7 @@ mod tests {
             ctx.take_commands().expect("condition command"),
             vec![json!({
                 "type": "open_condition_wait",
+                "condition_wait_occurrence_id": "rust:condition-wait:0",
                 "condition_key": "approval.ready",
                 "condition_definition_fingerprint": "sha256:approval-v1",
                 "timeout_seconds": 61,
@@ -15266,6 +15386,7 @@ mod tests {
                 json!({
                     "sequence": 4,
                     "condition_wait_id": "condition:4",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "approval",
                     "condition_definition_fingerprint": "sha256:approval-v1",
                     "timeout_seconds": 30,
@@ -15305,6 +15426,7 @@ mod tests {
                 json!({
                     "sequence": 7,
                     "condition_wait_id": "condition:7",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "update-approval",
                     "condition_definition_fingerprint": "sha256:update-approval-v1",
                 }),
@@ -15349,6 +15471,7 @@ mod tests {
                 json!({
                     "sequence": 3,
                     "condition_wait_id": "condition:3",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "two-votes",
                     "condition_definition_fingerprint": "sha256:two-votes-v1",
                     "timeout_seconds": 120,
@@ -15382,6 +15505,7 @@ mod tests {
                 ctx.take_commands().expect("reopened condition"),
                 vec![json!({
                     "type": "open_condition_wait",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "two-votes",
                     "condition_definition_fingerprint": "sha256:two-votes-v1",
                     "timeout_seconds": 120,
@@ -15395,6 +15519,7 @@ mod tests {
                 json!({
                     "sequence": 5,
                     "condition_wait_id": "condition:5",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "approval",
                     "condition_definition_fingerprint": "sha256:approval-v1",
                 }),
@@ -15404,6 +15529,7 @@ mod tests {
                 json!({
                     "sequence": 5,
                     "condition_wait_id": "condition:5",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "approval",
                     "condition_definition_fingerprint": "sha256:approval-v1",
                 }),
@@ -15425,6 +15551,7 @@ mod tests {
                 json!({
                     "sequence": 8,
                     "condition_wait_id": "condition:8",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "approval-timeout",
                     "condition_definition_fingerprint": "sha256:approval-timeout-v1",
                     "timeout_seconds": 5,
@@ -15466,12 +15593,13 @@ mod tests {
 
     #[test]
     fn condition_wait_replays_repeated_physical_opens_as_one_logical_wait() {
-        let ctx = workflow_context(vec![
+        let history = vec![
             history_event(
                 "ConditionWaitOpened",
                 json!({
                     "sequence": 3,
                     "condition_wait_id": "condition:3",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "two-votes",
                     "condition_definition_fingerprint": "sha256:two-votes-v1",
                 }),
@@ -15489,6 +15617,7 @@ mod tests {
                 json!({
                     "sequence": 3,
                     "condition_wait_id": "condition:3",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "two-votes",
                     "condition_definition_fingerprint": "sha256:two-votes-v1",
                 }),
@@ -15498,6 +15627,7 @@ mod tests {
                 json!({
                     "sequence": 5,
                     "condition_wait_id": "condition:5",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "two-votes",
                     "condition_definition_fingerprint": "sha256:two-votes-v1",
                 }),
@@ -15515,24 +15645,256 @@ mod tests {
                 json!({
                     "sequence": 5,
                     "condition_wait_id": "condition:5",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "two-votes",
                     "condition_definition_fingerprint": "sha256:two-votes-v1",
                 }),
             ),
-        ]);
-        let predicate_ctx = ctx.clone();
-        let mut wait = Box::pin(ctx.wait_condition(
-            ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
-            move || Ok(predicate_ctx.signals("vote")?.len() >= 2),
-        ));
-        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        ];
+        for _cold_worker_or_restart in 0..2 {
+            let ctx = workflow_context(history.clone());
+            let predicate_ctx = ctx.clone();
+            let mut wait = Box::pin(ctx.wait_condition(
+                ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+                move || Ok(predicate_ctx.signals("vote")?.len() >= 2),
+            ));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
 
-        assert!(matches!(
-            wait.as_mut().poll(&mut task_context),
-            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
-        ));
-        ctx.ensure_history_consumed()
-            .expect("every physical wait-open is consumed");
+            assert!(matches!(
+                wait.as_mut().poll(&mut task_context),
+                Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+            ));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+            ctx.ensure_history_consumed()
+                .expect("every physical wait-open is consumed");
+        }
+    }
+
+    #[test]
+    fn condition_wait_replays_update_driven_physical_opens_as_one_occurrence() {
+        let history = vec![
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 3,
+                    "condition_wait_id": "condition:3",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "approved",
+                    "condition_definition_fingerprint": "sha256:approved-v1",
+                }),
+            ),
+            history_event(
+                "UpdateApplied",
+                json!({
+                    "sequence": 3,
+                    "update_id": "update-1",
+                    "update_name": "approve",
+                    "arguments": fixture_envelope(json!([false])),
+                }),
+            ),
+            history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 5,
+                    "condition_wait_id": "condition:5",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "approved",
+                    "condition_definition_fingerprint": "sha256:approved-v1",
+                }),
+            ),
+            history_event(
+                "UpdateApplied",
+                json!({
+                    "sequence": 5,
+                    "update_id": "update-2",
+                    "update_name": "approve",
+                    "arguments": fixture_envelope(json!([true])),
+                }),
+            ),
+        ];
+
+        for _cold_worker_or_restart in 0..2 {
+            let ctx = workflow_context(history.clone());
+            let predicate_ctx = ctx.clone();
+            let mut wait = Box::pin(ctx.wait_condition(
+                ConditionWaitOptions::new("approved", "sha256:approved-v1"),
+                move || {
+                    Ok(predicate_ctx
+                        .updates("approve")?
+                        .last()
+                        .and_then(|arguments| arguments.first())
+                        .and_then(Value::as_bool)
+                        == Some(true))
+                },
+            ));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+            assert!(matches!(
+                wait.as_mut().poll(&mut task_context),
+                Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+            ));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+            ctx.ensure_history_consumed()
+                .expect("every update-driven reopen is consumed");
+        }
+    }
+
+    #[test]
+    fn condition_wait_replay_keeps_every_adjacent_authored_occurrence_distinct() {
+        for (first_key, first_fingerprint, second_key, second_fingerprint) in [
+            ("shared", "sha256:first", "shared", "sha256:second"),
+            ("first", "sha256:shared", "second", "sha256:shared"),
+            ("shared", "sha256:shared", "shared", "sha256:shared"),
+            ("first", "sha256:first", "second", "sha256:second"),
+        ] {
+            let history = vec![
+                history_event(
+                    "ConditionWaitOpened",
+                    json!({
+                        "sequence": 3,
+                        "condition_wait_id": "condition:3",
+                        "condition_wait_occurrence_id": "rust:condition-wait:0",
+                        "condition_key": first_key,
+                        "condition_definition_fingerprint": first_fingerprint,
+                    }),
+                ),
+                history_event(
+                    "ConditionWaitSatisfied",
+                    json!({
+                        "sequence": 3,
+                        "condition_wait_id": "condition:3",
+                        "condition_wait_occurrence_id": "rust:condition-wait:0",
+                        "condition_key": first_key,
+                        "condition_definition_fingerprint": first_fingerprint,
+                    }),
+                ),
+                history_event(
+                    "ConditionWaitOpened",
+                    json!({
+                        "sequence": 4,
+                        "condition_wait_id": "condition:4",
+                        "condition_wait_occurrence_id": "rust:condition-wait:1",
+                        "condition_key": second_key,
+                        "condition_definition_fingerprint": second_fingerprint,
+                    }),
+                ),
+                history_event(
+                    "ConditionWaitSatisfied",
+                    json!({
+                        "sequence": 4,
+                        "condition_wait_id": "condition:4",
+                        "condition_wait_occurrence_id": "rust:condition-wait:1",
+                        "condition_key": second_key,
+                        "condition_definition_fingerprint": second_fingerprint,
+                    }),
+                ),
+            ];
+            for _cold_worker_or_restart in 0..2 {
+                let ctx = workflow_context(history.clone());
+                let mut task_context = TaskContext::from_waker(noop_waker_ref());
+                let mut first = Box::pin(ctx.wait_condition(
+                    ConditionWaitOptions::new(first_key, first_fingerprint),
+                    || Ok(false),
+                ));
+                assert!(matches!(
+                    first.as_mut().poll(&mut task_context),
+                    Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+                ));
+
+                let mut second = Box::pin(ctx.wait_condition(
+                    ConditionWaitOptions::new(second_key, second_fingerprint),
+                    || Ok(false),
+                ));
+                assert!(matches!(
+                    second.as_mut().poll(&mut task_context),
+                    Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+                ));
+                assert!(ctx.take_commands().expect("commands").is_empty());
+                ctx.ensure_history_consumed()
+                    .expect("each authored wait consumes one occurrence");
+            }
+        }
+    }
+
+    #[test]
+    fn cold_workers_replay_adjacent_condition_waits_from_one_loop_call_site() {
+        fn worker() -> Worker {
+            let client = Client::new("http://127.0.0.1:8080").expect("client");
+            let mut worker = Worker::new(client, "rust-workers");
+            worker.register_workflow("rust.condition-loop", |ctx, _input| async move {
+                let mut outcomes = Vec::new();
+                for _ in 0..2 {
+                    outcomes.push(
+                        ctx.wait_condition(
+                            ConditionWaitOptions::new("shared", "sha256:shared"),
+                            || Ok(false),
+                        )
+                        .await?,
+                    );
+                }
+                Ok(json!(outcomes))
+            });
+            worker
+        }
+
+        let task = workflow_task(
+            "rust.condition-loop",
+            vec![
+                history_event(
+                    "ConditionWaitOpened",
+                    json!({
+                        "sequence": 1,
+                        "condition_wait_id": "condition:1",
+                        "condition_wait_occurrence_id": "rust:condition-wait:0",
+                        "condition_key": "shared",
+                        "condition_definition_fingerprint": "sha256:shared",
+                    }),
+                ),
+                history_event(
+                    "ConditionWaitSatisfied",
+                    json!({
+                        "sequence": 1,
+                        "condition_wait_id": "condition:1",
+                        "condition_wait_occurrence_id": "rust:condition-wait:0",
+                        "condition_key": "shared",
+                        "condition_definition_fingerprint": "sha256:shared",
+                    }),
+                ),
+                history_event(
+                    "ConditionWaitOpened",
+                    json!({
+                        "sequence": 2,
+                        "condition_wait_id": "condition:2",
+                        "condition_wait_occurrence_id": "rust:condition-wait:1",
+                        "condition_key": "shared",
+                        "condition_definition_fingerprint": "sha256:shared",
+                    }),
+                ),
+                history_event(
+                    "ConditionWaitSatisfied",
+                    json!({
+                        "sequence": 2,
+                        "condition_wait_id": "condition:2",
+                        "condition_wait_occurrence_id": "rust:condition-wait:1",
+                        "condition_key": "shared",
+                        "condition_definition_fingerprint": "sha256:shared",
+                    }),
+                ),
+            ],
+            DEFAULT_CODEC,
+        );
+
+        for _cold_worker_or_restart in 0..2 {
+            let commands = worker()
+                .execute_workflow_task(task.clone())
+                .expect("adjacent loop waits replay deterministically");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["type"], "complete_workflow");
+            assert_eq!(
+                decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).expect("workflow output"),
+                json!(["satisfied", "satisfied"])
+            );
+        }
     }
 
     #[test]
@@ -15542,6 +15904,7 @@ mod tests {
             json!({
                 "sequence": 12,
                 "condition_wait_id": "condition:12",
+                "condition_wait_occurrence_id": "rust:condition-wait:0",
                 "condition_key": "approval",
                 "condition_definition_fingerprint": "sha256:approval-v1",
                 "timeout_seconds": 30,
@@ -15585,6 +15948,7 @@ mod tests {
                 json!({
                     "sequence": 12,
                     "condition_wait_id": "condition:12",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "approval",
                 }),
             )],
@@ -15598,6 +15962,31 @@ mod tests {
             error,
             Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
                 if reason == "condition_wait_predicate_fingerprint_missing"
+        ));
+    }
+
+    #[test]
+    fn condition_wait_history_requires_authored_occurrence_identity() {
+        let error = WorkflowState::new(
+            vec![history_event(
+                "ConditionWaitOpened",
+                json!({
+                    "sequence": 12,
+                    "condition_wait_id": "condition:12",
+                    "condition_key": "approval",
+                    "condition_definition_fingerprint": "sha256:approval-v1",
+                }),
+            )],
+            "rust-workers".to_string(),
+            DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect_err("condition history without occurrence identity must fail");
+
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "condition_wait_occurrence_id_missing"
         ));
     }
 
@@ -15887,6 +16276,7 @@ mod tests {
                 json!({
                     "sequence": 1,
                     "condition_wait_id": "condition:1",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "signal:finish",
                     "condition_definition_fingerprint": "sha256:signal-finish-v1",
                 }),
@@ -15896,6 +16286,7 @@ mod tests {
                 json!({
                     "sequence": 1,
                     "condition_wait_id": "condition:1",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
                     "condition_key": "signal:finish",
                     "condition_definition_fingerprint": "sha256:signal-finish-v1",
                 }),
@@ -18947,6 +19338,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_116_server_rejects_occurrence_identity_worker_registration() {
+        let server = MockWorkerServer::rejected_registration_protocol();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "rust-workers").worker_id("protocol-117-worker");
+
+        let error = worker
+            .run_until(async {})
+            .await
+            .expect_err("a protocol 1.16 server must reject this worker");
+        let Error::Protocol(failure) = error else {
+            panic!("expected typed protocol rejection");
+        };
+        assert_eq!(failure.reason, "unsupported_protocol_version");
+        assert_eq!(failure.supported_version.as_deref(), Some("1.16"));
+        assert_eq!(failure.requested_version.as_deref(), Some("1.17"));
+        assert_eq!(
+            server
+                .worker_protocol_for("/api/worker/register")
+                .as_deref(),
+            Some(WORKER_PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
     async fn declined_registration_does_not_deregister() {
         let server = MockWorkerServer::declined_registration();
         let client = Client::builder(server.base_url())
@@ -19343,7 +19761,13 @@ mod tests {
         );
         assert_eq!(
             server.request_body("/api/worker/register")["capabilities"],
-            json!([QUERY_TASKS_CAPABILITY, WORKFLOW_UPDATES_CAPABILITY])
+            json!([
+                CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY,
+                MEMO_UPSERTS_CAPABILITY,
+                TYPED_SEARCH_ATTRIBUTES_CAPABILITY,
+                QUERY_TASKS_CAPABILITY,
+                WORKFLOW_UPDATES_CAPABILITY,
+            ])
         );
         assert_eq!(
             server.request_body("/api/worker/register")["workflow_command_contracts"]["snapshot"],
@@ -19555,6 +19979,7 @@ mod tests {
         concurrent_requests: bool,
         unauthorized_polls: bool,
         reject_registration: bool,
+        reject_registration_protocol: bool,
         reject_deregistration: bool,
         reject_deregistration_protocol: bool,
         cancelled_activity: bool,
@@ -19643,6 +20068,13 @@ mod tests {
         fn rejected_registration() -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 reject_registration: true,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn rejected_registration_protocol() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                reject_registration_protocol: true,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -19960,13 +20392,23 @@ mod tests {
                 .count()
         };
 
-        if behavior.reject_registration && path == "/api/worker/register" {
-            write_mock_response(
-                stream,
-                "503 Service Unavailable",
-                r#"{"reason":"registration_unavailable","message":"registration failed"}"#,
-            );
-            return;
+        if path == "/api/worker/register" {
+            if behavior.reject_registration_protocol {
+                write_mock_response(
+                    stream,
+                    "400 Bad Request",
+                    r#"{"reason":"unsupported_protocol_version","message":"condition-wait occurrence identity requires worker protocol 1.17","supported_version":"1.16","requested_version":"1.17"}"#,
+                );
+                return;
+            }
+            if behavior.reject_registration {
+                write_mock_response(
+                    stream,
+                    "503 Service Unavailable",
+                    r#"{"reason":"registration_unavailable","message":"registration failed"}"#,
+                );
+                return;
+            }
         }
 
         if path.starts_with("/api/worker/registrations/") {
@@ -19974,7 +20416,7 @@ mod tests {
                 write_mock_response(
                     stream,
                     "400 Bad Request",
-                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.15","requested_version":"1.16"}"#,
+                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.16","requested_version":"1.17"}"#,
                 );
             } else if behavior.reject_deregistration {
                 write_mock_response(

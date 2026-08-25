@@ -1,0 +1,125 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-condition-wait-occurrence-adjacent-cold-replay-avro",
+  "protocol_version": "1.17",
+  "supersedes": [
+    "rust-condition-search-signal-cold-replay-avro"
+  ],
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.condition-search-adjacent",
+    "payload_codec": "avro",
+    "input": []
+  },
+  "history": [
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 4,
+        "condition_wait_id": "condition:4",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "payload": {
+        "workflow_sequence": 4,
+        "signal_name": "approve",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCgZBZGEA"
+        }
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 5,
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 5,
+        "timer_id": "condition-timeout:condition:5",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "delay_seconds": 30
+      }
+    },
+    {
+      "event_type": "TimerFired",
+      "payload": {
+        "sequence": 5,
+        "timer_id": "condition-timeout:condition:5",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "delay_seconds": 30
+      }
+    },
+    {
+      "event_type": "ConditionWaitTimedOut",
+      "payload": {
+        "sequence": 5,
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "event_type": "SearchAttributesUpserted",
+      "payload": {
+        "sequence": 6,
+        "attributes": {
+          "OrderStatus": "approved",
+          "NeedsAttention": false
+        },
+        "attribute_types": {
+          "OrderStatus": "keyword",
+          "NeedsAttention": "bool"
+        },
+        "merged": {
+          "OrderStatus": "approved",
+          "NeedsAttention": false
+        }
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "status": "approved",
+        "waits": [
+          "satisfied",
+          "timed_out"
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "status": "approved",
+      "waits": [
+        "satisfied",
+        "timed_out"
+      ]
+    }
+  }
+}
