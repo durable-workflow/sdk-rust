@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DOCS_WORKFLOW = ROOT / ".github/workflows/docs.yml"
 PAGES_WORKFLOW = ROOT / ".github/workflows/pages.yml"
+RELEASE_TOOLING_INSTALLER = ROOT / "scripts/ci/install-release-tooling.sh"
 DOCS_LANDING = ROOT / "docs/index.html"
 NAVIGATION_EVIDENCE_VALIDATOR = (
     ROOT / "scripts/ci/validate-rustdoc-navigation-evidence.py"
@@ -55,6 +56,9 @@ class DocsWorkflowContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.qualification = DOCS_WORKFLOW.read_text(encoding="utf-8")
         self.publication = PAGES_WORKFLOW.read_text(encoding="utf-8")
+        self.release_tooling_installer = RELEASE_TOOLING_INSTALLER.read_text(
+            encoding="utf-8"
+        )
 
     def test_root_is_a_general_first_landing(self) -> None:
         landing = DOCS_LANDING.read_text(encoding="utf-8")
@@ -218,6 +222,28 @@ class DocsWorkflowContractTest(unittest.TestCase):
             triggers,
             r"on:\n  push:\n    branches: \[main\]\n\npermissions:",
         )
+        release_notes = step(
+            build, "Require current release notes before reference authorization"
+        )
+        release_tools = step(build, "Install hash-locked release tooling")
+        self.assertIn(
+            'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
+            release_tools,
+        )
+        self.assertLess(
+            self.release_tooling_installer.index(
+                'python3 -m venv "$release_tooling_venv"'
+            ),
+            self.release_tooling_installer.index(
+                '"$release_tooling_venv/bin/python" -m pip install'
+            ),
+        )
+        self.assertIn('>> "$GITHUB_PATH"', self.release_tooling_installer)
+        self.assertLess(
+            build.index("Install hash-locked release tooling"),
+            build.index("Require current release notes before reference authorization"),
+        )
+        self.assertIn("python3 scripts/ci/release_package.py", release_notes)
         self.assertNotIn("pull_request:", triggers)
         self.assertNotIn("workflow_dispatch:", triggers)
         self.assertRegex(build, PAGES_CONDITION)

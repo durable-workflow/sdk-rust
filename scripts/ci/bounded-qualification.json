@@ -33,6 +33,10 @@
       "command": ["python3", "scripts/ci/qualify-release-documentation.py"]
     },
     {
+      "id": "release-notes",
+      "command": ["python3", "scripts/ci/release_package.py"]
+    },
+    {
       "id": "compile",
       "command": ["cargo", "check", "--all-targets"]
     }

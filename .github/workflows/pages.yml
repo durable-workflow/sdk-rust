@@ -34,6 +34,12 @@ jobs:
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
 
+      - name: Install hash-locked release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+
+      - name: Require current release notes before reference authorization
+        run: python3 scripts/ci/release_package.py
+
       - name: Build complete API documentation
         env:
           CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}

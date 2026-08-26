@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/public-boundary.yml"
 CONTRACT = ROOT / "scripts/ci/bounded-qualification.json"
+RELEASE_TOOLING_INSTALLER = ROOT / "scripts/ci/install-release-tooling.sh"
 
 
 def job(workflow: str, name: str) -> str:
@@ -31,6 +32,9 @@ class SourceQualificationContractTest(unittest.TestCase):
         self.workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         self.boundary_workflow = BOUNDARY_WORKFLOW.read_text(encoding="utf-8")
         self.contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        self.release_tooling_installer = RELEASE_TOOLING_INSTALLER.read_text(
+            encoding="utf-8"
+        )
 
     def test_bounded_route_has_a_cold_compile_budget(self) -> None:
         self.assertEqual(
@@ -57,6 +61,7 @@ class SourceQualificationContractTest(unittest.TestCase):
                 "python3",
                 "scripts/ci/qualify-release-documentation.py",
             ],
+            "release-notes": ["python3", "scripts/ci/release_package.py"],
             "compile": ["cargo", "check", "--all-targets"],
         }
         self.assertEqual(
@@ -118,6 +123,7 @@ class SourceQualificationContractTest(unittest.TestCase):
             verify,
         )
         self.assertIn("cargo package", verify)
+        self.assertIn("scripts/ci/release_package.py", verify)
         self.assertIn("--check-package", verify)
         self.assertIn("--rustdoc target/doc/durable_workflow/index.html", verify)
         self.assertIn("python3 scripts/ci/verify-fresh-consumer.py package", verify)
@@ -141,6 +147,41 @@ class SourceQualificationContractTest(unittest.TestCase):
             },
             set(self.contract["complete_checks"]),
         )
+
+    def test_release_parser_is_installed_for_both_qualification_routes(self) -> None:
+        installer = self.release_tooling_installer
+        venv_creation = installer.index('python3 -m venv "$release_tooling_venv"')
+        package_install = installer.index(
+            '"$release_tooling_venv/bin/python" -m pip install'
+        )
+        path_export = installer.index('>> "$GITHUB_PATH"')
+        self.assertLess(
+            venv_creation,
+            package_install,
+        )
+        self.assertLess(package_install, path_export)
+        self.assertIn("--require-hashes --only-binary=:all:", installer)
+        self.assertIn(
+            '--requirement "$script_dir/release-tooling-requirements.txt"',
+            installer,
+        )
+        self.assertNotIn("--break-system-packages", installer)
+        self.assertNotIn("--user", installer)
+
+        for route in ("verify", "bounded-qualification"):
+            candidate = job(self.workflow, route)
+            with self.subTest(route=route):
+                self.assertIn("Install hash-locked release tooling", candidate)
+                self.assertIn(
+                    'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
+                    candidate,
+                )
+                self.assertLess(
+                    candidate.index("Install hash-locked release tooling"),
+                    candidate.index("scripts/ci/release_package.py")
+                    if route == "verify"
+                    else candidate.index("scripts/ci/run-bounded-qualification.py"),
+                )
 
     def test_untrusted_pull_requests_remain_read_only_with_pinned_actions(self) -> None:
         self.assertIn("pull_request:", self.workflow)

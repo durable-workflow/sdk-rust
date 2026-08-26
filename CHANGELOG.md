@@ -2,6 +2,10 @@
 
 ## 2.0.0-rc.34
 
+- Require the current release entry to be present in the source commit before
+  tagging or generated-reference deployment can authorize it.
+- Verify the packaged release entry and VCS identity before publication, then
+  verify the downloaded registry archive against the authorized package.
 - Restore `apache-avro` as the authoritative outbound datum encoder while
   retaining canonical string-map order, the fixed single-object frame, typed
   value identity, and the existing cross-language protocol bytes.

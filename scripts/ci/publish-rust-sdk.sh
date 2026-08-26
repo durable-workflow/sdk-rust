@@ -6,13 +6,14 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$script_dir/crates-io-publish-lib.sh"
 
 manifest_path="${RUST_SDK_MANIFEST_PATH:-Cargo.toml}"
+changelog_path="${RUST_SDK_CHANGELOG_PATH:-CHANGELOG.md}"
 evidence_path="${RUST_SDK_RELEASE_EVIDENCE_PATH:-rust-sdk-release-evidence.json}"
 release_tag="${RELEASE_TAG:-}"
 release_commit="${RELEASE_COMMIT:-}"
 release_run_id="${RELEASE_RUN_ID:-}"
 release_run_attempt="${RELEASE_RUN_ATTEMPT:-}"
 
-for command in cargo curl git jq python3 rustc sha256sum tar; do
+for command in cargo curl git jq python3 rustc sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "$command" >&2
         exit 1
@@ -21,6 +22,10 @@ done
 
 if [[ ! -f "$manifest_path" ]]; then
     printf 'Rust SDK manifest not found: %s\n' "$manifest_path" >&2
+    exit 1
+fi
+if [[ ! -f "$changelog_path" ]]; then
+    printf 'Rust SDK changelog not found: %s\n' "$changelog_path" >&2
     exit 1
 fi
 
@@ -150,6 +155,12 @@ published_at=""
 published_repository=""
 archive_vcs_commit=""
 archive_vcs_dirty=""
+published_archive_vcs_commit=""
+published_archive_vcs_dirty=""
+changelog_checksum=""
+release_entry_checksum=""
+published_changelog_checksum=""
+published_release_entry_checksum=""
 fresh_consumer_verified="false"
 
 write_evidence() {
@@ -216,6 +227,12 @@ write_evidence() {
         --arg release_run_attempt "$release_run_attempt" \
         --arg archive_vcs_commit "$archive_vcs_commit" \
         --arg archive_vcs_dirty "$archive_vcs_dirty" \
+        --arg published_archive_vcs_commit "$published_archive_vcs_commit" \
+        --arg published_archive_vcs_dirty "$published_archive_vcs_dirty" \
+        --arg changelog_checksum "$changelog_checksum" \
+        --arg release_entry_checksum "$release_entry_checksum" \
+        --arg published_changelog_checksum "$published_changelog_checksum" \
+        --arg published_release_entry_checksum "$published_release_entry_checksum" \
         --arg fresh_consumer_verified "$fresh_consumer_verified" \
         --arg outcome "$outcome" \
         --arg reason "$reason" \
@@ -237,7 +254,17 @@ write_evidence() {
                 crates_io_repository: $published_repository,
                 documentation: $documentation,
                 archive_vcs_commit: $archive_vcs_commit,
-                archive_vcs_dirty: ($archive_vcs_dirty == "true")
+                archive_vcs_dirty: ($archive_vcs_dirty == "true"),
+                downloaded_archive_vcs_commit: $published_archive_vcs_commit,
+                downloaded_archive_vcs_dirty: ($published_archive_vcs_dirty == "true")
+            },
+            release_notes: {
+                path: "CHANGELOG.md",
+                version: $version,
+                source_sha256: $changelog_checksum,
+                current_entry_sha256: $release_entry_checksum,
+                downloaded_archive_sha256: $published_changelog_checksum,
+                downloaded_current_entry_sha256: $published_release_entry_checksum
             },
             product_train: $product_train,
             compatibility_authority: $compatibility_authority,
@@ -310,19 +337,20 @@ if [[ ! -f "$local_archive" ]]; then
     exit 1
 fi
 local_checksum="$(sha256sum "$local_archive" | awk '{print $1}')"
-vcs_info_path="${package_name}-${package_version}/.cargo_vcs_info.json"
-if ! tar -xOf "$local_archive" "$vcs_info_path" > "$tmp_dir/vcs.json"; then
-    write_evidence "failed" "local_package_vcs_provenance_missing"
-    printf 'local Cargo package archive is missing VCS provenance\n' >&2
+local_identity="$tmp_dir/local-package-identity.json"
+if ! python3 "$script_dir/release_package.py" \
+    --manifest "$manifest_path" \
+    --changelog "$changelog_path" \
+    --archive "$local_archive" \
+    --expected-vcs-commit "$release_commit" > "$local_identity"; then
+    write_evidence "failed" "local_package_release_identity_mismatch"
+    printf 'local Cargo package does not contain the authorized release notes and VCS identity\n' >&2
     exit 1
 fi
-archive_vcs_commit="$(jq -er '.git.sha1' "$tmp_dir/vcs.json")"
-archive_vcs_dirty="$(jq -r '.git.dirty // false' "$tmp_dir/vcs.json")"
-if [[ "$archive_vcs_commit" != "$release_commit" || "$archive_vcs_dirty" != "false" ]]; then
-    write_evidence "failed" "local_package_vcs_provenance_mismatch"
-    printf 'local package VCS provenance does not match the clean release commit\n' >&2
-    exit 1
-fi
+archive_vcs_commit="$(jq -er '.archive.vcs_commit' "$local_identity")"
+archive_vcs_dirty="$(jq -r '.archive.vcs_dirty' "$local_identity")"
+changelog_checksum="$(jq -er '.changelog.sha256' "$local_identity")"
+release_entry_checksum="$(jq -er '.changelog.entry_sha256' "$local_identity")"
 
 write_evidence "pending" "checking_public_registry"
 
@@ -408,6 +436,29 @@ fi
 if [[ "$local_checksum" != "$published_checksum" ]]; then
     write_evidence "failed" "published_source_archive_mismatch"
     printf 'published crate archive differs from the exact release checkout package\n' >&2
+    exit 1
+fi
+
+published_identity="$tmp_dir/published-package-identity.json"
+if ! python3 "$script_dir/release_package.py" \
+    --manifest "$manifest_path" \
+    --changelog "$changelog_path" \
+    --archive "$published_archive" \
+    --expected-vcs-commit "$release_commit" > "$published_identity"; then
+    write_evidence "failed" "published_package_release_identity_mismatch"
+    printf 'downloaded crate does not contain the authorized release notes and VCS identity\n' >&2
+    exit 1
+fi
+published_archive_vcs_commit="$(jq -er '.archive.vcs_commit' "$published_identity")"
+published_archive_vcs_dirty="$(jq -r '.archive.vcs_dirty' "$published_identity")"
+published_changelog_checksum="$(jq -er '.archive.changelog_sha256' "$published_identity")"
+published_release_entry_checksum="$(jq -er '.archive.release_entry_sha256' "$published_identity")"
+if [[ "$published_archive_vcs_commit" != "$archive_vcs_commit" || \
+      "$published_archive_vcs_dirty" != "$archive_vcs_dirty" || \
+      "$published_changelog_checksum" != "$changelog_checksum" || \
+      "$published_release_entry_checksum" != "$release_entry_checksum" ]]; then
+    write_evidence "failed" "published_package_release_identity_mismatch"
+    printf 'downloaded crate release identity differs from the authorized local package\n' >&2
     exit 1
 fi
 

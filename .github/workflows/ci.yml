@@ -86,6 +86,9 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt
 
+      - name: Install hash-locked release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -124,6 +127,8 @@ jobs:
       - name: Verify publishable package
         run: |
           cargo package
+          python3 scripts/ci/release_package.py \
+            --archive "target/package/durable-workflow-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])').crate"
           python3 scripts/ci/qualify-release-documentation.py \
             --rustdoc target/doc/durable_workflow/index.html \
             --check-package
@@ -134,8 +139,8 @@ jobs:
 
       - name: Validate release tooling
         run: |
-          bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/verify-official-avro-encoder.py scripts/ci/official-avro-consumers/consume.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-official-avro-encoder.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py
+          bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/install-release-tooling.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
+          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_package.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/verify-official-avro-encoder.py scripts/ci/official-avro-consumers/consume.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-official-avro-encoder.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py scripts/ci/test-release-package.py
           python -m py_compile scripts/ci/qualify-docs-landing.py scripts/ci/qualify-release-documentation.py scripts/ci/test-docs-workflow.py scripts/ci/test-qualify-docs-landing.py scripts/ci/test-qualify-release-documentation.py
           scripts/ci/test-crates-io-publish.sh
           arguments=()
@@ -148,6 +153,7 @@ jobs:
             "${arguments[@]}"
           python scripts/ci/test-publish-planned-tag.py
           python scripts/ci/test-publish-rust-sdk.py
+          python scripts/ci/test-release-package.py
           python scripts/ci/test-maintain-crates-io.py
           python scripts/ci/test-example-base-urls.py
           python scripts/ci/test-docs-workflow.py
@@ -174,6 +180,9 @@ jobs:
         with:
           toolchain: 1.86.0
           components: rustfmt
+
+      - name: Install hash-locked release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Run bounded candidate structure checks
         env:

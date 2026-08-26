@@ -2272,6 +2272,14 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
             "      needs.discover.outputs.action == 'publish'",
             source,
         )
+        self.assertIn(
+            'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
+            source,
+        )
+        self.assertLess(
+            source.index("Install hash-locked release tooling"),
+            source.index("Configure repository publication credential"),
+        )
         self.recovery.verify_recovery_workflow_source("sdk-rust", source, digest)
         self.recovery.verify_recovery_workflow_source("sdk-rust", source.replace("\n", "\r\n"), digest)
 
@@ -2546,7 +2554,9 @@ class ProtectedReleaseDispatchTest(unittest.TestCase):
         self.assertIn("release_commit:\n", CURRENT_RELEASE_WORKFLOW)
         self.assertIn("REQUESTED_RELEASE_COMMIT:", CURRENT_RELEASE_WORKFLOW)
         self.assertIn('"$tag_commit" != "$REQUESTED_RELEASE_COMMIT"', CURRENT_RELEASE_WORKFLOW)
-        self.assertIn("inputs.release_commit || github.sha", CURRENT_RELEASE_WORKFLOW)
+        self.assertIn("REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}", CURRENT_RELEASE_WORKFLOW)
+        self.assertNotIn("inputs.release_commit || github.sha", CURRENT_RELEASE_WORKFLOW)
+        self.assertNotIn("push:\n    tags:", CURRENT_RELEASE_WORKFLOW)
 
     def test_selects_only_the_exact_protected_main_dispatch(self) -> None:
         selection = self.select([self.run_record()])

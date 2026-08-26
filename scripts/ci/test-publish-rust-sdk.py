@@ -16,6 +16,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+RELEASE_TOOLING_INSTALLER = ROOT / "scripts" / "ci" / "install-release-tooling.sh"
 PACKAGE_VERSION = "2.0.0-rc.34"
 PRODUCT_TRAIN = PACKAGE_VERSION
 SERVER_VERSIONS = ">=2.0.0-rc.50,<2.0.0"
@@ -47,9 +49,11 @@ class PublishRustSdkContractTest(unittest.TestCase):
             r"""
             #!/usr/bin/env python3
             import json
+            import io
             import os
             from pathlib import Path
             import sys
+            import tarfile
             import tomllib
 
             command = sys.argv[1]
@@ -71,7 +75,24 @@ class PublishRustSdkContractTest(unittest.TestCase):
             elif command == "package":
                 archive = target / "package" / f'{package["name"]}-{package["version"]}.crate'
                 archive.parent.mkdir(parents=True, exist_ok=True)
-                archive.write_bytes(b"local crate")
+                root = f'{package["name"]}-{package["version"]}'
+                changelog = Path(
+                    os.environ.get("RUST_SDK_CHANGELOG_PATH", "CHANGELOG.md")
+                ).read_bytes()
+                entries = {
+                    f"{root}/CHANGELOG.md": changelog,
+                    f"{root}/.cargo_vcs_info.json": json.dumps({
+                        "git": {
+                            "sha1": os.environ["MOCK_RELEASE_COMMIT"],
+                            "dirty": False,
+                        }
+                    }).encode(),
+                }
+                with tarfile.open(archive, "w:gz") as crate:
+                    for name, content in entries.items():
+                        member = tarfile.TarInfo(name)
+                        member.size = len(content)
+                        crate.addfile(member, io.BytesIO(content))
             elif command == "build":
                 if os.environ.get("MOCK_CONSUMER_BUILD_OUTCOME") == "fail":
                     raise SystemExit("mock fresh consumer build failed")
@@ -123,19 +144,23 @@ class PublishRustSdkContractTest(unittest.TestCase):
             "curl",
             f'''
             #!/usr/bin/env python3
+            import hashlib
             import json
+            import os
             from pathlib import Path
             import sys
 
             args = sys.argv[1:]
             output = Path(args[args.index("--output") + 1])
             url = args[-1]
+            archive = next((Path(os.environ["CARGO_TARGET_DIR"]) / "package").glob("*.crate"))
+            checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
             if url.endswith("/download"):
-                output.write_bytes(b"published crate")
+                output.write_bytes(archive.read_bytes())
             elif url.endswith("/{PACKAGE_VERSION}"):
                 output.write_text(json.dumps({{"version": {{
                     "num": "{PACKAGE_VERSION}",
-                    "checksum": "{CHECKSUM}",
+                    "checksum": checksum,
                     "created_at": "2026-07-22T00:00:00Z",
                 }}}}), encoding="utf-8")
             elif url.endswith("/durable-workflow"):
@@ -148,24 +173,6 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 print("200", end="")
             ''',
         )
-        self._write_executable(
-            "sha256sum",
-            f'''
-            #!/usr/bin/env python3
-            import sys
-            print("{CHECKSUM}  " + sys.argv[1])
-            ''',
-        )
-        self._write_executable(
-            "tar",
-            r"""
-            #!/usr/bin/env python3
-            import json
-            import os
-            print(json.dumps({"git": {"sha1": os.environ["MOCK_RELEASE_COMMIT"], "dirty": False}}))
-            """,
-        )
-
     def _publish(
         self,
         manifest: Path = MANIFEST,
@@ -326,6 +333,18 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         self.assertTrue(evidence["fresh_consumer"]["fresh_lockfile"])
         self.assertTrue(evidence["fresh_consumer"]["build_verified"])
+        self.assertEqual(
+            evidence["release_notes"]["source_sha256"],
+            evidence["release_notes"]["downloaded_archive_sha256"],
+        )
+        self.assertEqual(
+            evidence["release_notes"]["current_entry_sha256"],
+            evidence["release_notes"]["downloaded_current_entry_sha256"],
+        )
+        self.assertEqual(
+            RELEASE_COMMIT,
+            evidence["repository_provenance"]["downloaded_archive_vcs_commit"],
+        )
 
     def test_release_path_fails_closed_when_fresh_consumer_does_not_build(self) -> None:
         result = self._publish(environment={"MOCK_CONSUMER_BUILD_OUTCOME": "fail"})
@@ -388,6 +407,43 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
+
+    def test_release_path_rejects_package_without_current_release_notes(self) -> None:
+        changelog = self.temp / "CHANGELOG.md"
+        changelog.write_text(
+            "# Changelog\n\n## 2.0.0-rc.31\n\n- Previous release.\n",
+            encoding="utf-8",
+        )
+        result = self._publish(
+            environment={"RUST_SDK_CHANGELOG_PATH": str(changelog)}
+        )
+        self.assertNotEqual(0, result.returncode)
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual("local_package_release_identity_mismatch", evidence["reason"])
+        self.assertIn("current-version entry", result.stderr)
+
+    def test_release_workflow_only_publishes_planned_dispatches(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        installer = RELEASE_TOOLING_INSTALLER.read_text(encoding="utf-8")
+        triggers = workflow.split("\njobs:\n", maxsplit=1)[0]
+        self.assertIn("workflow_dispatch:", triggers)
+        self.assertNotIn("push:", triggers)
+        self.assertIn("scripts/ci/publish-rust-sdk.sh", workflow)
+        self.assertIn(
+            'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
+            workflow,
+        )
+        self.assertLess(
+            installer.index('python3 -m venv "$release_tooling_venv"'),
+            installer.index('"$release_tooling_venv/bin/python" -m pip install'),
+        )
+        self.assertIn("--require-hashes --only-binary=:all:", installer)
+        self.assertIn('>> "$GITHUB_PATH"', installer)
+        self.assertLess(
+            workflow.index("Install hash-locked release tooling"),
+            workflow.index("CARGO_REGISTRY_TOKEN"),
+        )
+        self.assertEqual(1, workflow.count("secrets.CARGO_REGISTRY_TOKEN"))
 
 
 if __name__ == "__main__":

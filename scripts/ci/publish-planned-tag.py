@@ -13,6 +13,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from release_package import ReleasePackageError, release_entry
+
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 PLAN_TAG_PATTERN = re.compile(r"^release-plan/[a-z0-9][a-z0-9._-]{0,55}$")
 TAG_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?$")
@@ -141,6 +143,14 @@ def source_identity_recovery(plan_tag: str, tag: str) -> str:
     )
 
 
+def source_release_notes_recovery(plan_tag: str, tag: str) -> str:
+    return (
+        f"Keep refs/tags/{tag} absent for {plan_tag}; compose the complete {tag} entry in "
+        "CHANGELOG.md and admit the commit through source qualification, then rerun Release plan "
+        "recovery; do not tag or publish a commit without its release notes"
+    )
+
+
 def require_source_identity(commit: str, tag: str, plan_tag: str) -> None:
     require_local_commit(commit)
     operation = f"git show {commit}:Cargo.toml"
@@ -176,6 +186,33 @@ def require_source_identity(commit: str, tag: str, plan_tag: str) -> None:
                 "planned_version": tag,
             },
             safe_recovery_action=source_identity_recovery(plan_tag, tag),
+        )
+
+    changelog_operation = f"git show {commit}:CHANGELOG.md"
+    changelog = run_git("show", f"{commit}:CHANGELOG.md")
+    try:
+        if changelog.returncode:
+            raise ReleasePackageError("planned commit has no readable CHANGELOG.md")
+        release_notes = release_entry(changelog.stdout.encode(), tag)
+    except ReleasePackageError as error:
+        raise PublicationError(
+            f"planned commit {commit} does not contain complete release notes for {tag}: {error}",
+            phase="source-release-notes",
+            operation=changelog_operation,
+            remote_diagnostic=changelog.stderr if changelog.returncode else None,
+            evidence={
+                "classification": "terminal-source-release-notes-conflict",
+                "changelog_path": "CHANGELOG.md",
+                "planned_version": tag,
+            },
+            safe_recovery_action=source_release_notes_recovery(plan_tag, tag),
+        ) from error
+    if not isinstance(release_notes.get("entry_sha256"), str):
+        raise PublicationError(
+            f"planned commit {commit} has invalid release-note evidence for {tag}",
+            phase="source-release-notes",
+            operation=changelog_operation,
+            safe_recovery_action=source_release_notes_recovery(plan_tag, tag),
         )
 
 

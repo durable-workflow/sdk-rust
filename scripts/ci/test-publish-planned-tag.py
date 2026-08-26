@@ -55,7 +55,11 @@ class PlannedTagPublicationTest(unittest.TestCase):
             f'version = "{version}"\n',
             encoding="utf-8",
         )
-        git("add", "Cargo.toml", "value.txt", cwd=self.source)
+        (self.source / "CHANGELOG.md").write_text(
+            f"# Changelog\n\n## {version}\n\n- {value}.\n",
+            encoding="utf-8",
+        )
+        git("add", "Cargo.toml", "CHANGELOG.md", "value.txt", cwd=self.source)
         git("commit", "--quiet", "-m", value, cwd=self.source)
         return git("rev-parse", "HEAD", cwd=self.source).stdout.strip()
 
@@ -135,6 +139,28 @@ class PlannedTagPublicationTest(unittest.TestCase):
         self.assertIn("protected successor plan", str(evidence["safe_recovery_action"]))
         self.assertIn("do not tag or publish", str(evidence["safe_recovery_action"]))
         self.assertIn("terminal-source-identity-conflict", json.dumps(evidence))
+        absent = git("ls-remote", str(self.remote), f"refs/tags/{RELEASE_TAG}")
+        self.assertEqual(absent.stdout, "")
+
+    def test_rejects_missing_current_release_notes_without_creating_tag(self) -> None:
+        (self.source / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## 0.1.15\n\n- Previous release.\n",
+            encoding="utf-8",
+        )
+        git("add", "CHANGELOG.md", cwd=self.source)
+        git("commit", "--quiet", "-m", "omit current release notes", cwd=self.source)
+        commit = git("rev-parse", "HEAD", cwd=self.source).stdout.strip()
+
+        rejected = self.publish(commit)
+
+        self.assertEqual(rejected.returncode, 1)
+        evidence = self.evidence()
+        self.assertEqual(evidence["phase"], "source-release-notes")
+        self.assertEqual(
+            evidence["classification"], "terminal-source-release-notes-conflict"
+        )
+        self.assertEqual(evidence["changelog_path"], "CHANGELOG.md")
+        self.assertIn("do not tag or publish", str(evidence["safe_recovery_action"]))
         absent = git("ls-remote", str(self.remote), f"refs/tags/{RELEASE_TAG}")
         self.assertEqual(absent.stdout, "")
 

@@ -111,6 +111,9 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
+      - name: Install hash-locked release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+
       - name: Restore the immutable release plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
