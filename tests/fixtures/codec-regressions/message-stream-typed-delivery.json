@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "rust-message-stream-typed-delivery",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": [
+    "rust"
+  ],
+  "value": {
+    "type": "array",
+    "items": [
+      {
+        "type": "map",
+        "entries": [
+          {
+            "key": "item",
+            "value": {
+              "type": "string",
+              "value": "two"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "framing": {
+    "encoding": "avro-single-object",
+    "wire_base64": "wwHioz3/VYAiNwwCDgIIaXRlbQoGdHdvAAA="
+  },
+  "failure_policy": {
+    "operation": "round_trip",
+    "error": null
+  },
+  "message_stream_delivery": {
+    "schema": "durable-workflow.v2.message-stream.message",
+    "stream_name": "orders",
+    "message_id": "message-2",
+    "position": 2,
+    "payload_envelope": {
+      "codec": "avro",
+      "blob": "wwHioz3/VYAiNwwCDgIIaXRlbQoGdHdvAAA="
+    }
+  }
+}

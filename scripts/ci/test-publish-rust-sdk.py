@@ -258,6 +258,10 @@ class PublishRustSdkContractTest(unittest.TestCase):
             "value-only+unknown-type-identity",
             metadata["legacy-search-attribute-history"],
         )
+        self.assertTrue(metadata["message-streams"])
+        self.assertEqual(
+            "1.15", metadata["message-streams-minimum-worker-protocol-version"]
+        )
 
     def test_release_path_accepts_component_advance_and_emits_baseline(self) -> None:
         result = self._publish()

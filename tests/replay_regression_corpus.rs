@@ -372,6 +372,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         workflow_type,
         "corpus.side-effect-version"
             | "corpus.workflow-stream"
+            | "corpus.message-stream-batch"
+            | "corpus.message-stream-partial-batches"
             | "corpus.nested-parallel"
             | "corpus.typed-replayed"
             | "corpus.memo-signed-zero"
@@ -468,6 +470,32 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 )?;
                 ctx.close_workflow_stream("tokens", None)?;
                 Ok(json!("done"))
+            });
+        }
+        "corpus.message-stream-batch" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let messages = ctx.message_stream("orders")?.receive(2).await?;
+                Ok(json!(messages
+                    .into_iter()
+                    .map(|message| message.message_id)
+                    .collect::<Vec<_>>()))
+            });
+        }
+        "corpus.message-stream-partial-batches" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let stream = ctx.message_stream("orders")?;
+                let first = stream.receive(10).await?;
+                let second = stream.receive(10).await?;
+                Ok(json!([
+                    first
+                        .into_iter()
+                        .map(|message| message.message_id)
+                        .collect::<Vec<_>>(),
+                    second
+                        .into_iter()
+                        .map(|message| message.message_id)
+                        .collect::<Vec<_>>(),
+                ]))
             });
         }
         "corpus.nested-parallel" => {
@@ -637,6 +665,20 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         (
             "command_sequence".to_string(),
             Value::Array(commands.clone()),
+        ),
+        (
+            "message_stream_cursors".to_string(),
+            completion
+                .get("message_stream_cursors")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        ),
+        (
+            "message_stream_waits".to_string(),
+            completion
+                .get("message_stream_waits")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
         ),
         (
             "side_effect_callback_calls".to_string(),

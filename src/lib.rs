@@ -43,6 +43,13 @@ pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
 pub const TYPED_SEARCH_ATTRIBUTES_CAPABILITY: &str = "typed_search_attributes";
 /// Worker-registration capability for synchronous workflow updates.
 pub const WORKFLOW_UPDATES_CAPABILITY: &str = "workflow_updates";
+/// Worker-registration capability for durable named input streams.
+pub const MESSAGE_STREAMS_CAPABILITY: &str = "message_streams";
+pub const MESSAGE_STREAMS_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.15";
+pub const MESSAGE_STREAM_SIGNAL: &str = "__durable_workflow_message_stream";
+pub const MESSAGE_STREAM_SCHEMA: &str = "durable-workflow.v2.message-stream.message";
+pub const MESSAGE_STREAM_CURSOR_SCHEMA: &str = "durable-workflow.v2.message-stream.cursor";
+pub const MESSAGE_STREAM_MAX_BATCH: usize = 100;
 /// First additive worker protocol that defines query-task transport.
 pub const QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.8";
 /// First additive worker protocol that defines typed search-attribute upserts.
@@ -55,6 +62,22 @@ pub const TYPED_SEARCH_ATTRIBUTES_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.16"
 pub const CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.9";
 /// First additive worker protocol that preserves authored condition-wait occurrences.
 pub const CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.17";
+
+pub fn worker_protocol_supports_message_streams(version: &str) -> bool {
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    major == "1" && minor.parse::<u64>().is_ok_and(|minor| minor >= 15)
+}
+
+fn validate_user_signal_name(signal_name: &str) -> Result<()> {
+    if signal_name == MESSAGE_STREAM_SIGNAL {
+        return Err(Error::Codec(format!(
+            "signal name {MESSAGE_STREAM_SIGNAL:?} is reserved by the workflow runtime"
+        )));
+    }
+    Ok(())
+}
 
 const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
 const WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE: &str =
@@ -2177,6 +2200,18 @@ fn workflow_completion_protocol_version(commands: &[Value]) -> &'static str {
     }
 }
 
+fn workflow_completion_protocol_version_with_message_streams(
+    commands: &[Value],
+    has_message_stream_metadata: bool,
+) -> &'static str {
+    let command_protocol = workflow_completion_protocol_version(commands);
+    if has_message_stream_metadata && !worker_protocol_supports_message_streams(command_protocol) {
+        MESSAGE_STREAMS_MINIMUM_WORKER_PROTOCOL_VERSION
+    } else {
+        command_protocol
+    }
+}
+
 fn workflow_command_payload_field(command_type: &str) -> Option<&'static str> {
     match command_type {
         "complete_workflow" | "complete_update" | "record_side_effect" => Some("result"),
@@ -2590,6 +2625,28 @@ impl Client {
             .await
     }
 
+    /// Append one idempotently identified item to an instance-scoped input stream.
+    pub async fn append_message_stream<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        stream_name: &str,
+        message_id: &str,
+        input: T,
+    ) -> Result<Value> {
+        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
+        let body = json!({
+            "message_id": message_id,
+            "input": encode_typed_envelope(&input, DEFAULT_CODEC)?
+        });
+        self.request_json(
+            reqwest::Method::POST,
+            &format!("/workflows/{workflow_id}/message-streams/{stream_name}/messages"),
+            RequestProtocol::ControlPlane,
+            Some(&body),
+        )
+        .await
+    }
+
     /// Signal only if `run_id` is still the current run for this instance.
     pub async fn signal_workflow_run<T: Serialize>(
         &self,
@@ -2609,6 +2666,7 @@ impl Client {
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
+        validate_user_signal_name(signal_name)?;
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
         let body = json!({
@@ -3596,13 +3654,52 @@ impl Client {
         workflow_task_attempt: u64,
         commands: Vec<Value>,
     ) -> Result<Value> {
+        self.complete_workflow_task_with_message_streams(
+            task_id,
+            lease_owner,
+            workflow_task_attempt,
+            commands,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn complete_workflow_task_with_message_streams(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        workflow_task_attempt: u64,
+        commands: Vec<Value>,
+        message_stream_cursors: Vec<Value>,
+        message_stream_waits: Vec<Value>,
+    ) -> Result<Value> {
         validate_workflow_task_commands(&commands)?;
-        let protocol_version = workflow_completion_protocol_version(&commands);
-        let body = json!({
+        let has_message_stream_metadata =
+            !message_stream_cursors.is_empty() || !message_stream_waits.is_empty();
+        if has_message_stream_metadata
+            && !worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
+        {
+            return Err(Error::Codec(
+                "message_streams_unavailable: message stream completion metadata requires worker protocol 1.15 or newer"
+                    .to_string(),
+            ));
+        }
+        let protocol_version = workflow_completion_protocol_version_with_message_streams(
+            &commands,
+            has_message_stream_metadata,
+        );
+        let mut body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
             "commands": commands
         });
+        if !message_stream_cursors.is_empty() {
+            body["message_stream_cursors"] = Value::Array(message_stream_cursors);
+        }
+        if !message_stream_waits.is_empty() {
+            body["message_stream_waits"] = Value::Array(message_stream_waits);
+        }
         let path = format!("/worker/workflow-tasks/{task_id}/complete");
         self.request_json(
             reqwest::Method::POST,
@@ -4302,6 +4399,17 @@ impl WorkflowHandle {
     pub async fn signal<T: Serialize>(&self, signal_name: &str, input: T) -> Result<Value> {
         self.client
             .signal_workflow(&self.workflow_id, signal_name, input)
+            .await
+    }
+
+    pub async fn append_message<T: Serialize>(
+        &self,
+        stream_name: &str,
+        message_id: &str,
+        input: T,
+    ) -> Result<Value> {
+        self.client
+            .append_message_stream(&self.workflow_id, stream_name, message_id, input)
             .await
     }
 
@@ -5407,6 +5515,23 @@ struct RegisteredWorkflow {
     state_type: Option<TypeId>,
 }
 
+#[derive(Debug)]
+struct WorkflowTaskDecision {
+    commands: Vec<Value>,
+    message_stream_cursors: Vec<Value>,
+    message_stream_waits: Vec<Value>,
+}
+
+impl WorkflowTaskDecision {
+    fn without_message_streams(commands: Vec<Value>) -> Self {
+        Self {
+            commands,
+            message_stream_cursors: Vec::new(),
+            message_stream_waits: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 enum RegisteredQuery {
     Snapshot(QueryHandler),
@@ -6033,16 +6158,18 @@ impl Worker {
                 .map(|handlers| handlers.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             updates.sort();
-            if !queries.is_empty() || !updates.is_empty() {
-                command_contracts.insert(
-                    workflow_type.clone(),
-                    json!({
-                        "queries": queries,
-                        "updates": updates,
-                        "update_validators": [],
-                    }),
-                );
-            }
+            command_contracts.insert(
+                workflow_type.clone(),
+                json!({
+                    "queries": queries,
+                    "query_contracts": [],
+                    "signals": [],
+                    "signal_contracts": [],
+                    "updates": updates,
+                    "update_contracts": [],
+                    "update_validators": [],
+                }),
+            );
         }
 
         self.client
@@ -6059,6 +6186,8 @@ impl Worker {
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
+                    worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
+                        .then(|| MESSAGE_STREAMS_CAPABILITY.to_string()),
                 ]
                 .into_iter()
                 .flatten()
@@ -6314,9 +6443,10 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
 
-        match self.execute_workflow_task(task) {
-            Ok(commands)
-                if commands_use_workflow_memo_updates(&commands) && !memo_updates_supported =>
+        match self.execute_workflow_task_decision(task) {
+            Ok(decision)
+                if commands_use_workflow_memo_updates(&decision.commands)
+                    && !memo_updates_supported =>
             {
                 self.client
                     .fail_workflow_task(
@@ -6327,7 +6457,7 @@ impl Worker {
                     )
                     .await?;
             }
-            Ok(commands) if commands.is_empty() => {
+            Ok(decision) if decision.commands.is_empty() => {
                 // A replay can consume a recorded pending durable command
                 // without producing a new command. The standalone protocol
                 // acknowledges that state through the typed waiting outcome;
@@ -6343,10 +6473,17 @@ impl Worker {
                     )
                     .await?;
             }
-            Ok(commands) => {
+            Ok(decision) => {
                 let completion = self
                     .client
-                    .complete_workflow_task(&task_id, &lease_owner, attempt, commands)
+                    .complete_workflow_task_with_message_streams(
+                        &task_id,
+                        &lease_owner,
+                        attempt,
+                        decision.commands,
+                        decision.message_stream_cursors,
+                        decision.message_stream_waits,
+                    )
                     .await;
                 if let Err(error) = completion {
                     if !workflow_task_completion_is_terminal_timeout(
@@ -6793,7 +6930,12 @@ impl Worker {
         })
     }
 
+    #[cfg(test)]
     fn execute_workflow_task(&self, task: WorkflowTask) -> Result<Vec<Value>> {
+        Ok(self.execute_workflow_task_decision(task)?.commands)
+    }
+
+    fn execute_workflow_task_decision(&self, task: WorkflowTask) -> Result<WorkflowTaskDecision> {
         validate_workflow_task_payloads(&task)?;
 
         if let Some(update_id) = task
@@ -6801,7 +6943,9 @@ impl Worker {
             .as_deref()
             .filter(|update_id| !update_id.is_empty())
         {
-            return self.execute_update_task(&task, update_id);
+            return self
+                .execute_update_task(&task, update_id)
+                .map(WorkflowTaskDecision::without_message_streams);
         }
 
         let workflow = self
@@ -6848,7 +6992,7 @@ impl Worker {
                     "type": "complete_workflow",
                     "result": result
                 }));
-                Ok(commands)
+                self.message_stream_decision(&ctx, commands)
             }
             Poll::Ready(Err(error)) => {
                 if let Error::ContinueAsNew(request) = error {
@@ -6857,7 +7001,7 @@ impl Worker {
                         commands.push(command);
                     }
                     ctx.ensure_history_consumed()?;
-                    return Ok(commands);
+                    return self.message_stream_decision(&ctx, commands);
                 }
                 if workflow_task_integrity_error(&error) {
                     // Replay and protocol failures describe the workflow-task
@@ -6871,17 +7015,30 @@ impl Worker {
                 ctx.ensure_history_consumed()?;
                 let mut commands = ctx.take_commands()?;
                 commands.push(workflow_failure_command(&error));
-                Ok(commands)
+                self.message_stream_decision(&ctx, commands)
             }
             Poll::Pending => {
                 let commands = ctx.take_commands()?;
                 if commands.is_empty() && !ctx.matched_recorded_pending()? {
                     Err(Error::WorkflowYieldedWithoutCommand)
                 } else {
-                    Ok(commands)
+                    self.message_stream_decision(&ctx, commands)
                 }
             }
         }
+    }
+
+    fn message_stream_decision(
+        &self,
+        ctx: &WorkflowContext,
+        commands: Vec<Value>,
+    ) -> Result<WorkflowTaskDecision> {
+        let (message_stream_cursors, message_stream_waits) = ctx.message_stream_metadata()?;
+        Ok(WorkflowTaskDecision {
+            commands,
+            message_stream_cursors,
+            message_stream_waits,
+        })
     }
 
     fn execute_update_task(&self, task: &WorkflowTask, update_id: &str) -> Result<Vec<Value>> {
@@ -7131,6 +7288,52 @@ impl<S: Clone> WorkflowInstance<S> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageStreamMessage {
+    pub stream_name: String,
+    pub message_id: String,
+    pub position: u64,
+    pub arguments: Vec<AvroValue>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageStream {
+    ctx: WorkflowContext,
+    name: String,
+}
+
+impl MessageStream {
+    /// Wait for one message, then return a bounded currently-available batch.
+    pub async fn receive(&self, max_items: usize) -> Result<Vec<MessageStreamMessage>> {
+        if !(1..=MESSAGE_STREAM_MAX_BATCH).contains(&max_items) {
+            return Err(Error::Codec(format!(
+                "message stream max_items must be between 1 and {MESSAGE_STREAM_MAX_BATCH}"
+            )));
+        }
+        loop {
+            if let Some(batch) = self.ctx.take_message_stream_batch(&self.name, max_items)? {
+                return Ok(batch);
+            }
+
+            self.ctx.record_message_stream_wait(&self.name)?;
+            let replay_wait_sequence = self.ctx.next_message_stream_wait_sequence()?;
+            let arguments = self.ctx.wait_runtime_signal(MESSAGE_STREAM_SIGNAL).await?;
+            self.ctx.buffer_message_stream_delivery(arguments)?;
+            if let Some(sequence) = replay_wait_sequence {
+                self.ctx.buffer_message_stream_history_for_wait(sequence)?;
+            }
+        }
+    }
+
+    pub async fn receive_one(&self) -> Result<MessageStreamMessage> {
+        self.receive(1)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Codec("message stream resumed without a message".to_string()))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkflowContext {
     state: Arc<Mutex<WorkflowState>>,
@@ -7213,6 +7416,207 @@ fn decode_memo_history_map(envelope: &Value, require_entries: bool) -> Result<Av
 }
 
 impl WorkflowContext {
+    pub fn message_stream(&self, name: impl Into<String>) -> Result<MessageStream> {
+        let name = name.into();
+        if name.is_empty()
+            || name.len() > 128
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+        {
+            return Err(Error::Codec(
+                "message stream names must contain 1-128 letters, numbers, periods, underscores, colons, or hyphens"
+                    .to_string(),
+            ));
+        }
+        Ok(MessageStream {
+            ctx: self.clone(),
+            name,
+        })
+    }
+
+    fn record_message_stream_wait(&self, name: &str) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let position = state.message_stream_cursors.get(name).copied().unwrap_or(0);
+        state
+            .message_stream_waits
+            .insert(name.to_string(), position);
+        Ok(())
+    }
+
+    fn buffer_message_stream(&self, message: MessageStreamMessage) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let cursor = state
+            .message_stream_cursors
+            .get(&message.stream_name)
+            .copied()
+            .unwrap_or(0);
+        if message.position <= cursor {
+            return Ok(());
+        }
+        let pending = state
+            .message_stream_messages
+            .entry(message.stream_name.clone())
+            .or_default();
+        if pending.iter().any(|candidate| {
+            candidate.position == message.position || candidate.message_id == message.message_id
+        }) {
+            return Ok(());
+        }
+        pending.push(message);
+        pending.sort_by_key(|candidate| candidate.position);
+        Ok(())
+    }
+
+    fn buffer_message_stream_delivery(&self, arguments: Vec<Value>) -> Result<Option<String>> {
+        if let Some(delivery) = decode_message_stream_delivery(arguments)? {
+            match delivery {
+                MessageStreamDelivery::Message(message) => {
+                    let stream_name = message.stream_name.clone();
+                    self.buffer_message_stream(message)?;
+                    return Ok(Some(stream_name));
+                }
+                MessageStreamDelivery::Cursor {
+                    stream_name,
+                    through_position,
+                } => self.apply_message_stream_cursor(&stream_name, through_position)?,
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_message_stream_wait_sequence(&self) -> Result<Option<u64>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(match state.recorded_commands.get(state.command_cursor) {
+            Some(RecordedCommand::SignalWait {
+                sequence,
+                signal_name,
+                ..
+            }) if signal_name == MESSAGE_STREAM_SIGNAL => Some(*sequence),
+            _ => None,
+        })
+    }
+
+    fn buffer_message_stream_history_for_wait(&self, wait_sequence: u64) -> Result<()> {
+        let (history, payload_codec) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            (
+                Arc::clone(&state.history_events),
+                state.payload_codec.clone(),
+            )
+        };
+
+        let Some(opened_index) = history.iter().position(|event| {
+            event.event_type == "SignalWaitOpened"
+                && durable_event_sequence(event) == Some(wait_sequence)
+                && event.payload.get("signal_name").and_then(Value::as_str)
+                    == Some(MESSAGE_STREAM_SIGNAL)
+        }) else {
+            return Ok(());
+        };
+        let boundary_index = history
+            .iter()
+            .enumerate()
+            .skip(opened_index + 1)
+            .find_map(|(index, event)| {
+                (durable_event_sequence(event).is_some_and(|sequence| sequence > wait_sequence)
+                    && is_authored_command_open_event(event))
+                .then_some(index)
+            })
+            .unwrap_or(history.len());
+
+        for event in history[opened_index + 1..boundary_index]
+            .iter()
+            .filter(|event| {
+                event.event_type == "SignalReceived"
+                    && event.payload.get("signal_name").and_then(Value::as_str)
+                        == Some(MESSAGE_STREAM_SIGNAL)
+            })
+        {
+            let arguments = decode_signal_event_arguments(event, &payload_codec)?
+                .into_iter()
+                .map(AvroValue::into_json)
+                .collect::<Result<Vec<_>>>()?;
+            self.buffer_message_stream_delivery(arguments)?;
+        }
+        Ok(())
+    }
+
+    fn apply_message_stream_cursor(&self, name: &str, through_position: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let cursor = state
+            .message_stream_cursors
+            .entry(name.to_string())
+            .or_default();
+        *cursor = (*cursor).max(through_position);
+        if let Some(pending) = state.message_stream_messages.get_mut(name) {
+            pending.retain(|message| message.position > through_position);
+        }
+        Ok(())
+    }
+
+    fn take_message_stream_batch(
+        &self,
+        name: &str,
+        max_items: usize,
+    ) -> Result<Option<Vec<MessageStreamMessage>>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let cursor = state.message_stream_cursors.get(name).copied().unwrap_or(0);
+        let pending = state
+            .message_stream_messages
+            .entry(name.to_string())
+            .or_default();
+        let count = contiguous_message_stream_count(pending, cursor, max_items);
+        if count == 0 {
+            return Ok(None);
+        }
+        let batch = pending.drain(..count).collect::<Vec<_>>();
+        let position = batch.last().map(|message| message.position).unwrap_or(0);
+        state
+            .message_stream_cursors
+            .insert(name.to_string(), position);
+        state.message_stream_waits.remove(name);
+        Ok(Some(batch))
+    }
+
+    fn message_stream_metadata(&self) -> Result<(Vec<Value>, Vec<Value>)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        let mut cursors = state.message_stream_cursors.iter().collect::<Vec<_>>();
+        cursors.sort_by_key(|(name, _)| *name);
+        let mut waits = state.message_stream_waits.iter().collect::<Vec<_>>();
+        waits.sort_by_key(|(name, _)| *name);
+        Ok((
+            cursors
+                .into_iter()
+                .map(|(name, position)| json!({"stream_name": name, "through_position": position}))
+                .collect(),
+            waits
+                .into_iter()
+                .map(|(name, position)| json!({"stream_name": name, "after_position": position}))
+                .collect(),
+        ))
+    }
     /// Identity of the parent workflow currently being replayed.
     pub fn workflow_identity(&self) -> Result<WorkflowIdentity> {
         let state = self
@@ -7452,6 +7856,17 @@ impl WorkflowContext {
         SignalCall {
             ctx: self.clone(),
             signal_name: signal_name.into(),
+            runtime_reserved_allowed: false,
+            opened_wait: false,
+            matched_pending: false,
+        }
+    }
+
+    fn wait_runtime_signal(&self, signal_name: impl Into<String>) -> SignalCall {
+        SignalCall {
+            ctx: self.clone(),
+            signal_name: signal_name.into(),
+            runtime_reserved_allowed: true,
             opened_wait: false,
             matched_pending: false,
         }
@@ -8179,6 +8594,40 @@ impl WorkflowContext {
     }
 }
 
+fn contiguous_message_stream_count(
+    pending: &[MessageStreamMessage],
+    cursor: u64,
+    max_items: usize,
+) -> usize {
+    pending
+        .iter()
+        .take(max_items)
+        .enumerate()
+        .take_while(|(offset, message)| {
+            u64::try_from(*offset)
+                .ok()
+                .and_then(|offset| cursor.checked_add(offset + 1))
+                == Some(message.position)
+        })
+        .count()
+}
+
+fn is_authored_command_open_event(event: &HistoryEvent) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "ActivityScheduled"
+            | "TimerScheduled"
+            | "ChildWorkflowScheduled"
+            | "SignalWaitOpened"
+            | "ConditionWaitOpened"
+            | "SearchAttributesUpserted"
+            | "SideEffectRecorded"
+            | "VersionMarkerRecorded"
+            | "MemoUpserted"
+            | "WorkflowContinuedAsNew"
+    )
+}
+
 #[derive(Debug)]
 struct WorkflowState {
     workflow_id: Option<String>,
@@ -8199,6 +8648,9 @@ struct WorkflowState {
     workflow_command_identity: String,
     workflow_stream_command_counter: u64,
     commands: Vec<Value>,
+    message_stream_messages: HashMap<String, Vec<MessageStreamMessage>>,
+    message_stream_cursors: HashMap<String, u64>,
+    message_stream_waits: HashMap<String, u64>,
 }
 
 impl WorkflowState {
@@ -8268,6 +8720,40 @@ impl WorkflowState {
                 })
             })
             .transpose()?;
+        let mut message_stream_cursors = HashMap::new();
+        for event in &history {
+            if !matches!(
+                event.event_type.as_str(),
+                "SignalReceived" | "SignalApplied"
+            ) || event.payload.get("signal_name").and_then(Value::as_str)
+                != Some(MESSAGE_STREAM_SIGNAL)
+            {
+                continue;
+            }
+            let arguments = decode_signal_event_arguments(event, &payload_codec)?;
+            if arguments.len() != 1 {
+                continue;
+            }
+            let envelope = arguments[0].clone().into_json()?;
+            let Some(envelope) = envelope.as_object() else {
+                continue;
+            };
+            if envelope.get("schema").and_then(Value::as_str) != Some(MESSAGE_STREAM_CURSOR_SCHEMA)
+            {
+                continue;
+            }
+            let Some(stream_name) = envelope.get("stream_name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(through_position) = envelope.get("through_position").and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            let cursor = message_stream_cursors
+                .entry(stream_name.to_string())
+                .or_insert(0);
+            *cursor = (*cursor).max(through_position);
+        }
         let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
         let cancel_requested = history.iter().any(|event| {
             matches!(
@@ -8297,8 +8783,75 @@ impl WorkflowState {
             matched_recorded_pending: false,
             version_markers: HashMap::new(),
             commands: Vec::new(),
+            message_stream_messages: HashMap::new(),
+            message_stream_cursors,
+            message_stream_waits: HashMap::new(),
         })
     }
+}
+
+enum MessageStreamDelivery {
+    Message(MessageStreamMessage),
+    Cursor {
+        stream_name: String,
+        through_position: u64,
+    },
+}
+
+fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<MessageStreamDelivery>> {
+    if arguments.len() != 1 {
+        return Ok(None);
+    }
+    let envelope = arguments
+        .into_iter()
+        .next()
+        .expect("one argument was checked");
+    let Some(envelope) = envelope.as_object() else {
+        return Ok(None);
+    };
+    let Some(stream_name) = envelope.get("stream_name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if envelope.get("schema").and_then(Value::as_str) == Some(MESSAGE_STREAM_CURSOR_SCHEMA) {
+        let Some(through_position) = envelope.get("through_position").and_then(Value::as_u64)
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(MessageStreamDelivery::Cursor {
+            stream_name: stream_name.to_string(),
+            through_position,
+        }));
+    }
+    if envelope.get("schema").and_then(Value::as_str) != Some(MESSAGE_STREAM_SCHEMA) {
+        return Ok(None);
+    }
+    let Some(message_id) = envelope.get("message_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(position) = envelope
+        .get("position")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+    else {
+        return Ok(None);
+    };
+    let Some(payload_envelope) = envelope.get("payload_envelope") else {
+        return Ok(None);
+    };
+    let Ok(payload_envelope) = serde_json::from_value::<PayloadEnvelope>(payload_envelope.clone())
+    else {
+        return Ok(None);
+    };
+    let decoded = decode_avro_value(&payload_envelope)?;
+    let AvroValue::Array(values) = decoded else {
+        return Ok(None);
+    };
+    Ok(Some(MessageStreamDelivery::Message(MessageStreamMessage {
+        stream_name: stream_name.to_string(),
+        message_id: message_id.to_string(),
+        position,
+        arguments: values,
+    })))
 }
 
 #[derive(Clone, Debug)]
@@ -9892,6 +10445,7 @@ fn command_mismatch(recorded: &RecordedCommand, actual: impl Into<String>) -> Er
 pub struct SignalCall {
     ctx: WorkflowContext,
     signal_name: String,
+    runtime_reserved_allowed: bool,
     opened_wait: bool,
     matched_pending: bool,
 }
@@ -9903,6 +10457,11 @@ impl SignalCall {
     ) -> Poll<Result<Vec<AvroValue>>> {
         if self.matched_pending {
             return Poll::Pending;
+        }
+        if !self.runtime_reserved_allowed {
+            if let Err(error) = validate_user_signal_name(&self.signal_name) {
+                return Poll::Ready(Err(error));
+            }
         }
 
         let ctx = self.ctx.clone();
@@ -12314,6 +12873,24 @@ mod tests {
                 "condition_wait_occurrence_id": "rust:condition-wait:0",
                 "condition_key": "ready",
             })]),
+            CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            workflow_completion_protocol_version_with_message_streams(
+                &[json!({"type": "upsert_memo", "entries": {"status": "waiting"}})],
+                true,
+            ),
+            MESSAGE_STREAMS_MINIMUM_WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            workflow_completion_protocol_version_with_message_streams(
+                &[json!({
+                    "type": "open_condition_wait",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "ready",
+                })],
+                true,
+            ),
             CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION
         );
     }
@@ -16303,6 +16880,498 @@ mod tests {
     }
 
     #[test]
+    fn runtime_message_stream_transport_cannot_be_opened_as_a_user_signal() {
+        let ctx = workflow_context(Vec::new());
+        let mut signal = Box::pin(ctx.wait_signal(MESSAGE_STREAM_SIGNAL));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        let Poll::Ready(Err(Error::Codec(message))) = signal.as_mut().poll(&mut task_context)
+        else {
+            panic!("runtime-reserved signal should be rejected");
+        };
+        assert!(message.contains("reserved by the workflow runtime"));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_message_stream_transport_cannot_be_sent_as_a_user_signal() {
+        let client = Client::builder("http://127.0.0.1:9")
+            .build()
+            .expect("client");
+        let error = client
+            .signal_workflow("workflow-1", MESSAGE_STREAM_SIGNAL, json!(["forged"]))
+            .await
+            .expect_err("runtime-reserved signal should be rejected before transport");
+
+        assert!(
+            matches!(error, Error::Codec(ref message) if message.contains("reserved by the workflow runtime"))
+        );
+    }
+
+    #[test]
+    fn message_stream_worker_task_consumes_current_contiguous_bounded_batch() {
+        fn delivery(message_id: &str, position: u64, value: &str) -> Value {
+            let payload = encode_avro_value(&AvroValue::Array(vec![AvroValue::String(
+                value.to_string(),
+            )]))
+            .expect("message payload");
+            json!({
+                "schema": MESSAGE_STREAM_SCHEMA,
+                "stream_name": "orders",
+                "message_id": message_id,
+                "position": position,
+                "payload_envelope": payload,
+            })
+        }
+
+        fn opened(sequence: u64) -> HistoryEvent {
+            history_event(
+                "SignalWaitOpened",
+                json!({
+                    "sequence": sequence,
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                }),
+            )
+        }
+
+        fn applied(sequence: u64, delivery: Value) -> HistoryEvent {
+            history_event(
+                "SignalApplied",
+                json!({
+                    "sequence": sequence,
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                    "value": fixture_envelope(json!([delivery])),
+                }),
+            )
+        }
+
+        fn received(delivery: Value) -> HistoryEvent {
+            history_event(
+                "SignalReceived",
+                json!({
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                    "arguments": fixture_envelope(json!([delivery])),
+                    "payload_codec": DEFAULT_CODEC,
+                }),
+            )
+        }
+
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.message-stream-batch", |ctx, _input| async move {
+            let messages = ctx.message_stream("orders")?.receive(2).await?;
+            Ok(json!(messages
+                .into_iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>()))
+        });
+
+        let first = delivery("message-1", 1, "one");
+        let second = delivery("message-2", 2, "two");
+        let batch = worker
+            .execute_workflow_task_decision(workflow_task(
+                "rust.message-stream-batch",
+                vec![
+                    opened(1),
+                    received(first.clone()),
+                    applied(1, first.clone()),
+                    received(first.clone()),
+                    received(second),
+                ],
+                DEFAULT_CODEC,
+            ))
+            .expect("worker task consumes the available batch");
+
+        assert_eq!(batch.commands.len(), 1);
+        assert_eq!(batch.commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&batch.commands[0]["result"], DEFAULT_CODEC)
+                .expect("workflow result"),
+            json!(["message-1", "message-2"])
+        );
+        assert_eq!(
+            batch.message_stream_cursors,
+            vec![json!({"stream_name": "orders", "through_position": 2})]
+        );
+        assert!(batch.message_stream_waits.is_empty());
+
+        let partial = worker
+            .execute_workflow_task_decision(workflow_task(
+                "rust.message-stream-batch",
+                vec![opened(1), received(first.clone()), applied(1, first)],
+                DEFAULT_CODEC,
+            ))
+            .expect("worker task returns without waiting for a missing second item");
+        assert_eq!(partial.commands.len(), 1);
+        assert_eq!(partial.commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&partial.commands[0]["result"], DEFAULT_CODEC)
+                .expect("workflow result"),
+            json!(["message-1"])
+        );
+        assert_eq!(
+            partial.message_stream_cursors,
+            vec![json!({"stream_name": "orders", "through_position": 1})]
+        );
+        assert!(partial.message_stream_waits.is_empty());
+    }
+
+    #[test]
+    fn message_stream_replay_preserves_partial_batch_boundary_before_later_wait() {
+        fn delivery(message_id: &str, position: u64, value: &str) -> Value {
+            let payload = encode_avro_value(&AvroValue::Array(vec![AvroValue::String(
+                value.to_string(),
+            )]))
+            .expect("message payload");
+            json!({
+                "schema": MESSAGE_STREAM_SCHEMA,
+                "stream_name": "orders",
+                "message_id": message_id,
+                "position": position,
+                "payload_envelope": payload,
+            })
+        }
+
+        fn opened(sequence: u64) -> HistoryEvent {
+            history_event(
+                "SignalWaitOpened",
+                json!({
+                    "sequence": sequence,
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                }),
+            )
+        }
+
+        fn received(delivery: Value) -> HistoryEvent {
+            history_event(
+                "SignalReceived",
+                json!({
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                    "arguments": fixture_envelope(json!([delivery])),
+                    "payload_codec": DEFAULT_CODEC,
+                }),
+            )
+        }
+
+        fn applied(sequence: u64, delivery: Value) -> HistoryEvent {
+            history_event(
+                "SignalApplied",
+                json!({
+                    "sequence": sequence,
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                    "value": fixture_envelope(json!([delivery])),
+                }),
+            )
+        }
+
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow(
+            "rust.message-stream-partial-batches",
+            |ctx, _input| async move {
+                let stream = ctx.message_stream("orders")?;
+                let first = stream.receive(10).await?;
+                let second = stream.receive(10).await?;
+                Ok(json!([
+                    first
+                        .into_iter()
+                        .map(|message| message.message_id)
+                        .collect::<Vec<_>>(),
+                    second
+                        .into_iter()
+                        .map(|message| message.message_id)
+                        .collect::<Vec<_>>(),
+                ]))
+            },
+        );
+
+        let first = delivery("message-1", 1, "one");
+        let second = delivery("message-2", 2, "two");
+        let decision = worker
+            .execute_workflow_task_decision(workflow_task(
+                "rust.message-stream-partial-batches",
+                vec![
+                    opened(1),
+                    received(first.clone()),
+                    applied(1, first),
+                    opened(2),
+                    received(second.clone()),
+                    applied(2, second),
+                ],
+                DEFAULT_CODEC,
+            ))
+            .expect("cold replay preserves both authored receive boundaries");
+
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(decision.commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&decision.commands[0]["result"], DEFAULT_CODEC)
+                .expect("workflow result"),
+            json!([["message-1"], ["message-2"]])
+        );
+        assert_eq!(
+            decision.message_stream_cursors,
+            vec![json!({"stream_name": "orders", "through_position": 2})]
+        );
+        assert!(decision.message_stream_waits.is_empty());
+    }
+
+    #[test]
+    fn empty_message_stream_opens_internal_signal_wait_and_reports_position() {
+        let ctx = workflow_context(Vec::new());
+        let stream = ctx.message_stream("orders").expect("message stream");
+        let mut receive = Box::pin(stream.receive(10));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            receive.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert_eq!(
+            ctx.take_commands().expect("message-stream wait command"),
+            vec![json!({
+                "type": "open_signal_wait",
+                "signal_name": MESSAGE_STREAM_SIGNAL,
+            })]
+        );
+        let (cursors, waits) = ctx.message_stream_metadata().expect("stream metadata");
+        assert!(cursors.is_empty());
+        assert_eq!(
+            waits,
+            vec![json!({"stream_name": "orders", "after_position": 0})]
+        );
+    }
+
+    #[test]
+    fn continue_as_new_cursor_checkpoint_preserves_global_pending_position() {
+        let ctx = workflow_context(vec![history_event(
+            "SignalReceived",
+            json!({
+                "signal_name": MESSAGE_STREAM_SIGNAL,
+                "arguments": fixture_envelope(json!([{
+                    "schema": MESSAGE_STREAM_CURSOR_SCHEMA,
+                    "stream_name": "orders",
+                    "through_position": 2,
+                }])),
+                "payload_codec": DEFAULT_CODEC,
+            }),
+        )]);
+        let stream = ctx.message_stream("orders").expect("message stream");
+        let mut receive = Box::pin(stream.receive(10));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            receive.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let (cursors, waits) = ctx.message_stream_metadata().expect("stream metadata");
+        assert_eq!(
+            cursors,
+            vec![json!({"stream_name": "orders", "through_position": 2})]
+        );
+        assert_eq!(
+            waits,
+            vec![json!({"stream_name": "orders", "after_position": 2})]
+        );
+    }
+
+    #[test]
+    fn message_stream_delivery_preserves_typed_avro_arguments_across_replay() {
+        let mut empty_map = BTreeMap::new();
+        let mut nested = BTreeMap::new();
+        nested.insert(
+            "value".to_string(),
+            AvroValue::Array(vec![AvroValue::Bytes(b"nested".to_vec())]),
+        );
+        let values = vec![
+            AvroValue::Bytes(vec![0, 255]),
+            AvroValue::Long(1),
+            AvroValue::Double(1.0),
+            AvroValue::Array(Vec::new()),
+            AvroValue::Map(std::mem::take(&mut empty_map)),
+            AvroValue::Map(nested),
+        ];
+        let payload = encode_avro_value(&AvroValue::Array(values.clone())).expect("payload");
+        let transport = vec![json!({
+            "schema": MESSAGE_STREAM_SCHEMA,
+            "stream_name": "orders",
+            "message_id": "message-1",
+            "position": 1,
+            "payload_envelope": payload,
+        })];
+
+        for _ in 0..2 {
+            let Some(MessageStreamDelivery::Message(message)) =
+                decode_message_stream_delivery(transport.clone()).expect("delivery")
+            else {
+                panic!("message delivery expected");
+            };
+            assert_eq!(message.arguments, values);
+            assert!(matches!(message.arguments[1], AvroValue::Long(1)));
+            assert!(matches!(message.arguments[2], AvroValue::Double(1.0)));
+        }
+    }
+
+    #[test]
+    fn cold_worker_replacement_consumes_message_stream_wait_arrivals_once_in_order() {
+        fn delivery(message_id: &str, position: u64, value: &str) -> Value {
+            let payload = encode_avro_value(&AvroValue::Array(vec![AvroValue::String(
+                value.to_string(),
+            )]))
+            .expect("message payload");
+            json!({
+                "schema": MESSAGE_STREAM_SCHEMA,
+                "stream_name": "orders",
+                "message_id": message_id,
+                "position": position,
+                "payload_envelope": payload,
+            })
+        }
+
+        fn opened(sequence: u64) -> HistoryEvent {
+            history_event(
+                "SignalWaitOpened",
+                json!({
+                    "sequence": sequence,
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                }),
+            )
+        }
+
+        fn applied(sequence: u64, delivery: Value) -> HistoryEvent {
+            history_event(
+                "SignalApplied",
+                json!({
+                    "sequence": sequence,
+                    "signal_name": MESSAGE_STREAM_SIGNAL,
+                    "value": fixture_envelope(json!([delivery])),
+                }),
+            )
+        }
+
+        fn worker() -> Worker {
+            let client = Client::new("http://127.0.0.1:8080").expect("client");
+            let mut worker = Worker::new(client, "rust-workers");
+            worker.register_workflow("rust.message-stream", |ctx, _input| async move {
+                let stream = ctx.message_stream("orders")?;
+                let first = stream.receive_one().await?;
+                let second = stream.receive_one().await?;
+                Ok(json!([first.message_id, second.message_id]))
+            });
+            worker
+        }
+
+        fn task_with_resume(history: Vec<HistoryEvent>, delivery: Value) -> WorkflowTask {
+            let mut task = workflow_task("rust.message-stream", history, DEFAULT_CODEC);
+            task.signal_name = Some(MESSAGE_STREAM_SIGNAL.to_string());
+            task.signal_arguments = Some(fixture_envelope(json!([delivery])));
+            task
+        }
+
+        let waiting = worker()
+            .execute_workflow_task_decision(workflow_task(
+                "rust.message-stream",
+                Vec::new(),
+                DEFAULT_CODEC,
+            ))
+            .expect("first worker opens the stream wait");
+        assert_eq!(
+            waiting.commands,
+            vec![json!({
+                "type": "open_signal_wait",
+                "signal_name": MESSAGE_STREAM_SIGNAL,
+            })]
+        );
+        assert!(waiting.message_stream_cursors.is_empty());
+        assert_eq!(
+            waiting.message_stream_waits,
+            vec![json!({"stream_name": "orders", "after_position": 0})]
+        );
+
+        let first_delivery = delivery("message-1", 1, "one");
+        let first_arrival = worker()
+            .execute_workflow_task_decision(task_with_resume(
+                vec![opened(1)],
+                first_delivery.clone(),
+            ))
+            .expect("replacement worker consumes the first arrival");
+        assert_eq!(
+            first_arrival.commands,
+            vec![json!({
+                "type": "open_signal_wait",
+                "signal_name": MESSAGE_STREAM_SIGNAL,
+            })]
+        );
+        assert_eq!(
+            first_arrival.message_stream_cursors,
+            vec![json!({"stream_name": "orders", "through_position": 1})]
+        );
+        assert_eq!(
+            first_arrival.message_stream_waits,
+            vec![json!({"stream_name": "orders", "after_position": 1})]
+        );
+
+        let second_delivery = delivery("message-2", 2, "two");
+        let first_applied = applied(1, first_delivery);
+        let completed = worker()
+            .execute_workflow_task_decision(task_with_resume(
+                vec![opened(1), first_applied.clone(), opened(2)],
+                second_delivery.clone(),
+            ))
+            .expect("next replacement worker consumes the second arrival");
+        assert_eq!(completed.commands.len(), 1);
+        assert_eq!(completed.commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&completed.commands[0]["result"], DEFAULT_CODEC)
+                .expect("workflow result"),
+            json!(["message-1", "message-2"])
+        );
+        assert_eq!(
+            completed.message_stream_cursors,
+            vec![json!({"stream_name": "orders", "through_position": 2})]
+        );
+        assert!(completed.message_stream_waits.is_empty());
+
+        let replay_history = vec![
+            opened(1),
+            first_applied,
+            opened(2),
+            applied(2, second_delivery),
+        ];
+        for _cold_worker_or_restart in 0..2 {
+            let replayed = worker()
+                .execute_workflow_task_decision(workflow_task(
+                    "rust.message-stream",
+                    replay_history.clone(),
+                    DEFAULT_CODEC,
+                ))
+                .expect("cold worker replays each logical message exactly once");
+            assert_eq!(replayed.commands.len(), 1);
+            assert_eq!(
+                decode_wire_value(&replayed.commands[0]["result"], DEFAULT_CODEC)
+                    .expect("replayed workflow result"),
+                json!(["message-1", "message-2"])
+            );
+            assert_eq!(
+                replayed.message_stream_cursors,
+                vec![json!({"stream_name": "orders", "through_position": 2})]
+            );
+            assert!(replayed.message_stream_waits.is_empty());
+        }
+    }
+
+    #[test]
+    fn message_stream_capability_and_completion_require_protocol_one_fifteen() {
+        assert!(!worker_protocol_supports_message_streams("1.14"));
+        assert!(worker_protocol_supports_message_streams("1.15"));
+        assert!(worker_protocol_supports_message_streams("1.16"));
+        assert!(worker_protocol_supports_message_streams(
+            WORKER_PROTOCOL_VERSION
+        ));
+        assert_eq!(MESSAGE_STREAMS_MINIMUM_WORKER_PROTOCOL_VERSION, "1.15");
+    }
+
+    #[test]
     fn condition_wait_history_cannot_be_consumed_as_a_typed_signal_wait() {
         let ctx = workflow_context(vec![
             history_event(
@@ -19801,13 +20870,18 @@ mod tests {
                 TYPED_SEARCH_ATTRIBUTES_CAPABILITY,
                 QUERY_TASKS_CAPABILITY,
                 WORKFLOW_UPDATES_CAPABILITY,
+                MESSAGE_STREAMS_CAPABILITY
             ])
         );
         assert_eq!(
             server.request_body("/api/worker/register")["workflow_command_contracts"]["snapshot"],
             json!({
                 "queries": ["current"],
+                "query_contracts": [],
+                "signals": [],
+                "signal_contracts": [],
                 "updates": ["replace"],
+                "update_contracts": [],
                 "update_validators": [],
             })
         );

@@ -1,6 +1,7 @@
 avro-value-v1-long-zero.json
 condition-update-arguments-avro.json
 malformed-task-payload-codecs-rejected.json
+message-stream-typed-delivery.json
 nested-parallel-group-history-replay.json
 official-avro-encoder-nested-boundaries.json
 raw-json-null-payload-rejected.json

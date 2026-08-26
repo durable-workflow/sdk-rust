@@ -4,7 +4,7 @@ use durable_workflow::{
     decode_avro_value, encode_avro_value, encode_payload, ActivityTask, AvroValue, Client,
     ParallelGroupMetadata, PayloadEnvelope, QueryTask, SearchAttributeUpdate,
     SearchAttributeUpdateError, Worker, WorkflowStreamAppendItem, WorkflowTask,
-    AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC,
+    AVRO_VALUE_SCHEMA_FINGERPRINT_HEX, DEFAULT_CODEC, MESSAGE_STREAM_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -246,6 +246,29 @@ fn check_workflow_stream_encoding(fixture: &Value) {
     assert!(referenced.payload_envelope.is_none());
 }
 
+fn check_message_stream_delivery_encoding(fixture: &Value) {
+    let Some(contract) = fixture.get("message_stream_delivery") else {
+        return;
+    };
+    assert_eq!(contract["schema"], MESSAGE_STREAM_SCHEMA);
+    assert_eq!(contract["stream_name"], "orders");
+    assert_eq!(contract["message_id"], "message-2");
+    assert_eq!(contract["position"], 2);
+
+    let envelope: PayloadEnvelope = serde_json::from_value(
+        contract
+            .get("payload_envelope")
+            .cloned()
+            .expect("message-stream payload envelope"),
+    )
+    .expect("parse message-stream payload envelope");
+    assert_eq!(envelope.codec, DEFAULT_CODEC);
+    assert_eq!(
+        decode_avro_value(&envelope).expect("decode typed message-stream arguments"),
+        tagged_value(&fixture["value"]),
+    );
+}
+
 fn check_parallel_group_replay(fixture: &Value) {
     let Some(replay) = fixture.get("parallel_group_replay") else {
         return;
@@ -477,6 +500,7 @@ fn check_corpus() {
 
         check_task_boundary(&fixture);
         check_workflow_stream_encoding(&fixture);
+        check_message_stream_delivery_encoding(&fixture);
         check_parallel_group_replay(&fixture);
         check_typed_handler(&fixture);
         check_signed_zero_identity(&fixture);

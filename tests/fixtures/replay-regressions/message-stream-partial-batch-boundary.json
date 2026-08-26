@@ -1,0 +1,111 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-message-stream-partial-batch-boundary",
+  "protocol_version": "1.15",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.message-stream-partial-batches",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "SignalWaitOpened",
+      "payload": {
+        "sequence": 1,
+        "signal_name": "__durable_workflow_message_stream"
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "payload": {
+        "signal_name": "__durable_workflow_message_stream",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCDgoMc2NoZW1hClRkdXJhYmxlLXdvcmtmbG93LnYyLm1lc3NhZ2Utc3RyZWFtLm1lc3NhZ2UWc3RyZWFtX25hbWUKDG9yZGVycxRtZXNzYWdlX2lkChJtZXNzYWdlLTEQcG9zaXRpb24EAiBwYXlsb2FkX2VudmVsb3BlDgQKY29kZWMKCGF2cm8IYmxvYgowd3dIaW96My9WWUFpTnd3Q0NnWnZibVVBAAAA"
+        },
+        "payload_codec": "avro"
+      }
+    },
+    {
+      "event_type": "SignalApplied",
+      "payload": {
+        "sequence": 1,
+        "signal_name": "__durable_workflow_message_stream",
+        "value": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCDgoMc2NoZW1hClRkdXJhYmxlLXdvcmtmbG93LnYyLm1lc3NhZ2Utc3RyZWFtLm1lc3NhZ2UWc3RyZWFtX25hbWUKDG9yZGVycxRtZXNzYWdlX2lkChJtZXNzYWdlLTEQcG9zaXRpb24EAiBwYXlsb2FkX2VudmVsb3BlDgQKY29kZWMKCGF2cm8IYmxvYgowd3dIaW96My9WWUFpTnd3Q0NnWnZibVVBAAAA"
+        },
+        "payload_codec": "avro"
+      }
+    },
+    {
+      "event_type": "SignalWaitOpened",
+      "payload": {
+        "sequence": 2,
+        "signal_name": "__durable_workflow_message_stream"
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "payload": {
+        "signal_name": "__durable_workflow_message_stream",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCDgoMc2NoZW1hClRkdXJhYmxlLXdvcmtmbG93LnYyLm1lc3NhZ2Utc3RyZWFtLm1lc3NhZ2UWc3RyZWFtX25hbWUKDG9yZGVycxRtZXNzYWdlX2lkChJtZXNzYWdlLTIQcG9zaXRpb24EBCBwYXlsb2FkX2VudmVsb3BlDgQKY29kZWMKCGF2cm8IYmxvYgpId3dIaW96My9WWUFpTnd3Q0RnSUlhWFJsYlFvR2RIZHZBQUE9AAAA"
+        },
+        "payload_codec": "avro"
+      }
+    },
+    {
+      "event_type": "SignalApplied",
+      "payload": {
+        "sequence": 2,
+        "signal_name": "__durable_workflow_message_stream",
+        "value": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCDgoMc2NoZW1hClRkdXJhYmxlLXdvcmtmbG93LnYyLm1lc3NhZ2Utc3RyZWFtLm1lc3NhZ2UWc3RyZWFtX25hbWUKDG9yZGVycxRtZXNzYWdlX2lkChJtZXNzYWdlLTIQcG9zaXRpb24EBCBwYXlsb2FkX2VudmVsb3BlDgQKY29kZWMKCGF2cm8IYmxvYgpId3dIaW96My9WWUFpTnd3Q0RnSUlhWFJsYlFvR2RIZHZBQUE9AAAA"
+        },
+        "payload_codec": "avro"
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": [
+        [
+          "message-1"
+        ],
+        [
+          "message-2"
+        ]
+      ]
+    }
+  ],
+  "expected": {
+    "command_sequence": [
+      {
+        "type": "complete_workflow",
+        "result": [
+          [
+            "message-1"
+          ],
+          [
+            "message-2"
+          ]
+        ]
+      }
+    ],
+    "message_stream_cursors": [
+      {
+        "stream_name": "orders",
+        "through_position": 2
+      }
+    ],
+    "message_stream_waits": []
+  }
+}

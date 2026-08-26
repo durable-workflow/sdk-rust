@@ -140,8 +140,9 @@ their replay/type contracts. Child-capable releases additionally publish
 `deterministic-parallel`, `parallel-authoring`, `parallel-members`,
 `parallel-result-order`, `parallel-group-metadata`, `saga-compensation`, and
 the compensation order, failure-policy, and cancellation fields. Workflow
-Stream authoring requires the `1.15` feature floor. Query-task requests and
-search-attribute updates use the additive `1.8` floor; condition-wait
+Stream authoring and inbound Message Stream consumption require the `1.15`
+feature floor. Query-task requests and search-attribute updates use the
+additive `1.8` floor; condition-wait
 completions use `1.9`, while authored condition-wait occurrence identity uses
 `1.17` and is advertised explicitly during high-level worker registration.
 

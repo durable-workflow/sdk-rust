@@ -19,6 +19,10 @@
 - Advance the worker protocol to `1.17` and advertise condition-wait occurrence
   identity, memo upserts, and typed search attributes explicitly from
   high-level worker registration.
+- Add `WorkflowContext::message_stream` for ordered bounded consumption of
+  named repeated input. Runtime-owned cursor and wait metadata survives replay,
+  worker replacement, server restart, duplicates, and continue-as-new while
+  preserving exact Avro payload values.
 
 ## 2.0.0-rc.33
 

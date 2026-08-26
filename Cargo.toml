@@ -21,6 +21,8 @@ qualified-server-version = "2.0.0-rc.50"
 worker-protocol-version = "1.17"
 server-worker-protocol-versions = ">=1.17,<2.0"
 control-plane-version = "2"
+message-streams = true
+message-streams-minimum-worker-protocol-version = "1.15"
 query-tasks = true
 query-task-minimum-worker-protocol-version = "1.8"
 replayed-instance-state-queries = true
