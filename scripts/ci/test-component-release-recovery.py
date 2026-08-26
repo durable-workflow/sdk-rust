@@ -2277,6 +2277,14 @@ class RecoveryWorkflowSourceTest(unittest.TestCase):
             source,
         )
         self.assertLess(
+            source.index("Restore the immutable release plan"),
+            source.index("Validate the exact producer artifact before use"),
+        )
+        self.assertLess(
+            source.index("Validate the exact producer artifact before use"),
+            source.index("Install hash-locked release tooling"),
+        )
+        self.assertLess(
             source.index("Install hash-locked release tooling"),
             source.index("Configure repository publication credential"),
         )

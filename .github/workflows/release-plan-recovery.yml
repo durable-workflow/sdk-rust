@@ -111,9 +111,6 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Install hash-locked release tooling
-        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
-
       - name: Restore the immutable release plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
@@ -163,6 +160,9 @@ jobs:
           fi
           printf 'validated artifact %s from run %s attempt %s\n' \
             "$EXPECTED_ARTIFACT_ID" "$EXPECTED_SOURCE_RUN_ID" "$EXPECTED_SOURCE_RUN_ATTEMPT"
+
+      - name: Install hash-locked release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Configure repository publication credential
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
