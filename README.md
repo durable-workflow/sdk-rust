@@ -106,11 +106,11 @@ without a source edit: `DURABLE_WORKFLOW_RUNTIME_URL`,
 ## Compatibility
 
 The installed crate's package metadata records its exact qualified Server
-range and baseline. Server build versions are identity, not the runtime
+release. Server build versions are identity, not the runtime
 negotiation mechanism: this release starts with the first Server release line
-that advertises worker protocol `1.17`, as identified by the package metadata.
+that advertises worker protocol `1.19`, as identified by the package metadata.
 Compatible servers must advertise control plane `2` and a
-same-major worker protocol in `>=1.17,<2.0`. The SDK sends worker protocol `1.17`;
+same-major worker protocol in `>=1.19,<2.0`. The SDK sends worker protocol `1.19`;
 newer `1.x` server minors accept that header under the additive protocol
 contract.
 
@@ -145,6 +145,9 @@ feature floor. Query-task requests and search-attribute updates use the
 additive `1.8` floor; condition-wait
 completions use `1.9`, while authored condition-wait occurrence identity uses
 `1.17` and is advertised explicitly during high-level worker registration.
+Durable selection uses the additive `1.19` floor and advertises
+`durable_selection` only from workers that implement persisted winner replay,
+later loser awaiting, and explicit loser cancellation.
 
 Typed search-attribute updates require worker protocol `1.16`. The SDK records
 canonical declarations with each command and compares both the JSON value and
@@ -441,6 +444,52 @@ the shared `parallel_group_*` identity plus its full outer-to-inner path.
 metadata, and already completed siblings. Exact duplicate deliveries are
 ignored; restart, late completion, and completed-history replay keep positional
 result and failure selection stable.
+
+## Durable first-completion selection
+
+Use `select` or `select_keyed` when independent durable operations must start
+together but the workflow can make progress after only one finishes. A deadline
+timer starts when the group is scheduled, independently of activity and input
+progress:
+
+```rust
+# use durable_workflow::{json, ParallelOperation, Result, SelectionKey, WorkflowContext};
+# use std::time::Duration;
+# async fn resolve(ctx: WorkflowContext) -> Result<String> {
+let selected = ctx.select_keyed(vec![
+    ("lookup", ParallelOperation::activity("resolver.lookup", json!(["name"]))),
+    ("deadline", ParallelOperation::timer(Duration::from_secs(2))),
+]).await?;
+
+let outcome = match selected.key {
+    SelectionKey::Name(ref key) if key == "lookup" => "resolved",
+    _ => "deadline",
+};
+
+// The lookup was not cancelled implicitly. Await it later, or cancel it
+// explicitly if the workflow no longer needs its result.
+if outcome == "deadline" {
+    if let Some(lookup) = selected.handle(&SelectionKey::from("lookup")) {
+        lookup.cancel().await?;
+    }
+}
+# Ok(outcome.to_string())
+# }
+```
+
+`cancel().await?` resolves to unit and never reports whether cancellation beat
+a concurrent completion. Only committed `SelectionOperationCancelled` history
+is authoritative. If completion commits first, replay advances past the void
+request and awaiting the handle returns that result.
+
+Server records one `SelectionResolved` winner while holding the parent-run
+lock. Cold restart and replay consume that winner even if later completion
+events arrive in another order. Stable member keys, operation identities,
+typed results or failures, and every non-winner handle survive replay. Duplicate
+external input is de-duplicated by its durable input identity; accepted input is
+applied in recorded server order, including input received while an activity is
+running. Condition and signal waits can participate alongside activities,
+children, timers, and nested all-groups.
 
 ## Saga compensation
 

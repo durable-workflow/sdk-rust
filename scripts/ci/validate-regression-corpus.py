@@ -1129,11 +1129,13 @@ def _policy(document: Mapping[str, Any], path: str) -> Mapping[str, Any]:
         for index, raw_guard in enumerate(guards):
             guard = _object(raw_guard, f"{path}.categories.{name}.guards[{index}]")
             _string(guard.get("glob"), f"{path}.categories.{name}.guards[{index}].glob")
-            patterns = guard.get("content_patterns")
-            if patterns is not None:
+            for pattern_field in ("content_patterns", "implementation_patterns"):
+                patterns = guard.get(pattern_field)
+                if patterns is None:
+                    continue
                 for pattern in _unique_strings(
                     patterns,
-                    f"{path}.categories.{name}.guards[{index}].content_patterns",
+                    f"{path}.categories.{name}.guards[{index}].{pattern_field}",
                 ):
                     try:
                         re.compile(pattern)
@@ -1150,14 +1152,29 @@ def _fixture_selector(raw_fixture: Any) -> tuple[str, str]:
     )
 
 
-def _guard_selector(raw_guard: Any) -> tuple[str, tuple[str, ...] | None]:
+def _guard_selector(
+    raw_guard: Any,
+) -> tuple[str, tuple[str, ...] | None, tuple[str, ...] | None]:
     guard = _object(raw_guard, "guard")
     patterns = guard.get("content_patterns")
+    implementation_patterns = guard.get("implementation_patterns")
     return (
         _string(guard.get("glob"), "guard.glob"),
         (
             tuple(sorted(_unique_strings(patterns, "guard.content_patterns")))
             if patterns is not None
+            else None
+        ),
+        (
+            tuple(
+                sorted(
+                    _unique_strings(
+                        implementation_patterns,
+                        "guard.implementation_patterns",
+                    )
+                )
+            )
+            if implementation_patterns is not None
             else None
         ),
     )
@@ -1215,7 +1232,7 @@ def _preserve_base_policy(
                 base_category["guards"], f"base categories.{name}.guards"
             )
         ):
-            base_glob, base_patterns = base_guard
+            base_glob, base_patterns, base_implementation_patterns = base_guard
             preserved = any(
                 current_glob == base_glob
                 and (
@@ -1225,7 +1242,19 @@ def _preserve_base_policy(
                         and set(base_patterns) <= set(current_patterns)
                     )
                 )
-                for current_glob, current_patterns in current_guards
+                and (
+                    base_implementation_patterns is None
+                    or (
+                        current_implementation_patterns is not None
+                        and set(base_implementation_patterns)
+                        <= set(current_implementation_patterns)
+                    )
+                )
+                for (
+                    current_glob,
+                    current_patterns,
+                    current_implementation_patterns,
+                ) in current_guards
             )
             if not preserved:
                 raise CorpusError(
@@ -1734,7 +1763,8 @@ def _guard_matches(
     if not matching:
         return False
     patterns = guard.get("content_patterns")
-    if patterns is None:
+    implementation_patterns = guard.get("implementation_patterns")
+    if patterns is None and implementation_patterns is None:
         return True
     diff = _run(
         [
@@ -1757,7 +1787,7 @@ def _guard_matches(
     enclosing_items: list[tuple[int, str]] = []
     item_declaration = re.compile(
         r"^(?:(?:pub(?:\([^)]*\))?|async|const|unsafe)\s+)*"
-        r"(?:fn|impl|struct|enum|trait|mod)\b"
+        r"(?:fn|impl|struct|enum|trait|mod|const|static)\b"
     )
     closing_scope = re.compile(r"^}\s*[,;]?$")
     for line in diff.splitlines():
@@ -1796,7 +1826,13 @@ def _guard_matches(
                 (root / path).read_text(encoding="utf-8", errors="replace")
             )
     relevant_context = "\n".join(relevant_lines)
-    return any(re.search(pattern, relevant_context) for pattern in patterns)
+    content_matches = patterns is None or any(
+        re.search(pattern, relevant_context) for pattern in patterns
+    )
+    implementation_matches = implementation_patterns is None or any(
+        re.search(pattern, relevant_context) for pattern in implementation_patterns
+    )
+    return content_matches and implementation_matches
 
 
 def validate(

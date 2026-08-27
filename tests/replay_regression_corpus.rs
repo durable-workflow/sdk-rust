@@ -15,7 +15,8 @@ use std::{
 use durable_workflow::{
     decode_payload, encode_payload, json, AvroValue, ChildWorkflowOptions, Client,
     ConditionWaitOptions, ConditionWaitResult, Error, ParallelOperation, ParallelResult,
-    PayloadEnvelope, SearchAttributeUpdate, Value, Worker, WorkflowInstance, DEFAULT_CODEC,
+    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, Value, Worker, WorkflowInstance,
+    DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 
@@ -380,6 +381,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.search-attribute-type-mismatch"
             | "corpus.condition-search"
             | "corpus.condition-search-adjacent"
+            | "corpus.durable-selection"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -621,6 +623,51 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 Ok(json!({"status": status, "waits": outcomes}))
             });
         }
+        "corpus.durable-selection" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let selected = ctx
+                    .select_keyed(vec![
+                        (
+                            "slow",
+                            ParallelOperation::activity("slow-activity", json!([])),
+                        ),
+                        (
+                            "fast",
+                            ParallelOperation::activity("fast-activity", json!([])),
+                        ),
+                    ])
+                    .await?;
+                let slow = selected
+                    .handle(&SelectionKey::Name("slow".to_string()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::WorkerLoop(
+                            "durable selection replay did not preserve the slow handle".to_string(),
+                        )
+                    })?;
+                let winner = match &selected.key {
+                    SelectionKey::Name(key) => key.clone(),
+                    SelectionKey::Index(index) => index.to_string(),
+                };
+                let winner_identity = selected.identity.clone();
+                let ParallelResult::Activity(winner_value) = selected.into_result()? else {
+                    return Err(Error::WorkerLoop(
+                        "durable selection replay returned a non-activity winner".to_string(),
+                    ));
+                };
+                let ParallelResult::Activity(slow_value) = slow.await_result().await? else {
+                    return Err(Error::WorkerLoop(
+                        "durable selection replay returned a non-activity loser".to_string(),
+                    ));
+                };
+                Ok(json!({
+                    "winner": winner,
+                    "winner_identity": winner_identity,
+                    "winner_value": winner_value,
+                    "slow": slow_value,
+                }))
+            });
+        }
         _ => unreachable!("workflow type was validated above"),
     }
     let handled = worker
@@ -830,6 +877,24 @@ async fn adjacent_condition_wait_occurrences_are_deterministic_across_cold_worke
         .expect("cold condition replay fixture must execute");
 
     assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn durable_selection_winner_is_deterministic_across_cold_workers() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/durable-selection-recorded-winner.json");
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in selection replay fixture"),
+    )
+    .expect("parse checked-in selection replay fixture");
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .expect("first selection replay fixture must execute");
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .expect("cold selection replay fixture must execute");
+
+    assert_eq!(first, restarted);
 }
 
 #[tokio::test]

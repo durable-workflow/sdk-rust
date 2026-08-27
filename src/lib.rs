@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 pub use uuid::Uuid;
 
-pub const WORKER_PROTOCOL_VERSION: &str = "1.17";
+pub const WORKER_PROTOCOL_VERSION: &str = "1.19";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
@@ -45,6 +45,8 @@ pub const TYPED_SEARCH_ATTRIBUTES_CAPABILITY: &str = "typed_search_attributes";
 pub const WORKFLOW_UPDATES_CAPABILITY: &str = "workflow_updates";
 /// Worker-registration capability for durable named input streams.
 pub const MESSAGE_STREAMS_CAPABILITY: &str = "message_streams";
+/// Worker-registration capability for persisted first-completion selection.
+pub const DURABLE_SELECTION_CAPABILITY: &str = "durable_selection";
 pub const MESSAGE_STREAMS_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.15";
 pub const MESSAGE_STREAM_SIGNAL: &str = "__durable_workflow_message_stream";
 pub const MESSAGE_STREAM_SCHEMA: &str = "durable-workflow.v2.message-stream.message";
@@ -62,6 +64,8 @@ pub const TYPED_SEARCH_ATTRIBUTES_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.16"
 pub const CONDITION_WAIT_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.9";
 /// First additive worker protocol that preserves authored condition-wait occurrences.
 pub const CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.17";
+/// First additive worker protocol that defines durable selection groups.
+pub const DURABLE_SELECTION_MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.19";
 
 pub fn worker_protocol_supports_message_streams(version: &str) -> bool {
     let Some((major, minor)) = version.split_once('.') else {
@@ -149,6 +153,8 @@ pub enum Error {
     SagaCompensationFailed(SagaCompensationFailure),
     #[error(transparent)]
     InvalidParallelGroup(ParallelGroupError),
+    #[error(transparent)]
+    DurableOperationCancelled(DurableOperationCancelled),
     #[error(transparent)]
     WorkflowCancellationRequested(WorkflowCancellationRequested),
     #[error(transparent)]
@@ -1042,6 +1048,43 @@ pub struct ChildWorkflowAvroResult {
     pub result: AvroValue,
 }
 
+/// Stable user-facing identity for one member of a durable selection group.
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum SelectionKey {
+    Index(usize),
+    Name(String),
+}
+
+impl From<usize> for SelectionKey {
+    fn from(value: usize) -> Self {
+        Self::Index(value)
+    }
+}
+
+impl From<String> for SelectionKey {
+    fn from(value: String) -> Self {
+        Self::Name(value)
+    }
+}
+
+impl From<&str> for SelectionKey {
+    fn from(value: &str) -> Self {
+        Self::Name(value.to_string())
+    }
+}
+
+/// Typed result of explicitly awaiting a cancelled non-winning operation.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("selected {operation_kind} operation {operation_identity} was explicitly cancelled")]
+pub struct DurableOperationCancelled {
+    pub selection_group_id: String,
+    pub member_key: SelectionKey,
+    pub member_index: usize,
+    pub operation_kind: String,
+    pub operation_identity: String,
+}
+
 /// Stable identity for one enclosing deterministic parallel group.
 ///
 /// The same fields are attached to every ordinary activity, timer, or child
@@ -1054,6 +1097,18 @@ pub struct ParallelGroupMetadata {
     pub parallel_group_base_sequence: u64,
     pub parallel_group_size: usize,
     pub parallel_group_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_group_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_member_key: Option<SelectionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_member_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_member_base_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_member_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_member_kind: Option<String>,
 }
 
 /// One input-ordered result returned by [`WorkflowContext::parallel`].
@@ -1062,6 +1117,8 @@ pub enum ParallelResult {
     Activity(Value),
     ChildWorkflow(ChildWorkflowResult),
     Timer,
+    Signal(Vec<Value>),
+    Condition(ConditionWaitResult),
     Group(Vec<ParallelResult>),
 }
 
@@ -1071,6 +1128,8 @@ pub enum ParallelAvroResult {
     Activity(AvroValue),
     ChildWorkflow(ChildWorkflowAvroResult),
     Timer,
+    Signal(Vec<AvroValue>),
+    Condition(ConditionWaitResult),
     Group(Vec<ParallelAvroResult>),
 }
 
@@ -1085,6 +1144,13 @@ impl ParallelAvroResult {
                 result: result.result.into_json()?,
             })),
             Self::Timer => Ok(ParallelResult::Timer),
+            Self::Signal(values) => Ok(ParallelResult::Signal(
+                values
+                    .into_iter()
+                    .map(AvroValue::into_json)
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            Self::Condition(result) => Ok(ParallelResult::Condition(result)),
             Self::Group(results) => Ok(ParallelResult::Group(
                 results
                     .into_iter()
@@ -1419,6 +1485,11 @@ pub enum ParallelOperation {
         arguments: Result<AvroValue>,
     },
     Timer(Duration),
+    Signal(String),
+    Condition {
+        options: ConditionWaitOptions,
+        predicate: Box<dyn Fn() -> Result<bool> + Send + 'static>,
+    },
     Group(Vec<ParallelOperation>),
 }
 
@@ -1453,6 +1524,20 @@ impl ParallelOperation {
 
     pub fn timer(duration: Duration) -> Self {
         Self::Timer(duration)
+    }
+
+    pub fn signal(signal_name: impl Into<String>) -> Self {
+        Self::Signal(signal_name.into())
+    }
+
+    pub fn condition<F>(options: ConditionWaitOptions, predicate: F) -> Self
+    where
+        F: Fn() -> Result<bool> + Send + 'static,
+    {
+        Self::Condition {
+            options,
+            predicate: Box::new(predicate),
+        }
     }
 
     pub fn group(operations: Vec<ParallelOperation>) -> Self {
@@ -6182,6 +6267,7 @@ impl Worker {
                 self.max_concurrent_activity_tasks,
                 [
                     Some(CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY.to_string()),
+                    Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
@@ -7825,6 +7911,31 @@ impl WorkflowContext {
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 
+    /// Start every durable operation and resume from the one winner persisted
+    /// by Server. Non-winning operations continue and remain addressable.
+    pub fn select(&self, operations: Vec<ParallelOperation>) -> SelectCall {
+        let operations = operations
+            .into_iter()
+            .enumerate()
+            .map(|(index, operation)| (SelectionKey::Index(index), operation))
+            .collect();
+        SelectCall::new(self.clone(), operations)
+    }
+
+    /// Named-key variant of [`WorkflowContext::select`].
+    pub fn select_keyed<K>(&self, operations: Vec<(K, ParallelOperation)>) -> SelectCall
+    where
+        K: Into<SelectionKey>,
+    {
+        SelectCall::new(
+            self.clone(),
+            operations
+                .into_iter()
+                .map(|(key, operation)| (key.into(), operation))
+                .collect(),
+        )
+    }
+
     /// Create a workflow-local deterministic compensation registry.
     pub fn saga(&self) -> Saga {
         Saga::new(self.clone())
@@ -7859,6 +7970,7 @@ impl WorkflowContext {
             runtime_reserved_allowed: false,
             opened_wait: false,
             matched_pending: false,
+            parallel_group_path: Vec::new(),
         }
     }
 
@@ -7869,6 +7981,7 @@ impl WorkflowContext {
             runtime_reserved_allowed: true,
             opened_wait: false,
             matched_pending: false,
+            parallel_group_path: Vec::new(),
         }
     }
 
@@ -7980,6 +8093,7 @@ impl WorkflowContext {
             predicate: Box::new(predicate),
             occurrence_id: None,
             opened_wait: false,
+            parallel_group_path: Vec::new(),
         }
     }
 
@@ -8639,6 +8753,9 @@ struct WorkflowState {
     cancel_requested: bool,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
+    selection_markers: Vec<SelectionMarker>,
+    selection_marker_cursor: usize,
+    cancelled_selection_members: Vec<SelectionCancellation>,
     recorded_continue_as_new_sequence: Option<u64>,
     continue_as_new_consumed: bool,
     command_cursor: usize,
@@ -8687,6 +8804,8 @@ impl WorkflowState {
                 run_id: run_id.clone(),
             },
         )?;
+        let selection_markers = recorded_selection_markers(&history)?;
+        let cancelled_selection_members = recorded_selection_cancellations(&history)?;
         let recorded_continue_as_new = history
             .iter()
             .filter(|event| event.event_type == "WorkflowContinuedAsNew")
@@ -8776,6 +8895,9 @@ impl WorkflowState {
             cancel_requested,
             resume_signal,
             recorded_commands,
+            selection_markers,
+            selection_marker_cursor: 0,
+            cancelled_selection_members,
             recorded_continue_as_new_sequence,
             continue_as_new_consumed: false,
             command_cursor: 0,
@@ -8879,6 +9001,7 @@ enum RecordedCommand {
         sequence: u64,
         signal_name: String,
         value: Option<Vec<AvroValue>>,
+        parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
     ConditionWait {
         sequence: u64,
@@ -8887,6 +9010,7 @@ enum RecordedCommand {
         predicate_identity: String,
         timeout_seconds: Option<u64>,
         result: Option<ConditionWaitResult>,
+        parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
     SearchAttributes {
         sequence: u64,
@@ -8906,6 +9030,299 @@ enum RecordedCommand {
         sequence: u64,
         entries: AvroValue,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectionMarker {
+    selection_group_id: String,
+    selection_group_base_sequence: u64,
+    selection_group_size: usize,
+    member_key: SelectionKey,
+    member_index: usize,
+    member_base_sequence: u64,
+    member_size: usize,
+    operation_kind: String,
+    operation_identity: String,
+    outcome: String,
+    resolution_event_id: String,
+    resolution_event_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectionCancellation {
+    selection_group_id: String,
+    member_key: SelectionKey,
+    member_index: usize,
+    member_base_sequence: u64,
+    member_size: usize,
+    operation_kind: String,
+    operation_identity: String,
+}
+
+fn recorded_selection_markers(events: &[HistoryEvent]) -> Result<Vec<SelectionMarker>> {
+    let mut markers: Vec<SelectionMarker> = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == "SelectionResolved")
+    {
+        let payload = &event.payload;
+        let base_sequence = required_selection_u64(payload, "selection_group_base_sequence")?;
+        let group_size = required_selection_usize(payload, "selection_group_size")?;
+        let member_base_sequence = required_selection_u64(payload, "member_base_sequence")?;
+        let member_size = required_selection_usize(payload, "member_size")?;
+        let member_index = required_selection_usize_allow_zero(payload, "member_index")?;
+        let group_id = payload_string(payload, "selection_group_id").ok_or_else(|| {
+            invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                "non-empty selection_group_id",
+                &payload.to_string(),
+                "selection winner history is missing its durable group identity",
+            )
+        })?;
+        let expected_group_id = format!("select-calls:{base_sequence}:{group_size}");
+        if group_id != expected_group_id {
+            return Err(invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                &expected_group_id,
+                &group_id,
+                "selection winner history contains an incompatible group identity",
+            ));
+        }
+        let group_end = base_sequence
+            .checked_add(u64::try_from(group_size).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
+        let member_end = member_base_sequence
+            .checked_add(u64::try_from(member_size).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
+        if member_index >= group_size
+            || member_base_sequence < base_sequence
+            || member_end > group_end
+        {
+            return Err(invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                "winner member within selection group bounds",
+                &payload.to_string(),
+                "selection winner history contains an invalid member range",
+            ));
+        }
+        let operation_kind = payload_string(payload, "operation_kind").ok_or_else(|| {
+            invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                "selection operation kind",
+                &payload.to_string(),
+                "selection winner history is missing its operation kind",
+            )
+        })?;
+        if !matches!(
+            operation_kind.as_str(),
+            "activity" | "child" | "timer" | "signal" | "condition" | "group"
+        ) {
+            return Err(invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                "activity, child, timer, signal, condition, or group",
+                &operation_kind,
+                "selection winner history contains an unsupported operation kind",
+            ));
+        }
+        let operation_identity =
+            payload_string(payload, "operation_identity").ok_or_else(|| {
+                invalid_recorded_history(
+                    "selection_marker_invalid",
+                    base_sequence,
+                    "non-empty operation identity",
+                    &payload.to_string(),
+                    "selection winner history is missing its durable operation identity",
+                )
+            })?;
+        let outcome = payload_string(payload, "outcome").ok_or_else(|| {
+            invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                "completed or failed selection outcome",
+                &payload.to_string(),
+                "selection winner history is missing its outcome",
+            )
+        })?;
+        if !matches!(outcome.as_str(), "completed" | "failed") {
+            return Err(invalid_recorded_history(
+                "selection_marker_invalid",
+                base_sequence,
+                "completed or failed selection outcome",
+                &outcome,
+                "selection winner history contains an unsupported outcome",
+            ));
+        }
+        let marker = SelectionMarker {
+            selection_group_id: group_id,
+            selection_group_base_sequence: base_sequence,
+            selection_group_size: group_size,
+            member_key: selection_key_from_value(payload.get("member_key"), base_sequence)?,
+            member_index,
+            member_base_sequence,
+            member_size,
+            operation_kind,
+            operation_identity,
+            outcome,
+            resolution_event_id: payload_string(payload, "resolution_event_id").ok_or_else(
+                || {
+                    invalid_recorded_history(
+                        "selection_marker_invalid",
+                        base_sequence,
+                        "durable resolution_event_id",
+                        &payload.to_string(),
+                        "selection winner history is missing its terminal event identity",
+                    )
+                },
+            )?,
+            resolution_event_type: payload_string(payload, "resolution_event_type").ok_or_else(
+                || {
+                    invalid_recorded_history(
+                        "selection_marker_invalid",
+                        base_sequence,
+                        "durable resolution_event_type",
+                        &payload.to_string(),
+                        "selection winner history is missing its terminal event type",
+                    )
+                },
+            )?,
+        };
+        if let Some(existing) = markers
+            .iter()
+            .find(|existing| existing.selection_group_id == marker.selection_group_id)
+        {
+            if existing != &marker {
+                return Err(invalid_recorded_history(
+                    "selection_marker_conflict",
+                    base_sequence,
+                    &format!("one winner for {}", marker.selection_group_id),
+                    &payload.to_string(),
+                    "selection history records conflicting winners for one durable group",
+                ));
+            }
+            continue;
+        }
+        markers.push(marker);
+    }
+    Ok(markers)
+}
+
+fn recorded_selection_cancellations(events: &[HistoryEvent]) -> Result<Vec<SelectionCancellation>> {
+    let mut cancelled: Vec<SelectionCancellation> = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == "SelectionOperationCancelled")
+    {
+        let group_id = payload_string(&event.payload, "selection_group_id").ok_or_else(|| {
+            invalid_recorded_history(
+                "selection_cancellation_invalid",
+                0,
+                "non-empty selection_group_id",
+                &event.payload.to_string(),
+                "selection cancellation history is missing its group identity",
+            )
+        })?;
+        let member_base_sequence = required_selection_u64(&event.payload, "member_base_sequence")?;
+        let marker = SelectionCancellation {
+            selection_group_id: group_id,
+            member_key: selection_key_from_value(
+                event.payload.get("member_key"),
+                member_base_sequence,
+            )?,
+            member_index: required_selection_usize_allow_zero(&event.payload, "member_index")?,
+            member_base_sequence,
+            member_size: required_selection_usize(&event.payload, "member_size")?,
+            operation_kind: payload_string(&event.payload, "operation_kind").ok_or_else(|| {
+                invalid_recorded_history(
+                    "selection_cancellation_invalid",
+                    member_base_sequence,
+                    "selection operation kind",
+                    &event.payload.to_string(),
+                    "selection cancellation is missing its operation kind",
+                )
+            })?,
+            operation_identity: payload_string(&event.payload, "operation_identity").ok_or_else(
+                || {
+                    invalid_recorded_history(
+                        "selection_cancellation_invalid",
+                        member_base_sequence,
+                        "selection operation identity",
+                        &event.payload.to_string(),
+                        "selection cancellation is missing its operation identity",
+                    )
+                },
+            )?,
+        };
+        if let Some(existing) = cancelled.iter().find(|recorded| {
+            recorded.selection_group_id == marker.selection_group_id
+                && recorded.member_base_sequence == marker.member_base_sequence
+        }) {
+            if existing != &marker {
+                return Err(invalid_recorded_history(
+                    "selection_cancellation_conflict",
+                    member_base_sequence,
+                    "one stable SelectionOperationCancelled marker",
+                    &event.payload.to_string(),
+                    "selection cancellation history contains conflicting member metadata",
+                ));
+            }
+        } else {
+            cancelled.push(marker);
+        }
+    }
+    Ok(cancelled)
+}
+
+fn required_selection_u64(payload: &Value, field: &str) -> Result<u64> {
+    payload
+        .get(field)
+        .and_then(value_as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "selection_marker_invalid",
+                0,
+                &format!("positive integer {field}"),
+                &payload.to_string(),
+                "selection history contains invalid durable identity metadata",
+            )
+        })
+}
+
+fn required_selection_usize(payload: &Value, field: &str) -> Result<usize> {
+    required_selection_usize_allow_zero(payload, field).and_then(|value| {
+        if value > 0 {
+            Ok(value)
+        } else {
+            Err(invalid_recorded_history(
+                "selection_marker_invalid",
+                0,
+                &format!("positive integer {field}"),
+                &payload.to_string(),
+                "selection history contains invalid durable identity metadata",
+            ))
+        }
+    })
+}
+
+fn required_selection_usize_allow_zero(payload: &Value, field: &str) -> Result<usize> {
+    payload
+        .get(field)
+        .and_then(value_as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "selection_marker_invalid",
+                0,
+                &format!("non-negative integer {field}"),
+                &payload.to_string(),
+                "selection history contains invalid durable identity metadata",
+            )
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -9149,6 +9566,42 @@ fn parallel_group_entry(
         parallel_group_base_sequence: base_sequence,
         parallel_group_size: size,
         parallel_group_index: index,
+        parallel_group_mode: None,
+        selection_member_key: None,
+        selection_member_index: None,
+        selection_member_base_sequence: None,
+        selection_member_size: None,
+        selection_member_kind: None,
+    }
+}
+
+struct SelectionMemberMetadata {
+    key: SelectionKey,
+    index: usize,
+    base_sequence: u64,
+    size: usize,
+    kind: String,
+}
+
+fn selection_group_entry(
+    base_sequence: u64,
+    size: usize,
+    index: usize,
+    kind: &str,
+    member: &SelectionMemberMetadata,
+) -> ParallelGroupMetadata {
+    ParallelGroupMetadata {
+        parallel_group_id: format!("select-calls:{base_sequence}:{size}"),
+        parallel_group_kind: kind.to_string(),
+        parallel_group_base_sequence: base_sequence,
+        parallel_group_size: size,
+        parallel_group_index: index,
+        parallel_group_mode: Some("select".to_string()),
+        selection_member_key: Some(member.key.clone()),
+        selection_member_index: Some(member.index),
+        selection_member_base_sequence: Some(member.base_sequence),
+        selection_member_size: Some(member.size),
+        selection_member_kind: Some(member.kind.clone()),
     }
 }
 
@@ -9179,6 +9632,27 @@ fn apply_parallel_group_path(
         "parallel_group_index".to_string(),
         json!(inner.parallel_group_index),
     );
+    if let Some(mode) = &inner.parallel_group_mode {
+        command.insert("parallel_group_mode".to_string(), json!(mode));
+    }
+    if let Some(key) = &inner.selection_member_key {
+        command.insert("selection_member_key".to_string(), json!(key));
+    }
+    if let Some(index) = inner.selection_member_index {
+        command.insert("selection_member_index".to_string(), json!(index));
+    }
+    if let Some(base_sequence) = inner.selection_member_base_sequence {
+        command.insert(
+            "selection_member_base_sequence".to_string(),
+            json!(base_sequence),
+        );
+    }
+    if let Some(size) = inner.selection_member_size {
+        command.insert("selection_member_size".to_string(), json!(size));
+    }
+    if let Some(kind) = &inner.selection_member_kind {
+        command.insert("selection_member_kind".to_string(), json!(kind));
+    }
     command.insert("parallel_group_path".to_string(), json!(path));
 }
 
@@ -9242,6 +9716,8 @@ fn parallel_operation_kind(operation: &ParallelOperation) -> Option<&'static str
         ParallelOperation::Activity { .. } => Some("activity"),
         ParallelOperation::ChildWorkflow { .. } => Some("child"),
         ParallelOperation::Timer(_) => Some("timer"),
+        ParallelOperation::Signal(_) => Some("signal"),
+        ParallelOperation::Condition { .. } => Some("condition"),
         ParallelOperation::Group(children) => parallel_group_kind(children),
     }
 }
@@ -9319,6 +9795,19 @@ fn validate_parallel_operations(
                 return Err(Error::TimerDurationOverflow);
             }
             ParallelOperation::Timer(_) => {}
+            ParallelOperation::Signal(signal_name) => {
+                validate_user_signal_name(signal_name)?;
+                if signal_name.trim().is_empty() {
+                    return Err(Error::InvalidParallelGroup(ParallelGroupError {
+                        reason: "signal_name_empty",
+                        member_path: member_path.clone(),
+                        message: "signal wait name must not be empty".to_string(),
+                    }));
+                }
+            }
+            ParallelOperation::Condition { options, .. } => {
+                options.validate()?;
+            }
             ParallelOperation::Group(children) => {
                 validate_parallel_operations(children, member_path, false)?;
             }
@@ -9416,6 +9905,75 @@ enum ParallelLeafCall {
     Activity(ActivityCall),
     ChildWorkflow(ChildWorkflowCall),
     Timer(TimerCall),
+    Signal(SignalCall),
+    Condition(ConditionWaitCall),
+}
+
+fn parallel_leaf_call(
+    ctx: &WorkflowContext,
+    operation: ParallelOperation,
+    parallel_group_path: Vec<ParallelGroupMetadata>,
+) -> ParallelLeafCall {
+    match operation {
+        ParallelOperation::Activity {
+            activity_type,
+            options,
+            arguments,
+        } => ParallelLeafCall::Activity(ActivityCall {
+            ctx: ctx.clone(),
+            activity_type,
+            options,
+            args: Some(arguments),
+            scheduled: false,
+            parallel_group_path,
+        }),
+        ParallelOperation::ChildWorkflow {
+            workflow_type,
+            options,
+            arguments,
+        } => ParallelLeafCall::ChildWorkflow(ChildWorkflowCall {
+            ctx: ctx.clone(),
+            workflow_type,
+            options,
+            args: Some(arguments),
+            scheduled: false,
+            matched_pending: false,
+            parallel_group_path,
+        }),
+        ParallelOperation::Timer(duration) => {
+            let delay_seconds = duration
+                .as_secs()
+                .checked_add(u64::from(duration.subsec_nanos() > 0));
+            ParallelLeafCall::Timer(TimerCall {
+                ctx: ctx.clone(),
+                delay_seconds,
+                scheduled: false,
+                matched_pending: false,
+                parallel_group_path,
+            })
+        }
+        ParallelOperation::Signal(signal_name) => ParallelLeafCall::Signal(SignalCall {
+            ctx: ctx.clone(),
+            signal_name,
+            runtime_reserved_allowed: false,
+            opened_wait: false,
+            matched_pending: false,
+            parallel_group_path,
+        }),
+        ParallelOperation::Condition { options, predicate } => {
+            ParallelLeafCall::Condition(ConditionWaitCall {
+                ctx: ctx.clone(),
+                options,
+                predicate,
+                occurrence_id: None,
+                opened_wait: false,
+                parallel_group_path,
+            })
+        }
+        ParallelOperation::Group(_) => {
+            unreachable!("parallel descriptors contain only durable leaves")
+        }
+    }
 }
 
 impl ParallelLeafCall {
@@ -9430,6 +9988,12 @@ impl ParallelLeafCall {
             Self::Timer(call) => Pin::new(call)
                 .poll(cx)
                 .map_ok(|()| ParallelAvroResult::Timer),
+            Self::Signal(call) => Pin::new(call)
+                .poll_avro_value(cx)
+                .map_ok(ParallelAvroResult::Signal),
+            Self::Condition(call) => Pin::new(call)
+                .poll(cx)
+                .map_ok(ParallelAvroResult::Condition),
         }
     }
 }
@@ -9496,49 +10060,11 @@ impl ParallelCall {
         self.leaves = parallel_descriptors(operations, base_sequence)?
             .into_iter()
             .map(|descriptor| {
-                let path = descriptor.group_path.clone();
-                let call = match descriptor.operation {
-                    ParallelOperation::Activity {
-                        activity_type,
-                        options,
-                        arguments,
-                    } => ParallelLeafCall::Activity(ActivityCall {
-                        ctx: self.ctx.clone(),
-                        activity_type,
-                        options,
-                        args: Some(arguments),
-                        scheduled: false,
-                        parallel_group_path: path,
-                    }),
-                    ParallelOperation::ChildWorkflow {
-                        workflow_type,
-                        options,
-                        arguments,
-                    } => ParallelLeafCall::ChildWorkflow(ChildWorkflowCall {
-                        ctx: self.ctx.clone(),
-                        workflow_type,
-                        options,
-                        args: Some(arguments),
-                        scheduled: false,
-                        matched_pending: false,
-                        parallel_group_path: path,
-                    }),
-                    ParallelOperation::Timer(duration) => {
-                        let delay_seconds = duration
-                            .as_secs()
-                            .checked_add(u64::from(duration.subsec_nanos() > 0));
-                        ParallelLeafCall::Timer(TimerCall {
-                            ctx: self.ctx.clone(),
-                            delay_seconds,
-                            scheduled: false,
-                            matched_pending: false,
-                            parallel_group_path: path,
-                        })
-                    }
-                    ParallelOperation::Group(_) => {
-                        unreachable!("parallel descriptors contain only durable leaves")
-                    }
-                };
+                let call = parallel_leaf_call(
+                    &self.ctx,
+                    descriptor.operation,
+                    descriptor.group_path.clone(),
+                );
                 ParallelLeaf {
                     call,
                     member_path: descriptor.member_path,
@@ -9630,7 +10156,11 @@ impl ParallelCall {
             ParallelAvroResult::Group(results) => results,
             ParallelAvroResult::Activity(_)
             | ParallelAvroResult::ChildWorkflow(_)
-            | ParallelAvroResult::Timer => unreachable!("root parallel shape is a group"),
+            | ParallelAvroResult::Timer
+            | ParallelAvroResult::Signal(_)
+            | ParallelAvroResult::Condition(_) => {
+                unreachable!("root parallel shape is a group")
+            }
         }))
     }
 }
@@ -9663,6 +10193,1004 @@ impl Future for ParallelCall {
             })
             .map_ok(|result| result)
             .flatten_result()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelectionMemberPlan {
+    key: SelectionKey,
+    index: usize,
+    base_sequence: u64,
+    size: usize,
+    kind: String,
+    shape: ParallelShape,
+    leaf_start: usize,
+}
+
+fn selection_operation_kind(operation: &ParallelOperation) -> &'static str {
+    match operation {
+        ParallelOperation::Activity { .. } => "activity",
+        ParallelOperation::ChildWorkflow { .. } => "child",
+        ParallelOperation::Timer(_) => "timer",
+        ParallelOperation::Signal(_) => "signal",
+        ParallelOperation::Condition { .. } => "condition",
+        ParallelOperation::Group(_) => "group",
+    }
+}
+
+fn selection_operation_shape(operation: &ParallelOperation) -> ParallelShape {
+    match operation {
+        ParallelOperation::Group(children) => parallel_shape(children),
+        _ => ParallelShape::Leaf,
+    }
+}
+
+fn selection_descriptors(
+    operations: Vec<(SelectionKey, ParallelOperation)>,
+    base_sequence: u64,
+) -> Result<(Vec<ParallelDescriptor>, Vec<SelectionMemberPlan>)> {
+    if operations.is_empty() {
+        return Err(Error::InvalidParallelGroup(ParallelGroupError {
+            reason: "selection_empty",
+            member_path: Vec::new(),
+            message: "durable selection requires at least one operation".to_string(),
+        }));
+    }
+    let operation_refs = operations
+        .iter()
+        .map(|(_, operation)| operation)
+        .collect::<Vec<_>>();
+    let total_size = operation_refs
+        .iter()
+        .map(|operation| match operation {
+            ParallelOperation::Group(children) => parallel_leaf_count(children),
+            _ => 1,
+        })
+        .sum::<usize>();
+    if total_size > MAX_PARALLEL_OPERATIONS {
+        return Err(Error::InvalidParallelGroup(ParallelGroupError {
+            reason: "fan_out_limit_exceeded",
+            member_path: Vec::new(),
+            message: format!(
+                "selection contains {total_size} durable leaves; the limit is {MAX_PARALLEL_OPERATIONS}"
+            ),
+        }));
+    }
+    let group_kind = {
+        let mut kind = None;
+        for operation in &operation_refs {
+            let operation_kind = parallel_operation_kind(operation).unwrap_or("mixed");
+            match kind {
+                None => kind = Some(operation_kind),
+                Some(current) if current == operation_kind => {}
+                Some(_) => {
+                    kind = Some("mixed");
+                    break;
+                }
+            }
+        }
+        kind.unwrap_or("mixed")
+    };
+
+    let mut descriptors = Vec::with_capacity(total_size);
+    let mut members = Vec::with_capacity(operations.len());
+    let mut cursor = 0usize;
+    let mut seen_keys: Vec<SelectionKey> = Vec::new();
+    for (member_index, (key, operation)) in operations.into_iter().enumerate() {
+        if matches!(&key, SelectionKey::Name(value) if value.is_empty()) {
+            return Err(Error::InvalidParallelGroup(ParallelGroupError {
+                reason: "selection_key_invalid",
+                member_path: vec![member_index],
+                message: "selection member keys must be non-empty strings or non-negative integers"
+                    .to_string(),
+            }));
+        }
+        if seen_keys.contains(&key) {
+            return Err(Error::InvalidParallelGroup(ParallelGroupError {
+                reason: "selection_key_duplicate",
+                member_path: vec![member_index],
+                message: format!("selection member key {key:?} is duplicated"),
+            }));
+        }
+        seen_keys.push(key.clone());
+        let member_size = match &operation {
+            ParallelOperation::Group(children) => parallel_leaf_count(children),
+            _ => 1,
+        };
+        if member_size == 0 {
+            return Err(Error::InvalidParallelGroup(ParallelGroupError {
+                reason: "selection_member_empty",
+                member_path: vec![member_index],
+                message: "a selection member must contain at least one durable leaf".to_string(),
+            }));
+        }
+        let member_base = base_sequence
+            .checked_add(u64::try_from(cursor).unwrap_or(u64::MAX))
+            .ok_or(Error::TimerDurationOverflow)?;
+        let member_kind = selection_operation_kind(&operation).to_string();
+        let member_shape = selection_operation_shape(&operation);
+        let leaf_start = descriptors.len();
+        match operation {
+            ParallelOperation::Group(children) => {
+                validate_parallel_operations(&children, &mut vec![member_index], false)?;
+                for mut descriptor in parallel_descriptors(children, member_base)? {
+                    let flat_index = cursor + descriptor.offset;
+                    descriptor.group_path.insert(
+                        0,
+                        selection_group_entry(
+                            base_sequence,
+                            total_size,
+                            flat_index,
+                            group_kind,
+                            &SelectionMemberMetadata {
+                                key: key.clone(),
+                                index: member_index,
+                                base_sequence: member_base,
+                                size: member_size,
+                                kind: member_kind.clone(),
+                            },
+                        ),
+                    );
+                    descriptor.member_path.insert(0, member_index);
+                    descriptor.offset = flat_index;
+                    descriptors.push(descriptor);
+                }
+            }
+            operation => {
+                validate_parallel_operations(
+                    std::slice::from_ref(&operation),
+                    &mut Vec::new(),
+                    true,
+                )?;
+                descriptors.push(ParallelDescriptor {
+                    operation,
+                    offset: cursor,
+                    member_path: vec![member_index],
+                    group_path: vec![selection_group_entry(
+                        base_sequence,
+                        total_size,
+                        cursor,
+                        group_kind,
+                        &SelectionMemberMetadata {
+                            key: key.clone(),
+                            index: member_index,
+                            base_sequence: member_base,
+                            size: member_size,
+                            kind: member_kind.clone(),
+                        },
+                    )],
+                });
+            }
+        }
+        members.push(SelectionMemberPlan {
+            key,
+            index: member_index,
+            base_sequence: member_base,
+            size: member_size,
+            kind: member_kind,
+            shape: member_shape,
+            leaf_start,
+        });
+        cursor += member_size;
+    }
+    Ok((descriptors, members))
+}
+
+struct SelectionLeaf {
+    call: ParallelLeafCall,
+    outcome: Option<Result<ParallelAvroResult>>,
+}
+
+/// Stable reference to one member of a durable selection group.
+#[derive(Clone)]
+pub struct DurableOperationHandle {
+    ctx: WorkflowContext,
+    pub key: SelectionKey,
+    pub index: usize,
+    pub kind: String,
+    pub identity: String,
+    pub base_sequence: u64,
+    pub size: usize,
+    pub selection_group_id: String,
+    shape: ParallelShape,
+}
+
+impl std::fmt::Debug for DurableOperationHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableOperationHandle")
+            .field("key", &self.key)
+            .field("index", &self.index)
+            .field("kind", &self.kind)
+            .field("identity", &self.identity)
+            .field("base_sequence", &self.base_sequence)
+            .field("size", &self.size)
+            .field("selection_group_id", &self.selection_group_id)
+            .finish()
+    }
+}
+
+impl DurableOperationHandle {
+    /// Await this member after another member has already won the selection.
+    pub fn await_result(&self) -> DurableOperationAwaitCall {
+        DurableOperationAwaitCall {
+            handle: self.clone(),
+        }
+    }
+
+    /// Request cancellation without affecting siblings. The future resolves
+    /// to unit; only `SelectionOperationCancelled` history proves cancellation
+    /// beat a concurrently committed terminal result.
+    pub fn cancel(&self) -> CancelDurableOperationCall {
+        CancelDurableOperationCall {
+            handle: self.clone(),
+            emitted: false,
+        }
+    }
+}
+
+/// The one winner committed for a durable selection group.
+#[derive(Debug)]
+pub struct SelectionResult {
+    pub key: SelectionKey,
+    pub index: usize,
+    pub kind: String,
+    pub identity: String,
+    pub value: Option<ParallelResult>,
+    pub failure: Option<Error>,
+    pub winner: DurableOperationHandle,
+    pub handles: Vec<DurableOperationHandle>,
+}
+
+impl SelectionResult {
+    pub fn succeeded(&self) -> bool {
+        self.failure.is_none()
+    }
+
+    pub fn handle(&self, key: &SelectionKey) -> Option<&DurableOperationHandle> {
+        self.handles.iter().find(|handle| &handle.key == key)
+    }
+
+    pub fn remaining(&self) -> Vec<&DurableOperationHandle> {
+        self.handles
+            .iter()
+            .filter(|handle| handle.index != self.index)
+            .collect()
+    }
+
+    pub fn into_result(self) -> Result<ParallelResult> {
+        match (self.value, self.failure) {
+            (Some(value), None) => Ok(value),
+            (_, Some(error)) => Err(error),
+            _ => Err(Error::WorkerLoop(
+                "selection result contained neither a value nor a failure".to_string(),
+            )),
+        }
+    }
+}
+
+/// Future returned by [`WorkflowContext::select`].
+pub struct SelectCall {
+    ctx: WorkflowContext,
+    operations: Option<Vec<(SelectionKey, ParallelOperation)>>,
+    members: Vec<SelectionMemberPlan>,
+    leaves: Vec<SelectionLeaf>,
+    group_id: Option<String>,
+}
+
+impl SelectCall {
+    fn new(ctx: WorkflowContext, operations: Vec<(SelectionKey, ParallelOperation)>) -> Self {
+        Self {
+            ctx,
+            operations: Some(operations),
+            members: Vec::new(),
+            leaves: Vec::new(),
+            group_id: None,
+        }
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let operations = self.operations.take().unwrap_or_default();
+        let base_sequence = {
+            let state = self
+                .ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            if let Some(marker) = state.selection_markers.get(state.selection_marker_cursor) {
+                marker.selection_group_base_sequence
+            } else if let Some(recorded) = state.recorded_commands.get(state.command_cursor) {
+                recorded.sequence()
+            } else {
+                let last = state
+                    .recorded_commands
+                    .last()
+                    .map(RecordedCommand::sequence)
+                    .unwrap_or(0);
+                last.checked_add(u64::try_from(state.commands.len()).unwrap_or(u64::MAX))
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .ok_or(Error::TimerDurationOverflow)?
+            }
+        };
+        let (descriptors, members) = selection_descriptors(operations, base_sequence)?;
+        let group_id = format!("select-calls:{base_sequence}:{}", descriptors.len());
+        self.leaves = descriptors
+            .into_iter()
+            .map(|descriptor| SelectionLeaf {
+                call: parallel_leaf_call(&self.ctx, descriptor.operation, descriptor.group_path),
+                outcome: None,
+            })
+            .collect();
+        self.members = members;
+        self.group_id = Some(group_id);
+        Ok(())
+    }
+}
+
+impl Future for SelectCall {
+    type Output = Result<SelectionResult>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if self.operations.is_some() {
+            if let Err(error) = self.initialize() {
+                return Poll::Ready(Err(error));
+            }
+        }
+
+        for leaf in &mut self.leaves {
+            if leaf.outcome.is_some() {
+                continue;
+            }
+            if let Poll::Ready(outcome) = leaf.call.poll_avro_value(cx) {
+                if outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(workflow_task_integrity_error)
+                {
+                    return Poll::Ready(outcome.map(|_| unreachable!()));
+                }
+                leaf.outcome = Some(outcome);
+            }
+        }
+
+        let all_members_terminal = self.leaves.iter().all(|leaf| leaf.outcome.is_some());
+        let selection_member_range = self
+            .members
+            .first()
+            .map(|member| member.base_sequence)
+            .zip(self.leaves.len().try_into().ok())
+            .map(|(base_sequence, size): (u64, u64)| {
+                base_sequence..base_sequence.saturating_add(size)
+            });
+        let marker = {
+            let mut state = match self.ctx.state.lock() {
+                Ok(state) => state,
+                Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+            };
+            let marker = state
+                .selection_markers
+                .get(state.selection_marker_cursor)
+                .cloned();
+            if marker.is_none()
+                && all_members_terminal
+                && selection_member_range.as_ref().is_some_and(|member_range| {
+                    state
+                        .recorded_commands
+                        .iter()
+                        .any(|command| member_range.contains(&command.sequence()))
+                })
+            {
+                // Terminal member history can be committed before the server's
+                // SelectionResolved marker becomes visible to this task. That
+                // marker is the durable barrier the selection is still waiting
+                // on, so an otherwise commandless replay remains legitimately
+                // pending instead of failing as an untracked yield.
+                state.matched_recorded_pending = true;
+            }
+            marker
+        };
+        let Some(marker) = marker else {
+            return Poll::Pending;
+        };
+        if self.group_id.as_deref() != Some(marker.selection_group_id.as_str())
+            || marker.selection_group_size != self.leaves.len()
+            || self.members.first().map(|member| member.base_sequence)
+                != Some(marker.selection_group_base_sequence)
+        {
+            return Poll::Ready(Err(invalid_recorded_history(
+                "selection_group_shape_mismatch",
+                marker.selection_group_base_sequence,
+                self.group_id
+                    .as_deref()
+                    .unwrap_or("initialized selection group"),
+                &marker.selection_group_id,
+                "recorded selection group differs from current workflow code",
+            )));
+        }
+        let Some(member_position) = self.members.iter().position(|member| {
+            member.key == marker.member_key
+                && member.index == marker.member_index
+                && member.base_sequence == marker.member_base_sequence
+                && member.size == marker.member_size
+                && member.kind == marker.operation_kind
+        }) else {
+            return Poll::Ready(Err(invalid_recorded_history(
+                "selection_member_shape_mismatch",
+                marker.member_base_sequence,
+                "winner member matching current workflow code",
+                &format!("{:?}", marker.member_key),
+                "recorded selection winner differs from the authored member identity",
+            )));
+        };
+        let member = self.members[member_position].clone();
+        let (handles, resolution_sequence) = {
+            let mut state = match self.ctx.state.lock() {
+                Ok(state) => state,
+                Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+            };
+            let identities = self
+                .members
+                .iter()
+                .map(|candidate| {
+                    selection_operation_identity(
+                        &state,
+                        &candidate.kind,
+                        candidate.base_sequence,
+                        candidate.size,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some((position, missing)) = identities
+                .iter()
+                .enumerate()
+                .find(|(_, identity)| identity.is_empty())
+                .map(|(position, identity)| (position, identity.clone()))
+            {
+                let candidate = &self.members[position];
+                return Poll::Ready(Err(invalid_recorded_history(
+                    "selection_operation_identity_missing",
+                    candidate.base_sequence,
+                    &format!(
+                        "durable {} resource identity from scheduled/open history",
+                        candidate.kind
+                    ),
+                    &missing,
+                    "selection member history is missing its canonical durable identity",
+                )));
+            }
+            let expected_winner_identity = &identities[member_position];
+            let resolution_sequence = match validated_selection_resolution_sequence(
+                &state,
+                &marker,
+                &member,
+                expected_winner_identity,
+            ) {
+                Ok(sequence) => sequence,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let handles = self
+                .members
+                .iter()
+                .zip(identities)
+                .map(|(member, identity)| DurableOperationHandle {
+                    ctx: self.ctx.clone(),
+                    key: member.key.clone(),
+                    index: member.index,
+                    kind: member.kind.clone(),
+                    identity,
+                    base_sequence: member.base_sequence,
+                    size: member.size,
+                    selection_group_id: marker.selection_group_id.clone(),
+                    shape: member.shape.clone(),
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) = validate_selection_cancellations_for_handles(&state, &handles) {
+                return Poll::Ready(Err(error));
+            }
+            state.selection_marker_cursor += 1;
+            (handles, resolution_sequence)
+        };
+
+        let mut winner_failure = None;
+        let mut flat_results = Vec::with_capacity(member.size);
+        if marker.outcome == "failed" {
+            let resolution_offset = match resolution_sequence
+                .checked_sub(member.base_sequence)
+                .and_then(|offset| usize::try_from(offset).ok())
+            {
+                Some(offset) if offset < member.size => offset,
+                _ => {
+                    return Poll::Ready(Err(invalid_recorded_history(
+                        "selection_resolution_event_mismatch",
+                        member.base_sequence,
+                        "failure event within selected member bounds",
+                        &resolution_sequence.to_string(),
+                        "selection failure event is outside the authored member",
+                    )))
+                }
+            };
+            let leaf = &mut self.leaves[member.leaf_start + resolution_offset];
+            match leaf.outcome.take() {
+                Some(Err(error)) => winner_failure = Some(error),
+                _ => {
+                    return Poll::Ready(Err(invalid_recorded_history(
+                        "selection_winner_outcome_mismatch",
+                        member.base_sequence,
+                        "exact failed terminal history referenced by SelectionResolved",
+                        "missing or successful resolution event",
+                        "selection winner marker disagrees with terminal operation history",
+                    )))
+                }
+            }
+        } else {
+            for leaf in &mut self.leaves[member.leaf_start..member.leaf_start + member.size] {
+                match leaf.outcome.take() {
+                    Some(Ok(result)) => flat_results.push(result),
+                    Some(Err(_)) => {
+                        return Poll::Ready(Err(invalid_recorded_history(
+                            "selection_winner_outcome_mismatch",
+                            member.base_sequence,
+                            "fully completed nested selection member",
+                            "failed durable leaf",
+                            "completed selection winner contains a failed leaf",
+                        )))
+                    }
+                    None => {
+                        return Poll::Ready(Err(invalid_recorded_history(
+                            "selection_winner_unresolved",
+                            member.base_sequence,
+                            "terminal history for every completed winner leaf",
+                            "pending member history",
+                            "completed SelectionResolved member has an unfinished durable barrier",
+                        )))
+                    }
+                }
+            }
+        }
+        let value = if winner_failure.is_none() {
+            let mut flat_results = flat_results.into_iter();
+            let value = parallel_results_for_shape(&member.shape, &mut flat_results);
+            match value.into_json_result() {
+                Ok(value) => Some(value),
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        } else {
+            None
+        };
+        let winner = handles[member_position].clone();
+        Poll::Ready(Ok(SelectionResult {
+            key: winner.key.clone(),
+            index: winner.index,
+            kind: winner.kind.clone(),
+            identity: winner.identity.clone(),
+            value,
+            failure: winner_failure,
+            winner,
+            handles,
+        }))
+    }
+}
+
+fn selection_operation_identity(
+    state: &WorkflowState,
+    kind: &str,
+    base_sequence: u64,
+    size: usize,
+) -> String {
+    if kind == "group" {
+        return format!("group:{base_sequence}:{size}");
+    }
+    let fields: &[&str] = match kind {
+        "activity" => &["activity_execution_id"],
+        "child" => &["child_workflow_run_id"],
+        "timer" => &["timer_id"],
+        "signal" => &["signal_wait_id"],
+        "condition" => &["condition_wait_id"],
+        _ => &[],
+    };
+    for sequence in base_sequence..base_sequence.saturating_add(size as u64) {
+        for event in state
+            .history_events
+            .iter()
+            .filter(|event| durable_event_sequence(event) == Some(sequence))
+        {
+            for field in fields {
+                if let Some(identity) = event.payload.get(*field).and_then(Value::as_str) {
+                    if !identity.is_empty() {
+                        return identity.to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn validated_selection_resolution_sequence(
+    state: &WorkflowState,
+    marker: &SelectionMarker,
+    member: &SelectionMemberPlan,
+    expected_identity: &str,
+) -> Result<u64> {
+    if expected_identity.is_empty() {
+        return Err(invalid_recorded_history(
+            "selection_operation_identity_missing",
+            member.base_sequence,
+            &format!(
+                "durable {} resource identity from scheduled/open history",
+                member.kind
+            ),
+            "missing operation identity",
+            "selection member history is missing its canonical durable identity",
+        ));
+    }
+    if marker.operation_identity != expected_identity {
+        return Err(invalid_recorded_history(
+            "selection_operation_identity_mismatch",
+            member.base_sequence,
+            expected_identity,
+            &marker.operation_identity,
+            "selection winner identity does not match durable scheduled/open history",
+        ));
+    }
+
+    let failure_types = [
+        "ActivityFailed",
+        "ActivityCancelled",
+        "ActivityTimedOut",
+        "ChildRunFailed",
+        "ChildRunCancelled",
+        "ChildRunTerminated",
+    ];
+    let success_types = [
+        "ActivityCompleted",
+        "ChildRunCompleted",
+        "TimerFired",
+        "SignalApplied",
+        "ConditionWaitSatisfied",
+        "ConditionWaitTimedOut",
+    ];
+    let terminal_types: &[&str] = if marker.outcome == "failed" {
+        &failure_types
+    } else {
+        &success_types
+    };
+    let mut candidates = Vec::new();
+    for event in state.history_events.iter() {
+        let Some(sequence) = durable_event_sequence(event) else {
+            continue;
+        };
+        if sequence < member.base_sequence
+            || sequence >= member.base_sequence.saturating_add(member.size as u64)
+            || !terminal_types.contains(&event.event_type.as_str())
+        {
+            continue;
+        }
+        let event_id = event
+            .raw
+            .get("id")
+            .or_else(|| event.raw.get("event_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                invalid_recorded_history(
+                    "selection_resolution_event_id_missing",
+                    member.base_sequence,
+                    "terminal selection history with a durable event id",
+                    &event.payload.to_string(),
+                    "selection terminal history cannot be bound to its winner marker",
+                )
+            })?;
+        candidates.push((event_id.to_string(), event.event_type.clone(), sequence));
+    }
+    let resolution = if marker.outcome == "failed" {
+        candidates.first()
+    } else {
+        candidates.last()
+    };
+    let Some((event_id, event_type, sequence)) = resolution else {
+        return Err(invalid_recorded_history(
+            "selection_resolution_event_missing",
+            member.base_sequence,
+            "terminal history for the selected member",
+            &format!("{:?}", marker.member_key),
+            "selection winner marker has no matching durable terminal event",
+        ));
+    };
+    if event_id != &marker.resolution_event_id || event_type != &marker.resolution_event_type {
+        return Err(invalid_recorded_history(
+            "selection_resolution_event_mismatch",
+            member.base_sequence,
+            &format!("{event_type}:{event_id}"),
+            &format!(
+                "{}:{}",
+                marker.resolution_event_type, marker.resolution_event_id
+            ),
+            "selection winner marker does not reference the event that made its member terminal",
+        ));
+    }
+    Ok(*sequence)
+}
+
+fn recorded_selection_member_outcome(
+    state: &WorkflowState,
+    handle: &DurableOperationHandle,
+) -> Result<Option<ParallelResult>> {
+    for event in state.history_events.iter() {
+        let Some(sequence) = durable_event_sequence(event) else {
+            continue;
+        };
+        if sequence < handle.base_sequence
+            || sequence >= handle.base_sequence.saturating_add(handle.size as u64)
+            || !matches!(
+                event.event_type.as_str(),
+                "ActivityFailed"
+                    | "ActivityCancelled"
+                    | "ActivityTimedOut"
+                    | "ChildRunFailed"
+                    | "ChildRunCancelled"
+                    | "ChildRunTerminated"
+            )
+        {
+            continue;
+        }
+        let Some(command) = state
+            .recorded_commands
+            .iter()
+            .find(|command| command.sequence() == sequence)
+        else {
+            continue;
+        };
+        match command {
+            RecordedCommand::Activity {
+                outcome: Some(Err(failure)),
+                ..
+            } => return Err(Error::ActivityFailed(failure.clone())),
+            RecordedCommand::ChildWorkflow {
+                outcome: Some(Err(failure)),
+                ..
+            } => return Err(Error::ChildWorkflowFailed(failure.clone())),
+            _ => {}
+        }
+    }
+
+    let mut results = Vec::with_capacity(handle.size);
+    for sequence in handle.base_sequence..handle.base_sequence.saturating_add(handle.size as u64) {
+        let Some(command) = state
+            .recorded_commands
+            .iter()
+            .find(|command| command.sequence() == sequence)
+        else {
+            return Ok(None);
+        };
+        let result = match command {
+            RecordedCommand::Activity { outcome, .. } => match outcome {
+                Some(Ok(value)) => ParallelAvroResult::Activity(value.clone()),
+                Some(Err(failure)) => return Err(Error::ActivityFailed(failure.clone())),
+                None => return Ok(None),
+            },
+            RecordedCommand::Timer { fired, .. } => {
+                if !fired {
+                    return Ok(None);
+                }
+                ParallelAvroResult::Timer
+            }
+            RecordedCommand::ChildWorkflow { outcome, .. } => match outcome {
+                Some(Ok(value)) => ParallelAvroResult::ChildWorkflow(value.clone()),
+                Some(Err(failure)) => return Err(Error::ChildWorkflowFailed(failure.clone())),
+                None => return Ok(None),
+            },
+            RecordedCommand::SignalWait { value, .. } => match value {
+                Some(value) => ParallelAvroResult::Signal(value.clone()),
+                None => return Ok(None),
+            },
+            RecordedCommand::ConditionWait { result, .. } => match result {
+                Some(result) => ParallelAvroResult::Condition(*result),
+                None => return Ok(None),
+            },
+            other => {
+                return Err(command_mismatch(
+                    other,
+                    format!("selected {} member", handle.kind),
+                ))
+            }
+        };
+        results.push(result);
+    }
+    let mut results = results.into_iter();
+    parallel_results_for_shape(&handle.shape, &mut results)
+        .into_json_result()
+        .map(Some)
+}
+
+fn recorded_selection_member_is_terminal(
+    state: &WorkflowState,
+    handle: &DurableOperationHandle,
+) -> bool {
+    let mut completed = 0usize;
+    let mut all_completed = true;
+    for sequence in handle.base_sequence..handle.base_sequence.saturating_add(handle.size as u64) {
+        let Some(command) = state
+            .recorded_commands
+            .iter()
+            .find(|command| command.sequence() == sequence)
+        else {
+            all_completed = false;
+            continue;
+        };
+        let terminal = match command {
+            RecordedCommand::Activity {
+                outcome: Some(Err(_)),
+                ..
+            }
+            | RecordedCommand::ChildWorkflow {
+                outcome: Some(Err(_)),
+                ..
+            } => return true,
+            RecordedCommand::Activity { outcome, .. } => outcome.is_some(),
+            RecordedCommand::ChildWorkflow { outcome, .. } => outcome.is_some(),
+            RecordedCommand::Timer { fired, .. } => *fired,
+            RecordedCommand::SignalWait { value, .. } => value.is_some(),
+            RecordedCommand::ConditionWait { result, .. } => result.is_some(),
+            RecordedCommand::SearchAttributes { .. }
+            | RecordedCommand::SideEffect { .. }
+            | RecordedCommand::VersionMarker { .. }
+            | RecordedCommand::Memo { .. } => false,
+        };
+        if !terminal {
+            all_completed = false;
+            continue;
+        }
+        completed += 1;
+    }
+    all_completed && completed == handle.size
+}
+
+fn selection_cancellation_for_handle(
+    state: &WorkflowState,
+    handle: &DurableOperationHandle,
+) -> Result<bool> {
+    let Some(marker) = state.cancelled_selection_members.iter().find(|recorded| {
+        recorded.selection_group_id == handle.selection_group_id
+            && recorded.member_base_sequence == handle.base_sequence
+    }) else {
+        return Ok(false);
+    };
+    validate_selection_cancellation_marker(marker, handle)?;
+    Ok(true)
+}
+
+fn validate_selection_cancellations_for_handles(
+    state: &WorkflowState,
+    handles: &[DurableOperationHandle],
+) -> Result<()> {
+    let Some(group_id) = handles
+        .first()
+        .map(|handle| handle.selection_group_id.as_str())
+    else {
+        return Ok(());
+    };
+    for marker in state
+        .cancelled_selection_members
+        .iter()
+        .filter(|marker| marker.selection_group_id == group_id)
+    {
+        let Some(handle) = handles
+            .iter()
+            .find(|handle| handle.base_sequence == marker.member_base_sequence)
+        else {
+            return Err(invalid_recorded_history(
+                "selection_cancellation_member_mismatch",
+                marker.member_base_sequence,
+                "SelectionOperationCancelled matching an authored selection handle",
+                &format!("{marker:?}"),
+                "selection cancellation member base does not name an authored member",
+            ));
+        };
+        validate_selection_cancellation_marker(marker, handle)?;
+    }
+    Ok(())
+}
+
+fn validate_selection_cancellation_marker(
+    marker: &SelectionCancellation,
+    handle: &DurableOperationHandle,
+) -> Result<()> {
+    if marker.selection_group_id != handle.selection_group_id
+        || marker.member_key != handle.key
+        || marker.member_index != handle.index
+        || marker.member_base_sequence != handle.base_sequence
+        || marker.member_size != handle.size
+        || marker.operation_kind != handle.kind
+        || marker.operation_identity != handle.identity
+    {
+        return Err(invalid_recorded_history(
+            "selection_cancellation_member_mismatch",
+            handle.base_sequence,
+            "SelectionOperationCancelled matching the authored selection handle",
+            &format!("{marker:?}"),
+            "selection cancellation history targets different authored member metadata",
+        ));
+    }
+    Ok(())
+}
+
+/// Future returned by [`DurableOperationHandle::await_result`].
+pub struct DurableOperationAwaitCall {
+    handle: DurableOperationHandle,
+}
+
+impl Future for DurableOperationAwaitCall {
+    type Output = Result<ParallelResult>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let state = match self.handle.ctx.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+        };
+        match selection_cancellation_for_handle(&state, &self.handle) {
+            Err(error) => return Poll::Ready(Err(error)),
+            Ok(false) => {}
+            Ok(true) => {
+                return Poll::Ready(Err(Error::DurableOperationCancelled(
+                    DurableOperationCancelled {
+                        selection_group_id: self.handle.selection_group_id.clone(),
+                        member_key: self.handle.key.clone(),
+                        member_index: self.handle.index,
+                        operation_kind: self.handle.kind.clone(),
+                        operation_identity: self.handle.identity.clone(),
+                    },
+                )));
+            }
+        }
+        match recorded_selection_member_outcome(&state, &self.handle) {
+            Ok(Some(result)) => Poll::Ready(Ok(result)),
+            Ok(None) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+/// Future returned by [`DurableOperationHandle::cancel`].
+pub struct CancelDurableOperationCall {
+    handle: DurableOperationHandle,
+    emitted: bool,
+}
+
+impl Future for CancelDurableOperationCall {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let ctx = self.handle.ctx.clone();
+        let mut state = match ctx.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+        };
+        match selection_cancellation_for_handle(&state, &self.handle) {
+            Err(error) => return Poll::Ready(Err(error)),
+            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(false) => {}
+        }
+        if recorded_selection_member_is_terminal(&state, &self.handle) {
+            return Poll::Ready(Ok(()));
+        }
+        if !self.emitted {
+            state.commands.push(json!({
+                "type": "cancel_selection_operation",
+                "selection_group_id": self.handle.selection_group_id,
+                "member_key": self.handle.key,
+                "member_index": self.handle.index,
+                "member_base_sequence": self.handle.base_sequence,
+                "member_size": self.handle.size,
+                "operation_kind": self.handle.kind,
+                "operation_identity": self.handle.identity,
+            }));
+            self.emitted = true;
+        }
+        // The cancellation command is only a request. Do not expose workflow
+        // state after cancel until committed SelectionOperationCancelled
+        // history proves that the request won the race with member completion.
+        Poll::Pending
     }
 }
 
@@ -10055,6 +11583,7 @@ pub struct ConditionWaitCall {
     predicate: Box<dyn Fn() -> Result<bool> + Send + 'static>,
     occurrence_id: Option<String>,
     opened_wait: bool,
+    parallel_group_path: Vec<ParallelGroupMetadata>,
 }
 
 impl Future for ConditionWaitCall {
@@ -10116,6 +11645,7 @@ impl Future for ConditionWaitCall {
                     predicate_identity,
                     timeout_seconds,
                     result: recorded_result,
+                    parallel_group_path,
                     ..
                 }) = state.recorded_commands.get(cursor)
                 else {
@@ -10124,6 +11654,13 @@ impl Future for ConditionWaitCall {
 
                 if cursor > state.command_cursor && recorded_occurrence_id != &occurrence_id {
                     break;
+                }
+                if let Err(error) = ensure_parallel_path_matches(
+                    *sequence,
+                    parallel_group_path.as_deref(),
+                    &self.parallel_group_path,
+                ) {
+                    return Poll::Ready(Err(error));
                 }
                 if let Err(error) = validate_recorded_condition_wait(
                     *sequence,
@@ -10172,12 +11709,18 @@ impl ConditionWaitCall {
         mut self: Pin<&mut Self>,
         options: ValidatedConditionWaitOptions,
     ) -> Poll<Result<ConditionWaitResult>> {
+        let selection_member = self
+            .parallel_group_path
+            .first()
+            .is_some_and(|entry| entry.parallel_group_mode.as_deref() == Some("select"));
         match (self.predicate)() {
-            Ok(true) => return Poll::Ready(Ok(ConditionWaitResult::Satisfied)),
-            Ok(false) => {}
+            Ok(true) if !selection_member => {
+                return Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+            }
+            Ok(_) => {}
             Err(error) => return Poll::Ready(Err(error)),
         }
-        if options.timeout_seconds == Some(0) {
+        if options.timeout_seconds == Some(0) && !selection_member {
             return Poll::Ready(Ok(ConditionWaitResult::TimedOut));
         }
 
@@ -10201,6 +11744,7 @@ impl ConditionWaitCall {
         if let Some(timeout_seconds) = options.timeout_seconds {
             command.insert("timeout_seconds".to_string(), json!(timeout_seconds));
         }
+        apply_parallel_group_path(&mut command, &self.parallel_group_path);
         state.commands.push(Value::Object(command));
         drop(state);
         self.opened_wait = true;
@@ -10448,6 +11992,7 @@ pub struct SignalCall {
     runtime_reserved_allowed: bool,
     opened_wait: bool,
     matched_pending: bool,
+    parallel_group_path: Vec<ParallelGroupMetadata>,
 }
 
 impl SignalCall {
@@ -10476,7 +12021,15 @@ impl SignalCall {
                     sequence,
                     signal_name,
                     value,
+                    parallel_group_path,
                 } => {
+                    if let Err(error) = ensure_parallel_path_matches(
+                        sequence,
+                        parallel_group_path.as_deref(),
+                        &self.parallel_group_path,
+                    ) {
+                        return Poll::Ready(Err(error));
+                    }
                     if signal_name != self.signal_name {
                         return Poll::Ready(Err(Error::NonDeterministicReplay(
                             ReplayFailure::new(
@@ -10532,10 +12085,12 @@ impl SignalCall {
         }
 
         if !self.opened_wait {
-            state.commands.push(json!({
-                "type": "open_signal_wait",
-                "signal_name": self.signal_name
-            }));
+            let mut command = serde_json::Map::from_iter([
+                ("type".to_string(), json!("open_signal_wait")),
+                ("signal_name".to_string(), json!(self.signal_name)),
+            ]);
+            apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            state.commands.push(Value::Object(command));
             self.opened_wait = true;
         }
 
@@ -10754,16 +12309,19 @@ fn recorded_parallel_group_entry(payload: &Value, sequence: u64) -> Result<Paral
         invalid_recorded_history(
             "parallel_group_metadata_invalid",
             sequence,
-            "activity, child, timer, or mixed group kind",
+            "activity, child, timer, signal, condition, or mixed group kind",
             &payload.to_string(),
             "parallel-group history is missing its group kind",
         )
     })?;
-    if !matches!(kind.as_str(), "activity" | "child" | "timer" | "mixed") {
+    if !matches!(
+        kind.as_str(),
+        "activity" | "child" | "timer" | "signal" | "condition" | "mixed"
+    ) {
         return Err(invalid_recorded_history(
             "parallel_group_metadata_invalid",
             sequence,
-            "activity, child, timer, or mixed group kind",
+            "activity, child, timer, signal, condition, or mixed group kind",
             &kind,
             "parallel-group history contains an unsupported group kind",
         ));
@@ -10818,7 +12376,24 @@ fn recorded_parallel_group_entry(payload: &Value, sequence: u64) -> Result<Paral
             "parallel-group path does not preserve durable workflow position",
         ));
     }
-    let expected_id = format!("{}:{base_sequence}:{size}", parallel_group_prefix(&kind));
+    let mode = payload
+        .get("parallel_group_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+    if !matches!(mode, "all" | "select") {
+        return Err(invalid_recorded_history(
+            "parallel_group_metadata_invalid",
+            sequence,
+            "parallel group mode all or select",
+            mode,
+            "parallel-group history contains an unsupported group mode",
+        ));
+    }
+    let expected_id = if mode == "select" {
+        format!("select-calls:{base_sequence}:{size}")
+    } else {
+        format!("{}:{base_sequence}:{size}", parallel_group_prefix(&kind))
+    };
     if group_id != expected_id {
         return Err(invalid_recorded_history(
             "parallel_group_metadata_invalid",
@@ -10828,13 +12403,164 @@ fn recorded_parallel_group_entry(payload: &Value, sequence: u64) -> Result<Paral
             "parallel-group history contains an incompatible stable group ID",
         ));
     }
+    let selection_member_key = if mode == "select" {
+        Some(selection_key_from_value(
+            payload.get("selection_member_key"),
+            sequence,
+        )?)
+    } else {
+        None
+    };
+    let selection_member_index = if mode == "select" {
+        Some(required_parallel_usize(
+            payload,
+            "selection_member_index",
+            sequence,
+        )?)
+    } else {
+        None
+    };
+    let selection_member_base_sequence = if mode == "select" {
+        Some(
+            payload
+                .get("selection_member_base_sequence")
+                .and_then(value_as_u64)
+                .filter(|value| *value >= base_sequence)
+                .ok_or_else(|| {
+                    invalid_recorded_history(
+                        "parallel_group_metadata_invalid",
+                        sequence,
+                        "selection member base within its group",
+                        &payload.to_string(),
+                        "selection history contains an invalid member base sequence",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let selection_member_size = if mode == "select" {
+        let member_size = required_parallel_usize(payload, "selection_member_size", sequence)?;
+        if member_size == 0 {
+            return Err(invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "positive selection member size",
+                &payload.to_string(),
+                "selection history contains an invalid member size",
+            ));
+        }
+        Some(member_size)
+    } else {
+        None
+    };
+    let selection_member_kind = if mode == "select" {
+        let kind = payload_string(payload, "selection_member_kind").ok_or_else(|| {
+            invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "selection member operation kind",
+                &payload.to_string(),
+                "selection history is missing its authored member kind",
+            )
+        })?;
+        if !matches!(
+            kind.as_str(),
+            "activity" | "child" | "timer" | "signal" | "condition" | "group"
+        ) {
+            return Err(invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "activity, child, timer, signal, condition, or group selection member kind",
+                &kind,
+                "selection history contains an unsupported member kind",
+            ));
+        }
+        Some(kind)
+    } else {
+        None
+    };
+    if let (Some(member_base), Some(member_size)) =
+        (selection_member_base_sequence, selection_member_size)
+    {
+        let member_end = member_base
+            .checked_add(u64::try_from(member_size).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                invalid_recorded_history(
+                    "parallel_group_metadata_invalid",
+                    sequence,
+                    "bounded selection member range",
+                    &payload.to_string(),
+                    "selection member range overflowed",
+                )
+            })?;
+        let group_end = base_sequence
+            .checked_add(u64::try_from(size).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
+        if sequence < member_base || sequence >= member_end || member_end > group_end {
+            return Err(invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                "workflow sequence within one bounded selection member",
+                &payload.to_string(),
+                "selection member range does not contain its durable leaf",
+            ));
+        }
+    }
     Ok(ParallelGroupMetadata {
         parallel_group_id: group_id,
         parallel_group_kind: kind,
         parallel_group_base_sequence: base_sequence,
         parallel_group_size: size,
         parallel_group_index: index,
+        parallel_group_mode: (mode == "select").then(|| "select".to_string()),
+        selection_member_key,
+        selection_member_index,
+        selection_member_base_sequence,
+        selection_member_size,
+        selection_member_kind,
     })
+}
+
+fn required_parallel_usize(payload: &Value, field: &str, sequence: u64) -> Result<usize> {
+    payload
+        .get(field)
+        .and_then(value_as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            invalid_recorded_history(
+                "parallel_group_metadata_invalid",
+                sequence,
+                &format!("non-negative integer {field}"),
+                &payload.to_string(),
+                "selection history contains invalid member metadata",
+            )
+        })
+}
+
+fn selection_key_from_value(value: Option<&Value>, sequence: u64) -> Result<SelectionKey> {
+    match value {
+        Some(Value::String(value)) if !value.is_empty() => Ok(SelectionKey::Name(value.clone())),
+        Some(value) => value_as_u64(value)
+            .and_then(|value| usize::try_from(value).ok())
+            .map(SelectionKey::Index)
+            .ok_or_else(|| {
+                invalid_recorded_history(
+                    "selection_member_key_invalid",
+                    sequence,
+                    "non-empty string or non-negative integer member key",
+                    &value.to_string(),
+                    "selection history contains an invalid member key",
+                )
+            }),
+        None => Err(invalid_recorded_history(
+            "selection_member_key_missing",
+            sequence,
+            "selection_member_key",
+            "<missing>",
+            "selection history is missing its stable member key",
+        )),
+    }
 }
 
 fn recorded_parallel_group_path(
@@ -10849,7 +12575,9 @@ fn recorded_parallel_group_path(
             || payload.get("parallel_group_kind").is_some()
             || payload.get("parallel_group_base_sequence").is_some()
             || payload.get("parallel_group_size").is_some()
-            || payload.get("parallel_group_index").is_some();
+            || payload.get("parallel_group_index").is_some()
+            || payload.get("parallel_group_mode").is_some()
+            || payload.get("selection_member_key").is_some();
         if !has_metadata {
             continue;
         }
@@ -11291,6 +13019,10 @@ fn recorded_commands(
                     sequence,
                     signal_name,
                     value,
+                    parallel_group_path: recorded_parallel_group_path(
+                        &signal_wait_events,
+                        sequence,
+                    )?,
                 });
             }
 
@@ -11831,6 +13563,7 @@ fn recorded_condition_wait(
         predicate_identity,
         timeout_seconds,
         result,
+        parallel_group_path: recorded_parallel_group_path(condition_events, sequence)?,
     })
 }
 
@@ -12736,8 +14469,10 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 mod tests {
     use super::*;
     use std::{
+        fs,
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        process::Command as ProcessCommand,
         sync::atomic::AtomicUsize,
         thread,
     };
@@ -13360,6 +15095,748 @@ mod tests {
             assert!(matches!(outcome, Poll::Pending), "{outcome:?}");
             assert!(ctx.take_commands().expect("commands").is_empty());
         }
+    }
+
+    fn selection_path(index: usize, key: &str) -> Vec<ParallelGroupMetadata> {
+        vec![selection_group_entry(
+            1,
+            2,
+            index,
+            "activity",
+            &SelectionMemberMetadata {
+                key: SelectionKey::Name(key.to_string()),
+                index,
+                base_sequence: index as u64 + 1,
+                size: 1,
+                kind: "activity".to_string(),
+            },
+        )]
+    }
+
+    fn selection_activity_event(
+        event_type: &str,
+        index: usize,
+        key: &str,
+        result: Option<Value>,
+    ) -> HistoryEvent {
+        let sequence = index as u64 + 1;
+        let mut event = parallel_history_event(
+            event_type,
+            sequence,
+            "activity_type",
+            &format!("{key}-activity"),
+            selection_path(index, key),
+            result,
+        );
+        event.payload["activity_execution_id"] = json!(format!("activity-{key}"));
+        event.raw.insert(
+            "id".to_string(),
+            json!(if event_type == "ActivityCompleted" {
+                format!("event-{key}")
+            } else {
+                format!("{event_type}-{key}")
+            }),
+        );
+        event
+    }
+
+    fn selection_winner_marker() -> HistoryEvent {
+        history_event(
+            "SelectionResolved",
+            json!({
+                "selection_group_id": "select-calls:1:2",
+                "selection_group_base_sequence": 1,
+                "selection_group_size": 2,
+                "member_key": "fast",
+                "member_index": 1,
+                "member_base_sequence": 2,
+                "member_size": 1,
+                "operation_kind": "activity",
+                "operation_identity": "activity-fast",
+                "outcome": "completed",
+                "resolution_event_id": "event-fast",
+                "resolution_event_type": "ActivityCompleted",
+            }),
+        )
+    }
+
+    fn keyed_activity_selection(ctx: &WorkflowContext) -> SelectCall {
+        ctx.select_keyed(vec![
+            (
+                "slow",
+                ParallelOperation::activity_with_options(
+                    "slow-activity",
+                    ActivityOptions::new().task_queue("default"),
+                    json!([]),
+                ),
+            ),
+            (
+                "fast",
+                ParallelOperation::activity_with_options(
+                    "fast-activity",
+                    ActivityOptions::new().task_queue("default"),
+                    json!([]),
+                ),
+            ),
+        ])
+    }
+
+    fn assert_persisted_selection_replay(history: Vec<HistoryEvent>) {
+        let ctx = workflow_context(history);
+        let mut call = Box::pin(keyed_activity_selection(&ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let selected = match call.as_mut().poll(&mut task_context) {
+            Poll::Ready(Ok(selected)) => selected,
+            Poll::Ready(Err(error)) => panic!("persisted selection winner must replay: {error:?}"),
+            Poll::Pending => panic!("persisted selection winner must replay without pending"),
+        };
+        assert_eq!(selected.key, SelectionKey::Name("fast".to_string()));
+        assert_eq!(
+            selected.value,
+            Some(ParallelResult::Activity(json!("winner-value")))
+        );
+        let slow = selected
+            .handle(&SelectionKey::Name("slow".to_string()))
+            .expect("slow handle")
+            .clone();
+        let mut await_slow = Box::pin(slow.await_result());
+        assert!(matches!(
+            await_slow.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ParallelResult::Activity(value))) if value == json!("loser-value")
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    const SELECTION_COLD_REPLAY_HISTORY: &str = "DURABLE_WORKFLOW_SELECTION_COLD_REPLAY_HISTORY";
+
+    fn canonical_selection_history() -> Vec<HistoryEvent> {
+        const FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/durable_selection_runtime_history.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(FIXTURE)),
+            "51fd8b9c16e978dcef536a5c727b9fdc0ae724d9afc17d9a7837d219f41ee3ba",
+        );
+        let fixture: Value = serde_json::from_slice(FIXTURE).expect("canonical selection fixture");
+
+        serde_json::from_value(fixture["history"].clone()).expect("canonical selection history")
+    }
+
+    #[test]
+    fn selection_fresh_process_entrypoint() {
+        let Ok(path) = std::env::var(SELECTION_COLD_REPLAY_HISTORY) else {
+            return;
+        };
+        let persisted = fs::read(path).expect("persisted selection history");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&persisted)),
+            "51fd8b9c16e978dcef536a5c727b9fdc0ae724d9afc17d9a7837d219f41ee3ba",
+        );
+        let fixture: Value =
+            serde_json::from_slice(&persisted).expect("valid persisted selection fixture");
+        let history: Vec<HistoryEvent> = serde_json::from_value(fixture["history"].clone())
+            .expect("valid persisted selection history");
+
+        assert_persisted_selection_replay(history);
+    }
+
+    #[test]
+    fn selection_starts_every_member_with_stable_keys_and_group_identity() {
+        let ctx = workflow_context(Vec::new());
+        let mut call = Box::pin(keyed_activity_selection(&ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("selection commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["selection_member_key"], json!("slow"));
+        assert_eq!(commands[1]["selection_member_key"], json!("fast"));
+        assert!(commands.iter().all(|command| {
+            command["parallel_group_id"] == json!("select-calls:1:2")
+                && command["parallel_group_mode"] == json!("select")
+        }));
+    }
+
+    #[test]
+    fn selection_key_domain_rejects_empty_authoring_and_malformed_history() {
+        let ctx = workflow_context(Vec::new());
+        let mut invalid = Box::pin(ctx.select_keyed(vec![(
+            "",
+            ParallelOperation::activity("invalid", json!([])),
+        )]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            invalid.as_mut().poll(&mut task_context),
+            Poll::Ready(Err(Error::InvalidParallelGroup(ParallelGroupError {
+                reason: "selection_key_invalid",
+                ..
+            })))
+        ));
+
+        for invalid_key in [json!(""), json!(-1)] {
+            let mut event = selection_activity_event("ActivityScheduled", 0, "slow", None);
+            event.payload["selection_member_key"] = invalid_key.clone();
+            event.payload["parallel_group_path"][0]["selection_member_key"] = invalid_key;
+            assert!(matches!(
+                WorkflowState::new_with_identity(
+                    vec![event],
+                    None,
+                    None,
+                    "rust-workers".to_string(),
+                    DEFAULT_CODEC.to_string(),
+                    None,
+                ),
+                Err(Error::NonDeterministicReplay(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn selection_preserves_valid_named_and_numeric_keys() {
+        let ctx = workflow_context(Vec::new());
+        let mut selection = Box::pin(ctx.select_keyed(vec![
+            (
+                SelectionKey::Index(0),
+                ParallelOperation::activity("numeric", json!([])),
+            ),
+            (
+                SelectionKey::Name("named".to_string()),
+                ParallelOperation::timer(Duration::from_secs(1)),
+            ),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            selection.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("selection commands");
+        assert_eq!(commands[0]["selection_member_key"], json!(0));
+        assert_eq!(commands[1]["selection_member_key"], json!("named"));
+    }
+
+    #[test]
+    fn selection_replays_persisted_winner_and_loser_can_be_awaited_later() {
+        let history = canonical_selection_history();
+        assert_persisted_selection_replay(history.clone());
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/durable_selection_runtime_history.json");
+        let output =
+            ProcessCommand::new(std::env::current_exe().expect("current Rust test binary"))
+                .args([
+                    "--exact",
+                    "tests::selection_fresh_process_entrypoint",
+                    "--nocapture",
+                ])
+                .env(SELECTION_COLD_REPLAY_HISTORY, &path)
+                .output()
+                .expect("run fresh selection replay process");
+
+        assert!(
+            output.status.success(),
+            "fresh selection replay failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn selection_waits_durably_when_terminal_members_precede_the_winner_marker() {
+        let mut history = canonical_selection_history();
+        history.retain(|event| event.event_type != "SelectionResolved");
+        let ctx = workflow_context(history);
+        let mut selection = Box::pin(keyed_activity_selection(&ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            selection.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+        assert!(
+            ctx.matched_recorded_pending()
+                .expect("selection pending state"),
+            "terminal member history must keep the workflow durably pending until SelectionResolved commits"
+        );
+    }
+
+    #[test]
+    fn selection_terminal_condition_history_waits_durably_for_its_winner_marker() {
+        for (terminal_event, predicate_satisfied, timeout_seconds) in [
+            ("ConditionWaitSatisfied", true, None),
+            ("ConditionWaitTimedOut", false, Some(0)),
+        ] {
+            let member = SelectionMemberMetadata {
+                key: SelectionKey::Name("condition".to_string()),
+                index: 0,
+                base_sequence: 1,
+                size: 1,
+                kind: "condition".to_string(),
+            };
+            let path = vec![selection_group_entry(1, 1, 0, "condition", &member)];
+            let mut payload = json!({
+                "sequence": 1,
+                "condition_wait_id": "condition-1",
+                "condition_wait_occurrence_id": "rust:condition-wait:0",
+                "condition_key": "ready",
+                "condition_definition_fingerprint": "sha256:ready-v1",
+                "parallel_group_path": path,
+            });
+            payload
+                .as_object_mut()
+                .expect("condition history payload")
+                .extend(
+                    serde_json::to_value(&path[0])
+                        .expect("condition selection metadata")
+                        .as_object()
+                        .expect("condition selection metadata object")
+                        .clone(),
+                );
+            if let Some(timeout_seconds) = timeout_seconds {
+                payload["timeout_seconds"] = json!(timeout_seconds);
+            }
+            let history = vec![
+                history_event("ConditionWaitOpened", payload.clone()),
+                history_event(terminal_event, payload),
+            ];
+            let ctx = workflow_context(history);
+            let mut options = ConditionWaitOptions::new("ready", "sha256:ready-v1");
+            if timeout_seconds.is_some() {
+                options = options.timeout(Duration::ZERO);
+            }
+            let mut selection = Box::pin(ctx.select_keyed(vec![(
+                "condition",
+                ParallelOperation::condition(options, move || Ok(predicate_satisfied)),
+            )]));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+            assert!(matches!(
+                selection.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+            assert!(
+                ctx.matched_recorded_pending()
+                    .expect("condition selection pending state"),
+                "{terminal_event} must keep the workflow durably pending until SelectionResolved commits"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_immediate_condition_members_open_a_durable_wait() {
+        for predicate_satisfied in [true, false] {
+            let ctx = workflow_context(Vec::new());
+            let mut selection = Box::pin(ctx.select_keyed(vec![(
+                "condition",
+                ParallelOperation::condition(
+                    ConditionWaitOptions::new("ready", "sha256:ready-v1").timeout(Duration::ZERO),
+                    move || Ok(predicate_satisfied),
+                ),
+            )]));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+            assert!(matches!(
+                selection.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            let commands = ctx.take_commands().expect("condition selection command");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["type"], json!("open_condition_wait"));
+            assert_eq!(commands[0]["timeout_seconds"], json!(0));
+            assert_eq!(
+                commands[0]["parallel_group_path"][0]["parallel_group_mode"],
+                json!("select")
+            );
+        }
+    }
+
+    #[test]
+    fn selection_loser_cancellation_is_explicit_and_idempotent() {
+        let history = vec![
+            selection_activity_event("ActivityScheduled", 0, "slow", None),
+            selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("winner"))),
+            selection_winner_marker(),
+        ];
+        let ctx = workflow_context(history.clone());
+        let mut call = Box::pin(keyed_activity_selection(&ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Ok(selected)) = call.as_mut().poll(&mut task_context) else {
+            panic!("winner must replay");
+        };
+        let slow = selected
+            .handle(&SelectionKey::Name("slow".to_string()))
+            .expect("slow handle")
+            .clone();
+        let mut cancel = Box::pin(slow.cancel());
+        assert!(matches!(
+            cancel.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            cancel.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("cancel command");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["type"], json!("cancel_selection_operation"));
+        assert_eq!(commands[0]["member_key"], json!("slow"));
+
+        let mut cancelled_history = history;
+        cancelled_history.push(history_event(
+            "SelectionOperationCancelled",
+            json!({
+                "selection_group_id": "select-calls:1:2",
+                "member_key": "slow",
+                "member_index": 0,
+                "member_base_sequence": 1,
+                "member_size": 1,
+                "operation_kind": "activity",
+                "operation_identity": "activity-slow",
+                "cancelled_at": "2026-08-27T00:00:00Z",
+            }),
+        ));
+        let replayed = workflow_context(cancelled_history);
+        let mut call = Box::pin(keyed_activity_selection(&replayed));
+        let Poll::Ready(Ok(selected)) = call.as_mut().poll(&mut task_context) else {
+            panic!("winner must replay after cancellation");
+        };
+        let slow = selected
+            .handle(&SelectionKey::Name("slow".to_string()))
+            .expect("slow handle")
+            .clone();
+        let mut cancel = Box::pin(slow.cancel());
+        assert!(matches!(
+            cancel.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(replayed.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn selection_cancellation_marker_is_bound_to_every_authored_handle_field() {
+        let base_history = vec![
+            selection_activity_event("ActivityScheduled", 0, "slow", None),
+            selection_activity_event("ActivityScheduled", 1, "fast", None),
+            selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("winner"))),
+            selection_winner_marker(),
+        ];
+        for (field, corrupt) in [
+            ("member_key", json!("fast")),
+            ("member_index", json!(1)),
+            ("member_base_sequence", json!(3)),
+            ("member_size", json!(2)),
+            ("operation_kind", json!("timer")),
+            ("operation_identity", json!("forged")),
+        ] {
+            let mut cancellation = json!({
+                "selection_group_id": "select-calls:1:2",
+                "member_key": "slow",
+                "member_index": 0,
+                "member_base_sequence": 1,
+                "member_size": 1,
+                "operation_kind": "activity",
+                "operation_identity": "activity-slow",
+            });
+            cancellation[field] = corrupt;
+            let mut history = base_history.clone();
+            history.push(history_event("SelectionOperationCancelled", cancellation));
+            let ctx = workflow_context(history);
+            let mut selection = Box::pin(keyed_activity_selection(&ctx));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+            assert!(matches!(
+                selection.as_mut().poll(&mut task_context),
+                Poll::Ready(Err(Error::NonDeterministicReplay(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn selection_child_identity_prefers_the_durable_run_id() {
+        let ctx = workflow_context(vec![history_event(
+            "ChildWorkflowScheduled",
+            json!({
+                "sequence": 1,
+                "child_workflow_type": "child",
+                "child_workflow_instance_id": "child-instance",
+                "child_workflow_run_id": "child-run",
+            }),
+        )]);
+        let state = ctx.state.lock().expect("workflow state");
+
+        assert_eq!(
+            selection_operation_identity(&state, "child", 1, 1),
+            "child-run"
+        );
+    }
+
+    #[test]
+    fn selection_activity_identity_requires_canonical_execution_id() {
+        let slow = selection_activity_event("ActivityScheduled", 0, "slow", None);
+        let mut fast_open = selection_activity_event("ActivityScheduled", 1, "fast", None);
+        let mut fast_completed =
+            selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("winner")));
+        for event in [&mut fast_open, &mut fast_completed] {
+            event
+                .payload
+                .as_object_mut()
+                .expect("activity payload")
+                .remove("activity_execution_id");
+            event.payload["activity_id"] = json!("forged-activity-id");
+        }
+        let mut marker = selection_winner_marker();
+        marker.payload["operation_identity"] = json!("forged-activity-id");
+        let ctx = workflow_context(vec![slow, fast_open, fast_completed, marker]);
+        let mut selection = Box::pin(keyed_activity_selection(&ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            selection.as_mut().poll(&mut task_context),
+            Poll::Ready(Err(Error::NonDeterministicReplay(_)))
+        ));
+    }
+
+    #[test]
+    fn selection_completion_before_cancellation_remains_awaitable() {
+        let history = vec![
+            selection_activity_event("ActivityScheduled", 0, "slow", None),
+            selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("winner"))),
+            selection_winner_marker(),
+            selection_activity_event(
+                "ActivityCompleted",
+                0,
+                "slow",
+                Some(json!("completed-first")),
+            ),
+        ];
+        let ctx = workflow_context(history);
+        let mut selection = Box::pin(keyed_activity_selection(&ctx));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Ok(selected)) = selection.as_mut().poll(&mut task_context) else {
+            panic!("winner must replay");
+        };
+        let slow = selected
+            .handle(&SelectionKey::Name("slow".to_string()))
+            .expect("slow handle")
+            .clone();
+        let mut cancel = Box::pin(slow.cancel());
+        assert!(matches!(
+            cancel.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(()))
+        ));
+        let mut await_slow = Box::pin(slow.await_result());
+        assert!(matches!(
+            await_slow.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ParallelResult::Activity(value))) if value == json!("completed-first")
+        ));
+        let commands = ctx.take_commands().expect("commands");
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn selection_nested_later_failure_before_cancel_remains_the_awaited_failure() {
+        let nested_member = SelectionMemberMetadata {
+            key: SelectionKey::Name("nested".to_string()),
+            index: 0,
+            base_sequence: 1,
+            size: 2,
+            kind: "group".to_string(),
+        };
+        let deadline_member = SelectionMemberMetadata {
+            key: SelectionKey::Name("deadline".to_string()),
+            index: 1,
+            base_sequence: 3,
+            size: 1,
+            kind: "timer".to_string(),
+        };
+        let nested_paths = [
+            vec![
+                selection_group_entry(1, 3, 0, "mixed", &nested_member),
+                parallel_group_entry(1, 2, 0, "activity"),
+            ],
+            vec![
+                selection_group_entry(1, 3, 1, "mixed", &nested_member),
+                parallel_group_entry(1, 2, 1, "activity"),
+            ],
+        ];
+        let deadline_path = vec![selection_group_entry(1, 3, 2, "mixed", &deadline_member)];
+        let mut timer_fired = parallel_history_event(
+            "TimerFired",
+            3,
+            "timer_id",
+            "timer-3",
+            deadline_path.clone(),
+            None,
+        );
+        timer_fired.payload["delay_seconds"] = json!(0);
+        timer_fired
+            .raw
+            .insert("id".to_string(), json!("timer-fired"));
+        let mut timer_scheduled = parallel_history_event(
+            "TimerScheduled",
+            3,
+            "timer_id",
+            "timer-3",
+            deadline_path,
+            None,
+        );
+        timer_scheduled.payload["delay_seconds"] = json!(0);
+        let history = vec![
+            parallel_history_event(
+                "ActivityScheduled",
+                1,
+                "activity_type",
+                "nested-first",
+                nested_paths[0].clone(),
+                None,
+            ),
+            parallel_history_event(
+                "ActivityScheduled",
+                2,
+                "activity_type",
+                "nested-second",
+                nested_paths[1].clone(),
+                None,
+            ),
+            timer_scheduled,
+            timer_fired,
+            history_event(
+                "SelectionResolved",
+                json!({
+                    "selection_group_id": "select-calls:1:3",
+                    "selection_group_base_sequence": 1,
+                    "selection_group_size": 3,
+                    "member_key": "deadline",
+                    "member_index": 1,
+                    "member_base_sequence": 3,
+                    "member_size": 1,
+                    "operation_kind": "timer",
+                    "operation_identity": "timer-3",
+                    "outcome": "completed",
+                    "resolution_event_id": "timer-fired",
+                    "resolution_event_type": "TimerFired",
+                }),
+            ),
+            parallel_history_event(
+                "ActivityFailed",
+                2,
+                "activity_type",
+                "nested-second",
+                nested_paths[1].clone(),
+                None,
+            ),
+        ];
+        let ctx = workflow_context(history);
+        let mut selection = Box::pin(ctx.select_keyed(vec![
+            (
+                "nested",
+                ParallelOperation::group(vec![
+                    ParallelOperation::activity("nested-first", json!([])),
+                    ParallelOperation::activity("nested-second", json!([])),
+                ]),
+            ),
+            ("deadline", ParallelOperation::timer(Duration::ZERO)),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Ok(selected)) = selection.as_mut().poll(&mut task_context) else {
+            panic!("deadline winner must replay");
+        };
+        let nested = selected
+            .handle(&SelectionKey::Name("nested".to_string()))
+            .expect("nested handle")
+            .clone();
+        let mut cancel = Box::pin(nested.cancel());
+        assert!(matches!(
+            cancel.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(()))
+        ));
+        let mut await_nested = Box::pin(nested.await_result());
+
+        assert!(matches!(
+            await_nested.as_mut().poll(&mut task_context),
+            Poll::Ready(Err(Error::ActivityFailed(_)))
+        ));
+        assert!(ctx.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn selection_supports_child_timer_signal_condition_and_nested_groups() {
+        let ctx = workflow_context(Vec::new());
+        let mut call = Box::pin(ctx.select(vec![
+            ParallelOperation::child_workflow(
+                "child",
+                ChildWorkflowOptions::new("children"),
+                json!([]),
+            ),
+            ParallelOperation::timer(Duration::from_secs(30)),
+            ParallelOperation::signal("approval"),
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("ready", "sha256:ready"),
+                || Ok(false),
+            ),
+            ParallelOperation::group(vec![
+                ParallelOperation::activity("nested-one", json!([])),
+                ParallelOperation::activity("nested-two", json!([])),
+            ]),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            call.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let commands = ctx.take_commands().expect("selection commands");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "start_child_workflow",
+                "start_timer",
+                "open_signal_wait",
+                "open_condition_wait",
+                "schedule_activity",
+                "schedule_activity",
+            ]
+        );
+        assert!(commands.iter().all(|command| {
+            command["parallel_group_path"][0]["parallel_group_mode"] == json!("select")
+        }));
+        assert_eq!(
+            commands[4]["parallel_group_path"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            commands[4]["parallel_group_path"][0]["selection_member_kind"],
+            json!("group")
+        );
+        assert_eq!(
+            commands[5]["parallel_group_path"][0]["selection_member_kind"],
+            json!("group")
+        );
+
+        let one_leaf_ctx = workflow_context(Vec::new());
+        let mut one_leaf = Box::pin(one_leaf_ctx.select(vec![ParallelOperation::group(vec![
+            ParallelOperation::activity("nested-only", json!([])),
+        ])]));
+        assert!(matches!(
+            one_leaf.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+        let one_leaf_commands = one_leaf_ctx.take_commands().expect("one-leaf commands");
+        assert_eq!(one_leaf_commands.len(), 1);
+        assert_eq!(
+            one_leaf_commands[0]["parallel_group_path"][0]["selection_member_kind"],
+            json!("group")
+        );
+        assert_eq!(
+            one_leaf_commands[0]["parallel_group_path"][0]["selection_member_size"],
+            json!(1)
+        );
     }
 
     async fn trip_saga(ctx: WorkflowContext) -> Result<Value> {
@@ -20866,6 +23343,7 @@ mod tests {
             server.request_body("/api/worker/register")["capabilities"],
             json!([
                 CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY,
+                DURABLE_SELECTION_CAPABILITY,
                 MEMO_UPSERTS_CAPABILITY,
                 TYPED_SEARCH_ATTRIBUTES_CAPABILITY,
                 QUERY_TASKS_CAPABILITY,
@@ -21524,7 +24002,7 @@ mod tests {
                 write_mock_response(
                     stream,
                     "400 Bad Request",
-                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.16","requested_version":"1.17"}"#,
+                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.17","requested_version":"1.19"}"#,
                 );
             } else if behavior.reject_deregistration {
                 write_mock_response(

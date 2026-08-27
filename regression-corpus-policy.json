@@ -24,6 +24,16 @@
             "Codec",
             "codec",
             "framing"
+          ],
+          "implementation_patterns": [
+            "^(?:pub\\s+)?(?:const|static) (?:DEFAULT_CODEC|MISSING_TASK_PAYLOAD_CODEC|NULL_TASK_PAYLOAD_CODEC|NON_STRING_TASK_PAYLOAD_CODEC|AVRO_[A-Z0-9_]+)\\b",
+            "^(?:pub\\s+)?struct PayloadEnvelope\\b",
+            "^impl PayloadEnvelope\\b",
+            "^(?:pub\\s+)?enum AvroValue\\b",
+            "^impl (?:PartialEq for |Serialize for )?AvroValue\\b",
+            "^(?:pub\\s+)?fn (?:encode_avro_value|decode_avro_value|encode_payload|decode_payload|encode_value_envelope|decode_wire_value|encode_typed_envelope|decode_wire_avro_value|normalize_avro_arguments|decode_blob|validate_payload_codec|invalid_task_payload_codec|payload_envelope_parts|validate_outbound_payload_envelope|unsupported_payload_codec|untagged_payload_value|decode_avro_value_blob|avro_value_to_datum|avro_value_from_datum|avro_value_schema|avro_value_ordered_map_encoding_schema|decode_task_avro_arguments|validate_history_event_payloads|declared_payload_codec|validate_optional_inbound_payload)\\b",
+            "^struct StrictAvroDatumReader\\b",
+            "^impl(?:<'[^>]+>)?\\s+(?:Read for\\s+)?StrictAvroDatumReader\\b"
           ]
         }
       ]

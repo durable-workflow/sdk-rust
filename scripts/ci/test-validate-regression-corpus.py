@@ -31,10 +31,7 @@ REPOSITORY_POLICY = json.loads(
         encoding="utf-8"
     )
 )
-CODEC_GUARD = {
-    "glob": "src/lib.rs",
-    "content_patterns": ["Avro", "avro", "Codec", "codec", "framing"],
-}
+CODEC_GUARD = REPOSITORY_POLICY["categories"]["codec"]["guards"][0]
 REPLAY_GUARD = REPOSITORY_POLICY["categories"]["replay"]["guards"][0]
 POLICY = {
     "$schema": "https://example.invalid/regression-corpus-policy.json",
@@ -391,6 +388,15 @@ enum RecordedSnapshotValue<T> {
     Known(T),
 }
 
+enum ParallelAvroResult {
+    Completed,
+    Failed,
+}
+
+fn recorded_selection_member_is_terminal(result: &ParallelAvroResult) -> bool {
+    matches!(result, ParallelAvroResult::Completed)
+}
+
 impl<T: PartialEq> RecordedSnapshotValue<T> {
     fn matches_current(&self, current: &Self) -> bool {
         match self {
@@ -509,6 +515,18 @@ mod tests {
     }
 
     fn typed_fidelity_probe() -> AvroValue""",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(self._guard_matches())
+
+    def test_selection_only_avro_result_change_is_not_related(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "matches!(result, ParallelAvroResult::Completed)",
+                "matches!(result, ParallelAvroResult::Completed | ParallelAvroResult::Failed)",
             ),
             encoding="utf-8",
         )
@@ -1394,6 +1412,28 @@ mod tests {
     def test_policy_cannot_weaken_guard_patterns(self) -> None:
         self.policy["categories"]["codec"]["guards"][0]["content_patterns"].remove(
             "framing"
+        )
+        self._write_policy()
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError, "cannot remove or weaken base guard"
+        ):
+            self._validate()
+
+    def test_policy_cannot_weaken_codec_implementation_boundary(self) -> None:
+        self.policy["categories"]["codec"]["guards"][0][
+            "implementation_patterns"
+        ].pop()
+        self._write_policy()
+
+        with self.assertRaisesRegex(
+            VALIDATOR.CorpusError, "cannot remove or weaken base guard"
+        ):
+            self._validate()
+
+    def test_policy_cannot_remove_codec_implementation_boundary(self) -> None:
+        self.policy["categories"]["codec"]["guards"][0].pop(
+            "implementation_patterns"
         )
         self._write_policy()
 

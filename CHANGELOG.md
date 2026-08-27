@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.0-rc.35
+
+- Add persisted first-completion selection across activities, child workflows,
+  durable timers, signal waits, condition waits, and nested parallel groups.
+  Server commits one stable keyed winner while non-winning operations continue
+  and remain available for later awaiting or explicit cancellation.
+- Replay the committed winner independently of later terminal-history order and
+  preserve typed results and failures across cold worker replacement.
+- Advance the worker protocol to `1.19` and advertise durable selection during
+  high-level worker registration.
+- Qualify this prerelease against the synchronized Server `2.0.0-rc.51`
+  artifact exactly.
+
 ## 2.0.0-rc.34
 
 - Require the current release entry to be present in the source commit before

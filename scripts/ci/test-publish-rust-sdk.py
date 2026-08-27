@@ -18,12 +18,12 @@ MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 RELEASE_TOOLING_INSTALLER = ROOT / "scripts" / "ci" / "install-release-tooling.sh"
-PACKAGE_VERSION = "2.0.0-rc.34"
+PACKAGE_VERSION = "2.0.0-rc.35"
 PRODUCT_TRAIN = PACKAGE_VERSION
-SERVER_VERSIONS = ">=2.0.0-rc.50,<2.0.0"
-QUALIFIED_SERVER_VERSION = "2.0.0-rc.50"
-WORKER_PROTOCOL_VERSION = "1.17"
-SERVER_WORKER_PROTOCOLS = ">=1.17,<2.0"
+SERVER_VERSIONS = "2.0.0-rc.51"
+QUALIFIED_SERVER_VERSION = "2.0.0-rc.51"
+WORKER_PROTOCOL_VERSION = "1.19"
+SERVER_WORKER_PROTOCOLS = ">=1.19,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 CHECKSUM = "a" * 64
 
@@ -234,8 +234,13 @@ class PublishRustSdkContractTest(unittest.TestCase):
             metadata["condition-wait-occurrence-identity"],
         )
         self.assertEqual(
-            WORKER_PROTOCOL_VERSION,
+            "1.17",
             metadata["condition-wait-occurrence-minimum-worker-protocol-version"],
+        )
+        self.assertTrue(metadata["durable-selection"])
+        self.assertEqual("select+select_keyed", metadata["durable-selection-authoring"])
+        self.assertEqual(
+            "1.19", metadata["durable-selection-minimum-worker-protocol-version"]
         )
         self.assertTrue(metadata["workflow-search-attribute-updates"])
         self.assertEqual(
@@ -294,8 +299,20 @@ class PublishRustSdkContractTest(unittest.TestCase):
             protocol["condition_wait_occurrence_identity"],
         )
         self.assertEqual(
-            WORKER_PROTOCOL_VERSION,
+            "1.17",
             protocol["condition_wait_occurrence_minimum_worker_protocol"],
+        )
+        self.assertTrue(protocol["durable_selection"])
+        self.assertEqual("select+select_keyed", protocol["durable_selection_authoring"])
+        self.assertEqual(
+            "1.19", protocol["durable_selection_minimum_worker_protocol"]
+        )
+        self.assertEqual(
+            "SelectionResolved", protocol["durable_selection_winner_history_event"]
+        )
+        self.assertEqual(
+            ["continue", "await", "cancel"],
+            protocol["durable_selection_non_winner_lifecycle"],
         )
         self.assertTrue(protocol["workflow_search_attribute_updates"])
         self.assertEqual(

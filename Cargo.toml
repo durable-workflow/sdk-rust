@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.0-rc.34"
+version = "2.0.0-rc.35"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -14,12 +14,12 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.0-rc.34"
+product-train = "2.0.0-rc.35"
 compatibility-authority = "protocol-manifests"
-supported-server-versions = ">=2.0.0-rc.50,<2.0.0"
-qualified-server-version = "2.0.0-rc.50"
-worker-protocol-version = "1.17"
-server-worker-protocol-versions = ">=1.17,<2.0"
+supported-server-versions = "2.0.0-rc.51"
+qualified-server-version = "2.0.0-rc.51"
+worker-protocol-version = "1.19"
+server-worker-protocol-versions = ">=1.19,<2.0"
 control-plane-version = "2"
 message-streams = true
 message-streams-minimum-worker-protocol-version = "1.15"
@@ -78,6 +78,11 @@ search-attribute-replay-identity = "json-value+canonical-declared-type"
 legacy-search-attribute-history = "value-only+unknown-type-identity"
 deterministic-parallel = true
 parallel-authoring = "parallel+join"
+durable-selection = true
+durable-selection-authoring = "select+select_keyed"
+durable-selection-minimum-worker-protocol-version = "1.19"
+durable-selection-winner-history-event = "SelectionResolved"
+durable-selection-non-winner-lifecycle = ["continue", "await", "cancel"]
 parallel-members = ["activity", "child", "timer", "mixed", "nested"]
 parallel-result-order = "input-position"
 parallel-group-metadata = ["parallel_group_id", "parallel_group_kind", "parallel_group_base_sequence", "parallel_group_size", "parallel_group_index", "parallel_group_path"]
