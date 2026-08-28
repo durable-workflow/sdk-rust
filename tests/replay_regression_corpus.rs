@@ -162,6 +162,12 @@ fn handle_request(
             .count()
     };
     let body = match path.as_str() {
+        "/api/worker/register" => json!({
+            "worker_id": "regression-corpus-worker",
+            "registered": true,
+            "heartbeat_interval_seconds": 3600
+        })
+        .to_string(),
         "/api/worker/workflow-tasks/poll" if request_number == 1 => {
             json!({"task": task}).to_string()
         }
@@ -382,6 +388,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.condition-search"
             | "corpus.condition-search-adjacent"
             | "corpus.durable-selection"
+            | "corpus.durable-selection-portable-affinity"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -623,7 +630,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 Ok(json!({"status": status, "waits": outcomes}))
             });
         }
-        "corpus.durable-selection" => {
+        "corpus.durable-selection" | "corpus.durable-selection-portable-affinity" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
                 let selected = ctx
                     .select_keyed(vec![
@@ -670,6 +677,26 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         }
         _ => unreachable!("workflow type was validated above"),
     }
+    let worker_registration = if let Some(expected) = fixture.get("worker_registration") {
+        let registration = worker
+            .register()
+            .await
+            .map_err(|error| format!("{fixture_id} worker registration failed: {error}"))?;
+        if !registration.registered {
+            return Err(format!("{fixture_id} worker registration was declined"));
+        }
+        let observed = server
+            .request_body("/api/worker/register")
+            .ok_or_else(|| format!("{fixture_id} worker registration was not captured"))?;
+        fixture_matches(
+            expected,
+            &observed,
+            &format!("{fixture_id}.worker_registration"),
+        )?;
+        Some(observed)
+    } else {
+        None
+    };
     let handled = worker
         .run_once()
         .await
@@ -732,6 +759,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             json!(callback_calls.load(Ordering::SeqCst)),
         ),
     ]);
+    if let Some(worker_registration) = worker_registration {
+        observed.insert("worker_registration".to_string(), worker_registration);
+    }
     if let [Value::Object(command)] = commands.as_slice() {
         observed.extend(command.clone());
     }
@@ -893,6 +923,26 @@ async fn durable_selection_winner_is_deterministic_across_cold_workers() {
     let restarted = execute_fixture_delivery(&fixture, "delivery-b")
         .await
         .expect("cold selection replay fixture must execute");
+
+    assert_eq!(first, restarted);
+}
+
+#[tokio::test]
+async fn portable_affinity_refusals_survive_durable_selection_cold_replay() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/replay-regressions/durable-selection-portable-affinity-cold-replay.json",
+    );
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path)
+            .expect("read checked-in portable-affinity selection fixture"),
+    )
+    .expect("parse checked-in portable-affinity selection fixture");
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .expect("first portable-affinity selection replay must execute");
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .expect("cold portable-affinity selection replay must execute");
 
     assert_eq!(first, restarted);
 }

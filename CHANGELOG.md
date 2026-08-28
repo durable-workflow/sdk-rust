@@ -2,6 +2,9 @@
 
 ## 2.0.0-rc.35
 
+- Explicitly refuse local activities, worker sessions, and sticky execution in
+  the worker capability manifest until the Rust runtime implements those
+  protocol 1.18 contracts.
 - Add persisted first-completion selection across activities, child workflows,
   durable timers, signal waits, condition waits, and nested parallel groups.
   Server commits one stable keyed winner while non-winning operations continue

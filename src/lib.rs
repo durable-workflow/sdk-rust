@@ -29,6 +29,8 @@ use thiserror::Error;
 pub use uuid::Uuid;
 
 pub const WORKER_PROTOCOL_VERSION: &str = "1.19";
+/// First additive worker protocol that defines portable worker-affinity features.
+pub const PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION: &str = "1.18";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
@@ -100,6 +102,27 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "query_task_not_leased",
     "query_task_timed_out",
 ];
+
+/// Truthful service-worker manifest for features this SDK currently refuses.
+pub fn portable_worker_affinity_capability_manifest() -> Value {
+    json!({
+        "local_activities": {
+            "supported": false,
+            "minimum_protocol_version": PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION,
+            "reason": "rust_worker_does_not_execute_record_local_activity",
+        },
+        "worker_sessions": {
+            "supported": false,
+            "minimum_protocol_version": PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION,
+            "reason": "rust_worker_has_no_typed_session_lifecycle",
+        },
+        "sticky_execution": {
+            "supported": false,
+            "minimum_protocol_version": PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION,
+            "reason": "rust_worker_uses_complete_durable_history_replay",
+        },
+    })
+}
 
 /// Canonical Avro Value schema packaged with the crate and parsed by the runtime.
 pub const AVRO_VALUE_SCHEMA_JSON: &str =
@@ -3411,6 +3434,7 @@ impl Client {
             "supported_workflow_types": supported_workflow_types,
             "supported_activity_types": supported_activity_types,
             "capabilities": capabilities,
+            "capability_manifest": portable_worker_affinity_capability_manifest(),
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
@@ -14628,6 +14652,22 @@ mod tests {
             ),
             CONDITION_WAIT_OCCURRENCE_IDENTITY_MINIMUM_WORKER_PROTOCOL_VERSION
         );
+    }
+
+    #[test]
+    fn portable_worker_affinity_manifest_explicitly_refuses_unimplemented_features() {
+        let manifest = portable_worker_affinity_capability_manifest();
+
+        for capability in ["local_activities", "worker_sessions", "sticky_execution"] {
+            assert_eq!(manifest[capability]["supported"], json!(false));
+            assert_eq!(
+                manifest[capability]["minimum_protocol_version"],
+                json!(PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION)
+            );
+            assert!(manifest[capability]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()));
+        }
     }
 
     fn typed_fidelity_probe() -> AvroValue {
