@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.0-rc.36
+
+- Qualify this prerelease against the final Server `2.0.0-rc.55` artifact
+  exactly.
+
 ## 2.0.0-rc.35
 
 - Explicitly refuse local activities, worker sessions, and sticky execution in
