@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.0-rc.37
+
+- Qualify this prerelease against the immutable Server `2.0.0-rc.56` artifact
+  exactly.
+
 ## 2.0.0-rc.36
 
 - Qualify this prerelease against the final Server `2.0.0-rc.55` artifact
