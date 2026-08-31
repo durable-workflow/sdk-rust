@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.0-rc.38"
+version = "2.0.0-rc.39"
 edition = "2021"
 description = "First-party Rust SDK for Durable Workflow workers and clients"
 license = "MIT"
@@ -14,10 +14,10 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.0-rc.38"
+product-train = "2.0.0-rc.39"
 compatibility-authority = "protocol-manifests"
-supported-server-versions = "2.0.0-rc.57"
-qualified-server-version = "2.0.0-rc.57"
+supported-server-versions = "2.0.0-rc.68"
+qualified-server-version = "2.0.0-rc.68"
 worker-protocol-version = "1.19"
 server-worker-protocol-versions = ">=1.19,<2.0"
 portable-worker-affinity-minimum-worker-protocol-version = "1.18"
