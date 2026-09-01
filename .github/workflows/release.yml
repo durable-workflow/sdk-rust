@@ -55,7 +55,12 @@ jobs:
           fi
           head_commit="$(git rev-parse HEAD)"
           tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
-          if [[ "$tag_commit" != "$head_commit" || "$tag_commit" != "$REQUESTED_RELEASE_COMMIT" ]]; then
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$REQUESTED_RELEASE_COMMIT" ]]; then
             printf 'release tag %s resolves to %s, not requested commit %s at checkout %s\n' \
               "$REQUESTED_RELEASE_TAG" "$tag_commit" "$REQUESTED_RELEASE_COMMIT" "$head_commit" >&2
             exit 1

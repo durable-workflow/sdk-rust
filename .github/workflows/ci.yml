@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   action-policy:
     name: Central action policy preflight
@@ -32,8 +36,7 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: "3.13"
-      - name: Install policy dependencies
-        run: python -m pip install PyYAML==6.0.2
+      - run: python -m pip install PyYAML==6.0.2
       - name: Require centrally approved immutable action commits
         run: >-
           python .central-action-policy/scripts/qualification_policy.py validate
@@ -50,24 +53,24 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install the Rust regression toolchain
+      - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: 1.86.0
-      - name: Require durable replay and codec evidence
+      - name: Require durable replay and codec fixtures
         env:
           CORPUS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
-          python scripts/ci/test-validate-regression-corpus.py
           arguments=()
           if [[ "$CORPUS_BASE_REF" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$CORPUS_BASE_REF" =~ ^0+$ ]]; then
             arguments+=(--base-ref "$CORPUS_BASE_REF")
           fi
           python scripts/ci/validate-regression-corpus.py "${arguments[@]}"
+      - name: Test the corpus policy
+        run: python scripts/ci/test-validate-regression-corpus.py
 
-  verify:
+  test:
     name: Rust ${{ matrix.rust }}
-    if: ${{ vars.SOURCE_QUALIFICATION_MODE == '' || vars.SOURCE_QUALIFICATION_MODE == 'complete' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -77,115 +80,111 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
-          fetch-depth: 0
           persist-credentials: false
-
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo test --all-targets --all-features
 
-      - name: Install hash-locked release tooling
-        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
+  protocol:
+    name: Avro protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: 1.86.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
       - name: Require the official Apache Avro encoder
         run: |
           python3 scripts/ci/verify-official-avro-encoder.py
           python3 scripts/ci/test-official-avro-encoder.py
-
-      - name: Test all targets
-        run: cargo test --all-targets
-
-      - name: Verify Rust payloads with official PHP and Python Avro consumers
-        if: matrix.rust == 'stable'
+      - name: Verify Rust payloads with the official PHP and Python Avro bindings
         run: |
           python3 -m venv "${RUNNER_TEMP}/official-avro-python"
-          "${RUNNER_TEMP}/official-avro-python/bin/pip" install \
-            --requirement scripts/ci/official-avro-consumers/requirements.txt
-          composer install \
-            --working-dir=scripts/ci/official-avro-consumers \
-            --no-interaction --no-progress --prefer-dist
-          OFFICIAL_AVRO_PYTHON="${RUNNER_TEMP}/official-avro-python/bin/python" \
-            scripts/ci/qualify-cross-language-avro-consumers.sh
-
-      - name: Enforce Avro Value regression budget
-        if: matrix.rust == 'stable'
+          "${RUNNER_TEMP}/official-avro-python/bin/pip" install --requirement scripts/ci/official-avro-consumers/requirements.txt
+          composer install --working-dir=scripts/ci/official-avro-consumers --no-interaction --no-progress --prefer-dist
+          OFFICIAL_AVRO_PYTHON="${RUNNER_TEMP}/official-avro-python/bin/python" scripts/ci/qualify-cross-language-avro-consumers.sh
+      - name: Enforce the Avro Value regression budget
         run: cargo run --release --example avro_value_benchmark -- --enforce
 
-      - name: Qualify warning-free API documentation and examples
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: |
-          cargo doc --all-features --no-deps
-          cargo doc --all-features --no-deps --examples
-          python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc
-
-      - name: Verify publishable package
-        run: |
-          cargo package
-          python3 scripts/ci/release_package.py \
-            --archive "target/package/durable-workflow-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])').crate"
-          python3 scripts/ci/qualify-release-documentation.py \
-            --rustdoc target/doc/durable_workflow/index.html \
-            --check-package
-
-      - name: Build a fresh Rust 1.86 package consumer
-        if: matrix.rust == '1.86.0'
-        run: python3 scripts/ci/verify-fresh-consumer.py package
-
-      - name: Validate release tooling
-        run: |
-          bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/install-release-tooling.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/maintain-crates-io.py scripts/ci/release_package.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/verify-official-avro-encoder.py scripts/ci/official-avro-consumers/consume.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-official-avro-encoder.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-rust-sdk.py scripts/ci/test-release-package.py
-          python -m py_compile scripts/ci/qualify-docs-landing.py scripts/ci/qualify-release-documentation.py scripts/ci/test-docs-workflow.py scripts/ci/test-qualify-docs-landing.py scripts/ci/test-qualify-release-documentation.py
-          scripts/ci/test-crates-io-publish.sh
-          python scripts/ci/test-publish-rust-sdk.py
-          python scripts/ci/test-release-package.py
-          python scripts/ci/test-maintain-crates-io.py
-          python scripts/ci/test-example-base-urls.py
-          python scripts/ci/test-docs-workflow.py
-          python scripts/ci/test-qualify-docs-landing.py
-          python scripts/ci/test-qualify-release-documentation.py
-          python scripts/ci/test-source-qualification.py
-  bounded-qualification:
-    name: Bounded structural qualification
-    if: ${{ vars.SOURCE_QUALIFICATION_MODE == 'bounded' }}
+  docs:
+    name: Documentation
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 15
     steps:
-      - name: Check out candidate source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Install the structural toolchain
+      - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: 1.86.0
-          components: rustfmt
-
-      - name: Install hash-locked release tooling
-        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
-
-      - name: Run bounded candidate structure checks
+      - name: Build and check the documentation
         env:
-          CANDIDATE_EVENT_NAME: ${{ github.event_name }}
-          CANDIDATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          CANDIDATE_BEFORE_SHA: ${{ github.event.before }}
-          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          CANDIDATE_CURRENT_SHA: ${{ github.sha }}
-          BOUNDED_QUALIFICATION_TIMING: ${{ runner.temp }}/bounded-qualification-timing.json
-        run: python3 scripts/ci/run-bounded-qualification.py
+          RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
+        run: |
+          cargo doc --all-features --no-deps
+          cargo doc --all-features --no-deps --examples
+          printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
+          touch target/doc/.nojekyll
+          cp docs/index.html target/doc/index.html
+          cp docs/layout.css target/doc/layout.css
+          cp docs/navigation.js target/doc/navigation.js
+          mkdir -p target/doc/analytics target/doc/assets
+          cp docs/analytics/analytics.js target/doc/analytics/
+          cp docs/assets/* target/doc/assets/
+          python3 scripts/check-docs-analytics.py target/doc
+          python3 scripts/check-docs-site.py target/doc
+          python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc
+          node scripts/ci/test-docs-analytics.mjs
+          node scripts/ci/test-docs-navigation.mjs
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: 1.86.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Install release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+      - name: Build and verify the publishable crate
+        run: |
+          cargo package
+          archive="target/package/durable-workflow-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])').crate"
+          python3 scripts/ci/release_package.py --archive "$archive"
+          python3 scripts/ci/verify-fresh-consumer.py package
+      - name: Validate release tooling
+        run: |
+          bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/install-release-tooling.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
+          scripts/ci/test-crates-io-publish.sh
+          python scripts/ci/test-publish-rust-sdk.py
+          python scripts/ci/test-release-package.py
+          python scripts/ci/test-example-base-urls.py
 
   target-branch-qualification:
     name: Target branch qualification
     if: ${{ always() }}
-    needs: [action-policy, regression-corpus, verify, bounded-qualification]
+    needs: [action-policy, regression-corpus, test, protocol, docs, package]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -194,27 +193,16 @@ jobs:
         env:
           ACTION_POLICY_RESULT: ${{ needs.action-policy.result }}
         run: test "$ACTION_POLICY_RESULT" = success
-
-      - name: Require regression corpus validation
+      - name: Require the supported Rust and package checks
         env:
           CORPUS_RESULT: ${{ needs.regression-corpus.result }}
-        run: test "$CORPUS_RESULT" = success
-
-      - name: Require the selected source qualification route
-        env:
-          QUALIFICATION_MODE: ${{ vars.SOURCE_QUALIFICATION_MODE }}
-          COMPLETE_RESULT: ${{ needs.verify.result }}
-          BOUNDED_RESULT: ${{ needs.bounded-qualification.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          PROTOCOL_RESULT: ${{ needs.protocol.result }}
+          TEST_RESULT: ${{ needs.test.result }}
         run: |
-          case "${QUALIFICATION_MODE:-complete}" in
-            complete)
-              test "$COMPLETE_RESULT" = success
-              ;;
-            bounded)
-              test "$BOUNDED_RESULT" = success
-              ;;
-            *)
-              printf 'unsupported source qualification mode: %s\n' "$QUALIFICATION_MODE" >&2
-              exit 1
-              ;;
-          esac
+          test "$CORPUS_RESULT" = success
+          test "$DOCS_RESULT" = success
+          test "$PACKAGE_RESULT" = success
+          test "$PROTOCOL_RESULT" = success
+          test "$TEST_RESULT" = success
