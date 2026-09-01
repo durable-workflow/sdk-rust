@@ -140,18 +140,9 @@ jobs:
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/install-release-tooling.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh
-          python -m py_compile scripts/ci/component-release-recovery.py scripts/ci/maintain-crates-io.py scripts/ci/publish-planned-tag.py scripts/ci/release_package.py scripts/ci/release_recovery_consumer_conformance.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/verify-official-avro-encoder.py scripts/ci/official-avro-consumers/consume.py scripts/ci/test-component-release-recovery.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-official-avro-encoder.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-planned-tag.py scripts/ci/test-publish-rust-sdk.py scripts/ci/test-release-package.py
+          python -m py_compile scripts/ci/maintain-crates-io.py scripts/ci/release_package.py scripts/ci/run-bounded-qualification.py scripts/ci/validate-example-base-urls.py scripts/ci/verify-fresh-consumer.py scripts/ci/verify-official-avro-encoder.py scripts/ci/official-avro-consumers/consume.py scripts/ci/test-example-base-urls.py scripts/ci/test-maintain-crates-io.py scripts/ci/test-official-avro-encoder.py scripts/ci/test-source-qualification.py scripts/ci/test-publish-rust-sdk.py scripts/ci/test-release-package.py
           python -m py_compile scripts/ci/qualify-docs-landing.py scripts/ci/qualify-release-documentation.py scripts/ci/test-docs-workflow.py scripts/ci/test-qualify-docs-landing.py scripts/ci/test-qualify-release-documentation.py
           scripts/ci/test-crates-io-publish.sh
-          arguments=()
-          if [ -n "$CONFORMANCE_BASE_REF" ]; then
-            arguments+=(--previous-ref "$CONFORMANCE_BASE_REF")
-          fi
-          python scripts/ci/release_recovery_consumer_conformance.py \
-            --contract scripts/ci/release-recovery-consumer-contract.json \
-            --adapter scripts/ci/release-recovery-consumer-adapter.json \
-            "${arguments[@]}"
-          python scripts/ci/test-publish-planned-tag.py
           python scripts/ci/test-publish-rust-sdk.py
           python scripts/ci/test-release-package.py
           python scripts/ci/test-maintain-crates-io.py
@@ -160,9 +151,6 @@ jobs:
           python scripts/ci/test-qualify-docs-landing.py
           python scripts/ci/test-qualify-release-documentation.py
           python scripts/ci/test-source-qualification.py
-        env:
-          CONFORMANCE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-
   bounded-qualification:
     name: Bounded structural qualification
     if: ${{ vars.SOURCE_QUALIFICATION_MODE == 'bounded' }}
