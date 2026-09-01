@@ -1,6 +1,6 @@
 name: Release
 
-run-name: Release ${{ inputs.release_tag }} at ${{ inputs.release_commit }} for ${{ inputs.release_plan }}
+run-name: Release ${{ inputs.release_tag }} at ${{ inputs.release_commit }}
 
 on:
   workflow_dispatch:
@@ -10,13 +10,8 @@ on:
         required: true
         type: string
       release_commit:
-        description: Exact source commit declared by the immutable release plan
+        description: Exact source commit for publication
         required: true
-        type: string
-      release_plan:
-        description: Immutable release-plan tag initiating this recovery run
-        required: false
-        default: direct
         type: string
 
 permissions:
