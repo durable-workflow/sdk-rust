@@ -61,6 +61,9 @@ QUICKSTART_CONTRACT_SCHEMA = (
 EXACT_PRERELEASE_VERSION = re.compile(
     r"\b\d+\.\d+\.\d+-(?:alpha|beta|rc)\.\d+\b"
 )
+EXACT_RELEASE_VERSION = re.compile(
+    r"\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?"
+)
 VISIBLE_CARGO_PATH = re.compile(
     r"\bcargo\s+add\s+durable-workflow\b|\bdurable-workflow\s*="
 )
@@ -433,9 +436,9 @@ def qualified_rust_version(contract_text: str) -> str:
     artifacts = contract.get("artifacts")
     rust = artifacts.get("sdk-rust") if isinstance(artifacts, dict) else None
     version = rust.get("version") if isinstance(rust, dict) else None
-    if not isinstance(version, str) or EXACT_PRERELEASE_VERSION.fullmatch(version) is None:
+    if not isinstance(version, str) or EXACT_RELEASE_VERSION.fullmatch(version) is None:
         raise QualificationError(
-            "public quickstart authority is missing a qualified Rust prerelease"
+            "public quickstart authority is missing a qualified Rust release"
         )
     return version
 

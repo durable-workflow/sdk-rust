@@ -65,7 +65,7 @@ jobs:
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
 
-      - name: Audit discovery and exact prerelease installation
+      - name: Audit discovery and exact release installation
         run: >-
           python3 scripts/ci/maintain-crates-io.py audit
           --evidence crates-io-audit-evidence.json
