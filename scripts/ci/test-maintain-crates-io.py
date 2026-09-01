@@ -110,7 +110,7 @@ class RegistryMaintenanceTest(unittest.TestCase):
                 for version in self.plan["retired_versions"]
             )
         )
-        self.assertTrue(maintenance.is_2_0_release_candidate(self.current))
+        self.assertTrue(maintenance.is_supported_2_0_release(self.current))
 
     def test_retirement_yanks_only_active_reviewed_versions(self) -> None:
         registry = FakeRegistry(self.plan, self.current)
@@ -192,7 +192,7 @@ class RegistryMaintenanceTest(unittest.TestCase):
         install.assert_not_called()
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
         self.assertIn(
-            "crate_root_default_version_is_not_current_release_candidate",
+            "crate_root_default_version_is_not_current_release",
             evidence["violations"],
         )
 

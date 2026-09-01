@@ -129,6 +129,13 @@ def is_2_0_release_candidate(version: str) -> bool:
     )
 
 
+def is_supported_2_0_release(version: str) -> bool:
+    major, minor, patch, prerelease = parse_semver(version)
+    return (major, minor, patch) == (2, 0, 0) and (
+        prerelease is None or prerelease.startswith("rc.")
+    )
+
+
 def load_authority(
     plan_path: Path, manifest_path: Path
 ) -> tuple[dict[str, Any], str, str]:
@@ -168,12 +175,12 @@ def load_authority(
         raise MaintenanceError(
             "authority_mismatch", "manifest and retirement plan name different packages"
         )
-    if not isinstance(current_version, str) or not is_2_0_release_candidate(
+    if not isinstance(current_version, str) or not is_supported_2_0_release(
         current_version
     ):
         raise MaintenanceError(
             "stable_release_not_authorized",
-            "registry maintenance requires the manifest to name an exact 2.0 release candidate",
+            "registry maintenance requires an exact supported 2.0 release",
         )
     return plan, current_version, hashlib.sha256(plan_bytes).hexdigest()
 
@@ -331,20 +338,20 @@ def registry_violations(
 
     exact = observation["current_exact_version"]
     if exact["state"] != "active":
-        violations.append(f"current_release_candidate_not_active:{current_version}")
+        violations.append(f"current_release_not_active:{current_version}")
     elif not exact.get("registry_response", {}).get("checksum"):
-        violations.append(
-            f"current_release_candidate_checksum_missing:{current_version}"
-        )
+        violations.append(f"current_release_checksum_missing:{current_version}")
     root = observation["crate_root"]
     if root["newest_version"] != current_version:
-        violations.append("crate_root_newest_version_is_not_current_release_candidate")
+        violations.append("crate_root_newest_version_is_not_current_release")
     if require_retired and root["default_version"] != current_version:
-        violations.append("crate_root_default_version_is_not_current_release_candidate")
+        violations.append("crate_root_default_version_is_not_current_release")
     for candidate in observation["release_candidates"]:
         if candidate["yanked"] is True:
             violations.append(f"release_candidate_yanked:{candidate['version']}")
-    if observation["stable_2_versions"]:
+    _, _, _, current_prerelease = parse_semver(current_version)
+    authorized_stable_versions = [current_version] if current_prerelease is None else []
+    if observation["stable_2_versions"] != authorized_stable_versions:
         violations.append("stable_2_release_exists_without_authorization")
     return violations
 
@@ -360,7 +367,7 @@ def base_evidence(
             "environment_variable": "CARGO_REGISTRY_TOKEN",
             "value_recorded": False,
         },
-        "current_release_candidate": current_version,
+        "current_release": current_version,
         "generated_at": utc_now(),
         "operation": operation,
         "outcome": "pending",
@@ -543,13 +550,13 @@ def verify_exact_install(
         if len(matches) != 1:
             raise MaintenanceError(
                 "exact_requirement_resolved_incorrectly",
-                "Cargo did not resolve the exact current release candidate",
+                "Cargo did not resolve the exact current release",
             )
         resolved = matches[0]
         if resolved.get("checksum") != expected_checksum:
             raise MaintenanceError(
                 "registry_checksum_mismatch",
-                "Cargo.lock and crates.io report different checksums for the current release candidate",
+                "Cargo.lock and crates.io report different checksums for the current release",
             )
         return {
             "credential_available": False,
@@ -581,7 +588,7 @@ def audit(
             evidence["violations"] = violations
             raise MaintenanceError(
                 "live_registry_audit_failed",
-                "crates.io discovery does not match the supported prerelease policy",
+                "crates.io discovery does not match the supported release policy",
             )
         checksum = observation["current_exact_version"]["registry_response"]["checksum"]
         evidence["exact_installation"] = verify_exact_install(

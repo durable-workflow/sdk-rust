@@ -40,7 +40,7 @@ fn visible_html_text(content: &str) -> String {
 }
 
 #[test]
-fn onboarding_uses_the_prerelease_channel() {
+fn onboarding_uses_the_versionless_supported_channel() {
     for (path, content) in [
         ("README.md", include_str!("../README.md")),
         ("docs/index.html", include_str!("../docs/index.html")),

@@ -951,6 +951,5 @@ the authoritative source for the `durable-workflow` crate and its Rust API
 documentation.
 
 Crate releases follow semantic versioning and are tagged with the exact crate
-version. During the 2.0 beta, the crate advances with the synchronized product
-train. After stable 2.0, fixes, additive capabilities, and breaking changes use
-ordinary patch, minor, and major progression respectively.
+version. Starting with stable 2.0, fixes, additive capabilities, and breaking
+changes use ordinary patch, minor, and major progression respectively.

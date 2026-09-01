@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.0
+
+- Publish the stable Rust SDK qualified against the immutable Server `2.0.0`
+  artifact.
+
 ## 2.0.0-rc.39
 
 - Qualify this prerelease against the immutable Server `2.0.0-rc.68` artifact

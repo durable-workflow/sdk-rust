@@ -105,6 +105,18 @@ class DocsLandingQualificationTest(unittest.TestCase):
         self.assertEqual(self.source_version, body.attrs.get("data-source-version"))
         self.assertNotIn("data-crate-version", body.attrs)
 
+    def test_stable_public_authority_is_accepted(self) -> None:
+        public_version = QUALIFIER.qualified_rust_version(
+            json.dumps(
+                {
+                    "schema": QUALIFIER.QUICKSTART_CONTRACT_SCHEMA,
+                    "artifacts": {"sdk-rust": {"version": "2.0.0"}},
+                }
+            )
+        )
+
+        self.assertEqual("2.0.0", public_version)
+
     def test_rejects_a_floating_cargo_requirement_in_visible_onboarding(self) -> None:
         floating_onboarding = self.html.replace(
             '<p class="dw-version">',
@@ -125,7 +137,7 @@ class DocsLandingQualificationTest(unittest.TestCase):
     def test_rejects_an_exact_prerelease_version_in_visible_onboarding(self) -> None:
         pinned_onboarding = self.html.replace(
             '<p class="dw-version">',
-            f'<p class="dw-version"><span>Qualified crate {self.source_version}</span>',
+            '<p class="dw-version"><span>Qualified crate 2.0.0-rc.99</span>',
             1,
         )
 
