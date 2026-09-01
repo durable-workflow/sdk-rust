@@ -1,284 +1,83 @@
 name: API Documentation
 
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'Cargo.toml'
+      - 'scripts/check-docs-analytics.py'
+      - 'scripts/check-docs-site.py'
+      - 'scripts/ci/test-docs-analytics.mjs'
+      - 'scripts/ci/test-docs-navigation.mjs'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: api-documentation
+  group: rust-api-documentation
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build rustdoc
+    name: Build and check the Rust documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
-
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
-
-      - name: Build complete API documentation
+      - name: Build and check the documentation
         env:
           CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}
           RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
         run: |
-          if [ "$GITHUB_SERVER_URL" = https://github.com ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
             if ! printf '%s' "$CLOUDFLARE_WEB_ANALYTICS_TOKEN" | grep -Eq '^[a-f0-9]{32}$'; then
-              echo 'CLOUDFLARE_WEB_ANALYTICS_TOKEN must be the canonical 32-character site token' >&2
+              echo 'CLOUDFLARE_WEB_ANALYTICS_TOKEN must be a 32-character site token' >&2
               exit 1
             fi
             sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
               docs/analytics/analytics.js
           fi
           cargo doc --all-features --no-deps
-          python3 scripts/ci/qualify-release-documentation.py \
-            --rustdoc target/doc/durable_workflow/index.html
-
-      - name: Prepare Pages artifact
-        run: |
+          cargo doc --all-features --no-deps --examples
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
           cp docs/layout.css target/doc/layout.css
           cp docs/navigation.js target/doc/navigation.js
-          mkdir -p target/doc/analytics
+          mkdir -p target/doc/analytics target/doc/assets
           cp docs/analytics/analytics.js target/doc/analytics/
+          cp docs/assets/* target/doc/assets/
           python3 scripts/check-docs-analytics.py target/doc
+          python3 scripts/check-docs-site.py target/doc
+          python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc
           node scripts/ci/test-docs-analytics.mjs
           node scripts/ci/test-docs-navigation.mjs
-          python3 scripts/ci/qualify-docs-landing.py \
-            --build-directory target/doc --check-external
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: target/doc
 
-  visual-evidence:
-    name: Render candidate reference states
+  deploy:
+    name: Deploy the Rust documentation
+    if: github.ref == 'refs/heads/main'
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     permissions:
       contents: read
+      id-token: write
+      pages: write
+    environment:
+      name: github-pages
+      url: https://rust.durable-workflow.com/
     steps:
-      - name: Check out candidate source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
-        with:
-          fetch-depth: 0
-          path: candidate
-          persist-credentials: false
-          ref: ${{ github.sha }}
-          repository: ${{ github.repository }}
-
-      - name: Admit the structurally qualified candidate
-        if: github.api_url != 'https://api.github.com'
-        working-directory: candidate
-        run: python3 scripts/ci/test-docs-workflow.py
-
-      - name: Check out visual evidence controller
-        if: github.api_url == 'https://api.github.com'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
-        with:
-          path: visual-controller
-          persist-credentials: false
-          ref: 0421c2e3a78ba4ca2adfe118e57db88d2264a62b
-          repository: durable-workflow/.github
-
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
-        if: github.api_url == 'https://api.github.com'
-        with:
-          python-version: "3.13"
-
-      - name: Classify candidate changes
-        if: github.api_url == 'https://api.github.com'
-        id: classify
-        env:
-          SOURCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
-          SOURCE_REPOSITORY: ${{ github.repository }}
-        run: |
-          test "$SOURCE_REPOSITORY" = durable-workflow/sdk-rust
-          classification_args=(
-            --root "$GITHUB_WORKSPACE/candidate"
-            --profile rust-sdk-reference
-          )
-          if [[ "$SOURCE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && \
-            git -C candidate cat-file -e "${SOURCE_BASE_SHA}^{commit}" 2>/dev/null; then
-            classification_args+=(--base-ref "$SOURCE_BASE_SHA")
-            if ! git -C candidate diff --quiet \
-              "$SOURCE_BASE_SHA...HEAD" -- .github/workflows/docs.yml; then
-              classification_args+=(--changed-file docs/analytics/analytics.js)
-            fi
-          else
-            mapfile -d '' candidate_files < <(git -C candidate ls-files -z)
-            for candidate_file in "${candidate_files[@]}"; do
-              classification_args+=(--changed-file "$candidate_file")
-            done
-          fi
-          python visual-controller/scripts/visual_evidence.py classify \
-            "${classification_args[@]}" > visual-classification.json
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          classification = json.loads(Path("visual-classification.json").read_text())
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-              print(f"required={str(bool(classification['classification'])).lower()}", file=output)
-          PY
-
-      - name: Install Rust 1.86
-        if: >-
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
-
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
-        if: >-
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        with:
-          node-version: "24"
-
-      - name: Install pinned visual capture runtime
-        if: >-
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        run: npm ci --prefix visual-controller
-
-      - name: Build candidate API reference
-        if: >-
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        working-directory: candidate
-        env:
-          RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
-        run: |
-          cargo doc --all-features --no-deps
-          python3 scripts/ci/qualify-release-documentation.py \
-            --rustdoc target/doc/durable_workflow/index.html
-          printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
-          touch target/doc/.nojekyll
-          cp docs/index.html target/doc/index.html
-          cp docs/layout.css target/doc/layout.css
-          cp docs/navigation.js target/doc/navigation.js
-          mkdir -p target/doc/analytics
-          cp docs/analytics/analytics.js target/doc/analytics/
-          python3 scripts/check-docs-analytics.py target/doc
-          node scripts/ci/test-docs-analytics.mjs
-          node scripts/ci/test-docs-navigation.mjs
-          python3 scripts/ci/qualify-docs-landing.py \
-            --build-directory target/doc --check-external
-
-      - name: Capture candidate state matrix
-        if: >-
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        env:
-          SOURCE_REVISION: ${{ github.sha }}
-          TMPDIR: ${{ runner.temp }}/rust-docs-visual-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          mkdir -p "$TMPDIR" visual-review
-          python3 -m http.server 4173 --bind 127.0.0.1 --directory candidate/target/doc \
-            >"$RUNNER_TEMP/rust-docs-preview.log" 2>&1 &
-          preview_pid=$!
-          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
-          python3 - <<'PY'
-          import time
-          import urllib.request
-
-          for _ in range(50):
-              try:
-                  with urllib.request.urlopen(
-                      "http://127.0.0.1:4173/",
-                      timeout=1,
-                  ) as response:
-                      if response.status == 200:
-                          break
-              except OSError:
-                  time.sleep(0.1)
-          else:
-              raise SystemExit("candidate documentation preview did not become ready")
-          PY
-          capture() {
-            local state=$1 width=$2 height=$3
-            shift 3
-            local capture_args=()
-            if [ "$state" = analytics-ui-removed ] && \
-              [ "$width" = 640 ] && [ "$height" = 360 ]; then
-              capture_args+=(--full-page)
-            fi
-            node visual-controller/scripts/pipeline_visual_capture.mjs \
-              --url http://127.0.0.1:4173/durable_workflow/ \
-              --surface rust-sdk-reference --state "$state" \
-              --width "$width" --height "$height" \
-              --source-repository durable-workflow/sdk-rust \
-              --source-revision "$SOURCE_REVISION" \
-              --screenshot "visual-review/${state}-${width}x${height}.png" \
-              --report "visual-review/${state}-${width}x${height}.json" \
-              --manifest visual-review/manifest.json "${capture_args[@]}" "$@"
-            if [ "$state" = navigation-open ]; then
-              node candidate/scripts/ci/record-rustdoc-navigation-isolation.mjs \
-                --url http://127.0.0.1:4173/durable_workflow/ \
-                --width "$width" --height "$height" \
-                --report "visual-review/${state}-${width}x${height}.json" \
-                --manifest visual-review/manifest.json \
-                --controller-root visual-controller
-            fi
-          }
-          for viewport in 1440x900 800x900 390x844 640x360; do
-            width=${viewport%x*}
-            height=${viewport#*x}
-            capture analytics-ui-removed "$width" "$height"
-          done
-          capture navigation-open 390 844 \
-            --state-scope responsive --click '.sidebar-menu-toggle'
-          capture navigation-open 640 360 \
-            --state-scope responsive --click '.sidebar-menu-toggle'
-
-      - name: Validate source-bound candidate evidence
-        if: >-
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        env:
-          SOURCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
-          SOURCE_REVISION: ${{ github.sha }}
-        run: |
-          validation_args=(
-            --root "$GITHUB_WORKSPACE/candidate"
-            --profile rust-sdk-reference
-            --expected-revision "$SOURCE_REVISION"
-            --manifest "$GITHUB_WORKSPACE/visual-review/manifest.json"
-          )
-          if [[ "$SOURCE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && \
-            git -C candidate cat-file -e "${SOURCE_BASE_SHA}^{commit}" 2>/dev/null; then
-            validation_args+=(--base-ref "$SOURCE_BASE_SHA")
-            if ! git -C candidate diff --quiet \
-              "$SOURCE_BASE_SHA...HEAD" -- .github/workflows/docs.yml; then
-              validation_args+=(--changed-file docs/analytics/analytics.js)
-            fi
-          else
-            mapfile -d '' candidate_files < <(git -C candidate ls-files -z)
-            for candidate_file in "${candidate_files[@]}"; do
-              validation_args+=(--changed-file "$candidate_file")
-            done
-          fi
-          python visual-controller/scripts/visual_evidence.py validate "${validation_args[@]}"
-          python3 candidate/scripts/ci/validate-rustdoc-navigation-evidence.py \
-            visual-review/manifest.json
-
-      - name: Retain candidate visual evidence
-        if: >-
-          always() &&
-          github.api_url == 'https://api.github.com' &&
-          steps.classify.outputs.required == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
-        with:
-          if-no-files-found: error
-          name: rust-docs-visual-${{ github.sha }}
-          path: visual-review
-          retention-days: 30
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5

@@ -1,19 +1,12 @@
-# Source qualification
+# CI support
 
-Source qualification defaults to the complete route. It tests all targets on
-Rust 1.86 and current stable, enforces the typed Avro compatibility and
-performance contracts, builds warning-free API documentation, verifies the
-publishable package contents, and validates the release tooling.
+These scripts support four public repository checks:
 
-A CI control plane may set the repository variable
-`SOURCE_QUALIFICATION_MODE=bounded` to select the bounded structural route.
-`scripts/ci/run-bounded-qualification.py` must complete within the
-machine-readable budget in `bounded-qualification.json`, while the enclosing
-job allows three minutes for setup and the checks. The route parses the Cargo
-manifest, checks Rust formatting and changed-file whitespace, scans the public
-boundary, and runs `cargo check --all-targets`. It does not link or execute the
-test suite.
+- replay and codec regression-corpus validation;
+- Apache Avro interoperability and performance checks;
+- publishable crate and fresh-consumer verification;
+- API documentation, analytics, navigation, and base-URL checks.
 
-Pull requests use the unprivileged `pull_request` event with read-only
-repository contents. Publication and recovery stay in their protected-ref
-workflows and are not part of the bounded structural route.
+The release workflow uses the crates.io publishing scripts after an immutable
+tag already exists. Ordinary pull requests run the product tests and package
+checks directly from `.github/workflows/ci.yml`.

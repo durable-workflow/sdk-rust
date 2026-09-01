@@ -3,13 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Install the first-party Durable Workflow Rust SDK and explore its generated API reference and SDK guide.">
+  <meta name="description" content="Build durable workflows and activities in Rust with the first-party Durable Workflow client and worker SDK.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Durable Workflow Rust SDK">
+  <meta property="og:description" content="Build durable workflows and activities in Rust with the first-party Durable Workflow client and worker SDK.">
+  <meta property="og:url" content="https://rust.durable-workflow.com/">
+  <meta property="og:image" content="https://rust.durable-workflow.com/assets/social-card.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Durable Workflow Rust SDK">
+  <meta name="twitter:description" content="Build durable workflows and activities in Rust with the first-party Durable Workflow client and worker SDK.">
+  <meta name="twitter:image" content="https://rust.durable-workflow.com/assets/social-card.png">
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
   <link rel="stylesheet" href="layout.css">
   <link rel="canonical" href="https://rust.durable-workflow.com/">
   <title>Durable Workflow for Rust</title>
   <script type="module" src="/analytics/analytics.js"></script>
 </head>
-<body class="dw-landing" data-landing-contract="general-rust-first" data-source-version="2.0.0" data-rust-version="1.86">
+<body class="dw-landing" data-landing-contract="general-rust-first" data-rust-version="1.86">
   <header class="dw-nav" data-landing-region="primary-navigation">
     <a class="dw-brand" href="/" aria-label="Durable Workflow Rust home">
       <span class="dw-brand__mark" aria-hidden="true">DW</span>
@@ -24,12 +34,12 @@
 
   <main>
     <header class="dw-page-heading" data-journey="general">
-      <p class="dw-kicker">Rust SDK · 2.0 stable</p>
+      <p class="dw-kicker">Rust SDK · stable</p>
       <h1>Durable Workflow Rust SDK</h1>
       <p data-landing-lead>Author deterministic workflows and activities, run workers, and control workflow executions with the first-party Rust SDK.</p>
       <p class="dw-version">
-        <strong>Supported 2.0 release</strong>
-        <span>Resolved by the public compatibility authority</span>
+        <strong>Stable release</strong>
+        <span>Compatible with Durable Workflow 2.x runtimes</span>
         <span>Requires Rust 1.86+</span>
       </p>
       <div class="dw-actions">
@@ -57,9 +67,9 @@
         <li>
           <span class="dw-step-number">2</span>
           <div>
-            <h3>Install the supported SDK</h3>
-            <p>Let the public compatibility authority select the supported crate in the 2.0 line.</p>
-            <pre><code>curl -fsSL https://durable-workflow.com/install-sdk.sh | sh -s -- rust</code></pre>
+            <h3>Add the SDK</h3>
+            <p>Use Cargo to select the current stable crate.</p>
+            <pre><code>cargo add durable-workflow</code></pre>
           </div>
         </li>
         <li>
@@ -104,7 +114,7 @@
 
   <footer>
     <span>Durable Workflow Rust SDK</span>
-    <span>Stable 2.0 documentation</span>
+    <span>Stable documentation</span>
   </footer>
 </body>
 </html>

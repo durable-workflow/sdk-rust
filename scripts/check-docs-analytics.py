@@ -87,28 +87,6 @@ if '<meta http-equiv="refresh"' in landing:
 if len(re.findall(r"<h1(?:\s|>)", landing)) != 1:
     raise SystemExit("Rust documentation landing must expose one primary heading")
 
-crate_home = (build_directory / "durable_workflow/index.html").read_text(
-    encoding="utf-8"
-)
-if crate_home.count('data-promotion-source="sdk-rust-reference"') != 1:
-    raise SystemExit("Rust reference home must render one bounded Cloud promotion")
-if (
-    'href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-reference"'
-    not in crate_home
-):
-    raise SystemExit("Rust reference promotion must resolve to the public early-access form")
-
-for promotion_boundary in (
-    "PROMOTION_SOURCE = 'sdk-rust-reference'",
-    "credentials: 'omit'",
-    "referrerPolicy: 'no-referrer'",
-    "JSON.stringify({source: PROMOTION_SOURCE, event})",
-):
-    if promotion_boundary not in runtime:
-        raise SystemExit(
-            f"Promotion analytics is missing its bounded contract: {promotion_boundary}"
-        )
-
 print(
     f"Validated cookie-free Cloudflare Web Analytics in {len(html_files)} rendered pages."
 )
