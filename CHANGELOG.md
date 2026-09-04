@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1
+
+- Keep workflow, activity, and query pollers alive when Server applies typed
+  long-poll capacity backpressure, honoring its bounded retry delay before the
+  worker polls again.
+- Accept full valid UTF-8 text values for typed string, keyword, and keyword
+  list search attributes while retaining structural and encoded-size limits.
+
 ## 2.0.0
 
 - Publish the stable Rust SDK qualified against the immutable Server `2.0.0`

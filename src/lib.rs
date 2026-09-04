@@ -4402,6 +4402,12 @@ fn long_poll_timeout_seconds(timeout: Duration) -> u64 {
 }
 
 fn worker_operation_is_retryable(error: &Error) -> bool {
+    if worker_poll_capacity_retry_after(error).is_some()
+        || worker_operation_is_explicitly_non_retryable(error)
+    {
+        return false;
+    }
+
     match error {
         Error::Transport(error) => {
             error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
@@ -4414,6 +4420,40 @@ fn worker_operation_is_retryable(error: &Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn worker_operation_is_explicitly_non_retryable(error: &Error) -> bool {
+    let Error::Http { body, .. } = error else {
+        return false;
+    };
+
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|body| body.get("retryable").and_then(Value::as_bool))
+        == Some(false)
+}
+
+fn worker_poll_capacity_retry_after(error: &Error) -> Option<Duration> {
+    let Error::Http { status, body } = error else {
+        return None;
+    };
+    if *status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+
+    let body = serde_json::from_str::<Value>(body).ok()?;
+    let capacity_exhausted = body.get("poll_status").and_then(Value::as_str)
+        == Some("long_poll_capacity_exhausted")
+        || body.get("reason").and_then(Value::as_str) == Some("long_poll_capacity_exhausted");
+    if !capacity_exhausted || body.get("retryable").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+
+    Some(Duration::from_secs(
+        body.get("retry_after_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    ))
 }
 
 fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
@@ -5660,8 +5700,10 @@ pub struct WorkerHeartbeatObservation {
 
 /// Bounded retry policy for worker poll acquisition and worker heartbeats.
 ///
-/// Expected empty long polls are normal successful responses. Transport
-/// failures, HTTP 408/429 responses, and server errors are retried with capped
+/// Expected empty long polls and explicit Server capacity backpressure are
+/// normal worker states. Capacity backpressure honors the advertised retry
+/// delay without consuming this retry budget. Other transport failures,
+/// retryable HTTP 408/429 responses, and server errors are retried with capped
 /// exponential backoff. Authentication, protocol, codec, and handler failures
 /// are never retried by the worker.
 #[derive(Clone, Copy, Debug)]
@@ -6535,7 +6577,10 @@ impl Worker {
                     0,
                 )
             })
-            .await?;
+            .await;
+        let Some(response) = self.settle_worker_poll_response(response).await? else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
         }
@@ -6639,7 +6684,10 @@ impl Worker {
                     0,
                 )
             })
-            .await?;
+            .await;
+        let Some(response) = self.settle_worker_poll_response(response).await? else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
         }
@@ -6716,7 +6764,10 @@ impl Worker {
                     0,
                 )
             })
-            .await?;
+            .await;
+        let Some(response) = self.settle_worker_poll_response(response).await? else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
         }
@@ -6824,6 +6875,24 @@ impl Worker {
                     tokio::time::sleep(worker_retry_delay(self.retry_policy, retries)).await;
                 }
                 result => return result,
+            }
+        }
+    }
+
+    async fn settle_worker_poll_response<T>(&self, response: Result<T>) -> Result<Option<T>> {
+        match response {
+            Ok(response) => Ok(Some(response)),
+            Err(error) => {
+                let Some(advertised_delay) = worker_poll_capacity_retry_after(&error) else {
+                    return Err(error);
+                };
+                let minimum_delay = self
+                    .retry_policy
+                    .initial_backoff
+                    .max(Duration::from_millis(1));
+                let maximum_delay = self.retry_policy.max_backoff.max(minimum_delay);
+                tokio::time::sleep(advertised_delay.max(minimum_delay).min(maximum_delay)).await;
+                Ok(None)
             }
         }
     }
@@ -23513,6 +23582,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_continues_after_long_poll_capacity_backpressure() {
+        let server = MockWorkerServer::capacity_limited_activity_poll();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("capacity-worker")
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 0,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        worker.register_activity("capacity.activity", |_ctx, _input| async move {
+            Ok(json!({"handled": true}))
+        });
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(50)))
+            .await
+            .expect("capacity backpressure must not stop the worker");
+
+        assert!(
+            server.request_count("/api/worker/activity-tasks/poll") >= 2,
+            "the activity poller must continue after capacity backpressure"
+        );
+        assert_eq!(
+            server.request_count("/api/worker/activity-tasks/capacity-activity/complete"),
+            1,
+            "the worker must complete work returned after capacity recovers"
+        );
+    }
+
+    #[test]
+    fn worker_poll_capacity_backpressure_requires_the_typed_retryable_contract() {
+        let capacity = Error::Http {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"poll_status":"long_poll_capacity_exhausted","retryable":true,"retry_after_seconds":3}"#.to_string(),
+        };
+        assert_eq!(
+            worker_poll_capacity_retry_after(&capacity),
+            Some(Duration::from_secs(3))
+        );
+
+        let rejected_capacity = Error::Http {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"reason":"long_poll_capacity_exhausted","retryable":false,"retry_after_seconds":3}"#.to_string(),
+        };
+        assert_eq!(worker_poll_capacity_retry_after(&rejected_capacity), None);
+        assert!(!worker_operation_is_retryable(&rejected_capacity));
+
+        let ordinary_rate_limit = Error::Http {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"reason":"rate_limited","retryable":true,"retry_after_seconds":3}"#
+                .to_string(),
+        };
+        assert_eq!(worker_poll_capacity_retry_after(&ordinary_rate_limit), None);
+        assert!(worker_operation_is_retryable(&ordinary_rate_limit));
+    }
+
+    #[tokio::test]
     async fn worker_bounds_transport_retries() {
         let server = MockWorkerServer::unavailable_polls();
         let client = Client::builder(server.base_url())
@@ -23622,6 +23753,7 @@ mod tests {
         decline_registration: bool,
         complete_named_signal: bool,
         poll_failures_per_path: usize,
+        long_poll_capacity_responses_per_path: usize,
         heartbeat_failures: usize,
         heartbeat_failure_request: Option<usize>,
         delayed_heartbeat_request: Option<usize>,
@@ -23677,6 +23809,13 @@ mod tests {
         fn consecutive_poll_failures(count: usize) -> Self {
             Self::start_with_behavior(MockWorkerBehavior {
                 poll_failures_per_path: count,
+                ..MockWorkerBehavior::default()
+            })
+        }
+
+        fn capacity_limited_activity_poll() -> Self {
+            Self::start_with_behavior(MockWorkerBehavior {
+                long_poll_capacity_responses_per_path: 1,
                 ..MockWorkerBehavior::default()
             })
         }
@@ -24090,6 +24229,14 @@ mod tests {
                 | "/api/worker/activity-tasks/poll"
                 | "/api/worker/query-tasks/poll"
         );
+        if is_poll && request_number <= behavior.long_poll_capacity_responses_per_path {
+            write_mock_response(
+                stream,
+                "429 Too Many Requests",
+                r#"{"task":null,"poll_status":"long_poll_capacity_exhausted","reason":"long_poll_capacity_exhausted","retryable":true,"retry_after_seconds":1}"#,
+            );
+            return;
+        }
         if is_poll && request_number <= behavior.poll_failures_per_path {
             return;
         }
@@ -24448,6 +24595,18 @@ mod tests {
                     r#"{"task":{"task_id":"activity-cancel","activity_attempt_id":"attempt-cancel","activity_type":"cancel-aware","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"attempt_number":1,"lease_owner":"rust-cancel-worker"}}"#,
                 )
             }
+            "/api/worker/activity-tasks/poll"
+                if behavior.long_poll_capacity_responses_per_path > 0
+                    && request_number
+                        == behavior
+                            .long_poll_capacity_responses_per_path
+                            .saturating_add(1) =>
+            {
+                (
+                    "200 OK",
+                    r#"{"task":{"task_id":"capacity-activity","activity_attempt_id":"capacity-attempt","activity_type":"capacity.activity","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"attempt_number":1,"lease_owner":"capacity-worker"}}"#,
+                )
+            }
             "/api/worker/activity-tasks/poll" | "/api/worker/workflow-tasks/poll" => {
                 ("200 OK", r#"{"task":null}"#)
             }
@@ -24472,6 +24631,7 @@ mod tests {
             ),
             "/api/worker/activity-tasks/activity-typed/complete"
             | "/api/worker/activity-tasks/activity-typed/fail"
+            | "/api/worker/activity-tasks/capacity-activity/complete"
             | "/api/workflows/typed-1/signal/changed" => ("200 OK", "{}"),
             "/api/workflows/counter-1/query/current" => (
                 "200 OK",
