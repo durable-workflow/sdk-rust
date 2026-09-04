@@ -398,7 +398,7 @@ macro_rules! wait_condition {
 
 const MAX_SEARCH_ATTRIBUTES_PER_UPDATE: usize = 100;
 const MAX_SEARCH_ATTRIBUTE_KEY_LENGTH: usize = 64;
-const MAX_SEARCH_ATTRIBUTE_STRING_LENGTH: usize = 255;
+const MAX_SEARCH_ATTRIBUTE_STRING_LENGTH: usize = 2_048;
 const MAX_SEARCH_ATTRIBUTE_KEYWORD_LENGTH: usize = 255;
 const MAX_SEARCH_ATTRIBUTE_UPDATE_BYTES: usize = 65_536;
 
@@ -19250,6 +19250,30 @@ mod tests {
             Err(Error::InvalidSearchAttributeUpdate(
                 SearchAttributeUpdateError::Empty
             ))
+        ));
+    }
+
+    #[test]
+    fn typed_search_attribute_text_uses_the_runtime_byte_limit() {
+        let ascii = "a".repeat(MAX_SEARCH_ATTRIBUTE_STRING_LENGTH);
+        let utf8 = "é".repeat(MAX_SEARCH_ATTRIBUTE_STRING_LENGTH / 2);
+
+        assert!(SearchAttributeUpdate::new()
+            .string("AsciiDescription", ascii)
+            .is_ok());
+        assert!(SearchAttributeUpdate::new()
+            .string("Utf8Description", utf8)
+            .is_ok());
+        assert!(matches!(
+            SearchAttributeUpdate::new().string(
+                "TooLongDescription",
+                "é".repeat((MAX_SEARCH_ATTRIBUTE_STRING_LENGTH / 2) + 1),
+            ),
+            Err(SearchAttributeUpdateError::ValueTooLong {
+                kind: "string",
+                limit: MAX_SEARCH_ATTRIBUTE_STRING_LENGTH,
+                ..
+            })
         ));
     }
 
