@@ -156,6 +156,33 @@ class ConsumerIsolationTest(unittest.TestCase):
         self.assertEqual(len(targets), len(set(targets)))
 
 
+class GitSnapshotTest(unittest.TestCase):
+    def test_ref_files_preserve_binary_content(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="regression-corpus-ref-") as directory:
+            root = Path(directory)
+            binary = b"\x89PNG\r\n\x1a\n\x00\xff"
+            (root / "asset.png").write_bytes(binary)
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            subprocess.run(["git", "add", "asset.png"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Corpus Snapshot Test",
+                    "-c",
+                    "user.email=corpus-snapshot@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "binary fixture",
+                ],
+                cwd=root,
+                check=True,
+            )
+
+            self.assertEqual(binary, VALIDATOR._ref_files(root, "HEAD")["asset.png"])
+
+
 class ReplayValueIdentityConsumerTest(unittest.TestCase):
     @staticmethod
     def _responding_consumer(
