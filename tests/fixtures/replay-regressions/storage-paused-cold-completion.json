@@ -1,0 +1,46 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-storage-paused-cold-completion",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.typed-replayed",
+    "input": [{"message": "typed-handler"}],
+    "payload_codec": "avro"
+  },
+  "worker_task": {
+    "payload_codec": "avro",
+    "completion_storage_refusals": 7
+  },
+  "history": [
+    {
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.typed.activity"
+      }
+    },
+    {
+      "event_type": "ActivityCompleted",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.typed.activity",
+        "result": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNw4CDm1lc3NhZ2UKGnR5cGVkLWhhbmRsZXIA"
+        },
+        "payload_codec": "avro"
+      }
+    }
+  ],
+  "command_sequence": [
+    {"type": "complete_workflow", "result": {"message": "typed-handler"}}
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {"message": "typed-handler"},
+    "completion_attempts": 8,
+    "handler_invocations": 1
+  }
+}

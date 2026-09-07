@@ -505,6 +505,35 @@ fn health_check(enabled: bool) -> bool {
 
         self.assertTrue(self._guard_matches())
 
+    def test_previous_codec_hunk_label_does_not_classify_client_changes(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -20,3 +20,4 @@ fn decode_avro_value_blob(bytes: &[u8]) -> bool {
+ struct Client {
+     timeout: u64,
++    retry: bool,
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertFalse(self._guard_matches())
+
+    def test_codec_declaration_after_unrelated_hunk_is_still_classified(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,3 +1,3 @@
+ struct Client {
+-    timeout: u32,
++    timeout: u64,
+ }
+@@ -20,3 +20,3 @@
+ fn decode_avro_value_blob(bytes: &[u8]) -> bool {
+-    bytes.len() < 10
++    bytes.len() < 9
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertTrue(self._guard_matches())
+
     def test_non_codec_test_before_avro_helper_is_not_related(self) -> None:
         source = self.root / "src/lib.rs"
         source.write_text(
