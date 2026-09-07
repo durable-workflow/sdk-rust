@@ -15,8 +15,8 @@ use std::{
 use durable_workflow::{
     decode_payload, encode_payload, json, AvroValue, ChildWorkflowOptions, Client,
     ConditionWaitOptions, ConditionWaitResult, Error, ParallelOperation, ParallelResult,
-    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, Value, Worker, WorkflowInstance,
-    DEFAULT_CODEC,
+    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, Value, Worker, WorkerRetryPolicy,
+    WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,7 @@ struct FixtureServer {
 }
 
 impl FixtureServer {
-    fn start(task: Value) -> Self {
+    fn start(task: Value, completion_storage_refusals: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay fixture server");
         listener
             .set_nonblocking(true)
@@ -62,7 +62,12 @@ impl FixtureServer {
             while !server_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        handle_request(&mut stream, &server_requests, &task);
+                        handle_request(
+                            &mut stream,
+                            &server_requests,
+                            &task,
+                            completion_storage_refusals,
+                        );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -114,6 +119,7 @@ fn handle_request(
     stream: &mut TcpStream,
     requests: &Arc<Mutex<Vec<CapturedRequest>>>,
     task: &Value,
+    completion_storage_refusals: u64,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut request = Vec::new();
@@ -161,7 +167,18 @@ fn handle_request(
             .filter(|request| request.path == path)
             .count()
     };
+    let storage_refused = path.starts_with("/api/worker/workflow-tasks/")
+        && path.ends_with("/complete")
+        && request_number as u64 <= completion_storage_refusals;
     let body = match path.as_str() {
+        _ if storage_refused => json!({
+            "reason": "storage_pressure",
+            "storage_state": "fenced",
+            "retryable": true,
+            "retry_after_seconds": 1,
+            "request_admitted": false
+        })
+        .to_string(),
         "/api/worker/register" => json!({
             "worker_id": "regression-corpus-worker",
             "registered": true,
@@ -181,7 +198,9 @@ fn handle_request(
         }
         _ => json!({"message": "not found"}).to_string(),
     };
-    let status = if body.contains("\"not found\"") {
+    let status = if storage_refused {
+        "503 Service Unavailable"
+    } else if body.contains("\"not found\"") {
         "404 Not Found"
     } else {
         "200 OK"
@@ -441,16 +460,26 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     {
         task["workflow_command_id"] = workflow_command_id.clone();
     }
-    let server = FixtureServer::start(task);
+    let completion_storage_refusals = fixture["worker_task"]["completion_storage_refusals"]
+        .as_u64()
+        .unwrap_or(0);
+    let server = FixtureServer::start(task, completion_storage_refusals);
     let client = Client::builder(server.base_url())
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|error| format!("create replay corpus client: {error}"))?;
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let observed_calls = Arc::clone(&callback_calls);
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let observed_handler_calls = Arc::clone(&handler_calls);
     let mut worker = Worker::new(client, "regression-corpus")
         .worker_id("regression-corpus-worker")
-        .poll_timeout(Duration::from_millis(10));
+        .poll_timeout(Duration::from_millis(10))
+        .retry_policy(WorkerRetryPolicy {
+            max_retries: 1,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        });
     match workflow_type {
         "corpus.side-effect-version" => {
             worker.register_workflow(workflow_type, move |ctx, _input| {
@@ -548,11 +577,17 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             worker.register_typed_replayed_workflow(
                 workflow_type,
                 TypedReplayState::default,
-                |ctx, input: TypedReplayContract, state: WorkflowInstance<TypedReplayState>| async move {
-                    let result: TypedReplayContract =
-                        ctx.activity_typed("corpus.typed.activity", input).await?;
-                    state.update(|current| current.message = Some(result.message.clone()))?;
-                    Ok(result)
+                move |ctx,
+                      input: TypedReplayContract,
+                      state: WorkflowInstance<TypedReplayState>| {
+                    let observed_handler_calls = Arc::clone(&observed_handler_calls);
+                    async move {
+                        observed_handler_calls.fetch_add(1, Ordering::SeqCst);
+                        let result: TypedReplayContract =
+                            ctx.activity_typed("corpus.typed.activity", input).await?;
+                        state.update(|current| current.message = Some(result.message.clone()))?;
+                        Ok(result)
+                    }
                 },
             );
         }
@@ -721,6 +756,23 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             ));
         }
     };
+    let completion_attempts = {
+        let requests = server
+            .requests
+            .lock()
+            .expect("captured replay fixture requests");
+        let bodies: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path == completion_path)
+            .map(|request| &request.body)
+            .collect();
+        if bodies.windows(2).any(|pair| pair[0] != pair[1]) {
+            return Err(format!(
+                "{fixture_id} changed a serialized completion during storage recovery"
+            ));
+        }
+        bodies.len()
+    };
     let commands = completion["commands"]
         .as_array()
         .ok_or_else(|| format!("{fixture_id} completion has no command sequence"))?
@@ -762,6 +814,14 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if let Some(worker_registration) = worker_registration {
         observed.insert("worker_registration".to_string(), worker_registration);
     }
+    observed.insert(
+        "completion_attempts".to_string(),
+        json!(completion_attempts),
+    );
+    observed.insert(
+        "handler_invocations".to_string(),
+        json!(handler_calls.load(Ordering::SeqCst)),
+    );
     if let [Value::Object(command)] = commands.as_slice() {
         observed.extend(command.clone());
     }

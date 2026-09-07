@@ -1810,9 +1810,8 @@ def _guard_matches(
         elif line.startswith("@@"):
             inside_hunk = True
             enclosing_items.clear()
-            match = re.match(r"^@@ [^@]* @@(?: ?(.*))?$", line)
-            if match and match.group(1):
-                relevant_lines.append(match.group(1))
+            # Git's hunk label may name the preceding, unchanged function.
+            # --function-context supplies actual declarations below instead.
         elif inside_hunk and line.startswith(" "):
             content = line[1:]
             stripped = content.lstrip()
@@ -1840,10 +1839,11 @@ def _guard_matches(
             )
     relevant_context = "\n".join(relevant_lines)
     content_matches = patterns is None or any(
-        re.search(pattern, relevant_context) for pattern in patterns
+        re.search(pattern, relevant_context, re.MULTILINE) for pattern in patterns
     )
     implementation_matches = implementation_patterns is None or any(
-        re.search(pattern, relevant_context) for pattern in implementation_patterns
+        re.search(pattern, relevant_context, re.MULTILINE)
+        for pattern in implementation_patterns
     )
     return content_matches and implementation_matches
 

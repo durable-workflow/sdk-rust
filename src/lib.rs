@@ -23311,7 +23311,10 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(2), worker.run_until(shutdown))
                 .await
                 .expect("shutdown interrupts admission");
-            assert!(result.is_err(), "a refused operation must not appear acknowledged: {path}, {result:?}");
+            assert!(
+                result.is_err(),
+                "a refused operation must not appear acknowledged: {path}, {result:?}"
+            );
             assert_eq!(server.request_count(path), 1);
             assert_eq!(
                 server.request_count("/api/worker/activity-tasks/storage-activity/fail"),
@@ -23328,7 +23331,9 @@ mod tests {
     async fn storage_query_outcome_is_retained_without_reexecuting_handler() {
         for fail in [false, true] {
             let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-                storage_query: true, storage_refusals: 7, storage_path: Some("/storage-query/"),
+                storage_query: true,
+                storage_refusals: 7,
+                storage_path: Some("/storage-query/"),
                 ..MockWorkerBehavior::default()
             });
             let mut worker = storage_worker(&server);
@@ -23339,41 +23344,79 @@ mod tests {
                 let calls = Arc::clone(&observed);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    if fail { Err(Error::WorkerLoop("intentional query failure".to_string())) }
-                    else { Ok(json!({"state":"waiting"})) }
+                    if fail {
+                        Err(Error::WorkerLoop("intentional query failure".to_string()))
+                    } else {
+                        Ok(json!({"state":"waiting"}))
+                    }
                 }
             });
             assert_eq!(worker.run_once().await.expect("query settled"), 1);
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             let suffix = if fail { "fail" } else { "complete" };
-            assert_identical_requests(&server, &format!("/api/worker/query-tasks/storage-query/{suffix}"), 8);
+            assert_identical_requests(
+                &server,
+                &format!("/api/worker/query-tasks/storage-query/{suffix}"),
+                8,
+            );
             let other = if fail { "complete" } else { "fail" };
-            assert_eq!(server.request_count(&format!("/api/worker/query-tasks/storage-query/{other}")), 0);
+            assert_eq!(
+                server.request_count(&format!("/api/worker/query-tasks/storage-query/{other}")),
+                0
+            );
         }
     }
 
     #[tokio::test]
     async fn storage_recovery_does_not_override_auth_lease_or_invalid_contract() {
         let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-            storage_refusals: 7, storage_path: Some("/poll"), unauthorized_polls: true,
+            storage_refusals: 7,
+            storage_path: Some("/poll"),
+            unauthorized_polls: true,
             ..MockWorkerBehavior::default()
         });
-        let error = storage_worker(&server).run_once().await.expect_err("auth remains terminal");
-        assert!(matches!(error, Error::Http { status: reqwest::StatusCode::UNAUTHORIZED, .. }));
+        let error = storage_worker(&server)
+            .run_once()
+            .await
+            .expect_err("auth remains terminal");
+        assert!(matches!(
+            error,
+            Error::Http {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        ));
         assert_identical_requests(&server, "/api/worker/workflow-tasks/poll", 8);
 
         let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-            storage_refusals: 7, storage_path: Some("/activity-cancel/complete"),
+            storage_refusals: 7,
+            storage_path: Some("/activity-cancel/complete"),
             ..MockWorkerBehavior::default()
         });
-        let worker = storage_worker(&server).with_storage_admission(Arc::new(AtomicBool::new(false)));
-        let error = worker.client.complete_activity_task("activity-cancel", "attempt-cancel", "worker", json!({}), DEFAULT_CODEC)
-            .await.expect_err("cancellation remains terminal");
+        let worker =
+            storage_worker(&server).with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let error = worker
+            .client
+            .complete_activity_task(
+                "activity-cancel",
+                "attempt-cancel",
+                "worker",
+                json!({}),
+                DEFAULT_CODEC,
+            )
+            .await
+            .expect_err("cancellation remains terminal");
         assert!(activity_task_rejection_is_final(&error));
-        assert_identical_requests(&server, "/api/worker/activity-tasks/activity-cancel/complete", 8);
+        assert_identical_requests(
+            &server,
+            "/api/worker/activity-tasks/activity-cancel/complete",
+            8,
+        );
 
         let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-            storage_refusals: usize::MAX, storage_path: Some("/poll"), storage_wrong_poll_id: true,
+            storage_refusals: usize::MAX,
+            storage_path: Some("/poll"),
+            storage_wrong_poll_id: true,
             ..MockWorkerBehavior::default()
         });
         assert!(storage_worker(&server).run_once().await.is_err());
@@ -23383,7 +23426,9 @@ mod tests {
     #[tokio::test]
     async fn storage_pollers_stop_when_the_run_future_is_aborted() {
         let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-            storage_refusals: usize::MAX, storage_path: Some("/poll"), ..MockWorkerBehavior::default()
+            storage_refusals: usize::MAX,
+            storage_path: Some("/poll"),
+            ..MockWorkerBehavior::default()
         });
         let mut worker = storage_worker(&server).retry_policy(WorkerRetryPolicy::default());
         worker.register_activity("unused", |_, _| async { Ok(Value::Null) });
@@ -23392,7 +23437,9 @@ mod tests {
             while server.request_count("/api/worker/activity-tasks/poll") == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        }).await.expect("poll started");
+        })
+        .await
+        .expect("poll started");
         run.abort();
         assert!(run.await.expect_err("cancelled run").is_cancelled());
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -24742,7 +24789,10 @@ mod tests {
             write_mock_response(stream, "503 Service Unavailable", &refusal.to_string());
             return;
         }
-        if path.contains("/storage-task/") || path.contains("/storage-activity/") || path.contains("/storage-query/") {
+        if path.contains("/storage-task/")
+            || path.contains("/storage-activity/")
+            || path.contains("/storage-query/")
+        {
             write_mock_response(stream, "200 OK", "{}");
             return;
         }
