@@ -2618,6 +2618,7 @@ pub struct Client {
     control_token: Option<String>,
     worker_token: Option<String>,
     namespace: String,
+    worker_storage_admission: Option<WorkerStorageAdmission>,
 }
 
 impl Client {
@@ -4055,23 +4056,70 @@ impl Client {
             request = request.json(body);
         }
 
-        let response = request.send().await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
+        let request = request.build()?;
+        let admission = self
+            .worker_storage_admission
+            .as_ref()
+            .filter(|_| matches!(protocol, RequestProtocol::Worker(_)));
+        let poll_request_id = path.ends_with("/poll").then(|| {
+            request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                .and_then(|body| body.get("poll_request_id")?.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        });
+        let mut storage_retries = 0_usize;
 
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes).to_string();
-            if let Some(protocol) = protocol_failure(status, &body) {
-                return Err(Error::Protocol(protocol));
+        loop {
+            // Keep the serialized body and lease/poll identity across admission pauses.
+            let response = self
+                .http
+                .execute(request.try_clone().ok_or_else(|| {
+                    Error::WorkerLoop("worker request body cannot be retried".to_string())
+                })?)
+                .await?;
+            let status = response.status();
+            let bytes = response.bytes().await?;
+
+            if !status.is_success() {
+                let body = String::from_utf8_lossy(&bytes).to_string();
+                if let Some(protocol) = protocol_failure(status, &body) {
+                    return Err(Error::Protocol(protocol));
+                }
+                let error = Error::Http { status, body };
+                if let Some(admission) = admission {
+                    if let Some(advertised_delay) =
+                        worker_storage_admission_retry_after(&error, poll_request_id.as_deref())
+                    {
+                        storage_retries = storage_retries.saturating_add(1);
+                        let delay = worker_retry_delay(admission.policy, storage_retries)
+                            .max(advertised_delay)
+                            .min(admission.policy.max_backoff.max(Duration::from_millis(1)));
+                        let deadline = tokio::time::Instant::now() + delay;
+                        loop {
+                            if admission.stop.load(Ordering::SeqCst) {
+                                return Err(error);
+                            }
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+                        }
+                        continue;
+                    }
+                }
+                return Err(error);
             }
-            return Err(Error::Http { status, body });
-        }
 
-        if bytes.is_empty() {
-            return Ok(serde_json::from_value(Value::Null)?);
-        }
+            if bytes.is_empty() {
+                return Ok(serde_json::from_value(Value::Null)?);
+            }
 
-        Ok(serde_json::from_slice(&bytes)?)
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
     }
 
     async fn poll_request_json<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -4403,6 +4451,7 @@ fn long_poll_timeout_seconds(timeout: Duration) -> u64 {
 
 fn worker_operation_is_retryable(error: &Error) -> bool {
     if worker_poll_capacity_retry_after(error).is_some()
+        || worker_storage_admission_body(error).is_some()
         || worker_operation_is_explicitly_non_retryable(error)
     {
         return false;
@@ -4420,6 +4469,57 @@ fn worker_operation_is_retryable(error: &Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn worker_storage_admission_body(error: &Error) -> Option<Value> {
+    let body: Value = match error {
+        Error::Http { body, .. } => serde_json::from_str(body).ok()?,
+        Error::ActivityTaskRejected(rejection) => rejection.body.clone(),
+        _ => return None,
+    };
+    matches!(
+        body.get("reason").and_then(Value::as_str),
+        Some("storage_pressure" | "storage_admission_unavailable")
+    )
+    .then_some(body)
+}
+
+fn worker_storage_admission_retry_after(
+    error: &Error,
+    poll_request_id: Option<&str>,
+) -> Option<Duration> {
+    let Error::Http { status, .. } = error else {
+        return None;
+    };
+    let body = worker_storage_admission_body(error)?;
+    let delay = body.get("retry_after_seconds")?.as_u64()?;
+    if *status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || delay == 0
+        || body.get("retryable") != Some(&Value::Bool(true))
+        || !matches!(body.get("storage_state")?.as_str()?, "draining" | "fenced")
+        || (body["reason"] == "storage_admission_unavailable" && body["storage_state"] != "fenced")
+        || body
+            .get("request_admitted")
+            .is_some_and(|admitted| admitted != &Value::Bool(false))
+    {
+        return None;
+    }
+    match poll_request_id {
+        Some(id) => {
+            if id.is_empty()
+                || body.get("task") != Some(&Value::Null)
+                || body.get("poll_request_id").and_then(Value::as_str) != Some(id)
+                || body.get("poll_status") != body.get("reason")
+                || body.get("retry_same_poll_request_id") != Some(&Value::Bool(true))
+                || body.get("claim_admitted") != Some(&Value::Bool(false))
+            {
+                return None;
+            }
+        }
+        None if body.get("request_admitted") != Some(&Value::Bool(false)) => return None,
+        None => {}
+    }
+    Some(Duration::from_secs(delay))
 }
 
 fn worker_operation_is_explicitly_non_retryable(error: &Error) -> bool {
@@ -4517,6 +4617,7 @@ impl ClientBuilder {
             control_token: self.control_token,
             worker_token: self.worker_token,
             namespace: self.namespace,
+            worker_storage_admission: None,
         })
     }
 }
@@ -5706,6 +5807,9 @@ pub struct WorkerHeartbeatObservation {
 /// retryable HTTP 408/429 responses, and server errors are retried with capped
 /// exponential backoff. Authentication, protocol, codec, and handler failures
 /// are never retried by the worker.
+/// Explicit storage admission pauses also preserve the already-serialized worker
+/// request without consuming this budget or rerunning its handler. The delay is
+/// capped by `max_backoff`, and shutdown interrupts storage waits.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerRetryPolicy {
     /// Number of retries after the initial request fails.
@@ -5723,6 +5827,26 @@ impl Default for WorkerRetryPolicy {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkerStorageAdmission {
+    policy: WorkerRetryPolicy,
+    stop: Arc<AtomicBool>,
+}
+
+struct StopWorkerOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn wait_for_worker_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -6365,6 +6489,31 @@ impl Worker {
     where
         F: Future<Output = ()>,
     {
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopWorkerOnDrop(Arc::clone(&stop));
+        let worker = self.with_storage_admission(Arc::clone(&stop));
+        let run = worker.run_with_storage_admission(Arc::clone(&stop));
+        tokio::pin!(run);
+        tokio::pin!(shutdown);
+        tokio::select! {
+            result = &mut run => result,
+            _ = &mut shutdown => {
+                stop.store(true, Ordering::SeqCst);
+                run.await
+            }
+        }
+    }
+
+    fn with_storage_admission(&self, stop: Arc<AtomicBool>) -> Self {
+        let mut worker = self.clone();
+        worker.client.worker_storage_admission = Some(WorkerStorageAdmission {
+            policy: self.retry_policy,
+            stop,
+        });
+        worker
+    }
+
+    async fn run_with_storage_admission(&self, stop: Arc<AtomicBool>) -> Result<()> {
         let registration = self.register().await?;
         if !registration.registered {
             return Err(Error::WorkerLoop(format!(
@@ -6373,7 +6522,7 @@ impl Worker {
             )));
         }
         let registered_worker_id = registration.worker_id.clone();
-        let primary = self.run_registered_until(shutdown, registration).await;
+        let primary = self.run_registered_until(stop, registration).await;
         let deregistration = self
             .client
             .deregister_worker_registration(&registered_worker_id)
@@ -6390,14 +6539,11 @@ impl Worker {
         }
     }
 
-    async fn run_registered_until<F>(
+    async fn run_registered_until(
         &self,
-        shutdown: F,
+        stop: Arc<AtomicBool>,
         registration: RegisterWorkerResponse,
-    ) -> Result<()>
-    where
-        F: Future<Output = ()>,
-    {
+    ) -> Result<()> {
         let heartbeat_interval = Duration::from_secs(
             registration
                 .heartbeat_interval_seconds
@@ -6410,8 +6556,6 @@ impl Worker {
         // soon as that request completes.
         let heartbeat = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(heartbeat);
-        tokio::pin!(shutdown);
-        let stop = Arc::new(AtomicBool::new(false));
         // Poll responses may already have leased server-side work by the time
         // they become ready, so each poller owns its responses through
         // completion or failure instead of racing raw polls in this select.
@@ -6433,7 +6577,7 @@ impl Worker {
 
         loop {
             tokio::select! {
-                _ = &mut shutdown => {
+                _ = wait_for_worker_stop(&stop) => {
                     stop.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -6544,19 +6688,20 @@ impl Worker {
     /// Direct callers of [`Client::complete_workflow_task`] continue to receive
     /// the original [`Error::Http`] status and response body.
     pub async fn run_once(&self) -> Result<usize> {
+        let worker = self.with_storage_admission(Arc::new(AtomicBool::new(false)));
         let mut handled = 0;
-        match self.poll_workflow_once().await? {
+        match worker.poll_workflow_once().await? {
             ManagedPollOutcome::Handled => handled += 1,
             ManagedPollOutcome::Stop => return Ok(handled),
             ManagedPollOutcome::Idle => {}
         }
-        match self.poll_activity_once().await? {
+        match worker.poll_activity_once().await? {
             ManagedPollOutcome::Handled => handled += 1,
             ManagedPollOutcome::Stop => return Ok(handled),
             ManagedPollOutcome::Idle => {}
         }
         if !self.queries.is_empty() {
-            match self.poll_query_once().await? {
+            match worker.poll_query_once().await? {
                 ManagedPollOutcome::Handled => handled += 1,
                 ManagedPollOutcome::Stop => return Ok(handled),
                 ManagedPollOutcome::Idle => {}
@@ -6708,6 +6853,7 @@ impl Worker {
         let codec = task.payload_codec.clone();
         let result = self.execute_activity_task(task).await;
         match result {
+            Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
                 let completion = self
                     .client
@@ -22874,6 +23020,385 @@ mod tests {
         }
     }
 
+    fn storage_refusal(poll_id: Option<&str>, unavailable: bool, mid_poll: bool) -> Value {
+        let reason = if unavailable {
+            "storage_admission_unavailable"
+        } else {
+            "storage_pressure"
+        };
+        let mut body = json!({
+            "reason": reason,
+            "storage_state": if unavailable { "fenced" } else { "draining" },
+            "retryable": true,
+            "retry_after_seconds": 1,
+        });
+        if !mid_poll {
+            body["request_admitted"] = json!(false);
+        }
+        if let Some(id) = poll_id {
+            body["task"] = Value::Null;
+            body["poll_status"] = json!(reason);
+            body["poll_request_id"] = json!(id);
+            body["retry_same_poll_request_id"] = json!(true);
+            body["claim_admitted"] = json!(false);
+        }
+        body
+    }
+
+    fn storage_worker(server: &MockWorkerServer) -> Worker {
+        Worker::new(Client::new(server.base_url()).expect("client"), "storage")
+            .worker_id("storage-worker")
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            })
+    }
+
+    fn assert_identical_requests(server: &MockWorkerServer, path: &str, count: usize) {
+        let requests = server.requests.lock().expect("requests");
+        let bodies: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path == path)
+            .map(|request| &request.body)
+            .collect();
+        assert_eq!(bodies.len(), count, "{path}");
+        assert!(bodies.iter().all(|body| body == &bodies[0]), "{path}");
+    }
+
+    #[test]
+    fn storage_admission_requires_an_explicit_identity_preserving_contract() {
+        for unavailable in [false, true] {
+            for mid_poll in [false, true] {
+                let body = storage_refusal(Some("same-poll"), unavailable, mid_poll);
+                let error = Error::Http {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    body: body.to_string(),
+                };
+                assert_eq!(
+                    worker_storage_admission_retry_after(&error, Some("same-poll")),
+                    Some(Duration::from_secs(1))
+                );
+                assert!(
+                    !worker_operation_is_retryable(&error),
+                    "storage is not a bounded generic retry"
+                );
+                for (field, value) in [
+                    ("poll_request_id", json!("wrong-poll")),
+                    ("task", json!({"task_id":"claimed"})),
+                    ("retryable", json!(false)),
+                    ("retry_after_seconds", json!(0)),
+                    ("retry_after_seconds", json!(true)),
+                    ("retry_after_seconds", json!(1.0)),
+                    ("storage_state", json!("normal")),
+                    ("poll_status", json!("empty")),
+                    ("claim_admitted", json!(true)),
+                    ("retry_same_poll_request_id", json!(false)),
+                    ("request_admitted", json!(true)),
+                ] {
+                    let mut invalid = body.clone();
+                    invalid[field] = value;
+                    let error = Error::Http {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body: invalid.to_string(),
+                    };
+                    assert!(
+                        worker_storage_admission_retry_after(&error, Some("same-poll")).is_none(),
+                        "{field}"
+                    );
+                }
+            }
+        }
+        let body = storage_refusal(None, false, false);
+        let error = Error::Http {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: body.to_string(),
+        };
+        assert!(worker_storage_admission_retry_after(&error, None).is_some());
+        assert!(worker_storage_admission_retry_after(&error, Some("")).is_none());
+        let error = Error::Http {
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: body.to_string(),
+        };
+        assert!(worker_storage_admission_retry_after(&error, None).is_none());
+        let body = storage_refusal(None, false, true);
+        let error = Error::Http {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: body.to_string(),
+        };
+        assert!(worker_storage_admission_retry_after(&error, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_poll_recovery_preserves_ambiguous_claim_identity() {
+        for unavailable in [false, true] {
+            for mid_poll in [false, true] {
+                let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                    poll_failures_per_path: 1,
+                    storage_refusals: 7,
+                    storage_path: Some("/poll"),
+                    storage_unavailable: unavailable,
+                    storage_mid_poll: mid_poll,
+                    ..MockWorkerBehavior::default()
+                });
+                let mut worker = storage_worker(&server);
+                worker.register_query("unused", "state", |_, _| async { Ok(Value::Null) });
+                assert_eq!(worker.run_once().await.expect("storage recovery"), 0);
+                for path in [
+                    "/api/worker/workflow-tasks/poll",
+                    "/api/worker/activity-tasks/poll",
+                    "/api/worker/query-tasks/poll",
+                ] {
+                    assert_identical_requests(&server, path, 9);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_refused_mutations_do_not_reserialize_or_change_client_scope() {
+        struct CountedBody(Arc<AtomicUsize>);
+        impl Serialize for CountedBody {
+            fn serialize<S: Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let count = self.0.fetch_add(1, Ordering::SeqCst);
+                json!({"serialization":count,"lease_owner":"worker","attempt":7})
+                    .serialize(serializer)
+            }
+        }
+        for path in [
+            "/api/worker/register",
+            "/api/worker/heartbeat",
+            "/api/worker/workflow-tasks/storage-task/complete",
+            "/api/worker/workflow-tasks/storage-task/fail",
+            "/api/worker/activity-tasks/storage-task/complete",
+            "/api/worker/activity-tasks/storage-task/fail",
+            "/api/worker/activity-tasks/storage-task/heartbeat",
+            "/api/worker/query-tasks/storage-task/complete",
+            "/api/worker/query-tasks/storage-task/fail",
+        ] {
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                storage_refusals: 7,
+                storage_path: Some(path),
+                ..MockWorkerBehavior::default()
+            });
+            let worker =
+                storage_worker(&server).with_storage_admission(Arc::new(AtomicBool::new(false)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let _: Value = worker
+                .client
+                .request_json(
+                    reqwest::Method::POST,
+                    &path[4..],
+                    RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                    Some(&CountedBody(Arc::clone(&calls))),
+                )
+                .await
+                .expect("prepared request recovery");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_identical_requests(&server, path, 8);
+        }
+        for worker_scope in [false, true] {
+            let path = if worker_scope {
+                "/api/health"
+            } else {
+                "/api/worker/register"
+            };
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                storage_refusals: usize::MAX,
+                storage_path: Some(path),
+                ..MockWorkerBehavior::default()
+            });
+            let worker = storage_worker(&server);
+            let client = worker.client.clone();
+            let worker = worker.with_storage_admission(Arc::new(AtomicBool::new(false)));
+            let error = if worker_scope {
+                worker
+                    .client
+                    .health()
+                    .await
+                    .expect_err("control plane is not retried")
+            } else {
+                client
+                    .request_json::<Value, Value>(
+                        reqwest::Method::POST,
+                        "/worker/register",
+                        RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                        Some(&json!({})),
+                    )
+                    .await
+                    .expect_err("direct client is not retried")
+            };
+            assert!(worker_storage_admission_body(&error).is_some());
+            assert_eq!(server.request_count(path), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_activity_outcome_is_retained_without_reexecuting_handler() {
+        for fail in [false, true] {
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                storage_activity: true,
+                storage_refusals: 7,
+                storage_path: Some("/storage-activity/"),
+                ..MockWorkerBehavior::default()
+            });
+            let mut worker = storage_worker(&server);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            worker.register_activity("storage.activity", move |ctx, _| {
+                let calls = Arc::clone(&observed);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    ctx.heartbeat(json!({"step":2})).await?;
+                    if fail {
+                        Err(Error::WorkerLoop("intentional handler failure".to_string()))
+                    } else {
+                        Ok(json!({"receipt":true}))
+                    }
+                }
+            });
+            assert_eq!(worker.run_once().await.expect("activity settled"), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_identical_requests(
+                &server,
+                "/api/worker/activity-tasks/storage-activity/heartbeat",
+                8,
+            );
+            let suffix = if fail { "fail" } else { "complete" };
+            assert_identical_requests(
+                &server,
+                &format!("/api/worker/activity-tasks/storage-activity/{suffix}"),
+                8,
+            );
+            let other = if fail { "complete" } else { "fail" };
+            assert_eq!(
+                server.request_count(&format!(
+                    "/api/worker/activity-tasks/storage-activity/{other}"
+                )),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_waits_are_interruptible_without_false_activity_failure() {
+        for path in [
+            "/api/worker/register",
+            "/api/worker/heartbeat",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/activity-tasks/storage-activity/heartbeat",
+            "/api/worker/activity-tasks/storage-activity/complete",
+        ] {
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                storage_activity: true,
+                storage_refusals: usize::MAX,
+                storage_path: Some(path),
+                ..MockWorkerBehavior::default()
+            });
+            let mut worker = storage_worker(&server).retry_policy(WorkerRetryPolicy::default());
+            worker.register_activity("storage.activity", |ctx, _| async move {
+                ctx.heartbeat(json!({"step":2})).await?;
+                Ok(json!({"receipt":true}))
+            });
+            let shutdown = async {
+                while server.request_count(path) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), worker.run_until(shutdown))
+                .await
+                .expect("shutdown interrupts admission");
+            assert!(result.is_err(), "a refused operation must not appear acknowledged: {path}, {result:?}");
+            assert_eq!(server.request_count(path), 1);
+            assert_eq!(
+                server.request_count("/api/worker/activity-tasks/storage-activity/fail"),
+                0
+            );
+            assert_eq!(
+                server.request_count("/api/worker/registrations/mock-worker"),
+                usize::from(!path.ends_with("/register"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_query_outcome_is_retained_without_reexecuting_handler() {
+        for fail in [false, true] {
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                storage_query: true, storage_refusals: 7, storage_path: Some("/storage-query/"),
+                ..MockWorkerBehavior::default()
+            });
+            let mut worker = storage_worker(&server);
+            worker.register_workflow("storage.workflow", |_, _| async { Ok(Value::Null) });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            worker.register_query("storage.workflow", "state", move |_, _| {
+                let calls = Arc::clone(&observed);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if fail { Err(Error::WorkerLoop("intentional query failure".to_string())) }
+                    else { Ok(json!({"state":"waiting"})) }
+                }
+            });
+            assert_eq!(worker.run_once().await.expect("query settled"), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let suffix = if fail { "fail" } else { "complete" };
+            assert_identical_requests(&server, &format!("/api/worker/query-tasks/storage-query/{suffix}"), 8);
+            let other = if fail { "complete" } else { "fail" };
+            assert_eq!(server.request_count(&format!("/api/worker/query-tasks/storage-query/{other}")), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_does_not_override_auth_lease_or_invalid_contract() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            storage_refusals: 7, storage_path: Some("/poll"), unauthorized_polls: true,
+            ..MockWorkerBehavior::default()
+        });
+        let error = storage_worker(&server).run_once().await.expect_err("auth remains terminal");
+        assert!(matches!(error, Error::Http { status: reqwest::StatusCode::UNAUTHORIZED, .. }));
+        assert_identical_requests(&server, "/api/worker/workflow-tasks/poll", 8);
+
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            storage_refusals: 7, storage_path: Some("/activity-cancel/complete"),
+            ..MockWorkerBehavior::default()
+        });
+        let worker = storage_worker(&server).with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let error = worker.client.complete_activity_task("activity-cancel", "attempt-cancel", "worker", json!({}), DEFAULT_CODEC)
+            .await.expect_err("cancellation remains terminal");
+        assert!(activity_task_rejection_is_final(&error));
+        assert_identical_requests(&server, "/api/worker/activity-tasks/activity-cancel/complete", 8);
+
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            storage_refusals: usize::MAX, storage_path: Some("/poll"), storage_wrong_poll_id: true,
+            ..MockWorkerBehavior::default()
+        });
+        assert!(storage_worker(&server).run_once().await.is_err());
+        assert_eq!(server.request_count("/api/worker/workflow-tasks/poll"), 1);
+    }
+
+    #[tokio::test]
+    async fn storage_pollers_stop_when_the_run_future_is_aborted() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            storage_refusals: usize::MAX, storage_path: Some("/poll"), ..MockWorkerBehavior::default()
+        });
+        let mut worker = storage_worker(&server).retry_policy(WorkerRetryPolicy::default());
+        worker.register_activity("unused", |_, _| async { Ok(Value::Null) });
+        let run = tokio::spawn(async move { worker.run().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.request_count("/api/worker/activity-tasks/poll") == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("poll started");
+        run.abort();
+        assert!(run.await.expect_err("cancelled run").is_cancelled());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(server.request_count("/api/worker/activity-tasks/poll"), 1);
+    }
+
     #[tokio::test]
     async fn query_protocol_rejection_from_older_server_is_typed() {
         let server = MockWorkerServer::reject_query_protocol();
@@ -23747,6 +24272,13 @@ mod tests {
 
     #[derive(Clone, Copy, Default)]
     struct MockWorkerBehavior {
+        storage_refusals: usize,
+        storage_path: Option<&'static str>,
+        storage_unavailable: bool,
+        storage_mid_poll: bool,
+        storage_activity: bool,
+        storage_query: bool,
+        storage_wrong_poll_id: bool,
         reject_query_protocol: bool,
         reject_query_completion: bool,
         waiting_query_worker: bool,
@@ -24180,6 +24712,61 @@ mod tests {
                 .filter(|request| request.path == path)
                 .count()
         };
+
+        if path.ends_with("/poll") && request_number <= behavior.poll_failures_per_path {
+            return;
+        }
+        let pressure_path = behavior
+            .storage_path
+            .is_some_and(|part| path.contains(part));
+        let prior_failures = if path.ends_with("/poll") {
+            behavior.poll_failures_per_path
+        } else {
+            0
+        };
+        if pressure_path
+            && request_number.saturating_sub(prior_failures) <= behavior.storage_refusals
+        {
+            let request_body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let poll_id = path
+                .ends_with("/poll")
+                .then(|| request_body["poll_request_id"].as_str().unwrap_or(""));
+            let mut refusal = storage_refusal(
+                poll_id,
+                behavior.storage_unavailable,
+                behavior.storage_mid_poll,
+            );
+            if behavior.storage_wrong_poll_id {
+                refusal["poll_request_id"] = json!("wrong-poll");
+            }
+            write_mock_response(stream, "503 Service Unavailable", &refusal.to_string());
+            return;
+        }
+        if path.contains("/storage-task/") || path.contains("/storage-activity/") || path.contains("/storage-query/") {
+            write_mock_response(stream, "200 OK", "{}");
+            return;
+        }
+        if behavior.storage_query && path == "/api/worker/query-tasks/poll" && request_number == 1 {
+            write_mock_response(stream, "200 OK", &json!({"task":{
+                "query_task_id":"storage-query", "query_task_attempt":7, "workflow_type":"storage.workflow",
+                "query_name":"state", "workflow_id":"workflow", "run_id":"run", "payload_codec":"avro",
+                "workflow_arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap(),
+                "query_arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap(),
+                "history_events":[], "run_status":"waiting", "lease_owner":"storage-worker"
+            }}).to_string());
+            return;
+        }
+        if behavior.storage_activity
+            && path == "/api/worker/activity-tasks/poll"
+            && request_number == 1
+        {
+            write_mock_response(stream, "200 OK", &json!({"task":{
+                "task_id":"storage-activity", "activity_attempt_id":"storage-attempt", "activity_type":"storage.activity",
+                "payload_codec":"avro", "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap(),
+                "attempt_number":7, "lease_owner":"storage-worker"
+            }}).to_string());
+            return;
+        }
 
         if path == "/api/worker/register" {
             if behavior.reject_registration_protocol {
