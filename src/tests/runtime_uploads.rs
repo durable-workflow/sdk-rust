@@ -31,6 +31,19 @@ fn responses(path: &str, blob: &str, number: usize) -> Option<(&'static str, Str
     if path.ends_with(DISCOVERY) {
         let mut value = policy();
         let storage = &mut value["namespace"]["external_payload_storage"];
+        if path.starts_with("/lease-") && !path.starts_with("/lease-legacy/") {
+            storage["transport"]["upload"]["completion_context"] = json!({
+                "schema":"durable-workflow.v2.payload-completion-context.v1",
+                "header":"X-Durable-Workflow-Payload-Completion"
+            });
+            if path.starts_with("/lease-unknown/") {
+                storage["transport"]["upload"]["completion_context"]["schema"] = json!("unknown");
+            }
+            if path.starts_with("/lease-header/") {
+                storage["transport"]["upload"]["completion_context"]["header"] =
+                    json!("Unexpected-Header");
+            }
+        }
         match path.split('/').nth(1).unwrap_or("") {
             "unavailable" => storage["status"] = json!("unavailable"),
             "aggregate" => storage["threshold_bytes"] = json!(1048576),
@@ -57,10 +70,27 @@ fn responses(path: &str, blob: &str, number: usize) -> Option<(&'static str, Str
         return Some(("200 OK", value.to_string()));
     }
     if path.ends_with(UPLOAD) {
-        if path.starts_with("/pressure/") && number <= 2 {
+        if path.starts_with("/lease-") && !path.starts_with("/lease-healthy/") {
+            if number == 1 || (number == 2 && path.starts_with("/lease-budget/")) {
+                let mut refusal = storage_refusal(None, false, false);
+                refusal["storage_state"] = json!(if path.starts_with("/lease-fenced/") {
+                    "fenced"
+                } else {
+                    "draining"
+                });
+                return Some(("503 Service Unavailable", refusal.to_string()));
+            }
+            if path.starts_with("/lease-rejected/") {
+                return Some((
+                    "409 Conflict",
+                    json!({"reason":"external_payload_completion_lease_rejected"}).to_string(),
+                ));
+            }
+        }
+        if (path.starts_with("/pressure/") || path.starts_with("/pressure-late/")) && number <= 2 {
             return Some((
                 "503 Service Unavailable",
-                storage_refusal(None, false, false).to_string(),
+                storage_refusal(None, false, path.starts_with("/pressure-late/")).to_string(),
             ));
         }
         if path.starts_with("/stopped/") {
@@ -123,6 +153,191 @@ async fn send(client: &Client, path: &str, worker: bool, body: Value) -> Result<
             Some(&body),
         )
         .await
+}
+
+fn completion_header(headers: &str) -> Option<Value> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("X-Durable-Workflow-Payload-Completion")
+            .then(|| serde_json::from_str(value.trim()).unwrap())
+    })
+}
+
+#[tokio::test]
+async fn runtime_upload_draining_retry_binds_each_completion_payload_to_its_lease() {
+    let mut cases = vec![
+        (
+            "/worker/activity-tasks/test/complete",
+            "activity",
+            json!("attempt-a"),
+            json!({"activity_attempt_id":"attempt-a", "result":payload()}),
+            json!(["result"]),
+        ),
+        (
+            "/worker/activity-tasks/test/fail",
+            "activity",
+            json!("attempt-a"),
+            json!({"activity_attempt_id":"attempt-a", "failure":{"details":payload()}}),
+            json!(["failure", "details"]),
+        ),
+        (
+            "/worker/query-tasks/test/complete",
+            "query",
+            json!(3),
+            json!({"query_task_attempt":3, "result_envelope":payload()}),
+            json!(["result_envelope"]),
+        ),
+        (
+            COMPLETE,
+            "workflow",
+            json!(2),
+            json!({"workflow_task_attempt":2,
+            "commands":[{"type":"fail_workflow", "exception":{"details":payload()}}]}),
+            json!(["commands", 0, "exception", "details"]),
+        ),
+        (
+            COMPLETE,
+            "workflow",
+            json!(2),
+            json!({"workflow_task_attempt":2,
+            "commands":[{"type":"record_side_effect", "workflow_stream":{"items":[
+                {"payload":payload()["blob"], "payload_codec":"avro"}]}}]}),
+            json!(["commands", 0, "workflow_stream", "items", 0, "payload"]),
+        ),
+    ];
+    for kind in [
+        "complete_workflow",
+        "complete_update",
+        "record_side_effect",
+        "schedule_activity",
+        "start_child_workflow",
+        "continue_as_new",
+        "start_service_operation",
+        "upsert_memo",
+    ] {
+        let field = workflow_command_payload_field(kind).unwrap();
+        cases.push((
+            COMPLETE,
+            "workflow",
+            json!(2),
+            json!({"workflow_task_attempt":2,
+            "commands":[{"type":kind, field:payload()}]}),
+            json!(["commands", 0, field]),
+        ));
+    }
+    for (path, kind, attempt, mut body, slot) in cases {
+        let server = server();
+        let client = Client::builder(format!("{}/lease-draining", server.base_url()))
+            .worker_token(Some("worker-only".into()))
+            .namespace("tenant-a")
+            .build()
+            .unwrap();
+        body["lease_owner"] = json!("Worker-A");
+        send(&client, path, true, body).await.unwrap();
+        let requests = server.requests.lock().unwrap();
+        let uploads: Vec<_> = requests
+            .iter()
+            .filter(|r| r.path.ends_with(UPLOAD))
+            .collect();
+        assert_eq!(uploads.len(), 2, "{path}: {slot}");
+        assert_eq!(uploads[0].body, uploads[1].body);
+        assert!(completion_header(&uploads[0].headers).is_none());
+        assert_eq!(
+            completion_header(&uploads[1].headers),
+            Some(json!({
+                "schema":"durable-workflow.v2.payload-completion-context.v1", "kind":kind,
+                "task_id":"test", "attempt":attempt, "lease_owner":"Worker-A",
+                "operation":path.rsplit('/').next().unwrap(), "slot":slot
+            }))
+        );
+        assert_eq!(uploads[1].namespace.as_deref(), Some("tenant-a"));
+        assert_eq!(
+            uploads[1].authorization.as_deref(),
+            Some("Bearer worker-only")
+        );
+        assert_eq!(
+            uploads[1].worker_protocol.as_deref(),
+            Some(WORKER_PROTOCOL_VERSION)
+        );
+    }
+}
+
+#[tokio::test]
+async fn runtime_upload_drain_capability_never_bypasses_unsupported_or_fenced_admission() {
+    for prefix in [
+        "lease-legacy",
+        "lease-unknown",
+        "lease-header",
+        "lease-fenced",
+        "lease-rejected",
+        "lease-healthy",
+        "lease-client",
+        "lease-missing-attempt",
+    ] {
+        let server = server();
+        let client = Client::new(format!("{}/{prefix}", server.base_url())).unwrap();
+        let worker = prefix != "lease-client";
+        let path = if worker { COMPLETE } else { "/workflows" };
+        let mut body = json!({"lease_owner":"worker", "workflow_task_attempt":1,
+            "commands":[{"type":"complete_workflow", "result":payload()}]});
+        if !worker {
+            body = json!({"input":payload()});
+        }
+        if prefix == "lease-missing-attempt" {
+            body["workflow_task_attempt"] = Value::Null;
+        }
+        let result = send(&client, path, worker, body).await;
+        if prefix == "lease-healthy" {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Http { .. }), "{prefix}: {error}");
+            assert_eq!(server.request_count(&format!("/{prefix}/api{path}")), 0);
+        }
+        let requests = server.requests.lock().unwrap();
+        let uploads: Vec<_> = requests
+            .iter()
+            .filter(|r| r.path.ends_with(UPLOAD))
+            .collect();
+        assert_eq!(
+            uploads.len(),
+            if prefix == "lease-rejected" { 2 } else { 1 },
+            "{prefix}"
+        );
+        assert!(completion_header(&uploads[0].headers).is_none());
+    }
+}
+
+#[tokio::test]
+async fn runtime_upload_drain_budget_refusal_resumes_ordinary_upload_after_capacity_recovers() {
+    let server = server();
+    let mut client = Client::new(format!("{}/lease-budget", server.base_url())).unwrap();
+    client.worker_storage_admission = Some(WorkerStorageAdmission {
+        stop: Arc::new(AtomicBool::new(false)),
+        policy: WorkerRetryPolicy {
+            max_backoff: Duration::from_millis(1),
+            ..WorkerRetryPolicy::default()
+        },
+    });
+    send(
+        &client,
+        COMPLETE,
+        true,
+        json!({"lease_owner":"worker", "workflow_task_attempt":1,
+        "commands":[{"type":"complete_workflow", "result":payload()}]}),
+    )
+    .await
+    .unwrap();
+    let requests = server.requests.lock().unwrap();
+    let uploads: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path.ends_with(UPLOAD))
+        .collect();
+    assert_eq!(uploads.len(), 3);
+    assert!(uploads.iter().all(|r| r.body == uploads[0].body));
+    assert!(completion_header(&uploads[0].headers).is_none());
+    assert!(completion_header(&uploads[1].headers).is_some());
+    assert!(completion_header(&uploads[2].headers).is_none());
 }
 
 #[tokio::test]
@@ -593,7 +808,7 @@ async fn runtime_upload_bounds_chunked_responses_and_does_not_follow_location() 
 
 #[tokio::test]
 async fn runtime_upload_storage_admission_reuses_identical_bytes_and_shutdown_interrupts() {
-    for prefix in ["pressure", "stopped"] {
+    for prefix in ["pressure", "pressure-late", "stopped"] {
         let server = server();
         let mut client = Client::new(format!("{}/{prefix}", server.base_url())).unwrap();
         let stop = Arc::new(AtomicBool::new(prefix == "stopped"));
@@ -611,7 +826,7 @@ async fn runtime_upload_storage_admission_reuses_identical_bytes_and_shutdown_in
             json!({"commands":[{"type":"complete_workflow","result":payload()}]}),
         )
         .await;
-        if prefix == "pressure" {
+        if prefix != "stopped" {
             outcome.unwrap();
             assert_identical_requests(&server, &format!("/{prefix}{UPLOAD}"), 3);
             assert_eq!(server.request_count(&format!("/{prefix}/api{COMPLETE}")), 1);

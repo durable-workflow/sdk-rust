@@ -2,6 +2,8 @@ use super::*;
 use runtime_payloads::Reference;
 
 pub(super) type PolicyCache = [Option<(Instant, Policy)>; 2];
+const COMPLETION_SCHEMA: &str = "durable-workflow.v2.payload-completion-context.v1";
+const COMPLETION_HEADER: &str = "x-durable-workflow-payload-completion";
 
 #[derive(Clone, Debug)]
 pub(super) struct Policy {
@@ -10,6 +12,7 @@ pub(super) struct Policy {
     request_bytes: usize,
     timeout: Duration,
     available: bool,
+    completion_context: bool,
 }
 
 fn unsupported(message: &str) -> Error {
@@ -38,6 +41,7 @@ impl Policy {
                 request_bytes,
                 timeout: Duration::from_secs(30),
                 available: false,
+                completion_context: false,
             });
         }
         if manifest["schema"] != "durable-workflow.v2.runtime-external-payload-transport.v1"
@@ -64,6 +68,10 @@ impl Policy {
             request_bytes,
             timeout: Duration::from_secs(timeout as u64),
             available: storage["status"] == "available",
+            completion_context: manifest["upload"]["completion_context"]["schema"]
+                == COMPLETION_SCHEMA
+                && manifest["upload"]["completion_context"]["header"]
+                    == "X-Durable-Workflow-Payload-Completion",
         })
     }
 }
@@ -137,6 +145,13 @@ impl Client {
             let reference = if let Some(reference) = uploaded.get(&identity) {
                 reference.clone()
             } else {
+                let completion = if policy.completion_context
+                    && matches!(protocol, RequestProtocol::Worker(_))
+                {
+                    completion_context(body, path, &upload.path)
+                } else {
+                    None
+                };
                 let request = self
                     .runtime_payload_request(
                         reqwest::Method::POST,
@@ -152,7 +167,7 @@ impl Client {
                     .body(upload.blob)
                     .build()?;
                 let response = self
-                    .runtime_payload_json(request, protocol, 64 * 1024)
+                    .runtime_payload_json(request, protocol, 64 * 1024, completion)
                     .await?;
                 if response["schema"] != "durable-workflow.v2.runtime-external-payload-upload.v1"
                     || response["transport_version"] != 1
@@ -192,7 +207,7 @@ impl Client {
             .runtime_payload_request(reqwest::Method::GET, "/cluster/info", protocol, true)?
             .build()?;
         let info = self
-            .runtime_payload_json(request, protocol, 2 * 1024 * 1024)
+            .runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
             .await?;
         let policy = Policy::from_info(&info)?;
         self.runtime_upload_policy
@@ -234,17 +249,22 @@ impl Client {
         request: reqwest::Request,
         protocol: RequestProtocol,
         limit: usize,
+        completion: Option<reqwest::header::HeaderValue>,
     ) -> Result<Value> {
         let mut retries = 0;
+        let mut bound_retry = false;
         loop {
-            let mut response = self
-                .http
-                .execute(
-                    request
-                        .try_clone()
-                        .ok_or_else(|| unsupported("upload body cannot be retried"))?,
-                )
-                .await?;
+            let mut attempt = request
+                .try_clone()
+                .ok_or_else(|| unsupported("upload body cannot be retried"))?;
+            if bound_retry {
+                if let Some(context) = &completion {
+                    attempt
+                        .headers_mut()
+                        .insert(COMPLETION_HEADER, context.clone());
+                }
+            }
+            let mut response = self.http.execute(attempt).await?;
             let status = response.status();
             if response
                 .content_length()
@@ -269,10 +289,43 @@ impl Client {
                     return Err(Error::Protocol(failure));
                 }
                 let error = Error::Http { status, body };
+                if !bound_retry
+                    && completion.is_some()
+                    && status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && worker_storage_admission_body(&error).is_some_and(|body| {
+                        body["reason"] == "storage_pressure" && body["storage_state"] == "draining"
+                    })
+                {
+                    bound_retry = true;
+                    continue;
+                }
+                // Upload bytes are content-addressed; a late refusal may safely
+                // retry them. Never relax admission for ordinary mutations.
+                let retry_error = worker_storage_admission_body(&error).and_then(|mut body| {
+                    if request.method() == reqwest::Method::POST
+                        && request.url().path().ends_with("/api/external-payloads/v1")
+                        && body.get("request_admitted").is_none()
+                    {
+                        body["request_admitted"] = json!(false);
+                        Some(Error::Http {
+                            status,
+                            body: body.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                });
                 if self
-                    .wait_for_storage_admission(&error, protocol, None, &mut retries)
+                    .wait_for_storage_admission(
+                        retry_error.as_ref().unwrap_or(&error),
+                        protocol,
+                        None,
+                        &mut retries,
+                    )
                     .await
                 {
+                    // Try ordinary admission again after capacity recovers.
+                    bound_retry = false;
                     continue;
                 }
                 return Err(error);
@@ -285,6 +338,55 @@ impl Client {
             return Ok(value);
         }
     }
+}
+
+fn completion_context(
+    body: &Value,
+    path: &str,
+    slot: &str,
+) -> Option<reqwest::header::HeaderValue> {
+    let parts: Vec<_> = path
+        .split('?')
+        .next()?
+        .trim_start_matches('/')
+        .split('/')
+        .collect();
+    let ["worker", family, task_id, operation] = parts.as_slice() else {
+        return None;
+    };
+    let (kind, field) = match *family {
+        "activity-tasks" => ("activity", "activity_attempt_id"),
+        "workflow-tasks" => ("workflow", "workflow_task_attempt"),
+        "query-tasks" => ("query", "query_task_attempt"),
+        _ => return None,
+    };
+    if !matches!(*operation, "complete" | "fail") || task_id.is_empty() {
+        return None;
+    }
+    let owner = body["lease_owner"].as_str().filter(|s| !s.is_empty())?;
+    let attempt = &body[field];
+    if kind == "activity" {
+        attempt.as_str().filter(|s| !s.is_empty())?;
+    } else {
+        attempt.as_u64().filter(|n| *n > 0)?;
+    }
+    // These pointers come only from payload_paths, never from application maps.
+    let slot: Vec<Value> = slot
+        .trim_start_matches('/')
+        .split('/')
+        .map(|part| {
+            part.parse::<u64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| json!(part))
+        })
+        .collect();
+    let context = json!({"schema": COMPLETION_SCHEMA, "kind": kind, "task_id": task_id,
+        "attempt": attempt, "lease_owner": owner, "operation": operation, "slot": slot})
+    .to_string();
+    if context.len() > 4096 {
+        return None;
+    }
+    reqwest::header::HeaderValue::from_str(&context).ok()
 }
 
 fn select(body: &mut Value, path: &str) -> Result<Upload> {
