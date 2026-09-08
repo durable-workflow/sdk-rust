@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.codec-regression/v1",
+  "id": "rust-runtime-external-activity-result",
+  "protocol": {
+    "codec": "avro",
+    "schema": "durable_workflow.protocol.Value",
+    "version": "1",
+    "fingerprint": "e2a33dff55802237"
+  },
+  "bindings": ["rust"],
+  "value": {"type": "string", "value": "external-activity-result"},
+  "framing": {
+    "encoding": "avro-single-object",
+    "wire_base64": "wwHioz3/VYAiNwowZXh0ZXJuYWwtYWN0aXZpdHktcmVzdWx0"
+  },
+  "failure_policy": {"operation": "round_trip", "error": null},
+  "runtime_transport": {
+    "reference_id": "ep_00000000000000000000000001",
+    "history_event": "ActivityCompleted",
+    "result_field": "result"
+  }
+}

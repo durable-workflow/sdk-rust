@@ -6,6 +6,7 @@ nested-parallel-group-history-replay.json
 official-avro-encoder-nested-boundaries.json
 raw-json-null-payload-rejected.json
 raw-json-payload-rejected.json
+runtime-external-activity-result.json
 typed-handler-avro-request.json
 workflow-memo-signed-zero-envelope.json
 workflow-stream-typed-payload-reference.json
