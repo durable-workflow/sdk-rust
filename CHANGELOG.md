@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.5
+
+- On supporting Servers, retry a draining refusal for a completion payload
+  with its exact activity, workflow, or query lease and immutable payload slot.
+  Client uploads, unknown capabilities, and hard storage fences remain blocked.
+- Preserve prepared completion bytes during late upload pressure without
+  re-executing handlers. Existing retries remain interruptible; Server upload
+  allowances, namespace quotas, and stale-lease errors remain authoritative.
+
 ## 2.0.4
 
 - Upload large encoded payloads through the authenticated namespace runtime
