@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.4
+
+- Upload large encoded payloads through the authenticated namespace runtime
+  before sending client requests or worker commands. Discover runtime limits,
+  externalize aggregate requests when necessary, and preserve exact Avro types.
+- Verify upload references, keep discovery and responses bounded, and reuse
+  existing worker storage-admission waits without re-executing handlers.
+- Include a native runtime qualification for large typed input, activity and
+  workflow results, query/signal recovery, maximum size and cold restart.
+
 ## 2.0.3
 
 - Resolve Server-managed external payload references before decoding worker

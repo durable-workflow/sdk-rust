@@ -1,15 +1,15 @@
 use super::*;
 
-const SCHEMA: &str = "durable-workflow.v2.runtime-external-payload-reference.v1";
+pub(super) const SCHEMA: &str = "durable-workflow.v2.runtime-external-payload-reference.v1";
 
-#[derive(Deserialize, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 #[serde(deny_unknown_fields)]
-struct Reference {
+pub(super) struct Reference {
     schema: String,
     codec: String,
     reference_id: String,
-    size_bytes: usize,
-    sha256: String,
+    pub(super) size_bytes: usize,
+    pub(super) sha256: String,
 }
 
 fn invalid_reference() -> Error {
@@ -30,7 +30,7 @@ fn integrity_mismatch() -> Error {
 }
 
 impl Reference {
-    fn parse(envelope: &Value) -> Result<Option<Self>> {
+    pub(super) fn parse(envelope: &Value) -> Result<Option<Self>> {
         let Some(raw) = envelope.get("external_payload") else {
             return Ok(None);
         };

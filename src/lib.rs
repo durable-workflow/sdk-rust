@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod runtime_payloads;
+mod runtime_uploads;
 
 use std::{
     any::{type_name, Any, TypeId},
@@ -2272,7 +2273,9 @@ fn validate_workflow_task_commands(commands: &[Value]) -> Result<()> {
         let payload = command
             .get(payload_field)
             .ok_or_else(invalid_payload_envelope)?;
-        validate_outbound_payload_envelope(payload)?;
+        if runtime_payloads::Reference::parse(payload)?.is_none() {
+            validate_outbound_payload_envelope(payload)?;
+        }
     }
     Ok(())
 }
@@ -2622,6 +2625,7 @@ pub struct Client {
     namespace: String,
     max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
+    runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
 }
 
 impl Client {
@@ -4034,7 +4038,7 @@ impl Client {
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
             .http
-            .request(method, format!("{}/api{}", self.base_url, path))
+            .request(method.clone(), format!("{}/api{}", self.base_url, path))
             .timeout(timeout)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -4057,14 +4061,18 @@ impl Client {
         }
 
         if let Some(body) = body {
-            request = request.json(body);
+            let mut body = serde_json::to_value(body)?;
+            if matches!(
+                method,
+                reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
+            ) {
+                self.externalize_runtime_payloads(&mut body, path, protocol)
+                    .await?;
+            }
+            request = request.json(&body);
         }
 
         let request = request.build()?;
-        let admission = self
-            .worker_storage_admission
-            .as_ref()
-            .filter(|_| matches!(protocol, RequestProtocol::Worker(_)));
         let poll_request_id = path.ends_with("/poll").then(|| {
             request
                 .body()
@@ -4092,28 +4100,16 @@ impl Client {
                     return Err(Error::Protocol(protocol));
                 }
                 let error = Error::Http { status, body };
-                if let Some(admission) = admission {
-                    if let Some(advertised_delay) =
-                        worker_storage_admission_retry_after(&error, poll_request_id.as_deref())
-                    {
-                        storage_retries = storage_retries.saturating_add(1);
-                        let delay = worker_retry_delay(admission.policy, storage_retries)
-                            .max(advertised_delay)
-                            .min(admission.policy.max_backoff.max(Duration::from_millis(1)));
-                        let deadline = tokio::time::Instant::now() + delay;
-                        loop {
-                            if admission.stop.load(Ordering::SeqCst) {
-                                return Err(error);
-                            }
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
-                        }
-                        continue;
-                    }
+                if self
+                    .wait_for_storage_admission(
+                        &error,
+                        protocol,
+                        poll_request_id.as_deref(),
+                        &mut storage_retries,
+                    )
+                    .await
+                {
+                    continue;
                 }
                 return Err(error);
             }
@@ -4126,6 +4122,41 @@ impl Client {
             self.resolve_runtime_payloads(&mut value, path, protocol)
                 .await?;
             return Ok(serde_json::from_value(value)?);
+        }
+    }
+
+    async fn wait_for_storage_admission(
+        &self,
+        error: &Error,
+        protocol: RequestProtocol,
+        poll_request_id: Option<&str>,
+        retries: &mut usize,
+    ) -> bool {
+        let Some(admission) = self
+            .worker_storage_admission
+            .as_ref()
+            .filter(|_| matches!(protocol, RequestProtocol::Worker(_)))
+        else {
+            return false;
+        };
+        let Some(advertised_delay) = worker_storage_admission_retry_after(error, poll_request_id)
+        else {
+            return false;
+        };
+        *retries = retries.saturating_add(1);
+        let delay = worker_retry_delay(admission.policy, *retries)
+            .max(advertised_delay)
+            .min(admission.policy.max_backoff.max(Duration::from_millis(1)));
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            if admission.stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
         }
     }
 
@@ -4637,6 +4668,7 @@ impl ClientBuilder {
             namespace: self.namespace,
             max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
+            runtime_upload_policy: Arc::new(Mutex::new([None, None])),
         })
     }
 }
@@ -14727,6 +14759,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 mod tests {
     use super::*;
     mod runtime_payloads;
+    mod runtime_uploads;
     use std::{
         fs,
         io::{Read, Write},
@@ -24320,6 +24353,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct CapturedRequest {
+        headers: String,
         method: String,
         path: String,
         authorization: Option<String>,
@@ -24337,9 +24371,12 @@ mod tests {
         thread: Option<thread::JoinHandle<()>>,
     }
 
+    type RequestOverride = fn(&str, &str, usize) -> Option<(&'static str, String)>;
+
     #[derive(Clone, Copy, Default)]
     struct MockWorkerBehavior {
         response_override: Option<fn(&str) -> Option<(&'static str, String)>>,
+        request_override: Option<RequestOverride>,
         storage_refusals: usize,
         storage_path: Option<&'static str>,
         storage_unavailable: bool,
@@ -24766,6 +24803,10 @@ mod tests {
         let request_number = {
             let mut requests = requests.lock().expect("captured requests");
             requests.push(CapturedRequest {
+                headers: request
+                    .split_once("\r\n\r\n")
+                    .map_or("", |(headers, _)| headers)
+                    .to_owned(),
                 method: method.to_string(),
                 path: path.to_string(),
                 authorization,
@@ -24781,6 +24822,13 @@ mod tests {
                 .count()
         };
 
+        if let Some(response) = behavior
+            .request_override
+            .and_then(|handler| handler(path, body, request_number))
+        {
+            write_mock_response(stream, response.0, &response.1);
+            return;
+        }
         if let Some(response) = behavior.response_override.and_then(|handler| handler(path)) {
             write_mock_response(stream, response.0, &response.1);
             return;
@@ -25231,6 +25279,7 @@ mod tests {
         }
 
         let (status, body) = match path {
+            "/api/cluster/info" => ("200 OK", r#"{"limits":{"max_payload_bytes":2097152}}"#),
             "/api/health" => ("200 OK", r#"{"status":"ok"}"#),
             "/api/workflows" => (
                 "201 Created",

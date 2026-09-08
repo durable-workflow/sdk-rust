@@ -171,6 +171,7 @@ fn handle_request(
         && path.ends_with("/complete")
         && request_number as u64 <= completion_storage_refusals;
     let body = match path.as_str() {
+        "/api/cluster/info" => json!({"limits": {"max_payload_bytes": 2097152}}).to_string(),
         _ if storage_refused => json!({
             "reason": "storage_pressure",
             "storage_state": "fenced",

@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.0.3"
+version = "2.0.4"
 edition = "2021"
 description = "Rust client and worker SDK for Durable Workflow Cloud and self-hosted Server"
 license = "MIT"
@@ -14,7 +14,7 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.0.3"
+product-train = "2.0.4"
 compatibility-authority = "protocol-manifests"
 supported-server-versions = "2.0.0"
 qualified-server-version = "2.0.0"
