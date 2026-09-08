@@ -192,7 +192,7 @@ impl Client {
             .runtime_payload_request(reqwest::Method::GET, "/cluster/info", protocol, true)?
             .build()?;
         let info = self
-            .runtime_payload_json(request, protocol, 512 * 1024)
+            .runtime_payload_json(request, protocol, 2 * 1024 * 1024)
             .await?;
         let policy = Policy::from_info(&info)?;
         self.runtime_upload_policy
@@ -264,10 +264,11 @@ impl Client {
                 bytes.extend_from_slice(&chunk);
             }
             if !status.is_success() {
-                let error = Error::Http {
-                    status,
-                    body: String::from_utf8_lossy(&bytes).into_owned(),
-                };
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                if let Some(failure) = protocol_failure(status, &body) {
+                    return Err(Error::Protocol(failure));
+                }
+                let error = Error::Http { status, body };
                 if self
                     .wait_for_storage_admission(&error, protocol, None, &mut retries)
                     .await

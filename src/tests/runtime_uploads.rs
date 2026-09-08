@@ -50,6 +50,8 @@ fn responses(path: &str, blob: &str, number: usize) -> Option<(&'static str, Str
                     json!("https://elsewhere.invalid/{referenceId}")
             }
             "request-limit" => value["limits"]["max_payload_bytes"] = json!(-1),
+            "full-manifest" => value["worker_protocol"] = json!("x".repeat(600_000)),
+            "oversized-manifest" => value["worker_protocol"] = json!("x".repeat(2_097_153)),
             _ => {}
         }
         return Some(("200 OK", value.to_string()));
@@ -79,6 +81,14 @@ fn responses(path: &str, blob: &str, number: usize) -> Option<(&'static str, Str
             "bad-json" => return Some(("200 OK", "broken".into())),
             "huge-response" => return Some(("200 OK", "x".repeat(65537))),
             "unauthorized" => return Some(("403 Forbidden", "access denied".into())),
+            "protocol" => return Some((
+                "400 Bad Request",
+                json!({
+                    "reason":"unsupported_protocol_version", "message":"worker protocol rejected",
+                    "supported_version":"1.19", "requested_version":"1.0"
+                })
+                .to_string(),
+            )),
             "missing" => {
                 return Some((
                     "404 Not Found",
@@ -213,6 +223,78 @@ async fn runtime_upload_deduplicates_per_request_but_keeps_role_cache_separate()
 }
 
 #[tokio::test]
+async fn runtime_upload_refreshes_expired_policy_without_sharing_namespaces() {
+    let server = server();
+    let client = Client::builder(server.base_url())
+        .namespace("a")
+        .build()
+        .unwrap();
+    send(&client, "/workflows", false, json!({"input":payload()}))
+        .await
+        .unwrap();
+    client.runtime_upload_policy.lock().unwrap()[0]
+        .as_mut()
+        .unwrap()
+        .0 = Instant::now() - Duration::from_secs(61);
+    send(
+        &client.clone(),
+        "/workflows",
+        false,
+        json!({"input":payload()}),
+    )
+    .await
+    .unwrap();
+    let other = Client::builder(server.base_url())
+        .namespace("b")
+        .build()
+        .unwrap();
+    send(&other, "/workflows", false, json!({"input":payload()}))
+        .await
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    let namespaces: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path == DISCOVERY)
+        .map(|r| r.namespace.as_deref())
+        .collect();
+    assert_eq!(namespaces, [Some("a"), Some("a"), Some("b")]);
+}
+
+#[tokio::test]
+async fn runtime_upload_recovery_retains_the_already_computed_activity_outcome() {
+    fn upload_pressure(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+        if path == UPLOAD || path == DISCOVERY {
+            responses(&format!("/pressure{path}"), body, number)
+        } else {
+            None
+        }
+    }
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(upload_pressure),
+        storage_activity: true,
+        ..MockWorkerBehavior::default()
+    });
+    let mut worker = storage_worker(&server);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    worker.register_activity("storage.activity", move |_, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async { Ok(json!("a".repeat(128))) }
+    });
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_identical_requests(&server, UPLOAD, 3);
+    assert_eq!(
+        server.request_count("/api/worker/activity-tasks/storage-activity/complete"),
+        1
+    );
+    assert_eq!(
+        server.request_count("/api/worker/activity-tasks/storage-activity/fail"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn runtime_upload_covers_only_protocol_payload_positions() {
     for (path, worker, body, pointer) in [
         (
@@ -342,9 +424,10 @@ async fn runtime_upload_plans_aggregate_limits_before_any_effect() {
         {"type":"schedule_activity", "arguments":envelope}, {"type":"complete_workflow", "result":envelope}
     ]})).await.unwrap();
     assert_eq!(server.request_count(&format!("/aggregate{UPLOAD}")), 1);
-    let requests = server.requests.lock().unwrap();
-    assert!(requests.last().unwrap().body.len() <= 2048);
-    drop(requests);
+    {
+        let requests = server.requests.lock().unwrap();
+        assert!(requests.last().unwrap().body.len() <= 2048);
+    }
     for body in [
         json!({"input":payload(), "metadata":"x".repeat(3000)}),
         json!({"input":{"codec":"avro","blob":"x".repeat(1048577)}}),
@@ -389,6 +472,7 @@ async fn runtime_upload_rejects_invalid_discovery_before_upload() {
         "upload-uri",
         "fetch-uri",
         "request-limit",
+        "oversized-manifest",
     ] {
         let server = server();
         let client = Client::new(format!("{}/{prefix}", server.base_url())).unwrap();
@@ -404,6 +488,16 @@ async fn runtime_upload_rejects_invalid_discovery_before_upload() {
 }
 
 #[tokio::test]
+async fn runtime_upload_discovery_accepts_the_full_server_protocol_manifest() {
+    let server = server();
+    let client = Client::new(format!("{}/full-manifest", server.base_url())).unwrap();
+    send(&client, "/workflows", false, json!({"input":payload()}))
+        .await
+        .unwrap();
+    assert_eq!(server.request_count(&format!("/full-manifest{UPLOAD}")), 1);
+}
+
+#[tokio::test]
 async fn runtime_upload_rejects_corrupt_responses_and_preserves_http_errors() {
     for (prefix, reason) in [
         ("bad-sha", "external_payload_integrity_mismatch"),
@@ -415,6 +509,7 @@ async fn runtime_upload_rejects_corrupt_responses_and_preserves_http_errors() {
         ("bad-json", "external_payload_unsupported"),
         ("huge-response", "external_payload_unsupported"),
         ("unauthorized", "http 403"),
+        ("protocol", "protocol rejected"),
         ("missing", "external_payload_not_found"),
         ("slow", "transport error"),
     ] {
@@ -425,6 +520,74 @@ async fn runtime_upload_rejects_corrupt_responses_and_preserves_http_errors() {
             .unwrap_err();
         assert!(error.to_string().contains(reason), "{prefix}: {error}");
         assert_eq!(server.request_count(&format!("/{prefix}/api/workflows")), 0);
+    }
+}
+
+#[tokio::test]
+async fn runtime_upload_bounds_chunked_responses_and_does_not_follow_location() {
+    for redirect in [false, true] {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let location = format!("http://{}/credential-sink", target.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = thread::spawn(move || {
+            for discovery in [true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    if mock_request_is_complete(&request) {
+                        break;
+                    }
+                }
+                if discovery {
+                    write_mock_response(&mut stream, "200 OK", &policy().to_string());
+                } else {
+                    let response = if redirect {
+                        format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10001\r\n{}\r\n0\r\n\r\n", "x".repeat(65537))
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        let client = Client::builder(format!("http://{address}"))
+            .control_token(Some("client-fixture".into()))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let error = send(&client, "/workflows", false, json!({"input":payload()}))
+            .await
+            .unwrap_err();
+        if redirect {
+            assert!(matches!(
+                error,
+                Error::Http {
+                    status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                    ..
+                }
+            ));
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("response exceeds its byte limit"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            target.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        transport.join().unwrap();
     }
 }
 

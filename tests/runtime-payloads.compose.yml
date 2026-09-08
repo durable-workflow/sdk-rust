@@ -1,0 +1,75 @@
+name: rust-payload-proof
+x-runtime: &runtime
+  image: ${SERVER_IMAGE:?Set an exact published Server image}
+  user: "1000:1000"
+  environment: &environment
+    APP_ENV: testing
+    APP_DEBUG: "false"
+    DW_SERVER_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    DB_CONNECTION: mysql
+    DB_HOST: mysql
+    DB_DATABASE: durable_workflow
+    DB_USERNAME: workflow
+    DB_PASSWORD: workflow
+    CACHE_STORE: redis
+    REDIS_HOST: redis
+    QUEUE_CONNECTION: redis
+    DW_AUTH_TOKEN: external-payload-fixture
+    DW_RUNTIME_CREDENTIALS_ENABLED: "true"
+    DW_AUTH_BACKWARD_COMPATIBLE: "true"
+  volumes:
+    - ../target/runtime-payloads:/payloads
+services:
+  mysql:
+    image: mysql:8.0.46
+    environment:
+      MYSQL_DATABASE: durable_workflow
+      MYSQL_USER: workflow
+      MYSQL_PASSWORD: workflow
+      MYSQL_ROOT_PASSWORD: fixture-root
+    volumes:
+      - mysql:/var/lib/mysql
+    mem_limit: 768m
+    healthcheck:
+      test: [CMD, mysqladmin, ping, -h, 127.0.0.1, -pfixture-root]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+  redis:
+    image: redis:7-alpine
+    mem_limit: 128m
+  bootstrap:
+    <<: *runtime
+    command: [server-bootstrap]
+    healthcheck:
+      disable: true
+    depends_on:
+      mysql:
+        condition: service_healthy
+  server:
+    <<: *runtime
+    mem_limit: 256m
+    cpus: 1
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    healthcheck:
+      test: [CMD, server-healthcheck]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  sdk:
+    image: rust:1.86-bookworm
+    user: "1000:1000"
+    working_dir: /sdk
+    entrypoint: [/sdk/target/debug/examples/runtime_payloads]
+    environment:
+      RUNTIME_URL: http://server:8080
+    volumes:
+      - ..:/sdk:ro
+    mem_limit: 2g
+    profiles: [client]
+volumes:
+  mysql:

@@ -24371,10 +24371,12 @@ mod tests {
         thread: Option<thread::JoinHandle<()>>,
     }
 
+    type RequestOverride = fn(&str, &str, usize) -> Option<(&'static str, String)>;
+
     #[derive(Clone, Copy, Default)]
     struct MockWorkerBehavior {
         response_override: Option<fn(&str) -> Option<(&'static str, String)>>,
-        request_override: Option<fn(&str, &str, usize) -> Option<(&'static str, String)>>,
+        request_override: Option<RequestOverride>,
         storage_refusals: usize,
         storage_path: Option<&'static str>,
         storage_unavailable: bool,
