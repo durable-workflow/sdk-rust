@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.3
+
+- Resolve Server-managed external payload references before decoding worker
+  tasks, history, query/update results, and client workflow results. Large
+  activity results can resume workflows without re-executing their activities.
+- Fetch only from the authenticated runtime with the original namespace and
+  credential role, verify size and SHA-256, and reject redirects or malformed
+  references. Keep downloads bounded by a configurable per-response byte limit
+  and leave application metadata untouched.
+
 ## 2.0.2
 
 - Retry retryable storage-admission refusals in worker registration, polling,
