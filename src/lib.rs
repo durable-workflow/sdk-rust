@@ -14707,6 +14707,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod runtime_payloads;
     use std::{
         fs,
         io::{Read, Write},
@@ -24319,6 +24320,7 @@ mod tests {
 
     #[derive(Clone, Copy, Default)]
     struct MockWorkerBehavior {
+        response_override: Option<fn(&str) -> Option<(&'static str, String)>>,
         storage_refusals: usize,
         storage_path: Option<&'static str>,
         storage_unavailable: bool,
@@ -24760,6 +24762,10 @@ mod tests {
                 .count()
         };
 
+        if let Some(response) = behavior.response_override.and_then(|handler| handler(path)) {
+            write_mock_response(stream, response.0, &response.1);
+            return;
+        }
         if path.ends_with("/poll") && request_number <= behavior.poll_failures_per_path {
             return;
         }
