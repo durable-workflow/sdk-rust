@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+mod runtime_payloads;
+
 use std::{
     any::{type_name, Any, TypeId},
     collections::{BTreeMap, HashMap},
@@ -2618,6 +2620,7 @@ pub struct Client {
     control_token: Option<String>,
     worker_token: Option<String>,
     namespace: String,
+    max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
 }
 
@@ -2634,6 +2637,7 @@ impl Client {
             worker_token: None,
             namespace: "default".to_string(),
             timeout: Duration::from_secs(60),
+            max_external_payload_bytes: 64 * 1024 * 1024,
         }
     }
 
@@ -4118,7 +4122,10 @@ impl Client {
                 return Ok(serde_json::from_value(Value::Null)?);
             }
 
-            return Ok(serde_json::from_slice(&bytes)?);
+            let mut value: Value = serde_json::from_slice(&bytes)?;
+            self.resolve_runtime_payloads(&mut value, path, protocol)
+                .await?;
+            return Ok(serde_json::from_value(value)?);
         }
     }
 
@@ -4572,6 +4579,7 @@ pub struct ClientBuilder {
     worker_token: Option<String>,
     namespace: String,
     timeout: Duration,
+    max_external_payload_bytes: usize,
 }
 
 impl ClientBuilder {
@@ -4600,6 +4608,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Maximum unique external-payload bytes fetched per response (default 64 MiB).
+    /// References are fetched only from this client's authenticated runtime.
+    pub fn max_external_payload_bytes(mut self, bytes: usize) -> Self {
+        self.max_external_payload_bytes = bytes;
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         let base_url = self.base_url.trim_end_matches('/').to_string();
         let has_sdk_api_suffix = reqwest::Url::parse(&base_url)
@@ -4611,12 +4626,16 @@ impl ClientBuilder {
         }
 
         Ok(Client {
-            http: reqwest::Client::builder().timeout(self.timeout).build()?,
+            http: reqwest::Client::builder()
+                .timeout(self.timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             base_url,
             token: self.token,
             control_token: self.control_token,
             worker_token: self.worker_token,
             namespace: self.namespace,
+            max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
         })
     }
