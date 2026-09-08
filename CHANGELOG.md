@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.2
+
+- Retry retryable storage-admission refusals in worker registration, polling,
+  heartbeats, and acknowledgements while preserving the prepared request and
+  already-computed handler result. Retries do not re-execute activities or
+  queries or change task identities.
+- Keep storage retries interruptible during shutdown. Client requests retain
+  their existing error behavior; authentication and stale-lease failures remain
+  terminal.
+
 ## 2.0.1
 
 - Keep workflow, activity, and query pollers alive when Server applies typed
