@@ -81,6 +81,12 @@ nulls, booleans, signed 64-bit integers, finite doubles, bytes, UTF-8 strings,
 lists, and string-keyed maps across official SDKs without customer-managed
 schemas or a registry.
 
+Server-managed external payloads are fetched automatically through the same
+runtime URL, namespace, and credential role, with size and SHA-256 verification.
+`Client::builder(...).max_external_payload_bytes(...)` limits unique downloaded
+bytes per response (64 MiB by default). Provider credentials are not needed;
+payload fetches never follow redirects.
+
 ## Examples
 
 | Example | Demonstrates |

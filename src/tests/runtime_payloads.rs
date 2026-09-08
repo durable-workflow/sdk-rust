@@ -307,6 +307,66 @@ fn redirect_response(path: &str) -> Option<(&'static str, String)> {
     }
 }
 
+fn namespace_response(path: &str) -> Option<(&'static str, String)> {
+    response(
+        path.strip_prefix("/api/runtime/v1/namespaces/fixture")
+            .unwrap_or(path),
+    )
+}
+
+#[tokio::test]
+async fn runtime_external_fetch_preserves_namespace_runtime_url_prefix() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        response_override: Some(namespace_response),
+        ..MockWorkerBehavior::default()
+    });
+    let client = Client::new(format!(
+        "{}/api/runtime/v1/namespaces/fixture",
+        server.base_url()
+    ))
+    .unwrap();
+    let result = client.describe_workflow("external").await.unwrap();
+    assert_eq!(result.output, Some(fixture()["value"]["value"].clone()));
+    assert_eq!(
+        server.request_count(&format!("/api/runtime/v1/namespaces/fixture{FETCH_PATH}")),
+        1
+    );
+    assert_eq!(server.request_count(FETCH_PATH), 0);
+}
+
+#[tokio::test]
+async fn runtime_external_chunked_body_cannot_exceed_reference_size() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = [0u8; 4096];
+        stream.read(&mut request).unwrap();
+        let response = format!("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n64\r\n{}\r\n0\r\n\r\n", "x".repeat(100));
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let client = Client::builder(format!("http://{address}"))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let error = client
+        .resolve_runtime_payloads(
+            &mut json!({"output_envelope":envelope()}),
+            "/workflows/test",
+            RequestProtocol::ControlPlane,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("external_payload_oversized"),
+        "{error}"
+    );
+    server.join().unwrap();
+}
+
 #[tokio::test]
 async fn runtime_external_fetch_failures_propagate_without_following_redirects() {
     type Response = fn(&str) -> Option<(&'static str, String)>;

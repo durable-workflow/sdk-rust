@@ -9,10 +9,10 @@
     "fingerprint": "e2a33dff55802237"
   },
   "bindings": ["rust"],
-  "value": {"type": "string", "value": "workflow-stream-inline"},
+  "value": {"type": "string", "value": "external-activity-result"},
   "framing": {
     "encoding": "avro-single-object",
-    "wire_base64": "wwHioz3/VYAiNwosd29ya2Zsb3ctc3RyZWFtLWlubGluZQ=="
+    "wire_base64": "wwHioz3/VYAiNwowZXh0ZXJuYWwtYWN0aXZpdHktcmVzdWx0"
   },
   "failure_policy": {"operation": "round_trip", "error": null},
   "runtime_transport": {
