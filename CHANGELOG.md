@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.6
+
+- Keep fresh installs compatible with Rust 1.86 by constraining the transitive
+  yoke-derive dependency to its compatible release. Consumer builds do not
+  inherit the SDK repository's Cargo.lock.
+
 ## 2.0.5
 
 - On supporting Servers, retry a draining refusal for a completion payload
