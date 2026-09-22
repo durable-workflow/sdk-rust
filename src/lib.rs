@@ -4104,6 +4104,7 @@ impl Client {
                     .wait_for_storage_admission(
                         &error,
                         protocol,
+                        Some(path),
                         poll_request_id.as_deref(),
                         &mut storage_retries,
                     )
@@ -4129,6 +4130,7 @@ impl Client {
         &self,
         error: &Error,
         protocol: RequestProtocol,
+        path: Option<&str>,
         poll_request_id: Option<&str>,
         retries: &mut usize,
     ) -> bool {
@@ -4140,6 +4142,11 @@ impl Client {
             return false;
         };
         let Some(advertised_delay) = worker_storage_admission_retry_after(error, poll_request_id)
+            .or_else(|| {
+                path.and_then(|path| {
+                    worker_backend_unavailable_retry_after(error, path, poll_request_id)
+                })
+            })
         else {
             return false;
         };
@@ -4490,6 +4497,7 @@ fn long_poll_timeout_seconds(timeout: Duration) -> u64 {
 fn worker_operation_is_retryable(error: &Error) -> bool {
     if worker_poll_capacity_retry_after(error).is_some()
         || worker_storage_admission_body(error).is_some()
+        || worker_backend_unavailable_body(error).is_some()
         || worker_operation_is_explicitly_non_retryable(error)
     {
         return false;
@@ -4558,6 +4566,56 @@ fn worker_storage_admission_retry_after(
         None => {}
     }
     Some(Duration::from_secs(delay))
+}
+
+fn worker_backend_unavailable_retry_after(
+    error: &Error,
+    path: &str,
+    poll_request_id: Option<&str>,
+) -> Option<Duration> {
+    let operation = match path {
+        "/worker/register" => "register_worker",
+        "/worker/heartbeat" => "heartbeat_worker",
+        "/worker/workflow-tasks/poll" => "poll_workflow_task",
+        "/worker/activity-tasks/poll" => "poll_activity_task",
+        "/worker/query-tasks/poll" => "poll_query_task",
+        "/worker/update-validation-tasks/poll" => "poll_update_validation_task",
+        _ => return None,
+    };
+    let body = worker_backend_unavailable_body(error)?;
+    let delay = body.get("retry_after_seconds")?.as_u64()?;
+    if delay == 0
+        || body.get("operation")?.as_str()? != operation
+        || body.get("outcome")?.as_str()? != "unknown"
+        || body.get("retryable") != Some(&Value::Bool(true))
+        || body.get("worker_id")?.as_str()?.is_empty()
+    {
+        return None;
+    }
+    if let Some(id) = poll_request_id {
+        if id.is_empty()
+            || body.get("task") != Some(&Value::Null)
+            || body.get("poll_status")?.as_str()? != "backend_unavailable"
+            || body.get("poll_request_id")?.as_str()? != id
+            || body.get("retry_same_poll_request_id") != Some(&Value::Bool(true))
+        {
+            return None;
+        }
+    } else if path.ends_with("/poll") {
+        return None;
+    }
+    Some(Duration::from_secs(delay))
+}
+
+fn worker_backend_unavailable_body(error: &Error) -> Option<Value> {
+    let Error::Http { status, body } = error else {
+        return None;
+    };
+    if *status != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let body: Value = serde_json::from_str(body).ok()?;
+    (body.get("reason")?.as_str()? == "backend_unavailable").then_some(body)
 }
 
 fn worker_operation_is_explicitly_non_retryable(error: &Error) -> bool {
@@ -23098,6 +23156,60 @@ mod tests {
         body
     }
 
+    fn backend_refusal(path: &str, request: &str) -> Option<Value> {
+        let operation = match path {
+            "/api/worker/register" => "register_worker",
+            "/api/worker/heartbeat" => "heartbeat_worker",
+            "/api/worker/workflow-tasks/poll" => "poll_workflow_task",
+            "/api/worker/activity-tasks/poll" => "poll_activity_task",
+            "/api/worker/query-tasks/poll" => "poll_query_task",
+            "/api/worker/update-validation-tasks/poll" => "poll_update_validation_task",
+            _ => return None,
+        };
+        let request: Value = serde_json::from_str(request).ok()?;
+        let mut response = json!({
+            "reason": "backend_unavailable",
+            "operation": operation,
+            "outcome": "unknown",
+            "retryable": true,
+            "retry_after_seconds": 1,
+            "worker_id": request["worker_id"],
+            "task_queue": request.get("task_queue"),
+        });
+        if path.ends_with("/poll") {
+            response["task"] = Value::Null;
+            response["poll_status"] = json!("backend_unavailable");
+            response["poll_request_id"] = request["poll_request_id"].clone();
+            response["retry_same_poll_request_id"] = json!(true);
+        }
+        Some(response)
+    }
+
+    fn backend_retry_override(
+        path: &str,
+        request: &str,
+        number: usize,
+    ) -> Option<(&'static str, String)> {
+        if number > 8 {
+            return None;
+        }
+        Some((
+            "503 Service Unavailable",
+            backend_refusal(path, request)?.to_string(),
+        ))
+    }
+
+    fn backend_unavailable_override(
+        path: &str,
+        request: &str,
+        _number: usize,
+    ) -> Option<(&'static str, String)> {
+        Some((
+            "503 Service Unavailable",
+            backend_refusal(path, request)?.to_string(),
+        ))
+    }
+
     fn storage_worker(server: &MockWorkerServer) -> Worker {
         Worker::new(Client::new(server.base_url()).expect("client"), "storage")
             .worker_id("storage-worker")
@@ -23117,6 +23229,135 @@ mod tests {
             .collect();
         assert_eq!(bodies.len(), count, "{path}");
         assert!(bodies.iter().all(|body| body == &bodies[0]), "{path}");
+    }
+
+    #[test]
+    fn backend_recovery_requires_the_explicit_worker_contract() {
+        for (path, operation) in [
+            ("/worker/register", "register_worker"),
+            ("/worker/heartbeat", "heartbeat_worker"),
+            ("/worker/workflow-tasks/poll", "poll_workflow_task"),
+            ("/worker/activity-tasks/poll", "poll_activity_task"),
+            ("/worker/query-tasks/poll", "poll_query_task"),
+            (
+                "/worker/update-validation-tasks/poll",
+                "poll_update_validation_task",
+            ),
+        ] {
+            let poll_id = path.ends_with("/poll").then_some("same-poll");
+            let request = json!({"worker_id":"same-worker","task_queue":"same-queue","poll_request_id":poll_id});
+            let body = backend_refusal(&format!("/api{path}"), &request.to_string())
+                .expect("worker operation");
+            assert_eq!(body["operation"], operation);
+            let error = Error::Http {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                body: body.to_string(),
+            };
+            assert_eq!(
+                worker_backend_unavailable_retry_after(&error, path, poll_id),
+                Some(Duration::from_secs(1))
+            );
+            assert!(!worker_operation_is_retryable(&error));
+            for (field, value) in [
+                ("operation", json!("wrong_operation")),
+                ("outcome", json!("completed")),
+                ("retryable", json!(false)),
+                ("retry_after_seconds", json!(0)),
+                ("worker_id", json!("")),
+            ] {
+                let mut invalid = body.clone();
+                invalid[field] = value;
+                let error = Error::Http {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    body: invalid.to_string(),
+                };
+                assert!(
+                    worker_backend_unavailable_retry_after(&error, path, poll_id).is_none(),
+                    "{path}: {field}"
+                );
+                assert!(!worker_operation_is_retryable(&error));
+            }
+            if let Some(poll_id) = poll_id {
+                for (field, value) in [
+                    ("poll_request_id", json!("wrong-poll")),
+                    ("poll_status", json!("empty")),
+                    ("task", json!({"task_id":"claimed"})),
+                    ("retry_same_poll_request_id", json!(false)),
+                ] {
+                    let mut invalid = body.clone();
+                    invalid[field] = value;
+                    let error = Error::Http {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body: invalid.to_string(),
+                    };
+                    assert!(
+                        worker_backend_unavailable_retry_after(&error, path, Some(poll_id))
+                            .is_none(),
+                        "{path}: {field}"
+                    );
+                }
+            }
+            let error = Error::Http {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: body.to_string(),
+            };
+            assert!(worker_backend_unavailable_retry_after(&error, path, poll_id).is_none());
+            assert!(!worker_operation_is_retryable(&error));
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_recovery_outlives_generic_retry_budget_and_preserves_polls() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(backend_retry_override),
+            ..MockWorkerBehavior::default()
+        });
+        let mut worker =
+            storage_worker(&server).with_storage_admission(Arc::new(AtomicBool::new(false)));
+        worker.register_workflow("backend.workflow", |_, _| async { Ok(Value::Null) });
+        worker.register_activity("backend.activity", |_, _| async { Ok(Value::Null) });
+        worker.register_query("backend.workflow", "state", |_, _| async {
+            Ok(Value::Null)
+        });
+        worker.register().await.expect("registration recovery");
+        worker
+            .client
+            .heartbeat_worker("storage-worker", 1, 1)
+            .await
+            .expect("heartbeat recovery");
+        assert_eq!(worker.run_once().await.expect("poll recovery"), 0);
+        for path in [
+            "/api/worker/register",
+            "/api/worker/heartbeat",
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            assert_identical_requests(&server, path, 9);
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_recovery_wait_stops_with_worker() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(backend_unavailable_override),
+            ..MockWorkerBehavior::default()
+        });
+        let mut worker = storage_worker(&server).retry_policy(WorkerRetryPolicy {
+            max_retries: 1,
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(2),
+        });
+        worker.register_workflow("backend.workflow", |_, _| async { Ok(Value::Null) });
+        let started = tokio::time::Instant::now();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.run_until(tokio::time::sleep(Duration::from_millis(100))),
+        )
+        .await
+        .expect("shutdown interrupts backend wait");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(server.request_count("/api/worker/register") >= 1);
     }
 
     #[test]
