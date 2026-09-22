@@ -320,6 +320,7 @@ impl Client {
                         retry_error.as_ref().unwrap_or(&error),
                         protocol,
                         None,
+                        None,
                         &mut retries,
                     )
                     .await

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.7
+
+- Keep managed workers polling and heartbeating through Server's explicit
+  retryable `backend_unavailable` response, even after the ordinary retry
+  budget. Preserve the original poll request, bound backoff, and interrupt the
+  wait on shutdown. Authentication, malformed responses, and unrelated worker
+  errors remain terminal.
+
 ## 2.0.6
 
 - Keep fresh installs compatible with Rust 1.86 by constraining the transitive
