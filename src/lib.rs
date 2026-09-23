@@ -883,6 +883,16 @@ pub struct WorkflowCommandResult {
     pub raw: Value,
 }
 
+/// A new run continuing a failed run from its recorded activity boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowRedriveResult {
+    pub workflow_id: String,
+    pub source_run_id: String,
+    pub run_id: String,
+    pub resume_step_sequence: u64,
+    pub raw: Value,
+}
+
 /// A stable rejection returned by instance- or selected-run lifecycle commands.
 #[derive(Clone, Debug, Error)]
 #[error("workflow {command:?} rejected ({reason}, HTTP {status}): {message}")]
@@ -2854,6 +2864,52 @@ impl Client {
             options,
         )
         .await
+    }
+
+    /// Continue a failed run from its recorded activity failure boundary.
+    pub async fn redrive_workflow_run(
+        &self,
+        workflow_id: &str,
+        failed_run_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<WorkflowRedriveResult> {
+        let body = request_id
+            .map(|id| json!({"request_id": id}))
+            .unwrap_or_else(|| json!({}));
+        let data: Value = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!("/workflows/{workflow_id}/runs/{failed_run_id}/redrive"),
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        if data.get("accepted").and_then(Value::as_bool) != Some(true) {
+            return Err(Error::Codec(
+                "redrive response was not accepted".to_string(),
+            ));
+        }
+        let run_id = data
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != failed_run_id)
+            .ok_or_else(|| {
+                Error::Codec("redrive response is missing a distinct successor run_id".to_string())
+            })?;
+        let resume_step_sequence = data
+            .get("resume_step_sequence")
+            .and_then(Value::as_u64)
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| {
+                Error::Codec("redrive response is missing resume_step_sequence".to_string())
+            })?;
+        Ok(WorkflowRedriveResult {
+            workflow_id: workflow_id.to_string(),
+            source_run_id: failed_run_id.to_string(),
+            run_id: run_id.to_string(),
+            resume_step_sequence,
+            raw: data,
+        })
     }
 
     async fn workflow_command(
@@ -4856,6 +4912,17 @@ impl WorkflowHandle {
         })?;
         self.client
             .terminate_workflow_run(&self.workflow_id, run_id, options)
+            .await
+    }
+
+    /// Continue this handle's failed run without repeating completed activities.
+    pub async fn redrive(&self, request_id: Option<&str>) -> Result<WorkflowRedriveResult> {
+        let run_id = self
+            .run_id
+            .as_deref()
+            .ok_or_else(|| Error::Codec("run_id is required for redrive".to_string()))?;
+        self.client
+            .redrive_workflow_run(&self.workflow_id, run_id, request_id)
             .await
     }
 
@@ -22539,6 +22606,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redrive_targets_a_failed_run_and_returns_successor_identity() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let result = client
+            .redrive_workflow_run("wf-lifecycle", "run-failed", Some("retry-1"))
+            .await
+            .expect("redrive accepted");
+        assert_eq!(result.workflow_id, "wf-lifecycle");
+        assert_eq!(result.source_run_id, "run-failed");
+        assert_eq!(result.run_id, "run-successor");
+        assert_eq!(result.resume_step_sequence, 2);
+        assert_eq!(
+            server.request_body("/api/workflows/wf-lifecycle/runs/run-failed/redrive"),
+            json!({"request_id":"retry-1"})
+        );
+
+        let error = client
+            .redrive_workflow_run("wf-lifecycle", "run-completed", None)
+            .await
+            .expect_err("completed run must be rejected");
+        let Error::Http { status, body } = error else {
+            panic!("expected HTTP redrive rejection");
+        };
+        assert_eq!(status.as_u16(), 409);
+        assert!(body.contains("run_not_failed"));
+        assert_eq!(
+            server.request_body("/api/workflows/wf-lifecycle/runs/run-completed/redrive"),
+            json!({})
+        );
+
+        let handle = WorkflowHandle {
+            client: client.clone(),
+            workflow_id: "wf-lifecycle".to_string(),
+            run_id: Some("run-failed".to_string()),
+            workflow_type: "test".to_string(),
+        };
+        assert_eq!(
+            handle.redrive(None).await.expect("handle redrive").run_id,
+            "run-successor"
+        );
+        let missing_run = WorkflowHandle {
+            run_id: None,
+            ..handle
+        };
+        assert!(matches!(
+            missing_run.redrive(None).await,
+            Err(Error::Codec(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn workflow_start_options_send_server_enforced_deadlines() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -25922,6 +26044,14 @@ mod tests {
             "/api/workflows/wf-lifecycle/runs/run-current/terminate" => (
                 "200 OK",
                 r#"{"workflow_id":"wf-lifecycle","run_id":"run-current","outcome":"terminated","command_status":"accepted"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-failed/redrive" => (
+                "202 Accepted",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-successor","accepted":true,"outcome":"redriven","command_status":"accepted","resume_step_sequence":2}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-completed/redrive" => (
+                "409 Conflict",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-completed","reason":"run_not_failed","message":"Run is not failed."}"#,
             ),
             "/api/workflows/wf-lifecycle/runs/run-stale/cancel"
             | "/api/workflows/wf-lifecycle/runs/run-stale/terminate" => (
