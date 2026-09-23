@@ -2884,9 +2884,18 @@ impl Client {
                 Some(&body),
             )
             .await?;
-        if data.get("accepted").and_then(Value::as_bool) != Some(true) {
+        if data.get("command_status").and_then(Value::as_str) != Some("accepted")
+            || data.get("outcome").and_then(Value::as_str) != Some("redriven")
+        {
             return Err(Error::Codec(
                 "redrive response was not accepted".to_string(),
+            ));
+        }
+        if data.get("workflow_id").and_then(Value::as_str) != Some(workflow_id)
+            || data.get("continued_from_run_id").and_then(Value::as_str) != Some(failed_run_id)
+        {
+            return Err(Error::Codec(
+                "redrive response does not match the requested source run".to_string(),
             ));
         }
         let run_id = data
@@ -22626,6 +22635,12 @@ mod tests {
             json!({"request_id":"retry-1"})
         );
 
+        let repeated = client
+            .redrive_workflow_run("wf-lifecycle", "run-failed-existing", Some("retry-1"))
+            .await
+            .expect("idempotent redrive response accepted");
+        assert_eq!(repeated.run_id, "run-successor");
+
         let error = client
             .redrive_workflow_run("wf-lifecycle", "run-completed", None)
             .await
@@ -26047,7 +26062,11 @@ mod tests {
             ),
             "/api/workflows/wf-lifecycle/runs/run-failed/redrive" => (
                 "202 Accepted",
-                r#"{"workflow_id":"wf-lifecycle","run_id":"run-successor","accepted":true,"outcome":"redriven","command_status":"accepted","resume_step_sequence":2}"#,
+                r#"{"workflow_id":"wf-lifecycle","continued_from_run_id":"run-failed","run_id":"run-successor","outcome":"redriven","command_status":"accepted","resume_step_sequence":2}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-failed-existing/redrive" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-lifecycle","continued_from_run_id":"run-failed-existing","run_id":"run-successor","outcome":"redriven","command_status":"accepted","resume_step_sequence":2}"#,
             ),
             "/api/workflows/wf-lifecycle/runs/run-completed/redrive" => (
                 "409 Conflict",
