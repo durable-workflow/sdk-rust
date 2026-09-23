@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-redrive-recorded-activity-failure",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.redrive-boundary",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.redrive.activity"
+      }
+    },
+    {
+      "event_type": "ActivityFailed",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.redrive.activity",
+        "activity_execution_id": "activity-redrive-1",
+        "message": "activity failed"
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "fail_workflow",
+      "failed_step_sequence": 1,
+      "failed_activity_execution_id": "activity-redrive-1"
+    }
+  ],
+  "expected": {
+    "type": "fail_workflow",
+    "failed_step_sequence": 1,
+    "failed_activity_execution_id": "activity-redrive-1"
+  }
+}
