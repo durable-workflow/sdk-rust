@@ -409,6 +409,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.condition-search-adjacent"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
+            | "corpus.redrive-boundary"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -591,6 +592,12 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     }
                 },
             );
+        }
+        "corpus.redrive-boundary" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.activity("corpus.redrive.activity", json!([])).await?;
+                Ok(json!("unexpected completion"))
+            });
         }
         "corpus.memo-signed-zero" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
@@ -885,6 +892,25 @@ async fn avro_side_effect_replay_is_deterministic_across_cold_workers() {
         .expect("cold Avro replay fixture must execute");
 
     assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn recorded_activity_failure_boundary_is_stable_across_cold_workers() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/redrive-activity-failure-boundary.json");
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read checked-in redrive fixture"),
+    )
+    .expect("parse checked-in redrive fixture");
+
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .expect("first failed-activity replay must execute");
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .expect("cold failed-activity replay must execute");
+
+    assert_eq!(first, restarted);
 }
 
 #[tokio::test]

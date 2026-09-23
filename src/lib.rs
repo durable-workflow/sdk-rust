@@ -883,6 +883,16 @@ pub struct WorkflowCommandResult {
     pub raw: Value,
 }
 
+/// A new run continuing a failed run from its recorded activity boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowRedriveResult {
+    pub workflow_id: String,
+    pub source_run_id: String,
+    pub run_id: String,
+    pub resume_step_sequence: u64,
+    pub raw: Value,
+}
+
 /// A stable rejection returned by instance- or selected-run lifecycle commands.
 #[derive(Clone, Debug, Error)]
 #[error("workflow {command:?} rejected ({reason}, HTTP {status}): {message}")]
@@ -995,7 +1005,7 @@ pub enum ActivityFailureKind {
 ///
 /// Match [`Error::ActivityFailed`] and inspect `kind`, `reason`,
 /// `failure_category`, or `timeout_kind`; display text is only diagnostic.
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq)]
 #[error("activity failed ({reason}): {message}")]
 pub struct ActivityFailure {
     pub kind: ActivityFailureKind,
@@ -2856,6 +2866,61 @@ impl Client {
         .await
     }
 
+    /// Continue a failed run from its recorded activity failure boundary.
+    pub async fn redrive_workflow_run(
+        &self,
+        workflow_id: &str,
+        failed_run_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<WorkflowRedriveResult> {
+        let body = request_id
+            .map(|id| json!({"request_id": id}))
+            .unwrap_or_else(|| json!({}));
+        let data: Value = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!("/workflows/{workflow_id}/runs/{failed_run_id}/redrive"),
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        if data.get("command_status").and_then(Value::as_str) != Some("accepted")
+            || data.get("outcome").and_then(Value::as_str) != Some("redriven")
+        {
+            return Err(Error::Codec(
+                "redrive response was not accepted".to_string(),
+            ));
+        }
+        if data.get("workflow_id").and_then(Value::as_str) != Some(workflow_id)
+            || data.get("continued_from_run_id").and_then(Value::as_str) != Some(failed_run_id)
+        {
+            return Err(Error::Codec(
+                "redrive response does not match the requested source run".to_string(),
+            ));
+        }
+        let run_id = data
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != failed_run_id)
+            .ok_or_else(|| {
+                Error::Codec("redrive response is missing a distinct successor run_id".to_string())
+            })?;
+        let resume_step_sequence = data
+            .get("resume_step_sequence")
+            .and_then(Value::as_u64)
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| {
+                Error::Codec("redrive response is missing resume_step_sequence".to_string())
+            })?;
+        Ok(WorkflowRedriveResult {
+            workflow_id: workflow_id.to_string(),
+            source_run_id: failed_run_id.to_string(),
+            run_id: run_id.to_string(),
+            resume_step_sequence,
+            raw: data,
+        })
+    }
+
     async fn workflow_command(
         &self,
         workflow_id: &str,
@@ -3419,6 +3484,33 @@ impl Client {
         capabilities: Vec<String>,
         workflow_command_contracts: Value,
     ) -> Result<RegisterWorkerResponse> {
+        self.register_worker_with_definition_fingerprints(
+            worker_id,
+            task_queue,
+            supported_workflow_types,
+            supported_activity_types,
+            max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks,
+            capabilities,
+            workflow_command_contracts,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn register_worker_with_definition_fingerprints(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        supported_workflow_types: Vec<String>,
+        supported_activity_types: Vec<String>,
+        max_concurrent_workflow_tasks: usize,
+        max_concurrent_activity_tasks: usize,
+        capabilities: Vec<String>,
+        workflow_command_contracts: Value,
+        workflow_definition_fingerprints: Option<BTreeMap<String, String>>,
+    ) -> Result<RegisterWorkerResponse> {
         if let Some(contracts) = workflow_command_contracts.as_object() {
             for (workflow_type, contract) in contracts {
                 let Some(update_validators) = contract.get("update_validators") else {
@@ -3452,6 +3544,9 @@ impl Client {
             .is_some_and(|contracts| !contracts.is_empty())
         {
             body["workflow_command_contracts"] = workflow_command_contracts;
+        }
+        if let Some(fingerprints) = workflow_definition_fingerprints {
+            body["workflow_definition_fingerprints"] = json!(fingerprints);
         }
 
         self.request_json(
@@ -4829,6 +4924,17 @@ impl WorkflowHandle {
             .await
     }
 
+    /// Continue this handle's failed run without repeating completed activities.
+    pub async fn redrive(&self, request_id: Option<&str>) -> Result<WorkflowRedriveResult> {
+        let run_id = self
+            .run_id
+            .as_deref()
+            .ok_or_else(|| Error::Codec("run_id is required for redrive".to_string()))?;
+        self.client
+            .redrive_workflow_run(&self.workflow_id, run_id, request_id)
+            .await
+    }
+
     /// Execute a named, read-only query against this workflow.
     pub async fn query<T: Serialize>(&self, query_name: &str, input: T) -> Result<Value> {
         self.client
@@ -5872,6 +5978,7 @@ struct RegisteredWorkflow {
     execute: WorkflowHandler,
     replay: Option<ReplayedWorkflowHandler>,
     state_type: Option<TypeId>,
+    definition_fingerprint: Option<String>,
 }
 
 #[derive(Debug)]
@@ -6065,6 +6172,7 @@ impl Worker {
                 }),
                 replay: None,
                 state_type: None,
+                definition_fingerprint: None,
             },
         );
     }
@@ -6107,6 +6215,7 @@ impl Worker {
                 }),
                 replay: None,
                 state_type: None,
+                definition_fingerprint: None,
             },
         );
     }
@@ -6126,6 +6235,7 @@ impl Worker {
                 execute: Arc::new(move |ctx, input| Box::pin(handler(ctx, input))),
                 replay: None,
                 state_type: None,
+                definition_fingerprint: None,
             },
         );
     }
@@ -6184,6 +6294,7 @@ impl Worker {
                 execute,
                 replay: Some(replay),
                 state_type: Some(TypeId::of::<S>()),
+                definition_fingerprint: None,
             },
         );
     }
@@ -6249,8 +6360,43 @@ impl Worker {
                 execute,
                 replay: Some(replay),
                 state_type: Some(TypeId::of::<S>()),
+                definition_fingerprint: None,
             },
         );
+    }
+
+    /// Bind a registered workflow to compile-time embedded source for safe redrive.
+    ///
+    /// Supply `include_str!` values for the workflow body and every helper whose
+    /// behavior can affect replay. A handler re-registration clears the local
+    /// identity; call this after registering the final handler. The server
+    /// rejects reusing a worker ID when its prior fingerprint disappears.
+    /// Workflows without source identity remain runnable but cannot be safely redriven.
+    /// For example, pass `&[include_str!("workflows.rs")]` when the handler and
+    /// replay-sensitive helpers are in a sibling `workflows.rs` file.
+    pub fn set_workflow_definition_sources(
+        &mut self,
+        workflow_type: &str,
+        sources: &[&str],
+    ) -> Result<()> {
+        if sources.is_empty() || sources.iter().any(|source| source.is_empty()) {
+            return Err(Error::Codec(
+                "workflow definition sources must be non-empty".to_string(),
+            ));
+        }
+        let workflow = self.workflows.get_mut(workflow_type).ok_or_else(|| {
+            Error::Codec(format!("workflow type {workflow_type:?} is not registered"))
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"durable-workflow-rust.workflow-definition.v1\0");
+        hasher.update((workflow_type.len() as u64).to_be_bytes());
+        hasher.update(workflow_type.as_bytes());
+        for source in sources {
+            hasher.update((source.len() as u64).to_be_bytes());
+            hasher.update(source.as_bytes());
+        }
+        workflow.definition_fingerprint = Some(format!("sha256:{:x}", hasher.finalize()));
+        Ok(())
     }
 
     /// Register a replayable workflow on the lossless fixed Avro Value surface.
@@ -6292,6 +6438,7 @@ impl Worker {
                 execute,
                 replay: Some(replay),
                 state_type: Some(TypeId::of::<S>()),
+                definition_fingerprint: None,
             },
         );
     }
@@ -6557,7 +6704,7 @@ impl Worker {
         }
 
         self.client
-            .register_worker_with_command_contracts(
+            .register_worker_with_definition_fingerprints(
                 &self.worker_id,
                 &self.task_queue,
                 self.workflows.keys().cloned().collect(),
@@ -6578,6 +6725,17 @@ impl Worker {
                 .flatten()
                 .collect(),
                 Value::Object(command_contracts),
+                Some(
+                    self.workflows
+                        .iter()
+                        .filter_map(|(workflow_type, workflow)| {
+                            workflow
+                                .definition_fingerprint
+                                .as_ref()
+                                .map(|fingerprint| (workflow_type.clone(), fingerprint.clone()))
+                        })
+                        .collect(),
+                ),
             )
             .await
     }
@@ -7448,7 +7606,10 @@ impl Worker {
                 // upgraded workflow code no longer consumes.
                 ctx.ensure_history_consumed()?;
                 let mut commands = ctx.take_commands()?;
-                commands.push(workflow_failure_command(&error));
+                commands.push(workflow_failure_command(
+                    &error,
+                    recorded_activity_failure_boundary(&ctx, &error),
+                ));
                 self.message_stream_decision(&ctx, commands)
             }
             Poll::Pending => {
@@ -14309,7 +14470,41 @@ fn payload_string(payload: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn workflow_failure_command(error: &Error) -> Value {
+fn recorded_activity_failure_boundary(
+    ctx: &WorkflowContext,
+    error: &Error,
+) -> Option<(u64, String)> {
+    let Error::ActivityFailed(failure) = error else {
+        return None;
+    };
+    if failure.kind != ActivityFailureKind::Failed {
+        return None;
+    }
+    let activity_execution_id = failure
+        .activity_execution_id
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let state = ctx.state.lock().ok()?;
+    let mut matches = state.recorded_commands.iter().filter_map(|command| {
+        let RecordedCommand::Activity {
+            sequence,
+            outcome: Some(Err(recorded_failure)),
+            ..
+        } = command
+        else {
+            return None;
+        };
+        (*sequence > 0 && recorded_failure == failure)
+            .then_some((*sequence, activity_execution_id.to_string()))
+    });
+    let boundary = matches.next()?;
+    matches.next().is_none().then_some(boundary)
+}
+
+fn workflow_failure_command(
+    error: &Error,
+    failed_activity_boundary: Option<(u64, String)>,
+) -> Value {
     let (exception_type, exception_class, properties) = match error {
         Error::ActivityFailed(failure) => (
             match failure.kind {
@@ -14406,7 +14601,7 @@ fn workflow_failure_command(error: &Error) -> Value {
         _ => false,
     };
 
-    json!({
+    let mut command = json!({
         "type": "fail_workflow",
         "message": error.to_string(),
         "exception_type": exception_type,
@@ -14418,7 +14613,14 @@ fn workflow_failure_command(error: &Error) -> Value {
             "message": error.to_string(),
             "properties": properties,
         }
-    })
+    });
+
+    if let Some((sequence, activity_execution_id)) = failed_activity_boundary {
+        command["failed_step_sequence"] = json!(sequence);
+        command["failed_activity_execution_id"] = json!(activity_execution_id);
+    }
+
+    command
 }
 
 fn workflow_error_type(error: &Error) -> &'static str {
@@ -21027,6 +21229,141 @@ mod tests {
     }
 
     #[test]
+    fn uncaught_recorded_activity_failure_claims_only_its_persisted_boundary() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.redrive", |ctx, _input| async move {
+            ctx.activity("greet", json!([])).await?;
+            Ok(Value::Null)
+        });
+        worker.register_workflow("rust.redrive-translated", |ctx, _input| async move {
+            match ctx.activity("greet", json!([])).await {
+                Err(Error::ActivityFailed(_)) => Err(Error::WorkerLoop("translated".to_string())),
+                result => result,
+            }
+        });
+
+        let failed = history_event(
+            "ActivityFailed",
+            json!({
+                "sequence": 1,
+                "activity_type": "greet",
+                "activity_execution_id": "activity-1",
+                "message": "failed"
+            }),
+        );
+        let commands = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive",
+                vec![failed.clone()],
+                DEFAULT_CODEC,
+            ))
+            .expect("recorded failure becomes a workflow command");
+        assert_eq!(commands[0]["type"], "fail_workflow");
+        assert_eq!(commands[0]["failed_step_sequence"], 1);
+        assert_eq!(commands[0]["failed_activity_execution_id"], "activity-1");
+
+        let translated = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive-translated",
+                vec![failed],
+                DEFAULT_CODEC,
+            ))
+            .expect("translated failure becomes a workflow command");
+        assert_eq!(translated[0]["type"], "fail_workflow");
+        assert!(translated[0].get("failed_step_sequence").is_none());
+        assert!(translated[0].get("failed_activity_execution_id").is_none());
+
+        let without_identity = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive",
+                vec![history_event(
+                    "ActivityFailed",
+                    json!({"sequence": 1, "activity_type": "greet", "message": "failed"}),
+                )],
+                DEFAULT_CODEC,
+            ))
+            .expect("incomplete identity still fails the workflow");
+        assert!(without_identity[0].get("failed_step_sequence").is_none());
+
+        let timed_out = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive",
+                vec![history_event(
+                    "ActivityTimedOut",
+                    json!({
+                        "sequence": 1,
+                        "activity_type": "greet",
+                        "activity_execution_id": "activity-timeout",
+                    }),
+                )],
+                DEFAULT_CODEC,
+            ))
+            .expect("timeout still fails the workflow");
+        assert!(timed_out[0].get("failed_step_sequence").is_none());
+    }
+
+    #[test]
+    fn redriven_history_reuses_completed_prefix_and_reschedules_only_failed_step() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.redrive-successor", |ctx, _input| async move {
+            let first = ctx.activity("first", json!([])).await?;
+            let second = ctx.activity("second", json!([first.clone()])).await?;
+            Ok(json!({"first": first, "second": second}))
+        });
+        let first = history_event(
+            "ActivityCompleted",
+            json!({
+                "sequence": 1,
+                "activity_type": "first",
+                "result": encode_value_envelope(&json!("recorded"), DEFAULT_CODEC).expect("first result"),
+                "payload_codec": DEFAULT_CODEC,
+                "reused_from_run_id": "failed-run",
+                "reused_activity_execution_id": "original-first",
+            }),
+        );
+
+        let retry = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive-successor",
+                vec![first.clone()],
+                DEFAULT_CODEC,
+            ))
+            .expect("reused result replays before failed step");
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0]["type"], "schedule_activity");
+        assert_eq!(retry[0]["activity_type"], "second");
+        assert_eq!(
+            decode_wire_value(&retry[0]["arguments"], DEFAULT_CODEC).expect("second arguments"),
+            json!(["recorded"]),
+        );
+
+        let second = history_event(
+            "ActivityCompleted",
+            json!({
+                "sequence": 2,
+                "activity_type": "second",
+                "result": encode_value_envelope(&json!("retried"), DEFAULT_CODEC).expect("second result"),
+                "payload_codec": DEFAULT_CODEC,
+            }),
+        );
+        let completed = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive-successor",
+                vec![first, second],
+                DEFAULT_CODEC,
+            ))
+            .expect("retried step completes the successor");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&completed[0]["result"], DEFAULT_CODEC).expect("workflow result"),
+            json!({"first": "recorded", "second": "retried"}),
+        );
+    }
+
+    #[test]
     fn handler_error_cannot_hide_an_unconsumed_committed_side_effect() {
         let client = Client::new("http://127.0.0.1:8080").expect("client");
         let mut worker = Worker::new(client, "rust-workers");
@@ -22278,6 +22615,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redrive_targets_a_failed_run_and_returns_successor_identity() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let result = client
+            .redrive_workflow_run("wf-lifecycle", "run-failed", Some("retry-1"))
+            .await
+            .expect("redrive accepted");
+        assert_eq!(result.workflow_id, "wf-lifecycle");
+        assert_eq!(result.source_run_id, "run-failed");
+        assert_eq!(result.run_id, "run-successor");
+        assert_eq!(result.resume_step_sequence, 2);
+        assert_eq!(
+            server.request_body("/api/workflows/wf-lifecycle/runs/run-failed/redrive"),
+            json!({"request_id":"retry-1"})
+        );
+
+        let repeated = client
+            .redrive_workflow_run("wf-lifecycle", "run-failed-existing", Some("retry-1"))
+            .await
+            .expect("idempotent redrive response accepted");
+        assert_eq!(repeated.run_id, "run-successor");
+
+        let error = client
+            .redrive_workflow_run("wf-lifecycle", "run-completed", None)
+            .await
+            .expect_err("completed run must be rejected");
+        let Error::Http { status, body } = error else {
+            panic!("expected HTTP redrive rejection");
+        };
+        assert_eq!(status.as_u16(), 409);
+        assert!(body.contains("run_not_failed"));
+        assert_eq!(
+            server.request_body("/api/workflows/wf-lifecycle/runs/run-completed/redrive"),
+            json!({})
+        );
+
+        let handle = WorkflowHandle {
+            client: client.clone(),
+            workflow_id: "wf-lifecycle".to_string(),
+            run_id: Some("run-failed".to_string()),
+            workflow_type: "test".to_string(),
+        };
+        assert_eq!(
+            handle.redrive(None).await.expect("handle redrive").run_id,
+            "run-successor"
+        );
+        let missing_run = WorkflowHandle {
+            run_id: None,
+            ..handle
+        };
+        assert!(matches!(
+            missing_run.redrive(None).await,
+            Err(Error::Codec(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn workflow_start_options_send_server_enforced_deadlines() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -22863,6 +23261,59 @@ mod tests {
         assert_eq!(
             server.request_body("/api/worker/register")["workflow_command_contracts"],
             contracts
+        );
+        assert!(server
+            .request_body("/api/worker/register")
+            .get("workflow_definition_fingerprints")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rust_worker_advertises_source_backed_definition_and_clears_it_on_reregistration() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
+
+        assert!(worker
+            .set_workflow_definition_sources("missing", &[include_str!("lib.rs")])
+            .is_err());
+        assert!(worker
+            .set_workflow_definition_sources("orders", &[])
+            .is_err());
+        worker
+            .set_workflow_definition_sources("orders", &[include_str!("lib.rs")])
+            .expect("embed workflow source");
+        worker.register().await.expect("register worker");
+        let first = server.request_bodies("/api/worker/register")[0]
+            ["workflow_definition_fingerprints"]["orders"]
+            .as_str()
+            .expect("source-backed fingerprint")
+            .to_string();
+        assert!(first.starts_with("sha256:"));
+
+        worker
+            .set_workflow_definition_sources("orders", &[include_str!("lib.rs"), "changed helper"])
+            .expect("change embedded helper source");
+        worker.register().await.expect("register changed source");
+        let changed = server.request_bodies("/api/worker/register")[1]
+            ["workflow_definition_fingerprints"]["orders"]
+            .as_str()
+            .expect("changed fingerprint")
+            .to_string();
+        assert_ne!(first, changed);
+
+        worker.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
+        worker
+            .register()
+            .await
+            .expect("register replacement handler");
+        assert_eq!(
+            server.request_bodies("/api/worker/register")[2]["workflow_definition_fingerprints"],
+            json!({})
         );
     }
 
@@ -25608,6 +26059,18 @@ mod tests {
             "/api/workflows/wf-lifecycle/runs/run-current/terminate" => (
                 "200 OK",
                 r#"{"workflow_id":"wf-lifecycle","run_id":"run-current","outcome":"terminated","command_status":"accepted"}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-failed/redrive" => (
+                "202 Accepted",
+                r#"{"workflow_id":"wf-lifecycle","continued_from_run_id":"run-failed","run_id":"run-successor","outcome":"redriven","command_status":"accepted","resume_step_sequence":2}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-failed-existing/redrive" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-lifecycle","continued_from_run_id":"run-failed-existing","run_id":"run-successor","outcome":"redriven","command_status":"accepted","resume_step_sequence":2}"#,
+            ),
+            "/api/workflows/wf-lifecycle/runs/run-completed/redrive" => (
+                "409 Conflict",
+                r#"{"workflow_id":"wf-lifecycle","run_id":"run-completed","reason":"run_not_failed","message":"Run is not failed."}"#,
             ),
             "/api/workflows/wf-lifecycle/runs/run-stale/cancel"
             | "/api/workflows/wf-lifecycle/runs/run-stale/terminate" => (
