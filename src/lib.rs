@@ -3419,6 +3419,33 @@ impl Client {
         capabilities: Vec<String>,
         workflow_command_contracts: Value,
     ) -> Result<RegisterWorkerResponse> {
+        self.register_worker_with_definition_fingerprints(
+            worker_id,
+            task_queue,
+            supported_workflow_types,
+            supported_activity_types,
+            max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks,
+            capabilities,
+            workflow_command_contracts,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn register_worker_with_definition_fingerprints(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        supported_workflow_types: Vec<String>,
+        supported_activity_types: Vec<String>,
+        max_concurrent_workflow_tasks: usize,
+        max_concurrent_activity_tasks: usize,
+        capabilities: Vec<String>,
+        workflow_command_contracts: Value,
+        workflow_definition_fingerprints: Option<BTreeMap<String, String>>,
+    ) -> Result<RegisterWorkerResponse> {
         if let Some(contracts) = workflow_command_contracts.as_object() {
             for (workflow_type, contract) in contracts {
                 let Some(update_validators) = contract.get("update_validators") else {
@@ -3452,6 +3479,9 @@ impl Client {
             .is_some_and(|contracts| !contracts.is_empty())
         {
             body["workflow_command_contracts"] = workflow_command_contracts;
+        }
+        if let Some(fingerprints) = workflow_definition_fingerprints {
+            body["workflow_definition_fingerprints"] = json!(fingerprints);
         }
 
         self.request_json(
@@ -5872,6 +5902,7 @@ struct RegisteredWorkflow {
     execute: WorkflowHandler,
     replay: Option<ReplayedWorkflowHandler>,
     state_type: Option<TypeId>,
+    definition_fingerprint: Option<String>,
 }
 
 #[derive(Debug)]
@@ -6065,6 +6096,7 @@ impl Worker {
                 }),
                 replay: None,
                 state_type: None,
+                definition_fingerprint: None,
             },
         );
     }
@@ -6107,6 +6139,7 @@ impl Worker {
                 }),
                 replay: None,
                 state_type: None,
+                definition_fingerprint: None,
             },
         );
     }
@@ -6126,6 +6159,7 @@ impl Worker {
                 execute: Arc::new(move |ctx, input| Box::pin(handler(ctx, input))),
                 replay: None,
                 state_type: None,
+                definition_fingerprint: None,
             },
         );
     }
@@ -6184,6 +6218,7 @@ impl Worker {
                 execute,
                 replay: Some(replay),
                 state_type: Some(TypeId::of::<S>()),
+                definition_fingerprint: None,
             },
         );
     }
@@ -6249,8 +6284,43 @@ impl Worker {
                 execute,
                 replay: Some(replay),
                 state_type: Some(TypeId::of::<S>()),
+                definition_fingerprint: None,
             },
         );
+    }
+
+    /// Bind a registered workflow to compile-time embedded source for safe redrive.
+    ///
+    /// Supply `include_str!` values for the workflow body and every helper whose
+    /// behavior can affect replay. A handler re-registration clears the local
+    /// identity; call this after registering the final handler. The server
+    /// rejects reusing a worker ID when its prior fingerprint disappears.
+    /// Workflows without source identity remain runnable but cannot be safely redriven.
+    /// For example, pass `&[include_str!("workflows.rs")]` when the handler and
+    /// replay-sensitive helpers are in a sibling `workflows.rs` file.
+    pub fn set_workflow_definition_sources(
+        &mut self,
+        workflow_type: &str,
+        sources: &[&str],
+    ) -> Result<()> {
+        if sources.is_empty() || sources.iter().any(|source| source.is_empty()) {
+            return Err(Error::Codec(
+                "workflow definition sources must be non-empty".to_string(),
+            ));
+        }
+        let workflow = self.workflows.get_mut(workflow_type).ok_or_else(|| {
+            Error::Codec(format!("workflow type {workflow_type:?} is not registered"))
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"durable-workflow-rust.workflow-definition.v1\0");
+        hasher.update((workflow_type.len() as u64).to_be_bytes());
+        hasher.update(workflow_type.as_bytes());
+        for source in sources {
+            hasher.update((source.len() as u64).to_be_bytes());
+            hasher.update(source.as_bytes());
+        }
+        workflow.definition_fingerprint = Some(format!("sha256:{:x}", hasher.finalize()));
+        Ok(())
     }
 
     /// Register a replayable workflow on the lossless fixed Avro Value surface.
@@ -6292,6 +6362,7 @@ impl Worker {
                 execute,
                 replay: Some(replay),
                 state_type: Some(TypeId::of::<S>()),
+                definition_fingerprint: None,
             },
         );
     }
@@ -6557,7 +6628,7 @@ impl Worker {
         }
 
         self.client
-            .register_worker_with_command_contracts(
+            .register_worker_with_definition_fingerprints(
                 &self.worker_id,
                 &self.task_queue,
                 self.workflows.keys().cloned().collect(),
@@ -6578,6 +6649,17 @@ impl Worker {
                 .flatten()
                 .collect(),
                 Value::Object(command_contracts),
+                Some(
+                    self.workflows
+                        .iter()
+                        .filter_map(|(workflow_type, workflow)| {
+                            workflow
+                                .definition_fingerprint
+                                .as_ref()
+                                .map(|fingerprint| (workflow_type.clone(), fingerprint.clone()))
+                        })
+                        .collect(),
+                ),
             )
             .await
     }
@@ -22982,6 +23064,59 @@ mod tests {
         assert_eq!(
             server.request_body("/api/worker/register")["workflow_command_contracts"],
             contracts
+        );
+        assert!(server
+            .request_body("/api/worker/register")
+            .get("workflow_definition_fingerprints")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rust_worker_advertises_source_backed_definition_and_clears_it_on_reregistration() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
+
+        assert!(worker
+            .set_workflow_definition_sources("missing", &[include_str!("lib.rs")])
+            .is_err());
+        assert!(worker
+            .set_workflow_definition_sources("orders", &[])
+            .is_err());
+        worker
+            .set_workflow_definition_sources("orders", &[include_str!("lib.rs")])
+            .expect("embed workflow source");
+        worker.register().await.expect("register worker");
+        let first = server.request_bodies("/api/worker/register")[0]
+            ["workflow_definition_fingerprints"]["orders"]
+            .as_str()
+            .expect("source-backed fingerprint")
+            .to_string();
+        assert!(first.starts_with("sha256:"));
+
+        worker
+            .set_workflow_definition_sources("orders", &[include_str!("lib.rs"), "changed helper"])
+            .expect("change embedded helper source");
+        worker.register().await.expect("register changed source");
+        let changed = server.request_bodies("/api/worker/register")[1]
+            ["workflow_definition_fingerprints"]["orders"]
+            .as_str()
+            .expect("changed fingerprint")
+            .to_string();
+        assert_ne!(first, changed);
+
+        worker.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
+        worker
+            .register()
+            .await
+            .expect("register replacement handler");
+        assert_eq!(
+            server.request_bodies("/api/worker/register")[2]["workflow_definition_fingerprints"],
+            json!({})
         );
     }
 
