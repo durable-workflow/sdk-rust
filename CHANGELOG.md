@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0
+
+- Add failed-run redrive to the Rust client and workflow handle. A worker can
+  register source identity so a successor run can reuse the completed prefix
+  and retry the failed boundary when the Server supports redrive.
+
 ## 2.0.7
 
 - Keep managed workers polling and heartbeating through Server's explicit
