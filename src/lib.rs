@@ -995,7 +995,7 @@ pub enum ActivityFailureKind {
 ///
 /// Match [`Error::ActivityFailed`] and inspect `kind`, `reason`,
 /// `failure_category`, or `timeout_kind`; display text is only diagnostic.
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq)]
 #[error("activity failed ({reason}): {message}")]
 pub struct ActivityFailure {
     pub kind: ActivityFailureKind,
@@ -7448,7 +7448,10 @@ impl Worker {
                 // upgraded workflow code no longer consumes.
                 ctx.ensure_history_consumed()?;
                 let mut commands = ctx.take_commands()?;
-                commands.push(workflow_failure_command(&error));
+                commands.push(workflow_failure_command(
+                    &error,
+                    recorded_activity_failure_boundary(&ctx, &error),
+                ));
                 self.message_stream_decision(&ctx, commands)
             }
             Poll::Pending => {
@@ -14309,7 +14312,41 @@ fn payload_string(payload: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn workflow_failure_command(error: &Error) -> Value {
+fn recorded_activity_failure_boundary(
+    ctx: &WorkflowContext,
+    error: &Error,
+) -> Option<(u64, String)> {
+    let Error::ActivityFailed(failure) = error else {
+        return None;
+    };
+    if failure.kind != ActivityFailureKind::Failed {
+        return None;
+    }
+    let activity_execution_id = failure
+        .activity_execution_id
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let state = ctx.state.lock().ok()?;
+    let mut matches = state.recorded_commands.iter().filter_map(|command| {
+        let RecordedCommand::Activity {
+            sequence,
+            outcome: Some(Err(recorded_failure)),
+            ..
+        } = command
+        else {
+            return None;
+        };
+        (*sequence > 0 && recorded_failure == failure)
+            .then_some((*sequence, activity_execution_id.to_string()))
+    });
+    let boundary = matches.next()?;
+    matches.next().is_none().then_some(boundary)
+}
+
+fn workflow_failure_command(
+    error: &Error,
+    failed_activity_boundary: Option<(u64, String)>,
+) -> Value {
     let (exception_type, exception_class, properties) = match error {
         Error::ActivityFailed(failure) => (
             match failure.kind {
@@ -14406,7 +14443,7 @@ fn workflow_failure_command(error: &Error) -> Value {
         _ => false,
     };
 
-    json!({
+    let mut command = json!({
         "type": "fail_workflow",
         "message": error.to_string(),
         "exception_type": exception_type,
@@ -14418,7 +14455,14 @@ fn workflow_failure_command(error: &Error) -> Value {
             "message": error.to_string(),
             "properties": properties,
         }
-    })
+    });
+
+    if let Some((sequence, activity_execution_id)) = failed_activity_boundary {
+        command["failed_step_sequence"] = json!(sequence);
+        command["failed_activity_execution_id"] = json!(activity_execution_id);
+    }
+
+    command
 }
 
 fn workflow_error_type(error: &Error) -> &'static str {
@@ -21024,6 +21068,81 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0]["type"], "record_side_effect");
         assert_eq!(commands[1]["type"], "fail_workflow");
+    }
+
+    #[test]
+    fn uncaught_recorded_activity_failure_claims_only_its_persisted_boundary() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.redrive", |ctx, _input| async move {
+            ctx.activity("greet", json!([])).await?;
+            Ok(Value::Null)
+        });
+        worker.register_workflow("rust.redrive-translated", |ctx, _input| async move {
+            match ctx.activity("greet", json!([])).await {
+                Err(Error::ActivityFailed(_)) => Err(Error::WorkerLoop("translated".to_string())),
+                result => result,
+            }
+        });
+
+        let failed = history_event(
+            "ActivityFailed",
+            json!({
+                "sequence": 1,
+                "activity_type": "greet",
+                "activity_execution_id": "activity-1",
+                "message": "failed"
+            }),
+        );
+        let commands = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive",
+                vec![failed.clone()],
+                DEFAULT_CODEC,
+            ))
+            .expect("recorded failure becomes a workflow command");
+        assert_eq!(commands[0]["type"], "fail_workflow");
+        assert_eq!(commands[0]["failed_step_sequence"], 1);
+        assert_eq!(commands[0]["failed_activity_execution_id"], "activity-1");
+
+        let translated = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive-translated",
+                vec![failed],
+                DEFAULT_CODEC,
+            ))
+            .expect("translated failure becomes a workflow command");
+        assert_eq!(translated[0]["type"], "fail_workflow");
+        assert!(translated[0].get("failed_step_sequence").is_none());
+        assert!(translated[0].get("failed_activity_execution_id").is_none());
+
+        let without_identity = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive",
+                vec![history_event(
+                    "ActivityFailed",
+                    json!({"sequence": 1, "activity_type": "greet", "message": "failed"}),
+                )],
+                DEFAULT_CODEC,
+            ))
+            .expect("incomplete identity still fails the workflow");
+        assert!(without_identity[0].get("failed_step_sequence").is_none());
+
+        let timed_out = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive",
+                vec![history_event(
+                    "ActivityTimedOut",
+                    json!({
+                        "sequence": 1,
+                        "activity_type": "greet",
+                        "activity_execution_id": "activity-timeout",
+                    }),
+                )],
+                DEFAULT_CODEC,
+            ))
+            .expect("timeout still fails the workflow");
+        assert!(timed_out[0].get("failed_step_sequence").is_none());
     }
 
     #[test]
