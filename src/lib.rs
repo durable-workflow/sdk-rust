@@ -21228,6 +21228,66 @@ mod tests {
     }
 
     #[test]
+    fn redriven_history_reuses_completed_prefix_and_reschedules_only_failed_step() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("rust.redrive-successor", |ctx, _input| async move {
+            let first = ctx.activity("first", json!([])).await?;
+            let second = ctx.activity("second", json!([first.clone()])).await?;
+            Ok(json!({"first": first, "second": second}))
+        });
+        let first = history_event(
+            "ActivityCompleted",
+            json!({
+                "sequence": 1,
+                "activity_type": "first",
+                "result": encode_value_envelope(&json!("recorded"), DEFAULT_CODEC).expect("first result"),
+                "payload_codec": DEFAULT_CODEC,
+                "reused_from_run_id": "failed-run",
+                "reused_activity_execution_id": "original-first",
+            }),
+        );
+
+        let retry = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive-successor",
+                vec![first.clone()],
+                DEFAULT_CODEC,
+            ))
+            .expect("reused result replays before failed step");
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0]["type"], "schedule_activity");
+        assert_eq!(retry[0]["activity_type"], "second");
+        assert_eq!(
+            decode_wire_value(&retry[0]["arguments"], DEFAULT_CODEC).expect("second arguments"),
+            json!(["recorded"]),
+        );
+
+        let second = history_event(
+            "ActivityCompleted",
+            json!({
+                "sequence": 2,
+                "activity_type": "second",
+                "result": encode_value_envelope(&json!("retried"), DEFAULT_CODEC).expect("second result"),
+                "payload_codec": DEFAULT_CODEC,
+            }),
+        );
+        let completed = worker
+            .execute_workflow_task(workflow_task(
+                "rust.redrive-successor",
+                vec![first, second],
+                DEFAULT_CODEC,
+            ))
+            .expect("retried step completes the successor");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&completed[0]["result"], DEFAULT_CODEC).expect("workflow result"),
+            json!({"first": "recorded", "second": "retried"}),
+        );
+    }
+
+    #[test]
     fn handler_error_cannot_hide_an_unconsumed_committed_side_effect() {
         let client = Client::new("http://127.0.0.1:8080").expect("client");
         let mut worker = Worker::new(client, "rust-workers");
