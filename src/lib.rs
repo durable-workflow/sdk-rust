@@ -2814,7 +2814,11 @@ impl Client {
         .await
     }
 
-    /// Request cooperative cancellation of the current run for an instance.
+    /// Close the current run as cancelled immediately.
+    ///
+    /// Server revokes open tasks and timers without resuming workflow code for
+    /// cleanup. Embedded Laravel's cooperative `requestCancellation()` is a
+    /// separate capability, not yet available in service mode.
     pub async fn cancel_workflow(
         &self,
         workflow_id: &str,
@@ -2824,7 +2828,7 @@ impl Client {
             .await
     }
 
-    /// Request cooperative cancellation only if `run_id` is still current.
+    /// Close the selected run as cancelled, only if `run_id` is still current.
     pub async fn cancel_workflow_run(
         &self,
         workflow_id: &str,
@@ -4881,7 +4885,7 @@ impl WorkflowHandle {
             .await
     }
 
-    /// Request cooperative cancellation of whichever run is current.
+    /// Close whichever run is current as cancelled, without workflow cleanup.
     pub async fn cancel(&self, options: WorkflowCommandOptions) -> Result<WorkflowCommandResult> {
         self.client
             .cancel_workflow(&self.workflow_id, options)
@@ -8450,7 +8454,10 @@ impl WorkflowContext {
         Saga::new(self.clone())
     }
 
-    /// Whether the current workflow task carries a cooperative cancel request.
+    /// Whether this task carries a cooperative cancellation request.
+    ///
+    /// Server's current `/cancel` route is terminal and does not set this flag.
+    /// Service-mode cooperative cancellation is not yet available.
     pub fn is_cancellation_requested(&self) -> Result<bool> {
         let state = self
             .state
