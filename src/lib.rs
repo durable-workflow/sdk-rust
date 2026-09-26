@@ -26234,7 +26234,7 @@ mod tests {
         match path {
             "/api/worker/workflow-tasks/poll" if request_number == 1 => Some((
                 "200 OK",
-                r#"{"task":{"task_id":"recover-workflow","workflow_id":"recover-instance","run_id":"recover-run","workflow_type":"recover.workflow","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"history_events":[],"workflow_task_attempt":3,"lease_owner":"recover-worker"}}"#.to_string(),
+                include_str!("../tests/fixtures/worker-completion-recovery.json").to_string(),
             )),
             "/api/worker/workflow-tasks/recover-workflow/complete" if request_number == 1 => Some((
                 "503 Service Unavailable",
