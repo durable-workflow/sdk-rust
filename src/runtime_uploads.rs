@@ -321,6 +321,7 @@ impl Client {
                         protocol,
                         None,
                         None,
+                        None,
                         &mut retries,
                     )
                     .await
