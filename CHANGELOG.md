@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.1
+
+- Keep managed activity and workflow workers retrying the same fenced completion
+  after an identity-matching, retryable Server `backend_unavailable` response.
+  Preserve the serialized result without re-executing the handler, and stop the
+  wait promptly on shutdown. Mismatched responses and terminal rejections stay
+  authoritative.
+
 ## 2.1.0
 
 - Add failed-run redrive to the Rust client and workflow handle. A worker can
