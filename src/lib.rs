@@ -4172,11 +4172,13 @@ impl Client {
         }
 
         let request = request.build()?;
+        let request_body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok());
         let poll_request_id = path.ends_with("/poll").then(|| {
-            request
-                .body()
-                .and_then(reqwest::Body::as_bytes)
-                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+            request_body
+                .as_ref()
                 .and_then(|body| body.get("poll_request_id")?.as_str().map(str::to_owned))
                 .unwrap_or_default()
         });
@@ -4205,6 +4207,7 @@ impl Client {
                         protocol,
                         Some(path),
                         poll_request_id.as_deref(),
+                        request_body.as_ref(),
                         &mut storage_retries,
                     )
                     .await
@@ -4231,6 +4234,7 @@ impl Client {
         protocol: RequestProtocol,
         path: Option<&str>,
         poll_request_id: Option<&str>,
+        request_body: Option<&Value>,
         retries: &mut usize,
     ) -> bool {
         let Some(admission) = self
@@ -4244,6 +4248,7 @@ impl Client {
             .or_else(|| {
                 path.and_then(|path| {
                     worker_backend_unavailable_retry_after(error, path, poll_request_id)
+                        .or_else(|| worker_fenced_completion_retry_after(error, path, request_body))
                 })
             })
         else {
@@ -4703,6 +4708,59 @@ fn worker_backend_unavailable_retry_after(
     } else if path.ends_with("/poll") {
         return None;
     }
+    Some(Duration::from_secs(delay))
+}
+
+fn worker_fenced_completion_retry_after(
+    error: &Error,
+    path: &str,
+    request_body: Option<&Value>,
+) -> Option<Duration> {
+    let (operation, task_id, attempt_field) = if let Some(task_id) = path
+        .strip_prefix("/worker/workflow-tasks/")
+        .and_then(|tail| tail.strip_suffix("/complete"))
+    {
+        ("complete_workflow_task", task_id, "workflow_task_attempt")
+    } else if let Some(task_id) = path
+        .strip_prefix("/worker/activity-tasks/")
+        .and_then(|tail| tail.strip_suffix("/complete"))
+    {
+        ("complete_activity_task", task_id, "activity_attempt_id")
+    } else {
+        return None;
+    };
+    if task_id.is_empty() || task_id.contains('/') {
+        return None;
+    }
+
+    let request = request_body?.as_object()?;
+    let lease_owner = request.get("lease_owner")?.as_str()?;
+    if lease_owner.is_empty() {
+        return None;
+    }
+    let attempt = request.get(attempt_field)?;
+    if (attempt_field == "workflow_task_attempt" && attempt.as_u64().filter(|id| *id > 0).is_none())
+        || (attempt_field == "activity_attempt_id"
+            && attempt.as_str().filter(|id| !id.is_empty()).is_none())
+    {
+        return None;
+    }
+
+    let body = worker_backend_unavailable_body(error)?;
+    let delay = body.get("retry_after_seconds")?.as_u64()?;
+    if delay == 0
+        || body.get("operation")?.as_str()? != operation
+        || body.get("outcome")?.as_str()? != "unknown"
+        || body.get("retryable") != Some(&Value::Bool(true))
+        || body.get("worker_id")?.as_str()? != lease_owner
+        || body.get("task_queue") != Some(&Value::Null)
+        || body.get("task_id")?.as_str()? != task_id
+        || body.get("lease_owner")?.as_str()? != lease_owner
+        || body.get(attempt_field) != Some(attempt)
+    {
+        return None;
+    }
+
     Some(Duration::from_secs(delay))
 }
 
@@ -26144,5 +26202,268 @@ mod tests {
 
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
+    }
+
+    fn activity_completion_backend_recovery(
+        path: &str,
+        _body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        match path {
+            "/api/worker/activity-tasks/poll" if request_number == 1 => Some((
+                "200 OK",
+                r#"{"task":{"task_id":"recover-activity","activity_attempt_id":"recover-attempt","activity_type":"recover.activity","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"attempt_number":1,"lease_owner":"recover-worker"}}"#.to_string(),
+            )),
+            "/api/worker/activity-tasks/recover-activity/complete" if request_number == 1 => Some((
+                "503 Service Unavailable",
+                r#"{"reason":"backend_unavailable","operation":"complete_activity_task","outcome":"unknown","worker_id":"recover-worker","task_queue":null,"retryable":true,"retry_after_seconds":1,"task_id":"recover-activity","lease_owner":"recover-worker","activity_attempt_id":"recover-attempt"}"#.to_string(),
+            )),
+            "/api/worker/activity-tasks/recover-activity/complete" => Some((
+                "200 OK",
+                r#"{"outcome":"completed","recorded":true}"#.to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn workflow_completion_backend_recovery(
+        path: &str,
+        _body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        match path {
+            "/api/worker/workflow-tasks/poll" if request_number == 1 => Some((
+                "200 OK",
+                include_str!("../tests/fixtures/worker-completion-recovery.json").to_string(),
+            )),
+            "/api/worker/workflow-tasks/recover-workflow/complete" if request_number == 1 => Some((
+                "503 Service Unavailable",
+                r#"{"reason":"backend_unavailable","operation":"complete_workflow_task","outcome":"unknown","worker_id":"recover-worker","task_queue":null,"retryable":true,"retry_after_seconds":1,"task_id":"recover-workflow","lease_owner":"recover-worker","workflow_task_attempt":3}"#.to_string(),
+            )),
+            "/api/worker/workflow-tasks/recover-workflow/complete" => Some((
+                "200 OK",
+                r#"{"outcome":"completed","recorded":true}"#.to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn activity_completion_stale_after_backend_recovery(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/activity-tasks/recover-activity/complete" && request_number > 1 {
+            return Some((
+                "409 Conflict",
+                r#"{"task_id":"recover-activity","activity_attempt_id":"recover-attempt","lease_owner":"recover-worker","reason":"stale_attempt","outcome":"completed","recorded":false,"activity_status":"completed","attempt_status":"completed","task_status":"completed"}"#.to_string(),
+            ));
+        }
+        activity_completion_backend_recovery(path, body, request_number)
+    }
+
+    fn activity_completion_remains_unavailable(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/activity-tasks/recover-activity/complete" {
+            return activity_completion_backend_recovery(path, body, 1);
+        }
+        activity_completion_backend_recovery(path, body, request_number)
+    }
+
+    #[tokio::test]
+    async fn managed_activity_retries_same_fenced_completion_after_backend_loss() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(activity_completion_backend_recovery),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_activity("recover.activity", {
+            let handler_calls = Arc::clone(&handler_calls);
+            move |_ctx, _args| {
+                let handler_calls = Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!("done"))
+                }
+            }
+        });
+
+        assert_eq!(worker.run_once().await.expect("activity settled"), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/activity-tasks/recover-activity/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn managed_workflow_retries_same_fenced_completion_after_backend_loss() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_backend_recovery),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("recover.workflow", {
+            let handler_calls = Arc::clone(&handler_calls);
+            move |_ctx, _args| {
+                let handler_calls = Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!("done"))
+                }
+            }
+        });
+
+        assert_eq!(worker.run_once().await.expect("workflow settled"), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn managed_activity_accepts_authoritative_stale_outcome_after_unknown_completion() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(activity_completion_stale_after_backend_recovery),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_activity("recover.activity", {
+            let handler_calls = Arc::clone(&handler_calls);
+            move |_ctx, _args| {
+                let handler_calls = Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!("done"))
+                }
+            }
+        });
+
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("authoritative stale outcome"),
+            1
+        );
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/activity-tasks/recover-activity/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[test]
+    fn fenced_completion_retry_rejects_mismatched_or_incomplete_identity() {
+        let request = json!({"lease_owner":"recover-worker","activity_attempt_id":"recover-attempt","result":{"codec":"avro","blob":"value"}});
+        let response = json!({
+            "reason":"backend_unavailable", "operation":"complete_activity_task",
+            "outcome":"unknown", "worker_id":"recover-worker", "task_queue":null,
+            "retryable":true, "retry_after_seconds":1, "task_id":"recover-activity",
+            "lease_owner":"recover-worker", "activity_attempt_id":"recover-attempt"
+        });
+        let path = "/worker/activity-tasks/recover-activity/complete";
+        let error = |body: Value| Error::Http {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: body.to_string(),
+        };
+        assert_eq!(
+            worker_fenced_completion_retry_after(&error(response.clone()), path, Some(&request)),
+            Some(Duration::from_secs(1))
+        );
+
+        for (field, invalid) in [
+            ("operation", json!("poll_activity_task")),
+            ("outcome", json!("rejected")),
+            ("worker_id", json!("another-worker")),
+            ("task_queue", json!("recover-queue")),
+            ("retryable", json!(false)),
+            ("retry_after_seconds", json!(0)),
+            ("task_id", json!("another-task")),
+            ("lease_owner", json!("another-worker")),
+            ("activity_attempt_id", json!("another-attempt")),
+        ] {
+            let mut invalid_response = response.clone();
+            invalid_response[field] = invalid;
+            assert_eq!(
+                worker_fenced_completion_retry_after(
+                    &error(invalid_response),
+                    path,
+                    Some(&request)
+                ),
+                None,
+                "must not retry mismatched {field}"
+            );
+        }
+        assert_eq!(
+            worker_fenced_completion_retry_after(&error(response), path, None),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_fenced_completion_backend_wait() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(activity_completion_remains_unavailable),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .with_storage_admission(Arc::clone(&stop));
+        let completion = tokio::spawn(async move {
+            worker
+                .client
+                .complete_activity_task(
+                    "recover-activity",
+                    "recover-attempt",
+                    "recover-worker",
+                    json!("done"),
+                    DEFAULT_CODEC,
+                )
+                .await
+        });
+        let path = "/api/worker/activity-tasks/recover-activity/complete";
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.request_count(path) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first completion request");
+        stop.store(true, Ordering::SeqCst);
+        let error = tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .expect("shutdown must interrupt retry wait")
+            .expect("completion task")
+            .expect_err("backend is still unavailable");
+        assert!(matches!(error, Error::ActivityTaskRejected(rejection) if rejection.status == 503));
+        assert_eq!(server.request_count(path), 1);
     }
 }
