@@ -818,6 +818,12 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             "side_effect_callback_calls".to_string(),
             json!(callback_calls.load(Ordering::SeqCst)),
         ),
+        (
+            "poll_request".to_string(),
+            server
+                .request_body("/api/worker/workflow-tasks/poll")
+                .unwrap_or(Value::Null),
+        ),
     ]);
     if let Some(worker_registration) = worker_registration {
         observed.insert("worker_registration".to_string(), worker_registration);
