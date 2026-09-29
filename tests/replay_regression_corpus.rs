@@ -795,6 +795,10 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         )?;
     }
 
+    let poll_history_page_size = server
+        .request_body("/api/worker/workflow-tasks/poll")
+        .and_then(|body| body.get("history_page_size").cloned())
+        .unwrap_or(Value::Null);
     let mut observed = serde_json::Map::from_iter([
         (
             "command_sequence".to_string(),
@@ -820,9 +824,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         ),
         (
             "poll_request".to_string(),
-            server
-                .request_body("/api/worker/workflow-tasks/poll")
-                .unwrap_or(Value::Null),
+            json!({"history_page_size": poll_history_page_size}),
         ),
     ]);
     if let Some(worker_registration) = worker_registration {
