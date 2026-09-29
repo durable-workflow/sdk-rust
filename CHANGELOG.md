@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.2
+
+- Request bounded workflow history pages in Rust worker polls. The client
+  follows page tokens and returns complete histories without requiring an
+  unbounded Server poll response.
+
 ## 2.1.1
 
 - Keep managed activity and workflow workers retrying the same fenced completion
