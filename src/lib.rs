@@ -32,6 +32,7 @@ use thiserror::Error;
 pub use uuid::Uuid;
 
 pub const WORKER_PROTOCOL_VERSION: &str = "1.19";
+const WORKFLOW_HISTORY_PAGE_SIZE: usize = 500;
 /// First additive worker protocol that defines portable worker-affinity features.
 pub const PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION: &str = "1.18";
 pub const CONTROL_PLANE_VERSION: &str = "2";
@@ -3787,6 +3788,7 @@ impl Client {
             "task_queue": task_queue,
             "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
+            "history_page_size": WORKFLOW_HISTORY_PAGE_SIZE,
         });
         let mut data: PollWorkflowTaskResponse = self
             .poll_request_json(
@@ -23493,6 +23495,10 @@ mod tests {
         assert_eq!(
             server.request_body("/api/worker/workflow-tasks/poll")["timeout_seconds"],
             1
+        );
+        assert_eq!(
+            server.request_body("/api/worker/workflow-tasks/poll")["history_page_size"],
+            500
         );
         assert_eq!(
             server.request_body("/api/worker/activity-tasks/poll")["timeout_seconds"],
