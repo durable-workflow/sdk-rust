@@ -11432,19 +11432,35 @@ fn validated_selection_resolution_sequence(
         &success_types
     };
     let mut candidates = Vec::new();
-    let member_sequences = (member.base_sequence
+    let member_commands = (member.base_sequence
         ..member.base_sequence.saturating_add(member.size as u64))
         .filter_map(|sequence| selection_member_recorded_command(state, sequence))
-        .map(RecordedCommand::sequence)
-        .collect::<BTreeSet<_>>();
+        .map(|command| (command.sequence(), command))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved_conditions = BTreeSet::new();
     for event in state.history_events.iter() {
         let Some(sequence) = durable_event_sequence(event) else {
             continue;
         };
-        if !member_sequences.contains(&sequence)
-            || !terminal_types.contains(&event.event_type.as_str())
-        {
+        let Some(command) = member_commands.get(&sequence) else {
             continue;
+        };
+        if !terminal_types.contains(&event.event_type.as_str()) {
+            continue;
+        }
+        if matches!(command, RecordedCommand::ConditionWait { .. }) {
+            if !matches!(
+                event.event_type.as_str(),
+                "ConditionWaitSatisfied" | "ConditionWaitTimedOut"
+            ) && !(event.event_type == "TimerFired"
+                && event.payload.get("timer_kind").and_then(Value::as_str)
+                    == Some("condition_timeout"))
+            {
+                continue;
+            }
+            if !resolved_conditions.insert(sequence) {
+                continue;
+            }
         }
         let event_id = event
             .raw
@@ -19450,10 +19466,27 @@ mod tests {
 
     #[test]
     fn reopened_selection_condition_replays_its_latest_physical_winner() {
-        for terminal_type in ["ConditionWaitSatisfied", "ConditionWaitTimedOut"] {
+        for (terminal_type, acknowledge_timeout) in [
+            ("ConditionWaitSatisfied", false),
+            ("ConditionWaitTimedOut", false),
+            ("TimerFired", false),
+            ("TimerFired", true),
+        ] {
             let mut history = reopened_selection_condition_history();
             let original_identity = history[1].payload["condition_wait_id"].clone();
-            let mut resolution = history_event(terminal_type, history[3].payload.clone());
+            let uses_timer = terminal_type == "TimerFired";
+            let mut resolution_payload = history[3].payload.clone();
+            if uses_timer {
+                for event in &mut history[1..] {
+                    event.payload["timeout_seconds"] = json!(3);
+                }
+                resolution_payload = history[3].payload.clone();
+                resolution_payload["timer_kind"] = json!("condition_timeout");
+                resolution_payload["timer_id"] = json!("condition-timeout-3");
+                resolution_payload["delay_seconds"] = json!(3);
+                history.push(history_event("TimerScheduled", resolution_payload.clone()));
+            }
+            let mut resolution = history_event(terminal_type, resolution_payload.clone());
             resolution
                 .raw
                 .insert("id".into(), json!("latest-condition-resolution"));
@@ -19475,13 +19508,21 @@ mod tests {
                     "resolution_event_type": terminal_type,
                 }),
             ));
+            if acknowledge_timeout {
+                history.push(history_event("ConditionWaitTimedOut", resolution_payload));
+            }
             let ctx = workflow_context(history);
             let mut selected = Box::pin(ctx.select_keyed(vec![
                 ("timer", ParallelOperation::timer(Duration::from_secs(300))),
                 (
                     "votes",
                     ParallelOperation::condition(
-                        ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+                        if uses_timer {
+                            ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                                .timeout(Duration::from_secs(3))
+                        } else {
+                            ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                        },
                         || Ok(true),
                     ),
                 ),
