@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.3
+
+- Replay condition reopens inside parallel and keyed selection groups using
+  their recorded authored identity. Keep changed definitions, paths and
+  unproven predecessors invalid.
+- Wait for a selected condition's canonical winner without reopening a true
+  predicate. Resolve the winner and operation handles through the latest
+  physical wait, including typed timeout results after acknowledgement.
+- Keep ordinary worker protocol 1.19. The grouped reopen Server correction is
+  provided by Workflow 2.3.2. Cooperative cancellation remains separately gated.
+
 ## 2.1.2
 
 - Request bounded workflow history pages in Rust worker polls. The client
