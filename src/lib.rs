@@ -13,7 +13,7 @@ pub use cooperative_cancellation::{
 
 use std::{
     any::{type_name, Any, TypeId},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     io::{self, Read},
     pin::Pin,
@@ -11766,15 +11766,35 @@ fn validated_selection_resolution_sequence(
         &success_types
     };
     let mut candidates = Vec::new();
+    let member_commands = (member.base_sequence
+        ..member.base_sequence.saturating_add(member.size as u64))
+        .filter_map(|sequence| selection_member_recorded_command(state, sequence))
+        .map(|command| (command.sequence(), command))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved_conditions = BTreeSet::new();
     for event in state.history_events.iter() {
         let Some(sequence) = durable_event_sequence(event) else {
             continue;
         };
-        if sequence < member.base_sequence
-            || sequence >= member.base_sequence.saturating_add(member.size as u64)
-            || !terminal_types.contains(&event.event_type.as_str())
-        {
+        let Some(command) = member_commands.get(&sequence) else {
             continue;
+        };
+        if !terminal_types.contains(&event.event_type.as_str()) {
+            continue;
+        }
+        if matches!(command, RecordedCommand::ConditionWait { .. }) {
+            if !matches!(
+                event.event_type.as_str(),
+                "ConditionWaitSatisfied" | "ConditionWaitTimedOut"
+            ) && !(event.event_type == "TimerFired"
+                && event.payload.get("timer_kind").and_then(Value::as_str)
+                    == Some("condition_timeout"))
+            {
+                continue;
+            }
+            if !resolved_conditions.insert(sequence) {
+                continue;
+            }
         }
         let event_id = event
             .raw
@@ -11822,6 +11842,36 @@ fn validated_selection_resolution_sequence(
     Ok(*sequence)
 }
 
+fn selection_member_recorded_command(
+    state: &WorkflowState,
+    authored_sequence: u64,
+) -> Option<&RecordedCommand> {
+    let original = state
+        .recorded_commands
+        .iter()
+        .find(|command| command.sequence() == authored_sequence)?;
+    let RecordedCommand::ConditionWait {
+        occurrence_id,
+        parallel_group_path: Some(_),
+        ..
+    } = original
+    else {
+        return Some(original);
+    };
+    // Decoding proves each physical reopen has the same authored identity and
+    // group path after a satisfied predecessor. Only its latest wait can make
+    // this logical member terminal.
+    state
+        .recorded_commands
+        .iter()
+        .filter(|command| {
+            matches!(command, RecordedCommand::ConditionWait {
+                occurrence_id: candidate, ..
+            } if candidate == occurrence_id)
+        })
+        .max_by_key(|command| command.sequence())
+}
+
 fn recorded_selection_member_outcome(
     state: &WorkflowState,
     handle: &DurableOperationHandle,
@@ -11866,11 +11916,7 @@ fn recorded_selection_member_outcome(
 
     let mut results = Vec::with_capacity(handle.size);
     for sequence in handle.base_sequence..handle.base_sequence.saturating_add(handle.size as u64) {
-        let Some(command) = state
-            .recorded_commands
-            .iter()
-            .find(|command| command.sequence() == sequence)
-        else {
+        let Some(command) = selection_member_recorded_command(state, sequence) else {
             return Ok(None);
         };
         let result = match command {
@@ -11920,11 +11966,7 @@ fn recorded_selection_member_is_terminal(
     let mut completed = 0usize;
     let mut all_completed = true;
     for sequence in handle.base_sequence..handle.base_sequence.saturating_add(handle.size as u64) {
-        let Some(command) = state
-            .recorded_commands
-            .iter()
-            .find(|command| command.sequence() == sequence)
-        else {
+        let Some(command) = selection_member_recorded_command(state, sequence) else {
             all_completed = false;
             continue;
         };
@@ -12784,7 +12826,7 @@ impl Future for ConditionWaitCall {
             return Poll::Ready(Ok(result));
         }
 
-        self.poll_open_condition(options)
+        self.poll_open_condition(options, true)
     }
 }
 
@@ -12793,12 +12835,13 @@ impl ConditionWaitCall {
         self: Pin<&mut Self>,
         options: ValidatedConditionWaitOptions,
     ) -> Poll<Result<ConditionWaitResult>> {
-        self.poll_open_condition(options)
+        self.poll_open_condition(options, false)
     }
 
     fn poll_open_condition(
         mut self: Pin<&mut Self>,
         options: ValidatedConditionWaitOptions,
+        recorded_wait: bool,
     ) -> Poll<Result<ConditionWaitResult>> {
         {
             let ctx = self.ctx.clone();
@@ -12825,7 +12868,7 @@ impl ConditionWaitCall {
             .first()
             .is_some_and(|entry| entry.parallel_group_mode.as_deref() == Some("select"));
         match (self.predicate)() {
-            Ok(true) if !selection_member => {
+            Ok(true) if !selection_member || recorded_wait => {
                 return Poll::Ready(Ok(ConditionWaitResult::Satisfied))
             }
             Ok(_) => {}
@@ -14753,8 +14796,81 @@ fn recorded_condition_wait(
         predicate_identity,
         timeout_seconds,
         result,
-        parallel_group_path: recorded_parallel_group_path(condition_events, sequence)?,
+        parallel_group_path: recorded_condition_group_path(condition_events, all_events, sequence)?,
     })
+}
+
+fn recorded_condition_group_path(
+    condition_events: &[&HistoryEvent],
+    all_events: &[HistoryEvent],
+    sequence: u64,
+) -> Result<Option<Vec<ParallelGroupMetadata>>> {
+    let opened = condition_events
+        .iter()
+        .copied()
+        .find(|event| event.event_type == "ConditionWaitOpened")
+        .expect("canonical condition opener is validated first");
+    let occurrence = required_condition_wait_occurrence_id(opened, sequence)?;
+    let previous_events = all_events
+        .iter()
+        .take_while(|event| !std::ptr::eq(*event, opened))
+        .collect::<Vec<_>>();
+    let originals = previous_events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type == "ConditionWaitOpened")
+        .filter(|event| {
+            event
+                .payload
+                .get("condition_wait_occurrence_id")
+                .and_then(Value::as_str)
+                == Some(occurrence.as_str())
+        })
+        .collect::<Vec<_>>();
+    let Some(original) = originals.first().copied() else {
+        return recorded_parallel_group_path(condition_events, sequence);
+    };
+    let authored_sequence = required_history_u64(original, "sequence", sequence)?;
+    if authored_sequence == sequence {
+        return recorded_parallel_group_path(condition_events, sequence);
+    }
+    let original_path = recorded_parallel_group_path(&[original], authored_sequence)?;
+    if original_path.is_none() {
+        return recorded_parallel_group_path(condition_events, sequence);
+    }
+    let reopened_path = recorded_parallel_group_path(condition_events, authored_sequence)?;
+    let identity_matches = [
+        "condition_key",
+        "condition_definition_fingerprint",
+        "timeout_seconds",
+    ]
+    .iter()
+    .all(|field| opened.payload.get(*field) == original.payload.get(*field));
+    let previous = originals
+        .iter()
+        .copied()
+        .filter(|event| durable_event_sequence(event).is_some_and(|physical| physical < sequence))
+        .max_by_key(|event| durable_event_sequence(event));
+    let previously_satisfied = previous.is_some_and(|previous| {
+        previous_events.iter().any(|event| {
+            event.event_type == "ConditionWaitSatisfied"
+                && event.payload.get("condition_wait_id")
+                    == previous.payload.get("condition_wait_id")
+                && event.payload.get("condition_wait_occurrence_id")
+                    == previous.payload.get("condition_wait_occurrence_id")
+                && durable_event_sequence(event) == durable_event_sequence(previous)
+        })
+    });
+    if !identity_matches || reopened_path != original_path || !previously_satisfied {
+        return Err(invalid_recorded_history(
+            "condition_wait_group_reopen_mismatch",
+            sequence,
+            "same authored condition and group path after a satisfied physical wait",
+            &opened.payload.to_string(),
+            "grouped condition reopen has no matching recorded predecessor",
+        ));
+    }
+    Ok(reopened_path)
 }
 
 fn required_condition_wait_occurrence_id(event: &HistoryEvent, sequence: u64) -> Result<String> {
@@ -19939,6 +20055,211 @@ mod tests {
             timed_out.as_mut().poll(&mut task_context),
             Poll::Ready(Ok(ConditionWaitResult::TimedOut))
         ));
+    }
+
+    #[test]
+    fn satisfied_reopened_selection_condition_waits_for_its_canonical_winner() {
+        let ctx = workflow_context(reopened_selection_condition_history());
+        {
+            let state = ctx.state.lock().unwrap();
+            assert!(matches!(
+                selection_member_recorded_command(&state, 2),
+                Some(RecordedCommand::ConditionWait {
+                    sequence: 3,
+                    result: None,
+                    ..
+                })
+            ));
+        }
+        let mut selected = Box::pin(ctx.select_keyed(vec![
+            ("timer", ParallelOperation::timer(Duration::from_secs(300))),
+            (
+                "votes",
+                ParallelOperation::condition(
+                    ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+                    || Ok(true),
+                ),
+            ),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(selected.as_mut().poll(&mut task_context).is_pending());
+        assert!(
+            ctx.take_commands().unwrap().is_empty(),
+            "true predicate must not reopen the recorded wait"
+        );
+        ctx.ensure_history_consumed()
+            .expect("physical reopens are consumed while canonical selection is pending");
+    }
+
+    #[test]
+    fn reopened_selection_condition_replays_its_latest_physical_winner() {
+        for (terminal_type, acknowledge_timeout) in [
+            ("ConditionWaitSatisfied", false),
+            ("ConditionWaitTimedOut", false),
+            ("TimerFired", false),
+            ("TimerFired", true),
+        ] {
+            let mut history = reopened_selection_condition_history();
+            let original_identity = history[1].payload["condition_wait_id"].clone();
+            let uses_timer = terminal_type == "TimerFired";
+            let mut resolution_payload = history[3].payload.clone();
+            if uses_timer {
+                for event in &mut history[1..] {
+                    event.payload["timeout_seconds"] = json!(3);
+                }
+                resolution_payload = history[3].payload.clone();
+                resolution_payload["timer_kind"] = json!("condition_timeout");
+                resolution_payload["timer_id"] = json!("condition-timeout-3");
+                resolution_payload["delay_seconds"] = json!(3);
+                history.push(history_event("TimerScheduled", resolution_payload.clone()));
+            }
+            let mut resolution = history_event(terminal_type, resolution_payload.clone());
+            resolution
+                .raw
+                .insert("id".into(), json!("latest-condition-resolution"));
+            history.push(resolution);
+            history.push(history_event(
+                "SelectionResolved",
+                json!({
+                    "selection_group_id": "select-calls:1:2",
+                    "selection_group_base_sequence": 1,
+                    "selection_group_size": 2,
+                    "member_key": "votes",
+                    "member_index": 1,
+                    "member_base_sequence": 2,
+                    "member_size": 1,
+                    "operation_kind": "condition",
+                    "operation_identity": original_identity,
+                    "outcome": "completed",
+                    "resolution_event_id": "latest-condition-resolution",
+                    "resolution_event_type": terminal_type,
+                }),
+            ));
+            if acknowledge_timeout {
+                history.push(history_event("ConditionWaitTimedOut", resolution_payload));
+            }
+            let ctx = workflow_context(history);
+            let mut selected = Box::pin(ctx.select_keyed(vec![
+                ("timer", ParallelOperation::timer(Duration::from_secs(300))),
+                (
+                    "votes",
+                    ParallelOperation::condition(
+                        if uses_timer {
+                            ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                                .timeout(Duration::from_secs(3))
+                        } else {
+                            ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                        },
+                        || Ok(true),
+                    ),
+                ),
+            ]));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            match selected.as_mut().poll(&mut task_context) {
+                Poll::Ready(Ok(result)) => {
+                    assert_eq!(result.key, SelectionKey::Name("votes".into()));
+                    let expected = if terminal_type == "ConditionWaitSatisfied" {
+                        ConditionWaitResult::Satisfied
+                    } else {
+                        ConditionWaitResult::TimedOut
+                    };
+                    assert_eq!(result.value, Some(ParallelResult::Condition(expected)));
+                }
+                other => panic!("latest physical winner must replay: {other:?}"),
+            }
+            assert!(ctx.take_commands().unwrap().is_empty());
+            ctx.ensure_history_consumed()
+                .expect("winner history consumed");
+        }
+    }
+
+    fn reopened_selection_condition_history() -> Vec<HistoryEvent> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/grouped-condition-physical-reopen.json"
+        ))
+        .expect("grouped condition fixture");
+        fixture["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                let mut payload = event["payload"].clone();
+                let index = payload["parallel_group_index"].as_u64().unwrap();
+                payload["parallel_group_id"] = json!("select-calls:1:2");
+                payload["parallel_group_mode"] = json!("select");
+                payload["selection_member_key"] = json!(if index == 0 { "timer" } else { "votes" });
+                payload["selection_member_index"] = json!(index);
+                payload["selection_member_base_sequence"] = json!(index + 1);
+                payload["selection_member_size"] = json!(1);
+                payload["selection_member_kind"] =
+                    json!(if index == 0 { "timer" } else { "condition" });
+                history_event(event["event_type"].as_str().unwrap(), payload)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_condition_replay_rejects_unproven_physical_reopens() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/grouped-condition-physical-reopen.json"
+        ))
+        .expect("grouped condition fixture");
+        let original = fixture["history"].as_array().expect("fixture history");
+        let decode = |events: &[Value]| {
+            let history = events
+                .iter()
+                .map(|event| {
+                    history_event(
+                        event["event_type"].as_str().unwrap(),
+                        event["payload"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            recorded_commands(
+                &history,
+                DEFAULT_CODEC,
+                WorkflowIdentity {
+                    workflow_id: None,
+                    run_id: None,
+                },
+            )
+        };
+        assert!(decode(original).is_ok());
+        for field in [
+            "condition_wait_occurrence_id",
+            "condition_key",
+            "condition_definition_fingerprint",
+            "timeout_seconds",
+            "parallel_group_id",
+            "parallel_group_size",
+            "parallel_group_index",
+        ] {
+            let mut changed = original.clone();
+            changed[3]["payload"][field] = match field {
+                "timeout_seconds" | "parallel_group_size" => json!(30),
+                "parallel_group_index" => json!(0),
+                _ => json!("changed"),
+            };
+            assert!(
+                decode(&changed).is_err(),
+                "reopen must reject changed {field}"
+            );
+        }
+        let mut unsettled = original.clone();
+        unsettled.remove(2);
+        assert!(
+            decode(&unsettled).is_err(),
+            "physical predecessor must be resolved"
+        );
+        let mut timed_out = original.clone();
+        timed_out[2]["event_type"] = json!("ConditionWaitTimedOut");
+        assert!(decode(&timed_out).is_err(), "timeout is terminal");
+        let mut late_resolution = original.clone();
+        late_resolution.swap(2, 3);
+        assert!(
+            decode(&late_resolution).is_err(),
+            "later history cannot authorize a reopen"
+        );
     }
 
     #[test]
