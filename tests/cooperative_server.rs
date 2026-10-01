@@ -584,7 +584,35 @@ async fn reopened_condition_cancellation(mode: &'static str, span: u64) {
     successor.register().await.unwrap();
     tick_until(&successor, &handle, "WorkflowCancelled").await;
     let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, false).await;
-    assert_eq!(count(&snapshot, "ConditionWaitOpened"), 2);
+    let events = snapshot["events"].as_array().unwrap();
+    let delivery_index = events
+        .iter()
+        .position(|event| event["event_type"] == "CooperativeCancellationDelivered")
+        .unwrap();
+    // Recorded command-prefix work can reopen a grouped physical wait before
+    // delivery. Cancellation must retain its authored identity and prevent any
+    // new wait after the canonical delivery boundary.
+    assert!(count(&snapshot, "ConditionWaitOpened") >= 2);
+    for event in events
+        .iter()
+        .filter(|event| event["event_type"] == "ConditionWaitOpened")
+    {
+        assert_eq!(
+            event["payload"]["condition_wait_occurrence_id"],
+            opens[0]["payload"]["condition_wait_occurrence_id"],
+            "physical prefix reopen changed authored identity: {snapshot}"
+        );
+    }
+    assert!(
+        events[delivery_index + 1..]
+            .iter()
+            .all(|event| event["event_type"] != "ConditionWaitOpened"),
+        "condition reopened after cancellation delivery: {snapshot}"
+    );
+    eprintln!("cooperative reopened condition {mode}: {snapshot}");
+    if mode == "condition" {
+        assert_eq!(count(&snapshot, "ConditionWaitOpened"), 2);
+    }
     assert_eq!(count(&snapshot, "SelectionResolved"), 0);
     let delivery = snapshot["events"]
         .as_array()
