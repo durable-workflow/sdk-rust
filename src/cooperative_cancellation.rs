@@ -291,6 +291,7 @@ pub struct CancellationHistory {
     pub request_index: usize,
     pub delivery_index: Option<usize>,
     resolved_before_request: BTreeSet<u64>,
+    latest_condition_sequences_before_request: BTreeMap<u64, u64>,
     failed_before_request: BTreeSet<u64>,
     selected_before_request: BTreeSet<(u64, u64)>,
 }
@@ -331,6 +332,32 @@ impl CancellationHistory {
                     original,
                 },
             );
+            // Physical condition reopens retain the group's authored identity
+            // but can lie beyond its original sequence span. Bind unresolved
+            // reopens as well, so replay consumes the latest wait at delivery.
+            for command in &mut commands[index + 1..] {
+                let RecordedCommand::ConditionWait {
+                    sequence,
+                    parallel_group_path: Some(path),
+                    ..
+                } = command
+                else {
+                    continue;
+                };
+                if self.resolved_before_request.contains(sequence)
+                    || !path.first().is_some_and(|group| {
+                        group.parallel_group_base_sequence == delivery.sequence
+                            && group.parallel_group_size as u64 == delivery.sequence_span
+                    })
+                {
+                    continue;
+                }
+                *command = RecordedCommand::CancellationBoundary {
+                    sequence: *sequence,
+                    call_kind: CancellationCallKind::Condition,
+                    original: Some(Box::new(command.clone())),
+                };
+            }
             return Ok(commands);
         }
         if !matches!(
@@ -421,6 +448,7 @@ impl CancellationHistory {
             request_index: events.len(),
             delivery_index: None,
             resolved_before_request: BTreeSet::new(),
+            latest_condition_sequences_before_request: BTreeMap::new(),
             failed_before_request: BTreeSet::new(),
             selected_before_request: BTreeSet::new(),
         };
@@ -502,6 +530,7 @@ impl CancellationHistory {
         if state.request.is_none() {
             return Ok(state);
         }
+        let mut condition_occurrences = BTreeMap::new();
         for event in &events[..state.request_index] {
             if matches!(
                 event.event_type.as_str(),
@@ -529,6 +558,14 @@ impl CancellationHistory {
             else {
                 continue;
             };
+            if event.event_type == "ConditionWaitOpened" {
+                if let Some(occurrence) = event.payload["condition_wait_occurrence_id"].as_str() {
+                    let authored = *condition_occurrences.entry(occurrence).or_insert(sequence);
+                    state
+                        .latest_condition_sequences_before_request
+                        .insert(authored, sequence);
+                }
+            }
             if matches!(
                 event.event_type.as_str(),
                 "ActivityCompleted"
@@ -574,8 +611,13 @@ impl CancellationHistory {
         (1..=1000).contains(&span)
             && sequence > 0
             && sequence <= MAX_SEQUENCE - span
-            && !(sequence..sequence + span)
-                .all(|sequence| self.resolved_before_request.contains(&sequence))
+            && !(sequence..sequence + span).all(|sequence| {
+                let latest = self
+                    .latest_condition_sequences_before_request
+                    .get(&sequence)
+                    .unwrap_or(&sequence);
+                self.resolved_before_request.contains(latest)
+            })
             && !(sequence..sequence + span)
                 .any(|sequence| self.failed_before_request.contains(&sequence))
             && !self.selected_before_request.contains(&(sequence, span))

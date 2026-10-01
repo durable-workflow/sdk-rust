@@ -589,10 +589,9 @@ async fn reopened_condition_cancellation(mode: &'static str, span: u64) {
         .iter()
         .position(|event| event["event_type"] == "CooperativeCancellationDelivered")
         .unwrap();
-    // Recorded command-prefix work can reopen a grouped physical wait before
-    // delivery. Cancellation must retain its authored identity and prevent any
-    // new wait after the canonical delivery boundary.
-    assert!(count(&snapshot, "ConditionWaitOpened") >= 2);
+    // Delivery consumes the latest physical wait under the original authored
+    // identity. It must not create another opening at either side of delivery.
+    assert_eq!(count(&snapshot, "ConditionWaitOpened"), 2);
     for event in events
         .iter()
         .filter(|event| event["event_type"] == "ConditionWaitOpened")
@@ -610,9 +609,6 @@ async fn reopened_condition_cancellation(mode: &'static str, span: u64) {
         "condition reopened after cancellation delivery: {snapshot}"
     );
     eprintln!("cooperative reopened condition {mode}: {snapshot}");
-    if mode == "condition" {
-        assert_eq!(count(&snapshot, "ConditionWaitOpened"), 2);
-    }
     assert_eq!(count(&snapshot, "SelectionResolved"), 0);
     let delivery = snapshot["events"]
         .as_array()

@@ -1171,6 +1171,71 @@ fn cooperative_replay_consumes_reopened_condition_once_at_its_physical_delivery(
     }
 }
 
+fn cancelled_reopened_group_history() -> Vec<HistoryEvent> {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/replay-regressions/cooperative-grouped-condition-reopen.json"
+    ))
+    .unwrap();
+    let mut events: Vec<HistoryEvent> = serde_json::from_value(fixture["history"].clone()).unwrap();
+    for event in &mut events {
+        if matches!(
+            event.event_type.as_str(),
+            "CooperativeCancellationRequested" | "CooperativeCancellationDelivered"
+        ) {
+            event.payload["workflow_run_id"] = json!("run");
+        }
+    }
+    events
+}
+
+#[test]
+fn cooperative_group_delivery_consumes_pending_physical_condition_without_reopening() {
+    for reopens in 1..=2 {
+        let mut events = cancelled_reopened_group_history();
+        if reopens == 2 {
+            let mut satisfied = events[3].clone();
+            satisfied.event_type = "ConditionWaitSatisfied".into();
+            let mut reopened = events[3].clone();
+            reopened.payload["sequence"] = json!(4);
+            reopened.payload["condition_wait_id"] = json!("condition-4");
+            events.splice(4..4, [satisfied, reopened]);
+        }
+        let ctx = workflow_context(events);
+        let mut call = Box::pin(ctx.parallel(vec![
+            ParallelOperation::timer(Duration::from_secs(300)),
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+                || panic!("canonical cancellation must not reevaluate or reopen the condition"),
+            ),
+        ]));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            call.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::CooperativeCancellationRequested(_)))
+        ));
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_group_eligibility_uses_the_latest_physical_condition_result() {
+    for latest_satisfied in [false, true] {
+        let mut events = cancelled_reopened_group_history();
+        events.pop();
+        let mut fired = events[0].clone();
+        fired.event_type = "TimerFired".into();
+        events.insert(4, fired);
+        if latest_satisfied {
+            let mut satisfied = events[3].clone();
+            satisfied.event_type = "ConditionWaitSatisfied".into();
+            events.insert(5, satisfied);
+        }
+        let cancellation = history(&events).unwrap();
+        assert_eq!(cancellation.eligible(1, 2), !latest_satisfied);
+    }
+}
+
 #[test]
 fn cooperative_replay_keeps_adjacent_condition_occurrences_and_cleanup_scopes_separate() {
     let payload = |sequence, occurrence| {
