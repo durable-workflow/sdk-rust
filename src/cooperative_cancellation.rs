@@ -76,6 +76,15 @@ fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 impl CancellationRequest {
+    pub(super) fn validate_observation(&self) -> Result<()> {
+        Self::from_observation(&json!({
+            "request_id":self.request_id, "requested_at":self.requested_at,
+            "cleanup_deadline_at":self.cleanup_deadline_at,
+            "history_refresh_page_token":self.history_refresh_page_token,
+        }))
+        .map(|_| ())
+    }
+
     pub(crate) fn from_observation(value: &Value) -> Result<Self> {
         let requested_at = text(value, "requested_at")?;
         let cleanup_deadline_at = text(value, "cleanup_deadline_at")?;
@@ -512,6 +521,133 @@ impl CancellationHistory {
 }
 
 impl WorkflowState {
+    fn next_cancellation_sequence(&self) -> Result<u64> {
+        self.recorded_commands.get(self.command_cursor).map_or_else(
+            || {
+                self.recorded_commands
+                    .last()
+                    .map_or(0, RecordedCommand::sequence)
+                    .checked_add(self.commands.len() as u64)
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .filter(|sequence| *sequence < MAX_SEQUENCE)
+                    .ok_or_else(|| invalid("authored cancellation sequence overflowed"))
+            },
+            |command| Ok(command.sequence()),
+        )
+    }
+
+    fn prepare_cancellation_delivery(&mut self, delivery: CancellationDelivery) -> Result<bool> {
+        if !self.cancellation_delivery_enabled || self.cancellation_shield_depth > 0 {
+            return Ok(false);
+        }
+        if self.cancellation_delivery_intent.is_some() {
+            self.matched_recorded_pending = true;
+            return Ok(true);
+        }
+        let (base, span) = delivery.range();
+        if !self.cancellation_history.eligible(base, span) {
+            return Ok(false);
+        }
+        let payload = json!({
+            "workflow_command_id":delivery.request_id, "sequence":delivery.sequence,
+            "call_kind":delivery.call_kind, "sequence_span":delivery.sequence_span,
+            "operation_sequence":delivery.operation_sequence,
+            "operation_sequence_span":delivery.operation_sequence_span,
+        });
+        CancellationDelivery::from_payload(&payload)?;
+        self.cancellation_delivery_command_count = self.commands.len();
+        self.cancellation_delivery_intent = Some(delivery);
+        self.matched_recorded_pending = true;
+        Ok(true)
+    }
+
+    pub(super) fn prepare_scalar_cancellation(
+        &mut self,
+        index: usize,
+        kind: CancellationCallKind,
+        group_path: &[ParallelGroupMetadata],
+    ) -> Result<bool> {
+        if !self.cancellation_delivery_enabled || self.cancellation_shield_depth > 0 {
+            return Ok(false);
+        }
+        // Group leaves validate their recorded calls before the enclosing
+        // parallel/select future suspends. They never choose scalar delivery.
+        if !group_path.is_empty() && self.cancellation_delivery_intent.is_none() {
+            return Ok(false);
+        }
+        let Some(request) = self.cancellation_history.request.as_ref() else {
+            return Ok(false);
+        };
+        let sequence = self.recorded_commands.get(index).map_or_else(
+            || self.next_cancellation_sequence(),
+            |command| Ok(command.sequence()),
+        )?;
+        let pending = self.prepare_cancellation_delivery(CancellationDelivery {
+            request_id: request.request_id.clone(),
+            sequence,
+            call_kind: kind,
+            sequence_span: 1,
+            operation_sequence: None,
+            operation_sequence_span: 1,
+        })?;
+        if pending && index < self.recorded_commands.len() {
+            self.command_cursor = index + 1;
+        }
+        Ok(pending)
+    }
+
+    pub(super) fn prepare_group_cancellation(
+        &mut self,
+        descriptors: &[ParallelDescriptor],
+    ) -> Result<()> {
+        let Some(request) = self.cancellation_history.request.as_ref() else {
+            return Ok(());
+        };
+        let Some(group) = descriptors.first().and_then(|leaf| leaf.group_path.first()) else {
+            return Ok(());
+        };
+        self.prepare_cancellation_delivery(CancellationDelivery {
+            request_id: request.request_id.clone(),
+            sequence: group.parallel_group_base_sequence,
+            call_kind: CancellationCallKind::Parallel,
+            sequence_span: descriptors.len() as u64,
+            operation_sequence: None,
+            operation_sequence_span: 1,
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn prepare_selection_handle_cancellation(
+        &mut self,
+        handle: &DurableOperationHandle,
+    ) -> Result<bool> {
+        if !self.cancellation_delivery_enabled || self.cancellation_shield_depth > 0 {
+            return Ok(false);
+        }
+        validate_selection_delivery_handle(self, handle)?;
+        if !self
+            .cancellation_history
+            .eligible(handle.base_sequence, handle.size as u64)
+        {
+            return Ok(false);
+        }
+        let request_id = self
+            .cancellation_history
+            .request
+            .as_ref()
+            .expect("eligible request")
+            .request_id
+            .clone();
+        self.prepare_cancellation_delivery(CancellationDelivery {
+            request_id,
+            sequence: self.next_cancellation_sequence()?,
+            call_kind: CancellationCallKind::SelectionHandle,
+            sequence_span: 1,
+            operation_sequence: Some(handle.base_sequence),
+            operation_sequence_span: handle.size as u64,
+        })
+    }
+
     pub(super) fn expand_cancellation_group(
         &mut self,
         descriptors: &[ParallelDescriptor],
@@ -852,11 +988,7 @@ impl Client {
         observation: &CancellationRequest,
     ) -> Result<Vec<HistoryEvent>> {
         let (owner, run_id) = cancellation_claim(task)?;
-        CancellationRequest::from_observation(&json!({
-            "request_id":observation.request_id, "requested_at":observation.requested_at,
-            "cleanup_deadline_at":observation.cleanup_deadline_at,
-            "history_refresh_page_token":observation.history_refresh_page_token,
-        }))?;
+        observation.validate_observation()?;
         let first_token = observation
             .history_refresh_page_token
             .clone()
@@ -988,7 +1120,7 @@ impl Client {
     }
 }
 
-fn cancellation_claim(task: &WorkflowTask) -> Result<(&str, &str)> {
+pub(super) fn cancellation_claim(task: &WorkflowTask) -> Result<(&str, &str)> {
     let owner = task
         .lease_owner
         .as_deref()

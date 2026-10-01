@@ -118,6 +118,514 @@ fn cancelled_parallel_history() -> Vec<HistoryEvent> {
     ]
 }
 
+fn intent_task(events: Vec<HistoryEvent>) -> WorkflowTask {
+    let mut task = transport_task();
+    task.history_events = events;
+    task
+}
+
+fn original_observation() -> CancellationRequest {
+    CancellationRequest::from_observation(&request_observation()).unwrap()
+}
+
+async fn authored_scalar(ctx: WorkflowContext, kind: &str) -> Result<()> {
+    match kind {
+        "activity" => {
+            ctx.activity("forward", json!([])).await?;
+        }
+        "timer" => {
+            ctx.sleep(Duration::from_secs(5)).await?;
+        }
+        "child" => {
+            ctx.start_child_workflow("child", ChildWorkflowOptions::new("queue"), json!([]))
+                .await?;
+        }
+        "signal" => {
+            ctx.wait_signal("resume").await?;
+        }
+        "condition" => {
+            ctx.wait_condition(ConditionWaitOptions::new("ready", "sha256:ready"), || {
+                Ok(false)
+            })
+            .await?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn pending_scalar_event(kind: &str) -> HistoryEvent {
+    match kind {
+        "activity" => event(
+            "ActivityScheduled",
+            json!({"sequence":1,"activity_type":"forward","task_queue":"queue"}),
+        ),
+        "timer" => scheduled_timer(1),
+        "child" => event(
+            "ChildWorkflowScheduled",
+            json!({"sequence":1,"workflow_type":"child"}),
+        ),
+        "signal" => event(
+            "SignalWaitOpened",
+            json!({"sequence":1,"signal_name":"resume"}),
+        ),
+        "condition" => event(
+            "ConditionWaitOpened",
+            json!({"sequence":1,"condition_wait_id":"condition-1",
+            "condition_wait_occurrence_id":"rust:condition-wait:0","condition_key":"ready","condition_definition_fingerprint":"sha256:ready"}),
+        ),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn cooperative_intent_suspends_actual_worker_scalar_calls_without_exposing_an_error() {
+    for kind in ["activity", "timer", "child", "signal", "condition"] {
+        for scheduled in [false, true] {
+            let resumed = Arc::new(AtomicBool::new(false));
+            let observed = resumed.clone();
+            let mut worker = cancellation_worker();
+            worker.register_workflow("cancel", move |ctx, _input| {
+                let observed = observed.clone();
+                async move {
+                    assert!(!ctx.is_cancellation_requested()?);
+                    // Even catching every error cannot expose cancellation
+                    // before the worker commits its delivery and replays.
+                    let _ = authored_scalar(ctx, kind).await;
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(Value::Null)
+                }
+            });
+            let mut events = Vec::new();
+            if scheduled {
+                events.push(pending_scalar_event(kind));
+            }
+            events.push(canonical_request());
+            let decision = worker
+                .execute_workflow_task_decision_with_cancellation(
+                    intent_task(events),
+                    Some(&original_observation()),
+                )
+                .unwrap();
+            assert!(!resumed.load(Ordering::SeqCst), "{kind}:{scheduled}");
+            assert!(decision.commands.is_empty(), "{kind}:{scheduled}");
+            let delivery = decision.cancellation_delivery.unwrap();
+            assert_eq!(delivery.sequence, 1);
+            assert_eq!(serde_json::to_value(delivery.call_kind).unwrap(), kind);
+            assert_eq!(delivery.request_id, "original-request");
+        }
+    }
+}
+
+#[test]
+fn cooperative_intent_suspends_a_resolution_committed_after_the_request() {
+    let resumed = Arc::new(AtomicBool::new(false));
+    let observed = resumed.clone();
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", move |ctx, _input| {
+        let observed = observed.clone();
+        async move {
+            let _ = ctx.sleep(Duration::from_secs(5)).await;
+            observed.store(true, Ordering::SeqCst);
+            Ok(Value::Null)
+        }
+    });
+    let decision = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![
+                scheduled_timer(1),
+                canonical_request(),
+                event(
+                    "TimerFired",
+                    json!({"sequence":1,"timer_id":"timer-1","delay_seconds":5}),
+                ),
+            ]),
+            Some(&original_observation()),
+        )
+        .unwrap();
+    assert!(!resumed.load(Ordering::SeqCst));
+    assert!(decision.commands.is_empty());
+    assert_eq!(decision.cancellation_delivery, Some(transport_delivery()));
+}
+
+#[test]
+fn cooperative_intent_preserves_earlier_commands_and_replayed_side_effects() {
+    let side_effects = Arc::new(Mutex::new(0));
+    let observed = side_effects.clone();
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", move |ctx, _input| {
+        let observed = observed.clone();
+        async move {
+            let value: Value = ctx.side_effect(|| {
+                *observed.lock().unwrap() += 1;
+                json!(7)
+            })?;
+            assert_eq!(value, 7);
+            ctx.sleep(Duration::from_secs(5)).await?;
+            Ok(Value::Null)
+        }
+    });
+    let first = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![canonical_request()]),
+            Some(&original_observation()),
+        )
+        .unwrap();
+    assert_eq!(first.commands.len(), 1);
+    assert_eq!(first.commands[0]["type"], "record_side_effect");
+    assert_eq!(first.cancellation_delivery.unwrap().sequence, 2);
+    let second = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![
+                event(
+                    "SideEffectRecorded",
+                    json!({"sequence":1,"result":fixture_envelope(json!(7))}),
+                ),
+                canonical_request(),
+            ]),
+            Some(&original_observation()),
+        )
+        .unwrap();
+    assert!(second.commands.is_empty());
+    assert_eq!(second.cancellation_delivery.unwrap().sequence, 2);
+    assert_eq!(*side_effects.lock().unwrap(), 1);
+}
+
+#[test]
+fn cooperative_intent_replays_committed_delivery_with_the_original_observation() {
+    let delivered = Arc::new(Mutex::new(None));
+    let observed = delivered.clone();
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", move |ctx, _input| {
+        let observed = observed.clone();
+        async move {
+            match ctx.sleep(Duration::from_secs(5)).await {
+                Err(Error::CooperativeCancellationRequested(cancellation)) => {
+                    *observed.lock().unwrap() = Some(cancellation.request);
+                }
+                other => panic!("{other:?}"),
+            }
+            Ok(Value::Null)
+        }
+    });
+    let observation = original_observation();
+    let decision = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![
+                scheduled_timer(1),
+                canonical_request(),
+                canonical_delivery(1, "timer"),
+            ]),
+            Some(&observation),
+        )
+        .unwrap();
+    assert!(decision.cancellation_delivery.is_none());
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(decision.commands[0]["type"], "complete_workflow");
+    assert_eq!(*delivered.lock().unwrap(), Some(observation));
+}
+
+#[test]
+fn cooperative_intent_cannot_publish_a_terminal_result_after_an_ignored_pending_call() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        let mut timer = Box::pin(ctx.sleep(Duration::from_secs(5)));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(timer.as_mut().poll(&mut cx), Poll::Pending));
+        Ok(json!("ignored pending timer"))
+    });
+    let decision = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![canonical_request()]),
+            Some(&original_observation()),
+        )
+        .unwrap();
+    assert!(decision.commands.is_empty());
+    assert_eq!(decision.cancellation_delivery, Some(transport_delivery()));
+}
+
+#[test]
+fn cooperative_intent_cannot_publish_commands_after_an_ignored_pending_call() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        let mut timer = Box::pin(ctx.sleep(Duration::from_secs(5)));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(timer.as_mut().poll(&mut cx), Poll::Pending));
+        let _: Value = ctx.side_effect(|| json!("authored after pending timer"))?;
+        Ok(Value::Null)
+    });
+    assert!(
+        matches!(worker.execute_workflow_task_decision_with_cancellation(
+        intent_task(vec![canonical_request()]), Some(&original_observation()),
+    ), Err(Error::NonDeterministicReplay(ReplayFailure { reason, .. }))
+        if reason == "cooperative_cancellation_pending_call_escaped")
+    );
+}
+
+#[test]
+fn cooperative_intent_preserves_a_prior_selection_winner_then_suspends_the_loser_await() {
+    for late in [false, true] {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let observed = resumed.clone();
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", move |ctx, _input| {
+            let observed = observed.clone();
+            async move {
+                let selected = keyed_activity_selection(&ctx).await?;
+                assert_eq!(selected.key, SelectionKey::Name("fast".into()));
+                assert_eq!(
+                    selected.value,
+                    Some(ParallelResult::Activity(json!("winner-value")))
+                );
+                let _ = selected
+                    .handle(&SelectionKey::Name("slow".into()))
+                    .unwrap()
+                    .await_result()
+                    .await;
+                observed.store(true, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        });
+        let mut events = cancelled_selection_history();
+        events.pop();
+        if late {
+            events.push(selection_activity_event(
+                "ActivityCompleted",
+                0,
+                "slow",
+                Some(json!("late")),
+            ));
+        }
+        let decision = worker
+            .execute_workflow_task_decision_with_cancellation(
+                intent_task(events),
+                Some(&original_observation()),
+            )
+            .unwrap();
+        assert!(!resumed.load(Ordering::SeqCst));
+        assert!(decision.commands.is_empty());
+        let delivery = decision.cancellation_delivery.unwrap();
+        assert_eq!(delivery.call_kind, CancellationCallKind::SelectionHandle);
+        assert_eq!(delivery.sequence, 3);
+        assert_eq!(delivery.operation_sequence, Some(1));
+        assert_eq!(delivery.operation_sequence_span, 1);
+    }
+}
+
+#[test]
+fn cooperative_intent_validates_all_handle_fields_before_checking_prior_resolution() {
+    for changed in 0..7 {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", move |ctx, _input| async move {
+            let selected = keyed_activity_selection(&ctx).await?;
+            let mut handle = selected
+                .handle(&SelectionKey::Name("slow".into()))
+                .unwrap()
+                .clone();
+            match changed {
+                0 => handle.key = SelectionKey::Name("changed".into()),
+                1 => handle.index = 9,
+                2 => handle.kind = "timer".into(),
+                3 => handle.identity = "changed".into(),
+                4 => handle.selection_group_id = "changed".into(),
+                5 => handle.base_sequence = 2,
+                6 => handle.size = 2,
+                _ => unreachable!(),
+            }
+            handle.await_result().await?;
+            Ok(Value::Null)
+        });
+        let mut events = cancelled_selection_history();
+        events.pop();
+        assert!(
+            matches!(
+                worker.execute_workflow_task_decision_with_cancellation(
+                    intent_task(events),
+                    Some(&original_observation()),
+                ),
+                Err(Error::NonDeterministicReplay(_))
+            ),
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn cooperative_intent_suspends_nested_parallel_and_an_uncommitted_selection_winner() {
+    for (selection, mode) in [
+        (false, "new"),
+        (false, "scheduled"),
+        (false, "partial"),
+        (true, "new"),
+        (true, "scheduled"),
+    ] {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let observed = resumed.clone();
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", move |ctx, _input| {
+            let observed = observed.clone();
+            async move {
+                if selection {
+                    let _ = keyed_activity_selection(&ctx).await;
+                } else {
+                    let _ = ctx.parallel(nested_parallel_operations()).await;
+                }
+                observed.store(true, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        });
+        let events = if mode == "new" {
+            vec![canonical_request()]
+        } else if selection {
+            vec![
+                selection_activity_event("ActivityScheduled", 0, "slow", None),
+                selection_activity_event("ActivityScheduled", 1, "fast", None),
+                canonical_request(),
+                selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("late"))),
+                selection_winner_marker(),
+            ]
+        } else {
+            let mut events = cancelled_parallel_history();
+            events.pop();
+            if mode == "partial" {
+                events.insert(
+                    3,
+                    parallel_history_event(
+                        "ActivityCompleted",
+                        1,
+                        "activity_type",
+                        "first",
+                        nested_parallel_paths()[0].clone(),
+                        Some(json!(7)),
+                    ),
+                );
+            }
+            events.push(event("ActivityFailed", json!({"sequence":3,"activity_type":"third",
+                "exception_type":"LateFailure","exception":{"class":"LateFailure","message":"too late"}})));
+            events
+        };
+        let decision = worker
+            .execute_workflow_task_decision_with_cancellation(
+                intent_task(events),
+                Some(&original_observation()),
+            )
+            .unwrap();
+        assert!(!resumed.load(Ordering::SeqCst));
+        assert!(decision.commands.is_empty());
+        let delivery = decision.cancellation_delivery.unwrap();
+        assert_eq!(delivery.call_kind, CancellationCallKind::Parallel);
+        assert_eq!(delivery.sequence, 1);
+        assert_eq!(delivery.sequence_span, if selection { 2 } else { 3 });
+    }
+}
+
+#[test]
+fn cooperative_intent_rejects_changed_later_leaf_details_before_exporting_delivery() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        ctx.parallel(vec![
+            ParallelOperation::activity("first", json!([])),
+            ParallelOperation::group(vec![
+                ParallelOperation::child_workflow(
+                    "second",
+                    ChildWorkflowOptions::new("child-workers"),
+                    json!([]),
+                ),
+                ParallelOperation::activity("changed-third", json!([])),
+            ]),
+        ])
+        .await?;
+        Ok(Value::Null)
+    });
+    let mut events = cancelled_parallel_history();
+    events.pop();
+    assert!(matches!(
+        worker.execute_workflow_task_decision_with_cancellation(
+            intent_task(events),
+            Some(&original_observation()),
+        ),
+        Err(Error::NonDeterministicReplay(_))
+    ));
+}
+
+#[test]
+fn cooperative_intent_uses_the_pending_physical_condition_reopen() {
+    let payload = |sequence| {
+        json!({"sequence":sequence,"condition_wait_id":format!("condition:{sequence}"),
+        "condition_wait_occurrence_id":"rust:condition-wait:0","condition_key":"ready",
+        "condition_definition_fingerprint":"sha256:ready"})
+    };
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        ctx.wait_condition(ConditionWaitOptions::new("ready", "sha256:ready"), || {
+            panic!("delivery proposal must suspend before reevaluating the predicate")
+        })
+        .await?;
+        Ok(Value::Null)
+    });
+    let decision = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![
+                event("ConditionWaitOpened", payload(1)),
+                event("ConditionWaitSatisfied", payload(1)),
+                event("ConditionWaitOpened", payload(2)),
+                canonical_request(),
+            ]),
+            Some(&original_observation()),
+        )
+        .unwrap();
+    assert!(decision.commands.is_empty());
+    let delivery = decision.cancellation_delivery.unwrap();
+    assert_eq!(delivery.call_kind, CancellationCallKind::Condition);
+    assert_eq!(delivery.sequence, 2);
+}
+
+#[test]
+fn cooperative_intent_keeps_explicit_shielded_cleanup_pending_without_delivery() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        let _shield = ctx.cancellation_shield()?;
+        ctx.sleep(Duration::from_secs(5)).await?;
+        Ok(Value::Null)
+    });
+    let decision = worker
+        .execute_workflow_task_decision_with_cancellation(
+            intent_task(vec![scheduled_timer(1), canonical_request()]),
+            Some(&original_observation()),
+        )
+        .unwrap();
+    assert!(decision.commands.is_empty());
+    assert!(decision.cancellation_delivery.is_none());
+}
+
+#[test]
+fn cooperative_intent_rejects_unproven_observation_or_claim_before_workflow_code() {
+    let invoked = Arc::new(AtomicBool::new(false));
+    let observed = invoked.clone();
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", move |_ctx, _input| {
+        observed.store(true, Ordering::SeqCst);
+        async { Ok(Value::Null) }
+    });
+    for changed in 0..6 {
+        let mut task = intent_task(vec![canonical_request()]);
+        let mut observation = original_observation();
+        match changed {
+            0 => task.history_events.clear(),
+            1 => task.lease_owner = None,
+            2 => task.run_id = Some("other-run".into()),
+            3 => observation.request_id = "other-request".into(),
+            4 => observation.cleanup_deadline_at = "2026-10-01T08:11:00Z".into(),
+            5 => observation.history_refresh_page_token = None,
+            _ => unreachable!(),
+        }
+        assert!(worker
+            .execute_workflow_task_decision_with_cancellation(task, Some(&observation))
+            .is_err());
+        assert!(!invoked.load(Ordering::SeqCst));
+    }
+}
+
 #[test]
 fn cooperative_parallel_replays_one_original_cancellation_for_nested_mixed_leaves() {
     for _cold_restart in 0..2 {
