@@ -971,6 +971,58 @@ fn acknowledgment(
 }
 
 impl Client {
+    /// Observe an exact activity attempt without renewing its lease or progress.
+    ///
+    /// This explicit worker-protocol 1.20 operation has one five-second budget.
+    /// A pending workflow request alone does not cancel an activity. Its reply
+    /// reports the runtime's current continuation authority after delivery.
+    pub async fn activity_task_status(
+        &self,
+        task_id: &str,
+        activity_attempt_id: &str,
+        lease_owner: &str,
+    ) -> Result<Value> {
+        if [task_id, activity_attempt_id, lease_owner]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(invalid("activity observation requires the actual claim"));
+        }
+        tokio::time::timeout(CONTROL_BUDGET, async {
+            let value: Value = activity_task_response(
+                self.request_json(
+                    reqwest::Method::POST,
+                    &format!(
+                        "/worker/activity-tasks/{}/status",
+                        percent_encode_path_segment(task_id)
+                    ),
+                    RequestProtocol::Worker("1.20"),
+                    Some(&json!({
+                        "activity_attempt_id":activity_attempt_id,"lease_owner":lease_owner
+                    })),
+                )
+                .await,
+                "status",
+                task_id,
+                activity_attempt_id,
+            )?;
+            if value["task_id"].as_str() != Some(task_id)
+                || value["activity_attempt_id"].as_str() != Some(activity_attempt_id)
+                || value["lease_owner"].as_str() != Some(lease_owner)
+                || value["can_continue"].as_bool().is_none()
+                || value["cancel_requested"].as_bool().is_none()
+                || value["heartbeat_recorded"].as_bool() != Some(false)
+            {
+                return Err(invalid(
+                    "activity observation did not acknowledge the exact claim",
+                ));
+            }
+            Ok(value)
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
     /// Acquire a claim with protocol 1.20 and retain its pending observation.
     ///
     /// The Server must have admitted a capable worker registration. This method
@@ -1405,6 +1457,116 @@ impl Client {
 }
 
 impl Worker {
+    pub(super) async fn poll_cooperative_activity_once(&self) -> Result<ManagedPollOutcome> {
+        let poll_request_id = unique_request_id("rust-activity-poll");
+        let response = self
+            .retry_worker_operation(|| {
+                self.client.poll_activity_task_response_with_request_id(
+                    &self.worker_id,
+                    &self.task_queue,
+                    self.poll_timeout,
+                    &poll_request_id,
+                    0,
+                )
+            })
+            .await;
+        let Some(response) = self.settle_worker_poll_response(response).await? else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
+        if response.outcome().should_stop() {
+            return Ok(ManagedPollOutcome::Stop);
+        }
+        let Some(task) = response.task else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
+        let guard = ActivityClaimGuard::new(&self.client, &task, &self.worker_id)?;
+        let _abandon_on_drop = AbandonActivityOnDrop(guard.clone());
+        if guard.observe().await.is_err() {
+            return Ok(ManagedPollOutcome::Handled);
+        }
+        let invocation = self.execute_cooperative_activity_task(&task, &guard);
+        tokio::pin!(invocation);
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = guard.wait_for_shutdown() => {
+                    guard.abandon();
+                    return Ok(ManagedPollOutcome::Handled);
+                }
+                result = &mut invocation => break result,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if guard.observe().await.is_err() {
+                        return Ok(ManagedPollOutcome::Handled);
+                    }
+                }
+            }
+        };
+        // Both genuine application failures and successful results need current
+        // authority before result upload or completion/failure publication.
+        if matches!(result, Err(Error::ActivityExecutionAbandoned(_)))
+            || guard.observe().await.is_err()
+        {
+            return Ok(ManagedPollOutcome::Handled);
+        }
+        let settlement = match result {
+            Ok(value) => {
+                self.client
+                    .complete_activity_task(
+                        &guard.task_id,
+                        &guard.attempt_id,
+                        &guard.owner,
+                        value,
+                        &task.payload_codec,
+                    )
+                    .await
+            }
+            Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
+            Err(error) => {
+                self.client
+                    .fail_activity_task(
+                        &guard.task_id,
+                        &guard.attempt_id,
+                        &guard.owner,
+                        error.to_string(),
+                        false,
+                    )
+                    .await
+            }
+        };
+        if let Err(error) = settlement {
+            if !activity_task_rejection_is_final(&error) {
+                return Err(error);
+            }
+        }
+        Ok(ManagedPollOutcome::Handled)
+    }
+
+    async fn execute_cooperative_activity_task(
+        &self,
+        task: &ActivityTask,
+        guard: &ActivityClaimGuard,
+    ) -> Result<AvroValue> {
+        validate_activity_task_payloads(task)?;
+        let handler = self
+            .activities
+            .get(&task.activity_type)
+            .ok_or_else(|| Error::ActivityNotRegistered(task.activity_type.clone()))?;
+        let args = decode_task_avro_arguments(task.arguments.as_ref(), &task.payload_codec)?;
+        let context = ActivityContext {
+            client: self.client.clone(),
+            task_id: guard.task_id.clone(),
+            activity_attempt_id: guard.attempt_id.clone(),
+            lease_owner: guard.owner.clone(),
+            activity_type: task.activity_type.clone(),
+            attempt_number: task.attempt_number,
+            task_queue: self.task_queue.clone(),
+            worker_id: self.worker_id.clone(),
+            claim_guard: Some(guard.clone()),
+        };
+        guard.boundary()?;
+        handler(context, args).await
+    }
+
     pub(super) async fn poll_cooperative_workflow_once(&self) -> Result<ManagedPollOutcome> {
         let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
@@ -1509,6 +1671,189 @@ impl Worker {
         Err(invalid(
             "workflow replay did not converge on its canonical cancellation delivery",
         ))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ActivityClaimGuard {
+    client: Client,
+    task_id: String,
+    attempt_id: String,
+    owner: String,
+    active: Arc<AtomicBool>,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+struct AbandonActivityOnDrop(ActivityClaimGuard);
+
+impl Drop for AbandonActivityOnDrop {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
+}
+
+impl ActivityClaimGuard {
+    fn new(client: &Client, task: &ActivityTask, worker_id: &str) -> Result<Self> {
+        let owner = task.lease_owner.as_deref().unwrap_or_default();
+        let attempt = task
+            .activity_attempt_id
+            .as_deref()
+            .or(task.attempt_id.as_deref())
+            .unwrap_or_default();
+        if task.task_id.trim().is_empty()
+            || attempt.trim().is_empty()
+            || owner.trim().is_empty()
+            || owner != worker_id
+            || matches!((&task.activity_attempt_id, &task.attempt_id), (Some(left), Some(right)) if left != right)
+        {
+            return Err(invalid(
+                "activity execution requires the worker's actual immutable claim",
+            ));
+        }
+        Ok(Self {
+            client: client.clone(),
+            task_id: task.task_id.clone(),
+            attempt_id: attempt.to_owned(),
+            owner: owner.to_owned(),
+            active: Arc::new(AtomicBool::new(true)),
+            stop: client
+                .worker_storage_admission
+                .as_ref()
+                .map(|admission| Arc::clone(&admission.stop)),
+        })
+    }
+
+    fn abandon(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    fn boundary(&self) -> Result<()> {
+        if !self.active.load(Ordering::SeqCst)
+            || self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            self.abandon();
+            return Err(Error::ActivityExecutionAbandoned(
+                "callback completed, was abandoned, or its worker is stopping".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn wait_for_shutdown(&self) {
+        if let Some(stop) = &self.stop {
+            wait_for_worker_stop(stop).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn observe(&self) -> Result<()> {
+        self.boundary()?;
+        let result = self
+            .client
+            .activity_task_status(&self.task_id, &self.attempt_id, &self.owner)
+            .await
+            .and_then(|value| {
+                if value["can_continue"].as_bool() != Some(true)
+                    || value["cancel_requested"].as_bool() != Some(false)
+                    || value.get("reason") != Some(&Value::Null)
+                    || value["task_status"].as_str() != Some("leased")
+                    || value["attempt_status"].as_str() != Some("running")
+                    || value["activity_status"].as_str() != Some("running")
+                {
+                    return Err(invalid("activity observation refused continuation"));
+                }
+                let mut bounds = vec![text(&value, "lease_expires_at")?];
+                if let Some(deadlines) = value.get("deadlines").filter(|v| !v.is_null()) {
+                    if !deadlines.is_object() {
+                        return Err(invalid("activity execution deadlines must be an object"));
+                    }
+                    for kind in ["heartbeat", "start_to_close", "schedule_to_close"] {
+                        if let Some(deadline) = deadlines.get(kind).filter(|v| !v.is_null()) {
+                            bounds.push(
+                                deadline
+                                    .as_str()
+                                    .ok_or_else(|| invalid("invalid activity deadline"))?,
+                            );
+                        }
+                    }
+                }
+                if let Some(session) = value.get("worker_session").filter(|v| !v.is_null()) {
+                    if session["status"].as_str() != Some("active")
+                        || session["lease_owner"].as_str() != Some(self.owner.as_str())
+                    {
+                        return Err(invalid(
+                            "activity no longer owns its required worker session",
+                        ));
+                    }
+                    bounds.push(text(session, "lease_expires_at")?);
+                    bounds.push(text(session, "ttl_expires_at")?);
+                }
+                for bound in bounds {
+                    let deadline = DateTime::parse_from_rfc3339(bound)
+                        .map_err(|_| invalid("activity deadline must include a timezone"))?;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| invalid("activity observation clock precedes the epoch"))?;
+                    if !u128::try_from(deadline.timestamp_millis())
+                        .is_ok_and(|millis| millis > now.as_millis())
+                    {
+                        return Err(invalid("activity ownership or execution deadline elapsed"));
+                    }
+                }
+                self.boundary()
+            });
+        result.map_err(|error| {
+            self.abandon();
+            Error::ActivityExecutionAbandoned(error.to_string())
+        })
+    }
+
+    pub(super) async fn heartbeat<T: Serialize>(
+        &self,
+        context: &ActivityContext,
+        details: T,
+    ) -> Result<ActivityHeartbeatResponse> {
+        if context.task_id != self.task_id
+            || context.activity_attempt_id != self.attempt_id
+            || context.lease_owner != self.owner
+            || context.worker_id != self.owner
+        {
+            self.abandon();
+            return Err(Error::ActivityExecutionAbandoned(
+                "activity context changed its original claim".into(),
+            ));
+        }
+        self.observe().await?;
+        let result = tokio::time::timeout(CONTROL_BUDGET, async {
+            let details = encode_typed_envelope(&AvroValue::from_serialize(&details)?, DEFAULT_CODEC)?;
+            self.boundary()?;
+            let value: Value = self.client.request_json(
+                reqwest::Method::POST,
+                &format!("/worker/activity-tasks/{}/heartbeat", percent_encode_path_segment(&self.task_id)),
+                RequestProtocol::Worker("1.20"),
+                Some(&json!({"activity_attempt_id":self.attempt_id,"lease_owner":self.owner,"details":details})),
+            ).await?;
+            if value["task_id"].as_str() != Some(self.task_id.as_str())
+                || value["activity_attempt_id"].as_str() != Some(self.attempt_id.as_str())
+                || value["lease_owner"].as_str() != Some(self.owner.as_str())
+                || value["can_continue"].as_bool() != Some(true)
+                || value["cancel_requested"].as_bool() != Some(false)
+                || value["heartbeat_recorded"].as_bool() != Some(true)
+            {
+                return Err(invalid("activity heartbeat lost its original claim"));
+            }
+            serde_json::from_value(value).map_err(Error::from)
+        }).await.map_err(|_| Error::Timeout).and_then(|result| result);
+        let response = result.map_err(|error| {
+            self.abandon();
+            Error::ActivityExecutionAbandoned(error.to_string())
+        })?;
+        self.observe().await?;
+        Ok(response)
     }
 }
 

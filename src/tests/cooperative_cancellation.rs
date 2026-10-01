@@ -1979,6 +1979,522 @@ fn transport_server() -> MockWorkerServer {
     })
 }
 
+fn remote_activity_responses(
+    path: &str,
+    body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    let case = path.split('/').nth(1).unwrap_or_default();
+    if path.ends_with("/cluster/info") {
+        return responses(path, body, number);
+    }
+    if path.ends_with("/worker/register") {
+        return Some((
+            "200 OK",
+            json!({"registered":true,"worker_id":"actual-owner","heartbeat_interval_seconds":3600})
+                .to_string(),
+        ));
+    }
+    if path.ends_with("/worker/heartbeat") {
+        return Some(("200 OK", json!({}).to_string()));
+    }
+    if path.ends_with("/worker/registrations/actual-owner") {
+        return Some(("200 OK", json!({"worker_id":"actual-owner","outcome":"deregistered","recovered_workflow_task_count":1}).to_string()));
+    }
+    if path.ends_with("/activity-tasks/poll") {
+        if number > 1 {
+            return Some((
+                "200 OK",
+                json!({"task":null,"poll_status":"timeout"}).to_string(),
+            ));
+        }
+        let mut task = json!({"task_id":"activity","activity_attempt_id":"attempt-original",
+            "activity_type":"work","payload_codec":"avro","lease_owner":"actual-owner","attempt_number":3});
+        match case {
+            "remote-missing-owner" => {
+                task.as_object_mut().unwrap().remove("lease_owner");
+            }
+            "remote-missing-attempt" => {
+                task.as_object_mut().unwrap().remove("activity_attempt_id");
+            }
+            "remote-invented-owner" => task["lease_owner"] = json!("other-worker"),
+            "remote-conflicting-attempt" => task["attempt_id"] = json!("other-attempt"),
+            _ => {}
+        }
+        return Some((
+            "200 OK",
+            json!({"task":task,"poll_status":"leased"}).to_string(),
+        ));
+    }
+    if path.ends_with("/status") {
+        let request: Value = serde_json::from_str(body).unwrap();
+        if case == "remote-refused" || (case == "remote-replaced" && number >= 2) {
+            return Some((
+                "409 Conflict",
+                json!({"reason":"lease_owner_mismatch"}).to_string(),
+            ));
+        }
+        if case == "remote-offline" {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_unavailable"}).to_string(),
+            ));
+        }
+        if case == "remote-status-slow" {
+            std::thread::sleep(Duration::from_millis(5250));
+        }
+        let mut reply = json!({"task_id":if path.ends_with("/activity%2Fselected/status") { "activity/selected" } else { "activity" },
+            "activity_attempt_id":request["activity_attempt_id"],"lease_owner":request["lease_owner"],
+            "can_continue":true,"cancel_requested":false,"reason":null,"heartbeat_recorded":false,
+            "lease_expires_at":"2099-01-01T00:00:00Z","deadlines":null,"worker_session":null,
+            "task_status":"leased","attempt_status":"running","activity_status":"running"});
+        match case {
+            "remote-wrong-task" => reply["task_id"] = json!("other-task"),
+            "remote-wrong-attempt" => reply["activity_attempt_id"] = json!("other-attempt"),
+            "remote-wrong-owner" => reply["lease_owner"] = json!("other-worker"),
+            "remote-malformed" => reply["can_continue"] = json!("true"),
+            "remote-recorded-progress" => reply["heartbeat_recorded"] = json!(true),
+            "remote-closed-task" => reply["task_status"] = json!("completed"),
+            "remote-closed-attempt" => reply["attempt_status"] = json!("completed"),
+            "remote-closed-activity" => reply["activity_status"] = json!("completed"),
+            "remote-expired" => reply["lease_expires_at"] = json!("2000-01-01T00:00:00Z"),
+            "remote-no-timezone" => reply["lease_expires_at"] = json!("2099-01-01T00:00:00"),
+            "remote-deadline" => reply["deadlines"] = json!({"heartbeat":"2000-01-01T00:00:00Z"}),
+            "remote-bad-deadlines" => reply["deadlines"] = json!(false),
+            "remote-session-expired" => {
+                reply["worker_session"] = json!({"status":"active","lease_owner":"actual-owner","lease_expires_at":"2099-01-01T00:00:00Z","ttl_expires_at":"2000-01-01T00:00:00Z"})
+            }
+            "remote-session-replaced" => {
+                reply["worker_session"] = json!({"status":"active","lease_owner":"replacement","lease_expires_at":"2099-01-01T00:00:00Z","ttl_expires_at":"2099-01-01T00:00:00Z"})
+            }
+            "remote-cancelled" | "remote-late-result"
+                if case == "remote-cancelled" || number >= 2 =>
+            {
+                reply["can_continue"] = json!(false);
+                reply["cancel_requested"] = json!(true);
+                reply["reason"] = json!("activity_cancelled");
+            }
+            "remote-heartbeat-post-loss" if number >= 3 => reply["can_continue"] = json!(false),
+            _ => {}
+        }
+        return Some(("200 OK", reply.to_string()));
+    }
+    if path.ends_with("/activity/heartbeat") {
+        let mut reply = json!({"task_id":"activity","activity_attempt_id":"attempt-original",
+            "lease_owner":"actual-owner","can_continue":true,"cancel_requested":false,"heartbeat_recorded":true});
+        match case {
+            "remote-heartbeat-wrong-attempt" => reply["activity_attempt_id"] = json!("replacement"),
+            "remote-heartbeat-cancelled" => reply["cancel_requested"] = json!(true),
+            _ => {}
+        }
+        return Some(("200 OK", reply.to_string()));
+    }
+    if path.ends_with("/complete") || path.ends_with("/fail") {
+        return Some(("200 OK", json!({"recorded":true}).to_string()));
+    }
+    None
+}
+
+fn remote_activity_server() -> MockWorkerServer {
+    MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(remote_activity_responses),
+        ..Default::default()
+    })
+}
+
+struct PendingActivityCallback(Arc<AtomicBool>);
+
+impl Future for PendingActivityCallback {
+    type Output = Result<Value>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
+}
+
+impl Drop for PendingActivityCallback {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn cooperative_activity_observation_uses_the_exact_worker_claim_without_renewal() {
+    let server = remote_activity_server();
+    let reply = client(&server, "remote-valid")
+        .activity_task_status("activity/selected", "attempt-original", "actual-owner")
+        .await
+        .unwrap();
+    assert_eq!(reply["heartbeat_recorded"], false);
+    assert_eq!(reply["can_continue"], true);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/remote-valid/api/worker/activity-tasks/activity%2Fselected/status"
+    );
+    assert_eq!(requests[0].worker_protocol.as_deref(), Some("1.20"));
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer worker-only")
+    );
+    assert_eq!(requests[0].namespace.as_deref(), Some("caller-namespace"));
+    let body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({"activity_attempt_id":"attempt-original","lease_owner":"actual-owner"})
+    );
+}
+
+#[tokio::test]
+async fn cooperative_activity_observation_rejects_changed_receipts_and_preserves_refusals() {
+    for case in [
+        "remote-wrong-task",
+        "remote-wrong-attempt",
+        "remote-wrong-owner",
+        "remote-malformed",
+        "remote-recorded-progress",
+    ] {
+        let server = remote_activity_server();
+        assert!(
+            matches!(
+                client(&server, case)
+                    .activity_task_status("activity", "attempt-original", "actual-owner")
+                    .await,
+                Err(Error::InvalidCooperativeCancellation(_))
+            ),
+            "{case}"
+        );
+    }
+    let server = remote_activity_server();
+    let result = client(&server, "remote-refused")
+        .activity_task_status("activity", "attempt-original", "actual-owner")
+        .await;
+    assert!(
+        matches!(result, Err(Error::ActivityTaskRejected(ref error)) if error.operation == "status"
+        && error.status == 409 && error.reason == "lease_owner_mismatch")
+    );
+    for (task, attempt, owner) in [
+        ("", "attempt", "owner"),
+        ("task", "", "owner"),
+        ("task", "attempt", ""),
+    ] {
+        assert!(client(&server, "remote-valid")
+            .activity_task_status(task, attempt, owner)
+            .await
+            .is_err());
+    }
+    let control_only = Client::builder(format!("{}/remote-valid", server.base_url()))
+        .control_token(Some("control-only".to_string()))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        control_only
+            .activity_task_status("activity", "attempt", "owner")
+            .await,
+        Err(Error::MissingRoleCredentials { role: "worker", .. })
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cooperative_activity_observation_has_one_five_second_budget() {
+    let server = remote_activity_server();
+    let start = Instant::now();
+    assert!(matches!(
+        client(&server, "remote-status-slow")
+            .activity_task_status("activity", "attempt-original", "actual-owner")
+            .await,
+        Err(Error::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_millis(5200));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cooperative_activity_refuses_execution_without_current_claim_deadlines_and_session() {
+    for case in [
+        "remote-refused",
+        "remote-offline",
+        "remote-cancelled",
+        "remote-wrong-task",
+        "remote-wrong-attempt",
+        "remote-wrong-owner",
+        "remote-malformed",
+        "remote-recorded-progress",
+        "remote-expired",
+        "remote-closed-task",
+        "remote-closed-attempt",
+        "remote-closed-activity",
+        "remote-no-timezone",
+        "remote-deadline",
+        "remote-bad-deadlines",
+        "remote-session-expired",
+        "remote-session-replaced",
+    ] {
+        let server = remote_activity_server();
+        let mut worker = coordinator_worker(&server, case);
+        let called = Arc::new(AtomicBool::new(false));
+        let invoked = Arc::clone(&called);
+        worker.register_activity("work", move |_, _| {
+            invoked.store(true, Ordering::SeqCst);
+            async { Ok(Value::Null) }
+        });
+        assert_eq!(
+            worker.poll_activity_once().await.unwrap(),
+            ManagedPollOutcome::Handled,
+            "{case}"
+        );
+        assert!(!called.load(Ordering::SeqCst), "{case}");
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{case}");
+        assert!(requests.last().unwrap().path.ends_with("/status"), "{case}");
+    }
+    for case in [
+        "remote-missing-owner",
+        "remote-missing-attempt",
+        "remote-invented-owner",
+        "remote-conflicting-attempt",
+    ] {
+        let server = remote_activity_server();
+        let worker = coordinator_worker(&server, case);
+        assert!(
+            matches!(
+                worker.poll_activity_once().await,
+                Err(Error::InvalidCooperativeCancellation(_))
+            ),
+            "{case}"
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn cooperative_activity_fences_success_failure_heartbeat_and_late_context() {
+    for fail in [false, true] {
+        let server = remote_activity_server();
+        let mut worker = coordinator_worker(&server, "remote-valid");
+        let saved = Arc::new(Mutex::new(None::<ActivityContext>));
+        let capture = Arc::clone(&saved);
+        worker.register_activity("work", move |ctx, _| {
+            *capture.lock().unwrap() = Some(ctx.clone());
+            async move {
+                assert!(
+                    ctx.heartbeat(json!({"completed":1}))
+                        .await?
+                        .heartbeat_recorded
+                );
+                if fail {
+                    return Err(Error::WorkerLoop("application failure".into()));
+                }
+                Ok(json!("done"))
+            }
+        });
+        assert_eq!(
+            worker.poll_activity_once().await.unwrap(),
+            ManagedPollOutcome::Handled
+        );
+        let context = saved.lock().unwrap().as_ref().unwrap().clone();
+        let before = server.requests.lock().unwrap().len();
+        assert!(matches!(
+            context.heartbeat(json!({"late":true})).await,
+            Err(Error::ActivityExecutionAbandoned(_))
+        ));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), before);
+        let paths = requests
+            .iter()
+            .map(|r| r.path.rsplit('/').next().unwrap())
+            .collect::<Vec<_>>();
+        let mut expected = vec!["poll", "status", "status", "heartbeat", "status", "status"];
+        if !fail {
+            expected.push("info");
+        }
+        expected.push(if fail { "fail" } else { "complete" });
+        assert_eq!(paths, expected);
+        let body: Value = serde_json::from_str(&requests.last().unwrap().body).unwrap();
+        assert_eq!(body["activity_attempt_id"], "attempt-original");
+        assert_eq!(body["lease_owner"], "actual-owner");
+        if fail {
+            assert_eq!(
+                body["failure"]["message"],
+                "worker loop error: application failure"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cooperative_activity_discards_results_and_failure_after_attempt_replacement() {
+    for (case, fail) in [
+        ("remote-replaced", false),
+        ("remote-replaced", true),
+        ("remote-late-result", false),
+    ] {
+        let server = remote_activity_server();
+        let mut worker = coordinator_worker(&server, case);
+        worker.register_activity("work", move |_, _| async move {
+            if fail {
+                Err(Error::WorkerLoop("application failure".into()))
+            } else {
+                Ok(json!("late"))
+            }
+        });
+        assert_eq!(
+            worker.poll_activity_once().await.unwrap(),
+            ManagedPollOutcome::Handled
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.last().unwrap().path.ends_with("/status"));
+        assert!(!requests.iter().any(|r| r.path.ends_with("/complete")
+            || r.path.ends_with("/fail")
+            || r.path.ends_with("/cluster/info")));
+    }
+}
+
+#[tokio::test]
+async fn cooperative_activity_heartbeat_abandons_changed_context_or_lost_authority() {
+    for case in [
+        "remote-context-changed",
+        "remote-heartbeat-wrong-attempt",
+        "remote-heartbeat-cancelled",
+        "remote-heartbeat-post-loss",
+    ] {
+        let server = remote_activity_server();
+        let mut worker = coordinator_worker(&server, case);
+        let changed = case == "remote-context-changed";
+        worker.register_activity("work", move |mut ctx, _| async move {
+            if changed {
+                ctx.activity_attempt_id = "replacement".into();
+            }
+            assert!(matches!(
+                ctx.heartbeat(json!({"progress":1})).await,
+                Err(Error::ActivityExecutionAbandoned(_))
+            ));
+            // Catching abandonment cannot restore publication authority.
+            Ok(json!("late"))
+        });
+        assert_eq!(
+            worker.poll_activity_once().await.unwrap(),
+            ManagedPollOutcome::Handled
+        );
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.path.ends_with("/complete") || r.path.ends_with("/fail")),
+            "{case}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path.ends_with("/activity/heartbeat"))
+                .count(),
+            if changed { 0 } else { 1 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn cooperative_activity_observer_drops_a_pending_callback_and_fences_its_context() {
+    let server = remote_activity_server();
+    let mut worker = coordinator_worker(&server, "remote-replaced");
+    let saved = Arc::new(Mutex::new(None::<ActivityContext>));
+    let capture = Arc::clone(&saved);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&dropped);
+    worker.register_activity("work", move |ctx, _| {
+        *capture.lock().unwrap() = Some(ctx);
+        PendingActivityCallback(Arc::clone(&finished))
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), worker.poll_activity_once())
+            .await
+            .unwrap()
+            .unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    let context = saved.lock().unwrap().as_ref().unwrap().clone();
+    assert!(dropped.load(Ordering::SeqCst));
+    let before = server.requests.lock().unwrap().len();
+    assert!(matches!(
+        context.heartbeat(Value::Null).await,
+        Err(Error::ActivityExecutionAbandoned(_))
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), before);
+    assert_eq!(before, 3);
+}
+
+#[tokio::test]
+async fn cooperative_activity_worker_shutdown_abandons_a_pending_callback_before_deregistration() {
+    let server = remote_activity_server();
+    let mut worker = coordinator_worker(&server, "remote-valid");
+    let saved = Arc::new(Mutex::new(None::<ActivityContext>));
+    let capture = Arc::clone(&saved);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let invoked = Arc::clone(&started);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&dropped);
+    worker.register_activity("work", move |ctx, _| {
+        *capture.lock().unwrap() = Some(ctx);
+        invoked.notify_one();
+        PendingActivityCallback(Arc::clone(&finished))
+    });
+    tokio::time::timeout(Duration::from_secs(3), worker.run_until(started.notified()))
+        .await
+        .unwrap()
+        .unwrap();
+    let context = saved.lock().unwrap().as_ref().unwrap().clone();
+    assert!(dropped.load(Ordering::SeqCst));
+    let before = server.requests.lock().unwrap().len();
+    assert!(matches!(
+        context.heartbeat(Value::Null).await,
+        Err(Error::ActivityExecutionAbandoned(_))
+    ));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), before);
+    let deregistration = requests.last().unwrap();
+    assert!(deregistration
+        .path
+        .ends_with("/worker/registrations/actual-owner"));
+    assert_eq!(deregistration.method, "DELETE");
+    assert!(!requests
+        .iter()
+        .any(|r| r.path.ends_with("/complete") || r.path.ends_with("/fail")));
+}
+
+#[tokio::test]
+async fn cooperative_activity_dropped_poll_future_abandons_cloned_context() {
+    let server = remote_activity_server();
+    let mut worker = coordinator_worker(&server, "remote-valid");
+    let saved = Arc::new(Mutex::new(None::<ActivityContext>));
+    let capture = Arc::clone(&saved);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let invoked = Arc::clone(&started);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&dropped);
+    worker.register_activity("work", move |ctx, _| {
+        *capture.lock().unwrap() = Some(ctx);
+        invoked.notify_one();
+        PendingActivityCallback(Arc::clone(&finished))
+    });
+    let poll = tokio::spawn(async move { worker.poll_activity_once().await });
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    poll.abort();
+    assert!(poll.await.unwrap_err().is_cancelled());
+    assert!(dropped.load(Ordering::SeqCst));
+    let context = saved.lock().unwrap().as_ref().unwrap().clone();
+    let before = server.requests.lock().unwrap().len();
+    assert!(matches!(
+        context.heartbeat(Value::Null).await,
+        Err(Error::ActivityExecutionAbandoned(_))
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), before);
+}
+
 fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
     let case = path.split('/').nth(1).unwrap_or_default();
     if path.ends_with("/cluster/info") {

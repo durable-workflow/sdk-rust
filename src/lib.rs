@@ -266,6 +266,8 @@ pub enum Error {
     CooperativeCancellationUnavailable(String),
     #[error("invalid cooperative cancellation: {0}")]
     InvalidCooperativeCancellation(String),
+    #[error("activity execution no longer owns its claim: {0}")]
+    ActivityExecutionAbandoned(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -7193,6 +7195,9 @@ impl Worker {
     }
 
     async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
+        if self.cooperative_cancellation_enabled {
+            return self.poll_cooperative_activity_once().await;
+        }
         let poll_request_id = unique_request_id("rust-activity-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -7906,6 +7911,7 @@ impl Worker {
             attempt_number: task.attempt_number,
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
+            claim_guard: None,
         };
 
         handler(ctx, args).await
@@ -13214,10 +13220,14 @@ pub struct ActivityContext {
     pub attempt_number: u64,
     pub task_queue: String,
     pub worker_id: String,
+    claim_guard: Option<cooperative_cancellation::ActivityClaimGuard>,
 }
 
 impl ActivityContext {
     pub async fn heartbeat<T: Serialize>(&self, details: T) -> Result<ActivityHeartbeatResponse> {
+        if let Some(guard) = &self.claim_guard {
+            return guard.heartbeat(self, details).await;
+        }
         self.client
             .heartbeat_activity_task(
                 &self.task_id,
