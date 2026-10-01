@@ -84,6 +84,292 @@ fn cancelled_selection_history() -> Vec<HistoryEvent> {
     ]
 }
 
+fn cancelled_parallel_history() -> Vec<HistoryEvent> {
+    let paths = nested_parallel_paths();
+    let mut delivery = canonical_delivery(1, "parallel");
+    delivery.payload["sequence_span"] = json!(3);
+    vec![
+        parallel_history_event(
+            "ActivityScheduled",
+            1,
+            "activity_type",
+            "first",
+            paths[0].clone(),
+            None,
+        ),
+        parallel_history_event(
+            "ChildWorkflowScheduled",
+            2,
+            "workflow_type",
+            "second",
+            paths[1].clone(),
+            None,
+        ),
+        parallel_history_event(
+            "ActivityScheduled",
+            3,
+            "activity_type",
+            "third",
+            paths[2].clone(),
+            None,
+        ),
+        canonical_request(),
+        delivery,
+    ]
+}
+
+#[test]
+fn cooperative_parallel_replays_one_original_cancellation_for_nested_mixed_leaves() {
+    for _cold_restart in 0..2 {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _input| async move {
+            ctx.parallel(nested_parallel_operations()).await?;
+            Ok(Value::Null)
+        });
+        let commands = worker
+            .execute_workflow_task(cancellation_task(cancelled_parallel_history()))
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0]["exception_type"],
+            "WorkflowCancellationRequested"
+        );
+        assert_eq!(
+            commands[0]["exception"]["properties"]["request_id"],
+            "original-request"
+        );
+        assert_eq!(commands[0]["non_retryable"], true);
+    }
+}
+
+#[test]
+fn cooperative_parallel_preserves_prior_result_and_overrides_a_late_leaf_failure() {
+    let mut events = cancelled_parallel_history();
+    events.insert(
+        3,
+        parallel_history_event(
+            "ActivityCompleted",
+            1,
+            "activity_type",
+            "first",
+            nested_parallel_paths()[0].clone(),
+            Some(json!(7)),
+        ),
+    );
+    events.push(event("ActivityFailed", json!({"sequence":3, "activity_type":"third", "exception_type":"LateFailure", "exception":{"class":"LateFailure", "message":"too late"}})));
+    let ctx = workflow_context(events);
+    let mut call = Box::pin(ctx.parallel(nested_parallel_operations()));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    let Poll::Ready(Err(Error::CooperativeCancellationRequested(cancellation))) =
+        call.as_mut().poll(&mut cx)
+    else {
+        panic!("group cancellation must retain priority")
+    };
+    assert_eq!(cancellation.delivery.sequence_span, 3);
+    assert_eq!(ctx.state.lock().unwrap().command_cursor, 3);
+    ctx.ensure_history_consumed().unwrap();
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn cooperative_parallel_does_not_hide_changed_later_leaf_details() {
+    let mut events = cancelled_parallel_history();
+    events[2].payload["activity_type"] = json!("changed-third");
+    let ctx = workflow_context(events);
+    let mut call = Box::pin(ctx.parallel(nested_parallel_operations()));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    assert!(
+        matches!(call.as_mut().poll(&mut cx), Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure { reason, .. }))) if reason == "recorded_command_detail_mismatch")
+    );
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn cooperative_parallel_rejects_changed_span_nesting_scalar_and_cleanup_scope() {
+    for change in 0..4 {
+        let ctx = workflow_context(cancelled_parallel_history());
+        let _shield = if change == 3 {
+            Some(ctx.cancellation_shield().unwrap())
+        } else {
+            None
+        };
+        let operations = match change {
+            0 => vec![ParallelOperation::activity("first", json!([]))],
+            1 => vec![
+                ParallelOperation::activity("first", json!([])),
+                ParallelOperation::child_workflow(
+                    "second",
+                    ChildWorkflowOptions::new("child-workers"),
+                    json!([]),
+                ),
+                ParallelOperation::activity("third", json!([])),
+            ],
+            _ => nested_parallel_operations(),
+        };
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let outcome = if change == 2 {
+            Box::pin(ctx.activity("first", json!([])))
+                .as_mut()
+                .poll(&mut cx)
+                .map_ok(|_| ())
+        } else {
+            Box::pin(ctx.parallel(operations))
+                .as_mut()
+                .poll(&mut cx)
+                .map_ok(|_| ())
+        };
+        assert!(matches!(
+            outcome,
+            Poll::Ready(Err(Error::NonDeterministicReplay(_)))
+        ));
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_parallel_cold_delivery_covers_all_scalar_leaf_kinds_without_scheduling() {
+    let mut delivery = canonical_delivery(1, "parallel");
+    delivery.payload["sequence_span"] = json!(5);
+    let ctx = workflow_context(vec![canonical_request(), delivery]);
+    let mut call = Box::pin(ctx.parallel(vec![
+        ParallelOperation::activity("work", json!([])),
+        ParallelOperation::child_workflow(
+            "child",
+            ChildWorkflowOptions::new("child-workers"),
+            json!([]),
+        ),
+        ParallelOperation::timer(Duration::from_secs(5)),
+        ParallelOperation::signal("ready"),
+        ParallelOperation::condition(ConditionWaitOptions::new("ready", "sha256:ready"), || {
+            Ok(false)
+        }),
+    ]));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    assert!(matches!(
+        call.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::CooperativeCancellationRequested(_)))
+    ));
+    assert_eq!(ctx.state.lock().unwrap().command_cursor, 5);
+    ctx.ensure_history_consumed().unwrap();
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn cooperative_parallel_validates_recorded_timer_signal_and_condition_leaves() {
+    for changed in 0..3 {
+        let names = [
+            ("ActivityScheduled", "activity_type", "work"),
+            ("ChildWorkflowScheduled", "workflow_type", "child"),
+            ("TimerScheduled", "timer_id", "timer"),
+            ("SignalWaitOpened", "signal_name", "ready"),
+            ("ConditionWaitOpened", "condition_wait_id", "condition"),
+        ];
+        let mut events = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, (event_type, field, name))| {
+                parallel_history_event(
+                    event_type,
+                    index as u64 + 1,
+                    field,
+                    name,
+                    vec![parallel_group_entry(1, 5, index, "mixed")],
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        events[2].payload["delay_seconds"] = json!(if changed == 1 { 500 } else { 5 });
+        events[4].payload["condition_wait_occurrence_id"] = json!("rust:condition-wait:0");
+        events[4].payload["condition_key"] = json!("ready");
+        events[4].payload["condition_definition_fingerprint"] = json!(if changed == 2 {
+            "changed"
+        } else {
+            "sha256:ready"
+        });
+        let mut delivery = canonical_delivery(1, "parallel");
+        delivery.payload["sequence_span"] = json!(5);
+        events.extend([canonical_request(), delivery]);
+        let ctx = workflow_context(events);
+        let mut call = Box::pin(ctx.parallel(vec![
+            ParallelOperation::activity("work", json!([])),
+            ParallelOperation::child_workflow(
+                "child",
+                ChildWorkflowOptions::new("child-workers"),
+                json!([]),
+            ),
+            ParallelOperation::timer(Duration::from_secs(5)),
+            ParallelOperation::signal("ready"),
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("ready", "sha256:ready"),
+                || panic!("delivered condition must not reevaluate its predicate"),
+            ),
+        ]));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        match call.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(Error::CooperativeCancellationRequested(_))) if changed == 0 => {
+                ctx.ensure_history_consumed().unwrap();
+            }
+            Poll::Ready(Err(Error::NonDeterministicReplay(failure))) if changed == 1 => {
+                assert_eq!(failure.reason, "timer_delay_mismatch");
+            }
+            Poll::Ready(Err(Error::NonDeterministicReplay(failure))) if changed == 2 => {
+                assert_eq!(failure.reason, "condition_wait_predicate_mismatch");
+            }
+            other => panic!("{changed}: {other:?}"),
+        }
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_selection_group_delivers_before_an_uncommitted_winner() {
+    let mut delivery = canonical_delivery(1, "parallel");
+    delivery.payload["sequence_span"] = json!(2);
+    let events = vec![
+        selection_activity_event("ActivityScheduled", 0, "slow", None),
+        selection_activity_event("ActivityScheduled", 1, "fast", None),
+        canonical_request(),
+        delivery,
+        selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("too-late"))),
+        selection_winner_marker(),
+    ];
+    let ctx = workflow_context(events);
+    let mut select = Box::pin(keyed_activity_selection(&ctx));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    assert!(matches!(
+        select.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::CooperativeCancellationRequested(_)))
+    ));
+    ctx.ensure_history_consumed().unwrap();
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn cooperative_parallel_saga_cleanup_uses_the_slot_after_the_entire_group() {
+    let mut events = cancelled_parallel_history();
+    events.extend(completed_activity(4, "undo", Value::Null));
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        saga.finish(ctx.parallel(nested_parallel_operations()).await)
+            .await?;
+        Ok(Value::Null)
+    });
+    let commands = worker
+        .execute_workflow_task(cancellation_task(events))
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0]["exception_type"],
+        "WorkflowCancellationRequested"
+    );
+    assert_eq!(
+        commands[0]["exception"]["properties"]["request_id"],
+        "original-request"
+    );
+}
+
 #[test]
 fn cooperative_selection_handle_replays_original_request_after_committed_winner() {
     for _cold_restart in 0..2 {

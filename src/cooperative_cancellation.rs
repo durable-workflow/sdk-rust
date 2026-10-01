@@ -218,6 +218,36 @@ impl CancellationHistory {
         let Some(delivery) = &self.delivery else {
             return Ok(commands);
         };
+        if delivery.call_kind == CancellationCallKind::Parallel {
+            let index = commands.partition_point(|command| command.sequence() < delivery.sequence);
+            let end = commands.partition_point(|command| {
+                command.sequence() < delivery.sequence + delivery.sequence_span
+            });
+            if commands.get(index).map(RecordedCommand::sequence) != Some(delivery.sequence) {
+                let previous = index
+                    .checked_sub(1)
+                    .map_or(0, |index| commands[index].sequence());
+                if previous.checked_add(1) != Some(delivery.sequence) {
+                    return Err(invalid_recorded_history(
+                        "cooperative_cancellation_call_mismatch",
+                        delivery.sequence,
+                        "next authored parallel group",
+                        "missing earlier call",
+                        "parallel cancellation marker skips an unrecorded authored command",
+                    ));
+                }
+            }
+            let original = commands.drain(index..end).collect();
+            commands.insert(
+                index,
+                RecordedCommand::CancellationGroup {
+                    sequence: delivery.sequence,
+                    span: delivery.sequence_span,
+                    original,
+                },
+            );
+            return Ok(commands);
+        }
         if !matches!(
             delivery.call_kind,
             CancellationCallKind::Activity
@@ -473,6 +503,77 @@ impl CancellationHistory {
 }
 
 impl WorkflowState {
+    pub(super) fn expand_cancellation_group(
+        &mut self,
+        descriptors: &[ParallelDescriptor],
+    ) -> Result<()> {
+        let Some(RecordedCommand::CancellationGroup {
+            sequence,
+            span,
+            original,
+        }) = self.recorded_commands.get(self.command_cursor).cloned()
+        else {
+            return Ok(());
+        };
+        self.validate_cancellation_call(
+            sequence,
+            CancellationCallKind::Parallel,
+            CancellationCallKind::Parallel,
+        )?;
+        if descriptors.len() as u64 != span {
+            return Err(invalid_recorded_history(
+                "cooperative_cancellation_call_mismatch",
+                sequence,
+                &format!("parallel group with {span} durable leaves"),
+                &format!("{} durable leaves", descriptors.len()),
+                "authored parallel group span differs from its committed cancellation",
+            ));
+        }
+        let mut original = original.into_iter().peekable();
+        let mut leaves = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            let leaf_sequence = sequence + descriptor.offset as u64;
+            let command = if original.peek().map(RecordedCommand::sequence) == Some(leaf_sequence) {
+                original.next()
+            } else {
+                None
+            };
+            if self
+                .cancellation_history
+                .resolved_before_request
+                .contains(&leaf_sequence)
+            {
+                let command = command.ok_or_else(|| {
+                    invalid_recorded_history(
+                        "cooperative_cancellation_call_mismatch",
+                        leaf_sequence,
+                        "recorded earlier result",
+                        "missing durable call",
+                        "parallel cancellation cannot discard an earlier committed result",
+                    )
+                })?;
+                leaves.push(command);
+                continue;
+            }
+            let kind = match &descriptor.operation {
+                ParallelOperation::Activity { .. } => CancellationCallKind::Activity,
+                ParallelOperation::ChildWorkflow { .. } => CancellationCallKind::Child,
+                ParallelOperation::Timer(_) => CancellationCallKind::Timer,
+                ParallelOperation::Signal(_) => CancellationCallKind::Signal,
+                ParallelOperation::Condition { .. } => CancellationCallKind::Condition,
+                ParallelOperation::Group(_) => unreachable!("descriptor is a durable leaf"),
+            };
+            leaves.push(RecordedCommand::CancellationBoundary {
+                sequence: leaf_sequence,
+                call_kind: kind,
+                original: command.map(Box::new),
+            });
+        }
+        self.recorded_commands
+            .splice(self.command_cursor..=self.command_cursor, leaves);
+        Ok(())
+    }
+
     pub(super) fn cancellation_error(&self) -> Error {
         match (
             &self.cancellation_history.request,

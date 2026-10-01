@@ -9601,6 +9601,11 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
 
 #[derive(Clone, Debug)]
 enum RecordedCommand {
+    CancellationGroup {
+        sequence: u64,
+        span: u64,
+        original: Vec<RecordedCommand>,
+    },
     CancellationBoundary {
         sequence: u64,
         call_kind: CancellationCallKind,
@@ -10119,7 +10124,8 @@ fn activity_options_description(options: &RecordedActivityOptions) -> String {
 impl RecordedCommand {
     fn sequence(&self) -> u64 {
         match self {
-            Self::CancellationBoundary { sequence, .. }
+            Self::CancellationGroup { sequence, .. }
+            | Self::CancellationBoundary { sequence, .. }
             | Self::Activity { sequence, .. }
             | Self::Timer { sequence, .. }
             | Self::ChildWorkflow { sequence, .. }
@@ -10134,7 +10140,9 @@ impl RecordedCommand {
 
     fn shape(&self) -> &'static str {
         match self {
-            Self::CancellationBoundary { .. } => "cooperative cancellation",
+            Self::CancellationBoundary { .. } | Self::CancellationGroup { .. } => {
+                "cooperative cancellation"
+            }
             Self::Activity { .. } => "activity",
             Self::Timer { .. } => "timer",
             Self::ChildWorkflow { .. } => "child workflow",
@@ -10687,7 +10695,13 @@ impl ParallelCall {
             }
         };
 
-        self.leaves = parallel_descriptors(operations, base_sequence)?
+        let descriptors = parallel_descriptors(operations, base_sequence)?;
+        self.ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .expand_cancellation_group(&descriptors)?;
+        self.leaves = descriptors
             .into_iter()
             .map(|descriptor| {
                 let call = parallel_leaf_call(
@@ -10736,6 +10750,12 @@ impl ParallelCall {
             if let Some(position) = failures
                 .iter()
                 .position(|(_, error)| workflow_task_integrity_error(error))
+            {
+                return Poll::Ready(Err(failures.remove(position).1));
+            }
+            if let Some(position) = failures
+                .iter()
+                .position(|(_, error)| matches!(error, Error::CooperativeCancellationRequested(_)))
             {
                 return Poll::Ready(Err(failures.remove(position).1));
             }
@@ -11127,7 +11147,12 @@ impl SelectCall {
                 .state
                 .lock()
                 .map_err(|_| Error::WorkflowStatePoisoned)?;
-            if let Some(marker) = state.selection_markers.get(state.selection_marker_cursor) {
+            if let Some(RecordedCommand::CancellationGroup { sequence, .. }) =
+                state.recorded_commands.get(state.command_cursor)
+            {
+                *sequence
+            } else if let Some(marker) = state.selection_markers.get(state.selection_marker_cursor)
+            {
                 marker.selection_group_base_sequence
             } else if let Some(recorded) = state.recorded_commands.get(state.command_cursor) {
                 recorded.sequence()
@@ -11144,6 +11169,11 @@ impl SelectCall {
         };
         let (descriptors, members) = selection_descriptors(operations, base_sequence)?;
         let group_id = format!("select-calls:{base_sequence}:{}", descriptors.len());
+        self.ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .expand_cancellation_group(&descriptors)?;
         self.leaves = descriptors
             .into_iter()
             .map(|descriptor| SelectionLeaf {
@@ -11181,6 +11211,20 @@ impl Future for SelectCall {
                 }
                 leaf.outcome = Some(outcome);
             }
+        }
+
+        if let Some(leaf) = self.leaves.iter_mut().find(|leaf| {
+            matches!(
+                leaf.outcome,
+                Some(Err(Error::CooperativeCancellationRequested(_)))
+            )
+        }) {
+            return Poll::Ready(
+                leaf.outcome
+                    .take()
+                    .expect("matched cancellation")
+                    .map(|_| unreachable!()),
+            );
         }
 
         let all_members_terminal = self.leaves.iter().all(|leaf| leaf.outcome.is_some());
@@ -11666,7 +11710,8 @@ fn recorded_selection_member_is_terminal(
             | RecordedCommand::SideEffect { .. }
             | RecordedCommand::VersionMarker { .. }
             | RecordedCommand::Memo { .. }
-            | RecordedCommand::CancellationBoundary { .. } => false,
+            | RecordedCommand::CancellationBoundary { .. }
+            | RecordedCommand::CancellationGroup { .. } => false,
         };
         if !terminal {
             all_completed = false;
