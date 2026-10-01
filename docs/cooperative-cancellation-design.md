@@ -27,9 +27,46 @@ request/run binding, cycles, budget and delivery snapshot equality. Older
 cancellation histories without rich context keep their existing delivery behavior
 with `context == None`.
 
+## Child policies
+
+`ChildWorkflowOptions` accepts `CancellationPolicy` through its builder for
+ordinary, parallel and selected child calls.
+
+```rust
+ChildWorkflowOptions::new("python-workers")
+    .cancellation_policy(CancellationPolicy::WaitCancellationCompleted)
+    .parent_close_policy(ParentClosePolicy::RequestCancellation)
+```
+
+`TryCancel` requests child cleanup and delivers parent cancellation without
+waiting. `WaitCancellationCompleted` parks the parent until the child reaches a
+recorded terminal outcome, releasing its task claim for other work. `Abandon`
+leaves the child independent and preserves the historical default. Parent
+closure remains separate. `RequestCancellation` requests genuine cooperative
+cleanup with the original lineage and budget. `RequestCancel` retains its
+legacy terminal behavior.
+
+Cold replay compares both policies, including cancellation delivery and groups.
+Omitted historical fields preserve the `Abandon` defaults. Later events with
+missing fields retain the scheduled snapshot. Invalid or conflicting policy
+history fails explicitly. A worker without the cooperation opt-in refuses the
+commands before completion with its identity and required protocol. Server also
+checks the immutable task claim and installed backend.
+
+## Rust API release boundary
+
+The candidate adds a variant to the existing exhaustive `ParentClosePolicy`
+enum and a field to the public `ChildWorkflowOptions` struct. Existing struct
+literals and exhaustive matches need updates. The cooperative error variants
+also extend an existing exhaustive public enum. These changes require a major
+Rust SDK release if retained. This draft does not authorize that release or
+change the published package version. The qualified release proposal must
+include its migration notes and receive the major-release decision before
+publication.
+
 ## Remaining qualification
 
-Portable operation policies, nested scopes and deterministic remaining-time
+Portable activity policies, nested scopes and deterministic remaining-time
 helpers still need completion. Remaining time must use the replayed workflow
 clock. Do not subtract the host clock from the deadline in workflow code. The
 runtime continues enforcing the original deadline and fencing task and activity

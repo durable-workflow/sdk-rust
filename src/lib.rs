@@ -1273,7 +1273,10 @@ pub struct SagaCompensationFailure {
 pub enum ParentClosePolicy {
     #[default]
     Abandon,
+    /// Legacy terminal cancellation without cooperative cleanup.
     RequestCancel,
+    /// Request cooperative cleanup with the original lineage and deadline.
+    RequestCancellation,
     Terminate,
 }
 
@@ -1282,7 +1285,31 @@ impl ParentClosePolicy {
         match self {
             Self::Abandon => "abandon",
             Self::RequestCancel => "request_cancel",
+            Self::RequestCancellation => "request_cancellation",
             Self::Terminate => "terminate",
+        }
+    }
+}
+
+/// Cancellation at an awaiting child call.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CancellationPolicy {
+    /// Request child cleanup and deliver parent cancellation without waiting.
+    TryCancel,
+    /// Wait for the child's recorded terminal outcome before parent delivery.
+    WaitCancellationCompleted,
+    /// Leave the child independent. This preserves the historical default.
+    #[default]
+    Abandon,
+}
+
+impl CancellationPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TryCancel => "try_cancel",
+            Self::WaitCancellationCompleted => "wait_cancellation_completed",
+            Self::Abandon => "abandon",
         }
     }
 }
@@ -1302,6 +1329,7 @@ pub struct ChildWorkflowRetryPolicy {
 pub struct ChildWorkflowOptions {
     pub task_queue: String,
     pub parent_close_policy: ParentClosePolicy,
+    pub cancellation_policy: CancellationPolicy,
     pub retry_policy: Option<ChildWorkflowRetryPolicy>,
     pub execution_timeout_seconds: Option<u64>,
     pub run_timeout_seconds: Option<u64>,
@@ -1312,6 +1340,7 @@ impl ChildWorkflowOptions {
         Self {
             task_queue: task_queue.into(),
             parent_close_policy: ParentClosePolicy::Abandon,
+            cancellation_policy: CancellationPolicy::Abandon,
             retry_policy: None,
             execution_timeout_seconds: None,
             run_timeout_seconds: None,
@@ -1320,6 +1349,11 @@ impl ChildWorkflowOptions {
 
     pub fn parent_close_policy(mut self, policy: ParentClosePolicy) -> Self {
         self.parent_close_policy = policy;
+        self
+    }
+
+    pub fn cancellation_policy(mut self, policy: CancellationPolicy) -> Self {
+        self.cancellation_policy = policy;
         self
     }
 
@@ -7889,6 +7923,21 @@ impl Worker {
         ctx: &WorkflowContext,
         commands: Vec<Value>,
     ) -> Result<WorkflowTaskDecision> {
+        if !self.cooperative_cancellation_enabled
+            && commands.iter().any(|command| {
+                command["type"] == "start_child_workflow"
+                    && (command["parent_close_policy"] == "request_cancellation"
+                        || matches!(
+                            command["cancellation_policy"].as_str(),
+                            Some("try_cancel" | "wait_cancellation_completed")
+                        ))
+            })
+        {
+            return Err(Error::CooperativeCancellationUnavailable(format!(
+                "child_cancellation_policy_not_supported: Rust worker {} must enable cooperative cancellation with worker protocol 1.20 and a compatible Server/Native backend",
+                self.worker_id,
+            )));
+        }
         let (message_stream_cursors, message_stream_waits) = ctx.message_stream_metadata()?;
         let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
         if state.cancellation_delivery_intent.is_some()
@@ -9829,6 +9878,7 @@ enum RecordedCommand {
     ChildWorkflow {
         sequence: u64,
         workflow_type: Option<String>,
+        policies: RecordedChildPolicies,
         outcome: Option<ChildWorkflowOutcome>,
         parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
@@ -10165,6 +10215,109 @@ struct RecordedActivityOptions {
     task_queue: RecordedSnapshotValue<Option<String>>,
     execution_mode: RecordedSnapshotValue<Option<String>>,
     retry_policy: ActivityRetrySnapshot,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedChildPolicies {
+    parent_close_policy: String,
+    cancellation_policy: String,
+}
+
+fn recorded_child_policy_value<'a>(
+    payload: &'a Value,
+    field: &str,
+    sequence: u64,
+) -> Result<Option<&'a str>> {
+    let Some(value) = payload.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let valid = match (field, value.as_str()) {
+        (
+            "parent_close_policy",
+            Some("abandon" | "request_cancel" | "request_cancellation" | "terminate"),
+        ) => true,
+        ("cancellation_policy", Some("abandon" | "try_cancel" | "wait_cancellation_completed")) => {
+            true
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(invalid_recorded_history(
+            "invalid_child_workflow_policy_history",
+            sequence,
+            "supported child workflow policy",
+            &value.to_string(),
+            "child workflow history contains an invalid policy",
+        ));
+    }
+    Ok(value.as_str())
+}
+
+fn recorded_child_policies(
+    events: &[&HistoryEvent],
+    scheduled: &HistoryEvent,
+    sequence: u64,
+) -> Result<RecordedChildPolicies> {
+    let parent_close_policy =
+        recorded_child_policy_value(&scheduled.payload, "parent_close_policy", sequence)?
+            .unwrap_or("abandon")
+            .to_string();
+    let cancellation_policy =
+        recorded_child_policy_value(&scheduled.payload, "cancellation_policy", sequence)?
+            .unwrap_or("abandon")
+            .to_string();
+    for event in events {
+        for (field, expected) in [
+            ("parent_close_policy", parent_close_policy.as_str()),
+            ("cancellation_policy", cancellation_policy.as_str()),
+        ] {
+            if let Some(actual) = recorded_child_policy_value(&event.payload, field, sequence)? {
+                if actual != expected {
+                    return Err(invalid_recorded_history(
+                        "child_workflow_policy_history_conflict",
+                        sequence,
+                        expected,
+                        actual,
+                        "child workflow policy changed between history events",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(RecordedChildPolicies {
+        parent_close_policy,
+        cancellation_policy,
+    })
+}
+
+fn ensure_child_policies_match(
+    sequence: u64,
+    recorded: &RecordedChildPolicies,
+    current: &ChildWorkflowOptions,
+) -> Result<()> {
+    for (field, expected, actual) in [
+        (
+            "parent_close_policy",
+            recorded.parent_close_policy.as_str(),
+            current.parent_close_policy.as_str(),
+        ),
+        (
+            "cancellation_policy",
+            recorded.cancellation_policy.as_str(),
+            current.cancellation_policy.as_str(),
+        ),
+    ] {
+        if expected != actual {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "child_workflow_policy_changed",
+                Some(sequence),
+                Some(expected.to_string()),
+                Some(actual.to_string()),
+                format!("child workflow {field} changed during replay"),
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -12994,6 +13147,7 @@ impl ChildWorkflowCall {
             match recorded {
                 RecordedCommand::ChildWorkflow {
                     workflow_type,
+                    policies,
                     outcome,
                     parallel_group_path,
                     ..
@@ -13017,6 +13171,11 @@ impl ChildWorkflowCall {
                                 ),
                             )));
                         }
+                    }
+                    if let Err(error) =
+                        ensure_child_policies_match(sequence, &policies, &self.options)
+                    {
+                        return Poll::Ready(Err(error));
                     }
                     if let Err(error) =
                         state.replay_cancellation_at(cursor, CancellationCallKind::Child)
@@ -13095,6 +13254,12 @@ impl ChildWorkflowCall {
             let object = command
                 .as_object_mut()
                 .expect("child workflow command is always an object");
+            if self.options.cancellation_policy != CancellationPolicy::Abandon {
+                object.insert(
+                    "cancellation_policy".to_string(),
+                    json!(self.options.cancellation_policy.as_str()),
+                );
+            }
             if let Some(policy) = &self.options.retry_policy {
                 let mut retry_policy = serde_json::Map::new();
                 if let Some(max_attempts) = policy.max_attempts {
@@ -13885,6 +14050,7 @@ fn recorded_commands(
         let is_child_workflow = matches!(
             event.event_type.as_str(),
             "ChildWorkflowScheduled"
+                | "ChildRunStarted"
                 | "ChildRunCompleted"
                 | "ChildRunFailed"
                 | "ChildRunCancelled"
@@ -14137,6 +14303,7 @@ fn recorded_commands(
                         "child workflow replay requires exactly one recorded schedule event",
                     ));
                 }
+                let policies = recorded_child_policies(&child_events, scheduled[0], sequence)?;
                 let workflow_type = child_events.iter().find_map(|event| {
                     event
                         .payload
@@ -14194,6 +14361,7 @@ fn recorded_commands(
                 return Ok(RecordedCommand::ChildWorkflow {
                     sequence,
                     workflow_type,
+                    policies,
                     outcome: outcomes.pop(),
                     parallel_group_path,
                 });
@@ -15830,6 +15998,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod child_workflow_policies;
     mod cooperative_cancellation;
     mod runtime_payloads;
     mod runtime_uploads;
@@ -22643,6 +22812,7 @@ mod tests {
                         "child_workflow_instance_id": "wf-child",
                         "child_workflow_run_id": "run-child",
                         "child_workflow_type": "python.child",
+                        "parent_close_policy": "terminate",
                     }),
                     raw: HashMap::new(),
                 },
@@ -22866,6 +23036,7 @@ mod tests {
             }),
         );
         task.workflow_type = "rust.handled-parent".to_string();
+        task.history_events[0].payload["parent_close_policy"] = json!("abandon");
 
         let commands = worker.execute_workflow_task(task).expect("handled failure");
         assert_eq!(commands[0]["type"], "complete_workflow");
