@@ -5,10 +5,10 @@ mod runtime_payloads;
 mod runtime_uploads;
 
 pub use cooperative_cancellation::{
-    CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt, CancellationHistory,
-    CancellationRequest, CancellationShield, CooperativeCancellationOptions,
-    CooperativeCancellationRequested, CooperativeWorkflowTask, CooperativeWorkflowTaskPoll,
-    WorkflowCancellationRequest, WorkflowTaskHeartbeat,
+    CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
+    CancellationDeliveryReply, CancellationHistory, CancellationRequest, CancellationShield,
+    CooperativeCancellationOptions, CooperativeCancellationRequested, CooperativeWorkflowTask,
+    CooperativeWorkflowTaskPoll, WorkflowCancellationRequest, WorkflowTaskHeartbeat,
 };
 
 use std::{

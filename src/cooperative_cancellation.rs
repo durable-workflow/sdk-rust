@@ -12,6 +12,18 @@ pub struct CancellationDeliveryReceipt {
     pub delivery: CancellationDelivery,
 }
 
+/// Delivery either commits or parks the parent until canonical child cleanup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancellationDeliveryReply {
+    Delivered(CancellationDeliveryReceipt),
+    /// The current claim is completed. Return to polling without publishing
+    /// completion or failure. A child terminal event wakes a successor claim.
+    ClaimReleased {
+        task_id: String,
+        run_id: String,
+    },
+}
+
 /// Successful renewal of the exact workflow-task claim with optional observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowTaskHeartbeat {
@@ -1294,12 +1306,13 @@ impl Client {
     /// This explicit worker-protocol 1.20 operation renews no lease and advertises
     /// no worker capability. The Server requires a previously admitted capable
     /// claim. Reload canonical history before exposing cancellation to workflow
-    /// code, including when an acknowledgment is lost.
+    /// code, including when an acknowledgment is lost. A child wait explicitly
+    /// releases the claim and must return the worker to polling.
     pub async fn deliver_workflow_cancellation(
         &self,
         task: &WorkflowTask,
         delivery: &CancellationDelivery,
-    ) -> Result<CancellationDeliveryReceipt> {
+    ) -> Result<CancellationDeliveryReply> {
         let (owner, run_id) = cancellation_claim(task)?;
         let body = json!({
             "lease_owner":owner, "workflow_task_attempt":task.workflow_task_attempt,
@@ -1328,6 +1341,33 @@ impl Client {
                     Some(&body),
                 )
                 .await?;
+            if response["delivered"].as_bool() == Some(false)
+                && matches!(
+                    delivery.call_kind,
+                    CancellationCallKind::Child
+                        | CancellationCallKind::Parallel
+                        | CancellationCallKind::SelectionHandle
+                )
+                && response["reason"].as_str() == Some("cancellation_waiting_for_child")
+                && response["claim_released"].as_bool() == Some(true)
+                && response["task_id"].as_str() == Some(task.task_id.as_str())
+                && response["workflow_run_id"].as_str() == Some(run_id)
+                && [
+                    "request_id",
+                    "sequence",
+                    "call_kind",
+                    "sequence_span",
+                    "operation_sequence",
+                    "operation_sequence_span",
+                ]
+                .iter()
+                .all(|field| response.get(*field).is_none_or(Value::is_null))
+            {
+                return Ok(CancellationDeliveryReply::ClaimReleased {
+                    task_id: task.task_id.clone(),
+                    run_id: run_id.to_owned(),
+                });
+            }
             if response["delivered"].as_bool() != Some(true)
                 || response["task_id"].as_str() != Some(task.task_id.as_str())
                 || response["workflow_run_id"].as_str() != Some(run_id)
@@ -1351,11 +1391,13 @@ impl Client {
                     "delivery acknowledgment changed its authored operation range",
                 ));
             }
-            Ok(CancellationDeliveryReceipt {
-                task_id: task.task_id.clone(),
-                run_id: run_id.to_owned(),
-                delivery: delivery.clone(),
-            })
+            Ok(CancellationDeliveryReply::Delivered(
+                CancellationDeliveryReceipt {
+                    task_id: task.task_id.clone(),
+                    run_id: run_id.to_owned(),
+                    delivery: delivery.clone(),
+                },
+            ))
         })
         .await
         .map_err(|_| Error::Timeout)?
@@ -1642,7 +1684,9 @@ impl Worker {
         };
         // An uncertain observation, delivery or canonical refresh cannot become
         // an application failure or be published as a workflow-task decision.
-        let decision = self.replay_cooperative_workflow_claim(&claim).await?;
+        let Some(decision) = self.replay_cooperative_workflow_claim(&claim).await? else {
+            return Ok(ManagedPollOutcome::Handled);
+        };
         let (owner, _) = cancellation_claim(&claim.task)?;
         self.settle_workflow_task_decision(
             &claim.task.task_id,
@@ -1658,7 +1702,7 @@ impl Worker {
     async fn replay_cooperative_workflow_claim(
         &self,
         claim: &CooperativeWorkflowTask,
-    ) -> Result<WorkflowTaskDecision> {
+    ) -> Result<Option<WorkflowTaskDecision>> {
         let (owner, run_id) = cancellation_claim(&claim.task)?;
         if owner != self.worker_id {
             return Err(invalid(
@@ -1673,7 +1717,7 @@ impl Worker {
                     "cooperative replay omitted its original pending observation",
                 ));
             }
-            return self.execute_workflow_task_decision(task);
+            return self.execute_workflow_task_decision(task).map(Some);
         };
         task.history_events = self
             .client
@@ -1689,20 +1733,24 @@ impl Worker {
                 Some(observation),
             )?;
             let Some(intent) = decision.cancellation_delivery.as_ref() else {
-                return Ok(decision);
+                return Ok(Some(decision));
             };
             if !decision.commands.is_empty() {
                 // Native permits delivery only at/before its next durable call.
                 // Commit earlier commands first. Completion releases this claim
                 // and its successor replays their durable results before delivery.
                 decision.cancellation_delivery = None;
-                return Ok(decision);
+                return Ok(Some(decision));
             }
-            let delivery_error = self
+            let delivery_error = match self
                 .client
                 .deliver_workflow_cancellation(&claim.task, intent)
                 .await
-                .err();
+            {
+                Ok(CancellationDeliveryReply::ClaimReleased { .. }) => return Ok(None),
+                Ok(CancellationDeliveryReply::Delivered(_)) => None,
+                Err(error) => Some(error),
+            };
             task.history_events = self
                 .client
                 .refresh_workflow_cancellation_history(&claim.task, observation)

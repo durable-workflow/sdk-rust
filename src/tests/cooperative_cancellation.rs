@@ -1817,6 +1817,13 @@ fn transport_delivery() -> CancellationDelivery {
     CancellationDelivery::from_payload(&canonical_delivery(1, "timer").payload).unwrap()
 }
 
+fn pending_child_delivery(task_id: &str) -> Value {
+    json!({"delivered":false, "task_id":task_id, "workflow_run_id":"run",
+        "reason":"cancellation_waiting_for_child", "claim_released":true,
+        "request_id":null, "sequence":null, "call_kind":null, "sequence_span":null,
+        "operation_sequence":null, "operation_sequence_span":null})
+}
+
 fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
     let case = path.split('/').nth(1).unwrap_or_default();
     let body: Value = serde_json::from_str(body).unwrap();
@@ -1901,6 +1908,28 @@ fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'stati
             })
             .to_string(),
         ));
+    }
+    if path.ends_with("/deliver-cancellation") && case.starts_with("child-wait") {
+        let mut pending = pending_child_delivery("task/selected");
+        match case {
+            "child-wait-wrong-task" => pending["task_id"] = json!("other"),
+            "child-wait-wrong-run" => pending["workflow_run_id"] = json!("other"),
+            "child-wait-not-released" => pending["claim_released"] = json!(false),
+            "child-wait-string-released" => pending["claim_released"] = json!("true"),
+            "child-wait-missing-release" => {
+                pending.as_object_mut().unwrap().remove("claim_released");
+            }
+            "child-wait-wrong-reason" => pending["reason"] = json!("other"),
+            "child-wait-request" => pending["request_id"] = body["request_id"].clone(),
+            "child-wait-sequence" => pending["sequence"] = json!(1),
+            "child-wait-kind" => pending["call_kind"] = json!("child"),
+            "child-wait-span" => pending["sequence_span"] = json!(1),
+            "child-wait-operation" => pending["operation_sequence"] = json!(1),
+            "child-wait-operation-span" => pending["operation_sequence_span"] = json!(1),
+            "child-wait-string-delivered" => pending["delivered"] = json!("false"),
+            _ => {}
+        }
+        return Some(("200 OK", pending.to_string()));
     }
     let mut response = if path.ends_with("/deliver-cancellation") {
         json!({"delivered":true, "task_id":"task/selected", "workflow_run_id":"run",
@@ -2804,6 +2833,20 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
             response["task"]["task_id"] = json!("cleanup");
             response["task"]["workflow_task_attempt"] = json!(9);
         }
+        if case == "coordinator-child-wait" && number == 2 {
+            response["task"]["task_id"] = json!("other-task");
+            response["task"]["workflow_type"] = json!("other");
+            response["task"]["run_id"] = json!("other-run");
+            response["task"]["cancel_requested"] = json!(false);
+            response["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("cancellation_request");
+        }
+        if case == "coordinator-child-wait" && number >= 3 {
+            response["task"]["task_id"] = json!("parent-resume-task");
+            response["task"]["workflow_task_attempt"] = json!(8);
+        }
         return Some((status, response.to_string()));
     }
     if path.ends_with("/history") {
@@ -2815,7 +2858,11 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
         }
         let prefix = case == "coordinator-prefix";
         let successor = prefix && path.ends_with("/successor/history");
-        let mut events = if prefix {
+        let child_wait = case == "coordinator-child-wait";
+        let child_resume = child_wait && path.ends_with("/parent-resume-task/history");
+        let mut events = if child_wait {
+            vec![pending_scalar_event("child"), canonical_request()]
+        } else if prefix {
             vec![canonical_request()]
         } else {
             vec![scheduled_timer(1), canonical_request()]
@@ -2827,7 +2874,9 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
             ));
         }
         let cleanup = case == "coordinator-saga" && path.ends_with("/cleanup/history");
-        let delivered = if prefix {
+        let delivered = if child_wait {
+            child_resume && number >= 2
+        } else if prefix {
             successor && number >= 2
         } else {
             number >= 2 || case == "coordinator-cold" || cleanup
@@ -2835,7 +2884,9 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
         if delivered && !matches!(case, "coordinator-unproved" | "coordinator-shield") {
             events.push(canonical_delivery(
                 if prefix { 2 } else { 1 },
-                if case == "coordinator-mismatch" {
+                if child_wait {
+                    "child"
+                } else if case == "coordinator-mismatch" {
                     "activity"
                 } else {
                     "timer"
@@ -2860,8 +2911,8 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
         return Some((
             "200 OK",
             json!({
-            "task_id":if successor { "successor" } else if cleanup { "cleanup" } else { "task/selected" },
-            "workflow_task_attempt":if successor { 8 } else if cleanup { 9 } else { 7 },
+            "task_id":if successor { "successor" } else if child_resume { "parent-resume-task" } else if cleanup { "cleanup" } else { "task/selected" },
+            "workflow_task_attempt":if successor || child_resume { 8 } else if cleanup { 9 } else { 7 },
                 "total_history_events":events.len(),"history_events":events,
                 "next_history_page_token":null,
             })
@@ -2869,6 +2920,14 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
         ));
     }
     if path.ends_with("/deliver-cancellation") {
+        if case == "coordinator-child-wait"
+            && !path.ends_with("/parent-resume-task/deliver-cancellation")
+        {
+            return Some((
+                "200 OK",
+                pending_child_delivery("task/selected").to_string(),
+            ));
+        }
         if case == "coordinator-lost-ack" {
             return Some((
                 "409 Conflict",
@@ -2879,6 +2938,9 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
         let mut response: Value = serde_json::from_str(&response).unwrap();
         if case == "coordinator-prefix" {
             response["task_id"] = json!("successor");
+        }
+        if case == "coordinator-child-wait" {
+            response["task_id"] = json!("parent-resume-task");
         }
         return Some((status, response.to_string()));
     }
@@ -2965,6 +3027,80 @@ async fn cooperative_coordinator_commits_delivery_proves_history_and_replays_bef
             .iter()
             .any(|request| request.path.ends_with("/fail")));
     }
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_returns_to_other_work_then_replays_the_parent_on_a_new_claim() {
+    let server = coordinator_server();
+    let mut worker = coordinator_worker(&server, "coordinator-child-wait");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let cleanup = Arc::clone(&observed);
+    worker.register_workflow("cancel", move |ctx, _| {
+        let cleanup = Arc::clone(&cleanup);
+        async move {
+            match ctx
+                .start_child_workflow("child", ChildWorkflowOptions::new("queue"), json!([]))
+                .await
+            {
+                Err(Error::CooperativeCancellationRequested(request)) => {
+                    cleanup.lock().unwrap().push(request)
+                }
+                result => {
+                    result?;
+                }
+            }
+            Ok(Value::Null)
+        }
+    });
+    worker.register_workflow("other", |_, _| async { Ok(Value::Null) });
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    assert!(observed.lock().unwrap().is_empty());
+    assert!(!server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.path.ends_with("/complete") || request.path.ends_with("/fail")));
+
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    assert!(observed.lock().unwrap().is_empty());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.path.ends_with("/other-task/complete")));
+
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].request, original_observation());
+    assert_eq!(observed[0].delivery.call_kind, CancellationCallKind::Child);
+    assert_eq!(observed[0].delivery.sequence, 1);
+    let requests = server.requests.lock().unwrap();
+    let deliveries = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/deliver-cancellation"))
+        .map(|request| serde_json::from_str::<Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0]["workflow_task_attempt"], 7);
+    assert_eq!(deliveries[1]["workflow_task_attempt"], 8);
+    assert!(deliveries
+        .iter()
+        .all(|body| body["request_id"] == "original-request"));
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/fail")));
 }
 
 #[tokio::test]
@@ -3540,10 +3676,13 @@ async fn cooperative_transport_delivers_the_exact_claim_with_worker_credentials(
     let client = client(&server, "valid");
     let task = transport_task();
     let delivery = transport_delivery();
-    let receipt = client
+    let reply = client
         .deliver_workflow_cancellation(&task, &delivery)
         .await
         .unwrap();
+    let CancellationDeliveryReply::Delivered(receipt) = reply else {
+        panic!("delivery must be committed")
+    };
     assert_eq!(receipt.task_id, task.task_id);
     assert_eq!(receipt.run_id, "run");
     assert_eq!(receipt.delivery, delivery);
@@ -3561,6 +3700,66 @@ async fn cooperative_transport_delivers_the_exact_claim_with_worker_credentials(
     assert_eq!(body["lease_owner"], "actual-owner");
     assert_eq!(body["workflow_task_attempt"], 7);
     assert_eq!(body["request_id"], "original-request");
+}
+
+#[tokio::test]
+async fn cooperative_transport_accepts_only_explicit_child_claim_release() {
+    for kind in [
+        CancellationCallKind::Child,
+        CancellationCallKind::Parallel,
+        CancellationCallKind::SelectionHandle,
+    ] {
+        let server = transport_server();
+        let mut delivery = transport_delivery();
+        delivery.call_kind = kind;
+        if kind == CancellationCallKind::SelectionHandle {
+            delivery.sequence = 2;
+            delivery.operation_sequence = Some(1);
+        }
+        assert_eq!(
+            client(&server, "child-wait")
+                .deliver_workflow_cancellation(&transport_task(), &delivery)
+                .await
+                .unwrap(),
+            CancellationDeliveryReply::ClaimReleased {
+                task_id: "task/selected".into(),
+                run_id: "run".into()
+            }
+        );
+    }
+    let server = transport_server();
+    assert!(matches!(
+        client(&server, "child-wait")
+            .deliver_workflow_cancellation(&transport_task(), &transport_delivery())
+            .await,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    for case in [
+        "child-wait-wrong-task",
+        "child-wait-wrong-run",
+        "child-wait-not-released",
+        "child-wait-string-released",
+        "child-wait-missing-release",
+        "child-wait-wrong-reason",
+        "child-wait-request",
+        "child-wait-sequence",
+        "child-wait-kind",
+        "child-wait-span",
+        "child-wait-operation",
+        "child-wait-operation-span",
+        "child-wait-string-delivered",
+    ] {
+        let server = transport_server();
+        let mut delivery = transport_delivery();
+        delivery.call_kind = CancellationCallKind::Child;
+        let result = client(&server, case)
+            .deliver_workflow_cancellation(&transport_task(), &delivery)
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+            "{case}: {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
