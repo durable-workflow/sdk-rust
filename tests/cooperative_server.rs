@@ -208,6 +208,13 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
     assert_ne!(reclaimed.activity_attempt_id, original.attempt_id);
     assert_ne!(reclaimed.lease_owner, original.owner);
     assert_eq!(reclaimed.attempt_number, 2);
+    eprintln!(
+        "SIGKILL successor grant: {}/{}/{}/{}",
+        reclaimed.task_id,
+        reclaimed.activity_attempt_id,
+        reclaimed.lease_owner,
+        reclaimed.attempt_number
+    );
 
     let before = history(&handle).await;
     for result in [
@@ -241,10 +248,20 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
             &original.owner,
             json!({"late":true}),
         )
-        .await;
-    assert!(
-        matches!(heartbeat, Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409)
+        .await
+        .expect("dead-attempt heartbeat returns its stop status");
+    assert_eq!(heartbeat.can_continue, Some(false));
+    assert!(!heartbeat.heartbeat_recorded);
+    assert!(heartbeat.should_stop());
+    assert_eq!(heartbeat.reason.as_deref(), Some("attempt_closed"));
+    assert!(!heartbeat.cancel_requested);
+    assert_eq!(heartbeat.last_heartbeat_at, None);
+    assert_eq!(
+        heartbeat.lease_expires_at.as_deref(),
+        leased["lease_expires_at"].as_str(),
+        "dead attempt renewed its lease"
     );
+    eprintln!("SIGKILL dead-attempt heartbeat: {heartbeat:?}");
     assert_eq!(
         before,
         history(&handle).await,
