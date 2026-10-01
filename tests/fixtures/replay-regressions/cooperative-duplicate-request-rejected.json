@@ -1,0 +1,37 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-cooperative-duplicate-request-rejected",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.side-effect-version",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "CooperativeCancellationRequested",
+      "workflow_command_id": "original-request",
+      "recorded_at": "2026-10-01T08:00:00Z",
+      "payload": {
+        "workflow_command_id": "original-request",
+        "workflow_run_id": "regression-corpus-run",
+        "cleanup_deadline_at": "2026-10-01T08:10:00Z"
+      }
+    },
+    {
+      "event_type": "CooperativeCancellationRequested",
+      "workflow_command_id": "original-request",
+      "recorded_at": "2026-10-01T08:00:00Z",
+      "payload": {
+        "workflow_command_id": "original-request",
+        "workflow_run_id": "regression-corpus-run",
+        "cleanup_deadline_at": "2026-10-01T08:10:00Z"
+      }
+    }
+  ],
+  "command_sequence": [{"type":"complete_workflow", "result":"unreachable"}],
+  "expected": {"type":"complete_workflow", "result":"unreachable"},
+  "expected_failure": "cooperative_cancellation_history_invalid"
+}

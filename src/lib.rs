@@ -7603,6 +7603,11 @@ impl Worker {
 
     fn execute_workflow_task_decision(&self, task: WorkflowTask) -> Result<WorkflowTaskDecision> {
         validate_workflow_task_payloads(&task)?;
+        CancellationHistory::from_events(
+            &task.history_events,
+            task.run_id.as_deref().unwrap_or_default(),
+            None,
+        )?;
 
         if let Some(update_id) = task
             .workflow_update_id
