@@ -6,7 +6,8 @@ mod runtime_uploads;
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationHistory, CancellationRequest,
-    CooperativeCancellationOptions, WorkflowCancellationRequest,
+    CancellationShield, CooperativeCancellationOptions, CooperativeCancellationRequested,
+    WorkflowCancellationRequest,
 };
 
 use std::{
@@ -190,6 +191,8 @@ pub enum Error {
     DurableOperationCancelled(DurableOperationCancelled),
     #[error(transparent)]
     WorkflowCancellationRequested(WorkflowCancellationRequested),
+    #[error(transparent)]
+    CooperativeCancellationRequested(CooperativeCancellationRequested),
     #[error(transparent)]
     WorkflowCommandRejected(WorkflowCommandRejection),
     #[error(transparent)]
@@ -7603,17 +7606,16 @@ impl Worker {
 
     fn execute_workflow_task_decision(&self, task: WorkflowTask) -> Result<WorkflowTaskDecision> {
         validate_workflow_task_payloads(&task)?;
-        CancellationHistory::from_events(
-            &task.history_events,
-            task.run_id.as_deref().unwrap_or_default(),
-            None,
-        )?;
-
         if let Some(update_id) = task
             .workflow_update_id
             .as_deref()
             .filter(|update_id| !update_id.is_empty())
         {
+            CancellationHistory::from_events(
+                &task.history_events,
+                task.run_id.as_deref().unwrap_or_default(),
+                None,
+            )?;
             return self
                 .execute_update_task(&task, update_id)
                 .map(WorkflowTaskDecision::without_message_streams);
@@ -7648,7 +7650,9 @@ impl Worker {
         )?;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
-        workflow_state.cancel_requested = task.cancel_requested;
+        if workflow_state.cancellation_history.request.is_none() {
+            workflow_state.cancel_requested = task.cancel_requested;
+        }
         let state = Arc::new(Mutex::new(workflow_state));
         let ctx = WorkflowContext { state };
         let mut future = (workflow.execute)(ctx.clone(), input);
@@ -8529,10 +8533,11 @@ impl WorkflowContext {
         Saga::new(self.clone())
     }
 
-    /// Whether this task carries a cooperative cancellation request.
+    /// Whether cancellation has reached this replay's authored boundary.
     ///
     /// Server's current `/cancel` route is terminal and does not set this flag.
-    /// Service-mode cooperative cancellation is not yet available.
+    /// A canonical service request remains pending until its committed delivery
+    /// is consumed. Request observation alone does not authorize an exception.
     pub fn is_cancellation_requested(&self) -> Result<bool> {
         let state = self
             .state
@@ -8546,10 +8551,12 @@ impl WorkflowContext {
     /// Passing this result to [`Saga::finish`] compensates already registered
     /// forward steps before the cancellation remains the initiating outcome.
     pub fn throw_if_cancellation_requested(&self) -> Result<()> {
-        if self.is_cancellation_requested()? {
-            return Err(Error::WorkflowCancellationRequested(
-                WorkflowCancellationRequested,
-            ));
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if state.cancel_requested && state.cancellation_shield_depth == 0 {
+            return Err(state.cancellation_error());
         }
         Ok(())
     }
@@ -9283,6 +9290,20 @@ impl WorkflowContext {
                 "workflow completed before consuming all recorded durable commands",
             )));
         }
+        if let Some(delivery) = state
+            .cancellation_history
+            .delivery
+            .as_ref()
+            .filter(|_| !state.cancellation_consumed)
+        {
+            return Err(invalid_recorded_history(
+                "cooperative_cancellation_unconsumed",
+                delivery.sequence,
+                "committed cancellation call",
+                "workflow completion",
+                "workflow completed without reaching its committed cancellation boundary",
+            ));
+        }
         if let Some(sequence) = state
             .recorded_continue_as_new_sequence
             .filter(|_| !state.continue_as_new_consumed)
@@ -9342,6 +9363,9 @@ struct WorkflowState {
     history_events: Arc<Vec<HistoryEvent>>,
     history_budget: WorkflowHistoryBudget,
     cancel_requested: bool,
+    cancellation_history: CancellationHistory,
+    cancellation_consumed: bool,
+    cancellation_shield_depth: u64,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
     selection_markers: Vec<SelectionMarker>,
@@ -9387,14 +9411,19 @@ impl WorkflowState {
         payload_codec: String,
         resume_signal: Option<ResumeSignal>,
     ) -> Result<Self> {
-        let recorded_commands = recorded_commands(
+        let cancellation_history = CancellationHistory::from_events(
+            &history,
+            run_id.as_deref().unwrap_or_default(),
+            None,
+        )?;
+        let recorded_commands = cancellation_history.bind_scalar_commands(recorded_commands(
             &history,
             &payload_codec,
             WorkflowIdentity {
                 workflow_id: workflow_id.clone(),
                 run_id: run_id.clone(),
             },
-        )?;
+        )?)?;
         let selection_markers = recorded_selection_markers(&history)?;
         let cancelled_selection_members = recorded_selection_cancellations(&history)?;
         let recorded_continue_as_new = history
@@ -9484,6 +9513,9 @@ impl WorkflowState {
                 ..WorkflowHistoryBudget::default()
             },
             cancel_requested,
+            cancellation_history,
+            cancellation_consumed: false,
+            cancellation_shield_depth: 0,
             resume_signal,
             recorded_commands,
             selection_markers,
@@ -9569,6 +9601,11 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
 
 #[derive(Clone, Debug)]
 enum RecordedCommand {
+    CancellationBoundary {
+        sequence: u64,
+        call_kind: CancellationCallKind,
+        original: Option<Box<RecordedCommand>>,
+    },
     Activity {
         sequence: u64,
         activity_type: Option<String>,
@@ -10082,7 +10119,8 @@ fn activity_options_description(options: &RecordedActivityOptions) -> String {
 impl RecordedCommand {
     fn sequence(&self) -> u64 {
         match self {
-            Self::Activity { sequence, .. }
+            Self::CancellationBoundary { sequence, .. }
+            | Self::Activity { sequence, .. }
             | Self::Timer { sequence, .. }
             | Self::ChildWorkflow { sequence, .. }
             | Self::SignalWait { sequence, .. }
@@ -10096,6 +10134,7 @@ impl RecordedCommand {
 
     fn shape(&self) -> &'static str {
         match self {
+            Self::CancellationBoundary { .. } => "cooperative cancellation",
             Self::Activity { .. } => "activity",
             Self::Timer { .. } => "timer",
             Self::ChildWorkflow { .. } => "child workflow",
@@ -11626,7 +11665,8 @@ fn recorded_selection_member_is_terminal(
             RecordedCommand::SearchAttributes { .. }
             | RecordedCommand::SideEffect { .. }
             | RecordedCommand::VersionMarker { .. }
-            | RecordedCommand::Memo { .. } => false,
+            | RecordedCommand::Memo { .. }
+            | RecordedCommand::CancellationBoundary { .. } => false,
         };
         if !terminal {
             all_completed = false;
@@ -11861,6 +11901,10 @@ impl Saga {
 
     /// Compensate `initiating_failure` and return the failure that must remain.
     pub async fn compensate(mut self, initiating_failure: Error) -> Error {
+        let _shield = match self.ctx.cancellation_shield() {
+            Ok(shield) => shield,
+            Err(error) => return error,
+        };
         while let Some(compensation) = self.compensations.pop() {
             if let Err(compensation_failure) = self
                 .ctx
@@ -11936,7 +11980,13 @@ impl ActivityCall {
             retry_policy: current_activity_retry_snapshot(&options),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded =
+            match state.cancellation_replay_command(cursor, CancellationCallKind::Activity) {
+                Ok(recorded) => recorded,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+        if let Some(recorded) = recorded {
             let sequence = recorded.sequence();
             match recorded {
                 RecordedCommand::Activity {
@@ -12009,6 +12059,11 @@ impl ActivityCall {
                                 ),
                             )));
                         }
+                    }
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Activity)
+                    {
+                        return Poll::Ready(Err(error));
                     }
                     state.command_cursor += 1;
                     if let Some(outcome) = outcome {
@@ -12113,7 +12168,13 @@ impl Future for TimerCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Timer)
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if let Some(recorded) = recorded {
             match recorded {
                 RecordedCommand::Timer {
                     sequence,
@@ -12139,6 +12200,11 @@ impl Future for TimerCall {
                                 "recorded timer delay differs from the current workflow command",
                             ),
                         )));
+                    }
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Timer)
+                    {
+                        return Poll::Ready(Err(error));
                     }
                     state.command_cursor += 1;
                     if fired {
@@ -12218,7 +12284,14 @@ impl Future for ConditionWaitCall {
                 Ok(state) => state,
                 Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
             };
-            let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() else {
+            let initial_cursor = state.command_cursor;
+            let recorded = match state
+                .cancellation_replay_command(initial_cursor, CancellationCallKind::Condition)
+            {
+                Ok(recorded) => recorded,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let Some(recorded) = recorded else {
                 drop(state);
                 return self.poll_new_condition(options);
             };
@@ -12229,36 +12302,50 @@ impl Future for ConditionWaitCall {
             let mut cursor = state.command_cursor;
             let mut result = None;
             loop {
+                if cursor > initial_cursor
+                    && matches!(
+                        state.recorded_commands.get(cursor),
+                        Some(RecordedCommand::CancellationBoundary { original: None, .. })
+                    )
+                {
+                    break;
+                }
+                let recorded = match state
+                    .cancellation_replay_command(cursor, CancellationCallKind::Condition)
+                {
+                    Ok(recorded) => recorded,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
                 let Some(RecordedCommand::ConditionWait {
                     sequence,
-                    occurrence_id: recorded_occurrence_id,
-                    condition_key,
-                    predicate_identity,
+                    occurrence_id: ref recorded_occurrence_id,
+                    ref condition_key,
+                    ref predicate_identity,
                     timeout_seconds,
                     result: recorded_result,
-                    parallel_group_path,
+                    ref parallel_group_path,
                     ..
-                }) = state.recorded_commands.get(cursor)
+                }) = recorded
                 else {
                     break;
                 };
 
-                if cursor > state.command_cursor && recorded_occurrence_id != &occurrence_id {
+                if cursor > initial_cursor && recorded_occurrence_id != &occurrence_id {
                     break;
                 }
                 if let Err(error) = ensure_parallel_path_matches(
-                    *sequence,
+                    sequence,
                     parallel_group_path.as_deref(),
                     &self.parallel_group_path,
                 ) {
                     return Poll::Ready(Err(error));
                 }
                 if let Err(error) = validate_recorded_condition_wait(
-                    *sequence,
+                    sequence,
                     recorded_occurrence_id,
                     condition_key.as_deref(),
                     predicate_identity,
-                    *timeout_seconds,
+                    timeout_seconds,
                     &occurrence_id,
                     &options,
                 ) {
@@ -12267,13 +12354,18 @@ impl Future for ConditionWaitCall {
                 if result == Some(ConditionWaitResult::TimedOut) {
                     return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
                         "condition_wait_reopened_after_timeout",
-                        Some(*sequence),
+                        Some(sequence),
                         Some("timed-out condition is terminal".to_string()),
                         Some("another physical wait-open".to_string()),
                         "condition history reopened one logical wait after its durable timeout",
                     ))));
                 }
-                result = *recorded_result;
+                if let Err(error) =
+                    state.replay_cancellation_at(cursor, CancellationCallKind::Condition)
+                {
+                    return Poll::Ready(Err(error));
+                }
+                result = recorded_result;
                 cursor += 1;
             }
             state.command_cursor = cursor;
@@ -12417,7 +12509,13 @@ impl ChildWorkflowCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Child)
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if let Some(recorded) = recorded {
             let sequence = recorded.sequence();
             match recorded {
                 RecordedCommand::ChildWorkflow {
@@ -12445,6 +12543,11 @@ impl ChildWorkflowCall {
                                 ),
                             )));
                         }
+                    }
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Child)
+                    {
+                        return Poll::Ready(Err(error));
                     }
                     state.command_cursor += 1;
                     if let Some(outcome) = outcome {
@@ -12606,7 +12709,13 @@ impl SignalCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Signal)
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if let Some(recorded) = recorded {
             match recorded {
                 RecordedCommand::SignalWait {
                     sequence,
@@ -12633,6 +12742,11 @@ impl SignalCall {
                         )));
                     }
 
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Signal)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
                     state.command_cursor += 1;
                     if let Some(value) = value {
                         return Poll::Ready(Ok(value));
@@ -14664,6 +14778,12 @@ fn workflow_failure_command(
             "durable_workflow::WorkflowCancellationRequested",
             json!({"reason": "cancelled"}),
         ),
+        Error::CooperativeCancellationRequested(cancellation) => (
+            "WorkflowCancellationRequested",
+            "durable_workflow::CooperativeCancellationRequested",
+            json!({"reason": "cancelled", "request_id": cancellation.request.request_id,
+                "cleanup_deadline_at": cancellation.request.cleanup_deadline_at}),
+        ),
         Error::NonDeterministicReplay(_) => (
             "NonDeterministicReplay",
             "durable_workflow::Error",
@@ -14678,7 +14798,9 @@ fn workflow_failure_command(
         Error::SagaCompensationFailed(failure) => {
             workflow_error_non_retryable(&failure.compensation_failure)
         }
-        Error::WorkflowCancellationRequested(_) => true,
+        Error::WorkflowCancellationRequested(_) | Error::CooperativeCancellationRequested(_) => {
+            true
+        }
         Error::NonDeterministicReplay(_) => true,
         _ => false,
     };
@@ -14719,7 +14841,9 @@ fn workflow_error_type(error: &Error) -> &'static str {
         },
         Error::ParallelFailed(_) => "ParallelFailed",
         Error::SagaCompensationFailed(_) => "SagaCompensationFailed",
-        Error::WorkflowCancellationRequested(_) => "WorkflowCancellationRequested",
+        Error::WorkflowCancellationRequested(_) | Error::CooperativeCancellationRequested(_) => {
+            "WorkflowCancellationRequested"
+        }
         Error::NonDeterministicReplay(_) => "NonDeterministicReplay",
         _ => "RustWorkflowError",
     }
@@ -14733,7 +14857,9 @@ fn workflow_error_non_retryable(error: &Error) -> bool {
         Error::SagaCompensationFailed(failure) => {
             workflow_error_non_retryable(&failure.compensation_failure)
         }
-        Error::WorkflowCancellationRequested(_) | Error::NonDeterministicReplay(_) => true,
+        Error::WorkflowCancellationRequested(_)
+        | Error::CooperativeCancellationRequested(_)
+        | Error::NonDeterministicReplay(_) => true,
         _ => false,
     }
 }

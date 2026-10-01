@@ -30,6 +30,30 @@ pub struct WorkflowCancellationRequest {
     pub cancellation_request: CancellationRequest,
 }
 
+/// Cancellation delivered at its committed authored call, with original identity.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workflow cancellation {request_id} was requested", request_id = .request.request_id)]
+pub struct CooperativeCancellationRequested {
+    pub request: CancellationRequest,
+    pub delivery: CancellationDelivery,
+}
+
+/// A workflow-local cleanup scope. Dropping it restores cancellation checks.
+///
+/// This does not renew or extend the Server's original cleanup deadline.
+#[derive(Debug)]
+pub struct CancellationShield {
+    state: Arc<Mutex<WorkflowState>>,
+}
+
+impl Drop for CancellationShield {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.cancellation_shield_depth = state.cancellation_shield_depth.saturating_sub(1);
+        }
+    }
+}
+
 fn invalid(detail: impl Into<String>) -> Error {
     Error::InvalidCooperativeCancellation(detail.into())
 }
@@ -187,6 +211,55 @@ pub struct CancellationHistory {
 }
 
 impl CancellationHistory {
+    pub(super) fn bind_scalar_commands(
+        &self,
+        mut commands: Vec<RecordedCommand>,
+    ) -> Result<Vec<RecordedCommand>> {
+        let Some(delivery) = &self.delivery else {
+            return Ok(commands);
+        };
+        if !matches!(
+            delivery.call_kind,
+            CancellationCallKind::Activity
+                | CancellationCallKind::Timer
+                | CancellationCallKind::Condition
+                | CancellationCallKind::Signal
+                | CancellationCallKind::Child
+        ) {
+            return Ok(commands);
+        }
+        let index = commands.partition_point(|command| command.sequence() < delivery.sequence);
+        let original = if commands
+            .get(index)
+            .is_some_and(|command| command.sequence() == delivery.sequence)
+        {
+            Some(Box::new(commands.remove(index)))
+        } else {
+            let previous = index
+                .checked_sub(1)
+                .map_or(0, |index| commands[index].sequence());
+            if previous.checked_add(1) != Some(delivery.sequence) {
+                return Err(invalid_recorded_history(
+                    "cooperative_cancellation_call_mismatch",
+                    delivery.sequence,
+                    "next authored durable call",
+                    "missing earlier call",
+                    "cancellation marker skips an unrecorded authored command",
+                ));
+            }
+            None
+        };
+        commands.insert(
+            index,
+            RecordedCommand::CancellationBoundary {
+                sequence: delivery.sequence,
+                call_kind: delivery.call_kind,
+                original,
+            },
+        );
+        Ok(commands)
+    }
+
     /// Read canonical markers without replacing original request identity.
     pub fn from_events(
         events: &[HistoryEvent],
@@ -395,6 +468,105 @@ impl CancellationHistory {
     /// Whether an unresolved authored call may deliver the pending request.
     pub fn eligible(&self, sequence: u64, span: u64) -> bool {
         self.request.is_some() && self.delivery.is_none() && self.range_eligible(sequence, span)
+    }
+}
+
+impl WorkflowState {
+    pub(super) fn cancellation_error(&self) -> Error {
+        match (
+            &self.cancellation_history.request,
+            &self.cancellation_history.delivery,
+        ) {
+            (Some(request), Some(delivery)) => {
+                Error::CooperativeCancellationRequested(CooperativeCancellationRequested {
+                    request: request.clone(),
+                    delivery: delivery.clone(),
+                })
+            }
+            _ => Error::WorkflowCancellationRequested(WorkflowCancellationRequested),
+        }
+    }
+
+    fn validate_cancellation_call(
+        &self,
+        sequence: u64,
+        kind: CancellationCallKind,
+        recorded_kind: CancellationCallKind,
+    ) -> Result<()> {
+        if kind != recorded_kind || self.cancellation_shield_depth > 0 {
+            return Err(invalid_recorded_history(
+                "cooperative_cancellation_call_mismatch",
+                sequence,
+                "matching unshielded authored call",
+                &format!("{kind:?}"),
+                "committed cancellation call kind or cleanup scope changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancellation_replay_command(
+        &mut self,
+        index: usize,
+        kind: CancellationCallKind,
+    ) -> Result<Option<RecordedCommand>> {
+        match self.recorded_commands.get(index).cloned() {
+            Some(RecordedCommand::CancellationBoundary {
+                sequence,
+                call_kind,
+                original,
+            }) => {
+                if let Some(original) = original {
+                    return Ok(Some(*original));
+                }
+                self.validate_cancellation_call(sequence, kind, call_kind)?;
+                self.cancellation_consumed = true;
+                self.cancel_requested = true;
+                self.command_cursor = index + 1;
+                Err(self.cancellation_error())
+            }
+            command => Ok(command),
+        }
+    }
+
+    pub(super) fn replay_cancellation_at(
+        &mut self,
+        index: usize,
+        kind: CancellationCallKind,
+    ) -> Result<()> {
+        if let Some(RecordedCommand::CancellationBoundary {
+            sequence,
+            call_kind,
+            ..
+        }) = self.recorded_commands.get(index)
+        {
+            self.validate_cancellation_call(*sequence, kind, *call_kind)?;
+            self.cancellation_consumed = true;
+            self.cancel_requested = true;
+            self.command_cursor = index + 1;
+            return Err(self.cancellation_error());
+        }
+        Ok(())
+    }
+}
+
+impl WorkflowContext {
+    /// Shield explicit cleanup from repeated cancellation checks.
+    ///
+    /// Keep the returned guard alive across cleanup awaits. Scopes can nest.
+    /// The Server retains and enforces the original immutable cleanup deadline.
+    pub fn cancellation_shield(&self) -> Result<CancellationShield> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        state.cancellation_shield_depth = state
+            .cancellation_shield_depth
+            .checked_add(1)
+            .ok_or_else(|| invalid("cancellation shield nesting overflowed"))?;
+        Ok(CancellationShield {
+            state: Arc::clone(&self.state),
+        })
     }
 }
 

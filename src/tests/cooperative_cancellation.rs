@@ -38,6 +38,375 @@ fn history(events: &[HistoryEvent]) -> Result<CancellationHistory> {
     CancellationHistory::from_events(events, "run", None)
 }
 
+fn cancellation_worker() -> Worker {
+    Worker::new(
+        Client::builder("http://127.0.0.1:1").build().unwrap(),
+        "queue",
+    )
+}
+
+fn cancellation_task(events: Vec<HistoryEvent>) -> WorkflowTask {
+    let mut task = workflow_task("cancel", events, DEFAULT_CODEC);
+    task.run_id = Some("run".into());
+    task
+}
+
+fn scheduled_timer(sequence: u64) -> HistoryEvent {
+    event(
+        "TimerScheduled",
+        json!({"sequence":sequence, "timer_id":format!("timer-{sequence}"), "delay_seconds":5}),
+    )
+}
+
+fn completed_activity(sequence: u64, name: &str, value: Value) -> Vec<HistoryEvent> {
+    vec![
+        event(
+            "ActivityScheduled",
+            json!({"sequence":sequence,"activity_type":name,"task_queue":"queue"}),
+        ),
+        event(
+            "ActivityCompleted",
+            json!({"sequence":sequence,"activity_type":name,"result":fixture_envelope(value)}),
+        ),
+    ]
+}
+
+#[test]
+fn cooperative_replay_preserves_completed_forward_result_and_saga_cleanup_identity() {
+    for _cold_restart in 0..2 {
+        let mut events = completed_activity(1, "forward", json!(7));
+        events.extend([
+            scheduled_timer(2),
+            canonical_request(),
+            canonical_delivery(2, "timer"),
+        ]);
+        events.extend(completed_activity(3, "undo", Value::Null));
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _input| async move {
+            let result = ctx.activity("forward", json!([])).await?;
+            assert_eq!(result, json!(7));
+            assert!(!ctx.is_cancellation_requested()?);
+            let mut saga = ctx.saga();
+            saga.add_compensation("undo", json!([]))?;
+            saga.finish(ctx.sleep(Duration::from_secs(5)).await).await?;
+            Ok(Value::Null)
+        });
+        let commands = worker
+            .execute_workflow_task(cancellation_task(events))
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0]["exception_type"],
+            "WorkflowCancellationRequested"
+        );
+        assert_eq!(
+            commands[0]["exception"]["properties"]["request_id"],
+            "original-request"
+        );
+        assert_eq!(
+            commands[0]["exception"]["properties"]["cleanup_deadline_at"],
+            "2026-10-01T08:10:00Z"
+        );
+    }
+}
+
+#[test]
+fn cooperative_replay_saga_schedules_cleanup_once_after_committed_delivery() {
+    let mut events = completed_activity(1, "forward", json!(7));
+    events.extend([
+        scheduled_timer(2),
+        canonical_request(),
+        canonical_delivery(2, "timer"),
+    ]);
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        ctx.activity("forward", json!([])).await?;
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        saga.finish(ctx.sleep(Duration::from_secs(5)).await).await?;
+        Ok(Value::Null)
+    });
+    let commands = worker
+        .execute_workflow_task(cancellation_task(events))
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["type"], "schedule_activity");
+    assert_eq!(commands[0]["activity_type"], "undo");
+}
+
+#[test]
+fn cooperative_replay_consumes_reopened_condition_once_at_its_physical_delivery() {
+    let payload = |sequence| {
+        json!({"sequence":sequence,"condition_wait_id":format!("condition:{sequence}"),
+        "condition_wait_occurrence_id":"rust:condition-wait:0", "condition_key":"ready",
+        "condition_definition_fingerprint":"sha256:ready"})
+    };
+    let events = vec![
+        event("ConditionWaitOpened", payload(1)),
+        event("ConditionWaitSatisfied", payload(1)),
+        event("ConditionWaitOpened", payload(2)),
+        canonical_request(),
+        canonical_delivery(2, "condition"),
+    ];
+    for _cold_restart in 0..2 {
+        let ctx = workflow_context(events.clone());
+        let mut wait = Box::pin(
+            ctx.wait_condition(ConditionWaitOptions::new("ready", "sha256:ready"), || {
+                Ok(false)
+            }),
+        );
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Err(Error::CooperativeCancellationRequested(cancellation))) =
+            wait.as_mut().poll(&mut cx)
+        else {
+            panic!("reopened condition must receive canonical cancellation")
+        };
+        assert_eq!(cancellation.delivery.sequence, 2);
+        assert_eq!(
+            ctx.state.lock().unwrap().condition_wait_occurrence_counter,
+            1
+        );
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_replay_keeps_adjacent_condition_occurrences_and_cleanup_scopes_separate() {
+    let payload = |sequence, occurrence| {
+        json!({"sequence":sequence,"condition_wait_id":format!("condition:{sequence}"),
+        "condition_wait_occurrence_id":format!("rust:condition-wait:{occurrence}"), "condition_key":"ready",
+        "condition_definition_fingerprint":"sha256:ready"})
+    };
+    let ctx = workflow_context(vec![
+        event("ConditionWaitOpened", payload(1, 0)),
+        event("ConditionWaitSatisfied", payload(1, 0)),
+        event("ConditionWaitOpened", payload(2, 1)),
+        canonical_request(),
+        canonical_delivery(2, "condition"),
+    ]);
+    let shield = ctx.cancellation_shield().unwrap();
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    let mut first = Box::pin(
+        ctx.wait_condition(ConditionWaitOptions::new("ready", "sha256:ready"), || {
+            Ok(false)
+        }),
+    );
+    assert!(matches!(
+        first.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+    ));
+    drop(shield);
+    let mut second = Box::pin(
+        ctx.wait_condition(ConditionWaitOptions::new("ready", "sha256:ready"), || {
+            Ok(false)
+        }),
+    );
+    assert!(matches!(
+        second.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::CooperativeCancellationRequested(_)))
+    ));
+    assert_eq!(
+        ctx.state.lock().unwrap().condition_wait_occurrence_counter,
+        2
+    );
+    ctx.ensure_history_consumed().unwrap();
+}
+
+#[test]
+fn cooperative_replay_marker_keeps_priority_over_resolution_committed_after_request() {
+    let ctx = workflow_context(vec![
+        scheduled_timer(1),
+        canonical_request(),
+        canonical_delivery(1, "timer"),
+        event(
+            "TimerFired",
+            json!({"sequence":1,"timer_id":"timer-1","delay_seconds":5}),
+        ),
+    ]);
+    let mut timer = Box::pin(ctx.sleep(Duration::from_secs(5)));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    assert!(matches!(
+        timer.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::CooperativeCancellationRequested(_)))
+    ));
+    ctx.ensure_history_consumed().unwrap();
+}
+
+#[test]
+fn cooperative_replay_actual_worker_delivers_scalar_calls_with_original_identity() {
+    for kind in ["activity", "timer", "child", "signal", "condition"] {
+        for _cold_restart in 0..2 {
+            let mut worker = cancellation_worker();
+            worker.register_workflow("cancel", move |ctx, _input| async move {
+                match kind {
+                    "activity" => {
+                        ctx.activity("forward", json!([])).await?;
+                    }
+                    "timer" => {
+                        ctx.sleep(Duration::from_secs(5)).await?;
+                    }
+                    "child" => {
+                        ctx.start_child_workflow(
+                            "child",
+                            ChildWorkflowOptions::new("queue"),
+                            json!([]),
+                        )
+                        .await?;
+                    }
+                    "signal" => {
+                        ctx.wait_signal("resume").await?;
+                    }
+                    "condition" => {
+                        ctx.wait_condition(
+                            ConditionWaitOptions::new("ready", "sha256:ready"),
+                            || Ok(false),
+                        )
+                        .await?;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(Value::Null)
+            });
+            let commands = worker
+                .execute_workflow_task(cancellation_task(vec![
+                    canonical_request(),
+                    canonical_delivery(1, kind),
+                ]))
+                .unwrap();
+            assert_eq!(commands.len(), 1, "{kind}");
+            assert_eq!(commands[0]["type"], "fail_workflow", "{kind}");
+            assert_eq!(
+                commands[0]["exception_type"], "WorkflowCancellationRequested",
+                "{kind}"
+            );
+            assert_eq!(
+                commands[0]["exception"]["properties"]["request_id"], "original-request",
+                "{kind}"
+            );
+            assert_eq!(
+                commands[0]["exception"]["properties"]["cleanup_deadline_at"],
+                "2026-10-01T08:10:00Z",
+                "{kind}"
+            );
+            assert_eq!(commands[0]["non_retryable"], true, "{kind}");
+        }
+    }
+}
+
+#[test]
+fn cooperative_replay_observed_request_and_task_flag_do_not_inject_without_delivery() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        assert!(!ctx.is_cancellation_requested()?);
+        ctx.throw_if_cancellation_requested()?;
+        ctx.sleep(Duration::from_secs(5)).await?;
+        Ok(Value::Null)
+    });
+    let mut task = cancellation_task(vec![scheduled_timer(1), canonical_request()]);
+    task.cancel_requested = true;
+    assert!(worker.execute_workflow_task(task).unwrap().is_empty());
+}
+
+#[test]
+fn cooperative_replay_recorded_timer_validates_authored_details_before_delivery() {
+    for delay in [5, 500] {
+        let ctx = workflow_context(vec![
+            scheduled_timer(1),
+            canonical_request(),
+            canonical_delivery(1, "timer"),
+        ]);
+        let mut timer = Box::pin(ctx.sleep(Duration::from_secs(delay)));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        match timer.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(Error::CooperativeCancellationRequested(cancellation)))
+                if delay == 5 =>
+            {
+                assert_eq!(cancellation.request.request_id, "original-request");
+                assert_eq!(cancellation.delivery.sequence, 1);
+                ctx.ensure_history_consumed().unwrap();
+            }
+            Poll::Ready(Err(Error::NonDeterministicReplay(failure))) if delay == 500 => {
+                assert_eq!(failure.reason, "timer_delay_mismatch");
+            }
+            other => panic!("{delay}: {other:?}"),
+        }
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_replay_changed_call_kind_and_unconsumed_boundary_are_rejected() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        ctx.activity("changed", json!([])).await?;
+        Ok(Value::Null)
+    });
+    assert!(
+        matches!(worker.execute_workflow_task(cancellation_task(vec![canonical_request(), canonical_delivery(1, "timer")])),
+        Err(Error::NonDeterministicReplay(ReplayFailure { reason, .. })) if reason == "cooperative_cancellation_call_mismatch")
+    );
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |_ctx, _input| async { Ok(Value::Null) });
+    assert!(
+        matches!(worker.execute_workflow_task(cancellation_task(vec![canonical_request(), canonical_delivery(1, "timer")])),
+        Err(Error::NonDeterministicReplay(ReplayFailure { reason, .. })) if reason == "recorded_commands_unconsumed")
+    );
+}
+
+#[test]
+fn cooperative_replay_rejects_a_marker_that_skips_unrecorded_authored_calls() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        ctx.sleep(Duration::from_secs(5)).await?;
+        Ok(Value::Null)
+    });
+    assert!(
+        matches!(worker.execute_workflow_task(cancellation_task(vec![canonical_request(), canonical_delivery(999, "timer")])),
+        Err(Error::NonDeterministicReplay(ReplayFailure { reason, .. })) if reason == "cooperative_cancellation_call_mismatch")
+    );
+}
+
+#[test]
+fn cooperative_replay_shields_nested_cleanup_and_preserves_original_request_after_drop() {
+    let ctx = workflow_context(vec![canonical_request(), canonical_delivery(1, "timer")]);
+    let mut timer = Box::pin(ctx.sleep(Duration::from_secs(5)));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    assert!(matches!(
+        timer.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::CooperativeCancellationRequested(_)))
+    ));
+    assert!(ctx.is_cancellation_requested().unwrap());
+    let outer = ctx.cancellation_shield().unwrap();
+    let inner = ctx.cancellation_shield().unwrap();
+    ctx.throw_if_cancellation_requested().unwrap();
+    drop(inner);
+    ctx.throw_if_cancellation_requested().unwrap();
+    drop(outer);
+    let Error::CooperativeCancellationRequested(cancellation) =
+        ctx.throw_if_cancellation_requested().unwrap_err()
+    else {
+        panic!("original cancellation missing")
+    };
+    assert_eq!(cancellation.request.request_id, "original-request");
+    assert_eq!(
+        cancellation.request.cleanup_deadline_at,
+        "2026-10-01T08:10:00Z"
+    );
+}
+
+#[test]
+fn cooperative_replay_cannot_shield_away_a_committed_authored_delivery() {
+    let ctx = workflow_context(vec![canonical_request(), canonical_delivery(1, "timer")]);
+    let _shield = ctx.cancellation_shield().unwrap();
+    let mut timer = Box::pin(ctx.sleep(Duration::from_secs(5)));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    assert!(matches!(
+        timer.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::NonDeterministicReplay(_)))
+    ));
+}
+
 #[test]
 fn cooperative_history_preserves_observation_without_authorizing_delivery() {
     let observation = CancellationRequest::from_observation(&request_observation()).unwrap();
