@@ -120,7 +120,7 @@ async fn await_child_file(process: &mut WorkerProcess, path: &std::path::Path) {
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "requires an isolated cooperative Server with ten-second leases and the repair daemon"]
+#[ignore = "requires an isolated cooperative Server with its real activity lease and repair daemon"]
 async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publication() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -148,6 +148,12 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
     let original: ActivityGrant =
         serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
     assert_eq!(original.attempt_number, 1);
+    let leased = client
+        .activity_task_status(&original.task_id, &original.attempt_id, &original.owner)
+        .await
+        .unwrap();
+    assert_eq!(leased["can_continue"], true);
+    eprintln!("SIGKILL original grant: {original:?}, actual lease: {leased}");
     original_process.0.kill().unwrap();
     let status = original_process.0.wait().unwrap();
     assert_eq!(
@@ -192,9 +198,11 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
     });
     let _abort_on_failure = AbortWorkerOnDrop(run.abort_handle());
     let reclaimed: ActivityContext =
-        tokio::time::timeout(Duration::from_secs(25), entered_rx.recv())
+        // Native's actual activity-task lease is five minutes. This case waits
+        // for real wall-clock expiry, without changing timestamps or storage.
+        tokio::time::timeout(Duration::from_secs(330), entered_rx.recv())
             .await
-            .expect("repair daemon and actual successor reclaim within 25 seconds")
+            .expect("repair daemon and actual successor reclaim within 330 seconds")
             .expect("actual successor callback entered");
     assert_eq!(reclaimed.task_id, original.task_id);
     assert_ne!(reclaimed.activity_attempt_id, original.attempt_id);

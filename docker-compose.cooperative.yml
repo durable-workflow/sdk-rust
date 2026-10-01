@@ -19,7 +19,6 @@ services:
       WORKFLOW_SERVER_AUTH_DRIVER: token
       WORKFLOW_SERVER_AUTH_TOKEN: test-token
       DW_WORKFLOW_TASK_TIMEOUT: 10
-      DW_ACTIVITY_TASK_TIMEOUT: 10
       DW_WORKER_PROTOCOL_VERSION: "1.20"
     depends_on:
       mysql:
