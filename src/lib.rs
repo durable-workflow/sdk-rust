@@ -19530,7 +19530,13 @@ mod tests {
             let mut task_context = TaskContext::from_waker(noop_waker_ref());
             match selected.as_mut().poll(&mut task_context) {
                 Poll::Ready(Ok(result)) => {
-                    assert_eq!(result.key, SelectionKey::Name("votes".into()))
+                    assert_eq!(result.key, SelectionKey::Name("votes".into()));
+                    let expected = if terminal_type == "ConditionWaitSatisfied" {
+                        ConditionWaitResult::Satisfied
+                    } else {
+                        ConditionWaitResult::TimedOut
+                    };
+                    assert_eq!(result.value, Some(ParallelResult::Condition(expected)));
                 }
                 other => panic!("latest physical winner must replay: {other:?}"),
             }

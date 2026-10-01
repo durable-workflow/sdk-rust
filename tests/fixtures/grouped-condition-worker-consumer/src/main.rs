@@ -1,5 +1,6 @@
 use durable_workflow::{
-    json, Client, ConditionWaitOptions, ParallelOperation, Value, Worker, WorkflowHandle,
+    json, Client, ConditionWaitOptions, ConditionWaitResult, ParallelOperation, ParallelResult,
+    SelectionKey, Value, Worker, WorkflowHandle,
 };
 use std::time::Duration;
 
@@ -114,34 +115,56 @@ async fn main() {
                 };
                 match mode {
                     "condition" => {
-                        ctx.wait_condition(condition(), move || {
-                            Ok(predicate_ctx.signals("vote")?.len() >= 2)
-                        })
-                        .await?;
+                        let observed = ctx
+                            .wait_condition(condition(), move || {
+                                Ok(predicate_ctx.signals("vote")?.len() >= 2)
+                            })
+                            .await?;
+                        assert_eq!(observed, ConditionWaitResult::Satisfied);
                     }
                     "parallel" | "parallel-timeout" => {
-                        ctx.parallel(vec![
-                            ParallelOperation::timer(Duration::from_secs(2)),
-                            ParallelOperation::group(vec![
-                                ParallelOperation::signal("never"),
-                                ParallelOperation::condition(condition(), move || {
-                                    Ok(predicate_ctx.signals("vote")?.len() >= 2)
-                                }),
-                            ]),
-                        ])
-                        .await?;
+                        let observed = ctx
+                            .parallel(vec![
+                                ParallelOperation::timer(Duration::from_secs(2)),
+                                ParallelOperation::group(vec![
+                                    ParallelOperation::signal("never"),
+                                    ParallelOperation::condition(condition(), move || {
+                                        Ok(predicate_ctx.signals("vote")?.len() >= 2)
+                                    }),
+                                ]),
+                            ])
+                            .await?;
+                        let expected = if mode.ends_with("timeout") {
+                            ConditionWaitResult::TimedOut
+                        } else {
+                            ConditionWaitResult::Satisfied
+                        };
+                        match &observed[1] {
+                            ParallelResult::Group(members) => {
+                                assert_eq!(members[1], ParallelResult::Condition(expected))
+                            }
+                            other => panic!("expected nested group: {other:?}"),
+                        }
                     }
                     "selection" | "selection-timeout" => {
-                        ctx.select_keyed(vec![
-                            ("timer", ParallelOperation::timer(Duration::from_secs(300))),
-                            (
-                                "votes",
-                                ParallelOperation::condition(condition(), move || {
-                                    Ok(predicate_ctx.signals("vote")?.len() >= 2)
-                                }),
-                            ),
-                        ])
-                        .await?;
+                        let observed = ctx
+                            .select_keyed(vec![
+                                ("timer", ParallelOperation::timer(Duration::from_secs(300))),
+                                (
+                                    "votes",
+                                    ParallelOperation::condition(condition(), move || {
+                                        Ok(predicate_ctx.signals("vote")?.len() >= 2)
+                                    }),
+                                ),
+                            ])
+                            .await?;
+                        assert_eq!(observed.key, SelectionKey::Name("votes".into()));
+                        let expected = if mode.ends_with("timeout") {
+                            ConditionWaitResult::TimedOut
+                        } else {
+                            ConditionWaitResult::Satisfied
+                        };
+                        assert_eq!(observed.value, Some(ParallelResult::Condition(expected)));
                     }
                     _ => unreachable!(),
                 }
