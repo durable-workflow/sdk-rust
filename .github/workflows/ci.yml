@@ -229,6 +229,7 @@ jobs:
           endpoint="$(docker compose -f docker-compose.cooperative.yml port server 8080)"
           echo "DURABLE_WORKFLOW_SERVER_URL=http://$endpoint" >> "$GITHUB_ENV"
       - name: Run actual Worker cooperative scenarios
+        shell: bash
         run: cargo test --test cooperative_server -- --ignored --nocapture --test-threads=1 2>&1 | tee cooperative-results.log
       - name: Retain bounded scenario evidence
         if: ${{ always() }}
