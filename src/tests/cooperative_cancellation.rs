@@ -1767,6 +1767,76 @@ fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'stati
     if case == "heartbeat-budget" {
         thread::sleep(Duration::from_millis(5200));
     }
+    if case == "claim-budget" {
+        thread::sleep(Duration::from_secs(3));
+    }
+    if path.ends_with("/workflow-tasks/poll") {
+        if case == "claim-retry" && number == 1 {
+            // The first HTTP reply is unreadable after acquisition. Retrying
+            // must reuse the same durable poll identity rather than claim twice.
+            return Some(("invalid-status", String::new()));
+        }
+        if matches!(case, "claim-idle" | "claim-stop") {
+            return Some((
+                "200 OK",
+                json!({"task":null,
+                    "poll_status":if case == "claim-stop" { "draining" } else { "idle" },
+                    "reason":if case == "claim-stop" { "worker_draining" } else { "no_tasks" },
+                    "protocol_version":"1.20"
+                })
+                .to_string(),
+            ));
+        }
+        let mut task = json!({
+            "task_id":"task/selected", "workflow_type":"cancel", "run_id":"run",
+            "lease_owner":"actual-owner", "workflow_task_attempt":7,
+            "payload_codec":DEFAULT_CODEC, "history_events":[],
+            "cancel_requested":true, "cancellation_request":request_observation()
+        });
+        match case {
+            "claim-no-observation" => {
+                task.as_object_mut().unwrap().remove("cancellation_request");
+            }
+            "claim-missing-attempt" => {
+                task.as_object_mut()
+                    .unwrap()
+                    .remove("workflow_task_attempt");
+            }
+            "claim-zero-attempt" => task["workflow_task_attempt"] = json!(0),
+            "claim-owner" => task["lease_owner"] = json!("replacement"),
+            "claim-missing-owner" => task["lease_owner"] = Value::Null,
+            "claim-missing-run" => task["run_id"] = Value::Null,
+            "claim-missing-id" => task["task_id"] = json!(" "),
+            "claim-bad-observation" => task["cancellation_request"] = json!(false),
+            "claim-bad-token" => {
+                task["cancellation_request"]["history_refresh_page_token"] = json!(" ")
+            }
+            _ => {}
+        }
+        if matches!(
+            case,
+            "claim-history"
+                | "claim-budget"
+                | "cycle"
+                | "page-bound"
+                | "empty-progress"
+                | "oversized-page"
+                | "wrong-task"
+                | "wrong-attempt"
+                | "malformed-event"
+                | "empty-token"
+                | "missing-token"
+        ) {
+            task["next_history_page_token"] = json!("opaque-server-token");
+        }
+        return Some((
+            "200 OK",
+            json!({"task":task,"protocol_version":"1.20",
+                "server_capabilities":{"workflow_memo_updates":{"supported":true}}
+            })
+            .to_string(),
+        ));
+    }
     let mut response = if path.ends_with("/deliver-cancellation") {
         json!({"delivered":true, "task_id":"task/selected", "workflow_run_id":"run",
             "request_id":body["request_id"], "sequence":body["sequence"], "call_kind":body["call_kind"],
@@ -1907,6 +1977,197 @@ fn transport_server() -> MockWorkerServer {
         request_override: Some(transport_responses),
         ..Default::default()
     })
+}
+
+#[tokio::test]
+async fn cooperative_poll_retains_the_actual_claim_observation_and_fenced_history() {
+    let server = transport_server();
+    let response = client(&server, "claim-history")
+        .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(response.outcome, WorkerPollOutcome::Task);
+    assert_eq!(response.protocol_version.as_deref(), Some("1.20"));
+    assert_eq!(
+        response.server_capabilities.unwrap()["workflow_memo_updates"]["supported"],
+        true
+    );
+    let claim = response.task.unwrap();
+    assert_eq!(claim.task().task_id, "task/selected");
+    assert_eq!(claim.task().lease_owner.as_deref(), Some("actual-owner"));
+    assert_eq!(claim.task().workflow_task_attempt, 7);
+    assert_eq!(claim.cancellation_request(), Some(&original_observation()));
+    assert_eq!(claim.task().history_events.len(), 3);
+    assert_eq!(claim.task().next_history_page_token, None);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
+        assert_eq!(request.authorization.as_deref(), Some("Bearer worker-only"));
+        assert_eq!(request.namespace.as_deref(), Some("caller-namespace"));
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        if request.path.ends_with("/poll") {
+            assert_eq!(body["worker_id"], "actual-owner");
+            assert_eq!(body["task_queue"], "queue");
+            assert_eq!(body["history_page_size"], WORKFLOW_HISTORY_PAGE_SIZE);
+            assert!(!body["poll_request_id"].as_str().unwrap().is_empty());
+        } else {
+            assert!(request.path.ends_with("/task%2Fselected/history"));
+            assert_eq!(body["lease_owner"], "actual-owner");
+            assert_eq!(body["workflow_task_attempt"], 7);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cooperative_poll_rejects_invented_claims_and_malformed_observations() {
+    for case in [
+        "claim-missing-attempt",
+        "claim-zero-attempt",
+        "claim-owner",
+        "claim-missing-owner",
+        "claim-missing-run",
+        "claim-missing-id",
+        "claim-bad-observation",
+        "claim-bad-token",
+    ] {
+        let server = transport_server();
+        let result = client(&server, case)
+            .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+            "{case}: {result:?}"
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cooperative_poll_transport_retry_preserves_the_same_acquisition_identity() {
+    let server = transport_server();
+    let response = client(&server, "claim-retry")
+        .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(response.task.unwrap().task().workflow_task_attempt, 7);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    let body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert!(!body["poll_request_id"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cooperative_claim_history_rejects_changed_claims_bad_progress_and_unbounded_pages() {
+    for case in [
+        "cycle",
+        "page-bound",
+        "empty-progress",
+        "oversized-page",
+        "wrong-task",
+        "wrong-attempt",
+        "malformed-event",
+        "empty-token",
+        "missing-token",
+    ] {
+        let server = transport_server();
+        let result = client(&server, case)
+            .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+            "{case}: {result:?}"
+        );
+        assert!(server.requests.lock().unwrap().len() <= 129);
+    }
+}
+
+#[tokio::test]
+async fn cooperative_claim_heartbeat_preserves_the_first_observation_and_refuses_replacement() {
+    let server = transport_server();
+    let mut claim = client(&server, "valid")
+        .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+        .await
+        .unwrap()
+        .task
+        .unwrap();
+    assert!(claim.task().history_events.is_empty());
+    claim
+        .heartbeat(&client(&server, "heartbeat-equivalent-time"))
+        .await
+        .unwrap();
+    assert_eq!(claim.cancellation_request(), Some(&original_observation()));
+    assert!(matches!(
+        claim.heartbeat(&client(&server, "heartbeat-owner")).await,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    assert_eq!(claim.cancellation_request(), Some(&original_observation()));
+    assert_eq!(claim.task().lease_owner.as_deref(), Some("actual-owner"));
+    assert_eq!(claim.task().workflow_task_attempt, 7);
+    assert!(claim.task().history_events.is_empty());
+}
+
+#[tokio::test]
+async fn cooperative_poll_preserves_idle_stop_and_no_observation_despite_task_flags() {
+    let server = transport_server();
+    for case in ["claim-idle", "claim-stop"] {
+        let response = client(&server, case)
+            .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(response.task.is_none());
+        assert_eq!(response.outcome.should_stop(), case == "claim-stop");
+    }
+    let mut claim = client(&server, "claim-no-observation")
+        .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+        .await
+        .unwrap()
+        .task
+        .unwrap();
+    assert!(claim.task().cancel_requested);
+    assert!(claim.cancellation_request().is_none());
+    claim.heartbeat(&client(&server, "valid")).await.unwrap();
+    assert_eq!(claim.cancellation_request(), Some(&original_observation()));
+}
+
+#[tokio::test]
+async fn cooperative_poll_preflights_inputs_and_shares_the_poll_and_history_budget() {
+    let server = transport_server();
+    let client = client(&server, "claim-budget");
+    for (owner, queue, timeout) in [
+        (" ", "queue", Duration::ZERO),
+        ("actual-owner", " ", Duration::ZERO),
+        ("actual-owner", "queue", Duration::MAX),
+    ] {
+        assert!(matches!(
+            client
+                .poll_cooperative_workflow_task(owner, queue, timeout)
+                .await,
+            Err(Error::InvalidCooperativeCancellation(_))
+        ));
+    }
+    assert!(server.requests.lock().unwrap().is_empty());
+    let control_only = Client::builder(server.base_url())
+        .control_token(Some("control-only".into()))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        control_only
+            .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+            .await,
+        Err(Error::MissingRoleCredentials { role: "worker", .. })
+    ));
+    assert!(server.requests.lock().unwrap().is_empty());
+    let started = Instant::now();
+    assert!(matches!(
+        client
+            .poll_cooperative_workflow_task("actual-owner", "queue", Duration::ZERO)
+            .await,
+        Err(Error::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -23,6 +23,46 @@ pub struct WorkflowTaskHeartbeat {
     pub cancellation_request: Option<CancellationRequest>,
 }
 
+/// One actual protocol 1.20 claim and its original pending observation.
+///
+/// The claim is read-only. Observing a request does not deliver cancellation to
+/// workflow code. Canonical history and a committed delivery are still required.
+#[derive(Clone, Debug)]
+pub struct CooperativeWorkflowTask {
+    task: WorkflowTask,
+    cancellation_request: Option<CancellationRequest>,
+}
+
+impl CooperativeWorkflowTask {
+    pub fn task(&self) -> &WorkflowTask {
+        &self.task
+    }
+
+    pub fn cancellation_request(&self) -> Option<&CancellationRequest> {
+        self.cancellation_request.as_ref()
+    }
+
+    /// Renew this exact claim and retain the first observation's identity/token.
+    ///
+    /// A refused or malformed renewal leaves the claim and observation intact.
+    pub async fn heartbeat(&mut self, client: &Client) -> Result<WorkflowTaskHeartbeat> {
+        let receipt = client
+            .heartbeat_workflow_task(&self.task, self.cancellation_request.as_ref())
+            .await?;
+        self.cancellation_request = receipt.cancellation_request.clone();
+        Ok(receipt)
+    }
+}
+
+/// An explicit cooperative poll, including ordinary idle and stop outcomes.
+#[derive(Clone, Debug)]
+pub struct CooperativeWorkflowTaskPoll {
+    pub task: Option<CooperativeWorkflowTask>,
+    pub outcome: WorkerPollOutcome,
+    pub protocol_version: Option<String>,
+    pub server_capabilities: Option<Value>,
+}
+
 /// Optional reason and runtime-owned cleanup limit for a cooperative request.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CooperativeCancellationOptions {
@@ -931,6 +971,148 @@ fn acknowledgment(
 }
 
 impl Client {
+    /// Acquire a claim with protocol 1.20 and retain its pending observation.
+    ///
+    /// The Server must have admitted a capable worker registration. This method
+    /// registers no capability and does not change ordinary [`Worker`] polling.
+    /// It never substitutes a worker ID for a missing lease owner or invents a
+    /// task attempt. Poll retries reuse one request ID. Poll and history loading
+    /// share one long-poll budget plus five seconds, with at most 128 pages.
+    pub async fn poll_cooperative_workflow_task(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+    ) -> Result<CooperativeWorkflowTaskPoll> {
+        if worker_id.trim().is_empty() || task_queue.trim().is_empty() {
+            return Err(invalid(
+                "cooperative polling requires a worker and task queue",
+            ));
+        }
+        let budget = timeout
+            .checked_add(CONTROL_BUDGET)
+            .ok_or_else(|| invalid("cooperative poll timeout exceeds its supported budget"))?;
+        let body = json!({
+            "worker_id":worker_id, "task_queue":task_queue,
+            "poll_request_id":unique_request_id("rust-workflow-poll"),
+            "timeout_seconds":long_poll_timeout_seconds(timeout),
+            "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
+        });
+        tokio::time::timeout(budget, async {
+            let value: Value = self
+                .poll_request_json(
+                    "/worker/workflow-tasks/poll",
+                    RequestProtocol::Worker("1.20"),
+                    &body,
+                    budget,
+                    1,
+                )
+                .await?;
+            let mut response: PollWorkflowTaskResponse = serde_json::from_value(value.clone())
+                .map_err(|_| invalid("cooperative poll returned a malformed envelope or task"))?;
+            let outcome = response.outcome();
+            let task = if let Some(task) = response.task.take() {
+                let (owner, _) = cancellation_claim(&task)?;
+                if owner != worker_id
+                    || value["task"]["workflow_task_attempt"].as_u64()
+                        != Some(task.workflow_task_attempt)
+                {
+                    return Err(invalid(
+                        "cooperative poll did not return the caller's actual owner and attempt",
+                    ));
+                }
+                let cancellation_request = match value["task"].get("cancellation_request") {
+                    None | Some(Value::Null) => None,
+                    Some(observation) => Some(CancellationRequest::from_observation(observation)?),
+                };
+                let mut claim = CooperativeWorkflowTask {
+                    task,
+                    cancellation_request,
+                };
+                self.load_cooperative_claim_history(&mut claim).await?;
+                Some(claim)
+            } else {
+                None
+            };
+            Ok(CooperativeWorkflowTaskPoll {
+                task,
+                outcome,
+                protocol_version: response.protocol_version,
+                server_capabilities: response.server_capabilities,
+            })
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    async fn load_cooperative_claim_history(
+        &self,
+        claim: &mut CooperativeWorkflowTask,
+    ) -> Result<()> {
+        let (owner, _) = cancellation_claim(&claim.task)?;
+        let owner = owner.to_owned();
+        let mut token = claim.task.next_history_page_token.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(current) = token.take() {
+            if current.trim().is_empty()
+                || seen.len() >= MAX_REFRESH_PAGES
+                || !seen.insert(current.clone())
+            {
+                return Err(invalid(
+                    "claim history exceeded its page bound or returned an invalid/repeated token",
+                ));
+            }
+            let body = json!({
+                "lease_owner":owner,"workflow_task_attempt":claim.task.workflow_task_attempt,
+                "next_history_page_token":current,"history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
+            });
+            let value: Value = self
+                .request_json(
+                    reqwest::Method::POST,
+                    &format!(
+                        "/worker/workflow-tasks/{}/history",
+                        percent_encode_path_segment(&claim.task.task_id)
+                    ),
+                    RequestProtocol::Worker("1.20"),
+                    Some(&body),
+                )
+                .await?;
+            if value["task_id"].as_str() != Some(claim.task.task_id.as_str())
+                || value["workflow_task_attempt"].as_u64() != Some(claim.task.workflow_task_attempt)
+            {
+                return Err(invalid(
+                    "claim history changed the selected task or attempt",
+                ));
+            }
+            let events = value["history_events"]
+                .as_array()
+                .ok_or_else(|| invalid("claim history page must contain an event array"))?;
+            if events.len() > WORKFLOW_HISTORY_PAGE_SIZE as usize {
+                return Err(invalid(
+                    "claim history page exceeds its requested event limit",
+                ));
+            }
+            token = match value.get("next_history_page_token") {
+                Some(Value::Null) => None,
+                Some(Value::String(next)) if !next.trim().is_empty() && !events.is_empty() => {
+                    Some(next.clone())
+                }
+                _ => return Err(invalid("claim history page token or progress is invalid")),
+            };
+            let page: WorkflowTaskHistoryPage = serde_json::from_value(value)
+                .map_err(|_| invalid("claim history page contains malformed fields or events"))?;
+            if page
+                .history_events
+                .iter()
+                .any(|event| event.event_type.trim().is_empty())
+            {
+                return Err(invalid("claim history event type must be non-empty"));
+            }
+            claim.task.append_history_page(page);
+        }
+        Ok(())
+    }
+
     /// Renew the exact selected workflow-task lease using worker protocol 1.20.
     ///
     /// The reply must acknowledge the actual task, owner and attempt. Renewal
