@@ -1764,11 +1764,19 @@ fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'stati
     if case == "budget" {
         thread::sleep(Duration::from_secs(3));
     }
+    if case == "heartbeat-budget" {
+        thread::sleep(Duration::from_millis(5200));
+    }
     let mut response = if path.ends_with("/deliver-cancellation") {
         json!({"delivered":true, "task_id":"task/selected", "workflow_run_id":"run",
             "request_id":body["request_id"], "sequence":body["sequence"], "call_kind":body["call_kind"],
             "sequence_span":body["sequence_span"], "operation_sequence":body["operation_sequence"],
             "operation_sequence_span":body["operation_sequence_span"], "reason":null})
+    } else if path.ends_with("/heartbeat") {
+        json!({"task_id":"task/selected", "workflow_task_attempt":7,
+            "lease_owner":"actual-owner", "renewed":true,
+            "lease_expires_at":"2026-10-01T08:00:30Z", "run_status":"running",
+            "task_status":"leased", "reason":null, "cancellation_request":request_observation()})
     } else if path.ends_with("/history") {
         let first = body["next_history_page_token"] == "opaque-server-token";
         let events = if first {
@@ -1829,6 +1837,44 @@ fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'stati
     match case {
         "wrong-task" => response["task_id"] = json!("other-task"),
         "wrong-run" => response["workflow_run_id"] = json!("other-run"),
+        "heartbeat-attempt" => response["workflow_task_attempt"] = json!(8),
+        "heartbeat-owner" => response["lease_owner"] = json!("replacement-owner"),
+        "heartbeat-not-renewed" => response["renewed"] = json!(false),
+        "heartbeat-string-renewed" => response["renewed"] = json!("true"),
+        "heartbeat-closed" => response["run_status"] = json!("cancelled"),
+        "heartbeat-unknown-run" => response["run_status"] = json!("unknown"),
+        "heartbeat-finished-task" => response["task_status"] = json!("completed"),
+        "heartbeat-expiry" => response["lease_expires_at"] = json!("bad"),
+        "heartbeat-expiry-no-zone" => response["lease_expires_at"] = json!("2026-10-01T08:00:30"),
+        "heartbeat-malformed-request" => response["cancellation_request"] = json!(false),
+        "heartbeat-missing-token" => {
+            response["cancellation_request"]
+                .as_object_mut()
+                .unwrap()
+                .remove("history_refresh_page_token");
+        }
+        "heartbeat-changed-request" => {
+            response["cancellation_request"]["request_id"] = json!("changed")
+        }
+        "heartbeat-changed-request-time" => {
+            response["cancellation_request"]["requested_at"] = json!("2026-10-01T08:00:01Z")
+        }
+        "heartbeat-changed-deadline" => {
+            response["cancellation_request"]["cleanup_deadline_at"] = json!("2026-10-01T08:11:00Z")
+        }
+        "heartbeat-equivalent-time" => {
+            response["cancellation_request"]["requested_at"] = json!("2026-10-01T10:00:00+02:00");
+            response["cancellation_request"]["cleanup_deadline_at"] =
+                json!("2026-10-01T10:10:00+02:00");
+            response["cancellation_request"]["history_refresh_page_token"] =
+                json!("fresh-server-token");
+        }
+        "heartbeat-no-request" => {
+            response
+                .as_object_mut()
+                .unwrap()
+                .remove("cancellation_request");
+        }
         "wrong-request" => response["request_id"] = json!("other-request"),
         "wrong-sequence" => response["sequence"] = json!(2),
         "wrong-kind" => response["call_kind"] = json!("activity"),
@@ -1861,6 +1907,124 @@ fn transport_server() -> MockWorkerServer {
         request_override: Some(transport_responses),
         ..Default::default()
     })
+}
+
+#[tokio::test]
+async fn cooperative_heartbeat_renews_the_exact_worker_claim_and_retains_original_observation() {
+    let server = transport_server();
+    let original = original_observation();
+    let receipt = client(&server, "heartbeat-equivalent-time")
+        .heartbeat_workflow_task(&transport_task(), Some(&original))
+        .await
+        .unwrap();
+    assert_eq!(receipt.task_id, "task/selected");
+    assert_eq!(receipt.workflow_task_attempt, 7);
+    assert_eq!(receipt.lease_owner, "actual-owner");
+    assert_eq!(receipt.cancellation_request, Some(original));
+    let requests = server.requests.lock().unwrap();
+    let request = &requests[0];
+    assert_eq!(
+        request.path,
+        "/heartbeat-equivalent-time/api/worker/workflow-tasks/task%2Fselected/heartbeat"
+    );
+    assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
+    assert_eq!(request.authorization.as_deref(), Some("Bearer worker-only"));
+    assert_eq!(request.namespace.as_deref(), Some("caller-namespace"));
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"lease_owner":"actual-owner", "workflow_task_attempt":7})
+    );
+}
+
+#[tokio::test]
+async fn cooperative_heartbeat_rejects_changed_claims_malformed_renewal_and_changed_identity() {
+    for case in [
+        "wrong-task",
+        "heartbeat-attempt",
+        "heartbeat-owner",
+        "heartbeat-not-renewed",
+        "heartbeat-string-renewed",
+        "heartbeat-closed",
+        "heartbeat-unknown-run",
+        "heartbeat-finished-task",
+        "heartbeat-expiry",
+        "heartbeat-expiry-no-zone",
+        "heartbeat-malformed-request",
+        "heartbeat-missing-token",
+        "heartbeat-changed-request",
+        "heartbeat-changed-request-time",
+        "heartbeat-changed-deadline",
+        "heartbeat-no-request",
+        "wrong-reason",
+    ] {
+        let server = transport_server();
+        let result = client(&server, case)
+            .heartbeat_workflow_task(&transport_task(), Some(&original_observation()))
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+            "{case}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cooperative_heartbeat_accepts_new_observation_and_does_not_invent_a_request() {
+    for case in ["valid", "heartbeat-no-request"] {
+        let server = transport_server();
+        let receipt = client(&server, case)
+            .heartbeat_workflow_task(&transport_task(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.cancellation_request,
+            if case == "valid" {
+                Some(original_observation())
+            } else {
+                None
+            }
+        );
+        assert_eq!(receipt.lease_expires_at, "2026-10-01T08:00:30Z");
+    }
+}
+
+#[tokio::test]
+async fn cooperative_heartbeat_validates_the_claim_and_original_observation_before_network_io() {
+    let server = transport_server();
+    let client = client(&server, "valid");
+    let mut task = transport_task();
+    task.lease_owner = None;
+    assert!(matches!(
+        client.heartbeat_workflow_task(&task, None).await,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    let mut original = original_observation();
+    original.history_refresh_page_token = None;
+    assert!(matches!(
+        client
+            .heartbeat_workflow_task(&transport_task(), Some(&original))
+            .await,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cooperative_heartbeat_preserves_ownership_refusal_and_the_total_budget() {
+    let server = transport_server();
+    assert!(
+        matches!(client(&server, "refused").heartbeat_workflow_task(&transport_task(), None).await,
+        Err(Error::Http { status, .. }) if status.as_u16() == 409)
+    );
+    let started = Instant::now();
+    assert!(matches!(
+        client(&server, "heartbeat-budget")
+            .heartbeat_workflow_task(&transport_task(), None)
+            .await,
+        Err(Error::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(6));
 }
 
 #[tokio::test]

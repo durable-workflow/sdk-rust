@@ -12,6 +12,17 @@ pub struct CancellationDeliveryReceipt {
     pub delivery: CancellationDelivery,
 }
 
+/// Successful renewal of the exact workflow-task claim with optional observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowTaskHeartbeat {
+    pub task_id: String,
+    pub workflow_task_attempt: u64,
+    pub lease_owner: String,
+    pub lease_expires_at: String,
+    pub run_status: String,
+    pub cancellation_request: Option<CancellationRequest>,
+}
+
 /// Optional reason and runtime-owned cleanup limit for a cooperative request.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CooperativeCancellationOptions {
@@ -76,6 +87,22 @@ fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 impl CancellationRequest {
+    pub(super) fn preserve_observation(&self, current: &Self) -> Result<Self> {
+        self.validate_observation()?;
+        current.validate_observation()?;
+        if self.request_id != current.request_id
+            || DateTime::parse_from_rfc3339(&self.requested_at).unwrap()
+                != DateTime::parse_from_rfc3339(&current.requested_at).unwrap()
+            || DateTime::parse_from_rfc3339(&self.cleanup_deadline_at).unwrap()
+                != DateTime::parse_from_rfc3339(&current.cleanup_deadline_at).unwrap()
+        {
+            return Err(invalid(
+                "observation changed the original request or cleanup deadline",
+            ));
+        }
+        Ok(self.clone())
+    }
+
     pub(super) fn validate_observation(&self) -> Result<()> {
         Self::from_observation(&json!({
             "request_id":self.request_id, "requested_at":self.requested_at,
@@ -904,6 +931,60 @@ fn acknowledgment(
 }
 
 impl Client {
+    /// Renew the exact selected workflow-task lease using worker protocol 1.20.
+    ///
+    /// The reply must acknowledge the actual task, owner and attempt. Renewal
+    /// neither commits cancellation delivery nor extends its cleanup deadline.
+    pub async fn heartbeat_workflow_task(
+        &self,
+        task: &WorkflowTask,
+        original: Option<&CancellationRequest>,
+    ) -> Result<WorkflowTaskHeartbeat> {
+        let (owner, _) = cancellation_claim(task)?;
+        if let Some(original) = original {
+            original.validate_observation()?;
+        }
+        tokio::time::timeout(CONTROL_BUDGET, async {
+            let response: Value = self.request_json(
+                reqwest::Method::POST,
+                &format!("/worker/workflow-tasks/{}/heartbeat", percent_encode_path_segment(&task.task_id)),
+                RequestProtocol::Worker("1.20"),
+                Some(&json!({"lease_owner":owner,"workflow_task_attempt":task.workflow_task_attempt})),
+            ).await?;
+            if response["task_id"].as_str() != Some(task.task_id.as_str())
+                || response["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
+                || response["lease_owner"].as_str() != Some(owner)
+                || response["renewed"].as_bool() != Some(true)
+                || response.get("reason") != Some(&Value::Null)
+                || response["task_status"].as_str() != Some("leased")
+            {
+                return Err(invalid("workflow heartbeat did not acknowledge the exact leased claim"));
+            }
+            let expires = text(&response, "lease_expires_at")?;
+            DateTime::parse_from_rfc3339(expires).map_err(|_| invalid("workflow heartbeat lease expiry must include a timezone"))?;
+            let run_status = text(&response, "run_status")?;
+            if !matches!(run_status, "pending" | "running" | "waiting") {
+                return Err(invalid("workflow heartbeat did not acknowledge an active run"));
+            }
+            let cancellation_request = match response.get("cancellation_request") {
+                None | Some(Value::Null) if original.is_none() => None,
+                None | Some(Value::Null) => return Err(invalid("workflow heartbeat omitted its original pending request")),
+                Some(observation) => {
+                    let current = CancellationRequest::from_observation(observation)?;
+                    Some(match original {
+                        Some(original) => original.preserve_observation(&current)?,
+                        None => current,
+                    })
+                },
+            };
+            Ok(WorkflowTaskHeartbeat {
+                task_id:task.task_id.clone(), workflow_task_attempt:task.workflow_task_attempt,
+                lease_owner:owner.to_owned(), lease_expires_at:expires.to_owned(),
+                run_status:run_status.to_owned(), cancellation_request,
+            })
+        }).await.map_err(|_| Error::Timeout)?
+    }
+
     /// Commit cooperative delivery on the exact selected workflow-task claim.
     ///
     /// This explicit worker-protocol 1.20 operation renews no lease and advertises
