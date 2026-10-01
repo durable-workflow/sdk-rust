@@ -216,6 +216,12 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
         reclaimed.attempt_number
     );
 
+    let closed = client
+        .activity_task_status(&original.task_id, &original.attempt_id, &original.owner)
+        .await
+        .unwrap();
+    assert_eq!(closed["attempt_status"], "expired");
+    assert_eq!(closed["can_continue"], false);
     let before = history(&handle).await;
     for result in [
         client
@@ -255,13 +261,24 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
     assert!(heartbeat.should_stop());
     assert_eq!(heartbeat.reason.as_deref(), Some("attempt_closed"));
     assert!(!heartbeat.cancel_requested);
-    assert_eq!(heartbeat.last_heartbeat_at, None);
+    assert_eq!(
+        heartbeat.last_heartbeat_at.as_deref(),
+        closed["last_heartbeat_at"].as_str()
+    );
     assert_eq!(
         heartbeat.lease_expires_at.as_deref(),
-        leased["lease_expires_at"].as_str(),
+        closed["lease_expires_at"].as_str(),
         "dead attempt renewed its lease"
     );
     eprintln!("SIGKILL dead-attempt heartbeat: {heartbeat:?}");
+    assert_eq!(
+        closed,
+        client
+            .activity_task_status(&original.task_id, &original.attempt_id, &original.owner)
+            .await
+            .unwrap(),
+        "dead heartbeat changed attempt authority or lifetime"
+    );
     assert_eq!(
         before,
         history(&handle).await,
