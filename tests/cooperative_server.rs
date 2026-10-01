@@ -3,8 +3,8 @@
 
 use durable_workflow::{
     json, ActivityContext, Client, ConditionWaitOptions, CooperativeCancellationOptions, Error,
-    ParallelOperation, ParallelResult, SelectionKey, Value, Worker, WorkflowHandle,
-    WorkflowResultOptions,
+    ParallelOperation, ParallelResult, SelectionKey, Value, Worker, WorkflowCommandOptions,
+    WorkflowHandle, WorkflowResultOptions,
 };
 use std::{
     sync::{
@@ -298,6 +298,172 @@ async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publicat
 }
 
 struct CallbackDrop(Arc<AtomicUsize>);
+
+async fn blocked_cleanup_cutoff(terminate: bool) {
+    let client = client();
+    let queue = queue();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let cleanup_dropped = Arc::clone(&dropped);
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut worker = Worker::new(client.clone(), &queue)
+        .cooperative_cancellation(true)
+        .max_concurrent_workflow_tasks(1)
+        .max_concurrent_activity_tasks(1)
+        .poll_timeout(Duration::from_secs(1));
+    register_process_workflow(&mut worker);
+    worker.register_activity(UNDO, move |ctx, _| {
+        let entered_tx = entered_tx.clone();
+        let cleanup_dropped = Arc::clone(&cleanup_dropped);
+        async move {
+            let _drop = CallbackDrop(cleanup_dropped);
+            entered_tx.send(ctx).unwrap();
+            std::future::pending::<durable_workflow::Result<Value>>().await
+        }
+    });
+    let handle = client
+        .start_workflow(PROCESS, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let request = handle
+        .request_cancellation(CooperativeCancellationOptions {
+            cleanup_timeout_seconds: Some(if terminate { 60 } else { 5 }),
+            ..CooperativeCancellationOptions::default()
+        })
+        .await
+        .unwrap();
+    let run = tokio::spawn(async move {
+        worker
+            .run_until(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let _abort_on_failure = AbortWorkerOnDrop(run.abort_handle());
+    let cleanup: ActivityContext = tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .unwrap()
+        .expect("actual shielded cleanup entered");
+    if terminate {
+        handle
+            .terminate_selected_run(WorkflowCommandOptions::default())
+            .await
+            .unwrap();
+    }
+    let result = handle
+        .result_selected_run(WorkflowResultOptions {
+            timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(50),
+        })
+        .await;
+    if terminate {
+        assert!(
+            matches!(result, Err(Error::WorkflowTerminated(_))),
+            "{result:?}"
+        );
+    } else {
+        assert!(
+            matches!(result, Err(Error::WorkflowCancelled(_))),
+            "{result:?}"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while dropped.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("blocked cleanup future drops after terminal authority loss");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        cleanup.heartbeat(json!({"late":true})).await,
+        Err(Error::ActivityExecutionAbandoned(_))
+    ));
+    let snapshot = history(&handle).await;
+    for kind in [
+        "CooperativeCancellationRequested",
+        "CooperativeCancellationDelivered",
+    ] {
+        assert_eq!(count(&snapshot, kind), 1, "{snapshot}");
+        let event = snapshot["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event_type"] == kind)
+            .unwrap();
+        assert_eq!(
+            event["payload"]["workflow_command_id"],
+            request.cancellation_request.request_id
+        );
+    }
+    assert_eq!(
+        count(&snapshot, "WorkflowCancelled"),
+        usize::from(!terminate)
+    );
+    assert_eq!(
+        count(&snapshot, "WorkflowTerminated"),
+        usize::from(terminate)
+    );
+    assert_eq!(count(&snapshot, "ActivityScheduled"), 1);
+    assert_eq!(count(&snapshot, "ActivityCancelled"), 1);
+    for kind in [
+        "ActivityCompleted",
+        "ActivityFailed",
+        "ActivityTimedOut",
+        "WorkflowCompleted",
+        "WorkflowFailed",
+    ] {
+        assert_eq!(count(&snapshot, kind), 0, "{snapshot}");
+    }
+    for result in [
+        client
+            .complete_activity_task(
+                &cleanup.task_id,
+                &cleanup.activity_attempt_id,
+                &cleanup.lease_owner,
+                json!("late"),
+                "avro",
+            )
+            .await,
+        client
+            .fail_activity_task(
+                &cleanup.task_id,
+                &cleanup.activity_attempt_id,
+                &cleanup.lease_owner,
+                "late",
+                true,
+            )
+            .await,
+    ] {
+        assert!(
+            matches!(result, Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409)
+        );
+    }
+    assert_eq!(
+        snapshot,
+        history(&handle).await,
+        "late cleanup changed canonical history"
+    );
+    eprintln!("blocked cleanup cutoff terminate={terminate}: {snapshot}");
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_cleanup_deadline_stops_blocked_compensation() {
+    blocked_cleanup_cutoff(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_termination_stops_blocked_compensation() {
+    blocked_cleanup_cutoff(true).await;
+}
 
 impl Drop for CallbackDrop {
     fn drop(&mut self) {
