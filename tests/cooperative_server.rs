@@ -2,8 +2,9 @@
 //! Ordinary cargo tests leave these cases ignored. They require a real runtime.
 
 use durable_workflow::{
-    json, ActivityContext, Client, CooperativeCancellationOptions, Error, Value, Worker,
-    WorkflowHandle, WorkflowResultOptions,
+    json, ActivityContext, Client, ConditionWaitOptions, CooperativeCancellationOptions, Error,
+    ParallelOperation, ParallelResult, SelectionKey, Value, Worker, WorkflowHandle,
+    WorkflowResultOptions,
 };
 use std::{
     sync::{
@@ -16,6 +17,7 @@ use std::{
 const WORKFLOW: &str = "tests.rust-cooperative-timer";
 const UNDO: &str = "tests.rust-cooperative-undo";
 const BLOCKED: &str = "tests.rust-cooperative-blocked";
+const REPLAY: &str = "tests.rust-cooperative-replay";
 
 struct CallbackDrop(Arc<AtomicUsize>);
 
@@ -97,12 +99,21 @@ fn count(history: &Value, kind: &str) -> usize {
 }
 
 async fn tick_until(worker: &Worker, handle: &WorkflowHandle, kind: &str) -> Value {
+    tick_until_count(worker, handle, kind, 1).await
+}
+
+async fn tick_until_count(
+    worker: &Worker,
+    handle: &WorkflowHandle,
+    kind: &str,
+    target: usize,
+) -> Value {
     let mut last_snapshot = Value::Null;
     let observed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             worker.run_once().await.expect("actual Worker tick");
             let snapshot = history(handle).await;
-            if count(&snapshot, kind) > 0 {
+            if count(&snapshot, kind) >= target {
                 return snapshot;
             }
             last_snapshot = snapshot;
@@ -112,7 +123,7 @@ async fn tick_until(worker: &Worker, handle: &WorkflowHandle, kind: &str) -> Val
     .await;
     observed.unwrap_or_else(|_| {
         panic!(
-            "expected {kind} within 30s for {}/{:?}, last history: {last_snapshot}",
+            "expected {target} {kind} within 30s for {}/{:?}, last history: {last_snapshot}",
             handle.workflow_id, handle.run_id
         )
     })
@@ -467,4 +478,187 @@ async fn server_managed_worker_fences_blocked_callback_without_user_heartbeats()
 #[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
 async fn server_managed_worker_fences_blocked_callback_with_user_heartbeats() {
     managed_remote_cancellation(true).await;
+}
+
+fn replay_worker(client: &Client, queue: &str, mode: &'static str) -> Worker {
+    let mut worker = Worker::new(client.clone(), queue)
+        .worker_id(format!("{queue}-{}", durable_workflow::Uuid::new_v4()))
+        .cooperative_cancellation(true)
+        .poll_timeout(Duration::from_secs(1));
+    worker.register_workflow(REPLAY, move |ctx, _| async move {
+        let predicate_ctx = ctx.clone();
+        let condition = || ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1");
+        match mode {
+            "condition" => {
+                ctx.wait_condition(condition(), move || {
+                    Ok(predicate_ctx.signals("vote")?.len() >= 2)
+                })
+                .await?;
+            }
+            "parallel" => {
+                ctx.parallel(vec![
+                    ParallelOperation::timer(Duration::from_secs(300)),
+                    ParallelOperation::group(vec![
+                        ParallelOperation::signal("never"),
+                        ParallelOperation::condition(condition(), move || {
+                            Ok(predicate_ctx.signals("vote")?.len() >= 2)
+                        }),
+                    ]),
+                ])
+                .await?;
+            }
+            "selection" => {
+                ctx.select_keyed(vec![
+                    ("timer", ParallelOperation::timer(Duration::from_secs(300))),
+                    (
+                        "votes",
+                        ParallelOperation::condition(condition(), move || {
+                            Ok(predicate_ctx.signals("vote")?.len() >= 2)
+                        }),
+                    ),
+                ])
+                .await?;
+            }
+            "winner" => {
+                let selected = ctx
+                    .select_keyed(vec![
+                        ("slow", ParallelOperation::signal("never")),
+                        ("fast", ParallelOperation::timer(Duration::from_secs(1))),
+                    ])
+                    .await?;
+                assert_eq!(selected.key, SelectionKey::Name("fast".into()));
+                let slow = selected
+                    .handle(&SelectionKey::Name("slow".into()))
+                    .unwrap()
+                    .clone();
+                assert_eq!(selected.into_result()?, ParallelResult::Timer);
+                slow.await_result().await?;
+            }
+            _ => panic!("unknown fixture mode"),
+        }
+        Ok(Value::Null)
+    });
+    worker
+}
+
+async fn reopened_condition_cancellation(mode: &'static str, span: u64) {
+    let client = client();
+    let queue = queue();
+    let original = replay_worker(&client, &queue, mode);
+    original.register().await.unwrap();
+    let handle = client
+        .start_workflow(REPLAY, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let first = tick_until(&original, &handle, "ConditionWaitOpened").await;
+    assert_eq!(count(&first, "ConditionWaitOpened"), 1);
+    handle
+        .signal_selected_run("vote", json!(["first"]))
+        .await
+        .unwrap();
+    let reopened = tick_until_count(&original, &handle, "ConditionWaitOpened", 2).await;
+    assert_eq!(count(&reopened, "ConditionWaitOpened"), 2);
+    assert_eq!(count(&reopened, "ConditionWaitSatisfied"), 1);
+    assert_eq!(count(&reopened, "SelectionResolved"), 0);
+    let opens = reopened["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event_type"] == "ConditionWaitOpened")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        opens[0]["payload"]["condition_wait_occurrence_id"],
+        opens[1]["payload"]["condition_wait_occurrence_id"]
+    );
+    assert_ne!(
+        opens[0]["payload"]["sequence"],
+        opens[1]["payload"]["sequence"]
+    );
+    let pending_sequence = opens[1]["payload"]["sequence"].as_u64().unwrap();
+    let request = handle
+        .request_cancellation(CooperativeCancellationOptions::default())
+        .await
+        .unwrap();
+    drop(original);
+    let successor = replay_worker(&client, &queue, mode);
+    successor.register().await.unwrap();
+    tick_until(&successor, &handle, "WorkflowCancelled").await;
+    let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, false).await;
+    assert_eq!(count(&snapshot, "ConditionWaitOpened"), 2);
+    assert_eq!(count(&snapshot, "SelectionResolved"), 0);
+    let delivery = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_type"] == "CooperativeCancellationDelivered")
+        .unwrap();
+    assert_eq!(
+        delivery["payload"]["sequence_span"].as_u64().unwrap_or(1),
+        span
+    );
+    if mode == "condition" {
+        assert_eq!(delivery["payload"]["call_kind"], "condition");
+        assert_eq!(delivery["payload"]["sequence"], pending_sequence);
+    } else {
+        assert_eq!(delivery["payload"]["call_kind"], "parallel");
+        assert_eq!(delivery["payload"]["sequence"], 1);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_cold_condition_delivery_uses_the_pending_physical_reopen() {
+    reopened_condition_cancellation("condition", 1).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_cold_nested_parallel_cancellation_replays_reopened_condition() {
+    reopened_condition_cancellation("parallel", 3).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_cold_selection_cancellation_replays_reopened_condition() {
+    reopened_condition_cancellation("selection", 2).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_cold_selection_preserves_committed_winner_before_loser_cancellation() {
+    let client = client();
+    let queue = queue();
+    let original = replay_worker(&client, &queue, "winner");
+    original.register().await.unwrap();
+    let handle = client
+        .start_workflow(REPLAY, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let winner = tick_until(&original, &handle, "SelectionResolved").await;
+    assert_eq!(count(&winner, "SelectionResolved"), 1);
+    assert_eq!(count(&winner, "WorkflowCompleted"), 0);
+    let request = handle
+        .request_cancellation(CooperativeCancellationOptions::default())
+        .await
+        .unwrap();
+    drop(original);
+    let successor = replay_worker(&client, &queue, "winner");
+    successor.register().await.unwrap();
+    tick_until(&successor, &handle, "WorkflowCancelled").await;
+    let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, false).await;
+    assert_eq!(count(&snapshot, "SelectionResolved"), 1);
+    let delivery = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_type"] == "CooperativeCancellationDelivered")
+        .unwrap();
+    assert_eq!(delivery["payload"]["call_kind"], "selection_handle");
+    assert_eq!(delivery["payload"]["operation_sequence"], 1);
+    assert_eq!(
+        delivery["payload"]["operation_sequence_span"]
+            .as_u64()
+            .unwrap_or(1),
+        1
+    );
 }
