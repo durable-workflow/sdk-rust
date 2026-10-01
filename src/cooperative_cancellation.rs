@@ -558,7 +558,14 @@ impl CancellationHistory {
             else {
                 continue;
             };
-            if event.event_type == "ConditionWaitOpened" {
+            // Groups deliver at their original authored span. Scalar condition
+            // delivery already names the pending physical sequence directly.
+            if event.event_type == "ConditionWaitOpened"
+                && (event.payload["parallel_group_id"].is_string()
+                    || event.payload["parallel_group_path"]
+                        .as_array()
+                        .is_some_and(|path| !path.is_empty()))
+            {
                 if let Some(occurrence) = event.payload["condition_wait_occurrence_id"].as_str() {
                     let authored = *condition_occurrences.entry(occurrence).or_insert(sequence);
                     state
