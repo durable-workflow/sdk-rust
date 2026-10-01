@@ -91,6 +91,7 @@ pub struct CancellationRequest {
     pub requested_at: String,
     pub cleanup_deadline_at: String,
     pub history_refresh_page_token: Option<String>,
+    pub context: Option<CancellationContext>,
 }
 
 /// Acknowledgment of a request targeting the current durable run.
@@ -179,6 +180,7 @@ impl CancellationRequest {
             requested_at: requested_at.to_owned(),
             cleanup_deadline_at: cleanup_deadline_at.to_owned(),
             history_refresh_page_token: Some(text(value, "history_refresh_page_token")?.to_owned()),
+            context: None,
         })
     }
 }
@@ -455,7 +457,10 @@ impl CancellationHistory {
             }
         }
         let mut state = Self {
-            request: observation.cloned(),
+            request: observation.cloned().map(|mut request| {
+                request.context = None;
+                request
+            }),
             delivery: None,
             request_index: events.len(),
             delivery_index: None,
@@ -496,7 +501,37 @@ impl CancellationHistory {
                 let deadline_text = text(&event.payload, "cleanup_deadline_at")?;
                 let deadline = DateTime::parse_from_rfc3339(deadline_text)
                     .map_err(|_| invalid("canonical cleanup deadline is invalid"))?;
-                if deadline <= requested {
+                let context = event
+                    .payload
+                    .get("cancellation")
+                    .map(CancellationContext::from_value)
+                    .transpose()?;
+                if let Some(context) = &context {
+                    let local = context.lineage().last().unwrap();
+                    if context.request_id() != request_id
+                        || local.workflow_run_id() != event_run
+                        || event
+                            .payload
+                            .get("workflow_instance_id")
+                            .is_some_and(|instance| {
+                                instance.as_str() != Some(local.workflow_instance_id())
+                            })
+                        || context.deadline() != deadline
+                        || context.requested_at() > requested
+                        || event
+                            .payload
+                            .get("reason")
+                            .is_some_and(|reason| match reason {
+                                Value::Null => context.reason().is_some(),
+                                Value::String(reason) => Some(reason.as_str()) != context.reason(),
+                                _ => true,
+                            })
+                    {
+                        return Err(invalid(
+                            "canonical cancellation context does not match its request event",
+                        ));
+                    }
+                } else if deadline <= requested {
                     return Err(invalid(
                         "canonical cleanup deadline must follow the request",
                     ));
@@ -510,12 +545,22 @@ impl CancellationHistory {
                             "observation changes the original request or cleanup deadline",
                         ));
                     }
-                } else {
+                }
+                if context.is_some() || observation.is_none() {
                     state.request = Some(CancellationRequest {
                         request_id: request_id.to_owned(),
-                        requested_at: recorded_at.to_owned(),
+                        requested_at: context.as_ref().map_or_else(
+                            || recorded_at.to_owned(),
+                            |context| {
+                                context
+                                    .requested_at()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+                            },
+                        ),
                         cleanup_deadline_at: deadline_text.to_owned(),
-                        history_refresh_page_token: None,
+                        history_refresh_page_token: observation
+                            .and_then(|request| request.history_refresh_page_token.clone()),
+                        context,
                     });
                 }
                 state.request_index = index;
@@ -534,6 +579,19 @@ impl CancellationHistory {
                     != Some(delivery.request_id.as_str())
                 {
                     return Err(invalid("delivery names a different original request"));
+                }
+                if let Some(snapshot) = event.payload.get("cancellation") {
+                    let context = CancellationContext::from_value(snapshot)?;
+                    if state
+                        .request
+                        .as_ref()
+                        .and_then(|request| request.context.as_ref())
+                        != Some(&context)
+                    {
+                        return Err(invalid(
+                            "delivery changes the canonical cancellation context",
+                        ));
+                    }
                 }
                 state.delivery = Some(delivery);
                 state.delivery_index = Some(index);
@@ -964,6 +1022,23 @@ impl WorkflowState {
 }
 
 impl WorkflowContext {
+    /// Original immutable metadata, visible only at committed delivery.
+    pub fn cancellation_context(&self) -> Result<Option<CancellationContext>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(if state.cancellation_consumed {
+            state
+                .cancellation_history
+                .request
+                .as_ref()
+                .and_then(|request| request.context.clone())
+        } else {
+            None
+        })
+    }
+
     /// Shield explicit cleanup from repeated cancellation checks.
     ///
     /// Keep the returned guard alive across cleanup awaits. Scopes can nest.

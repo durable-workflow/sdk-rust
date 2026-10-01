@@ -1,5 +1,253 @@
 use super::*;
 
+fn context_snapshot() -> Value {
+    serde_json::from_str(include_str!(
+        "fixtures/cooperative-cancellation-context.json"
+    ))
+    .unwrap()
+}
+
+fn context_request() -> HistoryEvent {
+    serde_json::from_value(json!({
+        "event_type": "CooperativeCancellationRequested", "recorded_at": "2026-10-01T00:00:05Z",
+        "payload": {
+            "workflow_command_id": "request-1", "workflow_run_id": "run-1", "workflow_instance_id": "child-instance",
+            "reason": "maintenance", "cleanup_deadline_at": "2026-10-01T00:00:30.123456Z",
+            "cancellation": context_snapshot(),
+        }
+    })).unwrap()
+}
+
+fn context_delivery() -> HistoryEvent {
+    event(
+        "CooperativeCancellationDelivered",
+        json!({
+            "workflow_command_id": "request-1", "workflow_run_id": "run-1",
+            "sequence": 1, "call_kind": "timer", "cancellation": context_snapshot(),
+        }),
+    )
+}
+
+fn context_observation() -> CancellationRequest {
+    CancellationRequest::from_observation(&json!({
+        "request_id": "request-1", "requested_at": "2026-10-01T00:00:05Z",
+        "cleanup_deadline_at": "2026-10-01T00:00:30.123456Z",
+        "history_refresh_page_token": "opaque-first-page", "cancellation": context_snapshot(),
+    }))
+    .unwrap()
+}
+
+fn context_task(events: Vec<HistoryEvent>) -> WorkflowTask {
+    let mut task = cancellation_task(events);
+    task.run_id = Some("run-1".into());
+    task
+}
+
+#[test]
+fn cooperative_context_retains_original_snapshot_and_detached_copies() {
+    let mut original = context_snapshot();
+    let context = CancellationContext::from_value(&original).unwrap();
+    original["requester"]["id"] = json!("changed");
+    original["lineage"][0]["request_id"] = json!("changed");
+    let mut detached = context.to_value();
+    detached["reason"] = json!("changed");
+    assert_eq!(context.to_value(), context_snapshot());
+    assert_eq!(context.request_id(), "request-1");
+    assert_eq!(context.root_request_id(), "root-1");
+    assert_eq!(context.parent_request_id(), Some("root-1"));
+    assert_eq!(context.root_workflow_instance_id(), "parent-instance");
+    assert_eq!(context.root_workflow_run_id(), "parent-run");
+    assert_eq!(context.reason(), Some("maintenance"));
+    assert_eq!(context.source(), "control_plane");
+    assert_eq!(context.requester()["id"], "operator-1");
+    assert_eq!(
+        context.lineage()[1].workflow_instance_id(),
+        "child-instance"
+    );
+    assert_eq!(
+        context.deadline() - context.requested_at(),
+        chrono::Duration::seconds(30)
+    );
+}
+
+#[test]
+fn cooperative_context_normalizes_equivalent_timezone_and_object_order() {
+    let mut value = context_snapshot();
+    value["requested_at"] = json!("2026-09-30T20:00:00.123456-04:00");
+    value["cleanup_deadline_at"] = json!("2026-09-30T20:00:30.123456-04:00");
+    assert_eq!(
+        CancellationContext::from_value(&value).unwrap(),
+        CancellationContext::from_value(&context_snapshot()).unwrap()
+    );
+}
+
+#[test]
+fn cooperative_context_rejects_invalid_snapshots() {
+    for (field, value) in [
+        ("schema", json!("unknown")),
+        ("request_id", json!("")),
+        ("source", json!(" ")),
+        ("parent_request_id", json!("wrong")),
+        ("root_request_id", json!("wrong")),
+        ("root_workflow_run_id", json!("wrong")),
+        ("reason", json!([])),
+        ("requester", json!([])),
+        ("lineage", json!([])),
+        ("requested_at", json!("2026-02-30T00:00:00Z")),
+        ("cleanup_deadline_at", json!("2026-10-01T00:00:00.123456Z")),
+    ] {
+        let mut snapshot = context_snapshot();
+        snapshot[field] = value;
+        assert!(
+            CancellationContext::from_value(&snapshot).is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn cooperative_context_rejects_lineage_cycles_order_and_unrelated_requester_metadata() {
+    for field in ["request_id", "workflow_run_id"] {
+        let mut value = context_snapshot();
+        value["lineage"][1][field] = value["lineage"][0][field].clone();
+        assert!(CancellationContext::from_value(&value).is_err());
+    }
+    let mut value = context_snapshot();
+    value["lineage"].as_array_mut().unwrap().reverse();
+    assert!(CancellationContext::from_value(&value).is_err());
+    let mut value = context_snapshot();
+    value["requester"]["authorization"] = json!("unsupported");
+    assert!(CancellationContext::from_value(&value).is_err());
+}
+
+#[test]
+fn cooperative_context_child_keeps_root_time_after_expired_local_admission() {
+    let mut request = context_request();
+    request
+        .raw
+        .insert("recorded_at".into(), json!("2026-10-01T00:00:31Z"));
+    let state = CancellationHistory::from_events(&[request], "run-1", None).unwrap();
+    let request = state.request.unwrap();
+    assert_eq!(request.requested_at, "2026-10-01T00:00:00.123456Z");
+    assert_eq!(request.cleanup_deadline_at, "2026-10-01T00:00:30.123456Z");
+    assert_eq!(request.context.unwrap().to_value(), context_snapshot());
+    assert!(state.delivery.is_none());
+}
+
+#[test]
+fn cooperative_context_observation_keeps_refresh_route_and_history_supplies_metadata() {
+    let mut observation = context_observation();
+    observation.context = Some(CancellationContext::from_value(&context_snapshot()).unwrap());
+    let pending = CancellationHistory::from_events(&[], "run-1", Some(&observation)).unwrap();
+    assert!(pending.request.unwrap().context.is_none());
+    let state = CancellationHistory::from_events(
+        &[context_request(), context_delivery()],
+        "run-1",
+        Some(&observation),
+    )
+    .unwrap();
+    let request = state.request.unwrap();
+    assert_eq!(
+        request.history_refresh_page_token.as_deref(),
+        Some("opaque-first-page")
+    );
+    assert_eq!(request.requested_at, "2026-10-01T00:00:00.123456Z");
+    assert_eq!(request.context.unwrap().to_value(), context_snapshot());
+}
+
+#[test]
+fn cooperative_context_must_match_canonical_local_request_and_run() {
+    for (field, value) in [
+        ("workflow_command_id", json!("other")),
+        ("workflow_instance_id", json!("other")),
+        ("cleanup_deadline_at", json!("2026-10-01T00:00:35Z")),
+        ("reason", json!("changed")),
+        ("cancellation", Value::Null),
+    ] {
+        let mut request = context_request();
+        request.payload[field] = value;
+        assert!(
+            CancellationHistory::from_events(&[request], "run-1", None).is_err(),
+            "{field}"
+        );
+    }
+    let mut request = context_request();
+    request.payload["cancellation"]["lineage"][1]["workflow_run_id"] = json!("other");
+    assert!(CancellationHistory::from_events(&[request], "run-1", None).is_err());
+    let mut request = context_request();
+    request
+        .raw
+        .insert("recorded_at".into(), json!("2026-09-30T23:59:59Z"));
+    assert!(CancellationHistory::from_events(&[request], "run-1", None).is_err());
+}
+
+#[test]
+fn cooperative_context_delivery_cannot_change_the_accepted_snapshot() {
+    let mut delivery = context_delivery();
+    delivery.payload["cancellation"]["reason"] = json!("changed");
+    assert!(
+        CancellationHistory::from_events(&[context_request(), delivery], "run-1", None).is_err()
+    );
+}
+
+#[test]
+fn cooperative_context_cold_worker_replay_restores_same_delivery_and_cleanup() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        assert!(ctx.cancellation_context()?.is_none());
+        let Err(Error::CooperativeCancellationRequested(cancelled)) =
+            ctx.sleep(Duration::from_secs(10)).await
+        else {
+            panic!("expected canonical cancellation");
+        };
+        let context = cancelled.request.context.unwrap();
+        assert_eq!(ctx.cancellation_context()?, Some(context.clone()));
+        let _shield = ctx.cancellation_shield()?;
+        ctx.throw_if_cancellation_requested()?;
+        ctx.activity("cleanup", json!([])).await?;
+        Ok(context.to_value())
+    });
+    let first = worker
+        .execute_workflow_task(context_task(vec![context_request(), context_delivery()]))
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0]["type"], "schedule_activity");
+    assert_eq!(first[0]["activity_type"], "cleanup");
+    let mut history = vec![context_request(), context_delivery()];
+    history.extend(completed_activity(2, "cleanup", json!("cleaned")));
+    for _restart in 0..2 {
+        let result = worker
+            .execute_workflow_task(context_task(history.clone()))
+            .unwrap();
+        assert_eq!(result[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&result[0]["result"], DEFAULT_CODEC).unwrap(),
+            context_snapshot()
+        );
+    }
+}
+
+#[test]
+fn cooperative_context_explicit_check_retains_delivered_metadata() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        let _ = ctx.sleep(Duration::from_secs(10)).await;
+        let Err(Error::CooperativeCancellationRequested(cancelled)) =
+            ctx.throw_if_cancellation_requested()
+        else {
+            panic!("expected the delivered cancellation");
+        };
+        assert_eq!(
+            cancelled.request.context.unwrap().to_value(),
+            context_snapshot()
+        );
+        Ok(Value::Null)
+    });
+    worker
+        .execute_workflow_task(context_task(vec![context_request(), context_delivery()]))
+        .unwrap();
+}
+
 fn request_observation() -> Value {
     json!({
         "request_id": "original-request",
