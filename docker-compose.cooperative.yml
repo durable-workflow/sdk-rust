@@ -19,6 +19,7 @@ services:
       WORKFLOW_SERVER_AUTH_DRIVER: token
       WORKFLOW_SERVER_AUTH_TOKEN: test-token
       DW_WORKFLOW_TASK_TIMEOUT: 10
+      DW_ACTIVITY_TASK_TIMEOUT: 10
       DW_WORKER_PROTOCOL_VERSION: "1.20"
     depends_on:
       mysql:
@@ -45,6 +46,13 @@ services:
     build:
       context: ${DURABLE_WORKFLOW_SERVER_SOURCE:-../server}
     command: ["php", "artisan", "queue:work", "--sleep=1", "--tries=3", "--max-time=1800"]
+    environment: *runtime-env
+    depends_on:
+      server:
+        condition: service_healthy
+  repair:
+    image: dw-rust-cooperative-server:${SERVER_CANDIDATE_SHA:-candidate}
+    command: ["php", "artisan", "workflow:v2:repair-pass", "--loop", "--sleep-seconds=1", "--json"]
     environment: *runtime-env
     depends_on:
       server:

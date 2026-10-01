@@ -18,6 +18,259 @@ const WORKFLOW: &str = "tests.rust-cooperative-timer";
 const UNDO: &str = "tests.rust-cooperative-undo";
 const BLOCKED: &str = "tests.rust-cooperative-blocked";
 const REPLAY: &str = "tests.rust-cooperative-replay";
+const PROCESS: &str = "tests.rust-cooperative-process-reclaim";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ActivityGrant {
+    task_id: String,
+    attempt_id: String,
+    owner: String,
+    attempt_number: u64,
+}
+
+struct WorkerProcess(std::process::Child);
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+struct ProcessScratch(std::path::PathBuf);
+
+impl Drop for ProcessScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct AbortWorkerOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn register_process_workflow(worker: &mut Worker) {
+    worker.register_workflow(PROCESS, |ctx, _| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation(UNDO, json!([]))?;
+        let result = ctx.activity(BLOCKED, json!([])).await;
+        saga.finish(result).await?;
+        Ok(Value::Null)
+    });
+}
+
+// Invoked only by the isolated process-death case. Ordinary tests return
+// without starting a worker. The parent kills this actual Worker with SIGKILL.
+#[tokio::test]
+async fn cooperative_process_worker_child() {
+    let Ok(queue) = std::env::var("DURABLE_WORKFLOW_PROCESS_CHILD_QUEUE") else {
+        return;
+    };
+    let ready = std::env::var("DURABLE_WORKFLOW_PROCESS_CHILD_READY").unwrap();
+    let grant = std::env::var("DURABLE_WORKFLOW_PROCESS_CHILD_GRANT").unwrap();
+    let mut worker = Worker::new(client(), &queue)
+        .worker_id(format!("{queue}-killed"))
+        .cooperative_cancellation(true)
+        .poll_timeout(Duration::from_secs(1));
+    register_process_workflow(&mut worker);
+    worker.register_activity(BLOCKED, move |ctx, _| {
+        let grant = grant.clone();
+        async move {
+            let bytes = serde_json::to_vec(&ActivityGrant {
+                task_id: ctx.task_id,
+                attempt_id: ctx.activity_attempt_id,
+                owner: ctx.lease_owner,
+                attempt_number: ctx.attempt_number,
+            })
+            .unwrap();
+            let pending = format!("{grant}.pending");
+            std::fs::write(&pending, bytes).unwrap();
+            std::fs::rename(pending, grant).unwrap();
+            std::future::pending::<durable_workflow::Result<Value>>().await
+        }
+    });
+    worker.register().await.unwrap();
+    std::fs::write(ready, b"registered").unwrap();
+    loop {
+        worker.run_once().await.expect("child actual Worker tick");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn await_child_file(process: &mut WorkerProcess, path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !path.is_file() {
+            assert!(
+                process.0.try_wait().unwrap().is_none(),
+                "actual child Worker exited before publishing {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("actual child Worker claim within 15 seconds");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with ten-second leases and the repair daemon"]
+async fn server_sigkill_activity_worker_reclaims_attempt_and_fences_old_publication() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let client = client();
+    let queue = queue();
+    let scratch = ProcessScratch(std::env::temp_dir().join(format!("{queue}-process")));
+    std::fs::create_dir(&scratch.0).unwrap();
+    let ready = scratch.0.join("ready");
+    let grant_path = scratch.0.join("grant.json");
+    let mut original_process = WorkerProcess(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cooperative_process_worker_child", "--nocapture"])
+            .env("DURABLE_WORKFLOW_PROCESS_CHILD_QUEUE", &queue)
+            .env("DURABLE_WORKFLOW_PROCESS_CHILD_READY", &ready)
+            .env("DURABLE_WORKFLOW_PROCESS_CHILD_GRANT", &grant_path)
+            .spawn()
+            .unwrap(),
+    );
+    await_child_file(&mut original_process, &ready).await;
+    let handle = client
+        .start_workflow(PROCESS, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    await_child_file(&mut original_process, &grant_path).await;
+    let original: ActivityGrant =
+        serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
+    assert_eq!(original.attempt_number, 1);
+    original_process.0.kill().unwrap();
+    let status = original_process.0.wait().unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "expected actual SIGKILL: {status}"
+    );
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    let mut successor = Worker::new(client.clone(), &queue)
+        .worker_id(format!("{queue}-successor"))
+        .cooperative_cancellation(true)
+        .max_concurrent_workflow_tasks(1)
+        .max_concurrent_activity_tasks(1)
+        .poll_timeout(Duration::from_secs(1));
+    register_process_workflow(&mut successor);
+    successor.register_activity(BLOCKED, move |ctx, _| {
+        let entered_tx = entered_tx.clone();
+        async move {
+            ctx.heartbeat(json!({"qualification":"reclaimed"})).await?;
+            entered_tx.send(ctx).unwrap();
+            std::future::pending::<durable_workflow::Result<Value>>().await
+        }
+    });
+    let completed = Arc::clone(&cleanups);
+    successor.register_activity(UNDO, move |ctx, _| {
+        let completed = Arc::clone(&completed);
+        async move {
+            ctx.heartbeat(json!({"qualification":"cleanup"})).await?;
+            completed.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::Null)
+        }
+    });
+    let run = tokio::spawn(async move {
+        successor
+            .run_until(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let _abort_on_failure = AbortWorkerOnDrop(run.abort_handle());
+    let reclaimed: ActivityContext =
+        tokio::time::timeout(Duration::from_secs(25), entered_rx.recv())
+            .await
+            .expect("repair daemon and actual successor reclaim within 25 seconds")
+            .expect("actual successor callback entered");
+    assert_eq!(reclaimed.task_id, original.task_id);
+    assert_ne!(reclaimed.activity_attempt_id, original.attempt_id);
+    assert_ne!(reclaimed.lease_owner, original.owner);
+    assert_eq!(reclaimed.attempt_number, 2);
+
+    let before = history(&handle).await;
+    for result in [
+        client
+            .complete_activity_task(
+                &original.task_id,
+                &original.attempt_id,
+                &original.owner,
+                json!("late"),
+                "avro",
+            )
+            .await,
+        client
+            .fail_activity_task(
+                &original.task_id,
+                &original.attempt_id,
+                &original.owner,
+                "late failure",
+                true,
+            )
+            .await,
+    ] {
+        assert!(
+            matches!(result, Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409)
+        );
+    }
+    let heartbeat = client
+        .heartbeat_activity_task(
+            &original.task_id,
+            &original.attempt_id,
+            &original.owner,
+            json!({"late":true}),
+        )
+        .await;
+    assert!(
+        matches!(heartbeat, Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409)
+    );
+    assert_eq!(
+        before,
+        history(&handle).await,
+        "dead attempt changed canonical history"
+    );
+
+    let request = handle
+        .request_cancellation(CooperativeCancellationOptions::default())
+        .await
+        .unwrap();
+    let result = handle
+        .result_selected_run(WorkflowResultOptions {
+            timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(Error::WorkflowCancelled(_))),
+        "reclaimed result: {result:?}"
+    );
+    let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, true).await;
+    assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&snapshot, "ActivityCancelled"), 1);
+    eprintln!(
+        "SIGKILL activity recovery: old={original:?}, successor={}/{}/{}, history={snapshot}",
+        reclaimed.task_id, reclaimed.activity_attempt_id, reclaimed.lease_owner
+    );
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
 
 struct CallbackDrop(Arc<AtomicUsize>);
 

@@ -244,7 +244,7 @@ jobs:
           if-no-files-found: warn
       - name: Emit failure diagnostics
         if: ${{ failure() }}
-        run: docker compose -f docker-compose.cooperative.yml logs --no-color --tail 100 bootstrap server worker
+        run: docker compose -f docker-compose.cooperative.yml logs --no-color --tail 100 bootstrap server worker repair
       - name: Remove task runtime resources
         if: ${{ always() }}
         run: |
