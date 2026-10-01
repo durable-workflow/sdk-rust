@@ -12269,7 +12269,7 @@ impl Future for ConditionWaitCall {
             return Poll::Ready(Ok(result));
         }
 
-        self.poll_open_condition(options)
+        self.poll_open_condition(options, true)
     }
 }
 
@@ -12278,19 +12278,20 @@ impl ConditionWaitCall {
         self: Pin<&mut Self>,
         options: ValidatedConditionWaitOptions,
     ) -> Poll<Result<ConditionWaitResult>> {
-        self.poll_open_condition(options)
+        self.poll_open_condition(options, false)
     }
 
     fn poll_open_condition(
         mut self: Pin<&mut Self>,
         options: ValidatedConditionWaitOptions,
+        recorded_wait: bool,
     ) -> Poll<Result<ConditionWaitResult>> {
         let selection_member = self
             .parallel_group_path
             .first()
             .is_some_and(|entry| entry.parallel_group_mode.as_deref() == Some("select"));
         match (self.predicate)() {
-            Ok(true) if !selection_member => {
+            Ok(true) if !selection_member || recorded_wait => {
                 return Poll::Ready(Ok(ConditionWaitResult::Satisfied))
             }
             Ok(_) => {}
@@ -19385,6 +19386,51 @@ mod tests {
             timed_out.as_mut().poll(&mut task_context),
             Poll::Ready(Ok(ConditionWaitResult::TimedOut))
         ));
+    }
+
+    #[test]
+    fn satisfied_reopened_selection_condition_waits_for_its_canonical_winner() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/grouped-condition-physical-reopen.json"
+        ))
+        .expect("grouped condition fixture");
+        let history = fixture["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                let mut payload = event["payload"].clone();
+                let index = payload["parallel_group_index"].as_u64().unwrap();
+                payload["parallel_group_id"] = json!("select-calls:1:2");
+                payload["parallel_group_mode"] = json!("select");
+                payload["selection_member_key"] = json!(if index == 0 { "timer" } else { "votes" });
+                payload["selection_member_index"] = json!(index);
+                payload["selection_member_base_sequence"] = json!(index + 1);
+                payload["selection_member_size"] = json!(1);
+                payload["selection_member_kind"] =
+                    json!(if index == 0 { "timer" } else { "condition" });
+                history_event(event["event_type"].as_str().unwrap(), payload)
+            })
+            .collect();
+        let ctx = workflow_context(history);
+        let mut selected = Box::pin(ctx.select_keyed(vec![
+            ("timer", ParallelOperation::timer(Duration::from_secs(300))),
+            (
+                "votes",
+                ParallelOperation::condition(
+                    ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+                    || Ok(true),
+                ),
+            ),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(selected.as_mut().poll(&mut task_context).is_pending());
+        assert!(
+            ctx.take_commands().unwrap().is_empty(),
+            "true predicate must not reopen the recorded wait"
+        );
+        ctx.ensure_history_consumed()
+            .expect("physical reopens are consumed while canonical selection is pending");
     }
 
     #[test]
