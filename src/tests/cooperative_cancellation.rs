@@ -71,6 +71,212 @@ fn completed_activity(sequence: u64, name: &str, value: Value) -> Vec<HistoryEve
     ]
 }
 
+fn cancelled_selection_history() -> Vec<HistoryEvent> {
+    let mut delivery = canonical_delivery(3, "selection_handle");
+    delivery.payload["operation_sequence"] = json!(1);
+    vec![
+        selection_activity_event("ActivityScheduled", 0, "slow", None),
+        selection_activity_event("ActivityScheduled", 1, "fast", None),
+        selection_activity_event("ActivityCompleted", 1, "fast", Some(json!("winner-value"))),
+        selection_winner_marker(),
+        canonical_request(),
+        delivery,
+    ]
+}
+
+#[test]
+fn cooperative_selection_handle_replays_original_request_after_committed_winner() {
+    for _cold_restart in 0..2 {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _input| async move {
+            let selected = keyed_activity_selection(&ctx).await?;
+            assert_eq!(selected.key, SelectionKey::Name("fast".into()));
+            assert_eq!(
+                selected.value,
+                Some(ParallelResult::Activity(json!("winner-value")))
+            );
+            assert!(!ctx.is_cancellation_requested()?);
+            selected
+                .handle(&SelectionKey::Name("slow".into()))
+                .unwrap()
+                .await_result()
+                .await?;
+            Ok(Value::Null)
+        });
+        let commands = worker
+            .execute_workflow_task(cancellation_task(cancelled_selection_history()))
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0]["exception_type"],
+            "WorkflowCancellationRequested"
+        );
+        assert_eq!(
+            commands[0]["exception"]["properties"]["request_id"],
+            "original-request"
+        );
+        assert_eq!(
+            commands[0]["exception"]["properties"]["cleanup_deadline_at"],
+            "2026-10-01T08:10:00Z"
+        );
+    }
+}
+
+#[test]
+fn cooperative_selection_handle_delivery_owns_a_late_loser_completion() {
+    for before_delivery in [true, false] {
+        let mut events = cancelled_selection_history();
+        let late =
+            selection_activity_event("ActivityCompleted", 0, "slow", Some(json!("too-late")));
+        if before_delivery {
+            events.insert(events.len() - 1, late);
+        } else {
+            events.push(late);
+        }
+        let ctx = workflow_context(events);
+        let mut select = Box::pin(keyed_activity_selection(&ctx));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Ok(selected)) = select.as_mut().poll(&mut cx) else {
+            panic!("committed winner must retain priority")
+        };
+        assert_eq!(
+            selected.value,
+            Some(ParallelResult::Activity(json!("winner-value")))
+        );
+        let mut loser = Box::pin(
+            selected
+                .handle(&SelectionKey::Name("slow".into()))
+                .unwrap()
+                .await_result(),
+        );
+        let Poll::Ready(Err(Error::CooperativeCancellationRequested(cancellation))) =
+            loser.as_mut().poll(&mut cx)
+        else {
+            panic!("late completion must not replace the committed cancellation")
+        };
+        assert_eq!(cancellation.delivery.sequence, 3);
+        assert_eq!(cancellation.delivery.operation_sequence, Some(1));
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_selection_handle_rejects_changed_public_identity_and_member_range() {
+    for changed in 0..7 {
+        let ctx = workflow_context(cancelled_selection_history());
+        let mut select = Box::pin(keyed_activity_selection(&ctx));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Ok(selected)) = select.as_mut().poll(&mut cx) else {
+            panic!("winner")
+        };
+        let mut handle = selected
+            .handle(&SelectionKey::Name("slow".into()))
+            .unwrap()
+            .clone();
+        match changed {
+            0 => handle.key = SelectionKey::Name("changed".into()),
+            1 => handle.index = 9,
+            2 => handle.kind = "timer".into(),
+            3 => handle.identity = "changed".into(),
+            4 => handle.selection_group_id = "changed".into(),
+            5 => handle.base_sequence = 2,
+            6 => handle.size = 2,
+            _ => unreachable!(),
+        }
+        let mut wait = Box::pin(handle.await_result());
+        assert!(
+            matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure { reason, .. }))) if reason == "cooperative_cancellation_call_mismatch")
+        );
+        assert!(!ctx.is_cancellation_requested().unwrap());
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cooperative_selection_handle_request_only_keeps_the_loser_pending() {
+    let mut events = cancelled_selection_history();
+    events.pop();
+    let ctx = workflow_context(events);
+    let mut select = Box::pin(keyed_activity_selection(&ctx));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    let Poll::Ready(Ok(selected)) = select.as_mut().poll(&mut cx) else {
+        panic!("winner")
+    };
+    let mut wait = Box::pin(
+        selected
+            .handle(&SelectionKey::Name("slow".into()))
+            .unwrap()
+            .await_result(),
+    );
+    assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(!ctx.is_cancellation_requested().unwrap());
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn cooperative_selection_handle_cannot_be_skipped_or_replaced_by_a_scalar_call() {
+    for skip in [true, false] {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", move |ctx, _input| async move {
+            let selected = keyed_activity_selection(&ctx).await?;
+            if !skip {
+                ctx.sleep(Duration::from_secs(5)).await?;
+            }
+            selected.into_result()?;
+            Ok(Value::Null)
+        });
+        assert!(matches!(
+            worker.execute_workflow_task(cancellation_task(cancelled_selection_history())),
+            Err(Error::NonDeterministicReplay(_))
+        ));
+    }
+}
+
+#[test]
+fn cooperative_selection_handle_cannot_hide_delivery_inside_a_cleanup_shield() {
+    let ctx = workflow_context(cancelled_selection_history());
+    let mut select = Box::pin(keyed_activity_selection(&ctx));
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    let Poll::Ready(Ok(selected)) = select.as_mut().poll(&mut cx) else {
+        panic!("winner")
+    };
+    let _shield = ctx.cancellation_shield().unwrap();
+    let mut wait = Box::pin(
+        selected
+            .handle(&SelectionKey::Name("slow".into()))
+            .unwrap()
+            .await_result(),
+    );
+    assert!(matches!(
+        wait.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::NonDeterministicReplay(_)))
+    ));
+}
+
+#[test]
+fn cooperative_selection_handle_runs_saga_cleanup_as_the_next_durable_command() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _input| async move {
+        let selected = keyed_activity_selection(&ctx).await?;
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        let result = selected
+            .handle(&SelectionKey::Name("slow".into()))
+            .unwrap()
+            .await_result()
+            .await;
+        saga.finish(result).await?;
+        Ok(Value::Null)
+    });
+    let commands = worker
+        .execute_workflow_task(cancellation_task(cancelled_selection_history()))
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["type"], "schedule_activity");
+    assert_eq!(commands[0]["activity_type"], "undo");
+}
+
 #[test]
 fn cooperative_replay_preserves_completed_forward_result_and_saga_cleanup_identity() {
     for _cold_restart in 0..2 {

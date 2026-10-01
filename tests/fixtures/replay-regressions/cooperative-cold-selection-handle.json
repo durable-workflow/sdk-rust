@@ -1,0 +1,69 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-cooperative-cold-selection-handle",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type":"corpus.durable-selection", "input":[], "payload_codec":"avro"},
+  "history": [
+    {
+      "id":"event-slow-open", "event_type":"ActivityScheduled", "payload": {
+        "sequence":1, "activity_execution_id":"activity-slow", "activity_type":"slow-activity",
+        "parallel_group_id":"select-calls:1:2", "parallel_group_kind":"activity", "parallel_group_mode":"select",
+        "parallel_group_base_sequence":1, "parallel_group_size":2, "parallel_group_index":0,
+        "selection_member_key":"slow", "selection_member_index":0, "selection_member_base_sequence":1,
+        "selection_member_size":1, "selection_member_kind":"activity"
+      }
+    },
+    {
+      "id":"event-fast-open", "event_type":"ActivityScheduled", "payload": {
+        "sequence":2, "activity_execution_id":"activity-fast", "activity_type":"fast-activity",
+        "parallel_group_id":"select-calls:1:2", "parallel_group_kind":"activity", "parallel_group_mode":"select",
+        "parallel_group_base_sequence":1, "parallel_group_size":2, "parallel_group_index":1,
+        "selection_member_key":"fast", "selection_member_index":1, "selection_member_base_sequence":2,
+        "selection_member_size":1, "selection_member_kind":"activity"
+      }
+    },
+    {
+      "id":"event-fast-completed", "event_type":"ActivityCompleted", "payload": {
+        "sequence":2, "activity_execution_id":"activity-fast", "activity_type":"fast-activity",
+        "result":"wwHioz3/VYAiNwoYd2lubmVyLXZhbHVl", "payload_codec":"avro"
+      }
+    },
+    {
+      "id":"event-selection", "event_type":"SelectionResolved", "payload": {
+        "selection_group_id":"select-calls:1:2", "selection_group_base_sequence":1, "selection_group_size":2,
+        "member_key":"fast", "member_index":1, "member_base_sequence":2, "member_size":1,
+        "operation_kind":"activity", "operation_identity":"activity-fast", "outcome":"completed",
+        "resolution_event_id":"event-fast-completed", "resolution_event_type":"ActivityCompleted"
+      }
+    },
+    {
+      "event_type":"CooperativeCancellationRequested", "workflow_command_id":"original-request",
+      "recorded_at":"2026-10-01T08:00:00Z", "payload": {
+        "workflow_command_id":"original-request", "workflow_run_id":"regression-corpus-run",
+        "cleanup_deadline_at":"2026-10-01T08:10:00Z"
+      }
+    },
+    {
+      "event_type":"CooperativeCancellationDelivered", "workflow_command_id":"original-request", "payload": {
+        "workflow_command_id":"original-request", "workflow_run_id":"regression-corpus-run",
+        "sequence":3, "call_kind":"selection_handle", "operation_sequence":1
+      }
+    },
+    {
+      "id":"event-slow-late", "event_type":"ActivityCompleted", "payload": {
+        "sequence":1, "activity_execution_id":"activity-slow", "activity_type":"slow-activity",
+        "result":"wwHioz3/VYAiNwoWbG9zZXItdmFsdWU=", "payload_codec":"avro"
+      }
+    }
+  ],
+  "command_sequence": [{
+    "type":"fail_workflow", "exception_type":"WorkflowCancellationRequested", "non_retryable":true,
+    "exception": {"properties": {"request_id":"original-request", "cleanup_deadline_at":"2026-10-01T08:10:00Z"}}
+  }],
+  "expected": {
+    "type":"fail_workflow", "exception_type":"WorkflowCancellationRequested", "non_retryable":true,
+    "exception": {"properties": {"request_id":"original-request", "cleanup_deadline_at":"2026-10-01T08:10:00Z"}}
+  }
+}

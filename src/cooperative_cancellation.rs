@@ -211,7 +211,7 @@ pub struct CancellationHistory {
 }
 
 impl CancellationHistory {
-    pub(super) fn bind_scalar_commands(
+    pub(super) fn bind_commands(
         &self,
         mut commands: Vec<RecordedCommand>,
     ) -> Result<Vec<RecordedCommand>> {
@@ -225,6 +225,7 @@ impl CancellationHistory {
                 | CancellationCallKind::Condition
                 | CancellationCallKind::Signal
                 | CancellationCallKind::Child
+                | CancellationCallKind::SelectionHandle
         ) {
             return Ok(commands);
         }
@@ -547,6 +548,44 @@ impl WorkflowState {
             return Err(self.cancellation_error());
         }
         Ok(())
+    }
+
+    pub(super) fn replay_selection_handle_cancellation(
+        &mut self,
+        handle: &DurableOperationHandle,
+    ) -> Result<()> {
+        let Some(RecordedCommand::CancellationBoundary {
+            sequence,
+            call_kind,
+            original,
+        }) = self.recorded_commands.get(self.command_cursor)
+        else {
+            return Ok(());
+        };
+        self.validate_cancellation_call(
+            *sequence,
+            CancellationCallKind::SelectionHandle,
+            *call_kind,
+        )?;
+        let delivery = self
+            .cancellation_history
+            .delivery
+            .as_ref()
+            .expect("bound canonical delivery");
+        if original.is_some()
+            || delivery.operation_sequence != Some(handle.base_sequence)
+            || delivery.operation_sequence_span != handle.size as u64
+        {
+            return Err(invalid_recorded_history(
+                "cooperative_cancellation_call_mismatch",
+                *sequence,
+                "selection handle for the committed operation range",
+                &format!("{}:{}", handle.base_sequence, handle.size),
+                "cancellation delivery targets a different authored selection member",
+            ));
+        }
+        validate_selection_delivery_handle(self, handle)?;
+        self.replay_cancellation_at(self.command_cursor, CancellationCallKind::SelectionHandle)
     }
 }
 

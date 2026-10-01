@@ -9416,7 +9416,7 @@ impl WorkflowState {
             run_id.as_deref().unwrap_or_default(),
             None,
         )?;
-        let recorded_commands = cancellation_history.bind_scalar_commands(recorded_commands(
+        let recorded_commands = cancellation_history.bind_commands(recorded_commands(
             &history,
             &payload_codec,
             WorkflowIdentity {
@@ -11755,10 +11755,13 @@ impl Future for DurableOperationAwaitCall {
     type Output = Result<ParallelResult>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        let state = match self.handle.ctx.state.lock() {
+        let mut state = match self.handle.ctx.state.lock() {
             Ok(state) => state,
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
+        if let Err(error) = state.replay_selection_handle_cancellation(&self.handle) {
+            return Poll::Ready(Err(error));
+        }
         match selection_cancellation_for_handle(&state, &self.handle) {
             Err(error) => return Poll::Ready(Err(error)),
             Ok(false) => {}
@@ -11780,6 +11783,62 @@ impl Future for DurableOperationAwaitCall {
             Err(error) => Poll::Ready(Err(error)),
         }
     }
+}
+
+fn validate_selection_delivery_handle(
+    state: &WorkflowState,
+    handle: &DurableOperationHandle,
+) -> Result<()> {
+    let path = state
+        .recorded_commands
+        .iter()
+        .find(|command| command.sequence() == handle.base_sequence)
+        .and_then(|command| match command {
+            RecordedCommand::Activity {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::ChildWorkflow {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::Timer {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::SignalWait {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::ConditionWait {
+                parallel_group_path,
+                ..
+            } => parallel_group_path.as_ref(),
+            _ => None,
+        })
+        .and_then(|path| path.first());
+    let matches = path.is_some_and(|entry| {
+        entry.parallel_group_mode.as_deref() == Some("select")
+            && entry.parallel_group_id == handle.selection_group_id
+            && entry.selection_member_key.as_ref() == Some(&handle.key)
+            && entry.selection_member_index == Some(handle.index)
+            && entry.selection_member_base_sequence == Some(handle.base_sequence)
+            && entry.selection_member_size == Some(handle.size)
+            && entry.selection_member_kind.as_deref() == Some(handle.kind.as_str())
+    });
+    if !matches
+        || selection_operation_identity(state, &handle.kind, handle.base_sequence, handle.size)
+            != handle.identity
+    {
+        return Err(invalid_recorded_history(
+            "cooperative_cancellation_call_mismatch",
+            handle.base_sequence,
+            "selection handle matching its authored durable identity",
+            &format!("{handle:?}"),
+            "selection handle identity or member metadata changed before cancellation replay",
+        ));
+    }
+    Ok(())
 }
 
 /// Future returned by [`DurableOperationHandle::cancel`].
