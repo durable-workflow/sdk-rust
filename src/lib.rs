@@ -1,7 +1,12 @@
 #![doc = include_str!("../README.md")]
 
+mod cooperative_cancellation;
 mod runtime_payloads;
 mod runtime_uploads;
+
+pub use cooperative_cancellation::{
+    CancellationRequest, CooperativeCancellationOptions, WorkflowCancellationRequest,
+};
 
 use std::{
     any::{type_name, Any, TypeId},
@@ -252,6 +257,10 @@ pub enum Error {
         "workflow_memo_updates_unavailable: the connected runtime did not advertise workflow memo update support"
     )]
     WorkflowMemoUpdatesUnavailable,
+    #[error("cooperative cancellation is unavailable: {0}")]
+    CooperativeCancellationUnavailable(String),
+    #[error("invalid cooperative cancellation: {0}")]
+    InvalidCooperativeCancellation(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -15085,6 +15094,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod cooperative_cancellation;
     mod runtime_payloads;
     mod runtime_uploads;
     use std::{
