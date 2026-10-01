@@ -1979,6 +1979,445 @@ fn transport_server() -> MockWorkerServer {
     })
 }
 
+fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    let case = path.split('/').nth(1).unwrap_or_default();
+    if path.ends_with("/cluster/info") {
+        return responses(path, body, number);
+    }
+    if path.ends_with("/poll") {
+        if case == "coordinator-retry" && number == 1 {
+            return Some(("invalid-status", String::new()));
+        }
+        let (status, response) = transport_responses(path, body, number)?;
+        let mut response: Value = serde_json::from_str(&response).unwrap();
+        if case == "coordinator-prefix" && number >= 2 {
+            response["task"]["task_id"] = json!("successor");
+            response["task"]["workflow_task_attempt"] = json!(8);
+        }
+        if case == "coordinator-saga" && number >= 2 {
+            response["task"]["task_id"] = json!("cleanup");
+            response["task"]["workflow_task_attempt"] = json!(9);
+        }
+        return Some((status, response.to_string()));
+    }
+    if path.ends_with("/history") {
+        if case == "coordinator-owner-lost" && number >= 2 {
+            return Some((
+                "409 Conflict",
+                json!({"reason":"lease_owner_mismatch"}).to_string(),
+            ));
+        }
+        let prefix = case == "coordinator-prefix";
+        let successor = prefix && path.ends_with("/successor/history");
+        let mut events = if prefix {
+            vec![canonical_request()]
+        } else {
+            vec![scheduled_timer(1), canonical_request()]
+        };
+        if successor {
+            events.push(event(
+                "SideEffectRecorded",
+                json!({"sequence":1,"result":fixture_envelope(json!(7))}),
+            ));
+        }
+        let cleanup = case == "coordinator-saga" && path.ends_with("/cleanup/history");
+        let delivered = if prefix {
+            successor && number >= 2
+        } else {
+            number >= 2 || case == "coordinator-cold" || cleanup
+        };
+        if delivered && !matches!(case, "coordinator-unproved" | "coordinator-shield") {
+            events.push(canonical_delivery(
+                if prefix { 2 } else { 1 },
+                if case == "coordinator-mismatch" {
+                    "activity"
+                } else {
+                    "timer"
+                },
+            ));
+        }
+        if cleanup {
+            events.extend(completed_activity(2, "undo", Value::Null));
+        }
+        if case == "coordinator-missing-request" {
+            events.retain(|event| event.event_type != "CooperativeCancellationRequested");
+        }
+        let events = events
+            .into_iter()
+            .map(|event| {
+                let mut value = event.raw;
+                value.insert("event_type".into(), json!(event.event_type));
+                value.insert("payload".into(), event.payload);
+                Value::Object(value.into_iter().collect())
+            })
+            .collect::<Vec<_>>();
+        return Some((
+            "200 OK",
+            json!({
+            "task_id":if successor { "successor" } else if cleanup { "cleanup" } else { "task/selected" },
+            "workflow_task_attempt":if successor { 8 } else if cleanup { 9 } else { 7 },
+                "total_history_events":events.len(),"history_events":events,
+                "next_history_page_token":null,
+            })
+            .to_string(),
+        ));
+    }
+    if path.ends_with("/deliver-cancellation") {
+        if case == "coordinator-lost-ack" {
+            return Some((
+                "409 Conflict",
+                json!({"reason":"lease_owner_mismatch"}).to_string(),
+            ));
+        }
+        let (status, response) = transport_responses(path, body, number)?;
+        let mut response: Value = serde_json::from_str(&response).unwrap();
+        if case == "coordinator-prefix" {
+            response["task_id"] = json!("successor");
+        }
+        return Some((status, response.to_string()));
+    }
+    if path.ends_with("/complete") || path.ends_with("/fail") {
+        return Some(("200 OK", json!({"recorded":true}).to_string()));
+    }
+    None
+}
+
+fn coordinator_server() -> MockWorkerServer {
+    MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(coordinator_responses),
+        ..Default::default()
+    })
+}
+
+fn coordinator_worker(server: &MockWorkerServer, case: &str) -> Worker {
+    let mut worker = Worker::new(client(server, case), "queue").worker_id("actual-owner");
+    worker.cooperative_cancellation_enabled = true;
+    worker.poll_timeout = Duration::ZERO;
+    worker.retry_policy = WorkerRetryPolicy {
+        max_retries: 1,
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(1),
+    };
+    worker
+}
+
+fn register_coordinator_timer(
+    worker: &mut Worker,
+    observed: Arc<Mutex<Vec<CooperativeCancellationRequested>>>,
+) {
+    worker.register_workflow("cancel", move |ctx, _| {
+        let observed = observed.clone();
+        async move {
+            match ctx.sleep(Duration::from_secs(5)).await {
+                Err(Error::CooperativeCancellationRequested(request)) => {
+                    observed.lock().unwrap().push(request)
+                }
+                result => result?,
+            }
+            Ok(Value::Null)
+        }
+    });
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_commits_delivery_proves_history_and_replays_before_completion() {
+    for case in [
+        "coordinator-valid",
+        "coordinator-lost-ack",
+        "coordinator-cold",
+    ] {
+        let server = coordinator_server();
+        let mut worker = coordinator_worker(&server, case);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        register_coordinator_timer(&mut worker, observed.clone());
+        assert_eq!(
+            worker.poll_workflow_once().await.unwrap(),
+            ManagedPollOutcome::Handled
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].request, original_observation());
+        assert_eq!(observed[0].delivery, transport_delivery());
+        let requests = server.requests.lock().unwrap();
+        let delivery_count = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/deliver-cancellation"))
+            .count();
+        assert_eq!(
+            delivery_count,
+            if case == "coordinator-cold" { 0 } else { 1 }
+        );
+        let completion = requests.last().unwrap();
+        assert!(completion.path.ends_with("/complete"));
+        assert!(requests[requests.len() - 2].path.ends_with("/history"));
+        let body: Value = serde_json::from_str(&completion.body).unwrap();
+        assert_eq!(body["lease_owner"], "actual-owner");
+        assert_eq!(body["workflow_task_attempt"], 7);
+        assert_eq!(body["commands"][0]["type"], "complete_workflow");
+        assert!(!requests
+            .iter()
+            .any(|request| request.path.ends_with("/fail")));
+    }
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_refuses_unproved_changed_or_lost_claim_history_without_publication(
+) {
+    for case in [
+        "coordinator-unproved",
+        "coordinator-mismatch",
+        "coordinator-owner-lost",
+        "coordinator-missing-request",
+    ] {
+        let server = coordinator_server();
+        let mut worker = coordinator_worker(&server, case);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        register_coordinator_timer(&mut worker, observed.clone());
+        let result = worker.poll_workflow_once().await;
+        if case == "coordinator-owner-lost" {
+            assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 409));
+        } else {
+            assert!(
+                matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+                "{case}: {result:?}"
+            );
+        }
+        assert!(observed.lock().unwrap().is_empty());
+        let requests = server.requests.lock().unwrap();
+        assert!(!requests
+            .iter()
+            .any(|request| request.path.ends_with("/complete") || request.path.ends_with("/fail")));
+    }
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_commits_earlier_prefix_and_delivers_only_on_its_successor_claim() {
+    let server = coordinator_server();
+    let mut worker = coordinator_worker(&server, "coordinator-prefix");
+    let side_effects = Arc::new(Mutex::new(0));
+    let executions = side_effects.clone();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let errors = observed.clone();
+    worker.register_workflow("cancel", move |ctx, _| {
+        let executions = executions.clone();
+        let errors = errors.clone();
+        async move {
+            let value: Value = ctx.side_effect(|| {
+                *executions.lock().unwrap() += 1;
+                json!(7)
+            })?;
+            assert_eq!(value, 7);
+            match ctx.sleep(Duration::from_secs(5)).await {
+                Err(Error::CooperativeCancellationRequested(request)) => {
+                    errors.lock().unwrap().push(request)
+                }
+                result => result?,
+            }
+            Ok(Value::Null)
+        }
+    });
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    assert!(observed.lock().unwrap().is_empty());
+    {
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let completion: Value = serde_json::from_str(&requests[2].body).unwrap();
+        assert_eq!(completion["commands"].as_array().unwrap().len(), 1);
+        assert_eq!(completion["commands"][0]["type"], "record_side_effect");
+        assert_eq!(completion["workflow_task_attempt"], 7);
+        assert!(!requests
+            .iter()
+            .any(|request| request.path.ends_with("/deliver-cancellation")));
+    }
+    let result = worker.poll_workflow_once().await;
+    assert!(
+        matches!(result, Ok(ManagedPollOutcome::Handled)),
+        "{result:?}, paths: {:?}",
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| &request.path)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(*side_effects.lock().unwrap(), 1);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].delivery.sequence, 2);
+    assert_eq!(observed[0].request, original_observation());
+    let requests = server.requests.lock().unwrap();
+    let delivery = requests
+        .iter()
+        .find(|request| request.path.ends_with("/deliver-cancellation"))
+        .unwrap();
+    assert!(delivery.path.ends_with("/successor/deliver-cancellation"));
+    let body: Value = serde_json::from_str(&delivery.body).unwrap();
+    assert_eq!(body["workflow_task_attempt"], 8);
+    assert_eq!(body["sequence"], 2);
+    let body: Value = serde_json::from_str(&requests.last().unwrap().body).unwrap();
+    assert_eq!(body["commands"].as_array().unwrap().len(), 1);
+    assert_eq!(body["commands"][0]["type"], "complete_workflow");
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_leaves_shielded_cleanup_pending_without_delivery() {
+    let server = coordinator_server();
+    let mut worker = coordinator_worker(&server, "coordinator-shield");
+    worker.register_workflow("cancel", |ctx, _| async move {
+        let _shield = ctx.cancellation_shield()?;
+        ctx.sleep(Duration::from_secs(5)).await?;
+        Ok(Value::Null)
+    });
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.last().unwrap().path.ends_with("/fail"));
+    let body: Value = serde_json::from_str(&requests.last().unwrap().body).unwrap();
+    assert_eq!(
+        body["failure"]["type"],
+        WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE
+    );
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/deliver-cancellation")));
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_unhandled_canonical_request_publishes_typed_workflow_cancellation()
+{
+    let server = coordinator_server();
+    let mut worker = coordinator_worker(&server, "coordinator-valid");
+    worker.register_workflow("cancel", |ctx, _| async move {
+        ctx.sleep(Duration::from_secs(5)).await?;
+        Ok(Value::Null)
+    });
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    let requests = server.requests.lock().unwrap();
+    let completion = requests.last().unwrap();
+    assert!(completion.path.ends_with("/complete"));
+    let body: Value = serde_json::from_str(&completion.body).unwrap();
+    assert_eq!(body["commands"].as_array().unwrap().len(), 1);
+    let command = &body["commands"][0];
+    assert_eq!(command["type"], "fail_workflow");
+    assert_eq!(command["exception_type"], "WorkflowCancellationRequested");
+    assert_eq!(
+        command["exception_class"],
+        "durable_workflow::CooperativeCancellationRequested"
+    );
+    assert_eq!(command["non_retryable"], true);
+    assert_eq!(command["exception"]["properties"]["reason"], "cancelled");
+    assert_eq!(
+        command["exception"]["properties"]["request_id"],
+        "original-request"
+    );
+    assert_eq!(
+        command["exception"]["properties"]["cleanup_deadline_at"],
+        "2026-10-01T08:10:00Z"
+    );
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/fail")));
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_replays_saga_cleanup_on_a_cold_successor_before_terminal_cancellation(
+) {
+    let server = coordinator_server();
+    let mut worker = coordinator_worker(&server, "coordinator-saga");
+    worker.register_workflow("cancel", |ctx, _| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        let result = ctx.sleep(Duration::from_secs(5)).await;
+        saga.finish(result).await?;
+        Ok(Value::Null)
+    });
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    {
+        let requests = server.requests.lock().unwrap();
+        let body: Value = serde_json::from_str(&requests.last().unwrap().body).unwrap();
+        assert_eq!(body["commands"].as_array().unwrap().len(), 1);
+        assert_eq!(body["commands"][0]["type"], "schedule_activity");
+        assert_eq!(body["commands"][0]["activity_type"], "undo");
+        assert_eq!(body["workflow_task_attempt"], 7);
+    }
+    // A fresh Worker represents process loss after cleanup was scheduled. The
+    // Server history proves its activity completion before terminal publication.
+    let mut replacement = coordinator_worker(&server, "coordinator-saga");
+    replacement.register_workflow("cancel", |ctx, _| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        let result = ctx.sleep(Duration::from_secs(5)).await;
+        saga.finish(result).await?;
+        Ok(Value::Null)
+    });
+    assert_eq!(
+        replacement.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with("/deliver-cancellation"))
+            .count(),
+        1
+    );
+    let completion = requests.last().unwrap();
+    assert!(completion.path.ends_with("/cleanup/complete"));
+    let body: Value = serde_json::from_str(&completion.body).unwrap();
+    assert_eq!(body["workflow_task_attempt"], 9);
+    assert_eq!(body["commands"].as_array().unwrap().len(), 1);
+    let command = &body["commands"][0];
+    assert_eq!(command["type"], "fail_workflow");
+    assert_eq!(command["exception_type"], "WorkflowCancellationRequested");
+    assert_eq!(
+        command["exception_class"],
+        "durable_workflow::CooperativeCancellationRequested"
+    );
+    assert_eq!(command["non_retryable"], true);
+    assert_eq!(command["exception"]["properties"]["reason"], "cancelled");
+    assert_eq!(
+        command["exception"]["properties"]["request_id"],
+        "original-request"
+    );
+    assert_eq!(
+        command["exception"]["properties"]["cleanup_deadline_at"],
+        "2026-10-01T08:10:00Z"
+    );
+}
+
+#[tokio::test]
+async fn cooperative_coordinator_poll_retry_retains_the_same_claim_acquisition_identity() {
+    let server = coordinator_server();
+    let mut worker = coordinator_worker(&server, "coordinator-retry");
+    register_coordinator_timer(&mut worker, Arc::new(Mutex::new(Vec::new())));
+    assert_eq!(
+        worker.poll_workflow_once().await.unwrap(),
+        ManagedPollOutcome::Handled
+    );
+    let requests = server.requests.lock().unwrap();
+    let polls = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/poll"))
+        .collect::<Vec<_>>();
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[0].body, polls[1].body);
+    assert_eq!(polls[0].worker_protocol.as_deref(), Some("1.20"));
+}
+
 #[tokio::test]
 async fn cooperative_poll_retains_the_actual_claim_observation_and_fenced_history() {
     let server = transport_server();

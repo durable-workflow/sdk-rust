@@ -6168,6 +6168,8 @@ pub struct Worker {
     heartbeat_interval: Duration,
     retry_policy: WorkerRetryPolicy,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
+    // Registration and callback lifetime qualification must precede activation.
+    cooperative_cancellation_enabled: bool,
 }
 
 impl Worker {
@@ -6186,6 +6188,7 @@ impl Worker {
             heartbeat_interval: Duration::from_secs(60),
             retry_policy: WorkerRetryPolicy::default(),
             heartbeat_observer: None,
+            cooperative_cancellation_enabled: false,
         }
     }
 
@@ -7058,6 +7061,9 @@ impl Worker {
     }
 
     async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        if self.cooperative_cancellation_enabled {
+            return self.poll_cooperative_workflow_once().await;
+        }
         let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -7090,7 +7096,27 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
 
-        match self.execute_workflow_task_decision(task) {
+        self.settle_workflow_task_decision(
+            &task_id,
+            &lease_owner,
+            attempt,
+            run_id.as_deref(),
+            self.execute_workflow_task_decision(task),
+            memo_updates_supported,
+        )
+        .await
+    }
+
+    async fn settle_workflow_task_decision(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        attempt: u64,
+        run_id: Option<&str>,
+        decision: Result<WorkflowTaskDecision>,
+        memo_updates_supported: bool,
+    ) -> Result<ManagedPollOutcome> {
+        match decision {
             Ok(decision) if decision.cancellation_delivery.is_some() => {
                 return Err(Error::CooperativeCancellationUnavailable(
                     "worker cancellation delivery has not been negotiated".into(),
@@ -7102,8 +7128,8 @@ impl Worker {
             {
                 self.client
                     .fail_workflow_task(
-                        &task_id,
-                        &lease_owner,
+                        task_id,
+                        lease_owner,
                         attempt,
                         Error::WorkflowMemoUpdatesUnavailable.to_string(),
                     )
@@ -7117,8 +7143,8 @@ impl Worker {
                 // least one executable command.
                 self.client
                     .fail_workflow_task_with_type(
-                        &task_id,
-                        &lease_owner,
+                        task_id,
+                        lease_owner,
                         attempt,
                         WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE,
                         WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE,
@@ -7129,8 +7155,8 @@ impl Worker {
                 let completion = self
                     .client
                     .complete_workflow_task_with_message_streams(
-                        &task_id,
-                        &lease_owner,
+                        task_id,
+                        lease_owner,
                         attempt,
                         decision.commands,
                         decision.message_stream_cursors,
@@ -7139,10 +7165,7 @@ impl Worker {
                     .await;
                 if let Err(error) = completion {
                     if !workflow_task_completion_is_terminal_timeout(
-                        &error,
-                        &task_id,
-                        attempt,
-                        run_id.as_deref(),
+                        &error, task_id, attempt, run_id,
                     ) {
                         return Err(error);
                     }
@@ -7150,7 +7173,7 @@ impl Worker {
             }
             Err(error) => {
                 self.client
-                    .fail_workflow_task(&task_id, &lease_owner, attempt, error.to_string())
+                    .fail_workflow_task(task_id, lease_owner, attempt, error.to_string())
                     .await?;
             }
         }

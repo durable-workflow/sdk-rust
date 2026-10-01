@@ -984,7 +984,28 @@ impl Client {
         task_queue: &str,
         timeout: Duration,
     ) -> Result<CooperativeWorkflowTaskPoll> {
-        if worker_id.trim().is_empty() || task_queue.trim().is_empty() {
+        self.poll_cooperative_workflow_task_with_request_id(
+            worker_id,
+            task_queue,
+            timeout,
+            &unique_request_id("rust-workflow-poll"),
+            1,
+        )
+        .await
+    }
+
+    async fn poll_cooperative_workflow_task_with_request_id(
+        &self,
+        worker_id: &str,
+        task_queue: &str,
+        timeout: Duration,
+        poll_request_id: &str,
+        transport_retries: usize,
+    ) -> Result<CooperativeWorkflowTaskPoll> {
+        if worker_id.trim().is_empty()
+            || task_queue.trim().is_empty()
+            || poll_request_id.trim().is_empty()
+        {
             return Err(invalid(
                 "cooperative polling requires a worker and task queue",
             ));
@@ -994,7 +1015,7 @@ impl Client {
             .ok_or_else(|| invalid("cooperative poll timeout exceeds its supported budget"))?;
         let body = json!({
             "worker_id":worker_id, "task_queue":task_queue,
-            "poll_request_id":unique_request_id("rust-workflow-poll"),
+            "poll_request_id":poll_request_id,
             "timeout_seconds":long_poll_timeout_seconds(timeout),
             "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
         });
@@ -1005,7 +1026,7 @@ impl Client {
                     RequestProtocol::Worker("1.20"),
                     &body,
                     budget,
-                    1,
+                    transport_retries,
                 )
                 .await?;
             let mut response: PollWorkflowTaskResponse = serde_json::from_value(value.clone())
@@ -1380,6 +1401,114 @@ impl Client {
         })
         .await
         .map_err(|_| Error::Timeout)?
+    }
+}
+
+impl Worker {
+    pub(super) async fn poll_cooperative_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        let poll_request_id = unique_request_id("rust-workflow-poll");
+        let response = self
+            .retry_worker_operation(|| {
+                self.client.poll_cooperative_workflow_task_with_request_id(
+                    &self.worker_id,
+                    &self.task_queue,
+                    self.poll_timeout,
+                    &poll_request_id,
+                    0,
+                )
+            })
+            .await;
+        let Some(response) = self.settle_worker_poll_response(response).await? else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
+        if response.outcome.should_stop() {
+            return Ok(ManagedPollOutcome::Stop);
+        }
+        let memo_updates_supported =
+            runtime_supports_workflow_memo_updates(response.server_capabilities.as_ref());
+        let Some(claim) = response.task else {
+            return Ok(ManagedPollOutcome::Idle);
+        };
+        // An uncertain observation, delivery or canonical refresh cannot become
+        // an application failure or be published as a workflow-task decision.
+        let decision = self.replay_cooperative_workflow_claim(&claim).await?;
+        let (owner, _) = cancellation_claim(&claim.task)?;
+        self.settle_workflow_task_decision(
+            &claim.task.task_id,
+            owner,
+            claim.task.workflow_task_attempt,
+            claim.task.run_id.as_deref(),
+            Ok(decision),
+            memo_updates_supported,
+        )
+        .await
+    }
+
+    async fn replay_cooperative_workflow_claim(
+        &self,
+        claim: &CooperativeWorkflowTask,
+    ) -> Result<WorkflowTaskDecision> {
+        let (owner, run_id) = cancellation_claim(&claim.task)?;
+        if owner != self.worker_id {
+            return Err(invalid(
+                "cooperative replay requires this worker's actual claim",
+            ));
+        }
+        let mut task = claim.task.clone();
+        let Some(observation) = claim.cancellation_request.as_ref() else {
+            let canonical = CancellationHistory::from_events(&task.history_events, run_id, None)?;
+            if canonical.request.is_some() {
+                return Err(invalid(
+                    "cooperative replay omitted its original pending observation",
+                ));
+            }
+            return self.execute_workflow_task_decision(task);
+        };
+        task.history_events = self
+            .client
+            .refresh_workflow_cancellation_history(&claim.task, observation)
+            .await?;
+        for _ in 0..3 {
+            // Count the actual refreshed snapshot. Its byte budget was not
+            // remeasured, so do not expose the old snapshot's size as current.
+            task.total_history_events = None;
+            task.history_size_bytes = None;
+            let mut decision = self.execute_workflow_task_decision_with_cancellation(
+                task.clone(),
+                Some(observation),
+            )?;
+            let Some(intent) = decision.cancellation_delivery.as_ref() else {
+                return Ok(decision);
+            };
+            if !decision.commands.is_empty() {
+                // Native permits delivery only at/before its next durable call.
+                // Commit earlier commands first. Completion releases this claim
+                // and its successor replays their durable results before delivery.
+                decision.cancellation_delivery = None;
+                return Ok(decision);
+            }
+            let delivery_error = self
+                .client
+                .deliver_workflow_cancellation(&claim.task, intent)
+                .await
+                .err();
+            task.history_events = self
+                .client
+                .refresh_workflow_cancellation_history(&claim.task, observation)
+                .await?;
+            let canonical =
+                CancellationHistory::from_events(&task.history_events, run_id, Some(observation))?;
+            if canonical.delivery.as_ref() != Some(intent) {
+                return Err(delivery_error.unwrap_or_else(|| {
+                    invalid(
+                        "canonical history did not prove the exact intended cancellation delivery",
+                    )
+                }));
+            }
+        }
+        Err(invalid(
+            "workflow replay did not converge on its canonical cancellation delivery",
+        ))
     }
 }
 
