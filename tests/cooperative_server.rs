@@ -369,7 +369,9 @@ async fn blocked_cleanup_cutoff(terminate: bool) {
     }
     let result = handle
         .result_selected_run(WorkflowResultOptions {
-            timeout: Duration::from_secs(15),
+            // Include the production ten-second repair cadence without extending
+            // the original cleanup deadline.
+            timeout: Duration::from_secs(25),
             poll_interval: Duration::from_millis(50),
         })
         .await;

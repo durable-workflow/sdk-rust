@@ -51,7 +51,8 @@ services:
         condition: service_healthy
   repair:
     image: dw-rust-cooperative-server:${SERVER_CANDIDATE_SHA:-candidate}
-    command: ["php", "artisan", "workflow:v2:repair-pass", "--loop", "--sleep-seconds=1", "--json"]
+    # Match the production scheduler's unscoped, unthrottled repair cadence.
+    command: sh -c 'while true; do php artisan workflow:v2:repair-pass --json; sleep 10; done'
     environment: *runtime-env
     depends_on:
       server:
