@@ -407,6 +407,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.search-attribute-type-mismatch"
             | "corpus.condition-search"
             | "corpus.condition-search-adjacent"
+            | "corpus.grouped-condition-reopen"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
             | "corpus.redrive-boundary"
@@ -536,6 +537,19 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                         .map(|message| message.message_id)
                         .collect::<Vec<_>>(),
                 ]))
+            });
+        }
+        "corpus.grouped-condition-reopen" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                ctx.parallel(vec![
+                    ParallelOperation::timer(Duration::from_secs(300)),
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1"),
+                        || Ok(false),
+                    ),
+                ])
+                .await?;
+                Ok(Value::Null)
             });
         }
         "corpus.nested-parallel" => {

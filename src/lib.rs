@@ -14139,8 +14139,81 @@ fn recorded_condition_wait(
         predicate_identity,
         timeout_seconds,
         result,
-        parallel_group_path: recorded_parallel_group_path(condition_events, sequence)?,
+        parallel_group_path: recorded_condition_group_path(condition_events, all_events, sequence)?,
     })
+}
+
+fn recorded_condition_group_path(
+    condition_events: &[&HistoryEvent],
+    all_events: &[HistoryEvent],
+    sequence: u64,
+) -> Result<Option<Vec<ParallelGroupMetadata>>> {
+    let opened = condition_events
+        .iter()
+        .copied()
+        .find(|event| event.event_type == "ConditionWaitOpened")
+        .expect("canonical condition opener is validated first");
+    let occurrence = required_condition_wait_occurrence_id(opened, sequence)?;
+    let previous_events = all_events
+        .iter()
+        .take_while(|event| !std::ptr::eq(*event, opened))
+        .collect::<Vec<_>>();
+    let originals = previous_events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type == "ConditionWaitOpened")
+        .filter(|event| {
+            event
+                .payload
+                .get("condition_wait_occurrence_id")
+                .and_then(Value::as_str)
+                == Some(occurrence.as_str())
+        })
+        .collect::<Vec<_>>();
+    let Some(original) = originals.first().copied() else {
+        return recorded_parallel_group_path(condition_events, sequence);
+    };
+    let authored_sequence = required_history_u64(original, "sequence", sequence)?;
+    if authored_sequence == sequence {
+        return recorded_parallel_group_path(condition_events, sequence);
+    }
+    let original_path = recorded_parallel_group_path(&[original], authored_sequence)?;
+    if original_path.is_none() {
+        return recorded_parallel_group_path(condition_events, sequence);
+    }
+    let reopened_path = recorded_parallel_group_path(condition_events, authored_sequence)?;
+    let identity_matches = [
+        "condition_key",
+        "condition_definition_fingerprint",
+        "timeout_seconds",
+    ]
+    .iter()
+    .all(|field| opened.payload.get(*field) == original.payload.get(*field));
+    let previous = originals
+        .iter()
+        .copied()
+        .filter(|event| durable_event_sequence(event).is_some_and(|physical| physical < sequence))
+        .max_by_key(|event| durable_event_sequence(event));
+    let previously_satisfied = previous.is_some_and(|previous| {
+        previous_events.iter().any(|event| {
+            event.event_type == "ConditionWaitSatisfied"
+                && event.payload.get("condition_wait_id")
+                    == previous.payload.get("condition_wait_id")
+                && event.payload.get("condition_wait_occurrence_id")
+                    == previous.payload.get("condition_wait_occurrence_id")
+                && durable_event_sequence(event) == durable_event_sequence(previous)
+        })
+    });
+    if !identity_matches || reopened_path != original_path || !previously_satisfied {
+        return Err(invalid_recorded_history(
+            "condition_wait_group_reopen_mismatch",
+            sequence,
+            "same authored condition and group path after a satisfied physical wait",
+            &opened.payload.to_string(),
+            "grouped condition reopen has no matching recorded predecessor",
+        ));
+    }
+    Ok(reopened_path)
 }
 
 fn required_condition_wait_occurrence_id(event: &HistoryEvent, sequence: u64) -> Result<String> {
@@ -19312,6 +19385,70 @@ mod tests {
             timed_out.as_mut().poll(&mut task_context),
             Poll::Ready(Ok(ConditionWaitResult::TimedOut))
         ));
+    }
+
+    #[test]
+    fn grouped_condition_replay_rejects_unproven_physical_reopens() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/grouped-condition-physical-reopen.json"
+        ))
+        .expect("grouped condition fixture");
+        let original = fixture["history"].as_array().expect("fixture history");
+        let decode = |events: &[Value]| {
+            let history = events
+                .iter()
+                .map(|event| {
+                    history_event(
+                        event["event_type"].as_str().unwrap(),
+                        event["payload"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            recorded_commands(
+                &history,
+                DEFAULT_CODEC,
+                WorkflowIdentity {
+                    workflow_id: None,
+                    run_id: None,
+                },
+            )
+        };
+        assert!(decode(original).is_ok());
+        for field in [
+            "condition_wait_occurrence_id",
+            "condition_key",
+            "condition_definition_fingerprint",
+            "timeout_seconds",
+            "parallel_group_id",
+            "parallel_group_size",
+            "parallel_group_index",
+        ] {
+            let mut changed = original.clone();
+            changed[3]["payload"][field] = match field {
+                "timeout_seconds" | "parallel_group_size" => json!(30),
+                "parallel_group_index" => json!(0),
+                _ => json!("changed"),
+            };
+            assert!(
+                decode(&changed).is_err(),
+                "reopen must reject changed {field}"
+            );
+        }
+        let mut unsettled = original.clone();
+        unsettled.remove(2);
+        assert!(
+            decode(&unsettled).is_err(),
+            "physical predecessor must be resolved"
+        );
+        let mut timed_out = original.clone();
+        timed_out[2]["event_type"] = json!("ConditionWaitTimedOut");
+        assert!(decode(&timed_out).is_err(), "timeout is terminal");
+        let mut late_resolution = original.clone();
+        late_resolution.swap(2, 3);
+        assert!(
+            decode(&late_resolution).is_err(),
+            "later history cannot authorize a reopen"
+        );
     }
 
     #[test]

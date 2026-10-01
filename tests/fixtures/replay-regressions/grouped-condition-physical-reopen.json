@@ -1,0 +1,82 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-grouped-condition-physical-reopen",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.grouped-condition-reopen",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "timer-1",
+        "delay_seconds": 300,
+        "parallel_group_id": "parallel-calls:1:2",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 0
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 2,
+        "condition_wait_id": "condition-2",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "two-votes",
+        "condition_definition_fingerprint": "sha256:two-votes-v1",
+        "parallel_group_id": "parallel-calls:1:2",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1
+      }
+    },
+    {
+      "event_type": "ConditionWaitSatisfied",
+      "payload": {
+        "sequence": 2,
+        "condition_wait_id": "condition-2",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "two-votes",
+        "condition_definition_fingerprint": "sha256:two-votes-v1",
+        "parallel_group_id": "parallel-calls:1:2",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 3,
+        "condition_wait_id": "condition-3",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "two-votes",
+        "condition_definition_fingerprint": "sha256:two-votes-v1",
+        "parallel_group_id": "parallel-calls:1:2",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1
+      }
+    }
+  ],
+  "expected": {
+    "type": "open_condition_wait",
+    "condition_wait_occurrence_id": "rust:condition-wait:0",
+    "condition_key": "two-votes",
+    "condition_definition_fingerprint": "sha256:two-votes-v1",
+    "parallel_group_id": "parallel-calls:1:2",
+    "parallel_group_base_sequence": 1,
+    "parallel_group_size": 2,
+    "parallel_group_index": 1
+  }
+}
