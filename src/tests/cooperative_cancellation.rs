@@ -1232,6 +1232,366 @@ fn client(server: &MockWorkerServer, case: &str) -> Client {
         .unwrap()
 }
 
+fn transport_task() -> WorkflowTask {
+    let mut task = cancellation_task(vec![scheduled_timer(1)]);
+    task.task_id = "task/selected".into();
+    task.workflow_task_attempt = 7;
+    task.lease_owner = Some("actual-owner".into());
+    task
+}
+
+fn transport_delivery() -> CancellationDelivery {
+    CancellationDelivery::from_payload(&canonical_delivery(1, "timer").payload).unwrap()
+}
+
+fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    let case = path.split('/').nth(1).unwrap_or_default();
+    let body: Value = serde_json::from_str(body).unwrap();
+    if case == "refused" || (case == "lost-ack" && path.ends_with("/deliver-cancellation")) {
+        return Some((
+            "409 Conflict",
+            json!({"reason":"lease_owner_mismatch"}).to_string(),
+        ));
+    }
+    if case == "budget" {
+        thread::sleep(Duration::from_secs(3));
+    }
+    let mut response = if path.ends_with("/deliver-cancellation") {
+        json!({"delivered":true, "task_id":"task/selected", "workflow_run_id":"run",
+            "request_id":body["request_id"], "sequence":body["sequence"], "call_kind":body["call_kind"],
+            "sequence_span":body["sequence_span"], "operation_sequence":body["operation_sequence"],
+            "operation_sequence_span":body["operation_sequence_span"], "reason":null})
+    } else if path.ends_with("/history") {
+        let first = body["next_history_page_token"] == "opaque-server-token";
+        let events = if first {
+            vec![scheduled_timer(1), canonical_request()]
+        } else {
+            vec![canonical_delivery(1, "timer")]
+        };
+        let events = events
+            .into_iter()
+            .map(|event| {
+                let mut value = event.raw;
+                value.insert("event_type".into(), json!(event.event_type));
+                value.insert("payload".into(), event.payload);
+                Value::Object(value.into_iter().collect())
+            })
+            .collect::<Vec<_>>();
+        let mut page = json!({"task_id":"task/selected", "workflow_task_attempt":7,
+            "history_events":events, "total_history_events":3,
+            "next_history_page_token":if first { json!("page-next") } else { Value::Null }});
+        match case {
+            "cycle" if !first => page["next_history_page_token"] = json!("opaque-server-token"),
+            "page-bound" => {
+                page["history_events"] =
+                    json!([{"event_type":"OpaqueUnrelatedEvent", "payload":{}}]);
+                page["next_history_page_token"] = json!(format!("next-{number}"));
+            }
+            "empty-progress" => page["history_events"] = json!([]),
+            "oversized-page" => {
+                page["history_events"] = json!(vec![
+                    json!({"event_type":"OpaqueUnrelatedEvent"});
+                    WORKFLOW_HISTORY_PAGE_SIZE as usize + 1
+                ])
+            }
+            "missing-request" => {
+                page["history_events"] = if first {
+                    json!([{"event_type":"TimerScheduled", "payload":{"sequence":1,"delay_seconds":5}}])
+                } else {
+                    json!([])
+                };
+            }
+            "changed-canonical" if !first => {
+                page["history_events"][0]["payload"]["workflow_command_id"] = json!("changed")
+            }
+            "malformed-event" => page["history_events"] = json!([{"event_type":false}]),
+            "wrong-attempt" => page["workflow_task_attempt"] = json!(8),
+            "empty-token" => page["next_history_page_token"] = json!(""),
+            "missing-token" => {
+                page.as_object_mut()
+                    .unwrap()
+                    .remove("next_history_page_token");
+            }
+            _ => {}
+        }
+        page
+    } else {
+        return None;
+    };
+    match case {
+        "wrong-task" => response["task_id"] = json!("other-task"),
+        "wrong-run" => response["workflow_run_id"] = json!("other-run"),
+        "wrong-request" => response["request_id"] = json!("other-request"),
+        "wrong-sequence" => response["sequence"] = json!(2),
+        "wrong-kind" => response["call_kind"] = json!("activity"),
+        "wrong-span" => response["sequence_span"] = json!(2),
+        "false-delivered" => response["delivered"] = json!(false),
+        "string-delivered" => response["delivered"] = json!("true"),
+        "wrong-reason" => response["reason"] = json!("not_committed"),
+        "missing-span" => {
+            response.as_object_mut().unwrap().remove("sequence_span");
+        }
+        "missing-operation" => {
+            response
+                .as_object_mut()
+                .unwrap()
+                .remove("operation_sequence");
+        }
+        "missing-operation-span" => {
+            response
+                .as_object_mut()
+                .unwrap()
+                .remove("operation_sequence_span");
+        }
+        _ => {}
+    }
+    Some(("200 OK", response.to_string()))
+}
+
+fn transport_server() -> MockWorkerServer {
+    MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(transport_responses),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn cooperative_transport_delivers_the_exact_claim_with_worker_credentials() {
+    let server = transport_server();
+    let client = client(&server, "valid");
+    let task = transport_task();
+    let delivery = transport_delivery();
+    let receipt = client
+        .deliver_workflow_cancellation(&task, &delivery)
+        .await
+        .unwrap();
+    assert_eq!(receipt.task_id, task.task_id);
+    assert_eq!(receipt.run_id, "run");
+    assert_eq!(receipt.delivery, delivery);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(
+        request.path,
+        "/valid/api/worker/workflow-tasks/task%2Fselected/deliver-cancellation"
+    );
+    assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
+    assert_eq!(request.authorization.as_deref(), Some("Bearer worker-only"));
+    assert_eq!(request.namespace.as_deref(), Some("caller-namespace"));
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["lease_owner"], "actual-owner");
+    assert_eq!(body["workflow_task_attempt"], 7);
+    assert_eq!(body["request_id"], "original-request");
+}
+
+#[tokio::test]
+async fn cooperative_transport_rejects_malformed_or_changed_delivery_acknowledgments() {
+    for case in [
+        "wrong-task",
+        "wrong-run",
+        "wrong-request",
+        "wrong-sequence",
+        "wrong-kind",
+        "wrong-span",
+        "false-delivered",
+        "string-delivered",
+        "wrong-reason",
+        "missing-span",
+        "missing-operation",
+        "missing-operation-span",
+    ] {
+        let server = transport_server();
+        let result = client(&server, case)
+            .deliver_workflow_cancellation(&transport_task(), &transport_delivery())
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+            "{case}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cooperative_transport_refreshes_with_the_opaque_token_and_preserves_the_snapshot() {
+    let server = transport_server();
+    let client = client(&server, "valid");
+    let task = transport_task();
+    let observation = CancellationRequest::from_observation(&request_observation()).unwrap();
+    let original = observation.clone();
+    let fresh = client
+        .refresh_workflow_cancellation_history(&task, &observation)
+        .await
+        .unwrap();
+    assert_eq!(fresh.len(), 3);
+    assert_eq!(task.history_events.len(), 1);
+    assert_eq!(observation, original);
+    let canonical = CancellationHistory::from_events(&fresh, "run", Some(&observation)).unwrap();
+    assert_eq!(canonical.delivery, Some(transport_delivery()));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(body["lease_owner"], "actual-owner");
+        assert_eq!(body["workflow_task_attempt"], 7);
+        assert_eq!(body["history_page_size"], WORKFLOW_HISTORY_PAGE_SIZE);
+        assert_eq!(
+            body["next_history_page_token"],
+            if index == 0 {
+                "opaque-server-token"
+            } else {
+                "page-next"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn cooperative_transport_rejects_changed_claims_bad_pages_and_token_cycles() {
+    for case in [
+        "wrong-task",
+        "wrong-attempt",
+        "cycle",
+        "empty-progress",
+        "oversized-page",
+        "missing-request",
+        "changed-canonical",
+        "malformed-event",
+        "empty-token",
+        "missing-token",
+    ] {
+        let server = transport_server();
+        let observation = CancellationRequest::from_observation(&request_observation()).unwrap();
+        let result = client(&server, case)
+            .refresh_workflow_cancellation_history(&transport_task(), &observation)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidCooperativeCancellation(_) | Error::NonDeterministicReplay(_))
+            ),
+            "{case}: {result:?}"
+        );
+        assert!(server.requests.lock().unwrap().len() <= 2);
+    }
+}
+
+#[tokio::test]
+async fn cooperative_transport_bounds_unique_history_pages() {
+    let server = transport_server();
+    let observation = CancellationRequest::from_observation(&request_observation()).unwrap();
+    let result = client(&server, "page-bound")
+        .refresh_workflow_cancellation_history(&transport_task(), &observation)
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), 128);
+}
+
+#[tokio::test]
+async fn cooperative_transport_can_prove_committed_history_after_a_lost_acknowledgment() {
+    let server = transport_server();
+    let client = client(&server, "lost-ack");
+    let task = transport_task();
+    let intent = transport_delivery();
+    assert!(matches!(
+        client.deliver_workflow_cancellation(&task, &intent).await,
+        Err(Error::Http { status, .. }) if status.as_u16() == 409
+    ));
+    let observation = CancellationRequest::from_observation(&request_observation()).unwrap();
+    let fresh = client
+        .refresh_workflow_cancellation_history(&task, &observation)
+        .await
+        .unwrap();
+    assert_eq!(
+        CancellationHistory::from_events(&fresh, "run", Some(&observation))
+            .unwrap()
+            .delivery,
+        Some(intent)
+    );
+}
+
+#[tokio::test]
+async fn cooperative_transport_validates_inputs_and_never_substitutes_control_credentials() {
+    let server = transport_server();
+    let client = client(&server, "valid");
+    for changed in 0..6 {
+        let mut task = transport_task();
+        match changed {
+            0 => task.task_id.clear(),
+            1 => task.workflow_task_attempt = 0,
+            2 => task.workflow_task_attempt = u64::MAX,
+            3 => task.run_id = None,
+            4 => task.lease_owner = None,
+            5 => task.lease_owner = Some(" ".into()),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            client
+                .deliver_workflow_cancellation(&task, &transport_delivery())
+                .await,
+            Err(Error::InvalidCooperativeCancellation(_))
+        ));
+    }
+    let mut invalid = transport_delivery();
+    invalid.sequence_span = 2;
+    assert!(matches!(
+        client
+            .deliver_workflow_cancellation(&transport_task(), &invalid)
+            .await,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    let mut observation = CancellationRequest::from_observation(&request_observation()).unwrap();
+    observation.history_refresh_page_token = None;
+    assert!(matches!(
+        client
+            .refresh_workflow_cancellation_history(&transport_task(), &observation)
+            .await,
+        Err(Error::InvalidCooperativeCancellation(_))
+    ));
+    let control_only = Client::builder(server.base_url())
+        .control_token(Some("control-only".into()))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        control_only
+            .deliver_workflow_cancellation(&transport_task(), &transport_delivery())
+            .await,
+        Err(Error::MissingRoleCredentials { role: "worker", .. })
+    ));
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cooperative_transport_preserves_claim_refusals_and_bounds_the_total_exchange() {
+    let server = transport_server();
+    assert!(matches!(
+        client(&server, "refused")
+            .deliver_workflow_cancellation(&transport_task(), &transport_delivery())
+            .await,
+        Err(Error::Http { status, .. }) if status.as_u16() == 409
+    ));
+    let started = Instant::now();
+    let observation = CancellationRequest::from_observation(&request_observation()).unwrap();
+    let result = client(&server, "budget")
+        .refresh_workflow_cancellation_history(&transport_task(), &observation)
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path.ends_with("/history"))
+            .count(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn cooperative_request_uses_control_role_namespace_and_preserves_server_identity() {
     let server = server();

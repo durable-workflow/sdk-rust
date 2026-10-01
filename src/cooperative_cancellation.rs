@@ -2,6 +2,15 @@ use super::*;
 use std::collections::BTreeSet;
 
 const CONTROL_BUDGET: Duration = Duration::from_secs(5);
+const MAX_REFRESH_PAGES: usize = 128;
+
+/// A delivery acknowledgment bound to one workflow task and durable run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancellationDeliveryReceipt {
+    pub task_id: String,
+    pub run_id: String,
+    pub delivery: CancellationDelivery,
+}
 
 /// Optional reason and runtime-owned cleanup limit for a cooperative request.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -759,6 +768,145 @@ fn acknowledgment(
 }
 
 impl Client {
+    /// Commit cooperative delivery on the exact selected workflow-task claim.
+    ///
+    /// This explicit worker-protocol 1.20 operation renews no lease and advertises
+    /// no worker capability. The Server requires a previously admitted capable
+    /// claim. Reload canonical history before exposing cancellation to workflow
+    /// code, including when an acknowledgment is lost.
+    pub async fn deliver_workflow_cancellation(
+        &self,
+        task: &WorkflowTask,
+        delivery: &CancellationDelivery,
+    ) -> Result<CancellationDeliveryReceipt> {
+        let (owner, run_id) = cancellation_claim(task)?;
+        let body = json!({
+            "lease_owner":owner, "workflow_task_attempt":task.workflow_task_attempt,
+            "request_id":delivery.request_id, "sequence":delivery.sequence,
+            "call_kind":delivery.call_kind, "sequence_span":delivery.sequence_span,
+            "operation_sequence":delivery.operation_sequence,
+            "operation_sequence_span":delivery.operation_sequence_span
+        });
+        let mut payload = body.clone();
+        payload["workflow_command_id"] = json!(delivery.request_id);
+        if CancellationDelivery::from_payload(&payload)? != *delivery {
+            return Err(invalid(
+                "delivery must name a valid authored operation range",
+            ));
+        }
+        tokio::time::timeout(CONTROL_BUDGET, async {
+            let path = format!(
+                "/worker/workflow-tasks/{}/deliver-cancellation",
+                percent_encode_path_segment(&task.task_id)
+            );
+            let response: Value = self
+                .request_json(
+                    reqwest::Method::POST,
+                    &path,
+                    RequestProtocol::Worker("1.20"),
+                    Some(&body),
+                )
+                .await?;
+            if response["delivered"].as_bool() != Some(true)
+                || response["task_id"].as_str() != Some(task.task_id.as_str())
+                || response["workflow_run_id"].as_str() != Some(run_id)
+                || response.get("reason") != Some(&Value::Null)
+                || [
+                    "sequence_span",
+                    "operation_sequence",
+                    "operation_sequence_span",
+                ]
+                .iter()
+                .any(|field| response.get(*field).is_none())
+            {
+                return Err(invalid(
+                    "delivery acknowledgment does not match the selected task/run",
+                ));
+            }
+            let mut recorded = response.clone();
+            recorded["workflow_command_id"] = response["request_id"].clone();
+            if CancellationDelivery::from_payload(&recorded)? != *delivery {
+                return Err(invalid(
+                    "delivery acknowledgment changed its authored operation range",
+                ));
+            }
+            Ok(CancellationDeliveryReceipt {
+                task_id: task.task_id.clone(),
+                run_id: run_id.to_owned(),
+                delivery: delivery.clone(),
+            })
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Reload canonical history with the Server-issued token and exact claim.
+    ///
+    /// The refresh has one five-second budget, at most 128 pages, and the existing
+    /// SDK page-size limit. Invalid, repeated or non-progressing tokens and pages
+    /// fail closed. This returns fresh history without modifying the caller's
+    /// previous task snapshot or its original request identity.
+    pub async fn refresh_workflow_cancellation_history(
+        &self,
+        task: &WorkflowTask,
+        observation: &CancellationRequest,
+    ) -> Result<Vec<HistoryEvent>> {
+        let (owner, run_id) = cancellation_claim(task)?;
+        CancellationRequest::from_observation(&json!({
+            "request_id":observation.request_id, "requested_at":observation.requested_at,
+            "cleanup_deadline_at":observation.cleanup_deadline_at,
+            "history_refresh_page_token":observation.history_refresh_page_token,
+        }))?;
+        let first_token = observation
+            .history_refresh_page_token
+            .clone()
+            .expect("validated history token");
+        tokio::time::timeout(CONTROL_BUDGET, async {
+            let path = format!("/worker/workflow-tasks/{}/history", percent_encode_path_segment(&task.task_id));
+            let mut token = Some(first_token);
+            let mut seen = BTreeSet::new();
+            let mut history = Vec::new();
+            while let Some(current) = token.take() {
+                if seen.len() >= MAX_REFRESH_PAGES || !seen.insert(current.clone()) {
+                    return Err(invalid("canonical history refresh exceeded its page bound or repeated a token"));
+                }
+                let body = json!({
+                    "lease_owner":owner, "workflow_task_attempt":task.workflow_task_attempt,
+                    "next_history_page_token":current, "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
+                });
+                let page: Value = self.request_json(
+                    reqwest::Method::POST, &path, RequestProtocol::Worker("1.20"), Some(&body),
+                ).await?;
+                if page["task_id"].as_str() != Some(task.task_id.as_str())
+                    || page["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
+                {
+                    return Err(invalid("canonical history page changed the selected task/attempt"));
+                }
+                let events = page["history_events"].as_array().ok_or_else(|| invalid("canonical history page must contain an event array"))?;
+                if events.len() > WORKFLOW_HISTORY_PAGE_SIZE as usize {
+                    return Err(invalid("canonical history page exceeds its requested event limit"));
+                }
+                token = match page.get("next_history_page_token") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(next)) if !next.is_empty() && !events.is_empty() => Some(next.clone()),
+                    _ => return Err(invalid("canonical history page token or progress is invalid")),
+                };
+                for event in events {
+                    let event: HistoryEvent = serde_json::from_value(event.clone()).map_err(|_| invalid("canonical history page contains a malformed event"))?;
+                    if event.event_type.trim().is_empty() {
+                        return Err(invalid("canonical history event type must be non-empty"));
+                    }
+                    history.push(event);
+                }
+            }
+            let canonical = CancellationHistory::from_events(&history, run_id, Some(observation))?;
+            if canonical.request_index >= history.len() {
+                return Err(invalid("canonical refresh omitted the original request event"));
+            }
+            Ok(history)
+        }).await.map_err(|_| Error::Timeout)?
+    }
+
     /// Request bounded workflow-authored cleanup on a capable runtime.
     ///
     /// This is separate from terminal cancellation. Discovery must advertise
@@ -838,6 +986,26 @@ impl Client {
         .await
         .map_err(|_| Error::Timeout)?
     }
+}
+
+fn cancellation_claim(task: &WorkflowTask) -> Result<(&str, &str)> {
+    let owner = task
+        .lease_owner
+        .as_deref()
+        .filter(|owner| !owner.trim().is_empty());
+    let run = task.run_id.as_deref().filter(|run| !run.trim().is_empty());
+    if task.task_id.trim().is_empty()
+        || task.workflow_task_attempt == 0
+        || task.workflow_task_attempt > MAX_SEQUENCE
+    {
+        return Err(invalid(
+            "cancellation transport requires a valid task and attempt",
+        ));
+    }
+    Ok((
+        owner.ok_or_else(|| invalid("cancellation transport requires the actual lease owner"))?,
+        run.ok_or_else(|| invalid("cancellation transport requires the selected durable run"))?,
+    ))
 }
 
 impl WorkflowHandle {
