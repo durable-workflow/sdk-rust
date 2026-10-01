@@ -1989,16 +1989,52 @@ fn remote_activity_responses(
         return responses(path, body, number);
     }
     if path.ends_with("/worker/register") {
-        return Some((
-            "200 OK",
-            json!({"registered":true,"worker_id":"actual-owner","heartbeat_interval_seconds":3600})
-                .to_string(),
-        ));
+        let request: Value = serde_json::from_str(body).unwrap();
+        let mut reply = json!({"registered":true,"worker_id":request["worker_id"],
+            "namespace":"caller-namespace","task_queue":request["task_queue"],
+            "capabilities":request["capabilities"],"heartbeat_interval_seconds":3600,
+            "protocol_version":"1.20","server_capabilities":{"cooperative_cancellation":true}});
+        match case {
+            "register-old-protocol" => reply["protocol_version"] = json!("1.19"),
+            "register-wrong-major" => reply["protocol_version"] = json!("2.0"),
+            "register-malformed-protocol" => reply["protocol_version"] = json!("1.20garbage"),
+            "register-missing-protocol" => {
+                reply.as_object_mut().unwrap().remove("protocol_version");
+            }
+            "register-unsupported" | "register-cleanup-refused" => {
+                reply["server_capabilities"]["cooperative_cancellation"] = json!(false)
+            }
+            "register-string-support" => {
+                reply["server_capabilities"]["cooperative_cancellation"] = json!("true")
+            }
+            "register-missing-support" => reply["server_capabilities"] = json!({}),
+            "register-wrong-worker" => reply["worker_id"] = json!("other-worker"),
+            "register-wrong-namespace" => reply["namespace"] = json!("other-namespace"),
+            "register-wrong-queue" => reply["task_queue"] = json!("other-queue"),
+            "register-missing-capability" => {
+                reply["capabilities"] = json!(["cooperative_cancellation"])
+            }
+            "register-no-cooperative" => reply["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|value| value != "cooperative_cancellation"),
+            "register-declined" => reply["registered"] = json!(false),
+            "register-newer" => reply["protocol_version"] = json!("1.21"),
+            "register-replaced" if number >= 2 => reply["worker_id"] = json!("replacement"),
+            _ => {}
+        }
+        return Some(("200 OK", reply.to_string()));
     }
     if path.ends_with("/worker/heartbeat") {
         return Some(("200 OK", json!({}).to_string()));
     }
     if path.ends_with("/worker/registrations/actual-owner") {
+        if case == "register-cleanup-refused" {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_unavailable"}).to_string(),
+            ));
+        }
         return Some(("200 OK", json!({"worker_id":"actual-owner","outcome":"deregistered","recovered_workflow_task_count":1}).to_string()));
     }
     if path.ends_with("/activity-tasks/poll") {
@@ -2100,6 +2136,195 @@ fn remote_activity_server() -> MockWorkerServer {
         request_override: Some(remote_activity_responses),
         ..Default::default()
     })
+}
+
+#[tokio::test]
+async fn cooperative_registration_uses_explicit_protocol_and_preserves_other_clients() {
+    for case in ["register-valid", "register-newer"] {
+        let server = remote_activity_server();
+        let original = client(&server, case);
+        let worker = Worker::new(original.clone(), "queue")
+            .worker_id("actual-owner")
+            .cooperative_cancellation(true);
+        let registration = worker.register().await.unwrap();
+        assert!(registration.registered);
+        assert!(worker
+            .cooperative_registration_confirmed
+            .load(Ordering::SeqCst));
+        original
+            .poll_activity_task("actual-owner", "queue", Duration::ZERO)
+            .await
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].worker_protocol.as_deref(), Some("1.20"));
+        assert_eq!(requests[1].worker_protocol.as_deref(), Some("1.19"));
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer worker-only")
+        );
+        assert_eq!(requests[0].namespace.as_deref(), Some("caller-namespace"));
+        let body: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert!(body["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("cooperative_cancellation")));
+        assert_eq!(
+            body["capability_manifest"],
+            portable_worker_affinity_capability_manifest()
+        );
+    }
+}
+
+#[tokio::test]
+async fn cooperative_registration_refuses_incompatible_receipts_before_polling() {
+    for case in [
+        "register-old-protocol",
+        "register-wrong-major",
+        "register-malformed-protocol",
+        "register-missing-protocol",
+        "register-unsupported",
+        "register-string-support",
+        "register-missing-support",
+        "register-wrong-worker",
+        "register-wrong-namespace",
+        "register-wrong-queue",
+        "register-missing-capability",
+        "register-no-cooperative",
+        "register-declined",
+    ] {
+        let server = remote_activity_server();
+        let worker = coordinator_worker(&server, case);
+        assert!(
+            matches!(
+                worker.register().await,
+                Err(Error::CooperativeCancellationUnavailable(_))
+            ),
+            "{case}"
+        );
+        assert!(
+            matches!(
+                worker.run_once().await,
+                Err(Error::CooperativeCancellationUnavailable(_))
+            ),
+            "{case}"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            if matches!(case, "register-wrong-worker" | "register-declined") {
+                1
+            } else {
+                2
+            },
+            "{case}"
+        );
+        assert!(requests[0].path.ends_with("/register"));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.ends_with("/poll")),
+            "{case}"
+        );
+        if requests.len() > 1 {
+            assert_eq!(requests[1].method, "DELETE");
+            assert!(requests[1].path.ends_with("/registrations/actual-owner"));
+            assert_eq!(requests[1].worker_protocol.as_deref(), Some("1.20"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cooperative_registration_preserves_cleanup_failure_and_requires_registration() {
+    let server = remote_activity_server();
+    let worker = coordinator_worker(&server, "register-cleanup-refused");
+    assert!(matches!(
+        worker.run_once().await,
+        Err(Error::CooperativeCancellationUnavailable(_))
+    ));
+    assert!(server.requests.lock().unwrap().is_empty());
+    let error = worker.register().await.unwrap_err();
+    assert!(
+        matches!(error, Error::WorkerShutdown {primary, deregistration}
+        if matches!(*primary, Error::CooperativeCancellationUnavailable(_))
+        && matches!(*deregistration, Error::Http { status, .. } if status.as_u16() == 503))
+    );
+    assert!(!worker
+        .cooperative_registration_confirmed
+        .load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn cooperative_registration_refusal_invalidates_previous_confirmation_and_changed_identity() {
+    let server = remote_activity_server();
+    let worker = coordinator_worker(&server, "register-replaced");
+    worker.register().await.unwrap();
+    assert!(worker
+        .cooperative_registration_confirmed
+        .load(Ordering::SeqCst));
+    assert!(matches!(
+        worker.register().await,
+        Err(Error::CooperativeCancellationUnavailable(_))
+    ));
+    assert!(matches!(
+        worker.run_once().await,
+        Err(Error::CooperativeCancellationUnavailable(_))
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+
+    let worker = coordinator_worker(&server, "register-valid");
+    worker.register().await.unwrap();
+    let changed = worker.worker_id("replacement");
+    assert!(matches!(
+        changed.run_once().await,
+        Err(Error::CooperativeCancellationUnavailable(_))
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn cooperative_registration_default_and_disabled_workers_keep_ordinary_protocol() {
+    for explicit in [false, true] {
+        let server = remote_activity_server();
+        let worker =
+            Worker::new(client(&server, "register-valid"), "queue").worker_id("actual-owner");
+        let worker = if explicit {
+            worker
+                .cooperative_cancellation(true)
+                .cooperative_cancellation(false)
+        } else {
+            worker
+        };
+        worker.register().await.unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests[0].worker_protocol.as_deref(), Some("1.19"));
+        let body: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert!(!body["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("cooperative_cancellation")));
+    }
+}
+
+#[tokio::test]
+async fn cooperative_registration_requires_only_worker_credentials() {
+    let server = remote_activity_server();
+    let client = Client::builder(format!("{}/register-valid", server.base_url()))
+        .worker_token(Some("worker-only".into()))
+        .namespace("caller-namespace")
+        .build()
+        .unwrap();
+    let worker = Worker::new(client, "queue")
+        .worker_id("actual-owner")
+        .cooperative_cancellation(true);
+    worker.register().await.unwrap();
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer worker-only")
+    );
+    assert!(requests[0].control_protocol.is_none());
 }
 
 struct PendingActivityCallback(Arc<AtomicBool>);
@@ -2606,8 +2831,9 @@ fn coordinator_server() -> MockWorkerServer {
 }
 
 fn coordinator_worker(server: &MockWorkerServer, case: &str) -> Worker {
-    let mut worker = Worker::new(client(server, case), "queue").worker_id("actual-owner");
-    worker.cooperative_cancellation_enabled = true;
+    let mut worker = Worker::new(client(server, case), "queue")
+        .worker_id("actual-owner")
+        .cooperative_cancellation(true);
     worker.poll_timeout = Duration::ZERO;
     worker.retry_policy = WorkerRetryPolicy {
         max_retries: 1,

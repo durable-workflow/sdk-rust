@@ -922,7 +922,7 @@ impl WorkflowContext {
     }
 }
 
-fn supports_protocol(version: &str) -> bool {
+pub(super) fn supports_protocol(version: &str) -> bool {
     let Some((major, minor)) = version.split_once('.') else {
         return false;
     };

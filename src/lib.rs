@@ -2652,6 +2652,7 @@ pub struct Client {
     namespace: String,
     max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
+    cooperative_worker_protocol: bool,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
 }
 
@@ -3570,13 +3571,51 @@ impl Client {
             body["workflow_definition_fingerprints"] = json!(fingerprints);
         }
 
-        self.request_json(
-            reqwest::Method::POST,
-            "/worker/register",
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-            Some(&body),
-        )
-        .await
+        let response: Value = self
+            .request_json(
+                reqwest::Method::POST,
+                "/worker/register",
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await?;
+        if self.cooperative_worker_protocol {
+            let compatible = response["registered"].as_bool() == Some(true)
+                && response["worker_id"].as_str() == Some(worker_id)
+                && response["namespace"].as_str() == Some(self.namespace.as_str())
+                && response["task_queue"].as_str() == Some(task_queue)
+                && response["protocol_version"]
+                    .as_str()
+                    .is_some_and(cooperative_cancellation::supports_protocol)
+                && response["server_capabilities"]["cooperative_cancellation"].as_bool()
+                    == Some(true)
+                && response["capabilities"].as_array().is_some_and(|accepted| {
+                    capabilities.iter().all(|capability| {
+                        accepted
+                            .iter()
+                            .any(|value| value.as_str() == Some(capability.as_str()))
+                    })
+                });
+            if !compatible {
+                let error = Error::CooperativeCancellationUnavailable(
+                    "registration must acknowledge this namespace, queue, worker, capabilities and compatible runtime protocol 1.20".into(),
+                );
+                if response["registered"].as_bool() == Some(true)
+                    && response["worker_id"].as_str() == Some(worker_id)
+                {
+                    if let Err(deregistration) =
+                        self.deregister_worker_registration(worker_id).await
+                    {
+                        return Err(Error::WorkerShutdown {
+                            primary: Box::new(error),
+                            deregistration: Box::new(deregistration),
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Gracefully remove one worker's registration through the worker plane.
@@ -4152,6 +4191,18 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        let protocol = match protocol {
+            RequestProtocol::Worker(version)
+                if self.cooperative_worker_protocol
+                    && version
+                        .strip_prefix("1.")
+                        .and_then(|minor| minor.parse::<u64>().ok())
+                        .is_some_and(|minor| minor < 20) =>
+            {
+                RequestProtocol::Worker("1.20")
+            }
+            protocol => protocol,
+        };
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
             .http
@@ -4901,6 +4952,7 @@ impl ClientBuilder {
             namespace: self.namespace,
             max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
+            cooperative_worker_protocol: false,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
         })
     }
@@ -6170,8 +6222,8 @@ pub struct Worker {
     heartbeat_interval: Duration,
     retry_policy: WorkerRetryPolicy,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
-    // Registration and callback lifetime qualification must precede activation.
     cooperative_cancellation_enabled: bool,
+    cooperative_registration_confirmed: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -6191,11 +6243,13 @@ impl Worker {
             retry_policy: WorkerRetryPolicy::default(),
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
+            cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = worker_id.into();
+        self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -6206,6 +6260,22 @@ impl Worker {
 
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Opt in to separate cooperative workflow cancellation requests.
+    ///
+    /// Registration requires the Server to acknowledge this exact worker,
+    /// namespace, queue and capabilities with compatible protocol 1.20. Task
+    /// processing uses canonical delivery and activity ownership fences.
+    /// Existing terminal cancel and terminate operations remain terminal.
+    /// The default is disabled, preserving ordinary protocol 1.19 workers.
+    /// Call [`Worker::register`] before [`Worker::run_once`]. [`Worker::run`]
+    /// and [`Worker::run_until`] register automatically.
+    pub fn cooperative_cancellation(mut self, enabled: bool) -> Self {
+        self.cooperative_cancellation_enabled = enabled;
+        self.client.cooperative_worker_protocol = enabled;
+        self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -6788,7 +6858,10 @@ impl Worker {
             );
         }
 
-        self.client
+        self.cooperative_registration_confirmed
+            .store(false, Ordering::SeqCst);
+        let response = self
+            .client
             .register_worker_with_definition_fingerprints(
                 &self.worker_id,
                 &self.task_queue,
@@ -6801,6 +6874,8 @@ impl Worker {
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
+                    self.cooperative_cancellation_enabled
+                        .then(|| "cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
                     worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
@@ -6822,7 +6897,12 @@ impl Worker {
                         .collect(),
                 ),
             )
-            .await
+            .await?;
+        if self.cooperative_cancellation_enabled && response.registered {
+            self.cooperative_registration_confirmed
+                .store(true, Ordering::SeqCst);
+        }
+        Ok(response)
     }
 
     /// Run until shutdown or a terminal worker error occurs.
@@ -6875,6 +6955,8 @@ impl Worker {
         }
         let registered_worker_id = registration.worker_id.clone();
         let primary = self.run_registered_until(stop, registration).await;
+        self.cooperative_registration_confirmed
+            .store(false, Ordering::SeqCst);
         let deregistration = self
             .client
             .deregister_worker_registration(&registered_worker_id)
@@ -7040,6 +7122,15 @@ impl Worker {
     /// Direct callers of [`Client::complete_workflow_task`] continue to receive
     /// the original [`Error::Http`] status and response body.
     pub async fn run_once(&self) -> Result<usize> {
+        if self.cooperative_cancellation_enabled
+            && !self
+                .cooperative_registration_confirmed
+                .load(Ordering::SeqCst)
+        {
+            return Err(Error::CooperativeCancellationUnavailable(
+                "register this cooperative worker before polling tasks".into(),
+            ));
+        }
         let worker = self.with_storage_admission(Arc::new(AtomicBool::new(false)));
         let mut handled = 0;
         match worker.poll_workflow_once().await? {
