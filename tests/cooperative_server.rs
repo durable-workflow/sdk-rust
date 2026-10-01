@@ -312,7 +312,7 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
         .max_concurrent_activity_tasks(1)
         .poll_timeout(Duration::from_secs(1))
         .on_worker_heartbeat(move |observation| {
-            if observation.acknowledgement.acknowledged {
+            if observation.acknowledgement["acknowledged"] == true {
                 let _ = heartbeat_tx.send(());
             }
         });
