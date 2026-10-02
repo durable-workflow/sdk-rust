@@ -71,6 +71,12 @@ cancellation. It requires a finite positive `schedule_to_close_timeout` and
 keeps that original deadline as its total lifetime. It does not extend the
 parent's cleanup budget.
 
+The opted-in managed worker runs at most `max_concurrent_activity_tasks`
+callbacks concurrently and joins all slots before deregistration. Reserve an
+available activity slot for remote cleanup when independent Abandon work uses
+the same worker. Workflow polling continues independently. Default protocol
+1.19 workers retain their existing serial activity loop.
+
 Explicit policies require cooperative worker opt-in, protocol 1.20 and a
 compatible installed backend. Unsupported workers identify their operation,
 identity and required protocol before submission. Server also checks the

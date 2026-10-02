@@ -31,7 +31,9 @@ use std::{
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
-use futures_util::{future::OptionFuture, task::noop_waker_ref};
+use futures_util::{
+    future::OptionFuture, stream::FuturesUnordered, task::noop_waker_ref, StreamExt,
+};
 use serde::{
     de::DeserializeOwned,
     ser::{SerializeMap, SerializeSeq},
@@ -7414,14 +7416,43 @@ impl Worker {
     }
 
     async fn poll_activities_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
-        while !stop.load(Ordering::SeqCst) {
-            if self.poll_activity_once().await? == ManagedPollOutcome::Stop {
-                stop.store(true, Ordering::SeqCst);
-                break;
+        // Each lane retains its leased response through callback settlement.
+        // A bounded independent activity must not occupy the cleanup lane too.
+        // Preserve the existing serial loop for default protocol 1.19 workers.
+        let lane_count = if self.cooperative_cancellation_enabled {
+            self.max_concurrent_activity_tasks
+        } else {
+            1
+        };
+        let mut lanes = FuturesUnordered::new();
+        for _ in 0..lane_count {
+            let worker = self.clone();
+            let stop = Arc::clone(&stop);
+            lanes.push(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    match worker.poll_activity_once().await {
+                        Ok(ManagedPollOutcome::Stop) => {
+                            stop.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(error) => {
+                            stop.store(true, Ordering::SeqCst);
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            });
+        }
+        // Join every lane before deregistration, including after one fails.
+        let mut first_error = None;
+        while let Some(result) = lanes.next().await {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
-
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {

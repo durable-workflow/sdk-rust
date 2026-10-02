@@ -2389,7 +2389,7 @@ fn remote_activity_responses(
         return Some(("200 OK", json!({"worker_id":"actual-owner","outcome":"deregistered","recovered_workflow_task_count":1}).to_string()));
     }
     if path.ends_with("/activity-tasks/poll") {
-        if number > 1 {
+        if number > if case == "remote-concurrency" { 3 } else { 1 } {
             return Some((
                 "200 OK",
                 json!({"task":null,"poll_status":"timeout"}).to_string(),
@@ -2397,6 +2397,10 @@ fn remote_activity_responses(
         }
         let mut task = json!({"task_id":"activity","activity_attempt_id":"attempt-original",
             "activity_type":"work","payload_codec":"avro","lease_owner":"actual-owner","attempt_number":3});
+        if case == "remote-concurrency" {
+            task["task_id"] = json!(format!("activity-{number}"));
+            task["activity_attempt_id"] = json!(format!("attempt-{number}"));
+        }
         match case {
             "remote-missing-owner" => {
                 task.as_object_mut().unwrap().remove("lease_owner");
@@ -2435,6 +2439,9 @@ fn remote_activity_responses(
             "can_continue":true,"cancel_requested":false,"reason":null,"heartbeat_recorded":false,
             "lease_expires_at":"2099-01-01T00:00:00Z","deadlines":null,"worker_session":null,
             "task_status":"leased","attempt_status":"running","activity_status":"running"});
+        if case == "remote-concurrency" {
+            reply["task_id"] = json!(path.rsplit('/').nth(1).unwrap());
+        }
         match case {
             "remote-wrong-task" => reply["task_id"] = json!("other-task"),
             "remote-wrong-attempt" => reply["activity_attempt_id"] = json!("other-attempt"),
@@ -3278,6 +3285,97 @@ async fn cooperative_activity_dropped_poll_future_abandons_cloned_context() {
         Err(Error::ActivityExecutionAbandoned(_))
     ));
     assert_eq!(server.requests.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn cooperative_activity_concurrency_reuses_slots_and_stops_before_deregistering() {
+    struct ActiveCallback(Arc<AtomicUsize>);
+    impl Drop for ActiveCallback {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let server = remote_activity_server();
+    let mut worker =
+        coordinator_worker(&server, "remote-concurrency").max_concurrent_activity_tasks(2);
+    let active = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let callbacks = Arc::clone(&active);
+    let permits = Arc::clone(&release);
+    worker.register_activity("work", move |ctx, _| {
+        let callbacks = Arc::clone(&callbacks);
+        let permits = Arc::clone(&permits);
+        let entered_tx = entered_tx.clone();
+        async move {
+            callbacks.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveCallback(callbacks);
+            entered_tx.send(ctx.task_id).unwrap();
+            permits.acquire().await.unwrap().forget();
+            Ok(Value::Null)
+        }
+    });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        worker
+            .run_until(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let mut entered = Vec::new();
+    for _ in 0..2 {
+        entered.push(
+            tokio::time::timeout(Duration::from_secs(3), entered_rx.recv())
+                .await
+                .expect("both configured slots must start callbacks")
+                .unwrap(),
+        );
+    }
+    assert_eq!(active.load(Ordering::SeqCst), 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), entered_rx.recv())
+            .await
+            .is_err(),
+        "a third callback cannot exceed the configured capacity"
+    );
+    release.add_permits(1);
+    entered.push(
+        tokio::time::timeout(Duration::from_secs(3), entered_rx.recv())
+            .await
+            .expect("a settled callback must release its slot")
+            .unwrap(),
+    );
+    entered.sort();
+    assert_eq!(entered, ["activity-1", "activity-2", "activity-3"]);
+    assert_eq!(active.load(Ordering::SeqCst), 2);
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        active.load(Ordering::SeqCst),
+        0,
+        "shutdown must drop all managed callbacks"
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with("/registrations/actual-owner"))
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .path
+            .ends_with("/registrations/actual-owner"),
+        "all lanes must stop before deregistration"
+    );
 }
 
 fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
