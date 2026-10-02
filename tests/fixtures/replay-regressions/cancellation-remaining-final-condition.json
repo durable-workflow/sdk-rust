@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-cancellation-remaining-final-condition",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.cancellation-remaining-condition", "input": [], "payload_codec": "avro"},
+  "history": [
+    {
+      "event_type": "CooperativeCancellationRequested", "recorded_at": "2026-10-01T00:00:00.123456Z",
+      "payload": {
+        "workflow_command_id": "original-request", "workflow_run_id": "regression-corpus-run",
+        "cleanup_deadline_at": "2026-10-01T00:00:30.123456Z",
+        "cancellation": {
+          "schema": "durable-workflow.cancellation-context/v1",
+          "request_id": "original-request", "root_request_id": "original-request",
+          "root_workflow_instance_id": "regression-corpus-rust-cancellation-remaining-final-condition",
+          "root_workflow_run_id": "regression-corpus-run", "parent_request_id": null,
+          "reason": null, "requester": {"type": "operator", "id": "fixture-operator"}, "source": "control_plane",
+          "requested_at": "2026-10-01T00:00:00.123456Z", "cleanup_deadline_at": "2026-10-01T00:00:30.123456Z",
+          "lineage": [{"request_id": "original-request", "workflow_instance_id": "regression-corpus-rust-cancellation-remaining-final-condition", "workflow_run_id": "regression-corpus-run"}]
+        }
+      }
+    },
+    {
+      "event_type": "CooperativeCancellationDelivered", "timestamp": "2026-10-01T00:00:08Z",
+      "payload": {"workflow_command_id": "original-request", "workflow_run_id": "regression-corpus-run", "sequence": 1, "call_kind": "timer"}
+    },
+    {
+      "event_type": "TimerScheduled",
+      "payload": {"sequence": 2, "timer_id": "timer-2", "delay_seconds": 1, "parallel_group_id": "parallel-calls:2:2", "parallel_group_kind": "mixed", "parallel_group_base_sequence": 2, "parallel_group_size": 2, "parallel_group_index": 0}
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {"sequence": 3, "condition_wait_id": "condition-3", "condition_wait_occurrence_id": "rust:condition-wait:0", "condition_key": "ready", "condition_definition_fingerprint": "sha256:ready", "parallel_group_id": "parallel-calls:2:2", "parallel_group_kind": "mixed", "parallel_group_base_sequence": 2, "parallel_group_size": 2, "parallel_group_index": 1}
+    },
+    {
+      "event_type": "ConditionWaitSatisfied", "timestamp": "2026-10-01T00:00:12Z",
+      "payload": {"sequence": 3, "condition_wait_id": "condition-3", "condition_wait_occurrence_id": "rust:condition-wait:0", "condition_key": "ready", "condition_definition_fingerprint": "sha256:ready", "parallel_group_id": "parallel-calls:2:2", "parallel_group_kind": "mixed", "parallel_group_base_sequence": 2, "parallel_group_size": 2, "parallel_group_index": 1}
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {"sequence": 4, "condition_wait_id": "condition-4", "condition_wait_occurrence_id": "rust:condition-wait:0", "condition_key": "ready", "condition_definition_fingerprint": "sha256:ready", "parallel_group_id": "parallel-calls:2:2", "parallel_group_kind": "mixed", "parallel_group_base_sequence": 2, "parallel_group_size": 2, "parallel_group_index": 1}
+    },
+    {
+      "event_type": "ConditionWaitSatisfied", "timestamp": "2026-10-01T00:00:25Z",
+      "payload": {"sequence": 4, "condition_wait_id": "condition-4", "condition_wait_occurrence_id": "rust:condition-wait:0", "condition_key": "ready", "condition_definition_fingerprint": "sha256:ready", "parallel_group_id": "parallel-calls:2:2", "parallel_group_kind": "mixed", "parallel_group_base_sequence": 2, "parallel_group_size": 2, "parallel_group_index": 1}
+    },
+    {
+      "event_type": "TimerFired", "timestamp": "2026-10-01T00:00:10Z",
+      "payload": {"sequence": 2, "timer_id": "timer-2", "delay_seconds": 1, "parallel_group_id": "parallel-calls:2:2", "parallel_group_kind": "mixed", "parallel_group_base_sequence": 2, "parallel_group_size": 2, "parallel_group_index": 0}
+    }
+  ],
+  "command_sequence": [{"type": "complete_workflow", "result": 5.123456}],
+  "expected": {"type": "complete_workflow", "result": 5.123456}
+}

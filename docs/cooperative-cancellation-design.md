@@ -13,6 +13,23 @@ after committed authored cancellation delivery. Earlier workflow code receives
 snapshot in `request.context`. Poll and heartbeat observations do not supply
 workflow-facing context, even when their transport object contains extra fields.
 
+`CancellationContext::remaining()` returns a `Result<Duration>` from the original
+deadline and the recorded blocking boundary consumed by this workflow replay.
+Committed delivery starts the clock. Activity/child results, timer fires, signal
+and condition resolutions advance it. Parallel groups use their consumed
+members and exclude results later than the failure returned to workflow code.
+Selection uses its committed winner marker, then the result or first cancellation
+receipt of a handle that workflow code actually awaits. Synchronous side effects,
+version markers, memo and search attributes preserve the same budget before and
+after persistence. Recorded clock skew cannot increase the budget, microseconds
+are preserved, and expiry returns zero.
+
+The helper reads no host clock and cannot renew a deadline. Contexts restored
+from portable metadata, ended or unrelated workflow replays, and missing or
+invalid committed timestamps return an explicit error. A weak replay binding
+does not keep workflow history alive. The Server independently enforces the
+original deadline while a worker is suspended or absent.
+
 `CancellationContext` and `CancellationLineage` expose read-only accessors.
 Metadata includes local and root request IDs, root workflow instance and run IDs,
 the immediate parent request ID, original reason, requester/source, root request
@@ -131,11 +148,11 @@ publication.
 
 ## Remaining qualification
 
-Portable activity policies, nested scopes and deterministic remaining-time
-helpers still need completion. Remaining time must use the replayed workflow
-clock. Do not subtract the host clock from the deadline in workflow code. The
-runtime continues enforcing the original deadline and fencing task and activity
-ownership. Rust local activities and worker affinity remain unsupported.
+Nested scopes, competitive qualification and exact published artifacts still
+need completion. The remaining-time helper needs connected exact-head
+qualification. Do not subtract the host clock from the deadline in workflow code.
+The runtime continues enforcing the original deadline and fencing task and
+activity ownership. Rust local activities and worker affinity remain unsupported.
 
 Connected qualification must cover the PHP parent, Python child, Rust remote
 activity and PHP local activity together. Both callbacks must stop without

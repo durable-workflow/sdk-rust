@@ -905,14 +905,21 @@ impl WorkflowState {
         Ok(())
     }
 
-    pub(super) fn cancellation_error(&self) -> Error {
+    pub(super) fn cancellation_error(&mut self) -> Error {
+        if self.cancellation_consumed {
+            self.start_cancellation_clock();
+        }
         match (
             &self.cancellation_history.request,
             &self.cancellation_history.delivery,
         ) {
             (Some(request), Some(delivery)) => {
+                let mut request = request.clone();
+                request.context = request.context.map(|context| {
+                    context.with_replay(cancellation_replay_clock::active_binding())
+                });
                 Error::CooperativeCancellationRequested(CooperativeCancellationRequested {
-                    request: request.clone(),
+                    request,
                     delivery: delivery.clone(),
                 })
             }
@@ -1034,6 +1041,7 @@ impl WorkflowContext {
                 .request
                 .as_ref()
                 .and_then(|request| request.context.clone())
+                .map(|context| context.with_replay(Some(Arc::downgrade(&self.state))))
         } else {
             None
         })

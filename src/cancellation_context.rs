@@ -1,5 +1,6 @@
 use super::*;
 use chrono::{SecondsFormat, Utc};
+use std::sync::Weak;
 
 /// One immutable local request in the ordered cancellation lineage.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +36,7 @@ impl CancellationLineage {
 ///
 /// Fields and nested metadata have read-only accessors. Descendants retain
 /// the original root identity, request time and cleanup budget.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CancellationContext {
     request_id: String,
     root_request_id: String,
@@ -48,7 +49,26 @@ pub struct CancellationContext {
     requested_at: DateTime<Utc>,
     cleanup_deadline_at: DateTime<Utc>,
     lineage: Vec<CancellationLineage>,
+    replay: Option<Weak<Mutex<WorkflowState>>>,
 }
+
+impl PartialEq for CancellationContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.root_request_id == other.root_request_id
+            && self.root_workflow_instance_id == other.root_workflow_instance_id
+            && self.root_workflow_run_id == other.root_workflow_run_id
+            && self.parent_request_id == other.parent_request_id
+            && self.reason == other.reason
+            && self.requester == other.requester
+            && self.source == other.source
+            && self.requested_at == other.requested_at
+            && self.cleanup_deadline_at == other.cleanup_deadline_at
+            && self.lineage == other.lineage
+    }
+}
+
+impl Eq for CancellationContext {}
 
 fn invalid_context(message: &str) -> Error {
     Error::InvalidCooperativeCancellation(message.to_owned())
@@ -164,6 +184,7 @@ impl CancellationContext {
             requested_at,
             cleanup_deadline_at,
             lineage: normalized,
+            replay: None,
         })
     }
 
@@ -196,6 +217,33 @@ impl CancellationContext {
     }
     pub fn deadline(&self) -> DateTime<Utc> {
         self.cleanup_deadline_at
+    }
+
+    /// Remaining cleanup budget at the last blocking result consumed by this replay.
+    ///
+    /// Never reads host time. Detached metadata, an ended replay, and a missing or
+    /// invalid committed timestamp return an explicit error. Expiry returns zero.
+    pub fn remaining(&self) -> Result<Duration> {
+        let state = self
+            .replay
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(cancellation_replay_clock::is_active)
+            .ok_or_else(|| {
+                invalid_context("remaining() is available only in its active workflow replay")
+            })?;
+        let time = state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .cancellation_time()?;
+        Ok((self.cleanup_deadline_at - time)
+            .to_std()
+            .unwrap_or(Duration::ZERO))
+    }
+
+    pub(super) fn with_replay(mut self, replay: Option<Weak<Mutex<WorkflowState>>>) -> Self {
+        self.replay = replay;
+        self
     }
     pub fn lineage(&self) -> &[CancellationLineage] {
         &self.lineage

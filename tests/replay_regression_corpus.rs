@@ -408,6 +408,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.condition-search"
             | "corpus.condition-search-adjacent"
             | "corpus.grouped-condition-reopen"
+            | "corpus.cancellation-remaining-condition"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
             | "corpus.redrive-boundary"
@@ -539,6 +540,24 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                         .map(|message| message.message_id)
                         .collect::<Vec<_>>(),
                 ]))
+            });
+        }
+        "corpus.cancellation-remaining-condition" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let _ = ctx.sleep(Duration::from_secs(10)).await;
+                let context = ctx
+                    .cancellation_context()?
+                    .expect("committed rich cancellation");
+                let _shield = ctx.cancellation_shield()?;
+                ctx.parallel(vec![
+                    ParallelOperation::timer(Duration::from_secs(1)),
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("ready", "sha256:ready"),
+                        || Ok(false),
+                    ),
+                ])
+                .await?;
+                Ok(json!(context.remaining()?.as_secs_f64()))
             });
         }
         "corpus.grouped-condition-reopen" => {

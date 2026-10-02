@@ -43,6 +43,464 @@ fn context_task(events: Vec<HistoryEvent>) -> WorkflowTask {
     task
 }
 
+fn remaining_delivery() -> HistoryEvent {
+    let mut delivery = context_delivery();
+    delivery
+        .raw
+        .insert("timestamp".into(), json!("2026-10-01T00:00:08Z"));
+    delivery
+}
+
+fn remaining_event(kind: &str, payload: Value, time: &str) -> HistoryEvent {
+    let mut result = event(kind, payload);
+    result.raw.insert("timestamp".into(), json!(time));
+    result
+}
+
+#[test]
+fn cancellation_remaining_preserves_memo_decision_and_consumes_the_timer_on_cold_replay() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _| async move {
+        let Err(Error::CooperativeCancellationRequested(cancelled)) =
+            ctx.sleep(Duration::from_secs(10)).await
+        else {
+            panic!("expected delivery");
+        };
+        let context = cancelled.request.context.unwrap();
+        assert_eq!(context.remaining()?, Duration::new(22, 123456000));
+        assert_eq!(
+            ctx.cancellation_context()?.unwrap().remaining()?,
+            context.remaining()?
+        );
+        assert_eq!(
+            CancellationContext::from_value(&context.to_value())?,
+            context
+        );
+        let _shield = ctx.cancellation_shield()?;
+        ctx.upsert_memo(json!({"phase": "cleanup"}))?;
+        let delay = if context.remaining()? == Duration::new(22, 123456000) {
+            1
+        } else {
+            2
+        };
+        ctx.sleep(Duration::from_secs(delay)).await?;
+        Ok(json!(context.remaining()?.as_secs_f64()))
+    });
+    let initial = vec![context_request(), remaining_delivery()];
+    let commands = worker
+        .execute_workflow_task(context_task(initial.clone()))
+        .unwrap();
+    assert_eq!(commands[0]["type"], "upsert_memo");
+    assert_eq!(commands[1]["delay_seconds"], 1);
+    let mut history = initial;
+    history.push(remaining_event(
+        "MemoUpserted",
+        json!({"sequence":2,"entries":commands[0]["entries"],"merged":commands[0]["entries"]}),
+        "2026-10-01T00:00:12Z",
+    ));
+    history.push(event(
+        "TimerScheduled",
+        json!({"sequence":3,"timer_id":"cleanup-timer","delay_seconds":1}),
+    ));
+    // A later unrelated row must not move an earlier application decision.
+    history.push(remaining_event(
+        "WorkflowTaskScheduled",
+        json!({}),
+        "2026-10-01T00:00:29Z",
+    ));
+    assert!(worker
+        .execute_workflow_task(context_task(history.clone()))
+        .unwrap()
+        .is_empty());
+    history.push(remaining_event(
+        "TimerFired",
+        json!({"sequence":3,"timer_id":"cleanup-timer","delay_seconds":1}),
+        "2026-10-01T00:00:25Z",
+    ));
+    for _restart in 0..2 {
+        let commands = worker
+            .execute_workflow_task(context_task(history.clone()))
+            .unwrap();
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+            json!(5.123456)
+        );
+    }
+}
+
+#[test]
+fn cancellation_remaining_parallel_excludes_later_failure_siblings_and_keeps_skew_monotonic() {
+    for failed in [true, false] {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _| async move {
+            let Err(Error::CooperativeCancellationRequested(cancelled)) =
+                ctx.sleep(Duration::from_secs(10)).await
+            else {
+                panic!("expected delivery");
+            };
+            let context = cancelled.request.context.unwrap();
+            let _shield = ctx.cancellation_shield()?;
+            let outcome = ctx
+                .parallel(vec![
+                    ParallelOperation::activity("a", json!([])),
+                    ParallelOperation::activity("b", json!([])),
+                ])
+                .await;
+            Ok(json!({"failed":outcome.is_err(),"remaining":context.remaining()?.as_secs_f64()}))
+        });
+        let mut history = vec![context_request(), remaining_delivery()];
+        let commands = worker
+            .execute_workflow_task(context_task(history.clone()))
+            .unwrap();
+        let mut payloads = Vec::new();
+        for (offset, command) in commands.iter().enumerate() {
+            let mut payload = command.clone();
+            payload.as_object_mut().unwrap().remove("type");
+            payload["sequence"] = json!(2 + offset);
+            history.push(event("ActivityScheduled", payload.clone()));
+            payloads.push(payload);
+        }
+        if failed {
+            payloads[0]["message"] = json!("failed");
+            payloads[0]["exception_type"] = json!("ExampleFailure");
+            history.push(remaining_event(
+                "ActivityFailed",
+                payloads[0].clone(),
+                "2026-10-01T00:00:12Z",
+            ));
+            payloads[1]["result"] = fixture_envelope(Value::Null);
+            history.push(remaining_event(
+                "ActivityCompleted",
+                payloads[1].clone(),
+                "2026-10-01T00:00:25Z",
+            ));
+        } else {
+            for (offset, time) in ["2026-10-01T00:00:25Z", "2026-10-01T00:00:20Z"]
+                .into_iter()
+                .enumerate()
+            {
+                payloads[offset]["result"] = fixture_envelope(Value::Null);
+                history.push(remaining_event(
+                    "ActivityCompleted",
+                    payloads[offset].clone(),
+                    time,
+                ));
+            }
+        }
+        for _restart in 0..2 {
+            let commands = worker
+                .execute_workflow_task(context_task(history.clone()))
+                .unwrap();
+            assert_eq!(
+                decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+                json!({"failed":failed,"remaining":if failed {18.123456} else {5.123456}})
+            );
+        }
+    }
+}
+
+#[test]
+fn cancellation_remaining_refuses_detached_ended_and_missing_or_invalid_delivery_time() {
+    assert!(CancellationContext::from_value(&context_snapshot())
+        .unwrap()
+        .remaining()
+        .is_err());
+    for time in [
+        Value::Null,
+        json!("tomorrow"),
+        json!("2026-02-30T00:00:08Z"),
+        json!("2026-10-01T00:00:08"),
+    ] {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _| async move {
+            let Err(Error::CooperativeCancellationRequested(cancelled)) =
+                ctx.sleep(Duration::from_secs(10)).await
+            else {
+                panic!("expected delivery");
+            };
+            assert!(cancelled.request.context.unwrap().remaining().is_err());
+            Ok(Value::Null)
+        });
+        let mut delivery = context_delivery();
+        delivery.raw.insert("timestamp".into(), time);
+        assert_eq!(
+            worker
+                .execute_workflow_task(context_task(vec![context_request(), delivery]))
+                .unwrap()[0]["type"],
+            "complete_workflow"
+        );
+    }
+    let captured = Arc::new(Mutex::new(None));
+    let capture = captured.clone();
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", move |ctx, _| {
+        let capture = capture.clone();
+        async move {
+            let Err(Error::CooperativeCancellationRequested(cancelled)) =
+                ctx.sleep(Duration::from_secs(10)).await
+            else {
+                panic!("expected delivery");
+            };
+            let context = cancelled.request.context.unwrap();
+            assert_eq!(context.remaining()?, Duration::new(22, 123456000));
+            *capture.lock().unwrap() = Some(context);
+            Ok(Value::Null)
+        }
+    });
+    worker
+        .execute_workflow_task(context_task(vec![context_request(), remaining_delivery()]))
+        .unwrap();
+    assert!(captured
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .remaining()
+        .is_err());
+}
+
+#[test]
+fn cancellation_remaining_refuses_missing_consumed_result_and_clamps_expiry_with_timezone_offsets()
+{
+    for time in [None, Some("2026-10-01T08:00:32+08:00")] {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _| async move {
+            let Err(Error::CooperativeCancellationRequested(cancelled)) =
+                ctx.sleep(Duration::from_secs(10)).await
+            else {
+                panic!("expected delivery");
+            };
+            let context = cancelled.request.context.unwrap();
+            let _shield = ctx.cancellation_shield()?;
+            ctx.sleep(Duration::from_secs(1)).await?;
+            Ok(json!(context
+                .remaining()
+                .map(|remaining| remaining.as_secs_f64())
+                .ok()))
+        });
+        let mut fired = event(
+            "TimerFired",
+            json!({"sequence":2,"timer_id":"cleanup-timer","delay_seconds":1}),
+        );
+        if let Some(time) = time {
+            fired.raw.insert("timestamp".into(), json!(time));
+        }
+        let history = vec![
+            context_request(),
+            remaining_delivery(),
+            event(
+                "TimerScheduled",
+                json!({"sequence":2,"timer_id":"cleanup-timer","delay_seconds":1}),
+            ),
+            fired,
+        ];
+        let commands = worker.execute_workflow_task(context_task(history)).unwrap();
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+            if time.is_some() {
+                json!(0.0)
+            } else {
+                Value::Null
+            }
+        );
+    }
+}
+
+#[test]
+fn cancellation_remaining_selection_uses_winner_then_handle_and_first_cancel_receipt() {
+    for cancel_slow in [false, true] {
+        let mut worker = cancellation_worker();
+        worker.register_workflow("cancel", |ctx, _| async move {
+            let Err(Error::CooperativeCancellationRequested(cancelled)) = ctx.sleep(Duration::from_secs(10)).await else { panic!("expected delivery"); };
+            let context = cancelled.request.context.unwrap();
+            let _shield = ctx.cancellation_shield()?;
+            let selection = ctx.select_keyed(vec![("slow", ParallelOperation::activity("slow", json!([]))), ("fast", ParallelOperation::activity("fast", json!([])))]).await?;
+            let selected = context.remaining()?.as_secs_f64();
+            selection.winner.await_result().await?;
+            let winner = context.remaining()?.as_secs_f64();
+            let result = selection.handle(&SelectionKey::from("slow")).unwrap().await_result().await;
+            Ok(json!({"selected":selected,"winner":winner,"slow":context.remaining()?.as_secs_f64(),"cancelled":matches!(result, Err(Error::DurableOperationCancelled(_)))}))
+        });
+        let mut history = vec![context_request(), remaining_delivery()];
+        let commands = worker
+            .execute_workflow_task(context_task(history.clone()))
+            .unwrap();
+        assert_eq!(commands.len(), 2);
+        let mut payloads = Vec::new();
+        for (offset, command) in commands.into_iter().enumerate() {
+            let mut payload = command;
+            payload.as_object_mut().unwrap().remove("type");
+            payload["sequence"] = json!(2 + offset);
+            payload["activity_execution_id"] = json!(if offset == 0 {
+                "activity-slow"
+            } else {
+                "activity-fast"
+            });
+            history.push(event("ActivityScheduled", payload.clone()));
+            payloads.push(payload);
+        }
+        payloads[1]["result"] = fixture_envelope(json!("fast"));
+        let mut completed = remaining_event(
+            "ActivityCompleted",
+            payloads[1].clone(),
+            "2026-10-01T00:00:10Z",
+        );
+        completed.raw.insert("id".into(), json!("event-fast"));
+        history.push(completed);
+        history.push(remaining_event("SelectionResolved", json!({
+            "selection_group_id":"select-calls:2:2","selection_group_base_sequence":2,"selection_group_size":2,
+            "member_key":"fast","member_index":1,"member_base_sequence":3,"member_size":1,
+            "operation_kind":"activity","operation_identity":"activity-fast","outcome":"completed",
+            "resolution_event_id":"event-fast","resolution_event_type":"ActivityCompleted"
+        }), "2026-10-01T00:00:12Z"));
+        if cancel_slow {
+            let receipt = json!({"selection_group_id":"select-calls:2:2","member_key":"slow","member_index":0,"member_base_sequence":2,"member_size":1,"operation_kind":"activity","operation_identity":"activity-slow"});
+            history.push(remaining_event(
+                "SelectionOperationCancelled",
+                receipt.clone(),
+                "2026-10-01T00:00:15Z",
+            ));
+            history.push(remaining_event(
+                "SelectionOperationCancelled",
+                receipt,
+                "2026-10-01T00:00:28Z",
+            ));
+        } else {
+            payloads[0]["result"] = fixture_envelope(json!("slow"));
+            history.push(remaining_event(
+                "ActivityCompleted",
+                payloads[0].clone(),
+                "2026-10-01T00:00:20Z",
+            ));
+        }
+        for _restart in 0..2 {
+            let commands = worker
+                .execute_workflow_task(context_task(history.clone()))
+                .unwrap();
+            assert_eq!(
+                decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+                json!({"selected":18.123456,"winner":18.123456,"slow":if cancel_slow {15.123456} else {10.123456},"cancelled":cancel_slow})
+            );
+        }
+    }
+}
+
+#[test]
+fn cancellation_remaining_parallel_consumes_the_final_physical_condition_wait() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _| async move {
+        let Err(Error::CooperativeCancellationRequested(cancelled)) =
+            ctx.sleep(Duration::from_secs(10)).await
+        else {
+            panic!("expected delivery");
+        };
+        let context = cancelled.request.context.unwrap();
+        let _shield = ctx.cancellation_shield()?;
+        ctx.parallel(vec![
+            ParallelOperation::timer(Duration::from_secs(1)),
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("ready", "sha256:ready"),
+                || Ok(false),
+            ),
+        ])
+        .await?;
+        Ok(json!(context.remaining()?.as_secs_f64()))
+    });
+    let mut history = vec![context_request(), remaining_delivery()];
+    let commands = worker
+        .execute_workflow_task(context_task(history.clone()))
+        .unwrap();
+    let mut timer = commands[0].clone();
+    timer.as_object_mut().unwrap().remove("type");
+    timer["sequence"] = json!(2);
+    timer["timer_id"] = json!("timer-2");
+    history.push(event("TimerScheduled", timer.clone()));
+    let mut condition = commands[1].clone();
+    condition.as_object_mut().unwrap().remove("type");
+    condition["sequence"] = json!(3);
+    condition["condition_wait_id"] = json!("condition-3");
+    history.push(event("ConditionWaitOpened", condition.clone()));
+    history.push(remaining_event(
+        "ConditionWaitSatisfied",
+        condition.clone(),
+        "2026-10-01T00:00:12Z",
+    ));
+    condition["sequence"] = json!(4);
+    condition["condition_wait_id"] = json!("condition-4");
+    history.push(event("ConditionWaitOpened", condition.clone()));
+    history.push(remaining_event(
+        "ConditionWaitSatisfied",
+        condition,
+        "2026-10-01T00:00:25Z",
+    ));
+    history.push(remaining_event("TimerFired", timer, "2026-10-01T00:00:10Z"));
+    for _restart in 0..2 {
+        let commands = worker
+            .execute_workflow_task(context_task(history.clone()))
+            .unwrap();
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+            json!(5.123456)
+        );
+    }
+}
+
+#[test]
+fn cancellation_remaining_cannot_escape_into_an_unrelated_nested_worker_poll() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _| async move {
+        let Err(Error::CooperativeCancellationRequested(cancelled)) =
+            ctx.sleep(Duration::from_secs(10)).await
+        else {
+            panic!("expected delivery");
+        };
+        let context = cancelled.request.context.unwrap();
+        let nested_context = context.clone();
+        let mut nested = cancellation_worker();
+        nested.register_workflow("cancel", move |_, _| {
+            let nested_context = nested_context.clone();
+            async move {
+                assert!(
+                    nested_context.remaining().is_err(),
+                    "another workflow cannot borrow the outer replay binding"
+                );
+                Ok(Value::Null)
+            }
+        });
+        nested.execute_workflow_task(context_task(Vec::new()))?;
+        assert_eq!(
+            context.remaining()?,
+            Duration::new(22, 123456000),
+            "outer binding is restored after nested poll"
+        );
+        Ok(Value::Null)
+    });
+    worker
+        .execute_workflow_task(context_task(vec![context_request(), remaining_delivery()]))
+        .unwrap();
+}
+
+#[test]
+fn cancellation_remaining_refuses_a_legacy_signal_without_committed_result_time() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _| async move {
+        let _ = ctx.sleep(Duration::from_secs(10)).await;
+        let context = ctx.cancellation_context()?.unwrap();
+        assert_eq!(context.remaining()?, Duration::new(22, 123456000));
+        let _shield = ctx.cancellation_shield()?;
+        assert_eq!(ctx.wait_signal("resume").await?, vec![json!(7)]);
+        assert!(
+            context.remaining().is_err(),
+            "missing signal time cannot reuse the delivery budget"
+        );
+        Ok(Value::Null)
+    });
+    let mut task = context_task(vec![context_request(), remaining_delivery()]);
+    task.signal_name = Some("resume".into());
+    task.signal_arguments = Some(fixture_envelope(json!([7])));
+    worker.execute_workflow_task(task).unwrap();
+}
+
 #[test]
 fn cooperative_context_retains_original_snapshot_and_detached_copies() {
     let mut original = context_snapshot();

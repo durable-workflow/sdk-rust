@@ -9,7 +9,7 @@ use durable_workflow::{
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -785,14 +785,19 @@ async fn server_commits_earlier_side_effect_before_cancellation_delivery() {
 async fn server_cold_successor_runs_saga_cleanup_before_terminal_cancellation() {
     let client = client();
     let queue = queue();
-    let original = worker(&client, &queue, true, false);
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut original = worker(&client, &queue, true, false);
+    register_remaining_workflow(&mut original, observations.clone(), "original");
     original.register().await.unwrap();
     let handle = client
         .start_workflow(WORKFLOW, &queue, &queue, json!([]))
         .await
         .unwrap();
     let request = handle
-        .request_cancellation(CooperativeCancellationOptions::default())
+        .request_cancellation(CooperativeCancellationOptions {
+            cleanup_timeout_seconds: Some(30),
+            ..CooperativeCancellationOptions::default()
+        })
         .await
         .unwrap();
     let pending = tick_until(&original, &handle, "ActivityScheduled").await;
@@ -800,6 +805,7 @@ async fn server_cold_successor_runs_saga_cleanup_before_terminal_cancellation() 
     assert_eq!(count(&pending, "WorkflowCancelled"), 0);
     drop(original);
     let mut successor = worker(&client, &queue, true, false);
+    register_remaining_workflow(&mut successor, observations.clone(), "replacement");
     let completed = Arc::new(AtomicUsize::new(0));
     let called = Arc::clone(&completed);
     successor.register_activity(UNDO, move |ctx, _| {
@@ -812,8 +818,82 @@ async fn server_cold_successor_runs_saga_cleanup_before_terminal_cancellation() 
     });
     successor.register().await.unwrap();
     tick_until(&successor, &handle, "WorkflowCancelled").await;
-    assert_cancelled(&handle, &request.cancellation_request.request_id, true).await;
+    let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, true).await;
     assert_eq!(completed.load(Ordering::SeqCst), 1);
+    let events = snapshot["events"].as_array().unwrap();
+    let event_time = |kind| {
+        chrono::DateTime::parse_from_rfc3339(
+            events
+                .iter()
+                .find(|event| event["event_type"] == kind)
+                .unwrap()["timestamp"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let deadline =
+        chrono::DateTime::parse_from_rfc3339(&request.cancellation_request.cleanup_deadline_at)
+            .unwrap();
+    let delivery_budget = (deadline - event_time("CooperativeCancellationDelivered"))
+        .to_std()
+        .unwrap()
+        .as_secs_f64();
+    let completed_budget = (deadline - event_time("ActivityCompleted"))
+        .to_std()
+        .unwrap()
+        .as_secs_f64();
+    let observed = observations.lock().unwrap();
+    let deliveries = observed
+        .iter()
+        .filter(|entry| entry["phase"] == "delivery")
+        .collect::<Vec<_>>();
+    assert!(deliveries.iter().any(|entry| entry["worker"] == "original"));
+    assert!(deliveries
+        .iter()
+        .any(|entry| entry["worker"] == "replacement"));
+    for entry in &deliveries {
+        assert_eq!(entry["context"], deliveries[0]["context"]);
+        assert!((entry["remaining"].as_f64().unwrap() - delivery_budget).abs() < 0.000001);
+    }
+    let completed = observed
+        .iter()
+        .find(|entry| entry["phase"] == "completed")
+        .unwrap();
+    assert_eq!(completed["context"], deliveries[0]["context"]);
+    assert!((completed["remaining"].as_f64().unwrap() - completed_budget).abs() < 0.000001);
+    assert!(0.0 < completed_budget && completed_budget < delivery_budget);
+    assert!(event_time("WorkflowCancelled") < deadline);
+    assert_eq!(count(&snapshot, "MemoUpserted"), 1);
+    eprintln!(
+        "cold cleanup remaining-time observations: {}",
+        json!(*observed)
+    );
+    eprintln!("cold cleanup remaining-time history: {snapshot}");
+}
+
+fn register_remaining_workflow(
+    worker: &mut Worker,
+    observations: Arc<Mutex<Vec<Value>>>,
+    label: &'static str,
+) {
+    worker.register_workflow(WORKFLOW, move |ctx, _| {
+        let observations = observations.clone();
+        async move {
+            let mut saga = ctx.saga();
+            saga.add_compensation(UNDO, json!([]))?;
+            let result = ctx.sleep(Duration::from_secs(300)).await;
+            let context = ctx.cancellation_context()?.expect("committed rich delivery");
+            let remaining = context.remaining()?;
+            observations.lock().unwrap().push(json!({"worker":label,"phase":"delivery","context":context.to_value(),"remaining":remaining.as_secs_f64()}));
+            ctx.upsert_memo(json!({"phase":"cleanup"}))?;
+            assert_eq!(context.remaining()?, remaining, "synchronous memo preserves the consumed budget");
+            let finished = saga.finish(result).await;
+            observations.lock().unwrap().push(json!({"worker":label,"phase":"completed","context":context.to_value(),"remaining":context.remaining()?.as_secs_f64()}));
+            finished?;
+            Ok(Value::Null)
+        }
+    });
 }
 
 async fn managed_remote_cancellation(user_heartbeat: bool, policy: Option<CancellationPolicy>) {
