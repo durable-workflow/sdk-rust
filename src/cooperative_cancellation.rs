@@ -1107,6 +1107,52 @@ fn acknowledgment(
 }
 
 impl Client {
+    /// Report a stopped and dropped remote callback under its original claim.
+    ///
+    /// Call only after callback execution has ended. This explicit protocol 1.20
+    /// operation preserves the original cancellation request and grants no lease
+    /// or result publication authority. The request has one five-second budget.
+    pub async fn acknowledge_activity_cancellation(
+        &self,
+        task_id: &str,
+        activity_attempt_id: &str,
+        lease_owner: &str,
+        request_id: &str,
+    ) -> Result<Value> {
+        if [task_id, activity_attempt_id, lease_owner, request_id]
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > 255)
+        {
+            return Err(invalid(
+                "activity stop receipt requires bounded original claim and request identities",
+            ));
+        }
+        tokio::time::timeout(CONTROL_BUDGET, async {
+            let value: Value = activity_task_response(
+                self.request_json(
+                    reqwest::Method::POST,
+                    &format!("/worker/activity-tasks/{}/acknowledge-cancellation", percent_encode_path_segment(task_id)),
+                    RequestProtocol::Worker("1.20"),
+                    Some(&json!({"activity_attempt_id":activity_attempt_id,"lease_owner":lease_owner,"request_id":request_id})),
+                ).await,
+                "acknowledge-cancellation", task_id, activity_attempt_id,
+            )?;
+            if value["task_id"].as_str() != Some(task_id)
+                || value["activity_attempt_id"].as_str() != Some(activity_attempt_id)
+                || value["lease_owner"].as_str() != Some(lease_owner)
+                || value["request_id"].as_str() != Some(request_id)
+                || value["acknowledged"].as_bool() != Some(true)
+                || value["duplicate"].as_bool().is_none()
+                || value.get("reason") != Some(&Value::Null)
+                || value["heartbeat_recorded"].as_bool() != Some(false)
+                || text(&value, "history_event_id").is_err()
+            {
+                return Err(invalid("activity callback-stop acknowledgment did not prove the original claim and receipt"));
+            }
+            Ok(value)
+        }).await.map_err(|_| Error::Timeout)?
+    }
+
     /// Observe an exact activity attempt without renewing its lease or progress.
     ///
     /// This explicit worker-protocol 1.20 operation has one five-second budget.
@@ -1650,28 +1696,42 @@ impl Worker {
         if guard.observe().await.is_err() {
             return Ok(ManagedPollOutcome::Handled);
         }
-        let invocation = self.execute_cooperative_activity_task(&task, &guard);
-        tokio::pin!(invocation);
-        let result = loop {
-            tokio::select! {
-                biased;
-                _ = guard.wait_for_shutdown() => {
-                    guard.abandon();
-                    return Ok(ManagedPollOutcome::Handled);
-                }
-                result = &mut invocation => break result,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if guard.observe().await.is_err() {
-                        return Ok(ManagedPollOutcome::Handled);
+        let mut callback_started = false;
+        let result = {
+            let invocation =
+                self.execute_cooperative_activity_task(&task, &guard, &mut callback_started);
+            tokio::pin!(invocation);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = guard.wait_for_shutdown() => {
+                        guard.abandon();
+                        break None;
+                    }
+                    result = &mut invocation => break Some(result),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if guard.observe().await.is_err() {
+                            break None;
+                        }
                     }
                 }
             }
+        };
+        // The invocation and its callback future are dropped before any receipt.
+        let Some(result) = result else {
+            if callback_started {
+                guard.acknowledge_stopped().await?;
+            }
+            return Ok(ManagedPollOutcome::Handled);
         };
         // Both genuine application failures and successful results need current
         // authority before result upload or completion/failure publication.
         if matches!(result, Err(Error::ActivityExecutionAbandoned(_)))
             || guard.observe().await.is_err()
         {
+            if callback_started {
+                guard.acknowledge_stopped().await?;
+            }
             return Ok(ManagedPollOutcome::Handled);
         }
         let settlement = match result {
@@ -1711,6 +1771,7 @@ impl Worker {
         &self,
         task: &ActivityTask,
         guard: &ActivityClaimGuard,
+        callback_started: &mut bool,
     ) -> Result<AvroValue> {
         validate_activity_task_payloads(task)?;
         let handler = self
@@ -1730,6 +1791,7 @@ impl Worker {
             claim_guard: Some(guard.clone()),
         };
         guard.boundary()?;
+        *callback_started = true;
         handler(context, args).await
     }
 
@@ -1853,6 +1915,7 @@ pub(super) struct ActivityClaimGuard {
     attempt_id: String,
     owner: String,
     active: Arc<AtomicBool>,
+    cancellation_receipt: Arc<Mutex<Option<Value>>>,
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -1888,6 +1951,7 @@ impl ActivityClaimGuard {
             attempt_id: attempt.to_owned(),
             owner: owner.to_owned(),
             active: Arc::new(AtomicBool::new(true)),
+            cancellation_receipt: Arc::new(Mutex::new(None)),
             stop: client
                 .worker_storage_admission
                 .as_ref()
@@ -1897,6 +1961,78 @@ impl ActivityClaimGuard {
 
     fn abandon(&self) {
         self.active.store(false, Ordering::SeqCst);
+    }
+
+    /// Caller has already dropped the callback future. Never restores authority.
+    async fn acknowledge_stopped(&self) -> Result<()> {
+        self.abandon();
+        let receipt = self
+            .cancellation_receipt
+            .lock()
+            .map_err(|_| invalid("activity cancellation receipt lock was poisoned"))?
+            .clone();
+        if let Some(receipt) = receipt {
+            self.client
+                .acknowledge_activity_cancellation(
+                    &self.task_id,
+                    &self.attempt_id,
+                    &self.owner,
+                    text(&receipt, "request_id")?,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn retain_cancellation_receipt(&self, value: &Value) -> Result<()> {
+        if value["can_continue"].as_bool() != Some(false)
+            || value["cancel_requested"].as_bool() != Some(true)
+        {
+            return Ok(());
+        }
+        let Some(receipt) = value
+            .get("cancellation_acknowledgement")
+            .filter(|receipt| receipt.is_object())
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            receipt["callback_state"].as_str(),
+            Some("unknown" | "stopped")
+        ) || [
+            "request_id",
+            "root_request_id",
+            "cleanup_deadline_at",
+            "cancellation_history_event_id",
+        ]
+        .iter()
+        .any(|field| text(receipt, field).is_err())
+            || DateTime::parse_from_rfc3339(text(receipt, "cleanup_deadline_at")?).is_err()
+        {
+            return Ok(());
+        }
+        let mut retained = self
+            .cancellation_receipt
+            .lock()
+            .map_err(|_| invalid("activity cancellation receipt lock was poisoned"))?;
+        if let Some(original) = retained.as_ref() {
+            if [
+                "request_id",
+                "root_request_id",
+                "cleanup_deadline_at",
+                "cancellation_history_event_id",
+            ]
+            .iter()
+            .any(|field| original[*field] != receipt[*field])
+            {
+                return Err(invalid(
+                    "activity cancellation observation changed its original identity or deadline",
+                ));
+            }
+        } else {
+            *retained = Some(receipt.clone());
+        }
+        Ok(())
     }
 
     fn boundary(&self) -> Result<()> {
@@ -1929,6 +2065,7 @@ impl ActivityClaimGuard {
             .activity_task_status(&self.task_id, &self.attempt_id, &self.owner)
             .await
             .and_then(|value| {
+                self.retain_cancellation_receipt(&value)?;
                 if value["can_continue"].as_bool() != Some(true)
                     || value["cancel_requested"].as_bool() != Some(false)
                     || value.get("reason") != Some(&Value::Null)

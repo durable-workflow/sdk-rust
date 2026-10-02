@@ -53,6 +53,30 @@ history fails explicitly. A worker without the cooperation opt-in refuses the
 commands before completion with its identity and required protocol. Server also
 checks the immutable task claim and installed backend.
 
+## Remote callback-stop receipts
+
+The managed worker drops its activity callback future before reporting a stop.
+Cloned `ActivityContext` values remain fenced. Only a canonical cancellation
+observation on the original task, attempt and owner supplies the local request ID
+for `Client::acknowledge_activity_cancellation()`. A lost lease, transport error,
+shutdown or malformed observation does not supply a cooperative stop receipt.
+Callbacks that never started are not reported as dropped.
+
+The explicit protocol 1.20 receipt request has a five-second budget. It validates
+the Server's original claim, request and history receipt. A failed acknowledgment
+remains an error and cannot become a completion or a new cleanup budget. A
+duplicate returns the original event. The report covers the managed callback
+future. Detached threads, processes and downstream effects need their own
+cooperating cancellation and fencing.
+
+Connected source qualification accepts an optional exact `native_commit` in
+addition to `server_commit`. The Native checkout is mounted read-only while the
+image retains its published Composer authority. The source lane verifies the
+durable receipt for callbacks with and without application heartbeats,
+duplicates, the original deadline and stale result refusal. Actions retains all
+three source identities and scenario history. This does not qualify a published
+Native image or package.
+
 ## Rust API release boundary
 
 The candidate adds a variant to the existing exhaustive `ParentClosePolicy`

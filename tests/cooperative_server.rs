@@ -846,7 +846,10 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
         .unwrap()
         .expect("actual blocked callback entered");
     let request = handle
-        .request_cancellation(CooperativeCancellationOptions::default())
+        .request_cancellation(CooperativeCancellationOptions {
+            cleanup_timeout_seconds: Some(30),
+            ..CooperativeCancellationOptions::default()
+        })
         .await
         .unwrap();
     let result = handle
@@ -859,7 +862,8 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
         matches!(result, Err(Error::WorkflowCancelled(_))),
         "managed result: {result:?}"
     );
-    let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, true).await;
+    let mut snapshot =
+        assert_cancelled(&handle, &request.cancellation_request.request_id, true).await;
     assert_eq!(
         dropped.load(Ordering::SeqCst),
         1,
@@ -892,6 +896,81 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
         ),
         "cloned context remains abandoned"
     );
+    if std::env::var("DURABLE_WORKFLOW_NATIVE_SOURCE_QUALIFICATION").as_deref() == Ok("1") {
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = client
+                    .activity_task_status(
+                        &original.task_id,
+                        &original.activity_attempt_id,
+                        &original.lease_owner,
+                    )
+                    .await
+                    .unwrap();
+                if status["cancellation_acknowledgement"]["callback_state"] == "stopped" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("dropped callback must leave a durable stop receipt");
+        let receipt = &status["cancellation_acknowledgement"];
+        assert_eq!(
+            receipt["request_id"],
+            request.cancellation_request.request_id
+        );
+        assert_eq!(
+            receipt["root_request_id"],
+            request.cancellation_request.request_id
+        );
+        assert_eq!(
+            receipt["cleanup_deadline_at"],
+            request.cancellation_request.cleanup_deadline_at
+        );
+        assert_eq!(receipt["received_after_deadline"], false);
+        assert_eq!(status["heartbeat_recorded"], false);
+        assert_eq!(status["can_continue"], false);
+        let duplicate = client
+            .acknowledge_activity_cancellation(
+                &original.task_id,
+                &original.activity_attempt_id,
+                &original.lease_owner,
+                &request.cancellation_request.request_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate["duplicate"], true);
+        assert_eq!(duplicate["history_event_id"], receipt["history_event_id"]);
+        snapshot = history(&handle).await;
+        assert_eq!(count(&snapshot, "ActivityCancellationAcknowledged"), 1);
+        let recorded = snapshot["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "ActivityCancellationAcknowledged")
+            .unwrap();
+        assert_eq!(recorded["payload"]["callback_state"], "stopped");
+        assert_eq!(recorded["payload"]["evidence_source"], "activity_worker");
+        assert_eq!(
+            recorded["payload"]["activity_attempt_id"],
+            original.activity_attempt_id
+        );
+        assert_eq!(recorded["payload"]["request_id"], receipt["request_id"]);
+        assert_eq!(
+            recorded["payload"]["root_request_id"],
+            receipt["root_request_id"]
+        );
+        assert_eq!(
+            recorded["payload"]["cleanup_deadline_at"],
+            receipt["cleanup_deadline_at"]
+        );
+        assert_eq!(
+            recorded["payload"]["cancellation_history_event_id"],
+            receipt["cancellation_history_event_id"]
+        );
+        eprintln!("remote stop receipt: user_heartbeat={user_heartbeat}, status={status}, duplicate={duplicate}, history={recorded}");
+    }
     let completion = client
         .complete_activity_task(
             &original.task_id,

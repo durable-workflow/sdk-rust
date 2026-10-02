@@ -2455,6 +2455,52 @@ fn remote_activity_responses(
             "remote-heartbeat-post-loss" if number >= 3 => reply["can_continue"] = json!(false),
             _ => {}
         }
+        if case.starts_with("remote-stop-joined-") && number >= 2 {
+            reply["can_continue"] = json!(false);
+            reply["cancel_requested"] = json!(true);
+            reply["reason"] = json!("activity_cancelled");
+            reply["cancellation_acknowledgement"] = json!({"request_id":"local-request","root_request_id":"root-request",
+                "cleanup_deadline_at":"2099-01-01T00:00:30Z","cancellation_history_event_id":"cancel-history","callback_state":"unknown"});
+        }
+        return Some(("200 OK", reply.to_string()));
+    }
+    if path.ends_with("/acknowledge-cancellation") {
+        let request: Value = serde_json::from_str(body).unwrap();
+        if case.starts_with("remote-stop-joined-")
+            && std::fs::read_to_string(std::env::temp_dir().join(case))
+                .ok()
+                .as_deref()
+                != Some("dropped")
+        {
+            return Some((
+                "409 Conflict",
+                json!({"reason":"callback_not_dropped"}).to_string(),
+            ));
+        }
+        if case == "remote-ack-refused" {
+            return Some((
+                "409 Conflict",
+                json!({"reason":"cancellation_request_mismatch"}).to_string(),
+            ));
+        }
+        let mut reply = json!({"task_id":"activity/selected","activity_attempt_id":request["activity_attempt_id"],
+            "lease_owner":request["lease_owner"],"request_id":request["request_id"],"acknowledged":true,
+            "duplicate":number > 1,"history_event_id":"stop-history","reason":null,"heartbeat_recorded":false});
+        if case.starts_with("remote-stop-joined-") {
+            reply["task_id"] = json!("activity");
+        }
+        match case {
+            "remote-ack-task" => reply["task_id"] = json!("wrong"),
+            "remote-ack-attempt" => reply["activity_attempt_id"] = json!("wrong"),
+            "remote-ack-owner" => reply["lease_owner"] = json!("wrong"),
+            "remote-ack-request" => reply["request_id"] = json!("wrong"),
+            "remote-ack-unproved" => reply["history_event_id"] = Value::Null,
+            "remote-ack-declined" => reply["acknowledged"] = json!(false),
+            "remote-ack-progress" => reply["heartbeat_recorded"] = json!(true),
+            "remote-ack-duplicate" => reply["duplicate"] = json!("true"),
+            "remote-ack-slow" => std::thread::sleep(Duration::from_millis(5250)),
+            _ => {}
+        }
         return Some(("200 OK", reply.to_string()));
     }
     if path.ends_with("/activity/heartbeat") {
@@ -2762,6 +2808,169 @@ async fn cooperative_activity_observation_rejects_changed_receipts_and_preserves
         Err(Error::MissingRoleCredentials { role: "worker", .. })
     ));
     assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cooperative_activity_stop_receipt_preserves_worker_authentication_and_duplicate_identity()
+{
+    let server = remote_activity_server();
+    let original = client(&server, "remote-ack-valid");
+    let first = original
+        .acknowledge_activity_cancellation(
+            "activity/selected",
+            "attempt-original",
+            "actual-owner",
+            "local-request",
+        )
+        .await
+        .unwrap();
+    let duplicate = original
+        .acknowledge_activity_cancellation(
+            "activity/selected",
+            "attempt-original",
+            "actual-owner",
+            "local-request",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["history_event_id"], duplicate["history_event_id"]);
+    assert_eq!(first["duplicate"], false);
+    assert_eq!(duplicate["duplicate"], true);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request
+            .path
+            .ends_with("/activity%2Fselected/acknowledge-cancellation"));
+        assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
+        assert_eq!(request.authorization.as_deref(), Some("Bearer worker-only"));
+        assert_eq!(request.namespace.as_deref(), Some("caller-namespace"));
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"activity_attempt_id":"attempt-original","lease_owner":"actual-owner","request_id":"local-request"})
+        );
+    }
+    assert_eq!(WORKER_PROTOCOL_VERSION, "1.19");
+}
+
+#[tokio::test]
+async fn cooperative_activity_stop_receipt_refuses_changed_fences_unproved_receipts_and_missing_identity(
+) {
+    for case in [
+        "remote-ack-task",
+        "remote-ack-attempt",
+        "remote-ack-owner",
+        "remote-ack-request",
+        "remote-ack-unproved",
+        "remote-ack-declined",
+        "remote-ack-progress",
+        "remote-ack-duplicate",
+    ] {
+        let server = remote_activity_server();
+        assert!(
+            matches!(
+                client(&server, case)
+                    .acknowledge_activity_cancellation(
+                        "activity/selected",
+                        "attempt-original",
+                        "actual-owner",
+                        "local-request"
+                    )
+                    .await,
+                Err(Error::InvalidCooperativeCancellation(_))
+            ),
+            "{case}"
+        );
+    }
+    let server = remote_activity_server();
+    assert!(
+        matches!(client(&server, "remote-ack-refused").acknowledge_activity_cancellation(
+        "activity/selected", "attempt-original", "actual-owner", "local-request").await,
+        Err(Error::ActivityTaskRejected(ref error)) if error.operation == "acknowledge-cancellation" && error.reason == "cancellation_request_mismatch")
+    );
+    for (task, attempt, owner, request) in [
+        ("", "attempt", "owner", "request"),
+        ("task", "", "owner", "request"),
+        ("task", "attempt", "", "request"),
+        ("task", "attempt", "owner", ""),
+    ] {
+        assert!(client(&server, "remote-ack-valid")
+            .acknowledge_activity_cancellation(task, attempt, owner, request)
+            .await
+            .is_err());
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cooperative_activity_stop_receipt_has_one_five_second_budget() {
+    let server = remote_activity_server();
+    let started = Instant::now();
+    assert!(matches!(
+        client(&server, "remote-ack-slow")
+            .acknowledge_activity_cancellation(
+                "activity/selected",
+                "attempt-original",
+                "actual-owner",
+                "local-request"
+            )
+            .await,
+        Err(Error::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(5200));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+struct StoppedCallbackMarker(std::path::PathBuf);
+
+impl Drop for StoppedCallbackMarker {
+    fn drop(&mut self) {
+        std::fs::write(&self.0, "dropped").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cooperative_activity_callback_is_dropped_before_stop_receipt_and_cloned_context_stays_fenced(
+) {
+    let case = unique_request_id("remote-stop-joined");
+    let marker = std::env::temp_dir().join(&case);
+    let server = remote_activity_server();
+    let mut worker = coordinator_worker(&server, &case);
+    let saved = Arc::new(Mutex::new(None::<ActivityContext>));
+    let capture = Arc::clone(&saved);
+    let callback_marker = marker.clone();
+    worker.register_activity("work", move |ctx, _| {
+        *capture.lock().unwrap() = Some(ctx);
+        let stopped = StoppedCallbackMarker(callback_marker.clone());
+        async move {
+            let _stopped = stopped;
+            std::future::pending::<()>().await;
+            Ok(Value::Null)
+        }
+    });
+    let result = worker.poll_activity_once().await;
+    let dropped = std::fs::read_to_string(&marker);
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(result.unwrap(), ManagedPollOutcome::Handled);
+    assert_eq!(dropped.unwrap(), "dropped");
+    let before = server.requests.lock().unwrap().len();
+    let context = saved.lock().unwrap().as_ref().unwrap().clone();
+    assert!(matches!(
+        context.heartbeat(json!({"late":true})).await,
+        Err(Error::ActivityExecutionAbandoned(_))
+    ));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), before);
+    assert_eq!(
+        requests.last().unwrap().path.rsplit('/').next(),
+        Some("acknowledge-cancellation")
+    );
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/heartbeat")
+            || request.path.ends_with("/complete")
+            || request.path.ends_with("/fail")));
 }
 
 #[tokio::test]
