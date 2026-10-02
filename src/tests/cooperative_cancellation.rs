@@ -2157,24 +2157,33 @@ fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'stati
             .to_string(),
         ));
     }
-    if path.ends_with("/deliver-cancellation") && case.starts_with("child-wait") {
+    if path.ends_with("/deliver-cancellation")
+        && (case.starts_with("child-wait") || case.starts_with("activity-wait"))
+    {
         let mut pending = pending_child_delivery("task/selected");
-        match case {
-            "child-wait-wrong-task" => pending["task_id"] = json!("other"),
-            "child-wait-wrong-run" => pending["workflow_run_id"] = json!("other"),
-            "child-wait-not-released" => pending["claim_released"] = json!(false),
-            "child-wait-string-released" => pending["claim_released"] = json!("true"),
-            "child-wait-missing-release" => {
+        if case.starts_with("activity-wait") {
+            pending["reason"] = json!("cancellation_waiting_for_activity");
+        }
+        let suffix = case
+            .strip_prefix("child-wait")
+            .or_else(|| case.strip_prefix("activity-wait"))
+            .unwrap();
+        match suffix {
+            "-wrong-task" => pending["task_id"] = json!("other"),
+            "-wrong-run" => pending["workflow_run_id"] = json!("other"),
+            "-not-released" => pending["claim_released"] = json!(false),
+            "-string-released" => pending["claim_released"] = json!("true"),
+            "-missing-release" => {
                 pending.as_object_mut().unwrap().remove("claim_released");
             }
-            "child-wait-wrong-reason" => pending["reason"] = json!("other"),
-            "child-wait-request" => pending["request_id"] = body["request_id"].clone(),
-            "child-wait-sequence" => pending["sequence"] = json!(1),
-            "child-wait-kind" => pending["call_kind"] = json!("child"),
-            "child-wait-span" => pending["sequence_span"] = json!(1),
-            "child-wait-operation" => pending["operation_sequence"] = json!(1),
-            "child-wait-operation-span" => pending["operation_sequence_span"] = json!(1),
-            "child-wait-string-delivered" => pending["delivered"] = json!("false"),
+            "-wrong-reason" => pending["reason"] = json!("other"),
+            "-request" => pending["request_id"] = body["request_id"].clone(),
+            "-sequence" => pending["sequence"] = json!(1),
+            "-kind" => pending["call_kind"] = json!("child"),
+            "-span" => pending["sequence_span"] = json!(1),
+            "-operation" => pending["operation_sequence"] = json!(1),
+            "-operation-span" => pending["operation_sequence_span"] = json!(1),
+            "-string-delivered" => pending["delivered"] = json!("false"),
             _ => {}
         }
         return Some(("200 OK", pending.to_string()));
@@ -4160,62 +4169,93 @@ async fn cooperative_transport_delivers_the_exact_claim_with_worker_credentials(
 }
 
 #[tokio::test]
-async fn cooperative_transport_accepts_only_explicit_child_claim_release() {
-    for kind in [
-        CancellationCallKind::Child,
-        CancellationCallKind::Parallel,
-        CancellationCallKind::SelectionHandle,
+async fn cooperative_transport_accepts_only_explicit_cancellation_claim_release() {
+    for (case, kinds) in [
+        (
+            "child-wait",
+            vec![
+                CancellationCallKind::Child,
+                CancellationCallKind::Parallel,
+                CancellationCallKind::SelectionHandle,
+            ],
+        ),
+        (
+            "activity-wait",
+            vec![
+                CancellationCallKind::Activity,
+                CancellationCallKind::LocalActivity,
+                CancellationCallKind::Parallel,
+                CancellationCallKind::SelectionHandle,
+            ],
+        ),
+    ] {
+        for kind in kinds {
+            let server = transport_server();
+            let mut delivery = transport_delivery();
+            delivery.call_kind = kind;
+            if kind == CancellationCallKind::SelectionHandle {
+                delivery.sequence = 2;
+                delivery.operation_sequence = Some(1);
+            }
+            assert_eq!(
+                client(&server, case)
+                    .deliver_workflow_cancellation(&transport_task(), &delivery)
+                    .await
+                    .unwrap(),
+                CancellationDeliveryReply::ClaimReleased {
+                    task_id: "task/selected".into(),
+                    run_id: "run".into()
+                }
+            );
+        }
+    }
+    for (case, kind) in [
+        ("child-wait", CancellationCallKind::Timer),
+        ("activity-wait", CancellationCallKind::Timer),
+        ("child-wait", CancellationCallKind::Activity),
+        ("activity-wait", CancellationCallKind::Child),
     ] {
         let server = transport_server();
         let mut delivery = transport_delivery();
         delivery.call_kind = kind;
-        if kind == CancellationCallKind::SelectionHandle {
-            delivery.sequence = 2;
-            delivery.operation_sequence = Some(1);
-        }
-        assert_eq!(
-            client(&server, "child-wait")
+        assert!(matches!(
+            client(&server, case)
                 .deliver_workflow_cancellation(&transport_task(), &delivery)
-                .await
-                .unwrap(),
-            CancellationDeliveryReply::ClaimReleased {
-                task_id: "task/selected".into(),
-                run_id: "run".into()
-            }
-        );
+                .await,
+            Err(Error::InvalidCooperativeCancellation(_))
+        ));
     }
-    let server = transport_server();
-    assert!(matches!(
-        client(&server, "child-wait")
-            .deliver_workflow_cancellation(&transport_task(), &transport_delivery())
-            .await,
-        Err(Error::InvalidCooperativeCancellation(_))
-    ));
-    for case in [
-        "child-wait-wrong-task",
-        "child-wait-wrong-run",
-        "child-wait-not-released",
-        "child-wait-string-released",
-        "child-wait-missing-release",
-        "child-wait-wrong-reason",
-        "child-wait-request",
-        "child-wait-sequence",
-        "child-wait-kind",
-        "child-wait-span",
-        "child-wait-operation",
-        "child-wait-operation-span",
-        "child-wait-string-delivered",
+    for (prefix, kind) in [
+        ("child-wait", CancellationCallKind::Child),
+        ("activity-wait", CancellationCallKind::Activity),
     ] {
-        let server = transport_server();
-        let mut delivery = transport_delivery();
-        delivery.call_kind = CancellationCallKind::Child;
-        let result = client(&server, case)
-            .deliver_workflow_cancellation(&transport_task(), &delivery)
-            .await;
-        assert!(
-            matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
-            "{case}: {result:?}"
-        );
+        for suffix in [
+            "wrong-task",
+            "wrong-run",
+            "not-released",
+            "string-released",
+            "missing-release",
+            "wrong-reason",
+            "request",
+            "sequence",
+            "kind",
+            "span",
+            "operation",
+            "operation-span",
+            "string-delivered",
+        ] {
+            let case = format!("{prefix}-{suffix}");
+            let server = transport_server();
+            let mut delivery = transport_delivery();
+            delivery.call_kind = kind;
+            let result = client(&server, &case)
+                .deliver_workflow_cancellation(&transport_task(), &delivery)
+                .await;
+            assert!(
+                matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
+                "{case}: {result:?}"
+            );
+        }
     }
 }
 

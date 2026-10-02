@@ -1427,7 +1427,7 @@ impl Client {
     /// This explicit worker-protocol 1.20 operation renews no lease and advertises
     /// no worker capability. The Server requires a previously admitted capable
     /// claim. Reload canonical history before exposing cancellation to workflow
-    /// code, including when an acknowledgment is lost. A child wait explicitly
+    /// code, including when an acknowledgment is lost. A cancellation wait explicitly
     /// releases the claim and must return the worker to polling.
     pub async fn deliver_workflow_cancellation(
         &self,
@@ -1463,13 +1463,22 @@ impl Client {
                 )
                 .await?;
             if response["delivered"].as_bool() == Some(false)
-                && matches!(
-                    delivery.call_kind,
-                    CancellationCallKind::Child
-                        | CancellationCallKind::Parallel
-                        | CancellationCallKind::SelectionHandle
-                )
-                && response["reason"].as_str() == Some("cancellation_waiting_for_child")
+                && match response["reason"].as_str() {
+                    Some("cancellation_waiting_for_child") => matches!(
+                        delivery.call_kind,
+                        CancellationCallKind::Child
+                            | CancellationCallKind::Parallel
+                            | CancellationCallKind::SelectionHandle
+                    ),
+                    Some("cancellation_waiting_for_activity") => matches!(
+                        delivery.call_kind,
+                        CancellationCallKind::Activity
+                            | CancellationCallKind::LocalActivity
+                            | CancellationCallKind::Parallel
+                            | CancellationCallKind::SelectionHandle
+                    ),
+                    _ => false,
+                }
                 && response["claim_released"].as_bool() == Some(true)
                 && response["task_id"].as_str() == Some(task.task_id.as_str())
                 && response["workflow_run_id"].as_str() == Some(run_id)
