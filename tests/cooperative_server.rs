@@ -398,7 +398,52 @@ async fn blocked_cleanup_cutoff(terminate: bool) {
         cleanup.heartbeat(json!({"late":true})).await,
         Err(Error::ActivityExecutionAbandoned(_))
     ));
+    let receipt_expected = !terminate
+        && std::env::var("DURABLE_WORKFLOW_NATIVE_SOURCE_QUALIFICATION").as_deref() == Ok("1");
+    if receipt_expected {
+        // Callback drop precedes the asynchronous Server receipt. Stabilize
+        // that diagnostic before checking stale result/failure publication.
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = client
+                    .activity_task_status(
+                        &cleanup.task_id,
+                        &cleanup.activity_attempt_id,
+                        &cleanup.lease_owner,
+                    )
+                    .await
+                    .unwrap();
+                if status["cancellation_acknowledgement"]["callback_state"] == "stopped" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("dropped cleanup callback must leave its original stop receipt");
+        let receipt = &status["cancellation_acknowledgement"];
+        assert_eq!(
+            receipt["request_id"],
+            request.cancellation_request.request_id
+        );
+        assert_eq!(
+            receipt["root_request_id"],
+            request.cancellation_request.request_id
+        );
+        assert_eq!(
+            receipt["cleanup_deadline_at"],
+            request.cancellation_request.cleanup_deadline_at
+        );
+        assert_eq!(receipt["received_after_deadline"], true);
+        assert_eq!(status["heartbeat_recorded"], false);
+        assert_eq!(status["can_continue"], false);
+        eprintln!("Blocked cleanup stop receipt: {status}");
+    }
     let snapshot = history(&handle).await;
+    assert_eq!(
+        count(&snapshot, "ActivityCancellationAcknowledged"),
+        usize::from(receipt_expected)
+    );
     for kind in [
         "CooperativeCancellationRequested",
         "CooperativeCancellationDelivered",
