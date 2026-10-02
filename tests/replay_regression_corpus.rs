@@ -412,6 +412,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.durable-selection-portable-affinity"
             | "corpus.redrive-boundary"
             | "corpus.child-policy-author"
+            | "corpus.activity-policy-author"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -607,6 +608,12 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     }
                 },
             );
+        }
+        "corpus.activity-policy-author" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.activity("work", json!([])).await?;
+                Ok(json!("unreachable"))
+            });
         }
         "corpus.child-policy-author" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {

@@ -53,6 +53,39 @@ history fails explicitly. A worker without the cooperation opt-in refuses the
 commands before completion with its identity and required protocol. Server also
 checks the immutable task claim and installed backend.
 
+## Remote Activity policies
+
+`ActivityOptions::cancellation_policy()` accepts the same `CancellationPolicy`
+enum for ordinary, parallel and selection Activity calls. Omission retains the
+historical Try behavior and wire shape.
+
+```rust
+ActivityOptions::new()
+    .cancellation_policy(CancellationPolicy::WaitCancellationCompleted)
+```
+
+Try requests cancellation and continues without waiting for the stop receipt.
+Wait delays workflow delivery until the original remote attempt's callback drop
+is durably acknowledged. Abandon leaves work independent after parent
+cancellation. It requires a finite positive `schedule_to_close_timeout` and
+keeps that original deadline as its total lifetime. It does not extend the
+parent's cleanup budget.
+
+Explicit policies require cooperative worker opt-in, protocol 1.20 and a
+compatible installed backend. Unsupported workers identify their operation,
+identity and required protocol before submission. Server also checks the
+original immutable claim. Replay compares the policy against canonical history
+before ordinary/group/selection settlement or cancellation delivery. Later
+events with missing fields retain the original policy. Invalid, conflicting
+and changed history fails explicitly. Historical omission retains Try.
+
+Connected Source cases include explicit Try/Wait callback drop without app
+heartbeats, receipt ordering for Wait and stale-result refusal. Bounded Abandon
+checks that the callback future survives parent closure, commits independent
+completion under its original total timeout and cannot publish a second outcome
+or reopen the parent. These tests supervise async callback futures. Detached
+threads, processes and downstream effects need their own cooperation and fencing.
+
 ## Remote callback-stop receipts
 
 The managed worker drops its activity callback future before reporting a stop.
@@ -80,7 +113,9 @@ Native image or package.
 ## Rust API release boundary
 
 The candidate adds a variant to the existing exhaustive `ParentClosePolicy`
-enum and a field to the public `ChildWorkflowOptions` struct. Existing struct
+enum and fields to the public `ChildWorkflowOptions` and `ActivityOptions`
+structs. It also adds a total-lifetime error category to the exhaustive public
+`ActivityOptionsErrorKind` enum. Existing struct
 literals and exhaustive matches need updates. The cooperative error variants
 also extend an existing exhaustive public enum. These changes require a major
 Rust SDK release if retained. This draft does not authorize that release or

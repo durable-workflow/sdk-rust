@@ -986,6 +986,7 @@ pub enum ActivityOptionsErrorKind {
     BackoffOverflow,
     EmptyNonRetryableErrorType,
     TimeoutNotPositive,
+    MissingTotalTimeout,
     TimeoutOverflow,
     TimeoutOrder,
 }
@@ -1291,15 +1292,15 @@ impl ParentClosePolicy {
     }
 }
 
-/// Cancellation at an awaiting child call.
+/// Cancellation at an awaiting operation. Activities default to Try, children to Abandon.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CancellationPolicy {
-    /// Request child cleanup and deliver parent cancellation without waiting.
+    /// Request cancellation and continue without waiting. Historical Activity default.
     TryCancel,
-    /// Wait for the child's recorded terminal outcome before parent delivery.
+    /// Wait for recorded child termination or the original Activity attempt's stop receipt.
     WaitCancellationCompleted,
-    /// Leave the child independent. This preserves the historical default.
+    /// Leave work independent. Historical child default. Remote Activities require a total timeout.
     #[default]
     Abandon,
 }
@@ -1450,6 +1451,7 @@ pub struct ActivityOptions {
     pub schedule_to_start_timeout: Option<Duration>,
     pub schedule_to_close_timeout: Option<Duration>,
     pub heartbeat_timeout: Option<Duration>,
+    pub cancellation_policy: Option<CancellationPolicy>,
 }
 
 impl ActivityOptions {
@@ -1487,7 +1489,21 @@ impl ActivityOptions {
         self
     }
 
+    pub fn cancellation_policy(mut self, policy: CancellationPolicy) -> Self {
+        self.cancellation_policy = Some(policy);
+        self
+    }
+
     fn validate(&self) -> std::result::Result<ValidatedActivityOptions, ActivityOptionsError> {
+        if self.cancellation_policy == Some(CancellationPolicy::Abandon)
+            && self.schedule_to_close_timeout.is_none()
+        {
+            return Err(ActivityOptionsError::new(
+                ActivityOptionsErrorKind::MissingTotalTimeout,
+                Some("schedule_to_close_timeout"),
+                "remote Activity Abandon requires a finite positive total timeout",
+            ));
+        }
         if self
             .task_queue
             .as_deref()
@@ -1554,6 +1570,7 @@ impl ActivityOptions {
                 self.schedule_to_close_timeout,
             )?,
             heartbeat_timeout: timeout_seconds("heartbeat_timeout", self.heartbeat_timeout)?,
+            cancellation_policy: self.cancellation_policy,
         })
     }
 }
@@ -1643,6 +1660,7 @@ struct ValidatedActivityOptions {
     schedule_to_start_timeout: Option<u64>,
     schedule_to_close_timeout: Option<u64>,
     heartbeat_timeout: Option<u64>,
+    cancellation_policy: Option<CancellationPolicy>,
 }
 
 fn validate_timeout_order(
@@ -7925,6 +7943,17 @@ impl Worker {
     ) -> Result<WorkflowTaskDecision> {
         if !self.cooperative_cancellation_enabled
             && commands.iter().any(|command| {
+                command["type"] == "schedule_activity"
+                    && command.get("cancellation_policy").is_some()
+            })
+        {
+            return Err(Error::CooperativeCancellationUnavailable(format!(
+                "activity_cancellation_policy_not_supported: Rust worker {} must enable cooperative cancellation with worker protocol 1.20 and a compatible Server/Native backend",
+                self.worker_id,
+            )));
+        }
+        if !self.cooperative_cancellation_enabled
+            && commands.iter().any(|command| {
                 command["type"] == "start_child_workflow"
                     && (command["parent_close_policy"] == "request_cancellation"
                         || matches!(
@@ -9865,6 +9894,7 @@ enum RecordedCommand {
     Activity {
         sequence: u64,
         activity_type: Option<String>,
+        cancellation_policy: String,
         options: Option<RecordedActivityOptions>,
         outcome: Option<ActivityOutcome>,
         parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
@@ -10221,6 +10251,58 @@ struct RecordedActivityOptions {
 struct RecordedChildPolicies {
     parent_close_policy: String,
     cancellation_policy: String,
+}
+
+fn recorded_activity_cancellation_policy(
+    events: &[&HistoryEvent],
+    sequence: u64,
+) -> Result<String> {
+    let mut policy: Option<String> = None;
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "ActivityScheduled"
+                | "ActivityStarted"
+                | "ActivityCompleted"
+                | "ActivityFailed"
+                | "ActivityTimedOut"
+                | "ActivityCancelled"
+        )
+    }) {
+        for source in [Some(&event.payload), event.payload.get("activity")]
+            .into_iter()
+            .flatten()
+        {
+            let Some(value) = source.get("cancellation_policy") else {
+                continue;
+            };
+            let Some(incoming @ ("try_cancel" | "wait_cancellation_completed" | "abandon")) =
+                value.as_str()
+            else {
+                return Err(invalid_recorded_history(
+                    "invalid_activity_cancellation_policy_history",
+                    sequence,
+                    "supported Activity cancellation policy",
+                    &value.to_string(),
+                    "Activity history contains an invalid cancellation policy",
+                ));
+            };
+            if let Some(previous) = policy.as_deref() {
+                if previous != incoming {
+                    return Err(invalid_recorded_history(
+                        "activity_cancellation_policy_history_conflict",
+                        sequence,
+                        previous,
+                        incoming,
+                        "Activity cancellation policy changed between history events",
+                    ));
+                }
+            }
+            policy = Some(incoming.to_string());
+        }
+        policy.get_or_insert_with(|| "try_cancel".to_string());
+    }
+    Ok(policy.unwrap_or_else(|| "try_cancel".to_string()))
 }
 
 fn recorded_child_policy_value<'a>(
@@ -12534,11 +12616,27 @@ impl ActivityCall {
             match recorded {
                 RecordedCommand::Activity {
                     activity_type,
+                    cancellation_policy,
                     options: recorded_options,
                     outcome,
                     parallel_group_path,
                     ..
                 } => {
+                    let current_policy = options
+                        .cancellation_policy
+                        .unwrap_or(CancellationPolicy::TryCancel)
+                        .as_str();
+                    if cancellation_policy != current_policy {
+                        return Poll::Ready(Err(Error::NonDeterministicReplay(
+                            ReplayFailure::new(
+                                "activity_cancellation_policy_changed",
+                                Some(sequence),
+                                Some(cancellation_policy),
+                                Some(current_policy.to_string()),
+                                "Activity cancellation policy changed during replay",
+                            ),
+                        )));
+                    }
                     if let Err(error) = ensure_parallel_path_matches(
                         sequence,
                         parallel_group_path.as_deref(),
@@ -12675,6 +12773,9 @@ impl ActivityCall {
             }
             if let Some(retry_policy) = options.retry_policy {
                 command.insert("retry_policy".to_string(), retry_policy);
+            }
+            if let Some(policy) = options.cancellation_policy {
+                command.insert("cancellation_policy".to_string(), json!(policy.as_str()));
             }
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
             match state.prepare_scalar_cancellation(
@@ -14281,6 +14382,7 @@ fn recorded_commands(
                 return Ok(RecordedCommand::Activity {
                     sequence,
                     activity_type,
+                    cancellation_policy: recorded_activity_cancellation_policy(&activity_events, sequence)?,
                     options,
                     outcome,
                     parallel_group_path,
@@ -15998,6 +16100,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod activity_cancellation_policies;
     mod child_workflow_policies;
     mod cooperative_cancellation;
     mod runtime_payloads;

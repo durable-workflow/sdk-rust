@@ -2,9 +2,9 @@
 //! Ordinary cargo tests leave these cases ignored. They require a real runtime.
 
 use durable_workflow::{
-    json, ActivityContext, Client, ConditionWaitOptions, CooperativeCancellationOptions, Error,
-    ParallelOperation, ParallelResult, SelectionKey, Value, Worker, WorkflowCommandOptions,
-    WorkflowHandle, WorkflowResultOptions,
+    json, ActivityContext, ActivityOptions, CancellationPolicy, Client, ConditionWaitOptions,
+    CooperativeCancellationOptions, Error, ParallelOperation, ParallelResult, SelectionKey, Value,
+    Worker, WorkflowCommandOptions, WorkflowHandle, WorkflowResultOptions,
 };
 use std::{
     sync::{
@@ -816,7 +816,7 @@ async fn server_cold_successor_runs_saga_cleanup_before_terminal_cancellation() 
     assert_eq!(completed.load(Ordering::SeqCst), 1);
 }
 
-async fn managed_remote_cancellation(user_heartbeat: bool) {
+async fn managed_remote_cancellation(user_heartbeat: bool, policy: Option<CancellationPolicy>) {
     let client = client();
     let queue = queue();
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -835,10 +835,20 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
                 let _ = heartbeat_tx.send(());
             }
         });
-    worker.register_workflow(WORKFLOW, |ctx, _| async move {
+    worker.register_workflow(WORKFLOW, move |ctx, _| async move {
         let mut saga = ctx.saga();
         saga.add_compensation(UNDO, json!([]))?;
-        let result = ctx.activity(BLOCKED, json!([])).await;
+        let result = match policy {
+            Some(policy) => {
+                ctx.activity_with_options(
+                    BLOCKED,
+                    ActivityOptions::new().cancellation_policy(policy),
+                    json!([]),
+                )
+                .await
+            }
+            None => ctx.activity(BLOCKED, json!([])).await,
+        };
         saga.finish(result).await?;
         Ok(Value::Null)
     });
@@ -989,6 +999,37 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
         assert_eq!(duplicate["history_event_id"], receipt["history_event_id"]);
         snapshot = history(&handle).await;
         assert_eq!(count(&snapshot, "ActivityCancellationAcknowledged"), 1);
+        if let Some(policy) = policy {
+            let events = snapshot["events"].as_array().unwrap();
+            let scheduled = events
+                .iter()
+                .find(|event| event["event_type"] == "ActivityScheduled")
+                .unwrap();
+            let expected = match policy {
+                CancellationPolicy::TryCancel => "try_cancel",
+                CancellationPolicy::WaitCancellationCompleted => "wait_cancellation_completed",
+                CancellationPolicy::Abandon => unreachable!(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                scheduled["payload"]["activity"]["cancellation_policy"],
+                expected
+            );
+            if policy == CancellationPolicy::WaitCancellationCompleted {
+                let stop = events
+                    .iter()
+                    .position(|event| event["event_type"] == "ActivityCancellationAcknowledged")
+                    .unwrap();
+                let delivery = events
+                    .iter()
+                    .position(|event| event["event_type"] == "CooperativeCancellationDelivered")
+                    .unwrap();
+                assert!(
+                    stop < delivery,
+                    "Wait must record actual callback drop before workflow delivery"
+                );
+            }
+        }
         let recorded = snapshot["events"]
             .as_array()
             .unwrap()
@@ -1058,13 +1099,204 @@ async fn managed_remote_cancellation(user_heartbeat: bool) {
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
 async fn server_managed_worker_fences_blocked_callback_without_user_heartbeats() {
-    managed_remote_cancellation(false).await;
+    managed_remote_cancellation(false, None).await;
 }
 
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
 async fn server_managed_worker_fences_blocked_callback_with_user_heartbeats() {
-    managed_remote_cancellation(true).await;
+    managed_remote_cancellation(true, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_explicit_try_cancellation_stops_callback_without_user_heartbeats() {
+    managed_remote_cancellation(false, Some(CancellationPolicy::TryCancel)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_explicit_wait_records_callback_stop_before_delivery() {
+    managed_remote_cancellation(false, Some(CancellationPolicy::WaitCancellationCompleted)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_bounded_abandon_completes_independent_activity_after_parent_cancellation() {
+    let client = client();
+    let queue = queue();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<ActivityContext>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut worker = Worker::new(client.clone(), &queue)
+        .worker_id(format!("{queue}-abandon"))
+        .cooperative_cancellation(true)
+        .max_concurrent_workflow_tasks(1)
+        .max_concurrent_activity_tasks(2)
+        .poll_timeout(Duration::from_secs(1));
+    worker.register_workflow(WORKFLOW, |ctx, _| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation(UNDO, json!([]))?;
+        let result = ctx
+            .activity_with_options(
+                BLOCKED,
+                ActivityOptions::new()
+                    .cancellation_policy(CancellationPolicy::Abandon)
+                    .schedule_to_close_timeout(Duration::from_secs(60)),
+                json!([]),
+            )
+            .await;
+        saga.finish(result).await?;
+        Ok(Value::Null)
+    });
+    let callback_dropped = Arc::clone(&dropped);
+    worker.register_activity(BLOCKED, move |ctx, _| {
+        let entered_tx = entered_tx.clone();
+        let callback_dropped = Arc::clone(&callback_dropped);
+        async move {
+            let _drop = CallbackDrop(callback_dropped);
+            entered_tx.send(ctx).unwrap();
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            Ok(json!("independent-completion"))
+        }
+    });
+    worker.register_activity(UNDO, |_ctx, _| async { Ok(Value::Null) });
+    let run = tokio::spawn(async move {
+        worker
+            .run_until(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let handle = client
+        .start_workflow(WORKFLOW, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let original = tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let request = handle
+        .request_cancellation(CooperativeCancellationOptions {
+            cleanup_timeout_seconds: Some(30),
+            ..CooperativeCancellationOptions::default()
+        })
+        .await
+        .unwrap();
+    let duplicate = handle
+        .request_cancellation(CooperativeCancellationOptions {
+            cleanup_timeout_seconds: Some(300),
+            ..CooperativeCancellationOptions::default()
+        })
+        .await
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(request.cancellation_request, duplicate.cancellation_request);
+    let snapshot = assert_cancelled(&handle, &request.cancellation_request.request_id, true).await;
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "Abandon must preserve the callback after parent closure"
+    );
+    assert_eq!(count(&snapshot, "ActivityCancelled"), 0);
+    assert_eq!(count(&snapshot, "ActivityCancellationAcknowledged"), 0);
+    let scheduled = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_type"] == "ActivityScheduled")
+        .unwrap();
+    assert_eq!(
+        scheduled["payload"]["activity"]["cancellation_policy"],
+        "abandon"
+    );
+    let total_deadline = scheduled["payload"]["activity"]["schedule_to_close_deadline_at"].clone();
+    assert!(total_deadline.is_string());
+    let status = client
+        .activity_task_status(
+            &original.task_id,
+            &original.activity_attempt_id,
+            &original.lease_owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status["can_continue"], true);
+    let snapshot = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            let snapshot = history(&handle).await;
+            if snapshot["events"].as_array().unwrap().iter().any(|event| {
+                event["event_type"] == "ActivityCompleted"
+                    && event["payload"]["activity_type"] == BLOCKED
+            }) {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("independent callback must complete within its original lifetime");
+    let completed: Vec<_> = snapshot["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["event_type"] == "ActivityCompleted"
+                && event["payload"]["activity_type"] == BLOCKED
+        })
+        .collect();
+    assert_eq!(completed.len(), 1);
+    let envelope: durable_workflow::PayloadEnvelope =
+        serde_json::from_value(completed[0]["payload"]["result"].clone()).unwrap();
+    assert_eq!(
+        durable_workflow::decode_payload::<String>(&envelope).unwrap(),
+        "independent-completion"
+    );
+    assert_eq!(
+        completed[0]["payload"]["activity"]["schedule_to_close_deadline_at"],
+        total_deadline
+    );
+    assert_eq!(
+        completed[0]["payload"]["activity_attempt_id"],
+        original.activity_attempt_id
+    );
+    assert_eq!(count(&snapshot, "WorkflowCancelled"), 1);
+    assert_eq!(count(&snapshot, "WorkflowCompleted"), 0);
+    assert_eq!(count(&snapshot, "ActivityCancellationAcknowledged"), 0);
+    for outcome in [
+        client
+            .complete_activity_task(
+                &original.task_id,
+                &original.activity_attempt_id,
+                &original.lease_owner,
+                json!("stale"),
+                "avro",
+            )
+            .await,
+        client
+            .fail_activity_task(
+                &original.task_id,
+                &original.activity_attempt_id,
+                &original.lease_owner,
+                "stale",
+                true,
+            )
+            .await,
+    ] {
+        assert!(
+            matches!(outcome, Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409)
+        );
+    }
+    assert_eq!(snapshot, history(&handle).await);
+    eprintln!(
+        "Bounded remote Abandon: root={}, total_deadline={}, completed={}",
+        request.cancellation_request.request_id, total_deadline, completed[0]
+    );
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 fn replay_worker(client: &Client, queue: &str, mode: &'static str) -> Worker {
