@@ -268,7 +268,7 @@ jobs:
             cooperative-package-provenance.txt
             cooperative-images.json
             cooperative-source-provenance.json
-          retention-days: 7
+          retention-days: 90
           if-no-files-found: warn
       - name: Emit failure diagnostics
         if: ${{ failure() }}
