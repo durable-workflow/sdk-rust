@@ -110,7 +110,7 @@ apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
 # Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
 bon = { version = "=3.8.1", default-features = false }
-chrono = { version = "0.4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures-util = "0.3"
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.
 icu_collections = { version = "=2.2.0", default-features = false }

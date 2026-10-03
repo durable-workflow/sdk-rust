@@ -1,7 +1,19 @@
 #![doc = include_str!("../README.md")]
 
+mod cancellation_context;
+mod cancellation_replay_clock;
+mod cooperative_cancellation;
 mod runtime_payloads;
 mod runtime_uploads;
+
+pub use cancellation_context::{CancellationContext, CancellationLineage};
+
+pub use cooperative_cancellation::{
+    CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
+    CancellationDeliveryReply, CancellationHistory, CancellationRequest, CancellationShield,
+    CooperativeCancellationOptions, CooperativeCancellationRequested, CooperativeWorkflowTask,
+    CooperativeWorkflowTaskPoll, WorkflowCancellationRequest, WorkflowTaskHeartbeat,
+};
 
 use std::{
     any::{type_name, Any, TypeId},
@@ -20,7 +32,9 @@ use std::{
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
-use futures_util::{future::OptionFuture, task::noop_waker_ref};
+use futures_util::{
+    future::OptionFuture, stream::FuturesUnordered, task::noop_waker_ref, StreamExt,
+};
 use serde::{
     de::DeserializeOwned,
     ser::{SerializeMap, SerializeSeq},
@@ -185,6 +199,8 @@ pub enum Error {
     #[error(transparent)]
     WorkflowCancellationRequested(WorkflowCancellationRequested),
     #[error(transparent)]
+    CooperativeCancellationRequested(CooperativeCancellationRequested),
+    #[error(transparent)]
     WorkflowCommandRejected(WorkflowCommandRejection),
     #[error(transparent)]
     WorkflowFailed(WorkflowTerminalOutcome),
@@ -252,6 +268,14 @@ pub enum Error {
         "workflow_memo_updates_unavailable: the connected runtime did not advertise workflow memo update support"
     )]
     WorkflowMemoUpdatesUnavailable,
+    #[error("cooperative cancellation is unavailable: {0}")]
+    CooperativeCancellationUnavailable(String),
+    #[error("cancellation_scope_execution_not_supported: Rust worker cannot replay scoped cancellation history")]
+    CancellationScopeExecutionUnavailable,
+    #[error("invalid cooperative cancellation: {0}")]
+    InvalidCooperativeCancellation(String),
+    #[error("activity execution no longer owns its claim: {0}")]
+    ActivityExecutionAbandoned(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -967,6 +991,7 @@ pub enum ActivityOptionsErrorKind {
     BackoffOverflow,
     EmptyNonRetryableErrorType,
     TimeoutNotPositive,
+    MissingTotalTimeout,
     TimeoutOverflow,
     TimeoutOrder,
 }
@@ -1254,7 +1279,10 @@ pub struct SagaCompensationFailure {
 pub enum ParentClosePolicy {
     #[default]
     Abandon,
+    /// Legacy terminal cancellation without cooperative cleanup.
     RequestCancel,
+    /// Request cooperative cleanup with the original lineage and deadline.
+    RequestCancellation,
     Terminate,
 }
 
@@ -1263,7 +1291,31 @@ impl ParentClosePolicy {
         match self {
             Self::Abandon => "abandon",
             Self::RequestCancel => "request_cancel",
+            Self::RequestCancellation => "request_cancellation",
             Self::Terminate => "terminate",
+        }
+    }
+}
+
+/// Cancellation at an awaiting operation. Activities default to Try, children to Abandon.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CancellationPolicy {
+    /// Request cancellation and continue without waiting. Historical Activity default.
+    TryCancel,
+    /// Wait for recorded child termination or the original Activity attempt's stop receipt.
+    WaitCancellationCompleted,
+    /// Leave work independent. Historical child default. Remote Activities require a total timeout.
+    #[default]
+    Abandon,
+}
+
+impl CancellationPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TryCancel => "try_cancel",
+            Self::WaitCancellationCompleted => "wait_cancellation_completed",
+            Self::Abandon => "abandon",
         }
     }
 }
@@ -1283,6 +1335,7 @@ pub struct ChildWorkflowRetryPolicy {
 pub struct ChildWorkflowOptions {
     pub task_queue: String,
     pub parent_close_policy: ParentClosePolicy,
+    pub cancellation_policy: CancellationPolicy,
     pub retry_policy: Option<ChildWorkflowRetryPolicy>,
     pub execution_timeout_seconds: Option<u64>,
     pub run_timeout_seconds: Option<u64>,
@@ -1293,6 +1346,7 @@ impl ChildWorkflowOptions {
         Self {
             task_queue: task_queue.into(),
             parent_close_policy: ParentClosePolicy::Abandon,
+            cancellation_policy: CancellationPolicy::Abandon,
             retry_policy: None,
             execution_timeout_seconds: None,
             run_timeout_seconds: None,
@@ -1301,6 +1355,11 @@ impl ChildWorkflowOptions {
 
     pub fn parent_close_policy(mut self, policy: ParentClosePolicy) -> Self {
         self.parent_close_policy = policy;
+        self
+    }
+
+    pub fn cancellation_policy(mut self, policy: CancellationPolicy) -> Self {
+        self.cancellation_policy = policy;
         self
     }
 
@@ -1397,6 +1456,7 @@ pub struct ActivityOptions {
     pub schedule_to_start_timeout: Option<Duration>,
     pub schedule_to_close_timeout: Option<Duration>,
     pub heartbeat_timeout: Option<Duration>,
+    pub cancellation_policy: Option<CancellationPolicy>,
 }
 
 impl ActivityOptions {
@@ -1434,7 +1494,21 @@ impl ActivityOptions {
         self
     }
 
+    pub fn cancellation_policy(mut self, policy: CancellationPolicy) -> Self {
+        self.cancellation_policy = Some(policy);
+        self
+    }
+
     fn validate(&self) -> std::result::Result<ValidatedActivityOptions, ActivityOptionsError> {
+        if self.cancellation_policy == Some(CancellationPolicy::Abandon)
+            && self.schedule_to_close_timeout.is_none()
+        {
+            return Err(ActivityOptionsError::new(
+                ActivityOptionsErrorKind::MissingTotalTimeout,
+                Some("schedule_to_close_timeout"),
+                "remote Activity Abandon requires a finite positive total timeout",
+            ));
+        }
         if self
             .task_queue
             .as_deref()
@@ -1501,6 +1575,7 @@ impl ActivityOptions {
                 self.schedule_to_close_timeout,
             )?,
             heartbeat_timeout: timeout_seconds("heartbeat_timeout", self.heartbeat_timeout)?,
+            cancellation_policy: self.cancellation_policy,
         })
     }
 }
@@ -1590,6 +1665,7 @@ struct ValidatedActivityOptions {
     schedule_to_start_timeout: Option<u64>,
     schedule_to_close_timeout: Option<u64>,
     heartbeat_timeout: Option<u64>,
+    cancellation_policy: Option<CancellationPolicy>,
 }
 
 fn validate_timeout_order(
@@ -2636,6 +2712,7 @@ pub struct Client {
     namespace: String,
     max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
+    cooperative_worker_protocol: bool,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
 }
 
@@ -3554,13 +3631,51 @@ impl Client {
             body["workflow_definition_fingerprints"] = json!(fingerprints);
         }
 
-        self.request_json(
-            reqwest::Method::POST,
-            "/worker/register",
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-            Some(&body),
-        )
-        .await
+        let response: Value = self
+            .request_json(
+                reqwest::Method::POST,
+                "/worker/register",
+                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                Some(&body),
+            )
+            .await?;
+        if self.cooperative_worker_protocol {
+            let compatible = response["registered"].as_bool() == Some(true)
+                && response["worker_id"].as_str() == Some(worker_id)
+                && response["namespace"].as_str() == Some(self.namespace.as_str())
+                && response["task_queue"].as_str() == Some(task_queue)
+                && response["protocol_version"]
+                    .as_str()
+                    .is_some_and(cooperative_cancellation::supports_protocol)
+                && response["server_capabilities"]["cooperative_cancellation"].as_bool()
+                    == Some(true)
+                && response["capabilities"].as_array().is_some_and(|accepted| {
+                    capabilities.iter().all(|capability| {
+                        accepted
+                            .iter()
+                            .any(|value| value.as_str() == Some(capability.as_str()))
+                    })
+                });
+            if !compatible {
+                let error = Error::CooperativeCancellationUnavailable(
+                    "registration must acknowledge this namespace, queue, worker, capabilities and compatible runtime protocol 1.20".into(),
+                );
+                if response["registered"].as_bool() == Some(true)
+                    && response["worker_id"].as_str() == Some(worker_id)
+                {
+                    if let Err(deregistration) =
+                        self.deregister_worker_registration(worker_id).await
+                    {
+                        return Err(Error::WorkerShutdown {
+                            primary: Box::new(error),
+                            deregistration: Box::new(deregistration),
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Gracefully remove one worker's registration through the worker plane.
@@ -4136,6 +4251,18 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        let protocol = match protocol {
+            RequestProtocol::Worker(version)
+                if self.cooperative_worker_protocol
+                    && version
+                        .strip_prefix("1.")
+                        .and_then(|minor| minor.parse::<u64>().ok())
+                        .is_some_and(|minor| minor < 20) =>
+            {
+                RequestProtocol::Worker("1.20")
+            }
+            protocol => protocol,
+        };
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
             .http
@@ -4885,6 +5012,7 @@ impl ClientBuilder {
             namespace: self.namespace,
             max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
+            cooperative_worker_protocol: false,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
         })
     }
@@ -6050,6 +6178,7 @@ struct WorkflowTaskDecision {
     commands: Vec<Value>,
     message_stream_cursors: Vec<Value>,
     message_stream_waits: Vec<Value>,
+    cancellation_delivery: Option<CancellationDelivery>,
 }
 
 impl WorkflowTaskDecision {
@@ -6058,6 +6187,7 @@ impl WorkflowTaskDecision {
             commands,
             message_stream_cursors: Vec::new(),
             message_stream_waits: Vec::new(),
+            cancellation_delivery: None,
         }
     }
 }
@@ -6152,6 +6282,8 @@ pub struct Worker {
     heartbeat_interval: Duration,
     retry_policy: WorkerRetryPolicy,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
+    cooperative_cancellation_enabled: bool,
+    cooperative_registration_confirmed: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -6170,11 +6302,14 @@ impl Worker {
             heartbeat_interval: Duration::from_secs(60),
             retry_policy: WorkerRetryPolicy::default(),
             heartbeat_observer: None,
+            cooperative_cancellation_enabled: false,
+            cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = worker_id.into();
+        self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -6185,6 +6320,22 @@ impl Worker {
 
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Opt in to separate cooperative workflow cancellation requests.
+    ///
+    /// Registration requires the Server to acknowledge this exact worker,
+    /// namespace, queue and capabilities with compatible protocol 1.20. Task
+    /// processing uses canonical delivery and activity ownership fences.
+    /// Existing terminal cancel and terminate operations remain terminal.
+    /// The default is disabled, preserving ordinary protocol 1.19 workers.
+    /// Call [`Worker::register`] before [`Worker::run_once`]. [`Worker::run`]
+    /// and [`Worker::run_until`] register automatically.
+    pub fn cooperative_cancellation(mut self, enabled: bool) -> Self {
+        self.cooperative_cancellation_enabled = enabled;
+        self.client.cooperative_worker_protocol = enabled;
+        self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -6767,7 +6918,10 @@ impl Worker {
             );
         }
 
-        self.client
+        self.cooperative_registration_confirmed
+            .store(false, Ordering::SeqCst);
+        let response = self
+            .client
             .register_worker_with_definition_fingerprints(
                 &self.worker_id,
                 &self.task_queue,
@@ -6780,6 +6934,8 @@ impl Worker {
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
+                    self.cooperative_cancellation_enabled
+                        .then(|| "cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
                     worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
@@ -6801,7 +6957,12 @@ impl Worker {
                         .collect(),
                 ),
             )
-            .await
+            .await?;
+        if self.cooperative_cancellation_enabled && response.registered {
+            self.cooperative_registration_confirmed
+                .store(true, Ordering::SeqCst);
+        }
+        Ok(response)
     }
 
     /// Run until shutdown or a terminal worker error occurs.
@@ -6854,6 +7015,8 @@ impl Worker {
         }
         let registered_worker_id = registration.worker_id.clone();
         let primary = self.run_registered_until(stop, registration).await;
+        self.cooperative_registration_confirmed
+            .store(false, Ordering::SeqCst);
         let deregistration = self
             .client
             .deregister_worker_registration(&registered_worker_id)
@@ -7019,6 +7182,15 @@ impl Worker {
     /// Direct callers of [`Client::complete_workflow_task`] continue to receive
     /// the original [`Error::Http`] status and response body.
     pub async fn run_once(&self) -> Result<usize> {
+        if self.cooperative_cancellation_enabled
+            && !self
+                .cooperative_registration_confirmed
+                .load(Ordering::SeqCst)
+        {
+            return Err(Error::CooperativeCancellationUnavailable(
+                "register this cooperative worker before polling tasks".into(),
+            ));
+        }
         let worker = self.with_storage_admission(Arc::new(AtomicBool::new(false)));
         let mut handled = 0;
         match worker.poll_workflow_once().await? {
@@ -7042,6 +7214,9 @@ impl Worker {
     }
 
     async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        if self.cooperative_cancellation_enabled {
+            return self.poll_cooperative_workflow_once().await;
+        }
         let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -7074,15 +7249,40 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
 
-        match self.execute_workflow_task_decision(task) {
+        self.settle_workflow_task_decision(
+            &task_id,
+            &lease_owner,
+            attempt,
+            run_id.as_deref(),
+            self.execute_workflow_task_decision(task),
+            memo_updates_supported,
+        )
+        .await
+    }
+
+    async fn settle_workflow_task_decision(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        attempt: u64,
+        run_id: Option<&str>,
+        decision: Result<WorkflowTaskDecision>,
+        memo_updates_supported: bool,
+    ) -> Result<ManagedPollOutcome> {
+        match decision {
+            Ok(decision) if decision.cancellation_delivery.is_some() => {
+                return Err(Error::CooperativeCancellationUnavailable(
+                    "worker cancellation delivery has not been negotiated".into(),
+                ));
+            }
             Ok(decision)
                 if commands_use_workflow_memo_updates(&decision.commands)
                     && !memo_updates_supported =>
             {
                 self.client
                     .fail_workflow_task(
-                        &task_id,
-                        &lease_owner,
+                        task_id,
+                        lease_owner,
                         attempt,
                         Error::WorkflowMemoUpdatesUnavailable.to_string(),
                     )
@@ -7096,8 +7296,8 @@ impl Worker {
                 // least one executable command.
                 self.client
                     .fail_workflow_task_with_type(
-                        &task_id,
-                        &lease_owner,
+                        task_id,
+                        lease_owner,
                         attempt,
                         WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE,
                         WORKFLOW_TASK_WAITING_FOR_HISTORY_TYPE,
@@ -7108,8 +7308,8 @@ impl Worker {
                 let completion = self
                     .client
                     .complete_workflow_task_with_message_streams(
-                        &task_id,
-                        &lease_owner,
+                        task_id,
+                        lease_owner,
                         attempt,
                         decision.commands,
                         decision.message_stream_cursors,
@@ -7118,18 +7318,16 @@ impl Worker {
                     .await;
                 if let Err(error) = completion {
                     if !workflow_task_completion_is_terminal_timeout(
-                        &error,
-                        &task_id,
-                        attempt,
-                        run_id.as_deref(),
+                        &error, task_id, attempt, run_id,
                     ) {
                         return Err(error);
                     }
                 }
             }
+            Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
             Err(error) => {
                 self.client
-                    .fail_workflow_task(&task_id, &lease_owner, attempt, error.to_string())
+                    .fail_workflow_task(task_id, lease_owner, attempt, error.to_string())
                     .await?;
             }
         }
@@ -7149,6 +7347,9 @@ impl Worker {
     }
 
     async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
+        if self.cooperative_cancellation_enabled {
+            return self.poll_cooperative_activity_once().await;
+        }
         let poll_request_id = unique_request_id("rust-activity-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -7219,14 +7420,43 @@ impl Worker {
     }
 
     async fn poll_activities_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
-        while !stop.load(Ordering::SeqCst) {
-            if self.poll_activity_once().await? == ManagedPollOutcome::Stop {
-                stop.store(true, Ordering::SeqCst);
-                break;
+        // Each lane retains its leased response through callback settlement.
+        // A bounded independent activity must not occupy the cleanup lane too.
+        // Preserve the existing serial loop for default protocol 1.19 workers.
+        let lane_count = if self.cooperative_cancellation_enabled {
+            self.max_concurrent_activity_tasks
+        } else {
+            1
+        };
+        let mut lanes = FuturesUnordered::new();
+        for _ in 0..lane_count {
+            let worker = self.clone();
+            let stop = Arc::clone(&stop);
+            lanes.push(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    match worker.poll_activity_once().await {
+                        Ok(ManagedPollOutcome::Stop) => {
+                            stop.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(error) => {
+                            stop.store(true, Ordering::SeqCst);
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            });
+        }
+        // Join every lane before deregistration, including after one fails.
+        let mut first_error = None;
+        while let Some(result) = lanes.next().await {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
-
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {
@@ -7518,7 +7748,18 @@ impl Worker {
                 };
                 let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone());
                 let mut cx = TaskContext::from_waker(noop_waker_ref());
-                match invocation.future.as_mut().poll(&mut cx) {
+                let outcome = {
+                    let _replay = cancellation_replay_clock::ReplayGuard::enter(&workflow_context)
+                        .map_err(|error| {
+                            QueryTaskExecutionFailure::new(
+                                "query_workflow_state_unavailable",
+                                error.to_string(),
+                                "QueryWorkflowStateUnavailable",
+                            )
+                        })?;
+                    invocation.future.as_mut().poll(&mut cx)
+                };
+                match outcome {
                     Poll::Ready(Ok(_)) => {
                         workflow_context
                             .ensure_history_consumed()
@@ -7592,13 +7833,43 @@ impl Worker {
     }
 
     fn execute_workflow_task_decision(&self, task: WorkflowTask) -> Result<WorkflowTaskDecision> {
-        validate_workflow_task_payloads(&task)?;
+        self.execute_workflow_task_decision_with_cancellation(task, None)
+    }
 
+    fn execute_workflow_task_decision_with_cancellation(
+        &self,
+        task: WorkflowTask,
+        observation: Option<&CancellationRequest>,
+    ) -> Result<WorkflowTaskDecision> {
+        validate_workflow_task_payloads(&task)?;
+        cooperative_cancellation::assert_cancellation_scope_replay_supported(&task.history_events)?;
+        let cancellation_history = if let Some(observation) = observation {
+            observation.validate_observation()?;
+            cooperative_cancellation::cancellation_claim(&task)?;
+            let canonical = CancellationHistory::from_events(
+                &task.history_events,
+                task.run_id.as_deref().unwrap_or_default(),
+                Some(observation),
+            )?;
+            if canonical.request_index >= task.history_events.len() {
+                return Err(Error::InvalidCooperativeCancellation(
+                    "workflow replay requires the observed canonical request".into(),
+                ));
+            }
+            Some(canonical)
+        } else {
+            None
+        };
         if let Some(update_id) = task
             .workflow_update_id
             .as_deref()
             .filter(|update_id| !update_id.is_empty())
         {
+            CancellationHistory::from_events(
+                &task.history_events,
+                task.run_id.as_deref().unwrap_or_default(),
+                None,
+            )?;
             return self
                 .execute_update_task(&task, update_id)
                 .map(WorkflowTaskDecision::without_message_streams);
@@ -7634,13 +7905,41 @@ impl Worker {
         )?;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
-        workflow_state.cancel_requested = task.cancel_requested;
+        if let Some(canonical) = cancellation_history {
+            workflow_state.cancellation_history = canonical;
+            workflow_state.cancellation_delivery_enabled = true;
+        }
+        if workflow_state.cancellation_history.request.is_none() {
+            workflow_state.cancel_requested = task.cancel_requested;
+        }
         let state = Arc::new(Mutex::new(workflow_state));
         let ctx = WorkflowContext { state };
         let mut future = (workflow.execute)(ctx.clone(), input);
         let mut cx = TaskContext::from_waker(noop_waker_ref());
 
-        match future.as_mut().poll(&mut cx) {
+        let outcome = {
+            let _replay = cancellation_replay_clock::ReplayGuard::enter(&ctx)?;
+            future.as_mut().poll(&mut cx)
+        };
+        if ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .cancellation_delivery_intent
+            .is_some()
+        {
+            // A private delivery intent never becomes an application error.
+            // Even a custom future which ignores a pending durable call cannot
+            // publish terminal commands before canonical delivery and replay.
+            if let Poll::Ready(Err(error)) = outcome {
+                if workflow_task_integrity_error(&error) {
+                    return Err(error);
+                }
+            }
+            return self.message_stream_decision(&ctx, ctx.take_commands()?);
+        }
+
+        match outcome {
             Poll::Ready(Ok(result)) => {
                 ctx.ensure_history_consumed()?;
                 let result = encode_typed_envelope(&result, &task.payload_codec)?;
@@ -7693,11 +7992,54 @@ impl Worker {
         ctx: &WorkflowContext,
         commands: Vec<Value>,
     ) -> Result<WorkflowTaskDecision> {
+        if !self.cooperative_cancellation_enabled
+            && commands.iter().any(|command| {
+                command["type"] == "schedule_activity"
+                    && command.get("cancellation_policy").is_some()
+            })
+        {
+            return Err(Error::CooperativeCancellationUnavailable(format!(
+                "activity_cancellation_policy_not_supported: Rust worker {} must enable cooperative cancellation with worker protocol 1.20 and a compatible Server/Native backend",
+                self.worker_id,
+            )));
+        }
+        if !self.cooperative_cancellation_enabled
+            && commands.iter().any(|command| {
+                command["type"] == "start_child_workflow"
+                    && (command["parent_close_policy"] == "request_cancellation"
+                        || matches!(
+                            command["cancellation_policy"].as_str(),
+                            Some("try_cancel" | "wait_cancellation_completed")
+                        ))
+            })
+        {
+            return Err(Error::CooperativeCancellationUnavailable(format!(
+                "child_cancellation_policy_not_supported: Rust worker {} must enable cooperative cancellation with worker protocol 1.20 and a compatible Server/Native backend",
+                self.worker_id,
+            )));
+        }
         let (message_stream_cursors, message_stream_waits) = ctx.message_stream_metadata()?;
+        let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+        if state.cancellation_delivery_intent.is_some()
+            && commands.len() != state.cancellation_delivery_command_count
+        {
+            return Err(invalid_recorded_history(
+                "cooperative_cancellation_pending_call_escaped",
+                state
+                    .cancellation_delivery_intent
+                    .as_ref()
+                    .expect("pending delivery")
+                    .sequence,
+                "only commands preceding the pending cancellation call",
+                "commands authored after a suspended call",
+                "workflow code cannot publish work beyond an uncommitted cancellation boundary",
+            ));
+        }
         Ok(WorkflowTaskDecision {
             commands,
             message_stream_cursors,
             message_stream_waits,
+            cancellation_delivery: state.cancellation_delivery_intent.clone(),
         })
     }
 
@@ -7792,6 +8134,7 @@ impl Worker {
             attempt_number: task.attempt_number,
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
+            claim_guard: None,
         };
 
         handler(ctx, args).await
@@ -8515,10 +8858,11 @@ impl WorkflowContext {
         Saga::new(self.clone())
     }
 
-    /// Whether this task carries a cooperative cancellation request.
+    /// Whether cancellation has reached this replay's authored boundary.
     ///
     /// Server's current `/cancel` route is terminal and does not set this flag.
-    /// Service-mode cooperative cancellation is not yet available.
+    /// A canonical service request remains pending until its committed delivery
+    /// is consumed. Request observation alone does not authorize an exception.
     pub fn is_cancellation_requested(&self) -> Result<bool> {
         let state = self
             .state
@@ -8532,10 +8876,12 @@ impl WorkflowContext {
     /// Passing this result to [`Saga::finish`] compensates already registered
     /// forward steps before the cancellation remains the initiating outcome.
     pub fn throw_if_cancellation_requested(&self) -> Result<()> {
-        if self.is_cancellation_requested()? {
-            return Err(Error::WorkflowCancellationRequested(
-                WorkflowCancellationRequested,
-            ));
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if state.cancel_requested && state.cancellation_shield_depth == 0 {
+            return Err(state.cancellation_error());
         }
         Ok(())
     }
@@ -9269,6 +9615,20 @@ impl WorkflowContext {
                 "workflow completed before consuming all recorded durable commands",
             )));
         }
+        if let Some(delivery) = state
+            .cancellation_history
+            .delivery
+            .as_ref()
+            .filter(|_| !state.cancellation_consumed)
+        {
+            return Err(invalid_recorded_history(
+                "cooperative_cancellation_unconsumed",
+                delivery.sequence,
+                "committed cancellation call",
+                "workflow completion",
+                "workflow completed without reaching its committed cancellation boundary",
+            ));
+        }
         if let Some(sequence) = state
             .recorded_continue_as_new_sequence
             .filter(|_| !state.continue_as_new_consumed)
@@ -9328,6 +9688,13 @@ struct WorkflowState {
     history_events: Arc<Vec<HistoryEvent>>,
     history_budget: WorkflowHistoryBudget,
     cancel_requested: bool,
+    cancellation_history: CancellationHistory,
+    cancellation_consumed: bool,
+    cancellation_clock: Option<cancellation_replay_clock::ReplayClock>,
+    cancellation_shield_depth: u64,
+    cancellation_delivery_enabled: bool,
+    cancellation_delivery_intent: Option<CancellationDelivery>,
+    cancellation_delivery_command_count: usize,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
     selection_markers: Vec<SelectionMarker>,
@@ -9373,14 +9740,20 @@ impl WorkflowState {
         payload_codec: String,
         resume_signal: Option<ResumeSignal>,
     ) -> Result<Self> {
-        let recorded_commands = recorded_commands(
+        cooperative_cancellation::assert_cancellation_scope_replay_supported(&history)?;
+        let cancellation_history = CancellationHistory::from_events(
+            &history,
+            run_id.as_deref().unwrap_or_default(),
+            None,
+        )?;
+        let recorded_commands = cancellation_history.bind_commands(recorded_commands(
             &history,
             &payload_codec,
             WorkflowIdentity {
                 workflow_id: workflow_id.clone(),
                 run_id: run_id.clone(),
             },
-        )?;
+        )?)?;
         let selection_markers = recorded_selection_markers(&history)?;
         let cancelled_selection_members = recorded_selection_cancellations(&history)?;
         let recorded_continue_as_new = history
@@ -9457,6 +9830,17 @@ impl WorkflowState {
                 "WorkflowCancellationRequested" | "WorkflowCancelRequested"
             )
         });
+        let cancellation_clock = cancellation_history
+            .request
+            .as_ref()
+            .and_then(|request| request.context.as_ref())
+            .map(|_| {
+                cancellation_replay_clock::ReplayClock::new(
+                    &history,
+                    &recorded_commands,
+                    cancellation_history.delivery_index,
+                )
+            });
         Ok(Self {
             workflow_command_identity: String::new(),
             workflow_stream_command_counter: 0,
@@ -9470,6 +9854,13 @@ impl WorkflowState {
                 ..WorkflowHistoryBudget::default()
             },
             cancel_requested,
+            cancellation_history,
+            cancellation_consumed: false,
+            cancellation_clock,
+            cancellation_shield_depth: 0,
+            cancellation_delivery_enabled: false,
+            cancellation_delivery_intent: None,
+            cancellation_delivery_command_count: 0,
             resume_signal,
             recorded_commands,
             selection_markers,
@@ -9555,9 +9946,20 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
 
 #[derive(Clone, Debug)]
 enum RecordedCommand {
+    CancellationGroup {
+        sequence: u64,
+        span: u64,
+        original: Vec<RecordedCommand>,
+    },
+    CancellationBoundary {
+        sequence: u64,
+        call_kind: CancellationCallKind,
+        original: Option<Box<RecordedCommand>>,
+    },
     Activity {
         sequence: u64,
         activity_type: Option<String>,
+        cancellation_policy: String,
         options: Option<RecordedActivityOptions>,
         outcome: Option<ActivityOutcome>,
         parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
@@ -9571,6 +9973,7 @@ enum RecordedCommand {
     ChildWorkflow {
         sequence: u64,
         workflow_type: Option<String>,
+        policies: RecordedChildPolicies,
         outcome: Option<ChildWorkflowOutcome>,
         parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
@@ -9909,6 +10312,161 @@ struct RecordedActivityOptions {
     retry_policy: ActivityRetrySnapshot,
 }
 
+#[derive(Clone, Debug)]
+struct RecordedChildPolicies {
+    parent_close_policy: String,
+    cancellation_policy: String,
+}
+
+fn recorded_activity_cancellation_policy(
+    events: &[&HistoryEvent],
+    sequence: u64,
+) -> Result<String> {
+    let mut policy: Option<String> = None;
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "ActivityScheduled"
+                | "ActivityStarted"
+                | "ActivityCompleted"
+                | "ActivityFailed"
+                | "ActivityTimedOut"
+                | "ActivityCancelled"
+        )
+    }) {
+        for source in [Some(&event.payload), event.payload.get("activity")]
+            .into_iter()
+            .flatten()
+        {
+            let Some(value) = source.get("cancellation_policy") else {
+                continue;
+            };
+            let Some(incoming @ ("try_cancel" | "wait_cancellation_completed" | "abandon")) =
+                value.as_str()
+            else {
+                return Err(invalid_recorded_history(
+                    "invalid_activity_cancellation_policy_history",
+                    sequence,
+                    "supported Activity cancellation policy",
+                    &value.to_string(),
+                    "Activity history contains an invalid cancellation policy",
+                ));
+            };
+            if let Some(previous) = policy.as_deref() {
+                if previous != incoming {
+                    return Err(invalid_recorded_history(
+                        "activity_cancellation_policy_history_conflict",
+                        sequence,
+                        previous,
+                        incoming,
+                        "Activity cancellation policy changed between history events",
+                    ));
+                }
+            }
+            policy = Some(incoming.to_string());
+        }
+        policy.get_or_insert_with(|| "try_cancel".to_string());
+    }
+    Ok(policy.unwrap_or_else(|| "try_cancel".to_string()))
+}
+
+fn recorded_child_policy_value<'a>(
+    payload: &'a Value,
+    field: &str,
+    sequence: u64,
+) -> Result<Option<&'a str>> {
+    let Some(value) = payload.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let valid = match (field, value.as_str()) {
+        (
+            "parent_close_policy",
+            Some("abandon" | "request_cancel" | "request_cancellation" | "terminate"),
+        ) => true,
+        ("cancellation_policy", Some("abandon" | "try_cancel" | "wait_cancellation_completed")) => {
+            true
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(invalid_recorded_history(
+            "invalid_child_workflow_policy_history",
+            sequence,
+            "supported child workflow policy",
+            &value.to_string(),
+            "child workflow history contains an invalid policy",
+        ));
+    }
+    Ok(value.as_str())
+}
+
+fn recorded_child_policies(
+    events: &[&HistoryEvent],
+    scheduled: &HistoryEvent,
+    sequence: u64,
+) -> Result<RecordedChildPolicies> {
+    let parent_close_policy =
+        recorded_child_policy_value(&scheduled.payload, "parent_close_policy", sequence)?
+            .unwrap_or("abandon")
+            .to_string();
+    let cancellation_policy =
+        recorded_child_policy_value(&scheduled.payload, "cancellation_policy", sequence)?
+            .unwrap_or("abandon")
+            .to_string();
+    for event in events {
+        for (field, expected) in [
+            ("parent_close_policy", parent_close_policy.as_str()),
+            ("cancellation_policy", cancellation_policy.as_str()),
+        ] {
+            if let Some(actual) = recorded_child_policy_value(&event.payload, field, sequence)? {
+                if actual != expected {
+                    return Err(invalid_recorded_history(
+                        "child_workflow_policy_history_conflict",
+                        sequence,
+                        expected,
+                        actual,
+                        "child workflow policy changed between history events",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(RecordedChildPolicies {
+        parent_close_policy,
+        cancellation_policy,
+    })
+}
+
+fn ensure_child_policies_match(
+    sequence: u64,
+    recorded: &RecordedChildPolicies,
+    current: &ChildWorkflowOptions,
+) -> Result<()> {
+    for (field, expected, actual) in [
+        (
+            "parent_close_policy",
+            recorded.parent_close_policy.as_str(),
+            current.parent_close_policy.as_str(),
+        ),
+        (
+            "cancellation_policy",
+            recorded.cancellation_policy.as_str(),
+            current.cancellation_policy.as_str(),
+        ),
+    ] {
+        if expected != actual {
+            return Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                "child_workflow_policy_changed",
+                Some(sequence),
+                Some(expected.to_string()),
+                Some(actual.to_string()),
+                format!("child workflow {field} changed during replay"),
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 enum RecordedSnapshotValue<T> {
     /// Older history did not persist this field, so it cannot constrain replay.
@@ -10068,7 +10626,9 @@ fn activity_options_description(options: &RecordedActivityOptions) -> String {
 impl RecordedCommand {
     fn sequence(&self) -> u64 {
         match self {
-            Self::Activity { sequence, .. }
+            Self::CancellationGroup { sequence, .. }
+            | Self::CancellationBoundary { sequence, .. }
+            | Self::Activity { sequence, .. }
             | Self::Timer { sequence, .. }
             | Self::ChildWorkflow { sequence, .. }
             | Self::SignalWait { sequence, .. }
@@ -10082,6 +10642,9 @@ impl RecordedCommand {
 
     fn shape(&self) -> &'static str {
         match self {
+            Self::CancellationBoundary { .. } | Self::CancellationGroup { .. } => {
+                "cooperative cancellation"
+            }
             Self::Activity { .. } => "activity",
             Self::Timer { .. } => "timer",
             Self::ChildWorkflow { .. } => "child workflow",
@@ -10577,6 +11140,7 @@ impl ParallelLeafCall {
 
 struct ParallelLeaf {
     call: ParallelLeafCall,
+    sequence: u64,
     member_path: Vec<usize>,
     group_path: Vec<ParallelGroupMetadata>,
     result: Option<ParallelAvroResult>,
@@ -10634,7 +11198,17 @@ impl ParallelCall {
             }
         };
 
-        self.leaves = parallel_descriptors(operations, base_sequence)?
+        let descriptors = parallel_descriptors(operations, base_sequence)?;
+        {
+            let mut state = self
+                .ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            state.expand_cancellation_group(&descriptors)?;
+            state.prepare_group_cancellation(&descriptors)?;
+        }
+        self.leaves = descriptors
             .into_iter()
             .map(|descriptor| {
                 let call = parallel_leaf_call(
@@ -10644,6 +11218,7 @@ impl ParallelCall {
                 );
                 ParallelLeaf {
                     call,
+                    sequence: base_sequence + descriptor.offset as u64,
                     member_path: descriptor.member_path,
                     group_path: descriptor.group_path,
                     result: None,
@@ -10686,6 +11261,22 @@ impl ParallelCall {
             {
                 return Poll::Ready(Err(failures.remove(position).1));
             }
+            if self
+                .ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?
+                .cancellation_delivery_intent
+                .is_some()
+            {
+                return Poll::Pending;
+            }
+            if let Some(position) = failures
+                .iter()
+                .position(|(_, error)| matches!(error, Error::CooperativeCancellationRequested(_)))
+            {
+                return Poll::Ready(Err(failures.remove(position).1));
+            }
             failures.sort_by_key(|(index, _)| *index);
             let (failed_index, cause) = failures.remove(0);
             let failed = &self.leaves[failed_index];
@@ -10707,6 +11298,16 @@ impl ParallelCall {
                 .first()
                 .map(|entry| entry.parallel_group_id.clone())
                 .unwrap_or_default();
+            let sequences = self
+                .leaves
+                .iter()
+                .map(|leaf| leaf.sequence)
+                .collect::<Vec<_>>();
+            self.ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?
+                .advance_cancellation_sequences(&sequences, Some(failed.sequence));
             return Poll::Ready(Err(Error::ParallelFailed(ParallelFailure {
                 group_id,
                 member_path: failed.member_path.clone(),
@@ -10715,7 +11316,15 @@ impl ParallelCall {
                 cause: Box::new(cause),
             })));
         }
-        if pending {
+        if pending
+            || self
+                .ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?
+                .cancellation_delivery_intent
+                .is_some()
+        {
             return Poll::Pending;
         }
 
@@ -10729,6 +11338,16 @@ impl ParallelCall {
             self.shape.as_ref().expect("initialized parallel shape"),
             &mut flat_results,
         );
+        let sequences = self
+            .leaves
+            .iter()
+            .map(|leaf| leaf.sequence)
+            .collect::<Vec<_>>();
+        self.ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .advance_cancellation_sequences(&sequences, None);
         Poll::Ready(Ok(match results {
             ParallelAvroResult::Group(results) => results,
             ParallelAvroResult::Activity(_)
@@ -11074,7 +11693,12 @@ impl SelectCall {
                 .state
                 .lock()
                 .map_err(|_| Error::WorkflowStatePoisoned)?;
-            if let Some(marker) = state.selection_markers.get(state.selection_marker_cursor) {
+            if let Some(RecordedCommand::CancellationGroup { sequence, .. }) =
+                state.recorded_commands.get(state.command_cursor)
+            {
+                *sequence
+            } else if let Some(marker) = state.selection_markers.get(state.selection_marker_cursor)
+            {
                 marker.selection_group_base_sequence
             } else if let Some(recorded) = state.recorded_commands.get(state.command_cursor) {
                 recorded.sequence()
@@ -11091,6 +11715,15 @@ impl SelectCall {
         };
         let (descriptors, members) = selection_descriptors(operations, base_sequence)?;
         let group_id = format!("select-calls:{base_sequence}:{}", descriptors.len());
+        {
+            let mut state = self
+                .ctx
+                .state
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?;
+            state.expand_cancellation_group(&descriptors)?;
+            state.prepare_group_cancellation(&descriptors)?;
+        }
         self.leaves = descriptors
             .into_iter()
             .map(|descriptor| SelectionLeaf {
@@ -11128,6 +11761,31 @@ impl Future for SelectCall {
                 }
                 leaf.outcome = Some(outcome);
             }
+        }
+
+        if self
+            .ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .cancellation_delivery_intent
+            .is_some()
+        {
+            return Poll::Pending;
+        }
+
+        if let Some(leaf) = self.leaves.iter_mut().find(|leaf| {
+            matches!(
+                leaf.outcome,
+                Some(Err(Error::CooperativeCancellationRequested(_)))
+            )
+        }) {
+            return Poll::Ready(
+                leaf.outcome
+                    .take()
+                    .expect("matched cancellation")
+                    .map(|_| unreachable!()),
+            );
         }
 
         let all_members_terminal = self.leaves.iter().all(|leaf| leaf.outcome.is_some());
@@ -11335,6 +11993,11 @@ impl Future for SelectCall {
             None
         };
         let winner = handles[member_position].clone();
+        self.ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .advance_cancellation_selection(&marker.selection_group_id);
         Poll::Ready(Ok(SelectionResult {
             key: winner.key.clone(),
             index: winner.index,
@@ -11654,7 +12317,9 @@ fn recorded_selection_member_is_terminal(
             RecordedCommand::SearchAttributes { .. }
             | RecordedCommand::SideEffect { .. }
             | RecordedCommand::VersionMarker { .. }
-            | RecordedCommand::Memo { .. } => false,
+            | RecordedCommand::Memo { .. }
+            | RecordedCommand::CancellationBoundary { .. }
+            | RecordedCommand::CancellationGroup { .. } => false,
         };
         if !terminal {
             all_completed = false;
@@ -11743,14 +12408,26 @@ impl Future for DurableOperationAwaitCall {
     type Output = Result<ParallelResult>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        let state = match self.handle.ctx.state.lock() {
+        let mut state = match self.handle.ctx.state.lock() {
             Ok(state) => state,
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
+        if let Err(error) = state.replay_selection_handle_cancellation(&self.handle) {
+            return Poll::Ready(Err(error));
+        }
+        match state.prepare_selection_handle_cancellation(&self.handle) {
+            Ok(true) => return Poll::Pending,
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
         match selection_cancellation_for_handle(&state, &self.handle) {
             Err(error) => return Poll::Ready(Err(error)),
             Ok(false) => {}
             Ok(true) => {
+                state.advance_cancellation_receipt(
+                    &self.handle.selection_group_id,
+                    self.handle.base_sequence,
+                );
                 return Poll::Ready(Err(Error::DurableOperationCancelled(
                     DurableOperationCancelled {
                         selection_group_id: self.handle.selection_group_id.clone(),
@@ -11763,11 +12440,75 @@ impl Future for DurableOperationAwaitCall {
             }
         }
         match recorded_selection_member_outcome(&state, &self.handle) {
-            Ok(Some(result)) => Poll::Ready(Ok(result)),
+            Ok(Some(result)) => {
+                state.advance_cancellation_handle(&self.handle, false);
+                Poll::Ready(Ok(result))
+            }
             Ok(None) => Poll::Pending,
-            Err(error) => Poll::Ready(Err(error)),
+            Err(error) => {
+                if !workflow_task_integrity_error(&error) {
+                    state.advance_cancellation_handle(&self.handle, true);
+                }
+                Poll::Ready(Err(error))
+            }
         }
     }
+}
+
+fn validate_selection_delivery_handle(
+    state: &WorkflowState,
+    handle: &DurableOperationHandle,
+) -> Result<()> {
+    let path = state
+        .recorded_commands
+        .iter()
+        .find(|command| command.sequence() == handle.base_sequence)
+        .and_then(|command| match command {
+            RecordedCommand::Activity {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::ChildWorkflow {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::Timer {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::SignalWait {
+                parallel_group_path,
+                ..
+            }
+            | RecordedCommand::ConditionWait {
+                parallel_group_path,
+                ..
+            } => parallel_group_path.as_ref(),
+            _ => None,
+        })
+        .and_then(|path| path.first());
+    let matches = path.is_some_and(|entry| {
+        entry.parallel_group_mode.as_deref() == Some("select")
+            && entry.parallel_group_id == handle.selection_group_id
+            && entry.selection_member_key.as_ref() == Some(&handle.key)
+            && entry.selection_member_index == Some(handle.index)
+            && entry.selection_member_base_sequence == Some(handle.base_sequence)
+            && entry.selection_member_size == Some(handle.size)
+            && entry.selection_member_kind.as_deref() == Some(handle.kind.as_str())
+    });
+    if !matches
+        || selection_operation_identity(state, &handle.kind, handle.base_sequence, handle.size)
+            != handle.identity
+    {
+        return Err(invalid_recorded_history(
+            "cooperative_cancellation_call_mismatch",
+            handle.base_sequence,
+            "selection handle matching its authored durable identity",
+            &format!("{handle:?}"),
+            "selection handle identity or member metadata changed before cancellation replay",
+        ));
+    }
+    Ok(())
 }
 
 /// Future returned by [`DurableOperationHandle::cancel`].
@@ -11787,7 +12528,13 @@ impl Future for CancelDurableOperationCall {
         };
         match selection_cancellation_for_handle(&state, &self.handle) {
             Err(error) => return Poll::Ready(Err(error)),
-            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(true) => {
+                state.advance_cancellation_receipt(
+                    &self.handle.selection_group_id,
+                    self.handle.base_sequence,
+                );
+                return Poll::Ready(Ok(()));
+            }
             Ok(false) => {}
         }
         if recorded_selection_member_is_terminal(&state, &self.handle) {
@@ -11889,6 +12636,10 @@ impl Saga {
 
     /// Compensate `initiating_failure` and return the failure that must remain.
     pub async fn compensate(mut self, initiating_failure: Error) -> Error {
+        let _shield = match self.ctx.cancellation_shield() {
+            Ok(shield) => shield,
+            Err(error) => return error,
+        };
         while let Some(compensation) = self.compensations.pop() {
             if let Err(compensation_failure) = self
                 .ctx
@@ -11964,16 +12715,38 @@ impl ActivityCall {
             retry_policy: current_activity_retry_snapshot(&options),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded =
+            match state.cancellation_replay_command(cursor, CancellationCallKind::Activity) {
+                Ok(recorded) => recorded,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+        if let Some(recorded) = recorded {
             let sequence = recorded.sequence();
             match recorded {
                 RecordedCommand::Activity {
                     activity_type,
+                    cancellation_policy,
                     options: recorded_options,
                     outcome,
                     parallel_group_path,
                     ..
                 } => {
+                    let current_policy = options
+                        .cancellation_policy
+                        .unwrap_or(CancellationPolicy::TryCancel)
+                        .as_str();
+                    if cancellation_policy != current_policy {
+                        return Poll::Ready(Err(Error::NonDeterministicReplay(
+                            ReplayFailure::new(
+                                "activity_cancellation_policy_changed",
+                                Some(sequence),
+                                Some(cancellation_policy),
+                                Some(current_policy.to_string()),
+                                "Activity cancellation policy changed during replay",
+                            ),
+                        )));
+                    }
                     if let Err(error) = ensure_parallel_path_matches(
                         sequence,
                         parallel_group_path.as_deref(),
@@ -12038,8 +12811,26 @@ impl ActivityCall {
                             )));
                         }
                     }
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Activity)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                    match state.prepare_scalar_cancellation(
+                        cursor,
+                        CancellationCallKind::Activity,
+                        &self.parallel_group_path,
+                    ) {
+                        Ok(true) => {
+                            self.scheduled = true;
+                            return Poll::Pending;
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
                     state.command_cursor += 1;
                     if let Some(outcome) = outcome {
+                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(outcome.map_err(Error::ActivityFailed));
                     }
                     state.matched_recorded_pending = true;
@@ -12094,7 +12885,22 @@ impl ActivityCall {
             if let Some(retry_policy) = options.retry_policy {
                 command.insert("retry_policy".to_string(), retry_policy);
             }
+            if let Some(policy) = options.cancellation_policy {
+                command.insert("cancellation_policy".to_string(), json!(policy.as_str()));
+            }
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            match state.prepare_scalar_cancellation(
+                cursor,
+                CancellationCallKind::Activity,
+                &self.parallel_group_path,
+            ) {
+                Ok(true) => {
+                    self.scheduled = true;
+                    return Poll::Pending;
+                }
+                Ok(false) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
             state.commands.push(Value::Object(command));
             self.scheduled = true;
         }
@@ -12141,7 +12947,13 @@ impl Future for TimerCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Timer)
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if let Some(recorded) = recorded {
             match recorded {
                 RecordedCommand::Timer {
                     sequence,
@@ -12168,8 +12980,27 @@ impl Future for TimerCall {
                             ),
                         )));
                     }
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Timer)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                    match state.prepare_scalar_cancellation(
+                        cursor,
+                        CancellationCallKind::Timer,
+                        &self.parallel_group_path,
+                    ) {
+                        Ok(true) => {
+                            self.scheduled = true;
+                            self.matched_pending = true;
+                            return Poll::Pending;
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
                     state.command_cursor += 1;
                     if fired {
+                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(Ok(()));
                     }
                     state.matched_recorded_pending = true;
@@ -12187,6 +13018,19 @@ impl Future for TimerCall {
                 ("delay_seconds".to_string(), json!(requested_delay)),
             ]);
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            match state.prepare_scalar_cancellation(
+                cursor,
+                CancellationCallKind::Timer,
+                &self.parallel_group_path,
+            ) {
+                Ok(true) => {
+                    self.scheduled = true;
+                    self.matched_pending = true;
+                    return Poll::Pending;
+                }
+                Ok(false) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
             state.commands.push(Value::Object(command));
             self.scheduled = true;
         }
@@ -12246,7 +13090,14 @@ impl Future for ConditionWaitCall {
                 Ok(state) => state,
                 Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
             };
-            let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() else {
+            let initial_cursor = state.command_cursor;
+            let recorded = match state
+                .cancellation_replay_command(initial_cursor, CancellationCallKind::Condition)
+            {
+                Ok(recorded) => recorded,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let Some(recorded) = recorded else {
                 drop(state);
                 return self.poll_new_condition(options);
             };
@@ -12256,37 +13107,52 @@ impl Future for ConditionWaitCall {
 
             let mut cursor = state.command_cursor;
             let mut result = None;
+            let mut pending_delivery = false;
             loop {
+                if cursor > initial_cursor
+                    && matches!(
+                        state.recorded_commands.get(cursor),
+                        Some(RecordedCommand::CancellationBoundary { original: None, .. })
+                    )
+                {
+                    break;
+                }
+                let recorded = match state
+                    .cancellation_replay_command(cursor, CancellationCallKind::Condition)
+                {
+                    Ok(recorded) => recorded,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
                 let Some(RecordedCommand::ConditionWait {
                     sequence,
-                    occurrence_id: recorded_occurrence_id,
-                    condition_key,
-                    predicate_identity,
+                    occurrence_id: ref recorded_occurrence_id,
+                    ref condition_key,
+                    ref predicate_identity,
                     timeout_seconds,
                     result: recorded_result,
-                    parallel_group_path,
+                    ref parallel_group_path,
                     ..
-                }) = state.recorded_commands.get(cursor)
+                }) = recorded
                 else {
                     break;
                 };
 
-                if cursor > state.command_cursor && recorded_occurrence_id != &occurrence_id {
+                if cursor > initial_cursor && recorded_occurrence_id != &occurrence_id {
                     break;
                 }
                 if let Err(error) = ensure_parallel_path_matches(
-                    *sequence,
+                    sequence,
                     parallel_group_path.as_deref(),
                     &self.parallel_group_path,
                 ) {
                     return Poll::Ready(Err(error));
                 }
                 if let Err(error) = validate_recorded_condition_wait(
-                    *sequence,
+                    sequence,
                     recorded_occurrence_id,
                     condition_key.as_deref(),
                     predicate_identity,
-                    *timeout_seconds,
+                    timeout_seconds,
                     &occurrence_id,
                     &options,
                 ) {
@@ -12295,16 +13161,36 @@ impl Future for ConditionWaitCall {
                 if result == Some(ConditionWaitResult::TimedOut) {
                     return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
                         "condition_wait_reopened_after_timeout",
-                        Some(*sequence),
+                        Some(sequence),
                         Some("timed-out condition is terminal".to_string()),
                         Some("another physical wait-open".to_string()),
                         "condition history reopened one logical wait after its durable timeout",
                     ))));
                 }
-                result = *recorded_result;
+                if let Err(error) =
+                    state.replay_cancellation_at(cursor, CancellationCallKind::Condition)
+                {
+                    return Poll::Ready(Err(error));
+                }
+                match state.prepare_scalar_cancellation(
+                    cursor,
+                    CancellationCallKind::Condition,
+                    &self.parallel_group_path,
+                ) {
+                    Ok(pending) => pending_delivery |= pending,
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+                result = recorded_result;
+                if result.is_some() {
+                    state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
+                }
                 cursor += 1;
             }
             state.command_cursor = cursor;
+            if pending_delivery {
+                self.opened_wait = true;
+                return Poll::Pending;
+            }
             result
         };
 
@@ -12329,6 +13215,26 @@ impl ConditionWaitCall {
         options: ValidatedConditionWaitOptions,
         recorded_wait: bool,
     ) -> Poll<Result<ConditionWaitResult>> {
+        {
+            let ctx = self.ctx.clone();
+            let mut state = match ctx.state.lock() {
+                Ok(state) => state,
+                Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+            };
+            let cursor = state.command_cursor;
+            match state.prepare_scalar_cancellation(
+                cursor,
+                CancellationCallKind::Condition,
+                &self.parallel_group_path,
+            ) {
+                Ok(true) => {
+                    self.opened_wait = true;
+                    return Poll::Pending;
+                }
+                Ok(false) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
         let selection_member = self
             .parallel_group_path
             .first()
@@ -12446,11 +13352,18 @@ impl ChildWorkflowCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Child)
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if let Some(recorded) = recorded {
             let sequence = recorded.sequence();
             match recorded {
                 RecordedCommand::ChildWorkflow {
                     workflow_type,
+                    policies,
                     outcome,
                     parallel_group_path,
                     ..
@@ -12475,8 +13388,32 @@ impl ChildWorkflowCall {
                             )));
                         }
                     }
+                    if let Err(error) =
+                        ensure_child_policies_match(sequence, &policies, &self.options)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Child)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                    match state.prepare_scalar_cancellation(
+                        cursor,
+                        CancellationCallKind::Child,
+                        &self.parallel_group_path,
+                    ) {
+                        Ok(true) => {
+                            self.scheduled = true;
+                            self.matched_pending = true;
+                            return Poll::Pending;
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
                     state.command_cursor += 1;
                     if let Some(outcome) = outcome {
+                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(outcome.map_err(Error::ChildWorkflowFailed));
                     }
                     state.matched_recorded_pending = true;
@@ -12534,6 +13471,12 @@ impl ChildWorkflowCall {
             let object = command
                 .as_object_mut()
                 .expect("child workflow command is always an object");
+            if self.options.cancellation_policy != CancellationPolicy::Abandon {
+                object.insert(
+                    "cancellation_policy".to_string(),
+                    json!(self.options.cancellation_policy.as_str()),
+                );
+            }
             if let Some(policy) = &self.options.retry_policy {
                 let mut retry_policy = serde_json::Map::new();
                 if let Some(max_attempts) = policy.max_attempts {
@@ -12568,6 +13511,19 @@ impl ChildWorkflowCall {
                 object.insert("run_timeout_seconds".to_string(), json!(seconds));
             }
             apply_parallel_group_path(object, &self.parallel_group_path);
+            match state.prepare_scalar_cancellation(
+                cursor,
+                CancellationCallKind::Child,
+                &self.parallel_group_path,
+            ) {
+                Ok(true) => {
+                    self.scheduled = true;
+                    self.matched_pending = true;
+                    return Poll::Pending;
+                }
+                Ok(false) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
             state.commands.push(command);
             self.scheduled = true;
         }
@@ -12635,7 +13591,13 @@ impl SignalCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
-        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+        let cursor = state.command_cursor;
+        let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Signal)
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if let Some(recorded) = recorded {
             match recorded {
                 RecordedCommand::SignalWait {
                     sequence,
@@ -12662,8 +13624,27 @@ impl SignalCall {
                         )));
                     }
 
+                    if let Err(error) =
+                        state.replay_cancellation_at(cursor, CancellationCallKind::Signal)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                    match state.prepare_scalar_cancellation(
+                        cursor,
+                        CancellationCallKind::Signal,
+                        &self.parallel_group_path,
+                    ) {
+                        Ok(true) => {
+                            self.opened_wait = true;
+                            self.matched_pending = true;
+                            return Poll::Pending;
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
                     state.command_cursor += 1;
                     if let Some(value) = value {
+                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(Ok(value));
                     }
                     if state
@@ -12675,6 +13656,7 @@ impl SignalCall {
                             .resume_signal
                             .take()
                             .expect("matching resume signal is present");
+                        state.unavailable_cancellation_boundary(&self.parallel_group_path);
                         return Poll::Ready(Ok(signal.arguments));
                     }
 
@@ -12692,6 +13674,20 @@ impl SignalCall {
             }
         }
 
+        match state.prepare_scalar_cancellation(
+            cursor,
+            CancellationCallKind::Signal,
+            &self.parallel_group_path,
+        ) {
+            Ok(true) => {
+                self.opened_wait = true;
+                self.matched_pending = true;
+                return Poll::Pending;
+            }
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+
         if state
             .resume_signal
             .as_ref()
@@ -12701,6 +13697,7 @@ impl SignalCall {
                 .resume_signal
                 .take()
                 .expect("matching resume signal is present");
+            state.unavailable_cancellation_boundary(&self.parallel_group_path);
             return Poll::Ready(Ok(signal.arguments));
         }
 
@@ -12745,10 +13742,14 @@ pub struct ActivityContext {
     pub attempt_number: u64,
     pub task_queue: String,
     pub worker_id: String,
+    claim_guard: Option<cooperative_cancellation::ActivityClaimGuard>,
 }
 
 impl ActivityContext {
     pub async fn heartbeat<T: Serialize>(&self, details: T) -> Result<ActivityHeartbeatResponse> {
+        if let Some(guard) = &self.claim_guard {
+            return guard.heartbeat(self, details).await;
+        }
         self.client
             .heartbeat_activity_task(
                 &self.task_id,
@@ -13269,6 +14270,7 @@ fn recorded_commands(
         let is_child_workflow = matches!(
             event.event_type.as_str(),
             "ChildWorkflowScheduled"
+                | "ChildRunStarted"
                 | "ChildRunCompleted"
                 | "ChildRunFailed"
                 | "ChildRunCancelled"
@@ -13499,6 +14501,7 @@ fn recorded_commands(
                 return Ok(RecordedCommand::Activity {
                     sequence,
                     activity_type,
+                    cancellation_policy: recorded_activity_cancellation_policy(&activity_events, sequence)?,
                     options,
                     outcome,
                     parallel_group_path,
@@ -13521,6 +14524,7 @@ fn recorded_commands(
                         "child workflow replay requires exactly one recorded schedule event",
                     ));
                 }
+                let policies = recorded_child_policies(&child_events, scheduled[0], sequence)?;
                 let workflow_type = child_events.iter().find_map(|event| {
                     event
                         .payload
@@ -13578,6 +14582,7 @@ fn recorded_commands(
                 return Ok(RecordedCommand::ChildWorkflow {
                     sequence,
                     workflow_type,
+                    policies,
                     outcome: outcomes.pop(),
                     parallel_group_path,
                 });
@@ -14766,6 +15771,12 @@ fn workflow_failure_command(
             "durable_workflow::WorkflowCancellationRequested",
             json!({"reason": "cancelled"}),
         ),
+        Error::CooperativeCancellationRequested(cancellation) => (
+            "WorkflowCancellationRequested",
+            "durable_workflow::CooperativeCancellationRequested",
+            json!({"reason": "cancelled", "request_id": cancellation.request.request_id,
+                "cleanup_deadline_at": cancellation.request.cleanup_deadline_at}),
+        ),
         Error::NonDeterministicReplay(_) => (
             "NonDeterministicReplay",
             "durable_workflow::Error",
@@ -14780,7 +15791,9 @@ fn workflow_failure_command(
         Error::SagaCompensationFailed(failure) => {
             workflow_error_non_retryable(&failure.compensation_failure)
         }
-        Error::WorkflowCancellationRequested(_) => true,
+        Error::WorkflowCancellationRequested(_) | Error::CooperativeCancellationRequested(_) => {
+            true
+        }
         Error::NonDeterministicReplay(_) => true,
         _ => false,
     };
@@ -14821,7 +15834,9 @@ fn workflow_error_type(error: &Error) -> &'static str {
         },
         Error::ParallelFailed(_) => "ParallelFailed",
         Error::SagaCompensationFailed(_) => "SagaCompensationFailed",
-        Error::WorkflowCancellationRequested(_) => "WorkflowCancellationRequested",
+        Error::WorkflowCancellationRequested(_) | Error::CooperativeCancellationRequested(_) => {
+            "WorkflowCancellationRequested"
+        }
         Error::NonDeterministicReplay(_) => "NonDeterministicReplay",
         _ => "RustWorkflowError",
     }
@@ -14835,7 +15850,9 @@ fn workflow_error_non_retryable(error: &Error) -> bool {
         Error::SagaCompensationFailed(failure) => {
             workflow_error_non_retryable(&failure.compensation_failure)
         }
-        Error::WorkflowCancellationRequested(_) | Error::NonDeterministicReplay(_) => true,
+        Error::WorkflowCancellationRequested(_)
+        | Error::CooperativeCancellationRequested(_)
+        | Error::NonDeterministicReplay(_) => true,
         _ => false,
     }
 }
@@ -14845,6 +15862,7 @@ fn workflow_task_integrity_error(error: &Error) -> bool {
         error,
         Error::NonDeterministicReplay(_)
             | Error::Protocol(_)
+            | Error::CancellationScopeExecutionUnavailable
             | Error::MissingWorkflowCommandIdentity
             | Error::WorkflowStatePoisoned
     )
@@ -15202,6 +16220,10 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod activity_cancellation_policies;
+    mod cancellation_scope_admission;
+    mod child_workflow_policies;
+    mod cooperative_cancellation;
     mod runtime_payloads;
     mod runtime_uploads;
     use std::{
@@ -22078,6 +23100,7 @@ mod tests {
                         "child_workflow_instance_id": "wf-child",
                         "child_workflow_run_id": "run-child",
                         "child_workflow_type": "python.child",
+                        "parent_close_policy": "terminate",
                     }),
                     raw: HashMap::new(),
                 },
@@ -22301,6 +23324,7 @@ mod tests {
             }),
         );
         task.workflow_type = "rust.handled-parent".to_string();
+        task.history_events[0].payload["parent_close_policy"] = json!("abandon");
 
         let commands = worker.execute_workflow_task(task).expect("handled failure");
         assert_eq!(commands[0]["type"], "complete_workflow");

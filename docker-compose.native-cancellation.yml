@@ -1,0 +1,14 @@
+# Source qualification only. Published Composer authority is retained in the image.
+services:
+  bootstrap:
+    volumes:
+      - ${DURABLE_WORKFLOW_NATIVE_SOURCE:?exact Native checkout}:/app/vendor/durable-workflow/workflow:ro
+  server:
+    volumes:
+      - ${DURABLE_WORKFLOW_NATIVE_SOURCE:?exact Native checkout}:/app/vendor/durable-workflow/workflow:ro
+  worker:
+    volumes:
+      - ${DURABLE_WORKFLOW_NATIVE_SOURCE:?exact Native checkout}:/app/vendor/durable-workflow/workflow:ro
+  repair:
+    volumes:
+      - ${DURABLE_WORKFLOW_NATIVE_SOURCE:?exact Native checkout}:/app/vendor/durable-workflow/workflow:ro

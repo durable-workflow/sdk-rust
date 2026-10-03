@@ -408,9 +408,12 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.condition-search"
             | "corpus.condition-search-adjacent"
             | "corpus.grouped-condition-reopen"
+            | "corpus.cancellation-remaining-condition"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
             | "corpus.redrive-boundary"
+            | "corpus.child-policy-author"
+            | "corpus.activity-policy-author"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -542,6 +545,24 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 ]))
             });
         }
+        "corpus.cancellation-remaining-condition" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let _ = ctx.sleep(Duration::from_secs(10)).await;
+                let context = ctx
+                    .cancellation_context()?
+                    .expect("committed rich cancellation");
+                let _shield = ctx.cancellation_shield()?;
+                ctx.parallel(vec![
+                    ParallelOperation::timer(Duration::from_secs(1)),
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("ready", "sha256:ready"),
+                        || Ok(false),
+                    ),
+                ])
+                .await?;
+                Ok(json!(context.remaining()?.as_secs_f64()))
+            });
+        }
         "corpus.grouped-condition-reopen" => {
             worker.register_workflow(workflow_type, |ctx, _| async move {
                 ctx.parallel(vec![
@@ -609,6 +630,23 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     }
                 },
             );
+        }
+        "corpus.activity-policy-author" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.activity("work", json!([])).await?;
+                Ok(json!("unreachable"))
+            });
+        }
+        "corpus.child-policy-author" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.start_child_workflow(
+                    "child",
+                    ChildWorkflowOptions::new("regression-corpus"),
+                    json!([]),
+                )
+                .await?;
+                Ok(json!("unreachable"))
+            });
         }
         "corpus.redrive-boundary" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
