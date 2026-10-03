@@ -213,7 +213,7 @@ pub enum Error {
     #[error("workflow future yielded without emitting a durable command")]
     WorkflowYieldedWithoutCommand,
     #[error(
-        "workflow_stream_command_identity_missing: workflow stream authoring requires a non-empty server-provided workflow_command_id"
+        "workflow_stream_command_identity_missing: workflow stream authoring requires a non-empty server-provided workflow_command_id or task_id"
     )]
     MissingWorkflowCommandIdentity,
     #[error("workflow state lock is poisoned")]
@@ -7622,6 +7622,7 @@ impl Worker {
             .workflow_command_id
             .clone()
             .filter(|identity| !identity.is_empty())
+            .or_else(|| (!task.task_id.is_empty()).then(|| task.task_id.clone()))
             .unwrap_or_default();
         let mut workflow_state = WorkflowState::new_with_identity(
             task.history_events,
@@ -17268,6 +17269,70 @@ mod tests {
 
         assert!(matches!(error, Error::MissingWorkflowCommandIdentity));
         assert!(context.take_commands().expect("commands").is_empty());
+    }
+
+    #[test]
+    fn worker_stream_authoring_uses_task_identity_and_replays_without_output() {
+        let client = Client::builder("http://localhost:8080").build().unwrap();
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("streams.worker", |ctx, _| async move {
+            ctx.append_workflow_stream(
+                "output",
+                &[WorkflowStreamAppendItem::new(json!("hello"))?],
+                None,
+            )?;
+            ctx.close_workflow_stream("output", None)?;
+            Ok(json!("done"))
+        });
+        for command_id in [None, Some(String::new()), Some("command-42".to_string())] {
+            let mut task = workflow_task("streams.worker", Vec::new(), DEFAULT_CODEC);
+            task.workflow_command_id = command_id.clone();
+            let expected_identity = command_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .unwrap_or(&task.task_id)
+                .to_string();
+            let commands = worker
+                .execute_workflow_task(task)
+                .expect("ordinary worker stream output");
+            assert_eq!(commands.len(), 3);
+            assert_eq!(
+                commands[0]["workflow_stream"]["command_identity"],
+                expected_identity
+            );
+            assert_eq!(
+                commands[0]["workflow_stream"]["items"][0]["idempotency_key"],
+                format!("dw-stream:{expected_identity}:0:0")
+            );
+            assert_eq!(
+                commands[1]["workflow_stream"]["command_identity"],
+                expected_identity
+            );
+            assert_eq!(commands[1]["workflow_stream"]["operation"], "close");
+            let history = commands[..2]
+                .iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    history_event(
+                        "SideEffectRecorded",
+                        json!({"sequence":index + 1,"result":command["result"]}),
+                    )
+                })
+                .collect();
+            let mut replay = workflow_task("streams.worker", history, DEFAULT_CODEC);
+            replay.task_id = "replacement-task".to_string();
+            let replayed = worker
+                .execute_workflow_task(replay)
+                .expect("replacement worker consumes recorded stream effects");
+            assert_eq!(replayed.len(), 1);
+            assert_eq!(replayed[0]["type"], "complete_workflow");
+        }
+        let mut missing = workflow_task("streams.worker", Vec::new(), DEFAULT_CODEC);
+        missing.task_id.clear();
+        assert!(matches!(
+            worker.execute_workflow_task(missing),
+            Err(Error::MissingWorkflowCommandIdentity)
+        ));
     }
 
     #[test]
