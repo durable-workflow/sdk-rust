@@ -140,11 +140,13 @@ enum and fields to the public `ChildWorkflowOptions` and `ActivityOptions`
 structs. It also adds a total-lifetime error category to the exhaustive public
 `ActivityOptionsErrorKind` enum. Existing struct
 literals and exhaustive matches need updates. The cooperative error variants
-also extend an existing exhaustive public enum. These changes require a major
-Rust SDK release if retained. This draft does not authorize that release or
-change the published package version. The qualified release proposal must
-include its migration notes and receive the major-release decision before
-publication.
+also extend an existing exhaustive public enum. The maintainer approved Rust
+SDK 3.0.0 in the [October 3 release decision](https://github.com/durable-workflow/sdk-rust/pull/55#issuecomment-5966048960).
+The [migration and release proposal](migrating-to-v3.md) covers these source
+changes, historical defaults, upgrade order and rollback. Approval resolves the
+major-version decision. Source qualification, protocol freeze and the published
+mixed-language cancellation acceptance scenario remain release gates. The
+candidate does not change a published artifact.
 
 ## Remaining qualification
 
