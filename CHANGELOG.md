@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.5
+
+- Allow the ordinary Worker to append and close workflow streams when Server
+  supplies a durable task ID without a separate workflow command ID. Prefer an
+  explicit command ID when available. Recorded stream effects still replay
+  without producing duplicate output.
+
 ## 2.1.4
 
 - Keep fresh installations compatible with Rust 1.86 by selecting uuid 1.26.1.
