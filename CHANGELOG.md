@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.4
+
+- Keep fresh installations compatible with Rust 1.86 by selecting uuid 1.26.1.
+  The newer uuid 1.27 requires Rust 1.89.
+
 ## 2.1.3
 
 - Replay condition reopens inside parallel and keyed selection groups using
