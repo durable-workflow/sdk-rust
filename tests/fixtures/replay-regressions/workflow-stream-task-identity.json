@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-workflow-stream-task-identity",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.workflow-stream", "input": [], "payload_codec": "avro"},
+  "worker_task": {"payload_codec": "avro", "task_id": "01JTASK0000000000000000000", "workflow_command_id": null},
+  "command_sequence": [
+    {
+      "type": "record_side_effect",
+      "workflow_stream": {
+        "operation": "append", "stream_name": "tokens", "command_identity": "01JTASK0000000000000000000", "command_ordinal": 0,
+        "items": [
+          {"payload": {"token": "hello"}, "payload_codec": "avro", "idempotency_key": "dw-stream:01JTASK0000000000000000000:0:0"},
+          {"payload_reference": "s3://payloads/token-2", "idempotency_key": "dw-stream:01JTASK0000000000000000000:0:1"}
+        ]
+      },
+      "result": null
+    },
+    {"type": "record_side_effect", "workflow_stream": {"operation": "close", "stream_name": "tokens", "command_identity": "01JTASK0000000000000000000", "command_ordinal": 1}, "result": null},
+    {"type": "complete_workflow", "result": "done"}
+  ],
+  "expected": {
+    "command_sequence": [
+      {
+        "type": "record_side_effect",
+        "workflow_stream": {
+          "operation": "append", "stream_name": "tokens", "command_identity": "01JTASK0000000000000000000", "command_ordinal": 0,
+          "items": [
+            {"payload": {"token": "hello"}, "payload_codec": "avro", "idempotency_key": "dw-stream:01JTASK0000000000000000000:0:0"},
+            {"payload_reference": "s3://payloads/token-2", "idempotency_key": "dw-stream:01JTASK0000000000000000000:0:1"}
+          ]
+        },
+        "result": null
+      },
+      {"type": "record_side_effect", "workflow_stream": {"operation": "close", "stream_name": "tokens", "command_identity": "01JTASK0000000000000000000", "command_ordinal": 1}, "result": null},
+      {"type": "complete_workflow", "result": "done"}
+    ]
+  }
+}

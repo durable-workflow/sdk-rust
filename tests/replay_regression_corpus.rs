@@ -442,7 +442,10 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         return Err(format!("{fixture_id}.history must be an array"));
     }
 
-    let task_id = format!("regression-corpus-{fixture_id}-{delivery_id}");
+    let task_id = fixture["worker_task"]["task_id"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("regression-corpus-{fixture_id}-{delivery_id}"));
     let task_payload_codec = match fixture.get("worker_task") {
         Some(worker_task) => worker_task.get("payload_codec").cloned(),
         None => Some(json!(payload_codec)),
@@ -1026,6 +1029,7 @@ async fn workflow_stream_command_without_durable_identity_fails_closed() {
         .as_object_mut()
         .expect("workflow stream worker task")
         .remove("workflow_command_id");
+    fixture["worker_task"]["task_id"] = json!("");
 
     let error = execute_fixture_delivery(&fixture, "missing-identity")
         .await
@@ -1036,6 +1040,23 @@ async fn workflow_stream_command_without_durable_identity_fails_closed() {
         "{error}"
     );
     assert!(error.contains("workflow_command_id"), "{error}");
+}
+
+#[tokio::test]
+async fn workflow_stream_task_identity_is_stable_across_cold_worker_redelivery() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/workflow-stream-task-identity.json");
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("read ordinary-task stream fixture"),
+    )
+    .expect("parse ordinary-task stream fixture");
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .expect("first ordinary task delivery");
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .expect("replacement ordinary task delivery");
+    assert_eq!(first, restarted);
 }
 
 #[tokio::test]
