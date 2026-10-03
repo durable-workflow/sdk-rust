@@ -270,6 +270,8 @@ pub enum Error {
     WorkflowMemoUpdatesUnavailable,
     #[error("cooperative cancellation is unavailable: {0}")]
     CooperativeCancellationUnavailable(String),
+    #[error("cancellation_scope_execution_not_supported: Rust worker cannot replay scoped cancellation history")]
+    CancellationScopeExecutionUnavailable,
     #[error("invalid cooperative cancellation: {0}")]
     InvalidCooperativeCancellation(String),
     #[error("activity execution no longer owns its claim: {0}")]
@@ -7322,6 +7324,7 @@ impl Worker {
                     }
                 }
             }
+            Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
             Err(error) => {
                 self.client
                     .fail_workflow_task(task_id, lease_owner, attempt, error.to_string())
@@ -7839,6 +7842,7 @@ impl Worker {
         observation: Option<&CancellationRequest>,
     ) -> Result<WorkflowTaskDecision> {
         validate_workflow_task_payloads(&task)?;
+        cooperative_cancellation::assert_cancellation_scope_replay_supported(&task.history_events)?;
         let cancellation_history = if let Some(observation) = observation {
             observation.validate_observation()?;
             cooperative_cancellation::cancellation_claim(&task)?;
@@ -9736,6 +9740,7 @@ impl WorkflowState {
         payload_codec: String,
         resume_signal: Option<ResumeSignal>,
     ) -> Result<Self> {
+        cooperative_cancellation::assert_cancellation_scope_replay_supported(&history)?;
         let cancellation_history = CancellationHistory::from_events(
             &history,
             run_id.as_deref().unwrap_or_default(),
@@ -15857,6 +15862,7 @@ fn workflow_task_integrity_error(error: &Error) -> bool {
         error,
         Error::NonDeterministicReplay(_)
             | Error::Protocol(_)
+            | Error::CancellationScopeExecutionUnavailable
             | Error::MissingWorkflowCommandIdentity
             | Error::WorkflowStatePoisoned
     )
@@ -16215,6 +16221,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 mod tests {
     use super::*;
     mod activity_cancellation_policies;
+    mod cancellation_scope_admission;
     mod child_workflow_policies;
     mod cooperative_cancellation;
     mod runtime_payloads;

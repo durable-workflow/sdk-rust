@@ -4,6 +4,32 @@ use std::collections::BTreeSet;
 const CONTROL_BUDGET: Duration = Duration::from_secs(5);
 const MAX_REFRESH_PAGES: usize = 128;
 
+pub(super) fn assert_cancellation_scope_replay_supported(events: &[HistoryEvent]) -> Result<()> {
+    for event in events {
+        let scope_marker = matches!(
+            event.event_type.as_str(),
+            "CancellationScopeOpened"
+                | "CancellationScopeRequested"
+                | "CancellationScopeRequestConflicted"
+        );
+        let scoped_membership = std::iter::once(&event.payload)
+            .chain(
+                ["activity", "timer", "child_workflow"]
+                    .iter()
+                    .filter_map(|name| event.payload.get(name)),
+            )
+            .any(|payload| {
+                payload
+                    .get("cancellation_scope_id")
+                    .is_some_and(|scope| scope.as_str() != Some("root"))
+            });
+        if scope_marker || scoped_membership {
+            return Err(Error::CancellationScopeExecutionUnavailable);
+        }
+    }
+    Ok(())
+}
+
 /// A delivery acknowledgment bound to one workflow task and durable run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancellationDeliveryReceipt {
