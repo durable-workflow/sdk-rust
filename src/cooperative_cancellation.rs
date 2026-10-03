@@ -10,6 +10,7 @@ pub(super) fn assert_cancellation_scope_replay_supported(events: &[HistoryEvent]
             event.event_type.as_str(),
             "CancellationScopeOpened"
                 | "CancellationScopeRequested"
+                | "CancellationScopeDelivered"
                 | "CancellationScopeRequestConflicted"
         );
         let scoped_membership = std::iter::once(&event.payload)

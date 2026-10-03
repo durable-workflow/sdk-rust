@@ -8,6 +8,7 @@ fn scope_histories() -> Vec<HistoryEvent> {
     let mut events = [
         "CancellationScopeOpened",
         "CancellationScopeRequested",
+        "CancellationScopeDelivered",
         "CancellationScopeRequestConflicted",
     ]
     .into_iter()
