@@ -6,7 +6,9 @@ mod cooperative_cancellation;
 mod runtime_payloads;
 mod runtime_uploads;
 
-pub use cancellation_context::{CancellationContext, CancellationLineage};
+pub use cancellation_context::{
+    CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
+};
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,

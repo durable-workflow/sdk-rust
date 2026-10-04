@@ -7,6 +7,278 @@ fn context_snapshot() -> Value {
     .unwrap()
 }
 
+fn scoped_run_snapshot(name: &str) -> Value {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "fixtures/scoped-run-cancellation-context.json"
+    ))
+    .unwrap();
+    fixtures[name].clone()
+}
+
+fn scoped_run_history() -> Vec<HistoryEvent> {
+    vec![serde_json::from_value(json!({
+        "event_type":"CooperativeCancellationRequested", "timestamp":"2026-10-04T00:00:05Z",
+        "payload": {"workflow_run_id":"child-run", "workflow_instance_id":"child-instance",
+            "workflow_command_id":"child-request", "reason":"maintenance",
+            "cleanup_deadline_at":"2026-10-04T00:00:15.123456Z", "cancellation":scoped_run_snapshot("child")}
+    })).unwrap(), remaining_event("CooperativeCancellationDelivered", json!({
+        "workflow_run_id":"child-run", "workflow_command_id":"child-request", "sequence":1,
+        "call_kind":"timer", "cancellation":scoped_run_snapshot("child")
+    }), "2026-10-04T00:00:08Z")]
+}
+
+fn scoped_run_task(history: Vec<HistoryEvent>) -> WorkflowTask {
+    let mut task = cancellation_task(history);
+    task.run_id = Some("child-run".into());
+    task
+}
+
+#[test]
+fn scoped_run_native_child_and_grandchild_preserve_every_origin_and_original_budget() {
+    for name in ["child", "grandchild"] {
+        let snapshot = scoped_run_snapshot(name);
+        let context = CancellationContext::from_value(&snapshot).unwrap();
+        assert_eq!(context.to_value(), snapshot);
+        assert_eq!(
+            CancellationContext::from_value(&context.to_value()).unwrap(),
+            context
+        );
+        assert_eq!(context.root_request_id(), "root-request");
+        assert_eq!(context.reason(), Some("maintenance"));
+        assert_eq!(context.source(), "api");
+        assert_eq!(context.requester()["id"], "operator-1");
+        assert_eq!(
+            context
+                .requested_at()
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2026-10-04T00:00:00.123456Z"
+        );
+        let origin = context.scope_origin().unwrap();
+        assert_eq!(
+            origin
+                .root_deadline()
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2026-10-04T00:00:30.123456Z"
+        );
+        assert_eq!(origin.requested_at(), context.requested_at());
+        let (scopes, parent, deadline) = if name == "child" {
+            (
+                vec!["outer", "inner"],
+                "inner-request",
+                "2026-10-04T00:00:15.123456Z",
+            )
+        } else {
+            (
+                vec!["outer", "inner", "root", "child-scope"],
+                "child-scope-request",
+                "2026-10-04T00:00:12.123456Z",
+            )
+        };
+        assert_eq!(context.parent_request_id(), Some(parent));
+        assert_eq!(
+            origin
+                .lineage()
+                .iter()
+                .map(|hop| hop.scope_id())
+                .collect::<Vec<_>>(),
+            scopes
+        );
+        assert_eq!(
+            context
+                .deadline()
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            deadline
+        );
+        assert!(matches!(
+            context.remaining(),
+            Err(Error::InvalidCooperativeCancellation(_))
+        ));
+    }
+}
+
+#[test]
+fn scoped_run_avro_timezone_and_detached_metadata_keep_the_original_tree() {
+    let original = scoped_run_snapshot("grandchild");
+    let mut snapshot = original.clone();
+    snapshot["requested_at"] = json!("2026-10-03T20:00:00.123456-04:00");
+    snapshot["cleanup_deadline_at"] = json!("2026-10-03T20:00:12.123456-04:00");
+    snapshot["scope_authority_deadline_at"] = snapshot["cleanup_deadline_at"].clone();
+    let decoded = decode_wire_value(&fixture_envelope(snapshot), DEFAULT_CODEC).unwrap();
+    let context = CancellationContext::from_value(&decoded).unwrap();
+    assert_eq!(context.to_value(), original);
+    let origin = context.scope_origin().unwrap();
+    let mut detached = origin.to_value();
+    detached["lineage"][3]["scope_id"] = json!("changed");
+    assert_eq!(origin.scope_id(), "child-scope");
+    assert_eq!(origin.root_scope_id(), "outer");
+    assert_eq!(origin.request_id(), "child-scope-request");
+    assert_eq!(origin.parent_request_id(), Some("child-request"));
+    assert_eq!(origin.workflow_instance_id(), "child-instance");
+    assert_eq!(origin.workflow_run_id(), "child-run");
+    assert_eq!(origin.to_value(), original["scope_origin"]);
+}
+
+#[test]
+fn scoped_run_cold_cleanup_replay_consumes_the_same_narrowed_original_clock() {
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _| async move {
+        assert!(ctx.cancellation_context()?.is_none());
+        let Err(Error::CooperativeCancellationRequested(cancelled)) = ctx.sleep(Duration::from_secs(10)).await else {
+            panic!("expected original cancellation");
+        };
+        let context = cancelled.request.context.unwrap();
+        assert_eq!(context.to_value(), scoped_run_snapshot("child"));
+        assert_eq!(ctx.cancellation_context()?, Some(context.clone()));
+        let before = context.remaining()?.as_secs_f64(); assert_eq!(before, 7.123456);
+        let _shield = ctx.cancellation_shield()?;
+        ctx.activity("cleanup", json!([])).await?;
+        Ok(json!({"remaining":[before,context.remaining()?.as_secs_f64()], "cancellation":context.to_value()}))
+    });
+    let mut history = scoped_run_history();
+    let initial = worker
+        .execute_workflow_task(scoped_run_task(history.clone()))
+        .unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0]["activity_type"], "cleanup");
+    let mut completion = completed_activity(2, "cleanup", json!("cleaned"));
+    completion
+        .last_mut()
+        .unwrap()
+        .raw
+        .insert("timestamp".into(), json!("2026-10-04T00:00:12Z"));
+    history.extend(completion);
+    history.push(remaining_event(
+        "WorkflowTaskScheduled",
+        json!({}),
+        "2026-10-04T00:00:29Z",
+    ));
+    for _replacement in 0..2 {
+        let result = worker
+            .execute_workflow_task(scoped_run_task(history.clone()))
+            .unwrap();
+        assert_eq!(result[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&result[0]["result"], DEFAULT_CODEC).unwrap(),
+            json!({
+                "remaining":[7.123456,3.123456],"cancellation":scoped_run_snapshot("child")
+            })
+        );
+    }
+}
+
+#[test]
+fn scoped_run_canonical_delivery_cannot_replace_an_original_scope() {
+    let mut history = scoped_run_history();
+    history[1].payload["cancellation"]["scope_origin"]["lineage"][1]["scope_id"] =
+        json!("different");
+    let mut worker = cancellation_worker();
+    worker.register_workflow("cancel", |ctx, _| async move {
+        ctx.sleep(Duration::from_secs(10)).await?;
+        Ok(Value::Null)
+    });
+    assert!(worker
+        .execute_workflow_task(scoped_run_task(history))
+        .is_err());
+}
+
+#[test]
+fn scoped_run_invalid_origin_identity_and_budget_are_refused() {
+    let original = scoped_run_snapshot("grandchild");
+    for (path, value) in [
+        ("/schema", json!("durable-workflow.cancellation-context/v1")),
+        ("/root_request_id", json!("other")),
+        ("/root_workflow_instance_id", json!("other")),
+        ("/root_workflow_run_id", json!("other")),
+        ("/parent_request_id", json!("root-request")),
+        ("/reason", json!("other")),
+        ("/source", json!("other")),
+        ("/requested_at", json!("2026-10-04T00:00:01.123456Z")),
+        ("/scope_origin", json!([])),
+        ("/cleanup_deadline_at", json!("2026-10-04T00:00:15.123456Z")),
+        (
+            "/scope_authority_deadline_at",
+            json!("2026-10-04T00:00:15.123456Z"),
+        ),
+        ("/requester/id", json!("other")),
+        ("/lineage/1/request_id", json!("child-request")),
+        ("/lineage/2/workflow_run_id", json!("child-run")),
+        (
+            "/scope_origin/lineage/3/cleanup_deadline_at",
+            json!("2026-10-04T00:00:16.123456Z"),
+        ),
+        (
+            "/scope_origin/lineage/3/workflow_instance_id",
+            json!("other"),
+        ),
+        ("/scope_origin/lineage/3/request_id", json!("inner-request")),
+        ("/scope_origin/lineage/3/scope_id", json!("root")),
+        (
+            "/scope_origin/root_context/schema",
+            json!("durable-workflow.cancellation-context/v2"),
+        ),
+    ] {
+        let mut snapshot = original.clone();
+        *snapshot.pointer_mut(path).unwrap() = value;
+        assert!(
+            matches!(
+                CancellationContext::from_value(&snapshot),
+                Err(Error::InvalidCooperativeCancellation(_))
+            ),
+            "{path}"
+        );
+    }
+    for key in [
+        "scope_origin",
+        "scope_authority_deadline_at",
+        "parent_request_id",
+    ] {
+        let mut snapshot = original.clone();
+        snapshot.as_object_mut().unwrap().remove(key);
+        assert!(
+            CancellationContext::from_value(&snapshot).is_err(),
+            "missing {key}"
+        );
+    }
+    for fault in [
+        "widened global budget",
+        "reused request",
+        "discarded root",
+        "run reentry",
+        "unsupported field",
+    ] {
+        let mut snapshot = original.clone();
+        match fault {
+            "widened global budget" => {
+                snapshot["cleanup_deadline_at"] = json!("2026-10-04T00:00:30.123456Z");
+                snapshot["scope_authority_deadline_at"] = snapshot["cleanup_deadline_at"].clone();
+            }
+            "reused request" => {
+                snapshot["request_id"] = json!("inner-request");
+                snapshot["lineage"][2]["request_id"] = json!("inner-request");
+            }
+            "discarded root" => {
+                snapshot["scope_origin"]["lineage"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(0);
+            }
+            "run reentry" => {
+                snapshot["scope_origin"]["lineage"][3]["workflow_run_id"] = json!("root-run");
+                snapshot["scope_origin"]["lineage"][3]["workflow_instance_id"] =
+                    json!("root-instance");
+            }
+            _ => snapshot["scope_origin"]["lineage"][3]["authority"] = json!("unrecorded"),
+        }
+        assert!(
+            matches!(
+                CancellationContext::from_value(&snapshot),
+                Err(Error::InvalidCooperativeCancellation(_))
+            ),
+            "{fault}"
+        );
+    }
+}
+
 fn context_request() -> HistoryEvent {
     serde_json::from_value(json!({
         "event_type": "CooperativeCancellationRequested", "recorded_at": "2026-10-01T00:00:05Z",

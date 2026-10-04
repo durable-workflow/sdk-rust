@@ -13,8 +13,10 @@ after committed authored cancellation delivery. Earlier workflow code receives
 snapshot in `request.context`. Poll and heartbeat observations do not supply
 workflow-facing context, even when their transport object contains extra fields.
 
-`CancellationContext::remaining()` returns a `Result<Duration>` from the original
-deadline and the recorded blocking boundary consumed by this workflow replay.
+`CancellationContext::remaining()` returns a `Result<Duration>` from the accepted
+cleanup deadline, bounded by the original global deadline, and the recorded
+blocking boundary consumed by this workflow replay. A scoped child can have an
+earlier authority ceiling.
 Committed delivery starts the clock. Activity/child results, timer fires, signal
 and condition resolutions advance it. Parallel groups use their consumed
 members and exclude results later than the failure returned to workflow code.
@@ -36,6 +38,15 @@ the immediate parent request ID, original reason, requester/source, root request
 time, original deadline and ordered lineage. Requester fields are limited to
 caller type, ID and label. Timestamp helpers return immutable UTC dates.
 `to_value()` produces a detached portable snapshot.
+
+A scoped child context preserves its complete immutable `scope_origin` alongside
+the local run lineage. `ScopedCancellationContext::root_context()` retains the
+original root deadline. Its scoped lineage records each run, instance, scope,
+request identity and accepted authority ceiling, including intermediate scopes
+in the same run. The child deadline can narrow that ceiling and never extend it.
+Legacy version 1 snapshots remain readable. Version 2 parsing rejects altered
+root metadata, substituted ancestry and widened budgets. This metadata support
+does not advertise scoped execution while that source contract is unfinished.
 
 A child keeps the root request time and cleanup budget even if its local request
 is accepted later. Cold replay restores the object from canonical request history.
