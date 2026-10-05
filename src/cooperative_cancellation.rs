@@ -4,12 +4,15 @@ use std::collections::BTreeSet;
 const CONTROL_BUDGET: Duration = Duration::from_secs(5);
 const MAX_REFRESH_PAGES: usize = 128;
 
-pub(super) fn assert_cancellation_scope_replay_supported(events: &[HistoryEvent]) -> Result<()> {
+pub(super) fn assert_cancellation_scope_replay_supported_with_authoring(
+    events: &[HistoryEvent],
+    allow_authoring: bool,
+) -> Result<()> {
     for event in events {
         let scope_marker = matches!(
             event.event_type.as_str(),
-            "CancellationScopeOpened"
-                | "CancellationScopeRequested"
+            "CancellationScopeRequested"
+                | "CancellationScopeDeliveryPrepared"
                 | "CancellationScopeDelivered"
                 | "CancellationScopeRequestConflicted"
         );
@@ -24,7 +27,10 @@ pub(super) fn assert_cancellation_scope_replay_supported(events: &[HistoryEvent]
                     .get("cancellation_scope_id")
                     .is_some_and(|scope| scope.as_str() != Some("root"))
             });
-        if scope_marker || scoped_membership {
+        if scope_marker
+            || (!allow_authoring
+                && (event.event_type == "CancellationScopeOpened" || scoped_membership))
+        {
             return Err(Error::CancellationScopeExecutionUnavailable);
         }
     }
@@ -1898,7 +1904,31 @@ impl Worker {
                     "cooperative replay omitted its original pending observation",
                 ));
             }
-            return self.execute_workflow_task_decision(task).map(Some);
+            for _ in 0..1000 {
+                let mut decision = self.execute_workflow_task_decision(task.clone())?;
+                let Some(opening) = decision.cancellation_scope_opening.as_ref() else {
+                    return Ok(Some(decision));
+                };
+                if !decision.commands.is_empty() {
+                    decision.cancellation_scope_opening = None;
+                    return Ok(Some(decision));
+                }
+                let receipt = self
+                    .client
+                    .open_cancellation_scope_on_claim(
+                        &task,
+                        opening.sequence,
+                        &opening.parent_scope_id,
+                        opening.shield_parent,
+                    )
+                    .await?;
+                task.history_events = receipt.history().to_vec();
+                task.total_history_events = None;
+                task.history_size_bytes = None;
+            }
+            return Err(invalid(
+                "workflow exceeded the canonical scope opening replay limit",
+            ));
         };
         task.history_events = self
             .client

@@ -6183,6 +6183,7 @@ struct WorkflowTaskDecision {
     message_stream_cursors: Vec<Value>,
     message_stream_waits: Vec<Value>,
     cancellation_delivery: Option<CancellationDelivery>,
+    cancellation_scope_opening: Option<cancellation_scope::CancellationScopeOpening>,
 }
 
 impl WorkflowTaskDecision {
@@ -6192,6 +6193,7 @@ impl WorkflowTaskDecision {
             message_stream_cursors: Vec::new(),
             message_stream_waits: Vec::new(),
             cancellation_delivery: None,
+            cancellation_scope_opening: None,
         }
     }
 }
@@ -6287,6 +6289,7 @@ pub struct Worker {
     retry_policy: WorkerRetryPolicy,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
     cooperative_cancellation_enabled: bool,
+    allow_cancellation_scope_authoring: bool,
     cooperative_registration_confirmed: Arc<AtomicBool>,
 }
 
@@ -6307,6 +6310,7 @@ impl Worker {
             retry_policy: WorkerRetryPolicy::default(),
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
+            allow_cancellation_scope_authoring: false,
             cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -6340,6 +6344,13 @@ impl Worker {
         self.cooperative_cancellation_enabled = enabled;
         self.client.cooperative_worker_protocol = enabled;
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self
+    }
+
+    /// Enable candidate scope authoring without advertising scoped execution.
+    #[doc(hidden)]
+    pub fn candidate_cancellation_scope_authoring(mut self, enabled: bool) -> Self {
+        self.allow_cancellation_scope_authoring = enabled;
         self
     }
 
@@ -7274,7 +7285,10 @@ impl Worker {
         memo_updates_supported: bool,
     ) -> Result<ManagedPollOutcome> {
         match decision {
-            Ok(decision) if decision.cancellation_delivery.is_some() => {
+            Ok(decision)
+                if decision.cancellation_delivery.is_some()
+                    || decision.cancellation_scope_opening.is_some() =>
+            {
                 return Err(Error::CooperativeCancellationUnavailable(
                     "worker cancellation delivery has not been negotiated".into(),
                 ));
@@ -7749,6 +7763,7 @@ impl Worker {
                 ));
                 let workflow_context = WorkflowContext {
                     state: workflow_state,
+                    cancellation_scope_id: "root".into(),
                 };
                 let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone());
                 let mut cx = TaskContext::from_waker(noop_waker_ref());
@@ -7845,8 +7860,14 @@ impl Worker {
         task: WorkflowTask,
         observation: Option<&CancellationRequest>,
     ) -> Result<WorkflowTaskDecision> {
+        if self.allow_cancellation_scope_authoring && !self.cooperative_cancellation_enabled {
+            return Err(Error::CancellationScopeExecutionUnavailable);
+        }
         validate_workflow_task_payloads(&task)?;
-        cooperative_cancellation::assert_cancellation_scope_replay_supported(&task.history_events)?;
+        cooperative_cancellation::assert_cancellation_scope_replay_supported_with_authoring(
+            &task.history_events,
+            self.allow_cancellation_scope_authoring,
+        )?;
         let cancellation_history = if let Some(observation) = observation {
             observation.validate_observation()?;
             cooperative_cancellation::cancellation_claim(&task)?;
@@ -7899,13 +7920,14 @@ impl Worker {
             .filter(|identity| !identity.is_empty())
             .or_else(|| (!task.task_id.is_empty()).then(|| task.task_id.clone()))
             .unwrap_or_default();
-        let mut workflow_state = WorkflowState::new_with_identity(
+        let mut workflow_state = WorkflowState::new_with_identity_and_scopes(
             task.history_events,
             task.workflow_id,
             task.run_id,
             self.task_queue.clone(),
             task.payload_codec.clone(),
             resume_signal,
+            self.allow_cancellation_scope_authoring,
         )?;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
@@ -7917,7 +7939,10 @@ impl Worker {
             workflow_state.cancel_requested = task.cancel_requested;
         }
         let state = Arc::new(Mutex::new(workflow_state));
-        let ctx = WorkflowContext { state };
+        let ctx = WorkflowContext {
+            state,
+            cancellation_scope_id: "root".into(),
+        };
         let mut future = (workflow.execute)(ctx.clone(), input);
         let mut cx = TaskContext::from_waker(noop_waker_ref());
 
@@ -7925,13 +7950,12 @@ impl Worker {
             let _replay = cancellation_replay_clock::ReplayGuard::enter(&ctx)?;
             future.as_mut().poll(&mut cx)
         };
-        if ctx
-            .state
-            .lock()
-            .map_err(|_| Error::WorkflowStatePoisoned)?
-            .cancellation_delivery_intent
-            .is_some()
-        {
+        let awaiting_canonical_boundary = {
+            let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+            state.cancellation_delivery_intent.is_some()
+                || state.cancellation_scope_opening.is_some()
+        };
+        if awaiting_canonical_boundary {
             // A private delivery intent never becomes an application error.
             // Even a custom future which ignores a pending durable call cannot
             // publish terminal commands before canonical delivery and replay.
@@ -8024,6 +8048,17 @@ impl Worker {
         }
         let (message_stream_cursors, message_stream_waits) = ctx.message_stream_metadata()?;
         let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+        if let Some(opening) = &state.cancellation_scope_opening {
+            if commands.len() != opening.command_count {
+                return Err(invalid_recorded_history(
+                    "cancellation_scope_pending_call_escaped",
+                    opening.sequence,
+                    "commands before original scope opening",
+                    "commands after suspended opening",
+                    "workflow cannot publish beyond an uncommitted scope opening",
+                ));
+            }
+        }
         if state.cancellation_delivery_intent.is_some()
             && commands.len() != state.cancellation_delivery_command_count
         {
@@ -8044,6 +8079,7 @@ impl Worker {
             message_stream_cursors,
             message_stream_waits,
             cancellation_delivery: state.cancellation_delivery_intent.clone(),
+            cancellation_scope_opening: state.cancellation_scope_opening.clone(),
         })
     }
 
@@ -8344,6 +8380,7 @@ impl MessageStream {
 #[derive(Clone, Debug)]
 pub struct WorkflowContext {
     state: Arc<Mutex<WorkflowState>>,
+    cancellation_scope_id: String,
 }
 
 fn valid_memo_key(key: &str) -> bool {
@@ -9699,6 +9736,9 @@ struct WorkflowState {
     cancellation_delivery_enabled: bool,
     cancellation_delivery_intent: Option<CancellationDelivery>,
     cancellation_delivery_command_count: usize,
+    allow_cancellation_scope_authoring: bool,
+    cancellation_scope_opening: Option<cancellation_scope::CancellationScopeOpening>,
+    cancellation_scope_memberships: BTreeMap<u64, String>,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
     selection_markers: Vec<SelectionMarker>,
@@ -9744,13 +9784,47 @@ impl WorkflowState {
         payload_codec: String,
         resume_signal: Option<ResumeSignal>,
     ) -> Result<Self> {
-        cooperative_cancellation::assert_cancellation_scope_replay_supported(&history)?;
+        Self::new_with_identity_and_scopes(
+            history,
+            workflow_id,
+            run_id,
+            task_queue,
+            payload_codec,
+            resume_signal,
+            false,
+        )
+    }
+
+    fn new_with_identity_and_scopes(
+        history: Vec<HistoryEvent>,
+        workflow_id: Option<String>,
+        run_id: Option<String>,
+        task_queue: String,
+        payload_codec: String,
+        resume_signal: Option<ResumeSignal>,
+        allow_cancellation_scope_authoring: bool,
+    ) -> Result<Self> {
+        cooperative_cancellation::assert_cancellation_scope_replay_supported_with_authoring(
+            &history,
+            allow_cancellation_scope_authoring,
+        )?;
+        let scopes = if allow_cancellation_scope_authoring {
+            cancellation_scope::CancellationScopeHistory::read(
+                &history,
+                run_id.as_deref().unwrap_or_default(),
+            )?
+        } else {
+            cancellation_scope::CancellationScopeHistory::default()
+        };
         let cancellation_history = CancellationHistory::from_events(
             &history,
             run_id.as_deref().unwrap_or_default(),
             None,
         )?;
-        let recorded_commands = cancellation_history.bind_commands(recorded_commands(
+        if allow_cancellation_scope_authoring && cancellation_history.request.is_some() {
+            return Err(Error::CancellationScopeExecutionUnavailable);
+        }
+        let mut recorded_commands = cancellation_history.bind_commands(recorded_commands(
             &history,
             &payload_codec,
             WorkflowIdentity {
@@ -9758,6 +9832,27 @@ impl WorkflowState {
                 run_id: run_id.clone(),
             },
         )?)?;
+        for (sequence, opening) in scopes.openings {
+            if recorded_commands
+                .iter()
+                .any(|command| command.sequence() == sequence)
+            {
+                return Err(invalid_recorded_history(
+                    "invalid_cancellation_scope_history",
+                    sequence,
+                    "distinct authored scope opening",
+                    "operation collision",
+                    "scope opening collides with a command",
+                ));
+            }
+            recorded_commands.push(RecordedCommand::CancellationScope {
+                sequence,
+                scope_id: opening.scope_id,
+                parent_scope_id: opening.parent_scope_id,
+                shield_parent: opening.shield_parent,
+            });
+        }
+        recorded_commands.sort_by_key(RecordedCommand::sequence);
         let selection_markers = recorded_selection_markers(&history)?;
         let cancelled_selection_members = recorded_selection_cancellations(&history)?;
         let recorded_continue_as_new = history
@@ -9865,6 +9960,9 @@ impl WorkflowState {
             cancellation_delivery_enabled: false,
             cancellation_delivery_intent: None,
             cancellation_delivery_command_count: 0,
+            allow_cancellation_scope_authoring,
+            cancellation_scope_opening: None,
+            cancellation_scope_memberships: scopes.memberships,
             resume_signal,
             recorded_commands,
             selection_markers,
@@ -9950,6 +10048,12 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
 
 #[derive(Clone, Debug)]
 enum RecordedCommand {
+    CancellationScope {
+        sequence: u64,
+        scope_id: String,
+        parent_scope_id: String,
+        shield_parent: bool,
+    },
     CancellationGroup {
         sequence: u64,
         span: u64,
@@ -10631,6 +10735,7 @@ impl RecordedCommand {
     fn sequence(&self) -> u64 {
         match self {
             Self::CancellationGroup { sequence, .. }
+            | Self::CancellationScope { sequence, .. }
             | Self::CancellationBoundary { sequence, .. }
             | Self::Activity { sequence, .. }
             | Self::Timer { sequence, .. }
@@ -10646,6 +10751,7 @@ impl RecordedCommand {
 
     fn shape(&self) -> &'static str {
         match self {
+            Self::CancellationScope { .. } => "cancellation scope",
             Self::CancellationBoundary { .. } | Self::CancellationGroup { .. } => {
                 "cooperative cancellation"
             }
@@ -12319,6 +12425,7 @@ fn recorded_selection_member_is_terminal(
             RecordedCommand::SignalWait { value, .. } => value.is_some(),
             RecordedCommand::ConditionWait { result, .. } => result.is_some(),
             RecordedCommand::SearchAttributes { .. }
+            | RecordedCommand::CancellationScope { .. }
             | RecordedCommand::SideEffect { .. }
             | RecordedCommand::VersionMarker { .. }
             | RecordedCommand::Memo { .. }
@@ -12720,6 +12827,9 @@ impl ActivityCall {
         };
 
         let cursor = state.command_cursor;
+        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+            return Poll::Ready(Err(error));
+        }
         let recorded =
             match state.cancellation_replay_command(cursor, CancellationCallKind::Activity) {
                 Ok(recorded) => recorded,
@@ -12893,6 +13003,7 @@ impl ActivityCall {
                 command.insert("cancellation_policy".to_string(), json!(policy.as_str()));
             }
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            ctx.apply_scope_membership(&mut command);
             match state.prepare_scalar_cancellation(
                 cursor,
                 CancellationCallKind::Activity,
@@ -12952,6 +13063,9 @@ impl Future for TimerCall {
         };
 
         let cursor = state.command_cursor;
+        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+            return Poll::Ready(Err(error));
+        }
         let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Timer)
         {
             Ok(recorded) => recorded,
@@ -13022,6 +13136,7 @@ impl Future for TimerCall {
                 ("delay_seconds".to_string(), json!(requested_delay)),
             ]);
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            ctx.apply_scope_membership(&mut command);
             match state.prepare_scalar_cancellation(
                 cursor,
                 CancellationCallKind::Timer,
@@ -13095,6 +13210,9 @@ impl Future for ConditionWaitCall {
                 Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
             };
             let initial_cursor = state.command_cursor;
+            if let Err(error) = ctx.validate_scope_membership(&state, initial_cursor) {
+                return Poll::Ready(Err(error));
+            }
             let recorded = match state
                 .cancellation_replay_command(initial_cursor, CancellationCallKind::Condition)
             {
@@ -13275,6 +13393,7 @@ impl ConditionWaitCall {
             command.insert("timeout_seconds".to_string(), json!(timeout_seconds));
         }
         apply_parallel_group_path(&mut command, &self.parallel_group_path);
+        ctx.apply_scope_membership(&mut command);
         state.commands.push(Value::Object(command));
         drop(state);
         self.opened_wait = true;
@@ -13357,6 +13476,9 @@ impl ChildWorkflowCall {
         };
 
         let cursor = state.command_cursor;
+        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+            return Poll::Ready(Err(error));
+        }
         let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Child)
         {
             Ok(recorded) => recorded,
@@ -13515,6 +13637,7 @@ impl ChildWorkflowCall {
                 object.insert("run_timeout_seconds".to_string(), json!(seconds));
             }
             apply_parallel_group_path(object, &self.parallel_group_path);
+            ctx.apply_scope_membership(object);
             match state.prepare_scalar_cancellation(
                 cursor,
                 CancellationCallKind::Child,
@@ -13596,6 +13719,9 @@ impl SignalCall {
         };
 
         let cursor = state.command_cursor;
+        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+            return Poll::Ready(Err(error));
+        }
         let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Signal)
         {
             Ok(recorded) => recorded,
@@ -13711,6 +13837,7 @@ impl SignalCall {
                 ("signal_name".to_string(), json!(self.signal_name)),
             ]);
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
+            ctx.apply_scope_membership(&mut command);
             state.commands.push(Value::Object(command));
             self.opened_wait = true;
         }
@@ -16226,6 +16353,7 @@ mod tests {
     use super::*;
     mod activity_cancellation_policies;
     mod cancellation_scope_admission;
+    mod cancellation_scope_authoring;
     mod cancellation_scope_opening;
     mod child_workflow_policies;
     mod cooperative_cancellation;
@@ -16588,6 +16716,7 @@ mod tests {
         payload_codec: &str,
     ) -> WorkflowContext {
         WorkflowContext {
+            cancellation_scope_id: "root".into(),
             state: Arc::new(Mutex::new(
                 WorkflowState::new_with_identity(
                     history,
@@ -18227,6 +18356,7 @@ mod tests {
         state.workflow_command_identity = "command-7".to_string();
         let context = WorkflowContext {
             state: Arc::new(Mutex::new(state)),
+            cancellation_scope_id: "root".into(),
         };
         let item =
             WorkflowStreamAppendItem::from_reference("s3://bucket/item.avro").item_type("receipt");
@@ -18265,6 +18395,7 @@ mod tests {
         replay_state.workflow_command_identity = "command-7".to_string();
         let replay_context = WorkflowContext {
             state: Arc::new(Mutex::new(replay_state)),
+            cancellation_scope_id: "root".into(),
         };
         replay_context
             .append_workflow_stream(
@@ -19594,6 +19725,7 @@ mod tests {
     #[test]
     fn workflow_context_schedules_activity_until_completion_is_in_history() {
         let ctx = WorkflowContext {
+            cancellation_scope_id: "root".into(),
             state: Arc::new(Mutex::new(
                 WorkflowState::new_with_identity(
                     Vec::new(),
@@ -23014,6 +23146,7 @@ mod tests {
     #[test]
     fn workflow_context_emits_explicit_child_workflow_contract() {
         let ctx = WorkflowContext {
+            cancellation_scope_id: "root".into(),
             state: Arc::new(Mutex::new(
                 WorkflowState::new_with_identity(
                     Vec::new(),

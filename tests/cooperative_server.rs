@@ -746,6 +746,101 @@ async fn server_scope_opening_proves_real_native_tree_on_original_claim() {
         .unwrap();
 }
 
+fn scope_authoring_worker(client: &Client, queue: &str, owner: &str) -> Worker {
+    let mut worker = Worker::new(client.clone(), queue)
+        .worker_id(owner)
+        .cooperative_cancellation(true)
+        .candidate_cancellation_scope_authoring(true)
+        .poll_timeout(Duration::from_millis(100));
+    worker.register_workflow("tests.rust-candidate-scope-replay", |ctx, _| async move {
+        let _: String = ctx.side_effect(|| "original prefix".to_string())?;
+        ctx.cancellation_scope(false, |outer| async move {
+            let deferred = outer
+                .cancellation_scope(true, |inner| async move {
+                    Ok(inner.sleep(Duration::from_secs(1)))
+                })
+                .await?;
+            deferred.await?;
+            outer.sleep(Duration::from_secs(1)).await
+        })
+        .await?;
+        ctx.sleep(Duration::from_secs(1)).await?;
+        Ok(json!("replayed original scopes"))
+    });
+    worker
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_authoring_replays_nested_tree_and_deferred_membership_on_replacement() {
+    let client = client();
+    let queue = queue();
+    let original = scope_authoring_worker(&client, &queue, &format!("{queue}-original"));
+    original.register().await.unwrap();
+    let handle = client
+        .start_workflow(
+            "tests.rust-candidate-scope-replay",
+            &queue,
+            &queue,
+            json!([]),
+        )
+        .await
+        .unwrap();
+    let first = tick_until(&original, &handle, "TimerScheduled").await;
+    assert_eq!(count(&first, "SideEffectRecorded"), 1);
+    assert_eq!(count(&first, "CancellationScopeOpened"), 2);
+    assert_eq!(count(&first, "TimerScheduled"), 1);
+
+    let replacement = scope_authoring_worker(&client, &queue, &format!("{queue}-replacement"));
+    replacement.register().await.unwrap();
+    let final_history = tick_until(&replacement, &handle, "WorkflowCompleted").await;
+    assert_eq!(count(&final_history, "SideEffectRecorded"), 1);
+    assert_eq!(count(&final_history, "CancellationScopeOpened"), 2);
+    assert_eq!(count(&final_history, "TimerScheduled"), 3);
+    assert_eq!(count(&final_history, "TimerFired"), 3);
+    assert_eq!(count(&final_history, "WorkflowFailed"), 0);
+    let rows = final_history["events"].as_array().unwrap();
+    let openings: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event_type"] == "CancellationScopeOpened")
+        .map(|row| &row["payload"])
+        .collect();
+    assert_eq!(openings[0]["sequence"], 2);
+    assert_eq!(openings[0]["parent_scope_id"], "root");
+    assert_eq!(openings[0]["shield_parent"], false);
+    assert_eq!(openings[1]["sequence"], 3);
+    assert_eq!(openings[1]["parent_scope_id"], openings[0]["scope_id"]);
+    assert_eq!(openings[1]["shield_parent"], true);
+    let timers: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event_type"] == "TimerScheduled")
+        .map(|row| &row["payload"])
+        .collect();
+    assert_eq!(
+        timers
+            .iter()
+            .map(|row| row["sequence"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+    assert_eq!(timers[0]["cancellation_scope_id"], openings[1]["scope_id"]);
+    assert_eq!(timers[1]["cancellation_scope_id"], openings[0]["scope_id"]);
+    assert!(timers[2]
+        .get("cancellation_scope_id")
+        .is_none_or(|id| id == "root"));
+    assert_eq!(
+        handle
+            .result_selected_run(WorkflowResultOptions {
+                timeout: Duration::from_secs(10),
+                ..WorkflowResultOptions::default()
+            })
+            .await
+            .unwrap(),
+        json!("replayed original scopes")
+    );
+    println!("Native scope authoring and replacement replay: {final_history}");
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
 async fn server_request_before_claim_replays_canonical_typed_cancellation() {

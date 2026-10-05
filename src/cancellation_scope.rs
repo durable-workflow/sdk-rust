@@ -19,6 +19,356 @@ fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(invalid)
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct CanonicalScopeOpening {
+    pub scope_id: String,
+    pub parent_scope_id: String,
+    pub shield_parent: bool,
+}
+
+#[derive(Default, Debug)]
+pub(super) struct CancellationScopeHistory {
+    pub openings: BTreeMap<u64, CanonicalScopeOpening>,
+    pub memberships: BTreeMap<u64, String>,
+}
+
+fn invalid_history(detail: &str) -> Error {
+    invalid_recorded_history(
+        "invalid_cancellation_scope_history",
+        0,
+        "canonical scope tree and original membership",
+        "invalid history",
+        detail,
+    )
+}
+
+fn starts_with_workflow_start(events: &[HistoryEvent]) -> bool {
+    events
+        .first()
+        .is_some_and(|event| event.event_type == "WorkflowStarted")
+        || (events
+            .first()
+            .is_some_and(|event| event.event_type == "StartAccepted")
+            && events
+                .get(1)
+                .is_some_and(|event| event.event_type == "WorkflowStarted"))
+}
+
+impl CancellationScopeHistory {
+    pub fn read(events: &[HistoryEvent], run_id: &str) -> Result<Self> {
+        let has_scopes = events
+            .iter()
+            .any(|event| event.event_type == "CancellationScopeOpened");
+        if has_scopes && !starts_with_workflow_start(events) {
+            return Err(invalid_history(
+                "scope history lacks its original workflow start",
+            ));
+        }
+        let mut history = Self::default();
+        let mut event_ids = BTreeSet::new();
+        let mut scopes = BTreeMap::new();
+        let mut namespace: Option<&str> = None;
+        let mut last_event_sequence = 0;
+        let mut last_opening = 0;
+        for event in events {
+            if has_scopes {
+                let event_id = event
+                    .raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| identity(value))
+                    .ok_or_else(|| invalid_history("missing canonical event identity"))?;
+                let sequence = event
+                    .raw
+                    .get("sequence")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > last_event_sequence && *value <= MAX_SCOPE_SEQUENCE)
+                    .ok_or_else(|| invalid_history("canonical event order changed"))?;
+                let incoming_namespace = event
+                    .raw
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .filter(|value| identity(value))
+                    .ok_or_else(|| invalid_history("missing canonical namespace"))?;
+                if !event_ids.insert(event_id)
+                    || namespace.is_some_and(|previous| previous != incoming_namespace)
+                    || !event.payload.is_object()
+                    || event.event_type.trim().is_empty()
+                {
+                    return Err(invalid_history(
+                        "canonical event identity, namespace or payload changed",
+                    ));
+                }
+                namespace = Some(incoming_namespace);
+                last_event_sequence = sequence;
+            }
+            let payload = &event.payload;
+            let sequence = payload["sequence"]
+                .as_u64()
+                .filter(|value| *value > 0 && *value <= MAX_SCOPE_SEQUENCE);
+            if event.event_type == "CancellationScopeOpened" {
+                let scope_id = text(payload, "scope_id")
+                    .map_err(|_| invalid_history("invalid scope identity"))?;
+                let parent = text(payload, "parent_scope_id")
+                    .map_err(|_| invalid_history("invalid parent identity"))?;
+                let sequence =
+                    sequence.ok_or_else(|| invalid_history("invalid authored opening sequence"))?;
+                let shield = payload["shield_parent"]
+                    .as_bool()
+                    .ok_or_else(|| invalid_history("invalid shielding"))?;
+                if payload["schema"] != "durable-workflow.cancellation-scope/v1"
+                    || run_id.is_empty()
+                    || payload["workflow_run_id"].as_str() != Some(run_id)
+                    || scope_id == "root"
+                    || scopes.contains_key(scope_id)
+                    || (parent != "root" && !scopes.contains_key(parent))
+                    || sequence <= last_opening
+                    || history.memberships.contains_key(&sequence)
+                {
+                    return Err(invalid_history("invalid canonical opening tree"));
+                }
+                scopes.insert(scope_id, sequence);
+                last_opening = sequence;
+                history.openings.insert(
+                    sequence,
+                    CanonicalScopeOpening {
+                        scope_id: scope_id.into(),
+                        parent_scope_id: parent.into(),
+                        shield_parent: shield,
+                    },
+                );
+                continue;
+            }
+            let admission = matches!(
+                event.event_type.as_str(),
+                "ActivityScheduled"
+                    | "TimerScheduled"
+                    | "ChildWorkflowScheduled"
+                    | "ConditionWaitOpened"
+                    | "SignalWaitOpened"
+            );
+            let operation = admission
+                || matches!(
+                    event.event_type.as_str(),
+                    "ActivityStarted"
+                        | "ActivityCompleted"
+                        | "ActivityFailed"
+                        | "ActivityTimedOut"
+                        | "ActivityCancelled"
+                        | "ActivityRetryScheduled"
+                        | "TimerFired"
+                        | "TimerCancelled"
+                        | "ChildRunStarted"
+                        | "ChildRunCompleted"
+                        | "ChildRunFailed"
+                        | "ChildRunCancelled"
+                        | "ChildRunTerminated"
+                        | "ConditionWaitSatisfied"
+                        | "ConditionWaitTimedOut"
+                        | "ConditionWaitCancelled"
+                        | "SignalWaitReceived"
+                        | "SignalWaitTimedOut"
+                        | "SignalWaitCancelled"
+                );
+            if !operation {
+                continue;
+            }
+            let mut membership: Option<&str> = None;
+            for snapshot in std::iter::once(payload).chain(
+                ["activity", "timer", "child_workflow"]
+                    .iter()
+                    .filter_map(|name| payload.get(name)),
+            ) {
+                let Some(value) = snapshot.get("cancellation_scope_id") else {
+                    continue;
+                };
+                let incoming = value
+                    .as_str()
+                    .filter(|value| identity(value))
+                    .ok_or_else(|| invalid_history("invalid operation scope membership"))?;
+                if membership.is_some_and(|previous| previous != incoming) {
+                    return Err(invalid_history("contradictory operation scope membership"));
+                }
+                membership = Some(incoming);
+            }
+            if membership.is_none() && !admission {
+                continue;
+            }
+            let membership = membership.unwrap_or("root");
+            if membership != "root"
+                && !sequence.is_some_and(|sequence| {
+                    scopes
+                        .get(membership)
+                        .is_some_and(|opening| *opening < sequence)
+                })
+            {
+                return Err(invalid_history(
+                    "operation scope was not opened before original admission",
+                ));
+            }
+            let Some(sequence) = sequence else {
+                continue;
+            };
+            if history.openings.contains_key(&sequence)
+                || history
+                    .memberships
+                    .get(&sequence)
+                    .is_some_and(|previous| previous != membership)
+            {
+                return Err(invalid_history(
+                    "operation changed its original scope membership",
+                ));
+            }
+            history.memberships.insert(sequence, membership.into());
+        }
+        Ok(history)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CancellationScopeOpening {
+    pub sequence: u64,
+    pub parent_scope_id: String,
+    pub shield_parent: bool,
+    pub command_count: usize,
+}
+
+impl WorkflowContext {
+    pub(super) fn validate_scope_membership(
+        &self,
+        state: &WorkflowState,
+        cursor: usize,
+    ) -> Result<()> {
+        if !state.allow_cancellation_scope_authoring {
+            return Ok(());
+        }
+        if let Some(recorded) = state.recorded_commands.get(cursor) {
+            let sequence = recorded.sequence();
+            let original = state
+                .cancellation_scope_memberships
+                .get(&sequence)
+                .map(String::as_str)
+                .unwrap_or("root");
+            if original != self.cancellation_scope_id {
+                return Err(invalid_recorded_history(
+                    "cancellation_scope_membership_changed",
+                    sequence,
+                    original,
+                    &self.cancellation_scope_id,
+                    "operation changed the scope where it was created",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_scope_membership(&self, command: &mut serde_json::Map<String, Value>) {
+        if self.cancellation_scope_id != "root" {
+            command.insert(
+                "cancellation_scope_id".into(),
+                json!(self.cancellation_scope_id),
+            );
+        }
+    }
+
+    /// Await the original durable opening, then run a body with its own context.
+    /// Operations created from that context retain their scope when awaited later.
+    /// Candidate authoring remains disabled on ordinary workers.
+    pub async fn cancellation_scope<F, Fut, T>(&self, shield_parent: bool, body: F) -> Result<T>
+    where
+        F: FnOnce(WorkflowContext) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let scope_id = ScopeOpeningCall {
+            ctx: self.clone(),
+            shield_parent,
+        }
+        .await?;
+        let mut scoped = self.clone();
+        scoped.cancellation_scope_id = scope_id;
+        body(scoped).await
+    }
+}
+
+struct ScopeOpeningCall {
+    ctx: WorkflowContext,
+    shield_parent: bool,
+}
+
+impl Future for ScopeOpeningCall {
+    type Output = Result<String>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let mut state = match self.ctx.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+        };
+        if !state.allow_cancellation_scope_authoring {
+            return Poll::Ready(Err(Error::CancellationScopeExecutionUnavailable));
+        }
+        if state
+            .cancellation_scope_opening
+            .as_ref()
+            .is_some_and(|opening| opening.command_count != state.commands.len())
+        {
+            return Poll::Ready(Err(invalid_history(
+                "workflow authored commands after an uncommitted opening",
+            )));
+        }
+        let sequence = (state.command_cursor as u64)
+            .saturating_add(state.commands.len() as u64)
+            .saturating_add(1);
+        if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
+            return match recorded {
+                RecordedCommand::CancellationScope {
+                    sequence: original,
+                    scope_id,
+                    parent_scope_id,
+                    shield_parent,
+                } if original == sequence
+                    && parent_scope_id == self.ctx.cancellation_scope_id
+                    && shield_parent == self.shield_parent =>
+                {
+                    state.command_cursor += 1;
+                    Poll::Ready(Ok(scope_id))
+                }
+                recorded => Poll::Ready(Err(invalid_recorded_history(
+                    "cancellation_scope_opening_changed",
+                    sequence,
+                    "original scope opening, parent and shielding",
+                    recorded.shape(),
+                    "authored cancellation scope differs from committed history",
+                ))),
+            };
+        }
+        if state.history_events.iter().any(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "WorkflowCompleted"
+                    | "WorkflowFailed"
+                    | "WorkflowCancelled"
+                    | "WorkflowTerminated"
+                    | "WorkflowContinuedAsNew"
+            )
+        }) {
+            return Poll::Ready(Err(invalid_recorded_history(
+                "cancellation_scope_opening_changed",
+                sequence,
+                "original scope opening",
+                "closed history",
+                "closed history cannot admit an unrecorded scope",
+            )));
+        }
+        state.cancellation_scope_opening = Some(CancellationScopeOpening {
+            sequence,
+            parent_scope_id: self.ctx.cancellation_scope_id.clone(),
+            shield_parent: self.shield_parent,
+            command_count: state.commands.len(),
+        });
+        Poll::Pending
+    }
+}
+
 /// A scope opening proved against complete history on its original claim.
 /// This proof does not advertise scoped workflow execution support.
 #[derive(Clone, Debug)]
@@ -147,6 +497,8 @@ impl CancellationScopeOpenReceipt {
         if !found {
             return Err(invalid());
         }
+        CancellationScopeHistory::read(&history, text(expected, "workflow_run_id")?)
+            .map_err(|_| invalid())?;
         Ok(Self {
             scope_id: text(receipt, "scope_id")?.into(),
             history_event_id: text(receipt, "history_event_id")?.into(),
