@@ -2,6 +2,7 @@
 
 mod cancellation_context;
 mod cancellation_replay_clock;
+mod cancellation_scope;
 mod cooperative_cancellation;
 mod runtime_payloads;
 mod runtime_uploads;
@@ -9,6 +10,7 @@ mod runtime_uploads;
 pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
 };
+pub use cancellation_scope::CancellationScopeOpenReceipt;
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
@@ -16224,6 +16226,7 @@ mod tests {
     use super::*;
     mod activity_cancellation_policies;
     mod cancellation_scope_admission;
+    mod cancellation_scope_opening;
     mod child_workflow_policies;
     mod cooperative_cancellation;
     mod runtime_payloads;
