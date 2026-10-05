@@ -257,7 +257,12 @@ jobs:
           echo "DURABLE_WORKFLOW_SERVER_URL=http://$endpoint" >> "$GITHUB_ENV"
       - name: Run actual Worker cooperative scenarios
         shell: bash
-        run: cargo test --test cooperative_server -- --ignored --nocapture --test-threads=1 2>&1 | tee cooperative-results.log
+        run: |
+          arguments=(--ignored --nocapture --test-threads=1)
+          if [ -z "$NATIVE_CANDIDATE_SHA" ]; then
+            arguments+=(--skip server_scope_opening_proves_real_native_tree_on_original_claim)
+          fi
+          cargo test --test cooperative_server -- "${arguments[@]}" 2>&1 | tee cooperative-results.log
       - name: Retain bounded scenario evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7

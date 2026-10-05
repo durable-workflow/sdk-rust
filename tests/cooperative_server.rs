@@ -680,6 +680,74 @@ async fn assert_cancelled(handle: &WorkflowHandle, request_id: &str, cleanup: bo
 
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
+async fn server_scope_opening_proves_real_native_tree_on_original_claim() {
+    let client = client();
+    let queue = queue();
+    let owner = format!("{queue}-scope-owner");
+    let worker = worker(&client, &queue, false, false).worker_id(&owner);
+    worker.register().await.unwrap();
+    let handle = client
+        .start_workflow(WORKFLOW, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let claim = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let reply = client
+                .poll_cooperative_workflow_task(&owner, &queue, Duration::from_secs(1))
+                .await
+                .unwrap();
+            if let Some(claim) = reply.task {
+                return claim;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let parent = client
+        .open_cancellation_scope_on_claim(claim.task(), 1, "root", false)
+        .await
+        .unwrap();
+    let child = client
+        .open_cancellation_scope_on_claim(claim.task(), 2, parent.scope_id(), true)
+        .await
+        .unwrap();
+    let duplicate = client
+        .open_cancellation_scope_on_claim(claim.task(), 2, parent.scope_id(), true)
+        .await
+        .unwrap();
+    assert_eq!(parent.parent_scope_id(), "root");
+    assert!(!parent.shield_parent() && !parent.duplicate());
+    assert_eq!(child.parent_scope_id(), parent.scope_id());
+    assert!(child.shield_parent() && !child.duplicate() && duplicate.duplicate());
+    assert_eq!(duplicate.scope_id(), child.scope_id());
+    assert_eq!(duplicate.history_event_id(), child.history_event_id());
+    let openings = child
+        .history()
+        .iter()
+        .filter(|event| event.event_type == "CancellationScopeOpened")
+        .map(|event| event.payload["scope_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(openings, vec![parent.scope_id(), child.scope_id()]);
+    let mut stale = claim.task().clone();
+    stale.workflow_task_attempt += 1;
+    assert!(
+        matches!(client.open_cancellation_scope_on_claim(&stale,3,"root",false).await,
+        Err(Error::Http { status, .. }) if status.as_u16()==409)
+    );
+    let snapshot = history(&handle).await;
+    assert_eq!(count(&snapshot, "CancellationScopeOpened"), 2);
+    for kind in ["TimerScheduled", "WorkflowFailed", "WorkflowCompleted"] {
+        assert_eq!(count(&snapshot, kind), 0);
+    }
+    eprintln!("Native scope opening proof: {:?}", child.history());
+    handle
+        .terminate_selected_run(WorkflowCommandOptions::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
 async fn server_request_before_claim_replays_canonical_typed_cancellation() {
     let client = client();
     let queue = queue();
