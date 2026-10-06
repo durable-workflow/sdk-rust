@@ -763,6 +763,7 @@ impl WorkflowState {
         if !self.cancellation_delivery_enabled || self.cancellation_shield_depth > 0 {
             return Ok(false);
         }
+        self.assert_root_cancellation_membership()?;
         if self.cancellation_delivery_intent.is_some() {
             self.matched_recorded_pending = true;
             return Ok(true);
@@ -782,6 +783,17 @@ impl WorkflowState {
         self.cancellation_delivery_intent = Some(delivery);
         self.matched_recorded_pending = true;
         Ok(true)
+    }
+
+    fn assert_root_cancellation_membership(&self) -> Result<()> {
+        if self
+            .scope_delivery
+            .as_ref()
+            .is_some_and(|replay| replay.active_scope != "root")
+        {
+            return Err(Error::CancellationScopeExecutionUnavailable);
+        }
+        Ok(())
     }
 
     pub(super) fn prepare_scalar_cancellation(
@@ -1000,6 +1012,7 @@ impl WorkflowState {
                     return Ok(Some(*original));
                 }
                 self.replay_scope_cancellation_at(index, kind)?;
+                self.assert_root_cancellation_membership()?;
                 self.validate_cancellation_call(sequence, kind, call_kind)?;
                 self.cancellation_consumed = true;
                 self.cancel_requested = true;
@@ -1022,6 +1035,7 @@ impl WorkflowState {
             ..
         }) = self.recorded_commands.get(index)
         {
+            self.assert_root_cancellation_membership()?;
             self.validate_cancellation_call(*sequence, kind, *call_kind)?;
             self.cancellation_consumed = true;
             self.cancel_requested = true;
@@ -1077,16 +1091,18 @@ impl WorkflowContext {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
-        Ok(if state.cancellation_consumed {
-            state
-                .cancellation_history
-                .request
-                .as_ref()
-                .and_then(|request| request.context.clone())
-                .map(|context| context.with_replay(Some(Arc::downgrade(&self.state))))
-        } else {
-            None
-        })
+        Ok(
+            if state.cancellation_consumed && self.cancellation_scope_id == "root" {
+                state
+                    .cancellation_history
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.context.clone())
+                    .map(|context| context.with_replay(Some(Arc::downgrade(&self.state))))
+            } else {
+                None
+            },
+        )
     }
 
     /// Shield explicit cleanup from repeated cancellation checks.
@@ -1969,7 +1985,7 @@ impl Worker {
             .client
             .refresh_workflow_cancellation_history(&claim.task, observation)
             .await?;
-        for _ in 0..3 {
+        for _ in 0..1000 {
             // Count the actual refreshed snapshot. Its byte budget was not
             // remeasured, so do not expose the old snapshot's size as current.
             task.total_history_events = None;
@@ -1978,6 +1994,30 @@ impl Worker {
                 task.clone(),
                 Some(observation),
             )?;
+            if let Some(intent) = decision.cancellation_scope_delivery.as_ref() {
+                if !decision.commands.is_empty() {
+                    decision.cancellation_scope_delivery = None;
+                    return Ok(Some(decision));
+                }
+                let mut budget = CancellationScopeDeliveryBudget::new();
+                budget.restrict(intent.context.deadline())?;
+                let prepared = self
+                    .client
+                    .prepare_cancellation_scope_on_claim(
+                        &task,
+                        &intent.context,
+                        &intent.boundary,
+                        &budget,
+                    )
+                    .await?;
+                budget.restrict(prepared.authority_deadline())?;
+                let delivered = self
+                    .client
+                    .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
+                    .await?;
+                task.history_events = delivered.history().to_vec();
+                continue;
+            }
             let Some(intent) = decision.cancellation_delivery.as_ref() else {
                 return Ok(Some(decision));
             };

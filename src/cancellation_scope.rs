@@ -316,6 +316,9 @@ impl Future for ScopeOpeningCall {
         if !state.allow_cancellation_scope_authoring {
             return Poll::Ready(Err(Error::CancellationScopeExecutionUnavailable));
         }
+        if state.cancellation_consumed {
+            return Poll::Ready(Err(Error::CancellationScopeExecutionUnavailable));
+        }
         if state
             .cancellation_scope_opening
             .as_ref()

@@ -20,6 +20,7 @@ const UNDO: &str = "tests.rust-cooperative-undo";
 const BLOCKED: &str = "tests.rust-cooperative-blocked";
 const REPLAY: &str = "tests.rust-cooperative-replay";
 const PROCESS: &str = "tests.rust-cooperative-process-reclaim";
+const RUN_SCOPE: &str = "tests.rust-run-scope-cleanup";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ActivityGrant {
@@ -75,11 +76,18 @@ async fn cooperative_process_worker_child() {
     };
     let ready = std::env::var("DURABLE_WORKFLOW_PROCESS_CHILD_READY").unwrap();
     let grant = std::env::var("DURABLE_WORKFLOW_PROCESS_CHILD_GRANT").unwrap();
-    let mut worker = Worker::new(client(), &queue)
-        .worker_id(format!("{queue}-killed"))
-        .cooperative_cancellation(true)
-        .poll_timeout(Duration::from_secs(1));
-    register_process_workflow(&mut worker);
+    let scoped =
+        std::env::var("DURABLE_WORKFLOW_PROCESS_CHILD_PROFILE").as_deref() == Ok("scope-root");
+    let mut worker = if scoped {
+        run_scope_worker(&client(), &queue, &format!("{queue}-killed"))
+    } else {
+        let mut worker = Worker::new(client(), &queue)
+            .worker_id(format!("{queue}-killed"))
+            .cooperative_cancellation(true)
+            .poll_timeout(Duration::from_secs(1));
+        register_process_workflow(&mut worker);
+        worker
+    };
     worker.register_activity(BLOCKED, move |ctx, _| {
         let grant = grant.clone();
         async move {
@@ -1105,6 +1113,209 @@ async fn qualify_scope_cleanup_replacement(grouped: bool, descendants: bool) {
         .as_f64()
         .is_some_and(|remaining| remaining > 0.0 && remaining < 30.0));
     println!("Native scope cleanup and replacement replay: {final_history}");
+}
+
+fn run_scope_worker(client: &Client, queue: &str, owner: &str) -> Worker {
+    let mut worker = Worker::new(client.clone(), queue)
+        .worker_id(owner)
+        .cooperative_cancellation(true)
+        .poll_timeout(Duration::from_secs(1))
+        .candidate_cancellation_scope_authoring(true)
+        .candidate_cancellation_scope_delivery(true);
+    worker.register_workflow(RUN_SCOPE, |root, _| async move {
+        let scoped = root
+            .cancellation_scope(false, |parent| async move {
+                parent
+                    .cancellation_scope(false, |child| async move {
+                        match child.sleep(Duration::from_secs(300)).await {
+                            Err(Error::CancellationScopeRequested(cancelled)) => {
+                                assert!(child.cancellation_context()?.is_none());
+                                let original = cancelled.context.to_value();
+                                {
+                                    let _shield = child.cancellation_shield()?;
+                                    child.sleep(Duration::from_secs(5)).await?;
+                                }
+                                Ok(original)
+                            }
+                            Err(error) => Err(error),
+                            Ok(()) => {
+                                panic!("original scoped timer completed without cancellation")
+                            }
+                        }
+                    })
+                    .await
+            })
+            .await?;
+        match root.sleep(Duration::from_secs(300)).await {
+            Err(Error::CooperativeCancellationRequested(cancelled)) => {
+                assert_eq!(
+                    scoped["root_context"],
+                    root.cancellation_context()?.unwrap().to_value()
+                );
+                {
+                    let _shield = root.cancellation_shield()?;
+                    root.sleep(Duration::from_secs(1)).await?;
+                }
+                Err(Error::CooperativeCancellationRequested(cancelled))
+            }
+            Err(error) => Err(error),
+            Ok(()) => panic!("root timer completed without canonical root delivery"),
+        }
+    });
+    worker
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_sigkill_scoped_cleanup_replays_before_root_with_original_30_second_deadline() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let client = client();
+    let queue = queue();
+    let scratch = ProcessScratch(std::env::temp_dir().join(format!("{queue}-run-scope")));
+    std::fs::create_dir(&scratch.0).unwrap();
+    let ready = scratch.0.join("ready");
+    let mut original = WorkerProcess(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cooperative_process_worker_child", "--nocapture"])
+            .env("DURABLE_WORKFLOW_PROCESS_CHILD_QUEUE", &queue)
+            .env("DURABLE_WORKFLOW_PROCESS_CHILD_PROFILE", "scope-root")
+            .env("DURABLE_WORKFLOW_PROCESS_CHILD_READY", &ready)
+            .env(
+                "DURABLE_WORKFLOW_PROCESS_CHILD_GRANT",
+                scratch.0.join("unused-grant"),
+            )
+            .spawn()
+            .unwrap(),
+    );
+    await_child_file(&mut original, &ready).await;
+    let handle = client
+        .start_workflow(RUN_SCOPE, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let observe = |target| {
+        let handle = handle.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let snapshot = history(&handle).await;
+                    if count(&snapshot, "TimerScheduled") >= target {
+                        return snapshot;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("actual process must admit its original timer")
+        }
+    };
+    observe(1).await;
+    let accepted = handle
+        .request_cancellation(CooperativeCancellationOptions {
+            reason: Some("bounded scope cleanup".into()),
+            cleanup_timeout_seconds: Some(30),
+        })
+        .await
+        .unwrap();
+    let cleaning = observe(2).await;
+    assert_eq!(count(&cleaning, "CancellationScopeDelivered"), 1);
+    assert_eq!(count(&cleaning, "CooperativeCancellationDelivered"), 0);
+    let snapshot = cleaning["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["event_type"] == "TimerScheduled"
+                && row["payload"]["cancellation_cleanup"].is_object()
+        })
+        .unwrap()["payload"]["cancellation_cleanup"]
+        .clone();
+    assert_eq!(snapshot.as_object().unwrap().len(), 8);
+    assert_ne!(snapshot["scope_id"], snapshot["operation_scope_id"]);
+    assert_eq!(
+        snapshot["root_request_id"],
+        accepted.cancellation_request.request_id
+    );
+    assert_eq!(
+        snapshot["cleanup_deadline_at"],
+        accepted.cancellation_request.cleanup_deadline_at
+    );
+    original.0.kill().unwrap();
+    assert_eq!(original.0.wait().unwrap().signal(), Some(9));
+    let duplicate = handle
+        .request_cancellation(CooperativeCancellationOptions {
+            reason: Some("duplicate request".into()),
+            cleanup_timeout_seconds: Some(90),
+        })
+        .await
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate.cancellation_request.request_id,
+        accepted.cancellation_request.request_id
+    );
+    assert_eq!(
+        duplicate.cancellation_request.requested_at,
+        accepted.cancellation_request.requested_at
+    );
+    assert_eq!(
+        duplicate.cancellation_request.cleanup_deadline_at,
+        accepted.cancellation_request.cleanup_deadline_at
+    );
+    let replacement = run_scope_worker(&client, &queue, &format!("{queue}-replacement"));
+    replacement.register().await.unwrap();
+    let deadline =
+        chrono::DateTime::parse_from_rfc3339(&accepted.cancellation_request.cleanup_deadline_at)
+            .unwrap();
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let now =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(wall.as_secs() as i64, wall.subsec_nanos())
+            .unwrap();
+    let remaining = (deadline.with_timezone(&chrono::Utc) - now)
+        .to_std()
+        .unwrap();
+    let final_history = tokio::time::timeout(
+        remaining,
+        tick_until(&replacement, &handle, "WorkflowCancelled"),
+    )
+    .await
+    .expect("replacement must converge before the original deadline");
+    for kind in [
+        "CooperativeCancellationRequested",
+        "CancellationScopeDeliveryPrepared",
+        "CancellationScopeDelivered",
+        "CooperativeCancellationDelivered",
+        "WorkflowCancelled",
+    ] {
+        assert_eq!(count(&final_history, kind), 1, "{kind}");
+    }
+    assert_eq!(count(&final_history, "CancellationScopeOpened"), 2);
+    assert_eq!(count(&final_history, "CancellationScopeRequested"), 2);
+    assert_eq!(count(&final_history, "TimerScheduled"), 3);
+    assert_eq!(count(&final_history, "TimerFired"), 2);
+    assert_eq!(count(&final_history, "WorkflowCompleted"), 0);
+    assert_eq!(count(&final_history, "WorkflowFailed"), 0);
+    let events = final_history["events"].as_array().unwrap();
+    let recovered = events
+        .iter()
+        .find(|row| {
+            row["event_type"] == "TimerScheduled"
+                && row["payload"]["cancellation_cleanup"].is_object()
+        })
+        .unwrap();
+    assert_eq!(recovered["payload"]["cancellation_cleanup"], snapshot);
+    let terminal = events
+        .iter()
+        .find(|row| row["event_type"] == "WorkflowCancelled")
+        .unwrap();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(terminal["timestamp"].as_str().unwrap()).unwrap()
+            < deadline
+    );
+    println!("Root/scope SIGKILL and original budget: {final_history}");
 }
 
 #[tokio::test]

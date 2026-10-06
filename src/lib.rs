@@ -8959,6 +8959,14 @@ impl WorkflowContext {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if self.cancellation_scope_id != "root" && state.scope_delivery.is_some() {
+            return Ok(state
+                .scope_delivery
+                .as_ref()
+                .unwrap()
+                .contexts
+                .contains_key(&self.cancellation_scope_id));
+        }
         Ok(state.cancel_requested
             || state
                 .scope_delivery
@@ -8997,6 +9005,9 @@ impl WorkflowContext {
             }
         }
         if state.cancel_requested && state.cancellation_shield_depth == 0 {
+            if self.cancellation_scope_id != "root" && state.scope_delivery.is_some() {
+                return Ok(());
+            }
             return Err(state.cancellation_error());
         }
         Ok(())
@@ -9936,7 +9947,10 @@ impl WorkflowState {
             run_id.as_deref().unwrap_or_default(),
             None,
         )?;
-        if allow_cancellation_scope_authoring && cancellation_history.request.is_some() {
+        if allow_cancellation_scope_authoring
+            && cancellation_history.request.is_some()
+            && !allow_cancellation_scope_delivery
+        {
             return Err(Error::CancellationScopeExecutionUnavailable);
         }
         let scope_delivery = if allow_cancellation_scope_delivery {

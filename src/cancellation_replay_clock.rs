@@ -179,14 +179,12 @@ impl WorkflowState {
 
     pub(super) fn start_cancellation_clock(&mut self) {
         if let Some(clock) = &mut self.cancellation_clock {
-            if !clock.started {
-                clock.started = true;
-                clock.observe(
-                    clock
-                        .delivery_index
-                        .and_then(|index| self.history_events.get(index)),
-                );
-            }
+            clock.started = true;
+            clock.observe(
+                clock
+                    .delivery_index
+                    .and_then(|index| self.history_events.get(index)),
+            );
         }
     }
 
