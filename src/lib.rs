@@ -59,7 +59,7 @@ pub use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 pub use uuid::Uuid;
-pub use worker_session::WorkerSessionOptions;
+pub use worker_session::{WorkerSession, WorkerSessionOptions};
 
 pub const WORKER_PROTOCOL_VERSION: &str = "1.19";
 const WORKFLOW_HISTORY_PAGE_SIZE: usize = 500;
@@ -2735,6 +2735,8 @@ pub struct Client {
     worker_storage_admission: Option<WorkerStorageAdmission>,
     cooperative_worker_protocol: bool,
     local_activities_enabled: bool,
+    worker_sessions_enabled: bool,
+    max_concurrent_worker_sessions: usize,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
 }
 
@@ -3647,6 +3649,11 @@ impl Client {
             body["capability_manifest"]["local_activities"] = json!({"supported":true,
                 "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION});
         }
+        if self.worker_sessions_enabled {
+            body["capability_manifest"]["worker_sessions"] = json!({"supported":true,
+                "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION});
+            body["max_concurrent_worker_sessions"] = json!(self.max_concurrent_worker_sessions);
+        }
         if workflow_command_contracts
             .as_object()
             .is_some_and(|contracts| !contracts.is_empty())
@@ -3665,7 +3672,7 @@ impl Client {
                 Some(&body),
             )
             .await?;
-        if self.local_activities_enabled {
+        if self.local_activities_enabled || self.worker_sessions_enabled {
             let compatible = response["registered"].as_bool() == Some(true)
                 && response["worker_id"].as_str() == Some(worker_id)
                 && response["namespace"].as_str() == Some(self.namespace.as_str())
@@ -3675,10 +3682,25 @@ impl Client {
                     .and_then(|version| version.strip_prefix("1."))
                     .and_then(|minor| minor.parse::<u64>().ok())
                     .is_some_and(|minor| minor >= 18)
-                && response["capability_manifest"]["local_activities"]["supported"].as_bool()
-                    == Some(true);
+                && (!self.local_activities_enabled
+                    || response["capability_manifest"]["local_activities"]["supported"].as_bool()
+                        == Some(true))
+                && (!self.worker_sessions_enabled
+                    || (response["capability_manifest"]["worker_sessions"]["supported"].as_bool()
+                        == Some(true)
+                        && response["capabilities"].as_array().is_some_and(|accepted| {
+                            capabilities.iter().all(|capability| {
+                                accepted
+                                    .iter()
+                                    .any(|value| value.as_str() == Some(capability.as_str()))
+                            })
+                        })));
             if !compatible {
-                let error = Error::WorkerLoop("local_activity_registration_unconfirmed: Server must acknowledge this worker, namespace, queue and local capability".into());
+                let error = Error::WorkerLoop(if self.worker_sessions_enabled {
+                    "worker_session_registration_unconfirmed: Server must acknowledge this worker, namespace, queue and session capabilities".into()
+                } else {
+                    "local_activity_registration_unconfirmed: Server must acknowledge this worker, namespace, queue and local capability".into()
+                });
                 if response["registered"] == true
                     && response["worker_id"].as_str() == Some(worker_id)
                 {
@@ -3895,7 +3917,18 @@ impl Client {
         workflow_available: usize,
         activity_available: usize,
     ) -> Result<Value> {
-        let body = json!({
+        self.heartbeat_worker_with_sessions(worker_id, workflow_available, activity_available, None)
+            .await
+    }
+
+    async fn heartbeat_worker_with_sessions(
+        &self,
+        worker_id: &str,
+        workflow_available: usize,
+        activity_available: usize,
+        session_available: Option<usize>,
+    ) -> Result<Value> {
+        let mut body = json!({
             "worker_id": worker_id,
             "task_slots": {
                 "workflow_available": workflow_available,
@@ -3906,6 +3939,10 @@ impl Client {
                 "process_uptime_seconds": 0
             }
         });
+
+        if let Some(available) = session_available {
+            body["task_slots"]["session_available"] = json!(available);
+        }
 
         self.request_json(
             reqwest::Method::POST,
@@ -4170,6 +4207,7 @@ impl Client {
             1,
         )
         .await
+        .map(worker_session::SessionPollResponse::ordinary)
     }
 
     async fn poll_activity_task_response_with_request_id(
@@ -4179,14 +4217,14 @@ impl Client {
         timeout: Duration,
         poll_request_id: &str,
         transport_retries: usize,
-    ) -> Result<PollActivityTaskResponse> {
+    ) -> Result<worker_session::SessionPollResponse> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
             "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let data: PollActivityTaskResponse = self
+        let data: worker_session::SessionPollResponse = self
             .poll_request_json(
                 "/worker/activity-tasks/poll",
                 RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
@@ -4266,6 +4304,20 @@ impl Client {
         lease_owner: &str,
         details: T,
     ) -> Result<ActivityHeartbeatResponse> {
+        serde_json::from_value(
+            self.heartbeat_activity_task_value(task_id, activity_attempt_id, lease_owner, details)
+                .await?,
+        )
+        .map_err(Error::from)
+    }
+
+    async fn heartbeat_activity_task_value<T: Serialize>(
+        &self,
+        task_id: &str,
+        activity_attempt_id: &str,
+        lease_owner: &str,
+        details: T,
+    ) -> Result<Value> {
         let details = encode_typed_envelope(&AvroValue::from_serialize(&details)?, DEFAULT_CODEC)?;
         let body = json!({
             "activity_attempt_id": activity_attempt_id,
@@ -5069,6 +5121,8 @@ impl ClientBuilder {
             worker_storage_admission: None,
             cooperative_worker_protocol: false,
             local_activities_enabled: false,
+            worker_sessions_enabled: false,
+            max_concurrent_worker_sessions: 10,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
         })
     }
@@ -6356,6 +6410,9 @@ pub struct Worker {
     allow_cancellation_scope_delivery: bool,
     cooperative_registration_confirmed: Arc<AtomicBool>,
     local_registration_confirmed: Arc<AtomicBool>,
+    session_registration_confirmed: Arc<AtomicBool>,
+    resource_capabilities: Vec<String>,
+    sessions: Arc<Mutex<HashMap<String, WorkerSession>>>,
 }
 
 impl Worker {
@@ -6379,6 +6436,9 @@ impl Worker {
             allow_cancellation_scope_delivery: false,
             cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
             local_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            session_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            resource_capabilities: Vec::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -6386,6 +6446,8 @@ impl Worker {
         self.worker_id = worker_id.into();
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.sessions = Arc::new(Mutex::new(HashMap::new()));
         self
     }
 
@@ -6991,6 +7053,11 @@ impl Worker {
     }
 
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
+        self.session_registration_confirmed
+            .store(false, Ordering::SeqCst);
+        for capability in &self.resource_capabilities {
+            worker_session::validate_resource_capability(capability)?;
+        }
         self.local_registration_confirmed
             .store(false, Ordering::SeqCst);
         if self.client.local_activities_enabled && self.cooperative_cancellation_enabled {
@@ -7045,6 +7112,9 @@ impl Worker {
                     self.client
                         .local_activities_enabled
                         .then(|| "local_activities".to_string()),
+                    self.client
+                        .worker_sessions_enabled
+                        .then(|| "worker_sessions".to_string()),
                     self.cooperative_cancellation_enabled
                         .then(|| "cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
@@ -7054,6 +7124,7 @@ impl Worker {
                 ]
                 .into_iter()
                 .flatten()
+                .chain(self.resource_capabilities.iter().cloned())
                 .collect(),
                 Value::Object(command_contracts),
                 Some(
@@ -7075,6 +7146,10 @@ impl Worker {
         }
         if self.client.local_activities_enabled && response.registered {
             self.local_registration_confirmed
+                .store(true, Ordering::SeqCst);
+        }
+        if self.client.worker_sessions_enabled && response.registered {
+            self.session_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
         Ok(response)
@@ -7130,6 +7205,16 @@ impl Worker {
         }
         let registered_worker_id = registration.worker_id.clone();
         let primary = self.run_registered_until(stop, registration).await;
+        let primary = match (primary, self.close_worker_sessions().await) {
+            (Ok(()), result) => result,
+            (Err(error), Ok(())) => Err(error),
+            (Err(primary), Err(close)) => Err(Error::WorkerShutdown {
+                primary: Box::new(primary),
+                deregistration: Box::new(close),
+            }),
+        };
+        self.session_registration_confirmed
+            .store(false, Ordering::SeqCst);
         self.cooperative_registration_confirmed
             .store(false, Ordering::SeqCst);
         self.local_registration_confirmed
@@ -7194,10 +7279,11 @@ impl Worker {
                 }
                 _ = &mut heartbeat => {
                     let result = self.retry_worker_operation(|| {
-                        self.client.heartbeat_worker(
+                        self.client.heartbeat_worker_with_sessions(
                             &self.worker_id,
                             self.max_concurrent_workflow_tasks,
                             self.max_concurrent_activity_tasks,
+                            self.client.worker_sessions_enabled.then(|| self.session_available()),
                         )
                     }).await;
                     heartbeat
@@ -7299,6 +7385,9 @@ impl Worker {
     /// Direct callers of [`Client::complete_workflow_task`] continue to receive
     /// the original [`Error::Http`] status and response body.
     pub async fn run_once(&self) -> Result<usize> {
+        if self.client.worker_sessions_enabled {
+            self.require_session_registration()?;
+        }
         if self.cooperative_cancellation_enabled
             && !self
                 .cooperative_registration_confirmed
@@ -7478,6 +7567,9 @@ impl Worker {
     }
 
     async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
+        if self.client.worker_sessions_enabled {
+            self.require_session_registration()?;
+        }
         if self.cooperative_cancellation_enabled {
             return self.poll_cooperative_activity_once().await;
         }
@@ -7503,6 +7595,9 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        let session = self.track_session_task(task.worker_session.as_ref())?;
+        let task = task.task;
+
         let task_id = task.task_id.clone();
         let attempt_id = task
             .activity_attempt_id
@@ -7514,7 +7609,7 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
-        let result = self.execute_activity_task(task).await;
+        let result = self.execute_session_activity_task(task, session).await;
         match result {
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
@@ -8335,8 +8430,31 @@ impl Worker {
         }
     }
 
+    #[cfg(test)]
     async fn execute_activity_task(&self, task: ActivityTask) -> Result<AvroValue> {
+        self.execute_session_activity_task(task, None).await
+    }
+
+    async fn execute_session_activity_task(
+        &self,
+        task: ActivityTask,
+        worker_session: Option<WorkerSession>,
+    ) -> Result<AvroValue> {
         validate_activity_task_payloads(&task)?;
+        if worker_session.is_some() {
+            if task.lease_owner.as_deref() != Some(self.worker_id.as_str())
+                || task
+                    .activity_attempt_id
+                    .as_deref()
+                    .or(task.attempt_id.as_deref())
+                    .is_none_or(str::is_empty)
+                || matches!((&task.activity_attempt_id,&task.attempt_id),(Some(a),Some(b)) if a != b)
+            {
+                return Err(Error::ActivityExecutionAbandoned(
+                    "session activity requires this worker's exact immutable claim".into(),
+                ));
+            }
+        }
 
         let handler = self
             .activities
@@ -8352,6 +8470,7 @@ impl Worker {
             .lease_owner
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
+        let session = worker_session.clone();
         let ctx = ActivityContext {
             client: self.client.clone(),
             task_id: task.task_id,
@@ -8363,9 +8482,21 @@ impl Worker {
             worker_id: self.worker_id.clone(),
             claim_guard: None,
             local_heartbeats: None,
+            worker_session,
         };
 
-        handler(ctx, args).await
+        let callback = handler(ctx, args);
+        if let Some(session) = session {
+            tokio::select! {
+                biased;
+                _ = session.wait_until_unavailable() => Err(Error::ActivityExecutionAbandoned("worker-session lease or TTL expired, closed or became uncertain".into())),
+                result = callback => if session.active() { result } else {
+                    Err(Error::ActivityExecutionAbandoned("worker-session authority ended before callback settlement".into()))
+                },
+            }
+        } else {
+            callback.await
+        }
     }
 }
 
@@ -8962,6 +9093,7 @@ impl WorkflowContext {
             ctx: self.clone(),
             activity_type: activity_type.into(),
             options,
+            worker_session: None,
             args: Some(AvroValue::from_serialize(&args)),
             scheduled: false,
             local: false,
@@ -9027,6 +9159,7 @@ impl WorkflowContext {
             ctx: self.clone(),
             activity_type: activity_type.clone(),
             options,
+            worker_session: None,
             args: Some(encoded),
             scheduled: false,
             local: false,
@@ -10710,6 +10843,7 @@ struct RecordedActivityOptions {
     task_queue: RecordedSnapshotValue<Option<String>>,
     execution_mode: RecordedSnapshotValue<Option<String>>,
     retry_policy: ActivityRetrySnapshot,
+    worker_session: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -11520,6 +11654,7 @@ fn parallel_leaf_call(
             ctx: ctx.clone(),
             activity_type,
             options,
+            worker_session: None,
             args: Some(arguments),
             scheduled: false,
             local: false,
@@ -11612,6 +11747,7 @@ pub struct ParallelCall {
     shape: Option<ParallelShape>,
     leaves: Vec<ParallelLeaf>,
     pending_scope_delivery: bool,
+    worker_session: Option<WorkerSessionOptions>,
 }
 
 impl ParallelCall {
@@ -11622,10 +11758,14 @@ impl ParallelCall {
             shape: None,
             leaves: Vec::new(),
             pending_scope_delivery: false,
+            worker_session: None,
         }
     }
 
     fn initialize(&mut self) -> Result<()> {
+        if let Some(session) = &self.worker_session {
+            session.to_wire()?;
+        }
         let operations = self.operations.take().unwrap_or_default();
         validate_parallel_operations(&operations, &mut Vec::new(), true)?;
         self.shape = Some(parallel_shape(&operations));
@@ -11678,11 +11818,16 @@ impl ParallelCall {
         self.leaves = descriptors
             .into_iter()
             .map(|descriptor| {
-                let call = parallel_leaf_call(
+                let mut call = parallel_leaf_call(
                     &self.ctx,
                     descriptor.operation,
                     descriptor.group_path.clone(),
                 );
+                if let (Some(session), ParallelLeafCall::Activity(activity)) =
+                    (&self.worker_session, &mut call)
+                {
+                    activity.worker_session = Some(session.clone());
+                }
                 ParallelLeaf {
                     call,
                     sequence: base_sequence + descriptor.offset as u64,
@@ -13148,6 +13293,7 @@ pub struct ActivityCall {
     ctx: WorkflowContext,
     activity_type: String,
     options: ActivityOptions,
+    worker_session: Option<WorkerSessionOptions>,
     args: Option<Result<AvroValue>>,
     scheduled: bool,
     local: bool,
@@ -13185,18 +13331,42 @@ impl ActivityCall {
             }
         };
         if self.local {
+            if self.worker_session.is_some() {
+                return Poll::Ready(Err(Error::WorkerLoop(
+                    "local activities cannot use worker-session routing".into(),
+                )));
+            }
             if let Err(error) = local_activity::validate(&options) {
                 return Poll::Ready(Err(error));
             }
         }
+        let session = match self
+            .worker_session
+            .as_ref()
+            .map(WorkerSessionOptions::to_wire)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let session_queue = session
+            .as_ref()
+            .and_then(|session| session["queue"].as_str());
         let task_queue = options
             .task_queue
             .clone()
+            .or_else(|| session_queue.map(str::to_owned))
             .unwrap_or_else(|| state.task_queue.clone());
+        if session_queue.is_some_and(|queue| queue != task_queue) {
+            return Poll::Ready(Err(Error::WorkerLoop(
+                "worker-session queue must match the activity task queue".into(),
+            )));
+        }
         let current_recorded_options = RecordedActivityOptions {
             task_queue: RecordedSnapshotValue::Known(Some(task_queue.clone())),
             execution_mode: RecordedSnapshotValue::Known(self.local.then(|| "local".to_string())),
             retry_policy: current_activity_retry_snapshot(&options),
+            worker_session: session,
         };
 
         let cursor = state.command_cursor;
@@ -13259,6 +13429,16 @@ impl ActivityCall {
                         }
                     }
                     if let Some(recorded_options) = recorded_options {
+                        if recorded_options.worker_session
+                            != current_recorded_options.worker_session
+                        {
+                            return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
+                                "activity_worker_session_mismatch", Some(sequence),
+                                Some(activity_options_description(&recorded_options)),
+                                Some(activity_options_description(&current_recorded_options)),
+                                "recorded worker-session routing differs from the current activity",
+                            ))));
+                        }
                         if !recorded_options
                             .task_queue
                             .matches_current(&current_recorded_options.task_queue)
@@ -13388,6 +13568,9 @@ impl ActivityCall {
             }
             if let Some(policy) = options.cancellation_policy {
                 command.insert("cancellation_policy".to_string(), json!(policy.as_str()));
+            }
+            if let Some(session) = current_recorded_options.worker_session {
+                command.insert("worker_session".into(), session);
             }
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
             ctx.apply_scope_membership(&mut command);
@@ -14283,6 +14466,7 @@ pub struct ActivityContext {
     pub worker_id: String,
     claim_guard: Option<cooperative_cancellation::ActivityClaimGuard>,
     local_heartbeats: Option<Arc<Mutex<local_activity::Heartbeats>>>,
+    worker_session: Option<WorkerSession>,
 }
 
 impl ActivityContext {
@@ -14295,6 +14479,29 @@ impl ActivityContext {
         }
         if let Some(guard) = &self.claim_guard {
             return guard.heartbeat(self, details).await;
+        }
+        if let Some(session) = &self.worker_session {
+            if !session.active() {
+                return Err(Error::ActivityExecutionAbandoned(
+                    "worker-session lease or TTL is no longer active".into(),
+                ));
+            }
+            let result = self
+                .client
+                .heartbeat_activity_task_value(
+                    &self.task_id,
+                    &self.activity_attempt_id,
+                    &self.lease_owner,
+                    details,
+                )
+                .await;
+            return worker_session::settle_activity_heartbeat(
+                session,
+                result,
+                &self.task_id,
+                &self.activity_attempt_id,
+                &self.lease_owner,
+            );
         }
         self.client
             .heartbeat_activity_task(
@@ -15045,11 +15252,13 @@ fn recorded_commands(
                         retry_policy: recorded_activity_retry_snapshot(
                             activity.get("retry_policy"),
                         ),
+                        worker_session: worker_session::recorded_session(&activity_events, sequence)?,
                     },
                     None => RecordedActivityOptions {
                         task_queue: RecordedSnapshotValue::Unknown,
                         execution_mode,
                         retry_policy: recorded_activity_retry_snapshot(None),
+                        worker_session: worker_session::recorded_session(&activity_events, sequence)?,
                     },
                 });
                 return Ok(RecordedCommand::Activity {
@@ -16793,6 +17002,7 @@ mod tests {
     mod local_activity;
     mod runtime_payloads;
     mod runtime_uploads;
+    mod worker_session;
     use std::{
         fs,
         io::{Read, Write},
@@ -20230,6 +20440,114 @@ mod tests {
         assert_eq!(commands[0]["schedule_to_start_timeout"], 10);
         assert_eq!(commands[0]["schedule_to_close_timeout"], 300);
         assert_eq!(commands[0]["heartbeat_timeout"], 15);
+    }
+
+    fn completed_worker_session_history(session: &WorkerSessionOptions) -> Vec<HistoryEvent> {
+        vec![
+            history_event(
+                "ActivityScheduled",
+                json!({"sequence":1,"activity_type":"render",
+                "activity":{"queue":"gpu-workers","worker_session":session.to_wire().unwrap()}}),
+            ),
+            history_event(
+                "ActivityCompleted",
+                json!({"sequence":1,"activity_type":"render",
+                "payload_codec":DEFAULT_CODEC,
+                "result":encode_typed_envelope(&AvroValue::Long(42),DEFAULT_CODEC).unwrap()}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn worker_session_activity_routes_to_session_queue_once() {
+        let ctx = workflow_context(Vec::new());
+        let session = WorkerSessionOptions::new("render-1").queue("gpu-workers");
+        let mut call = Box::pin(
+            ctx.activity("render", json!([]))
+                .in_worker_session(session.clone()),
+        );
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        let commands = ctx.take_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["queue"], "gpu-workers");
+        assert_eq!(commands[0]["worker_session"], session.to_wire().unwrap());
+    }
+
+    #[tokio::test]
+    async fn worker_session_cold_replay_uses_recorded_avro_result() {
+        let session = WorkerSessionOptions::new("render-1").queue("gpu-workers");
+        for _replacement in 0..2 {
+            let ctx = workflow_context(completed_worker_session_history(&session));
+            let result: i64 = ctx
+                .activity("render", json!([]))
+                .in_worker_session(session.clone())
+                .typed()
+                .await
+                .unwrap();
+            assert_eq!(result, 42);
+            assert!(ctx.take_commands().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn worker_session_cold_replay_rejects_changed_identity_and_lifetime() {
+        let original = WorkerSessionOptions::new("render-1").queue("gpu-workers");
+        for changed in [
+            Some(WorkerSessionOptions::new("render-2").queue("gpu-workers")),
+            Some(original.clone().ttl_seconds(60)),
+            Some(original.clone().requirements(["gpu:l4"])),
+            None,
+        ] {
+            let ctx = workflow_context(completed_worker_session_history(&original));
+            let mut call = ctx.activity_with_options(
+                "render",
+                ActivityOptions::new().task_queue("gpu-workers"),
+                json!([]),
+            );
+            if let Some(changed) = changed {
+                call = call.in_worker_session(changed);
+            }
+            let mut call = Box::pin(call);
+            let mut cx = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut cx)
+            else {
+                panic!("changed session must fail replay");
+            };
+            assert_eq!(failure.reason, "activity_worker_session_mismatch");
+            assert!(ctx.take_commands().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn worker_session_local_and_contradictory_queue_routing_emit_no_commands() {
+        let session = WorkerSessionOptions::new("render-1").queue("gpu-workers");
+        let ctx = workflow_context(Vec::new());
+        let mut local = Box::pin(
+            ctx.local_activity("render", json!([]))
+                .in_worker_session(session.clone()),
+        );
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            local.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::WorkerLoop(_)))
+        ));
+        assert!(ctx.take_commands().unwrap().is_empty());
+        let mut remote = Box::pin(
+            ctx.activity_with_options(
+                "render",
+                ActivityOptions::new().task_queue("other"),
+                json!([]),
+            )
+            .in_worker_session(session),
+        );
+        assert!(matches!(
+            remote.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::WorkerLoop(_)))
+        ));
+        assert!(ctx.take_commands().unwrap().is_empty());
     }
 
     #[test]

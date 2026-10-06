@@ -399,6 +399,7 @@ impl Worker {
                 worker_id: self.worker_id.clone(),
                 claim_guard: None,
                 local_heartbeats: Some(reports.clone()),
+                worker_session: None,
             };
             let callback = self
                 .activities

@@ -126,7 +126,7 @@ serde_json = "1"
 serde-value = "0.7"
 sha2 = "0.10"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 # uuid 1.27 requires Rust 1.89. Keep fresh consumers compatible with Rust 1.86.
 uuid = { version = "=1.26.1", features = ["serde", "v4"] }
 
