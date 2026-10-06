@@ -11395,6 +11395,7 @@ pub struct ParallelCall {
     operations: Option<Vec<ParallelOperation>>,
     shape: Option<ParallelShape>,
     leaves: Vec<ParallelLeaf>,
+    pending_scope_delivery: bool,
 }
 
 impl ParallelCall {
@@ -11404,6 +11405,7 @@ impl ParallelCall {
             operations: Some(operations),
             shape: None,
             leaves: Vec::new(),
+            pending_scope_delivery: false,
         }
     }
 
@@ -11448,6 +11450,12 @@ impl ParallelCall {
                 .state
                 .lock()
                 .map_err(|_| Error::WorkflowStatePoisoned)?;
+            let cursor = state.command_cursor;
+            self.ctx.validate_scope_membership(&mut state, cursor)?;
+            if state.prepare_parallel_scope_cancellation(&descriptors)? {
+                self.pending_scope_delivery = true;
+                return Ok(());
+            }
             state.expand_cancellation_group(&descriptors)?;
             state.prepare_group_cancellation(&descriptors)?;
         }
@@ -11479,6 +11487,9 @@ impl ParallelCall {
             if let Err(error) = self.initialize() {
                 return Poll::Ready(Err(error));
             }
+        }
+        if self.pending_scope_delivery {
+            return Poll::Pending;
         }
         if self.leaves.is_empty() {
             return Poll::Ready(Ok(Vec::new()));

@@ -881,50 +881,76 @@ fn request_native_scope_fixture(handle: &WorkflowHandle, scope: &str) -> Value {
     serde_json::from_slice(&result.stdout).unwrap()
 }
 
-fn scope_cleanup_worker(client: &Client, queue: &str, owner: &str) -> Worker {
+fn scope_cleanup_worker(client: &Client, queue: &str, owner: &str, grouped: bool) -> Worker {
     let mut worker = Worker::new(client.clone(), queue)
         .worker_id(owner)
         .cooperative_cancellation(true)
         .candidate_cancellation_scope_authoring(true)
         .candidate_cancellation_scope_delivery(true)
         .poll_timeout(Duration::from_millis(100));
-    worker.register_workflow("tests.rust-candidate-scope-cleanup", |ctx, _| async move {
-        let _: String = ctx.side_effect(|| "original prefix".to_owned())?;
-        let (cancellation, metadata) = ctx
-            .cancellation_scope(false, |scope| async move {
-                let cancellation = match scope.sleep(Duration::from_secs(300)).await {
-                    Err(Error::CancellationScopeRequested(request)) => request.context,
-                    Err(error) => return Err(error),
-                    Ok(()) => {
-                        return Err(Error::InvalidCooperativeCancellation(
-                            "original timer was not interrupted".into(),
-                        ))
-                    }
-                };
-                assert!(scope.is_cancellation_requested()?);
-                let _shield = scope.cancellation_shield()?;
-                let metadata = scope.side_effect(|| cancellation.to_value())?;
-                scope.sleep(Duration::from_secs(1)).await?;
-                Ok((cancellation, metadata))
-            })
-            .await?;
-        assert!(!ctx.is_cancellation_requested()?);
-        assert!(ctx.scoped_cancellation_context()?.is_none());
-        ctx.sleep(Duration::from_secs(1)).await?;
-        Ok(json!({"context":metadata, "remaining":cancellation.remaining()?.as_secs_f64()}))
-    });
+    worker.register_workflow(
+        "tests.rust-candidate-scope-cleanup",
+        move |ctx, _| async move {
+            let _: String = ctx.side_effect(|| "original prefix".to_owned())?;
+            let (cancellation, metadata) = ctx
+                .cancellation_scope(false, move |scope| async move {
+                    let pending = if grouped {
+                        scope
+                            .parallel(vec![
+                                ParallelOperation::timer(Duration::from_secs(300)),
+                                ParallelOperation::group(vec![ParallelOperation::timer(
+                                    Duration::from_secs(600),
+                                )]),
+                            ])
+                            .await
+                            .map(|_| ())
+                    } else {
+                        scope.sleep(Duration::from_secs(300)).await
+                    };
+                    let cancellation = match pending {
+                        Err(Error::CancellationScopeRequested(request)) => request.context,
+                        Err(error) => return Err(error),
+                        Ok(()) => {
+                            return Err(Error::InvalidCooperativeCancellation(
+                                "original timer was not interrupted".into(),
+                            ))
+                        }
+                    };
+                    assert!(scope.is_cancellation_requested()?);
+                    let _shield = scope.cancellation_shield()?;
+                    let metadata = scope.side_effect(|| cancellation.to_value())?;
+                    scope.sleep(Duration::from_secs(1)).await?;
+                    Ok((cancellation, metadata))
+                })
+                .await?;
+            assert!(!ctx.is_cancellation_requested()?);
+            assert!(ctx.scoped_cancellation_context()?.is_none());
+            ctx.sleep(Duration::from_secs(1)).await?;
+            Ok(json!({"context":metadata, "remaining":cancellation.remaining()?.as_secs_f64()}))
+        },
+    );
     worker
 }
 
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
 async fn server_scope_cleanup_preserves_original_delivery_and_budget_after_replacement() {
+    qualify_scope_cleanup_replacement(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_group_cleanup_preserves_original_delivery_and_budget_after_replacement() {
+    qualify_scope_cleanup_replacement(true).await;
+}
+
+async fn qualify_scope_cleanup_replacement(grouped: bool) {
     let client = client();
     let queue = format!(
         "rust-cooperative-scope-boundary-{}",
         durable_workflow::Uuid::new_v4().simple()
     );
-    let original = scope_cleanup_worker(&client, &queue, &format!("{queue}-original"));
+    let original = scope_cleanup_worker(&client, &queue, &format!("{queue}-original"), grouped);
     original.register().await.unwrap();
     let handle = client
         .start_workflow(
@@ -948,9 +974,13 @@ async fn server_scope_cleanup_preserves_original_delivery_and_budget_after_repla
     let accepted = request_native_scope_fixture(&handle, scope);
     assert_eq!(accepted, request_native_scope_fixture(&handle, scope));
     let cleaning = tick_until_count(&original, &handle, "SideEffectRecorded", 2).await;
-    assert_eq!(count(&cleaning, "TimerScheduled"), 2);
+    assert_eq!(
+        count(&cleaning, "TimerScheduled"),
+        if grouped { 3 } else { 2 }
+    );
     assert_eq!(count(&cleaning, "CancellationScopeDelivered"), 1);
-    let replacement = scope_cleanup_worker(&client, &queue, &format!("{queue}-replacement"));
+    let replacement =
+        scope_cleanup_worker(&client, &queue, &format!("{queue}-replacement"), grouped);
     replacement.register().await.unwrap();
     let final_history = tick_until(&replacement, &handle, "WorkflowCompleted").await;
     for kind in [
@@ -958,13 +988,19 @@ async fn server_scope_cleanup_preserves_original_delivery_and_budget_after_repla
         "CancellationScopeRequested",
         "CancellationScopeDeliveryPrepared",
         "CancellationScopeDelivered",
-        "TimerCancelled",
         "WorkflowCompleted",
     ] {
         assert_eq!(count(&final_history, kind), 1, "{kind}");
     }
     assert_eq!(count(&final_history, "SideEffectRecorded"), 2);
-    assert_eq!(count(&final_history, "TimerScheduled"), 3);
+    assert_eq!(
+        count(&final_history, "TimerCancelled"),
+        if grouped { 2 } else { 1 }
+    );
+    assert_eq!(
+        count(&final_history, "TimerScheduled"),
+        if grouped { 4 } else { 3 }
+    );
     assert_eq!(count(&final_history, "TimerFired"), 2);
     for kind in [
         "CooperativeCancellationRequested",

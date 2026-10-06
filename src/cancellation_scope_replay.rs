@@ -1,4 +1,4 @@
-//! Candidate scalar scope delivery. Admission remains private and disabled by default.
+//! Candidate scope delivery. Admission remains private and disabled by default.
 
 use super::*;
 use crate::cancellation_scope_history::CommittedCancellationScopeHistory;
@@ -34,7 +34,7 @@ fn invalid(sequence: u64, detail: &str) -> Error {
     invalid_recorded_history(
         "cancellation_scope_call_mismatch",
         sequence,
-        "original scalar scoped call",
+        "original scoped call",
         "changed call or authority",
         detail,
     )
@@ -50,6 +50,157 @@ fn scalar(kind: CancellationCallKind) -> bool {
     )
 }
 
+fn scope_operation_terminal(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ActivityCompleted"
+            | "ActivityFailed"
+            | "ActivityCancelled"
+            | "ActivityTimedOut"
+            | "TimerFired"
+            | "TimerCancelled"
+            | "ConditionWaitSatisfied"
+            | "ConditionWaitTimedOut"
+            | "ChildRunCompleted"
+            | "ChildRunFailed"
+            | "ChildRunCancelled"
+            | "ChildRunTerminated"
+    )
+}
+
+fn validate_scoped_group_definition(
+    state: &WorkflowState,
+    descriptor: &ParallelDescriptor,
+    recorded: &RecordedCommand,
+) -> Result<()> {
+    let sequence = recorded.sequence();
+    let path = match (&descriptor.operation, recorded) {
+        (
+            ParallelOperation::Activity {
+                activity_type,
+                options,
+                ..
+            },
+            RecordedCommand::Activity {
+                activity_type: original_type,
+                cancellation_policy,
+                options: original_options,
+                parallel_group_path,
+                ..
+            },
+        ) => {
+            let options = options.validate().map_err(Error::InvalidActivityOptions)?;
+            if original_type
+                .as_ref()
+                .is_some_and(|original| original != activity_type)
+                || cancellation_policy
+                    != options
+                        .cancellation_policy
+                        .unwrap_or(CancellationPolicy::TryCancel)
+                        .as_str()
+            {
+                return Err(invalid(
+                    sequence,
+                    "scoped activity changed its original type or cancellation policy",
+                ));
+            }
+            if let Some(original) = original_options {
+                let queue = RecordedSnapshotValue::Known(Some(
+                    options
+                        .task_queue
+                        .clone()
+                        .unwrap_or_else(|| state.task_queue.clone()),
+                ));
+                if !original.task_queue.matches_current(&queue)
+                    || !original
+                        .execution_mode
+                        .matches_current(&RecordedSnapshotValue::Known(None))
+                    || !original
+                        .retry_policy
+                        .matches_current(&current_activity_retry_snapshot(&options))
+                {
+                    return Err(invalid(sequence, "scoped activity changed its original queue, execution mode or retry policy"));
+                }
+            }
+            parallel_group_path
+        }
+        (
+            ParallelOperation::Timer(delay),
+            RecordedCommand::Timer {
+                delay_seconds,
+                parallel_group_path,
+                ..
+            },
+        ) => {
+            if delay
+                .as_secs()
+                .checked_add(u64::from(delay.subsec_nanos() > 0))
+                != Some(*delay_seconds)
+            {
+                return Err(invalid(sequence, "scoped timer changed its original delay"));
+            }
+            parallel_group_path
+        }
+        (
+            ParallelOperation::ChildWorkflow {
+                workflow_type,
+                options,
+                ..
+            },
+            RecordedCommand::ChildWorkflow {
+                workflow_type: original_type,
+                policies,
+                parallel_group_path,
+                ..
+            },
+        ) => {
+            if original_type
+                .as_ref()
+                .is_some_and(|original| original != workflow_type)
+            {
+                return Err(invalid(
+                    sequence,
+                    "scoped child changed its original workflow type",
+                ));
+            }
+            ensure_child_policies_match(sequence, policies, options)?;
+            parallel_group_path
+        }
+        (
+            ParallelOperation::Condition { options, .. },
+            RecordedCommand::ConditionWait {
+                condition_key,
+                predicate_identity,
+                timeout_seconds,
+                parallel_group_path,
+                ..
+            },
+        ) => {
+            let options = options
+                .validate()
+                .map_err(Error::InvalidConditionWaitOptions)?;
+            if condition_key.as_deref() != Some(options.condition_key.as_str())
+                || predicate_identity != &options.predicate_identity
+                || timeout_seconds != &options.timeout_seconds
+            {
+                return Err(invalid(
+                    sequence,
+                    "scoped condition changed its original key, predicate identity or timeout",
+                ));
+            }
+            // Delivery interrupts the original occurrence without evaluating the predicate.
+            parallel_group_path
+        }
+        _ => {
+            return Err(invalid(
+                sequence,
+                "scoped group changed its original member kind",
+            ))
+        }
+    };
+    ensure_parallel_path_matches(sequence, path.as_deref(), &descriptor.group_path)
+}
+
 impl ScopeReplay {
     pub fn read(
         history: &[HistoryEvent],
@@ -59,8 +210,28 @@ impl ScopeReplay {
     ) -> Result<Self> {
         let canonical = CommittedCancellationScopeHistory::read(history, run, workflow)?;
         for preparation in canonical.preparations.values() {
-            if !scalar(preparation.boundary.call_kind)
-                || preparation.boundary.sequence_span != 1
+            let boundary = &preparation.boundary;
+            let supported = if boundary.call_kind == CancellationCallKind::Parallel {
+                history
+                    .iter()
+                    .filter(|event| {
+                        durable_event_sequence(event)
+                            .is_some_and(|sequence| boundary.interrupts(sequence))
+                    })
+                    .all(|event| match event.event_type.as_str() {
+                        "SignalWaitOpened" => false,
+                        "ActivityScheduled" => {
+                            event.payload["local_activity"] != true
+                                && event.payload["execution_mode"] != "local"
+                                && event.payload["activity"]["local_activity"] != true
+                                && event.payload["activity"]["execution_mode"] != "local"
+                        }
+                        _ => true,
+                    })
+            } else {
+                scalar(boundary.call_kind) && boundary.sequence_span == 1
+            };
+            if !supported
                 || preparation.boundary.operation_sequence.is_some()
                 || preparation.event.payload["descendant_members"]
                     .as_array()
@@ -86,6 +257,33 @@ impl ScopeReplay {
     pub fn bind_commands(&self, commands: &mut Vec<RecordedCommand>) -> Result<()> {
         for (&sequence, delivered) in &self.canonical.deliveries {
             let index = commands.partition_point(|command| command.sequence() < sequence);
+            if delivered.boundary.call_kind == CancellationCallKind::Parallel {
+                let end = commands.partition_point(|command| {
+                    delivered.boundary.interrupts(command.sequence())
+                        || command.sequence() < sequence
+                });
+                let original: Vec<_> = commands.drain(index..end).collect();
+                if original.len() as u64 != delivered.boundary.sequence_span
+                    || original
+                        .iter()
+                        .enumerate()
+                        .any(|(offset, command)| command.sequence() != sequence + offset as u64)
+                {
+                    return Err(invalid(
+                        sequence,
+                        "scope delivery omits an original group member",
+                    ));
+                }
+                commands.insert(
+                    index,
+                    RecordedCommand::CancellationGroup {
+                        sequence,
+                        span: delivered.boundary.sequence_span,
+                        original,
+                    },
+                );
+                continue;
+            }
             let original = if commands
                 .get(index)
                 .is_some_and(|command| command.sequence() == sequence)
@@ -117,6 +315,158 @@ impl ScopeReplay {
 }
 
 impl WorkflowState {
+    /// Validate the whole group before exposing cancellation to application code.
+    pub(super) fn prepare_parallel_scope_cancellation(
+        &mut self,
+        descriptors: &[ParallelDescriptor],
+    ) -> Result<bool> {
+        let Some(replay) = &self.scope_delivery else {
+            return Ok(false);
+        };
+        let index = self.command_cursor;
+        let sequence = descriptors[0].group_path[0].parallel_group_base_sequence;
+        if let Some(delivered) = replay.canonical.deliveries.get(&sequence) {
+            let delivered = delivered.clone();
+            if replay.active_scope != delivered.context.scope_id()
+                || self.cancellation_shield_depth > 0
+                || delivered.boundary.call_kind != CancellationCallKind::Parallel
+            {
+                return Err(invalid(
+                    sequence,
+                    "scoped group changed its original membership, kind or shielding",
+                ));
+            }
+            let Some(RecordedCommand::CancellationGroup { span, original, .. }) =
+                self.recorded_commands.get(index).cloned()
+            else {
+                return Err(invalid(
+                    sequence,
+                    "scoped group crossed its original delivery boundary",
+                ));
+            };
+            if span != descriptors.len() as u64 {
+                return Err(invalid(sequence, "scoped group changed its original span"));
+            }
+            self.validate_scoped_group_members(descriptors, &original)?;
+            let conditions = descriptors
+                .iter()
+                .filter(|descriptor| {
+                    matches!(descriptor.operation, ParallelOperation::Condition { .. })
+                })
+                .count() as u64;
+            self.condition_wait_occurrence_counter = self
+                .condition_wait_occurrence_counter
+                .checked_add(conditions)
+                .ok_or_else(|| {
+                    invalid(sequence, "scoped condition occurrence counter overflowed")
+                })?;
+            self.recorded_commands.splice(index..=index, original);
+            return self
+                .replay_scope_cancellation_at(index, CancellationCallKind::Parallel)
+                .map(|()| false);
+        }
+        if self.cancellation_shield_depth > 0 {
+            return Ok(false);
+        }
+        if replay.intent.is_some() {
+            return Ok(true);
+        }
+        let Some(request) = replay
+            .canonical
+            .pending_request_for_scope(&replay.active_scope, &replay.tree)?
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if replay.contexts.contains_key(request.context.scope_id()) {
+            return Ok(false);
+        }
+        if request.context.scope_id() != replay.active_scope
+            || descriptors
+                .iter()
+                .any(|descriptor| matches!(descriptor.operation, ParallelOperation::Signal(_)))
+        {
+            return Err(Error::CancellationScopeExecutionUnavailable);
+        }
+        let span = descriptors.len() as u64;
+        let resolved = |sequence| {
+            self.history_events
+                .iter()
+                .take(request.history_index)
+                .any(|event| {
+                    durable_event_sequence(event) == Some(sequence)
+                        && scope_operation_terminal(&event.event_type)
+                })
+        };
+        if (sequence..sequence + span).all(resolved) {
+            return Ok(false);
+        }
+        let original: Vec<_> = self
+            .recorded_commands
+            .iter()
+            .skip(index)
+            .take(descriptors.len())
+            .cloned()
+            .collect();
+        self.validate_scoped_group_members(descriptors, &original)?;
+        let boundary = CancellationDelivery {
+            request_id: request.context.request_id().into(),
+            sequence,
+            call_kind: CancellationCallKind::Parallel,
+            sequence_span: span,
+            operation_sequence: None,
+            operation_sequence_span: 1,
+        };
+        if replay
+            .canonical
+            .preparations
+            .get(request.context.scope_id())
+            .is_some_and(|prepared| prepared.boundary != boundary)
+        {
+            return Err(invalid(
+                sequence,
+                "prepared scope changed its original authored group",
+            ));
+        }
+        self.scope_delivery.as_mut().unwrap().intent = Some(ScopeDeliveryIntent {
+            context: request.context,
+            boundary,
+            command_count: self.commands.len(),
+        });
+        self.matched_recorded_pending = true;
+        self.command_cursor = index + descriptors.len();
+        Ok(true)
+    }
+
+    fn validate_scoped_group_members(
+        &self,
+        descriptors: &[ParallelDescriptor],
+        original: &[RecordedCommand],
+    ) -> Result<()> {
+        if descriptors.len() != original.len() {
+            return Err(invalid(
+                descriptors[0].group_path[0].parallel_group_base_sequence,
+                "scoped group omits an original admitted member",
+            ));
+        }
+        let replay = self.scope_delivery.as_ref().unwrap();
+        for (descriptor, recorded) in descriptors.iter().zip(original) {
+            let sequence =
+                descriptor.group_path[0].parallel_group_base_sequence + descriptor.offset as u64;
+            if recorded.sequence() != sequence
+                || replay.tree.memberships.get(&sequence).map(String::as_str)
+                    != Some(replay.active_scope.as_str())
+            {
+                return Err(invalid(
+                    sequence,
+                    "scoped group changed its original member address",
+                ));
+            }
+            validate_scoped_group_definition(self, descriptor, recorded)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn scope_cleanup_timer_proof(&self, scope: &str) -> Result<Option<Value>> {
         if self.cancellation_shield_depth == 0 {
             return Ok(None);
@@ -185,9 +535,6 @@ impl WorkflowState {
         if replay.contexts.contains_key(request.context.scope_id()) {
             return Ok(false);
         }
-        if !scalar(kind) || !path.is_empty() || request.context.scope_id() != replay.active_scope {
-            return Err(Error::CancellationScopeExecutionUnavailable);
-        }
         let sequence = self.recorded_commands.get(index).map_or_else(
             || self.next_scope_cancellation_sequence(),
             |command| Ok(command.sequence()),
@@ -216,6 +563,9 @@ impl WorkflowState {
             })
         {
             return Ok(false);
+        }
+        if !scalar(kind) || !path.is_empty() || request.context.scope_id() != replay.active_scope {
+            return Err(Error::CancellationScopeExecutionUnavailable);
         }
         let boundary = CancellationDelivery {
             request_id: request.context.request_id().into(),
@@ -294,7 +644,12 @@ impl WorkflowState {
             delivered.context.scope_id().into(),
             (delivered.context.clone(), delivered.authority_deadline),
         );
-        self.command_cursor = index + 1;
+        self.command_cursor = index
+            + if kind == CancellationCallKind::Parallel {
+                delivered.boundary.sequence_span as usize
+            } else {
+                1
+            };
         Err(Error::CancellationScopeRequested(
             CancellationScopeRequested {
                 context: delivered

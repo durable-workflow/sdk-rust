@@ -159,11 +159,27 @@ major-version decision. Source qualification, protocol freeze and the published
 mixed-language cancellation acceptance scenario remain release gates. The
 candidate does not change a published artifact.
 
+## Candidate scoped delivery
+
+The private scope opt-ins consume scalar calls and flat or nested `parallel`
+groups of remote activities, timers, children and conditions. The complete group
+is checked against its original definitions, policies, member addresses and paths
+before workflow code receives `CancellationScopeRequested`. Earlier completed
+members do not hide pending siblings. A committed condition is interrupted
+without evaluating its predicate. Replacement replay retains the original group
+span, cleanup sequence, context and deadline.
+
+Shielded cleanup timers carry only the original scope, request and delivery
+references. Server derives their immutable authority and rejects a timer that
+would reach its ceiling. Unsupported local, signal, selection, incomplete or
+mixed-scope groups are refused before the workflow factory runs. Descendant
+delivery and root/scope composition still require qualification. These opt-ins
+remain disabled by default and do not advertise general scoped execution.
+
 ## Remaining qualification
 
-Nested scopes, competitive qualification and exact published artifacts still
-need completion. The remaining-time helper needs connected exact-head
-qualification. Do not subtract the host clock from the deadline in workflow code.
+Complete the remaining scoped consumers, competitive qualification and exact
+published artifacts. Do not subtract the host clock from the deadline in workflow code.
 The runtime continues enforcing the original deadline and fencing task and
 activity ownership. Rust local activities and worker affinity remain unsupported.
 
