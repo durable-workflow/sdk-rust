@@ -91,10 +91,37 @@ payload fetches never follow redirects.
 
 ## Examples
 
+### Local activities (source preview)
+
+Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.
+Register the callback with the ordinary activity registration methods, then call
+`ctx.local_activity(...)`, `local_activity_typed(...)` or
+`local_activity_avro_value(...)` from workflow code. `LocalActivityOptions` sets
+bounded retries and start-to-close, schedule-to-close and heartbeat timeouts.
+
+Local activities run in the workflow worker and bypass the activity queue.
+Server records their attempts, heartbeat details and terminal result. Committed
+results replay without running the callback. A worker lost before completion is
+acknowledged can execute the callback again, so external effects must be idempotent.
+
+Callbacks must yield to Tokio. Timeout or lost workflow lease drops the async
+callback without requiring application heartbeats. Blocking work needs separate
+process supervision. Inline local execution and cooperative prepared local
+supervision use separate worker profiles. Registration rejects combining them.
+Database-generated execution and failure IDs become available after Server
+commits history. Use the failure kind, timeout kind and attempt number to branch
+during fresh execution, rather than testing whether an ID has been assigned.
+
+This API remains a source preview pending published-package qualification.
+Default workers continue to advertise local activities as disabled.
+
+### Runnable examples
+
 | Example | Demonstrates |
 | --- | --- |
 | [`hello_world.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs) | Typed worker, workflow, activities, retries, and completion |
 | [`activity_options.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/activity_options.rs) | Activity retry and timeout policies |
+| [`local_activities.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/local_activities.rs) | Explicit local execution, retries, durable timers and remote work |
 | [`condition_search_attributes.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/condition_search_attributes.rs) | Durable conditions and typed search attributes |
 | [`continue_as_new.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/continue_as_new.rs) | Bounded histories and continue-as-new |
 | [`parallel_saga.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/parallel_saga.rs) | Deterministic parallel work and saga compensation |

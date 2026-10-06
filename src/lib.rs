@@ -6,6 +6,7 @@ mod cancellation_scope;
 mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
+mod local_activity;
 mod runtime_payloads;
 mod runtime_uploads;
 
@@ -47,6 +48,7 @@ use chrono::DateTime;
 use futures_util::{
     future::OptionFuture, stream::FuturesUnordered, task::noop_waker_ref, StreamExt,
 };
+pub use local_activity::LocalActivityOptions;
 use serde::{
     de::DeserializeOwned,
     ser::{SerializeMap, SerializeSeq},
@@ -2727,6 +2729,7 @@ pub struct Client {
     max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
     cooperative_worker_protocol: bool,
+    local_activities_enabled: bool,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
 }
 
@@ -3635,6 +3638,10 @@ impl Client {
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
+        if self.local_activities_enabled {
+            body["capability_manifest"]["local_activities"] = json!({"supported":true,
+                "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION});
+        }
         if workflow_command_contracts
             .as_object()
             .is_some_and(|contracts| !contracts.is_empty())
@@ -3653,6 +3660,35 @@ impl Client {
                 Some(&body),
             )
             .await?;
+        if self.local_activities_enabled {
+            let compatible = response["registered"].as_bool() == Some(true)
+                && response["worker_id"].as_str() == Some(worker_id)
+                && response["namespace"].as_str() == Some(self.namespace.as_str())
+                && response["task_queue"].as_str() == Some(task_queue)
+                && response["protocol_version"]
+                    .as_str()
+                    .and_then(|version| version.strip_prefix("1."))
+                    .and_then(|minor| minor.parse::<u64>().ok())
+                    .is_some_and(|minor| minor >= 18)
+                && response["capability_manifest"]["local_activities"]["supported"].as_bool()
+                    == Some(true);
+            if !compatible {
+                let error = Error::WorkerLoop("local_activity_registration_unconfirmed: Server must acknowledge this worker, namespace, queue and local capability".into());
+                if response["registered"] == true
+                    && response["worker_id"].as_str() == Some(worker_id)
+                {
+                    if let Err(deregistration) =
+                        self.deregister_worker_registration(worker_id).await
+                    {
+                        return Err(Error::WorkerShutdown {
+                            primary: Box::new(error),
+                            deregistration: Box::new(deregistration),
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        }
         if self.cooperative_worker_protocol {
             let compatible = response["registered"].as_bool() == Some(true)
                 && response["worker_id"].as_str() == Some(worker_id)
@@ -5027,6 +5063,7 @@ impl ClientBuilder {
             max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
             cooperative_worker_protocol: false,
+            local_activities_enabled: false,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
         })
     }
@@ -6197,6 +6234,15 @@ struct WorkflowTaskDecision {
     cancellation_scope_delivery: Option<cancellation_scope_replay::ScopeDeliveryIntent>,
 }
 
+enum PreparedWorkflowTask {
+    Decision(WorkflowTaskDecision),
+    Execution {
+        task: WorkflowTask,
+        context: WorkflowContext,
+        future: WorkflowFuture,
+    },
+}
+
 impl WorkflowTaskDecision {
     fn without_message_streams(commands: Vec<Value>) -> Self {
         Self {
@@ -6304,6 +6350,7 @@ pub struct Worker {
     allow_cancellation_scope_authoring: bool,
     allow_cancellation_scope_delivery: bool,
     cooperative_registration_confirmed: Arc<AtomicBool>,
+    local_registration_confirmed: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -6326,12 +6373,14 @@ impl Worker {
             allow_cancellation_scope_authoring: false,
             allow_cancellation_scope_delivery: false,
             cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            local_registration_confirmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = worker_id.into();
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -6342,6 +6391,17 @@ impl Worker {
 
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Explicitly enable inline local activities in this workflow worker.
+    ///
+    /// The worker advertises the capability to Server only when enabled.
+    /// These callbacks must yield to Tokio and have idempotent side effects.
+    /// Cooperative prepared local supervision is a separate capability.
+    pub fn local_activities(mut self, enabled: bool) -> Self {
+        self.client.local_activities_enabled = enabled;
+        self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -6926,6 +6986,13 @@ impl Worker {
     }
 
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
+        self.local_registration_confirmed
+            .store(false, Ordering::SeqCst);
+        if self.client.local_activities_enabled && self.cooperative_cancellation_enabled {
+            return Err(Error::CooperativeCancellationUnavailable(
+                "inline local activities cannot advertise prepared local supervision; use a separate ordinary worker for inline local callbacks".into(),
+            ));
+        }
         let mut command_contracts = serde_json::Map::new();
         for workflow_type in self.workflows.keys() {
             let mut queries = self
@@ -6970,6 +7037,9 @@ impl Worker {
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
+                    self.client
+                        .local_activities_enabled
+                        .then(|| "local_activities".to_string()),
                     self.cooperative_cancellation_enabled
                         .then(|| "cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
@@ -6996,6 +7066,10 @@ impl Worker {
             .await?;
         if self.cooperative_cancellation_enabled && response.registered {
             self.cooperative_registration_confirmed
+                .store(true, Ordering::SeqCst);
+        }
+        if self.client.local_activities_enabled && response.registered {
+            self.local_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
         Ok(response)
@@ -7052,6 +7126,8 @@ impl Worker {
         let registered_worker_id = registration.worker_id.clone();
         let primary = self.run_registered_until(stop, registration).await;
         self.cooperative_registration_confirmed
+            .store(false, Ordering::SeqCst);
+        self.local_registration_confirmed
             .store(false, Ordering::SeqCst);
         let deregistration = self
             .client
@@ -7250,6 +7326,11 @@ impl Worker {
     }
 
     async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        if self.client.local_activities_enabled
+            && !self.local_registration_confirmed.load(Ordering::SeqCst)
+        {
+            return Err(Error::WorkerLoop("local_activity_registration_unconfirmed: register this local-capable worker before polling workflow tasks".into()));
+        }
         if self.cooperative_cancellation_enabled {
             return self.poll_cooperative_workflow_once().await;
         }
@@ -7285,12 +7366,17 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
 
+        let decision = match self.execute_workflow_with_local_activities(task).await {
+            Ok(Some(decision)) => Ok(decision),
+            Ok(None) => return Ok(ManagedPollOutcome::Handled),
+            Err(error) => Err(error),
+        };
         self.settle_workflow_task_decision(
             &task_id,
             &lease_owner,
             attempt,
             run_id.as_deref(),
-            self.execute_workflow_task_decision(task),
+            decision,
             memo_updates_supported,
         )
         .await
@@ -7882,6 +7968,24 @@ impl Worker {
         task: WorkflowTask,
         observation: Option<&CancellationRequest>,
     ) -> Result<WorkflowTaskDecision> {
+        match self.prepare_workflow_task_execution(task, observation)? {
+            PreparedWorkflowTask::Decision(decision) => Ok(decision),
+            PreparedWorkflowTask::Execution {
+                task,
+                context,
+                mut future,
+            } => {
+                let outcome = Self::poll_workflow_future(&context, &mut future)?;
+                self.finish_workflow_task_execution(&task, &context, outcome)
+            }
+        }
+    }
+
+    fn prepare_workflow_task_execution(
+        &self,
+        task: WorkflowTask,
+        observation: Option<&CancellationRequest>,
+    ) -> Result<PreparedWorkflowTask> {
         if (self.allow_cancellation_scope_authoring || self.allow_cancellation_scope_delivery)
             && !self.cooperative_cancellation_enabled
         {
@@ -7925,7 +8029,8 @@ impl Worker {
             )?;
             return self
                 .execute_update_task(&task, update_id)
-                .map(WorkflowTaskDecision::without_message_streams);
+                .map(WorkflowTaskDecision::without_message_streams)
+                .map(PreparedWorkflowTask::Decision);
         }
 
         let workflow = self
@@ -7949,9 +8054,9 @@ impl Worker {
             .or_else(|| (!task.task_id.is_empty()).then(|| task.task_id.clone()))
             .unwrap_or_default();
         let mut workflow_state = WorkflowState::new_with_identity_and_scope_delivery(
-            task.history_events,
-            task.workflow_id,
-            task.run_id,
+            task.history_events.clone(),
+            task.workflow_id.clone(),
+            task.run_id.clone(),
             self.task_queue.clone(),
             task.payload_codec.clone(),
             resume_signal,
@@ -7972,13 +8077,40 @@ impl Worker {
             state,
             cancellation_scope_id: "root".into(),
         };
-        let mut future = (workflow.execute)(ctx.clone(), input);
-        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let future = (workflow.execute)(ctx.clone(), input);
+        Ok(PreparedWorkflowTask::Execution {
+            task,
+            context: ctx,
+            future,
+        })
+    }
 
-        let outcome = {
-            let _replay = cancellation_replay_clock::ReplayGuard::enter(&ctx)?;
-            future.as_mut().poll(&mut cx)
-        };
+    fn poll_workflow_future(
+        ctx: &WorkflowContext,
+        future: &mut WorkflowFuture,
+    ) -> Result<Poll<Result<AvroValue>>> {
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let _replay = cancellation_replay_clock::ReplayGuard::enter(ctx)?;
+        Ok(future.as_mut().poll(&mut cx))
+    }
+
+    fn finish_workflow_task_execution(
+        &self,
+        task: &WorkflowTask,
+        ctx: &WorkflowContext,
+        outcome: Poll<Result<AvroValue>>,
+    ) -> Result<WorkflowTaskDecision> {
+        if !ctx
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?
+            .local_activity_requests
+            .is_empty()
+        {
+            return Err(Error::CooperativeCancellationUnavailable(
+                "local_activity_execution_unavailable: unresolved inline local calls require an ordinary workflow worker executor; cooperative execution requires prepared local supervision".into(),
+            ));
+        }
         let awaiting_canonical_boundary = {
             let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
             state.cancellation_delivery_intent.is_some()
@@ -8225,6 +8357,7 @@ impl Worker {
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
             claim_guard: None,
+            local_heartbeats: None,
         };
 
         handler(ctx, args).await
@@ -8826,6 +8959,8 @@ impl WorkflowContext {
             options,
             args: Some(AvroValue::from_serialize(&args)),
             scheduled: false,
+            local: false,
+            local_result: None,
             parallel_group_path: Vec::new(),
         }
     }
@@ -8889,6 +9024,8 @@ impl WorkflowContext {
             options,
             args: Some(encoded),
             scheduled: false,
+            local: false,
+            local_result: None,
             parallel_group_path: Vec::new(),
         };
         let result = std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await?;
@@ -9856,6 +9993,7 @@ struct WorkflowState {
     workflow_command_identity: String,
     workflow_stream_command_counter: u64,
     commands: Vec<Value>,
+    local_activity_requests: Vec<local_activity::Request>,
     message_stream_messages: HashMap<String, Vec<MessageStreamMessage>>,
     message_stream_cursors: HashMap<String, u64>,
     message_stream_waits: HashMap<String, u64>,
@@ -10123,6 +10261,7 @@ impl WorkflowState {
             matched_recorded_pending: false,
             version_markers: HashMap::new(),
             commands: Vec::new(),
+            local_activity_requests: Vec::new(),
             message_stream_messages: HashMap::new(),
             message_stream_cursors,
             message_stream_waits: HashMap::new(),
@@ -10799,6 +10938,61 @@ fn recorded_optional_string(
     }
 }
 
+fn recorded_activity_execution_mode(
+    events: &[&HistoryEvent],
+    sequence: u64,
+) -> Result<RecordedSnapshotValue<Option<String>>> {
+    let mut recorded = RecordedSnapshotValue::Unknown;
+    for event in events {
+        for object in [
+            event.payload.as_object(),
+            event.payload.get("activity").and_then(Value::as_object),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mode = match object.get("execution_mode") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(mode)) if !mode.is_empty() => Some(Some(mode.clone())),
+                Some(_) => {
+                    return Err(invalid_recorded_history(
+                        "activity_execution_mode_invalid",
+                        sequence,
+                        "null or a non-empty execution mode",
+                        "invalid execution_mode",
+                        "activity history contains an invalid execution mode",
+                    ))
+                }
+            };
+            let legacy_mode = match object.get("local_activity") {
+                None => None,
+                Some(Value::Bool(local)) => Some(local.then(|| "local".to_string())),
+                Some(_) => {
+                    return Err(invalid_recorded_history(
+                        "activity_execution_mode_invalid",
+                        sequence,
+                        "boolean local_activity",
+                        "invalid local_activity",
+                        "activity history contains an invalid local-activity marker",
+                    ))
+                }
+            };
+            for mode in [mode, legacy_mode].into_iter().flatten() {
+                if matches!(&recorded, RecordedSnapshotValue::Known(previous) if previous != &mode)
+                {
+                    return Err(invalid_recorded_history(
+                        "activity_execution_mode_conflict", sequence, "one activity execution mode", "conflicting execution modes",
+                        "activity lifecycle events at one workflow sequence disagree on execution mode",
+                    ));
+                }
+                recorded = RecordedSnapshotValue::Known(mode);
+            }
+        }
+    }
+    Ok(recorded)
+}
+
 fn recorded_activity_retry_snapshot(policy: Option<&Value>) -> ActivityRetrySnapshot {
     let policy = policy.and_then(Value::as_object);
     let backoff_seconds = policy
@@ -11323,6 +11517,8 @@ fn parallel_leaf_call(
             options,
             args: Some(arguments),
             scheduled: false,
+            local: false,
+            local_result: None,
             parallel_group_path,
         }),
         ParallelOperation::ChildWorkflow {
@@ -12949,6 +13145,8 @@ pub struct ActivityCall {
     options: ActivityOptions,
     args: Option<Result<AvroValue>>,
     scheduled: bool,
+    local: bool,
+    local_result: Option<Arc<Mutex<Option<ActivityOutcome>>>>,
     parallel_group_path: Vec<ParallelGroupMetadata>,
 }
 
@@ -12963,6 +13161,14 @@ impl ActivityCall {
             Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
         };
 
+        if let Some(result) = &self.local_result {
+            return match result.lock() {
+                Ok(mut result) => result.take().map_or(Poll::Pending, |result| {
+                    Poll::Ready(result.map_err(Error::ActivityFailed))
+                }),
+                Err(_) => Poll::Ready(Err(Error::WorkflowStatePoisoned)),
+            };
+        }
         if self.scheduled {
             return Poll::Pending;
         }
@@ -12973,27 +13179,34 @@ impl ActivityCall {
                 return Poll::Ready(Err(Error::InvalidActivityOptions(error)));
             }
         };
+        if self.local {
+            if let Err(error) = local_activity::validate(&options) {
+                return Poll::Ready(Err(error));
+            }
+        }
         let task_queue = options
             .task_queue
             .clone()
             .unwrap_or_else(|| state.task_queue.clone());
         let current_recorded_options = RecordedActivityOptions {
             task_queue: RecordedSnapshotValue::Known(Some(task_queue.clone())),
-            // Rust schedules ordinary durable activities. The server records a
-            // non-null mode only for a specialized execution primitive.
-            execution_mode: RecordedSnapshotValue::Known(None),
+            execution_mode: RecordedSnapshotValue::Known(self.local.then(|| "local".to_string())),
             retry_policy: current_activity_retry_snapshot(&options),
         };
 
         let cursor = state.command_cursor;
+        let call_kind = if self.local {
+            CancellationCallKind::LocalActivity
+        } else {
+            CancellationCallKind::Activity
+        };
         if let Err(error) = ctx.validate_scope_membership(&mut state, cursor) {
             return Poll::Ready(Err(error));
         }
-        let recorded =
-            match state.cancellation_replay_command(cursor, CancellationCallKind::Activity) {
-                Ok(recorded) => recorded,
-                Err(error) => return Poll::Ready(Err(error)),
-            };
+        let recorded = match state.cancellation_replay_command(cursor, call_kind) {
+            Ok(recorded) => recorded,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
         if let Some(recorded) = recorded {
             let sequence = recorded.sequence();
             match recorded {
@@ -13055,9 +13268,14 @@ impl ActivityCall {
                                 ),
                             )));
                         }
-                        if !recorded_options
-                            .execution_mode
-                            .matches_current(&current_recorded_options.execution_mode)
+                        if (self.local
+                            && matches!(
+                                recorded_options.execution_mode,
+                                RecordedSnapshotValue::Unknown
+                            ))
+                            || !recorded_options
+                                .execution_mode
+                                .matches_current(&current_recorded_options.execution_mode)
                         {
                             return Poll::Ready(Err(Error::NonDeterministicReplay(
                                 ReplayFailure::new(
@@ -13084,14 +13302,12 @@ impl ActivityCall {
                             )));
                         }
                     }
-                    if let Err(error) =
-                        state.replay_cancellation_at(cursor, CancellationCallKind::Activity)
-                    {
+                    if let Err(error) = state.replay_cancellation_at(cursor, call_kind) {
                         return Poll::Ready(Err(error));
                     }
                     match state.prepare_scalar_cancellation(
                         cursor,
-                        CancellationCallKind::Activity,
+                        call_kind,
                         &self.parallel_group_path,
                     ) {
                         Ok(true) => {
@@ -13131,7 +13347,14 @@ impl ActivityCall {
             };
 
             let mut command = serde_json::Map::from_iter([
-                ("type".to_string(), json!("schedule_activity")),
+                (
+                    "type".to_string(),
+                    json!(if self.local {
+                        "record_local_activity"
+                    } else {
+                        "schedule_activity"
+                    }),
+                ),
                 (
                     "activity_type".to_string(),
                     json!(self.activity_type.clone()),
@@ -13155,25 +13378,34 @@ impl ActivityCall {
                     command.insert(field.to_string(), json!(value));
                 }
             }
-            if let Some(retry_policy) = options.retry_policy {
-                command.insert("retry_policy".to_string(), retry_policy);
+            if let Some(retry_policy) = &options.retry_policy {
+                command.insert("retry_policy".to_string(), retry_policy.clone());
             }
             if let Some(policy) = options.cancellation_policy {
                 command.insert("cancellation_policy".to_string(), json!(policy.as_str()));
             }
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
             ctx.apply_scope_membership(&mut command);
-            match state.prepare_scalar_cancellation(
-                cursor,
-                CancellationCallKind::Activity,
-                &self.parallel_group_path,
-            ) {
+            match state.prepare_scalar_cancellation(cursor, call_kind, &self.parallel_group_path) {
                 Ok(true) => {
                     self.scheduled = true;
                     return Poll::Pending;
                 }
                 Ok(false) => {}
                 Err(error) => return Poll::Ready(Err(error)),
+            }
+            if self.local {
+                command.remove("queue");
+                command.insert("execution_mode".into(), json!("local"));
+                let result = Arc::new(Mutex::new(None));
+                let command_index = state.commands.len();
+                state.local_activity_requests.push(local_activity::Request {
+                    command_index,
+                    options,
+                    arguments,
+                    result: result.clone(),
+                });
+                self.local_result = Some(result);
             }
             state.commands.push(Value::Object(command));
             self.scheduled = true;
@@ -14045,10 +14277,17 @@ pub struct ActivityContext {
     pub task_queue: String,
     pub worker_id: String,
     claim_guard: Option<cooperative_cancellation::ActivityClaimGuard>,
+    local_heartbeats: Option<Arc<Mutex<local_activity::Heartbeats>>>,
 }
 
 impl ActivityContext {
     pub async fn heartbeat<T: Serialize>(&self, details: T) -> Result<ActivityHeartbeatResponse> {
+        if let Some(heartbeats) = &self.local_heartbeats {
+            return heartbeats
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?
+                .record(details);
+        }
         if let Some(guard) = &self.claim_guard {
             return guard.heartbeat(self, details).await;
         }
@@ -14788,18 +15027,26 @@ fn recorded_commands(
                     .first()
                     .map(|event| activity_outcome(event, fallback_codec, activity_type.clone()))
                     .transpose()?;
-                let options = activity_events
+                let execution_mode = recorded_activity_execution_mode(&activity_events, sequence)?;
+                let activity_snapshot = activity_events
                     .iter()
                     .find(|event| event.event_type == "ActivityScheduled")
                     .and_then(|event| event.payload.get("activity"))
-                    .and_then(Value::as_object)
-                    .map(|activity| RecordedActivityOptions {
+                    .and_then(Value::as_object);
+                let options = Some(match activity_snapshot {
+                    Some(activity) => RecordedActivityOptions {
                         task_queue: recorded_optional_string(activity, "queue"),
-                        execution_mode: recorded_optional_string(activity, "execution_mode"),
+                        execution_mode,
                         retry_policy: recorded_activity_retry_snapshot(
                             activity.get("retry_policy"),
                         ),
-                    });
+                    },
+                    None => RecordedActivityOptions {
+                        task_queue: RecordedSnapshotValue::Unknown,
+                        execution_mode,
+                        retry_policy: recorded_activity_retry_snapshot(None),
+                    },
+                });
                 return Ok(RecordedCommand::Activity {
                     sequence,
                     activity_type,
@@ -16538,6 +16785,7 @@ mod tests {
     mod cancellation_scope_replay;
     mod child_workflow_policies;
     mod cooperative_cancellation;
+    mod local_activity;
     mod runtime_payloads;
     mod runtime_uploads;
     use std::{
@@ -20299,6 +20547,57 @@ mod tests {
             assert_eq!(failure.sequence, Some(1));
             assert!(ctx.take_commands().expect("commands").is_empty());
         }
+    }
+
+    #[test]
+    fn remote_activity_rejects_local_history_markers_without_option_snapshot() {
+        for (nested, field, value, terminal_only) in [
+            (false, "execution_mode", json!("local"), false),
+            (false, "local_activity", json!(true), false),
+            (true, "local_activity", json!(true), false),
+            (false, "local_activity", json!(true), true),
+        ] {
+            let mut history = completed_retry_activity_history();
+            history[0]
+                .payload
+                .as_object_mut()
+                .unwrap()
+                .remove("activity");
+            let event = if terminal_only {
+                history.last_mut().unwrap()
+            } else {
+                &mut history[0]
+            };
+            if nested {
+                event.payload["activity"] = json!({(field): value});
+            } else {
+                event.payload[field] = value;
+            }
+            let ctx = workflow_context(history);
+            let mut call =
+                Box::pin(ctx.activity_with_options("flaky", retry_activity_options(), json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("local history must not replay as a remote activity: {nested}/{field}/{terminal_only}");
+            };
+            assert_eq!(failure.reason, "activity_execution_mode_mismatch");
+            assert_eq!(failure.sequence, Some(1));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    #[test]
+    fn activity_history_rejects_conflicting_local_execution_markers() {
+        let mut history = completed_retry_activity_history();
+        history.last_mut().unwrap().payload["local_activity"] = json!(true);
+        let error = WorkflowState::new(history, "queue".into(), DEFAULT_CODEC.into(), None)
+            .expect_err("remote schedule cannot become a local completion");
+        assert!(
+            matches!(error, Error::NonDeterministicReplay(ReplayFailure { reason, sequence: Some(1), .. })
+            if reason == "activity_execution_mode_conflict")
+        );
     }
 
     #[test]

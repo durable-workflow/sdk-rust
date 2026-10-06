@@ -4847,6 +4847,22 @@ async fn cooperative_poll_preflights_inputs_and_shares_the_poll_and_history_budg
 }
 
 #[tokio::test]
+async fn ordinary_workflow_heartbeat_uses_119_with_the_same_claim_fences() {
+    let server = transport_server();
+    let task = transport_task();
+    let receipt = client(&server, "heartbeat-equivalent-time")
+        .heartbeat_workflow_task_with_protocol(&task, None, WORKER_PROTOCOL_VERSION)
+        .await
+        .unwrap();
+    assert_eq!(receipt.task_id, task.task_id);
+    assert_eq!(receipt.workflow_task_attempt, task.workflow_task_attempt);
+    assert_eq!(receipt.lease_owner, "actual-owner");
+    let requests = server.requests.lock().unwrap();
+    let request = &requests[0];
+    assert_eq!(request.worker_protocol.as_deref(), Some("1.19"));
+}
+
+#[tokio::test]
 async fn cooperative_heartbeat_renews_the_exact_worker_claim_and_retains_original_observation() {
     let server = transport_server();
     let original = original_observation();

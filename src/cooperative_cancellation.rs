@@ -1443,6 +1443,16 @@ impl Client {
         task: &WorkflowTask,
         original: Option<&CancellationRequest>,
     ) -> Result<WorkflowTaskHeartbeat> {
+        self.heartbeat_workflow_task_with_protocol(task, original, "1.20")
+            .await
+    }
+
+    pub(super) async fn heartbeat_workflow_task_with_protocol(
+        &self,
+        task: &WorkflowTask,
+        original: Option<&CancellationRequest>,
+        protocol: &'static str,
+    ) -> Result<WorkflowTaskHeartbeat> {
         let (owner, _) = cancellation_claim(task)?;
         if let Some(original) = original {
             original.validate_observation()?;
@@ -1451,7 +1461,7 @@ impl Client {
             let response: Value = self.request_json(
                 reqwest::Method::POST,
                 &format!("/worker/workflow-tasks/{}/heartbeat", percent_encode_path_segment(&task.task_id)),
-                RequestProtocol::Worker("1.20"),
+                RequestProtocol::Worker(protocol),
                 Some(&json!({"lease_owner":owner,"workflow_task_attempt":task.workflow_task_attempt})),
             ).await?;
             if response["task_id"].as_str() != Some(task.task_id.as_str())
@@ -1864,6 +1874,7 @@ impl Worker {
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
             claim_guard: Some(guard.clone()),
+            local_heartbeats: None,
         };
         guard.boundary()?;
         *callback_started = true;
