@@ -10799,6 +10799,61 @@ fn recorded_optional_string(
     }
 }
 
+fn recorded_activity_execution_mode(
+    events: &[&HistoryEvent],
+    sequence: u64,
+) -> Result<RecordedSnapshotValue<Option<String>>> {
+    let mut recorded = RecordedSnapshotValue::Unknown;
+    for event in events {
+        for object in [
+            event.payload.as_object(),
+            event.payload.get("activity").and_then(Value::as_object),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mode = match object.get("execution_mode") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(mode)) if !mode.is_empty() => Some(Some(mode.clone())),
+                Some(_) => {
+                    return Err(invalid_recorded_history(
+                        "activity_execution_mode_invalid",
+                        sequence,
+                        "null or a non-empty execution mode",
+                        "invalid execution_mode",
+                        "activity history contains an invalid execution mode",
+                    ))
+                }
+            };
+            let legacy_mode = match object.get("local_activity") {
+                None => None,
+                Some(Value::Bool(local)) => Some(local.then(|| "local".to_string())),
+                Some(_) => {
+                    return Err(invalid_recorded_history(
+                        "activity_execution_mode_invalid",
+                        sequence,
+                        "boolean local_activity",
+                        "invalid local_activity",
+                        "activity history contains an invalid local-activity marker",
+                    ))
+                }
+            };
+            for mode in [mode, legacy_mode].into_iter().flatten() {
+                if matches!(&recorded, RecordedSnapshotValue::Known(previous) if previous != &mode)
+                {
+                    return Err(invalid_recorded_history(
+                        "activity_execution_mode_conflict", sequence, "one activity execution mode", "conflicting execution modes",
+                        "activity lifecycle events at one workflow sequence disagree on execution mode",
+                    ));
+                }
+                recorded = RecordedSnapshotValue::Known(mode);
+            }
+        }
+    }
+    Ok(recorded)
+}
+
 fn recorded_activity_retry_snapshot(policy: Option<&Value>) -> ActivityRetrySnapshot {
     let policy = policy.and_then(Value::as_object);
     let backoff_seconds = policy
@@ -14788,18 +14843,26 @@ fn recorded_commands(
                     .first()
                     .map(|event| activity_outcome(event, fallback_codec, activity_type.clone()))
                     .transpose()?;
-                let options = activity_events
+                let execution_mode = recorded_activity_execution_mode(&activity_events, sequence)?;
+                let activity_snapshot = activity_events
                     .iter()
                     .find(|event| event.event_type == "ActivityScheduled")
                     .and_then(|event| event.payload.get("activity"))
-                    .and_then(Value::as_object)
-                    .map(|activity| RecordedActivityOptions {
+                    .and_then(Value::as_object);
+                let options = Some(match activity_snapshot {
+                    Some(activity) => RecordedActivityOptions {
                         task_queue: recorded_optional_string(activity, "queue"),
-                        execution_mode: recorded_optional_string(activity, "execution_mode"),
+                        execution_mode,
                         retry_policy: recorded_activity_retry_snapshot(
                             activity.get("retry_policy"),
                         ),
-                    });
+                    },
+                    None => RecordedActivityOptions {
+                        task_queue: RecordedSnapshotValue::Unknown,
+                        execution_mode,
+                        retry_policy: recorded_activity_retry_snapshot(None),
+                    },
+                });
                 return Ok(RecordedCommand::Activity {
                     sequence,
                     activity_type,
@@ -20299,6 +20362,57 @@ mod tests {
             assert_eq!(failure.sequence, Some(1));
             assert!(ctx.take_commands().expect("commands").is_empty());
         }
+    }
+
+    #[test]
+    fn remote_activity_rejects_local_history_markers_without_option_snapshot() {
+        for (nested, field, value, terminal_only) in [
+            (false, "execution_mode", json!("local"), false),
+            (false, "local_activity", json!(true), false),
+            (true, "local_activity", json!(true), false),
+            (false, "local_activity", json!(true), true),
+        ] {
+            let mut history = completed_retry_activity_history();
+            history[0]
+                .payload
+                .as_object_mut()
+                .unwrap()
+                .remove("activity");
+            let event = if terminal_only {
+                history.last_mut().unwrap()
+            } else {
+                &mut history[0]
+            };
+            if nested {
+                event.payload["activity"] = json!({(field): value});
+            } else {
+                event.payload[field] = value;
+            }
+            let ctx = workflow_context(history);
+            let mut call =
+                Box::pin(ctx.activity_with_options("flaky", retry_activity_options(), json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("local history must not replay as a remote activity: {nested}/{field}/{terminal_only}");
+            };
+            assert_eq!(failure.reason, "activity_execution_mode_mismatch");
+            assert_eq!(failure.sequence, Some(1));
+            assert!(ctx.take_commands().expect("commands").is_empty());
+        }
+    }
+
+    #[test]
+    fn activity_history_rejects_conflicting_local_execution_markers() {
+        let mut history = completed_retry_activity_history();
+        history.last_mut().unwrap().payload["local_activity"] = json!(true);
+        let error = WorkflowState::new(history, "queue".into(), DEFAULT_CODEC.into(), None)
+            .expect_err("remote schedule cannot become a local completion");
+        assert!(
+            matches!(error, Error::NonDeterministicReplay(ReplayFailure { reason, sequence: Some(1), .. })
+            if reason == "activity_execution_mode_conflict")
+        );
     }
 
     #[test]

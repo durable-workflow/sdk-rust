@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-activity-local-marker-as-remote",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.activity-policy-author", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "ActivityScheduled", "payload": {"sequence": 1, "activity_type": "work", "local_activity": true}}
+  ],
+  "command_sequence": [{"type": "schedule_activity", "activity_type": "work"}],
+  "expected": {"type": "complete_workflow", "result": "unreachable"},
+  "expected_failure": "activity_execution_mode_mismatch"
+}
