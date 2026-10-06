@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         .start_workflow(
             "example.local-workflow",
             &queue,
-            format!("rust-local-example-{}", durable_workflow::Uuid::new_v4()),
+            &format!("rust-local-example-{}", durable_workflow::Uuid::new_v4()),
             json!([]),
         )
         .await?;
