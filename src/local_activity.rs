@@ -285,10 +285,20 @@ impl Worker {
     }
 
     async fn local_claim_is_active(&self, task: &WorkflowTask) -> bool {
-        self.client
-            .heartbeat_workflow_task_with_protocol(task, None, WORKER_PROTOCOL_VERSION)
-            .await
-            .is_ok_and(|receipt| receipt.cancellation_request.is_none())
+        tokio::select! {
+            biased;
+            _ = self.local_worker_stopped() => false,
+            receipt = self.client.heartbeat_workflow_task_with_protocol(task, None, WORKER_PROTOCOL_VERSION) => {
+                receipt.is_ok_and(|receipt| receipt.cancellation_request.is_none())
+            }
+        }
+    }
+
+    async fn local_worker_stopped(&self) {
+        match &self.client.worker_storage_admission {
+            Some(admission) => wait_for_worker_stop(&admission.stop).await,
+            None => std::future::pending::<()>().await,
+        }
     }
 
     async fn externalize_local_command(
@@ -439,6 +449,7 @@ impl Worker {
                 tokio::pin!(timeout);
                 tokio::select! {
                     biased;
+                    _ = self.local_worker_stopped() => return Ok(None),
                     _ = &mut timeout => {
                         if timeout_kind == "heartbeat" && heartbeat_extended(&reports, request.options.heartbeat_timeout)? { continue; }
                         break Err((format!("local activity exceeded {timeout_kind} timeout"), "LocalActivityTimeout".to_owned(), false, Some(timeout_kind)));
@@ -561,6 +572,20 @@ impl Worker {
                     }
                 }
                 wire["attempts"] = json!(attempts);
+                // Match the terminal fields Server persists. Database-generated
+                // execution/failure IDs are only available on committed replay.
+                let mut payload = wire.clone();
+                payload["attempt_number"] = json!(number);
+                payload["failure_category"] = json!(if timeout_kind.is_some() {
+                    "timeout"
+                } else {
+                    "application"
+                });
+                if timeout_kind.is_some() {
+                    payload["exception_class"] = payload["exception_type"].take();
+                    payload.as_object_mut().unwrap().remove("exception_type");
+                    payload.as_object_mut().unwrap().remove("non_retryable");
+                }
                 let event = HistoryEvent {
                     event_type: if timeout_kind.is_some() {
                         "ActivityTimedOut"
@@ -568,7 +593,7 @@ impl Worker {
                         "ActivityFailed"
                     }
                     .into(),
-                    payload: wire.clone(),
+                    payload,
                     raw: HashMap::new(),
                 };
                 let result =

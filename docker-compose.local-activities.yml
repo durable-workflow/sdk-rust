@@ -1,0 +1,98 @@
+# Exact published Server tuple for ordinary local activity qualification.
+services:
+  bootstrap:
+    image: &server-image ghcr.io/durable-workflow/server@sha256:66bd0e510c033af611cc1e2191e1ed592acf26e80f89766b0a3e1a0e463ccd19
+    command: [sh, -c, 'chown 1000:1000 /app/database/runtime-external-payloads && exec server-bootstrap']
+    healthcheck: {disable: true}
+    volumes: [&payload-volume 'payloads:/app/database/runtime-external-payloads']
+    environment: &runtime-env
+      APP_ENV: testing
+      APP_DEBUG: 'false'
+      DW_SERVER_KEY: 'base64:dGVzdGluZy1rZXktMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMg=='
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_DATABASE: durable_workflow
+      DB_USERNAME: workflow
+      DB_PASSWORD: workflow
+      REDIS_HOST: redis
+      QUEUE_CONNECTION: redis
+      CACHE_STORE: redis
+      DW_AUTH_DRIVER: token
+      DW_AUTH_TOKEN: test-token
+      DW_WORKFLOW_TASK_TIMEOUT: '10'
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  server:
+    image: *server-image
+    environment: *runtime-env
+    volumes: [*payload-volume]
+    ports: ['127.0.0.1::8080']
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, curl, -f, 'http://localhost:8080/api/health']
+      interval: 3s
+      timeout: 2s
+      retries: 30
+  worker:
+    image: *server-image
+    user: '1000:1000'
+    command: [php, artisan, 'queue:work', '--sleep=1', '--tries=3', '--max-time=1800']
+    environment: *runtime-env
+    volumes: [*payload-volume]
+    depends_on:
+      server: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, server-process-healthcheck, worker]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+  repair:
+    image: *server-image
+    user: '1000:1000'
+    init: true
+    command: [sh, -c, 'while true; do php artisan workflow:v2:repair-pass --json; sleep 2; done']
+    environment: *runtime-env
+    volumes: [*payload-volume]
+    healthcheck: {disable: true}
+    depends_on:
+      server: {condition: service_healthy}
+  ack-proxy:
+    image: node@sha256:eae779f20e0cdf264247f6f3b4e62510d91f168a615117ed38430ba295f55590
+    user: '1000:1000'
+    command: [node, /qualification/local-activity-ack-proxy.mjs]
+    volumes: ['./scripts/ci/local-activity-ack-proxy.mjs:/qualification/local-activity-ack-proxy.mjs:ro']
+    environment:
+      DURABLE_WORKFLOW_ACK_UPSTREAM: http://server:8080
+    ports: ['127.0.0.1::3000']
+    depends_on:
+      server: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, node, -e, 'fetch("http://localhost:3000/__qualification/lost-ack").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 3s
+      timeout: 2s
+      retries: 10
+  mysql:
+    image: mysql@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
+    environment:
+      MYSQL_DATABASE: durable_workflow
+      MYSQL_USER: workflow
+      MYSQL_PASSWORD: workflow
+      MYSQL_ROOT_PASSWORD: root
+    tmpfs: [/var/lib/mysql]
+    healthcheck:
+      test: [CMD, mysqladmin, ping, -h, localhost]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    tmpfs: [/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+volumes:
+  payloads: {}

@@ -7127,6 +7127,8 @@ impl Worker {
         let primary = self.run_registered_until(stop, registration).await;
         self.cooperative_registration_confirmed
             .store(false, Ordering::SeqCst);
+        self.local_registration_confirmed
+            .store(false, Ordering::SeqCst);
         let deregistration = self
             .client
             .deregister_worker_registration(&registered_worker_id)
