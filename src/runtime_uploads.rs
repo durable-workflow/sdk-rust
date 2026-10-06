@@ -347,6 +347,12 @@ fn completion_context(
     path: &str,
     slot: &str,
 ) -> Option<reqwest::header::HeaderValue> {
+    // Local heartbeat details use ordinary payload admission. The published
+    // Server completion allowance accepts command inputs/results, not these
+    // diagnostic slots.
+    if slot.contains("/heartbeats/") {
+        return None;
+    }
     let parts: Vec<_> = path
         .split('?')
         .next()?
@@ -465,6 +471,17 @@ fn payload_paths(body: &Value, path: &str, protocol: RequestProtocol) -> Vec<Str
                             format!("/commands/{index}/arguments"),
                             format!("/commands/{index}/result"),
                         ]);
+                        for (attempt, report) in command["attempts"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .enumerate()
+                        {
+                            for heartbeat in 0..report["heartbeats"].as_array().map_or(0, Vec::len)
+                            {
+                                paths.push(format!("/commands/{index}/attempts/{attempt}/heartbeats/{heartbeat}/details"));
+                            }
+                        }
                     }
                     if command_type == "fail_workflow" {
                         paths.push(format!("/commands/{index}/exception/details"));

@@ -4,7 +4,7 @@ const UPLOAD: &str = "/api/external-payloads/v1";
 const DISCOVERY: &str = "/api/cluster/info";
 const COMPLETE: &str = "/worker/workflow-tasks/test/complete";
 
-fn policy() -> Value {
+pub(super) fn policy() -> Value {
     json!({"limits":{"max_payload_bytes":2048}, "namespace":{"external_payload_storage":{
         "status":"available", "threshold_bytes":64, "transport":{
             "schema":"durable-workflow.v2.runtime-external-payload-transport.v1", "version":1,
@@ -16,7 +16,7 @@ fn policy() -> Value {
     }}})
 }
 
-fn reference(blob: &str) -> Value {
+pub(super) fn reference(blob: &str) -> Value {
     let hash = format!("{:x}", Sha256::digest(blob.as_bytes()));
     json!({"schema":crate::runtime_payloads::SCHEMA, "codec":"avro",
         "reference_id":format!("ep_{}", hash[..26].to_uppercase()),

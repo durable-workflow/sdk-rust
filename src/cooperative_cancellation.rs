@@ -1874,6 +1874,7 @@ impl Worker {
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
             claim_guard: Some(guard.clone()),
+            local_heartbeats: None,
         };
         guard.boundary()?;
         *callback_started = true;
