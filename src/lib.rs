@@ -2915,7 +2915,7 @@ impl Client {
     /// Close the current run as cancelled immediately.
     ///
     /// Server revokes open tasks and timers without resuming workflow code for
-    /// cleanup. Use [`Client::request_cancellation`] for a separate cooperative
+    /// cleanup. Use [`Client::request_workflow_cancellation`] for a separate cooperative
     /// request on a supporting runtime and opted-in worker.
     pub async fn cancel_workflow(
         &self,
