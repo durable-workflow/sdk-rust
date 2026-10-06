@@ -13213,6 +13213,11 @@ impl Future for TimerCall {
                     parallel_group_path,
                     ..
                 } => {
+                    if let Err(error) =
+                        state.validate_scope_cleanup_timer(&ctx.cancellation_scope_id, sequence)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
                     if let Err(error) = ensure_parallel_path_matches(
                         sequence,
                         parallel_group_path.as_deref(),
@@ -13268,6 +13273,13 @@ impl Future for TimerCall {
                 ("type".to_string(), json!("start_timer")),
                 ("delay_seconds".to_string(), json!(requested_delay)),
             ]);
+            match state.scope_cleanup_timer_proof(&ctx.cancellation_scope_id) {
+                Ok(Some(proof)) => {
+                    command.insert("cancellation_cleanup".into(), proof);
+                }
+                Ok(None) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
             apply_parallel_group_path(&mut command, &self.parallel_group_path);
             ctx.apply_scope_membership(&mut command);
             match state.prepare_scalar_cancellation(

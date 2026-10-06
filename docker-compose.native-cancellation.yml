@@ -6,6 +6,7 @@ services:
   server:
     volumes:
       - ${DURABLE_WORKFLOW_NATIVE_SOURCE:?exact Native checkout}:/app/vendor/durable-workflow/workflow:ro
+      - ./tests/fixtures/source/native-scope-request.php:/app/sdk-source-fixtures/native-scope-request.php:ro
   worker:
     volumes:
       - ${DURABLE_WORKFLOW_NATIVE_SOURCE:?exact Native checkout}:/app/vendor/durable-workflow/workflow:ro

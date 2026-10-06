@@ -26,6 +26,7 @@ pub(super) struct ScopeReplay {
     pub active_scope: String,
     pub consumed: BTreeSet<u64>,
     pub contexts: BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>,
+    pub cleanup_timers: BTreeMap<u64, Value>,
     pub intent: Option<ScopeDeliveryIntent>,
 }
 
@@ -74,6 +75,10 @@ impl ScopeReplay {
             active_scope: "root".into(),
             consumed: BTreeSet::new(),
             contexts: BTreeMap::new(),
+            cleanup_timers: history.iter().filter(|row| row.event_type == "TimerScheduled")
+                .filter_map(|row| row.payload.get("cancellation_cleanup").map(|snapshot|
+                    (row.payload["sequence"].as_u64().unwrap(), json!({"scope_id":snapshot["scope_id"],
+                     "request_id":snapshot["request_id"], "delivery_history_event_id":snapshot["delivery_history_event_id"]})))).collect(),
             intent: None,
         })
     }
@@ -112,6 +117,49 @@ impl ScopeReplay {
 }
 
 impl WorkflowState {
+    pub(super) fn scope_cleanup_timer_proof(&self, scope: &str) -> Result<Option<Value>> {
+        if self.cancellation_shield_depth == 0 {
+            return Ok(None);
+        }
+        let Some(replay) = &self.scope_delivery else {
+            return Ok(None);
+        };
+        let Some((context, _)) = replay.contexts.get(scope) else {
+            return Ok(None);
+        };
+        let delivered = replay
+            .canonical
+            .deliveries
+            .values()
+            .find(|delivery| {
+                delivery.context == *context
+                    && replay.consumed.contains(&delivery.boundary.sequence)
+            })
+            .ok_or_else(|| {
+                Error::InvalidCooperativeCancellation(
+                    "scoped cleanup lacks its consumed original delivery".into(),
+                )
+            })?;
+        Ok(Some(
+            json!({"scope_id":scope, "request_id":context.request_id(),
+            "delivery_history_event_id":delivered.event.raw["id"]}),
+        ))
+    }
+
+    pub(super) fn validate_scope_cleanup_timer(&self, scope: &str, sequence: u64) -> Result<()> {
+        let original = self
+            .scope_delivery
+            .as_ref()
+            .and_then(|replay| replay.cleanup_timers.get(&sequence));
+        if original != self.scope_cleanup_timer_proof(scope)?.as_ref() {
+            return Err(invalid(
+                sequence,
+                "cleanup timer changed its original delivery or shielding",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_scalar_scope_cancellation(
         &mut self,
         index: usize,

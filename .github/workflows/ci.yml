@@ -262,6 +262,7 @@ jobs:
           if [ -z "$NATIVE_CANDIDATE_SHA" ]; then
             arguments+=(--skip server_scope_opening_proves_real_native_tree_on_original_claim)
             arguments+=(--skip server_scope_authoring_replays_nested_tree_and_deferred_membership_on_replacement)
+            arguments+=(--skip server_scope_cleanup_preserves_original_delivery_and_budget_after_replacement)
           fi
           cargo test --test cooperative_server -- "${arguments[@]}" 2>&1 | tee cooperative-results.log
       - name: Retain bounded scenario evidence

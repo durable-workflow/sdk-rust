@@ -74,6 +74,23 @@ fn append(value: &mut Value, kind: &str, payload: Value, timestamp: &str) {
     );
 }
 
+fn cleanup_snapshot(value: &Value) -> Value {
+    let delivery = value["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["event_type"] == "CancellationScopeDelivered")
+        .unwrap();
+    let context =
+        ScopedCancellationContext::from_value(&delivery["payload"]["cancellation"]).unwrap();
+    json!({"scope_id":context.scope_id(), "operation_scope_id":context.scope_id(),
+        "request_id":context.request_id(), "root_request_id":context.root_context().root_request_id(),
+        "delivery_history_event_id":delivery["id"],
+        "preparation_history_event_id":delivery["payload"]["preparation_history_event_id"],
+        "cleanup_deadline_at":context.deadline().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        "authority_deadline_at":delivery["payload"]["authority_deadline_at"]})
+}
+
 #[test]
 fn cancellation_scope_replay_waits_for_original_prepare_and_committed_delivery() {
     let original = fixture();
@@ -100,12 +117,20 @@ fn cancellation_scope_replay_waits_for_original_prepare_and_committed_delivery()
     assert_eq!(decision.commands[0]["type"], "start_timer");
     assert_eq!(decision.commands[0]["delay_seconds"], 2);
     assert!(decision.commands[0]["cancellation_scope_id"].is_string());
+    let snapshot = cleanup_snapshot(&original);
+    assert_eq!(
+        decision.commands[0]["cancellation_cleanup"],
+        json!({
+        "scope_id":snapshot["scope_id"], "request_id":snapshot["request_id"],
+        "delivery_history_event_id":snapshot["delivery_history_event_id"]})
+    );
     assert_eq!(cleanup.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn cancellation_scope_replay_replacement_keeps_context_clock_and_parent_unaffected() {
     let mut source = fixture();
+    let snapshot = cleanup_snapshot(&source);
     let scope = source["history"]
         .as_array()
         .unwrap()
@@ -117,7 +142,8 @@ fn cancellation_scope_replay_replacement_keeps_context_clock_and_parent_unaffect
         &mut source,
         "TimerScheduled",
         json!({"sequence":5, "timer_id":"cleanup-timer",
-        "delay_seconds":2, "cancellation_scope_id":scope}),
+        "delay_seconds":2, "cancellation_scope_id":scope,
+        "fire_at":"2026-10-04T00:00:11.123456Z", "cancellation_cleanup":snapshot}),
         "2026-10-04T00:00:09.123456Z",
     );
     append(
@@ -152,6 +178,39 @@ fn cancellation_scope_replay_replacement_keeps_context_clock_and_parent_unaffect
         .unwrap();
     assert_eq!(decision.commands.len(), 1);
     assert_eq!(decision.commands[0]["type"], "complete_workflow");
+}
+
+#[test]
+fn cancellation_scope_replay_cleanup_timer_refuses_changed_authority_before_factory() {
+    for field in [
+        "request_id",
+        "delivery_history_event_id",
+        "authority_deadline_at",
+        "cleanup_deadline_at",
+        "operation_scope_id",
+    ] {
+        let mut value = fixture();
+        let mut snapshot = cleanup_snapshot(&value);
+        let scope = snapshot["scope_id"].clone();
+        snapshot[field] = json!("changed");
+        append(
+            &mut value,
+            "TimerScheduled",
+            json!({"sequence":5, "timer_id":"cleanup-timer",
+            "delay_seconds":2, "cancellation_scope_id":scope,
+            "fire_at":"2026-10-04T00:00:11.123456Z", "cancellation_cleanup":snapshot}),
+            "2026-10-04T00:00:09.123456Z",
+        );
+        let factories = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&factories);
+        let mut worker = worker(Arc::new(AtomicUsize::new(0)), false);
+        worker.register_workflow("scope-replay", move |_, _| {
+            called.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Value::Null) }
+        });
+        assert!(worker.execute_workflow_task_decision(task(&value)).is_err());
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]

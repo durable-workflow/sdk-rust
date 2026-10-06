@@ -63,6 +63,59 @@ pub(super) fn timestamp(value: &Value) -> Result<DateTime<Utc>> {
         .ok_or_else(|| invalid("scope authority requires an original timestamp with timezone"))
 }
 
+fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> {
+    let p = &event.payload;
+    let Some(snapshot) = p.get("cancellation_cleanup") else {
+        return Ok(false);
+    };
+    let matches: Vec<_> = prefix
+        .iter()
+        .filter(|row| {
+            row.event_type == "CancellationScopeDelivered"
+                && row.raw.get("id") == snapshot.get("delivery_history_event_id")
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err(invalid(
+            "cleanup timer lacks its earlier canonical delivery",
+        ));
+    }
+    let delivery = matches[0];
+    let original = &delivery.payload;
+    let context = ScopedCancellationContext::from_value(&original["cancellation"])?;
+    let expected = json!({"scope_id":context.scope_id(), "operation_scope_id":context.scope_id(),
+        "request_id":context.request_id(), "root_request_id":context.root_context().root_request_id(),
+        "delivery_history_event_id":event_id(delivery)?,
+        "preparation_history_event_id":original["preparation_history_event_id"],
+        "cleanup_deadline_at":canonical_time(context.deadline()),
+        "authority_deadline_at":original["authority_deadline_at"]});
+    let ceiling = timestamp(&original["authority_deadline_at"])?;
+    let boundary = CancellationDelivery::from_payload(&json!({
+        "workflow_command_id":context.request_id(), "sequence":original["sequence"],
+        "call_kind":original["call_kind"], "sequence_span":original["sequence_span"],
+        "operation_sequence":original["operation_sequence"], "operation_sequence_span":original["operation_sequence_span"]}))?;
+    if snapshot != &expected
+        || p["cancellation_scope_id"] != context.scope_id()
+        || p["sequence"]
+            .as_u64()
+            .is_none_or(|sequence| sequence < boundary.sequence + boundary.sequence_span)
+        || event.raw["sequence"].as_u64().is_none_or(|sequence| {
+            delivery.raw["sequence"]
+                .as_u64()
+                .is_none_or(|prior| prior >= sequence)
+        })
+        || event_time(event)? < event_time(delivery)?
+        || event_time(event)? >= ceiling
+        || timestamp(&p["fire_at"])? >= ceiling
+        || !p["timer_kind"].is_null()
+    {
+        return Err(invalid(
+            "cleanup timer changes its original delivery or authority ceiling",
+        ));
+    }
+    Ok(true)
+}
+
 fn event_time(event: &HistoryEvent) -> Result<DateTime<Utc>> {
     timestamp(
         event
@@ -425,6 +478,9 @@ pub(super) fn members_from_prefix(
                     return Err(invalid("scope timer changes its original descriptor"));
                 }
                 timer_sequences.insert(sequence.as_u64().unwrap(), kind.clone());
+                if cleanup_timer(event, prefix)? {
+                    continue;
+                }
                 members.push(json!({"sequence":sequence, "timer_id":id,
                     "descriptor_hash":descriptor_hash(json!([scope, event_id(event)?, sequence, id,
                         p["delay_seconds"], p["fire_at"], kind, p["condition_wait_id"],
@@ -755,6 +811,9 @@ impl CommittedCancellationScopeHistory {
         for (index, event) in history.iter().enumerate() {
             let kind = event.event_type.as_str();
             let p = &event.payload;
+            if kind == "TimerScheduled" {
+                cleanup_timer(event, &history[..index])?;
+            }
             if kind == "CancellationScopeOpened" {
                 opened.insert(text(p, "scope_id")?);
             }

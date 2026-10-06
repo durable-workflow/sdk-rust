@@ -841,6 +841,152 @@ async fn server_scope_authoring_replays_nested_tree_and_deferred_membership_on_r
     println!("Native scope authoring and replacement replay: {final_history}");
 }
 
+fn request_native_scope_fixture(handle: &WorkflowHandle, scope: &str) -> Value {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut process = Command::new("timeout")
+        .args([
+            "--kill-after=1",
+            "10",
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "--user",
+            "1000:1000",
+            "--env",
+            "DURABLE_WORKFLOW_NATIVE_SCOPE_FIXTURE=1",
+            "server",
+            "timeout",
+            "--kill-after=1",
+            "5",
+            "php",
+            "/app/sdk-source-fixtures/native-scope-request.php",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = serde_json::to_vec(&json!({"run_id":handle.run_id.as_deref().unwrap(),
+        "workflow_id":handle.workflow_id, "scope_id":scope}))
+    .unwrap();
+    process.stdin.take().unwrap().write_all(&input).unwrap();
+    let result = process.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "Native scope fixture: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    serde_json::from_slice(&result.stdout).unwrap()
+}
+
+fn scope_cleanup_worker(client: &Client, queue: &str, owner: &str) -> Worker {
+    let mut worker = Worker::new(client.clone(), queue)
+        .worker_id(owner)
+        .cooperative_cancellation(true)
+        .candidate_cancellation_scope_authoring(true)
+        .candidate_cancellation_scope_delivery(true)
+        .poll_timeout(Duration::from_millis(100));
+    worker.register_workflow("tests.rust-candidate-scope-cleanup", |ctx, _| async move {
+        let _: String = ctx.side_effect(|| "original prefix".to_owned())?;
+        let (cancellation, metadata) = ctx
+            .cancellation_scope(false, |scope| async move {
+                let cancellation = match scope.sleep(Duration::from_secs(300)).await {
+                    Err(Error::CancellationScopeRequested(request)) => request.context,
+                    Err(error) => return Err(error),
+                    Ok(()) => {
+                        return Err(Error::InvalidCooperativeCancellation(
+                            "original timer was not interrupted".into(),
+                        ))
+                    }
+                };
+                assert!(scope.is_cancellation_requested()?);
+                let _shield = scope.cancellation_shield()?;
+                let metadata = scope.side_effect(|| cancellation.to_value())?;
+                scope.sleep(Duration::from_secs(1)).await?;
+                Ok((cancellation, metadata))
+            })
+            .await?;
+        assert!(!ctx.is_cancellation_requested()?);
+        assert!(ctx.scoped_cancellation_context()?.is_none());
+        ctx.sleep(Duration::from_secs(1)).await?;
+        Ok(json!({"context":metadata, "remaining":cancellation.remaining()?.as_secs_f64()}))
+    });
+    worker
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_cleanup_preserves_original_delivery_and_budget_after_replacement() {
+    let client = client();
+    let queue = format!(
+        "rust-cooperative-scope-boundary-{}",
+        durable_workflow::Uuid::new_v4().simple()
+    );
+    let original = scope_cleanup_worker(&client, &queue, &format!("{queue}-original"));
+    original.register().await.unwrap();
+    let handle = client
+        .start_workflow(
+            "tests.rust-candidate-scope-cleanup",
+            &queue,
+            &queue,
+            json!([]),
+        )
+        .await
+        .unwrap();
+    let first = tick_until(&original, &handle, "TimerScheduled").await;
+    assert_eq!(count(&first, "SideEffectRecorded"), 1);
+    let scope = first["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["event_type"] == "CancellationScopeOpened")
+        .unwrap()["payload"]["scope_id"]
+        .as_str()
+        .unwrap();
+    let accepted = request_native_scope_fixture(&handle, scope);
+    assert_eq!(accepted, request_native_scope_fixture(&handle, scope));
+    let cleaning = tick_until_count(&original, &handle, "SideEffectRecorded", 2).await;
+    assert_eq!(count(&cleaning, "TimerScheduled"), 2);
+    assert_eq!(count(&cleaning, "CancellationScopeDelivered"), 1);
+    let replacement = scope_cleanup_worker(&client, &queue, &format!("{queue}-replacement"));
+    replacement.register().await.unwrap();
+    let final_history = tick_until(&replacement, &handle, "WorkflowCompleted").await;
+    for kind in [
+        "CancellationScopeOpened",
+        "CancellationScopeRequested",
+        "CancellationScopeDeliveryPrepared",
+        "CancellationScopeDelivered",
+        "TimerCancelled",
+        "WorkflowCompleted",
+    ] {
+        assert_eq!(count(&final_history, kind), 1, "{kind}");
+    }
+    assert_eq!(count(&final_history, "SideEffectRecorded"), 2);
+    assert_eq!(count(&final_history, "TimerScheduled"), 3);
+    assert_eq!(count(&final_history, "TimerFired"), 2);
+    for kind in [
+        "CooperativeCancellationRequested",
+        "WorkflowCancelled",
+        "WorkflowFailed",
+    ] {
+        assert_eq!(count(&final_history, kind), 0, "{kind}");
+    }
+    let result = handle
+        .result_selected_run(WorkflowResultOptions {
+            timeout: Duration::from_secs(5),
+            ..WorkflowResultOptions::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["context"], accepted["payload"]["cancellation"]);
+    assert!(result["remaining"]
+        .as_f64()
+        .is_some_and(|remaining| remaining > 0.0 && remaining < 30.0));
+    println!("Native scope cleanup and replacement replay: {final_history}");
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server protocol 1.20 candidate"]
 async fn server_request_before_claim_replays_canonical_typed_cancellation() {
