@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.2.0-rc.1
+## 3.2.0
 
 - Add typed worker-session options and shared create, renew and close handles.
   Enable sessions explicitly with `Worker::worker_sessions(true)` and route
