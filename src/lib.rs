@@ -9,6 +9,7 @@ mod cooperative_cancellation;
 mod local_activity;
 mod runtime_payloads;
 mod runtime_uploads;
+mod worker_session;
 
 pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
@@ -58,6 +59,7 @@ pub use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 pub use uuid::Uuid;
+pub use worker_session::WorkerSessionOptions;
 
 pub const WORKER_PROTOCOL_VERSION: &str = "1.19";
 const WORKFLOW_HISTORY_PAGE_SIZE: usize = 500;
