@@ -31,7 +31,11 @@ fn scope_response(path: &str, body: &str, number: usize) -> Option<(&'static str
     if matches!(case, "lost-ack" | "worker-lost-ack") && path.ends_with("/prepare") && number == 1 {
         return Some(("invalid-status", String::new()));
     }
-    let mut source = scalar_fixture();
+    let mut source = match case {
+        "group-flat" => fixture("groups", "flat"),
+        "group-nested" => fixture("groups", "nested"),
+        _ => scalar_fixture(),
+    };
     if case.starts_with("worker") {
         // Synthetic transport time is safely ahead of the actual request budget.
         // The fixture has no admitted members whose descriptor contains dates.
@@ -257,10 +261,14 @@ async fn cancellation_scope_replay_worker_coordinates_original_claim_and_lost_ac
 
 #[tokio::test]
 async fn scope_history_prepare_and_delivery_prove_original_claim_and_all_pages_after_lost_ack() {
-    for case in ["valid", "lost-ack"] {
+    for case in ["valid", "lost-ack", "group-flat", "group-nested"] {
         let server = scope_server();
         let client = scope_client(&server, case);
-        let value = scalar_fixture();
+        let value = match case {
+            "group-flat" => fixture("groups", "flat"),
+            "group-nested" => fixture("groups", "nested"),
+            _ => scalar_fixture(),
+        };
         let task = claim(&value);
         let (context, boundary) = boundary(&value);
         let budget = CancellationScopeDeliveryBudget::new();
@@ -458,6 +466,7 @@ fn fixture(name: &str, variant: &str) -> Value {
         }
         "empty" => include_str!("../../tests/fixtures/committed-scope-delivery.json"),
         "single" => include_str!("../../tests/fixtures/populated-scope-single-calls.json"),
+        "groups" => include_str!("../../tests/fixtures/populated-scope-groups.json"),
         "root" => include_str!("../../tests/fixtures/run-inherited-scope-delivery.json"),
         _ => panic!("unknown fixture"),
     };

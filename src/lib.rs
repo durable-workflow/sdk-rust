@@ -6368,7 +6368,7 @@ impl Worker {
         self
     }
 
-    /// Enable the candidate scalar scope consumer with canonical authoring.
+    /// Enable the candidate scoped call consumer with canonical authoring.
     #[doc(hidden)]
     pub fn candidate_cancellation_scope_delivery(mut self, enabled: bool) -> Self {
         self.allow_cancellation_scope_delivery = enabled;

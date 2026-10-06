@@ -1360,7 +1360,7 @@ impl CancellationScopeDeliveryReceipt {
 }
 
 impl Client {
-    /// Candidate scalar preparation proof. All operations share the supplied budget.
+    /// Candidate preparation proof. All operations share the supplied budget.
     #[doc(hidden)]
     pub async fn prepare_cancellation_scope_on_claim(
         &self,
@@ -1394,7 +1394,7 @@ impl Client {
             .await
     }
 
-    /// Candidate scalar delivery requires the earlier original preparation proof.
+    /// Candidate delivery requires the earlier original preparation proof.
     #[doc(hidden)]
     pub async fn deliver_cancellation_scope_on_claim(
         &self,
@@ -1437,7 +1437,7 @@ impl Client {
             || context.workflow_run_id() != run
             || context.workflow_instance_id() != workflow
             || boundary.request_id != context.request_id()
-            || boundary.sequence_span != 1
+            || (boundary.call_kind != CancellationCallKind::Parallel && boundary.sequence_span != 1)
             || boundary.operation_sequence.is_some()
             || boundary.operation_sequence_span != 1
             || !matches!(
@@ -1447,10 +1447,11 @@ impl Client {
                     | CancellationCallKind::Timer
                     | CancellationCallKind::Condition
                     | CancellationCallKind::Child
+                    | CancellationCallKind::Parallel
             )
         {
             return Err(invalid(
-                "scope boundary requires its original claim and scalar durable call",
+                "scope boundary requires its original claim and supported durable call",
             ));
         }
         budget.remaining()?;
