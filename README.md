@@ -91,7 +91,7 @@ payload fetches never follow redirects.
 
 ## Examples
 
-### Local activities (source preview)
+### Local activities
 
 Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.
 Register the callback with the ordinary activity registration methods, then call
@@ -112,8 +112,8 @@ Database-generated execution and failure IDs become available after Server
 commits history. Use the failure kind, timeout kind and attempt number to branch
 during fresh execution, rather than testing whether an ID has been assigned.
 
-This API remains a source preview pending published-package qualification.
-Default workers continue to advertise local activities as disabled.
+Available since SDK 3.1.0. Default workers keep local execution disabled.
+Opted-in workers negotiate their local capability during registration.
 
 ### Runnable examples
 
