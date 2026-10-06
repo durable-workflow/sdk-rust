@@ -4,10 +4,14 @@ use std::collections::BTreeSet;
 const CONTROL_BUDGET: Duration = Duration::from_secs(5);
 const MAX_REFRESH_PAGES: usize = 128;
 
-pub(super) fn assert_cancellation_scope_replay_supported_with_authoring(
+pub(super) fn assert_cancellation_scope_replay_supported(
     events: &[HistoryEvent],
     allow_authoring: bool,
+    allow_delivery: bool,
 ) -> Result<()> {
+    if allow_delivery && !allow_authoring {
+        return Err(Error::CancellationScopeExecutionUnavailable);
+    }
     for event in events {
         let scope_marker = matches!(
             event.event_type.as_str(),
@@ -27,7 +31,7 @@ pub(super) fn assert_cancellation_scope_replay_supported_with_authoring(
                     .get("cancellation_scope_id")
                     .is_some_and(|scope| scope.as_str() != Some("root"))
             });
-        if scope_marker
+        if (scope_marker && !allow_delivery)
             || (!allow_authoring
                 && (event.event_type == "CancellationScopeOpened" || scoped_membership))
         {
@@ -786,6 +790,9 @@ impl WorkflowState {
         kind: CancellationCallKind,
         group_path: &[ParallelGroupMetadata],
     ) -> Result<bool> {
+        if self.prepare_scalar_scope_cancellation(index, kind, group_path)? {
+            return Ok(true);
+        }
         if !self.cancellation_delivery_enabled || self.cancellation_shield_depth > 0 {
             return Ok(false);
         }
@@ -992,6 +999,7 @@ impl WorkflowState {
                 if let Some(original) = original {
                     return Ok(Some(*original));
                 }
+                self.replay_scope_cancellation_at(index, kind)?;
                 self.validate_cancellation_call(sequence, kind, call_kind)?;
                 self.cancellation_consumed = true;
                 self.cancel_requested = true;
@@ -1007,6 +1015,7 @@ impl WorkflowState {
         index: usize,
         kind: CancellationCallKind,
     ) -> Result<()> {
+        self.replay_scope_cancellation_at(index, kind)?;
         if let Some(RecordedCommand::CancellationBoundary {
             sequence,
             call_kind,
@@ -1906,6 +1915,32 @@ impl Worker {
             }
             for _ in 0..1000 {
                 let mut decision = self.execute_workflow_task_decision(task.clone())?;
+                if let Some(intent) = decision.cancellation_scope_delivery.as_ref() {
+                    if !decision.commands.is_empty() {
+                        decision.cancellation_scope_delivery = None;
+                        return Ok(Some(decision));
+                    }
+                    let mut budget = CancellationScopeDeliveryBudget::new();
+                    budget.restrict(intent.context.deadline())?;
+                    let prepared = self
+                        .client
+                        .prepare_cancellation_scope_on_claim(
+                            &task,
+                            &intent.context,
+                            &intent.boundary,
+                            &budget,
+                        )
+                        .await?;
+                    budget.restrict(prepared.authority_deadline())?;
+                    let delivered = self
+                        .client
+                        .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
+                        .await?;
+                    task.history_events = delivered.history().to_vec();
+                    task.total_history_events = None;
+                    task.history_size_bytes = None;
+                    continue;
+                }
                 let Some(opening) = decision.cancellation_scope_opening.as_ref() else {
                     return Ok(Some(decision));
                 };

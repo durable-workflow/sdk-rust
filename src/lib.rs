@@ -4,6 +4,7 @@ mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
 mod cancellation_scope_history;
+mod cancellation_scope_replay;
 mod cooperative_cancellation;
 mod runtime_payloads;
 mod runtime_uploads;
@@ -16,6 +17,8 @@ pub use cancellation_scope::CancellationScopeOpenReceipt;
 pub use cancellation_scope_history::{
     CancellationScopeDeliveryBudget, CancellationScopeDeliveryReceipt,
 };
+#[doc(hidden)]
+pub use cancellation_scope_replay::CancellationScopeRequested;
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
@@ -209,6 +212,8 @@ pub enum Error {
     WorkflowCancellationRequested(WorkflowCancellationRequested),
     #[error(transparent)]
     CooperativeCancellationRequested(CooperativeCancellationRequested),
+    #[error(transparent)]
+    CancellationScopeRequested(CancellationScopeRequested),
     #[error(transparent)]
     WorkflowCommandRejected(WorkflowCommandRejection),
     #[error(transparent)]
@@ -6189,6 +6194,7 @@ struct WorkflowTaskDecision {
     message_stream_waits: Vec<Value>,
     cancellation_delivery: Option<CancellationDelivery>,
     cancellation_scope_opening: Option<cancellation_scope::CancellationScopeOpening>,
+    cancellation_scope_delivery: Option<cancellation_scope_replay::ScopeDeliveryIntent>,
 }
 
 impl WorkflowTaskDecision {
@@ -6199,6 +6205,7 @@ impl WorkflowTaskDecision {
             message_stream_waits: Vec::new(),
             cancellation_delivery: None,
             cancellation_scope_opening: None,
+            cancellation_scope_delivery: None,
         }
     }
 }
@@ -6295,6 +6302,7 @@ pub struct Worker {
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
     cooperative_cancellation_enabled: bool,
     allow_cancellation_scope_authoring: bool,
+    allow_cancellation_scope_delivery: bool,
     cooperative_registration_confirmed: Arc<AtomicBool>,
 }
 
@@ -6316,6 +6324,7 @@ impl Worker {
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
             allow_cancellation_scope_authoring: false,
+            allow_cancellation_scope_delivery: false,
             cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -6356,6 +6365,13 @@ impl Worker {
     #[doc(hidden)]
     pub fn candidate_cancellation_scope_authoring(mut self, enabled: bool) -> Self {
         self.allow_cancellation_scope_authoring = enabled;
+        self
+    }
+
+    /// Enable the candidate scalar scope consumer with canonical authoring.
+    #[doc(hidden)]
+    pub fn candidate_cancellation_scope_delivery(mut self, enabled: bool) -> Self {
+        self.allow_cancellation_scope_delivery = enabled;
         self
     }
 
@@ -7292,6 +7308,7 @@ impl Worker {
         match decision {
             Ok(decision)
                 if decision.cancellation_delivery.is_some()
+                    || decision.cancellation_scope_delivery.is_some()
                     || decision.cancellation_scope_opening.is_some() =>
             {
                 return Err(Error::CooperativeCancellationUnavailable(
@@ -7865,13 +7882,16 @@ impl Worker {
         task: WorkflowTask,
         observation: Option<&CancellationRequest>,
     ) -> Result<WorkflowTaskDecision> {
-        if self.allow_cancellation_scope_authoring && !self.cooperative_cancellation_enabled {
+        if (self.allow_cancellation_scope_authoring || self.allow_cancellation_scope_delivery)
+            && !self.cooperative_cancellation_enabled
+        {
             return Err(Error::CancellationScopeExecutionUnavailable);
         }
         validate_workflow_task_payloads(&task)?;
-        cooperative_cancellation::assert_cancellation_scope_replay_supported_with_authoring(
+        cooperative_cancellation::assert_cancellation_scope_replay_supported(
             &task.history_events,
             self.allow_cancellation_scope_authoring,
+            self.allow_cancellation_scope_delivery,
         )?;
         let cancellation_history = if let Some(observation) = observation {
             observation.validate_observation()?;
@@ -7895,6 +7915,9 @@ impl Worker {
             .as_deref()
             .filter(|update_id| !update_id.is_empty())
         {
+            if self.allow_cancellation_scope_delivery {
+                return Err(Error::CancellationScopeExecutionUnavailable);
+            }
             CancellationHistory::from_events(
                 &task.history_events,
                 task.run_id.as_deref().unwrap_or_default(),
@@ -7925,7 +7948,7 @@ impl Worker {
             .filter(|identity| !identity.is_empty())
             .or_else(|| (!task.task_id.is_empty()).then(|| task.task_id.clone()))
             .unwrap_or_default();
-        let mut workflow_state = WorkflowState::new_with_identity_and_scopes(
+        let mut workflow_state = WorkflowState::new_with_identity_and_scope_delivery(
             task.history_events,
             task.workflow_id,
             task.run_id,
@@ -7933,6 +7956,7 @@ impl Worker {
             task.payload_codec.clone(),
             resume_signal,
             self.allow_cancellation_scope_authoring,
+            self.allow_cancellation_scope_delivery,
         )?;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
@@ -7959,6 +7983,10 @@ impl Worker {
             let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
             state.cancellation_delivery_intent.is_some()
                 || state.cancellation_scope_opening.is_some()
+                || state
+                    .scope_delivery
+                    .as_ref()
+                    .is_some_and(|replay| replay.intent.is_some())
         };
         if awaiting_canonical_boundary {
             // A private delivery intent never becomes an application error.
@@ -8053,6 +8081,22 @@ impl Worker {
         }
         let (message_stream_cursors, message_stream_waits) = ctx.message_stream_metadata()?;
         let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+        let scope_delivery = state
+            .scope_delivery
+            .as_ref()
+            .and_then(|replay| replay.intent.clone());
+        if scope_delivery
+            .as_ref()
+            .is_some_and(|intent| commands.len() != intent.command_count)
+        {
+            return Err(invalid_recorded_history(
+                "cancellation_scope_pending_call_escaped",
+                scope_delivery.as_ref().unwrap().boundary.sequence,
+                "commands preceding the pending scoped call",
+                "commands after suspension",
+                "workflow cannot publish beyond an uncommitted scope delivery",
+            ));
+        }
         if let Some(opening) = &state.cancellation_scope_opening {
             if commands.len() != opening.command_count {
                 return Err(invalid_recorded_history(
@@ -8085,6 +8129,7 @@ impl Worker {
             message_stream_waits,
             cancellation_delivery: state.cancellation_delivery_intent.clone(),
             cancellation_scope_opening: state.cancellation_scope_opening.clone(),
+            cancellation_scope_delivery: scope_delivery,
         })
     }
 
@@ -8914,7 +8959,11 @@ impl WorkflowContext {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
-        Ok(state.cancel_requested)
+        Ok(state.cancel_requested
+            || state
+                .scope_delivery
+                .as_ref()
+                .is_some_and(|replay| replay.contexts.contains_key(&self.cancellation_scope_id)))
     }
 
     /// Raise a typed cooperative cancellation at an author-controlled point.
@@ -8926,6 +8975,26 @@ impl WorkflowContext {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if state.cancellation_shield_depth == 0 {
+            if let Some(replay) = &state.scope_delivery {
+                if let Some((context, _)) = replay.contexts.get(&self.cancellation_scope_id) {
+                    let delivered = replay
+                        .canonical
+                        .deliveries
+                        .values()
+                        .find(|delivered| delivered.context.request_id() == context.request_id())
+                        .unwrap();
+                    return Err(Error::CancellationScopeRequested(
+                        CancellationScopeRequested {
+                            context: context
+                                .clone()
+                                .with_replay(Some(Arc::downgrade(&self.state))),
+                            delivery: delivered.boundary.clone(),
+                        },
+                    ));
+                }
+            }
+        }
         if state.cancel_requested && state.cancellation_shield_depth == 0 {
             return Err(state.cancellation_error());
         }
@@ -9652,6 +9721,22 @@ impl WorkflowContext {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if let Some(replay) = &state.scope_delivery {
+            if let Some((&sequence, _)) = replay
+                .canonical
+                .deliveries
+                .iter()
+                .find(|(sequence, _)| !replay.consumed.contains(sequence))
+            {
+                return Err(invalid_recorded_history(
+                    "cancellation_scope_delivery_unconsumed",
+                    sequence,
+                    "original scoped delivery",
+                    "workflow completion",
+                    "workflow completed without consuming its committed scope delivery",
+                ));
+            }
+        }
         if let Some(command) = state.recorded_commands.get(state.command_cursor) {
             return Err(Error::NonDeterministicReplay(ReplayFailure::new(
                 "recorded_commands_unconsumed",
@@ -9744,6 +9829,7 @@ struct WorkflowState {
     allow_cancellation_scope_authoring: bool,
     cancellation_scope_opening: Option<cancellation_scope::CancellationScopeOpening>,
     cancellation_scope_memberships: BTreeMap<u64, String>,
+    scope_delivery: Option<cancellation_scope_replay::ScopeReplay>,
     resume_signal: Option<ResumeSignal>,
     recorded_commands: Vec<RecordedCommand>,
     selection_markers: Vec<SelectionMarker>,
@@ -9809,9 +9895,32 @@ impl WorkflowState {
         resume_signal: Option<ResumeSignal>,
         allow_cancellation_scope_authoring: bool,
     ) -> Result<Self> {
-        cooperative_cancellation::assert_cancellation_scope_replay_supported_with_authoring(
+        Self::new_with_identity_and_scope_delivery(
+            history,
+            workflow_id,
+            run_id,
+            task_queue,
+            payload_codec,
+            resume_signal,
+            allow_cancellation_scope_authoring,
+            false,
+        )
+    }
+
+    fn new_with_identity_and_scope_delivery(
+        history: Vec<HistoryEvent>,
+        workflow_id: Option<String>,
+        run_id: Option<String>,
+        task_queue: String,
+        payload_codec: String,
+        resume_signal: Option<ResumeSignal>,
+        allow_cancellation_scope_authoring: bool,
+        allow_cancellation_scope_delivery: bool,
+    ) -> Result<Self> {
+        cooperative_cancellation::assert_cancellation_scope_replay_supported(
             &history,
             allow_cancellation_scope_authoring,
+            allow_cancellation_scope_delivery,
         )?;
         let scopes = if allow_cancellation_scope_authoring {
             cancellation_scope::CancellationScopeHistory::read(
@@ -9829,6 +9938,16 @@ impl WorkflowState {
         if allow_cancellation_scope_authoring && cancellation_history.request.is_some() {
             return Err(Error::CancellationScopeExecutionUnavailable);
         }
+        let scope_delivery = if allow_cancellation_scope_delivery {
+            Some(cancellation_scope_replay::ScopeReplay::read(
+                &history,
+                &scopes,
+                run_id.as_deref().unwrap_or_default(),
+                workflow_id.as_deref().unwrap_or_default(),
+            )?)
+        } else {
+            None
+        };
         let mut recorded_commands = cancellation_history.bind_commands(recorded_commands(
             &history,
             &payload_codec,
@@ -9837,27 +9956,30 @@ impl WorkflowState {
                 run_id: run_id.clone(),
             },
         )?)?;
-        for (sequence, opening) in scopes.openings {
+        for (sequence, opening) in &scopes.openings {
             if recorded_commands
                 .iter()
-                .any(|command| command.sequence() == sequence)
+                .any(|command| command.sequence() == *sequence)
             {
                 return Err(invalid_recorded_history(
                     "invalid_cancellation_scope_history",
-                    sequence,
+                    *sequence,
                     "distinct authored scope opening",
                     "operation collision",
                     "scope opening collides with a command",
                 ));
             }
             recorded_commands.push(RecordedCommand::CancellationScope {
-                sequence,
-                scope_id: opening.scope_id,
-                parent_scope_id: opening.parent_scope_id,
+                sequence: *sequence,
+                scope_id: opening.scope_id.clone(),
+                parent_scope_id: opening.parent_scope_id.clone(),
                 shield_parent: opening.shield_parent,
             });
         }
         recorded_commands.sort_by_key(RecordedCommand::sequence);
+        if let Some(replay) = &scope_delivery {
+            replay.bind_commands(&mut recorded_commands)?;
+        }
         let selection_markers = recorded_selection_markers(&history)?;
         let cancelled_selection_members = recorded_selection_cancellations(&history)?;
         let recorded_continue_as_new = history
@@ -9944,6 +10066,11 @@ impl WorkflowState {
                     &recorded_commands,
                     cancellation_history.delivery_index,
                 )
+            })
+            .or_else(|| {
+                scope_delivery.as_ref().map(|_| {
+                    cancellation_replay_clock::ReplayClock::new(&history, &recorded_commands, None)
+                })
             });
         Ok(Self {
             workflow_command_identity: String::new(),
@@ -9968,6 +10095,7 @@ impl WorkflowState {
             allow_cancellation_scope_authoring,
             cancellation_scope_opening: None,
             cancellation_scope_memberships: scopes.memberships,
+            scope_delivery,
             resume_signal,
             recorded_commands,
             selection_markers,
@@ -12832,7 +12960,7 @@ impl ActivityCall {
         };
 
         let cursor = state.command_cursor;
-        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+        if let Err(error) = ctx.validate_scope_membership(&mut state, cursor) {
             return Poll::Ready(Err(error));
         }
         let recorded =
@@ -13068,7 +13196,7 @@ impl Future for TimerCall {
         };
 
         let cursor = state.command_cursor;
-        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+        if let Err(error) = ctx.validate_scope_membership(&mut state, cursor) {
             return Poll::Ready(Err(error));
         }
         let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Timer)
@@ -13215,7 +13343,7 @@ impl Future for ConditionWaitCall {
                 Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
             };
             let initial_cursor = state.command_cursor;
-            if let Err(error) = ctx.validate_scope_membership(&state, initial_cursor) {
+            if let Err(error) = ctx.validate_scope_membership(&mut state, initial_cursor) {
                 return Poll::Ready(Err(error));
             }
             let recorded = match state
@@ -13481,7 +13609,7 @@ impl ChildWorkflowCall {
         };
 
         let cursor = state.command_cursor;
-        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+        if let Err(error) = ctx.validate_scope_membership(&mut state, cursor) {
             return Poll::Ready(Err(error));
         }
         let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Child)
@@ -13724,7 +13852,7 @@ impl SignalCall {
         };
 
         let cursor = state.command_cursor;
-        if let Err(error) = ctx.validate_scope_membership(&state, cursor) {
+        if let Err(error) = ctx.validate_scope_membership(&mut state, cursor) {
             return Poll::Ready(Err(error));
         }
         let recorded = match state.cancellation_replay_command(cursor, CancellationCallKind::Signal)
@@ -15913,6 +16041,13 @@ fn workflow_failure_command(
             json!({"reason": "cancelled", "request_id": cancellation.request.request_id,
                 "cleanup_deadline_at": cancellation.request.cleanup_deadline_at}),
         ),
+        Error::CancellationScopeRequested(cancellation) => (
+            "WorkflowCancellationRequested",
+            "durable_workflow::CancellationScopeRequested",
+            json!({"reason":"scope_cancelled", "request_id":cancellation.context.request_id(),
+                "cleanup_deadline_at":cancellation.context.deadline().to_rfc3339(),
+                "cancellation":cancellation.context.to_value()}),
+        ),
         Error::NonDeterministicReplay(_) => (
             "NonDeterministicReplay",
             "durable_workflow::Error",
@@ -15927,9 +16062,9 @@ fn workflow_failure_command(
         Error::SagaCompensationFailed(failure) => {
             workflow_error_non_retryable(&failure.compensation_failure)
         }
-        Error::WorkflowCancellationRequested(_) | Error::CooperativeCancellationRequested(_) => {
-            true
-        }
+        Error::WorkflowCancellationRequested(_)
+        | Error::CooperativeCancellationRequested(_)
+        | Error::CancellationScopeRequested(_) => true,
         Error::NonDeterministicReplay(_) => true,
         _ => false,
     };
@@ -15970,9 +16105,9 @@ fn workflow_error_type(error: &Error) -> &'static str {
         },
         Error::ParallelFailed(_) => "ParallelFailed",
         Error::SagaCompensationFailed(_) => "SagaCompensationFailed",
-        Error::WorkflowCancellationRequested(_) | Error::CooperativeCancellationRequested(_) => {
-            "WorkflowCancellationRequested"
-        }
+        Error::WorkflowCancellationRequested(_)
+        | Error::CooperativeCancellationRequested(_)
+        | Error::CancellationScopeRequested(_) => "WorkflowCancellationRequested",
         Error::NonDeterministicReplay(_) => "NonDeterministicReplay",
         _ => "RustWorkflowError",
     }
@@ -15988,6 +16123,7 @@ fn workflow_error_non_retryable(error: &Error) -> bool {
         }
         Error::WorkflowCancellationRequested(_)
         | Error::CooperativeCancellationRequested(_)
+        | Error::CancellationScopeRequested(_)
         | Error::NonDeterministicReplay(_) => true,
         _ => false,
     }
@@ -16361,6 +16497,7 @@ mod tests {
     mod cancellation_scope_authoring;
     mod cancellation_scope_history;
     mod cancellation_scope_opening;
+    mod cancellation_scope_replay;
     mod child_workflow_policies;
     mod cooperative_cancellation;
     mod runtime_payloads;

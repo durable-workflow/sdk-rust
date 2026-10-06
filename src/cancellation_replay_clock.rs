@@ -170,6 +170,13 @@ impl ReplayClock {
 }
 
 impl WorkflowState {
+    pub(super) fn observe_scope_cancellation_delivery(&mut self, event: &HistoryEvent) {
+        if let Some(clock) = &mut self.cancellation_clock {
+            clock.started = true;
+            clock.observe(Some(event));
+        }
+    }
+
     pub(super) fn start_cancellation_clock(&mut self) {
         if let Some(clock) = &mut self.cancellation_clock {
             if !clock.started {

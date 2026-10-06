@@ -26,7 +26,7 @@ pub(super) struct CanonicalScopeOpening {
     pub shield_parent: bool,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(super) struct CancellationScopeHistory {
     pub openings: BTreeMap<u64, CanonicalScopeOpening>,
     pub memberships: BTreeMap<u64, String>,
@@ -236,11 +236,14 @@ pub(super) struct CancellationScopeOpening {
 impl WorkflowContext {
     pub(super) fn validate_scope_membership(
         &self,
-        state: &WorkflowState,
+        state: &mut WorkflowState,
         cursor: usize,
     ) -> Result<()> {
         if !state.allow_cancellation_scope_authoring {
             return Ok(());
+        }
+        if let Some(replay) = &mut state.scope_delivery {
+            replay.active_scope = self.cancellation_scope_id.clone();
         }
         if let Some(recorded) = state.recorded_commands.get(cursor) {
             let sequence = recorded.sequence();
@@ -248,6 +251,13 @@ impl WorkflowContext {
                 .cancellation_scope_memberships
                 .get(&sequence)
                 .map(String::as_str)
+                .or_else(|| {
+                    state
+                        .scope_delivery
+                        .as_ref()
+                        .and_then(|replay| replay.canonical.deliveries.get(&sequence))
+                        .map(|delivered| delivered.context.scope_id())
+                })
                 .unwrap_or("root");
             if original != self.cancellation_scope_id {
                 return Err(invalid_recorded_history(

@@ -28,10 +28,30 @@ fn scope_response(path: &str, body: &str, number: usize) -> Option<(&'static str
     if case == "budget" {
         thread::sleep(Duration::from_millis(900));
     }
-    if case == "lost-ack" && path.ends_with("/prepare") && number == 1 {
+    if matches!(case, "lost-ack" | "worker-lost-ack") && path.ends_with("/prepare") && number == 1 {
         return Some(("invalid-status", String::new()));
     }
     let mut source = scalar_fixture();
+    if case.starts_with("worker") {
+        // Synthetic transport time is safely ahead of the actual request budget.
+        // The fixture has no admitted members whose descriptor contains dates.
+        source =
+            serde_json::from_str(&source.to_string().replace("2026-10-04", "2029-10-04")).unwrap();
+        if path.ends_with("/poll") {
+            let task = claim(&source);
+            return Some(("200 OK", json!({"protocol_version":"1.20", "task":{
+                "task_id":task.task_id, "run_id":task.run_id, "workflow_id":task.workflow_id,
+                "workflow_type":task.workflow_type, "lease_owner":task.lease_owner,
+                "workflow_task_attempt":task.workflow_task_attempt, "payload_codec":DEFAULT_CODEC,
+                "history_events":source["history"].as_array().unwrap().iter()
+                    .take_while(|event| event["event_type"] != "CancellationScopeDeliveryPrepared")
+                    .cloned().collect::<Vec<_>>()
+            }}).to_string()));
+        }
+        if path.ends_with("/complete") {
+            return Some(("200 OK", "{}".into()));
+        }
+    }
     let delivering =
         path.ends_with("/deliver") || (path.ends_with("/history") && body.contains("deliver-"));
     if case == "substituted" && delivering {
@@ -151,6 +171,88 @@ fn scope_client(server: &MockWorkerServer, case: &str) -> Client {
         .worker_token(Some("worker-only".into()))
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn cancellation_scope_replay_worker_coordinates_original_claim_and_lost_ack() {
+    for case in ["worker", "worker-lost-ack"] {
+        let server = scope_server();
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&cleanup);
+        let mut worker = Worker::new(scope_client(&server, case), "queue")
+            .worker_id("original")
+            .poll_timeout(Duration::ZERO)
+            .cooperative_cancellation(true)
+            .candidate_cancellation_scope_authoring(true)
+            .candidate_cancellation_scope_delivery(true);
+        worker.register_workflow("scope", move |ctx, _| {
+            let observed = Arc::clone(&observed);
+            async move {
+                ctx.cancellation_scope(false, move |outer| async move {
+                    outer
+                        .cancellation_scope(false, move |inner| async move {
+                            match inner.sleep(Duration::from_secs(3600)).await {
+                                Err(Error::CancellationScopeRequested(cancellation)) => {
+                                    observed.fetch_add(1, Ordering::SeqCst);
+                                    assert_eq!(
+                                        cancellation.context.remaining()?,
+                                        Duration::from_micros(22_623_456)
+                                    );
+                                    let _shield = inner.cancellation_shield()?;
+                                    inner.sleep(Duration::from_secs(1)).await?;
+                                    Ok(Value::Null)
+                                }
+                                Err(error) => Err(error),
+                                Ok(()) => panic!("cancelled timer cannot complete ordinarily"),
+                            }
+                        })
+                        .await
+                })
+                .await
+            }
+        });
+        assert_eq!(
+            worker.poll_workflow_once().await.unwrap(),
+            ManagedPollOutcome::Handled
+        );
+        assert_eq!(cleanup.load(Ordering::SeqCst), 1);
+        let requests = server.requests.lock().unwrap();
+        let preparations: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/prepare"))
+            .collect();
+        assert_eq!(
+            preparations.len(),
+            if case == "worker-lost-ack" { 2 } else { 1 }
+        );
+        if preparations.len() == 2 {
+            assert_eq!(preparations[0].body, preparations[1].body);
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/deliver"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/history"))
+                .count(),
+            4
+        );
+        let completion = requests.last().unwrap();
+        assert_eq!(
+            completion.path,
+            format!("/{case}/api/worker/workflow-tasks/task/one/complete")
+        );
+        let body: Value = serde_json::from_str(&completion.body).unwrap();
+        assert_eq!(body["workflow_task_attempt"], 4);
+        assert_eq!(body["lease_owner"], "original");
+        assert_eq!(body["commands"][0]["type"], "start_timer");
+        assert_eq!(body["commands"][0]["delay_seconds"], 1);
+    }
 }
 
 #[tokio::test]

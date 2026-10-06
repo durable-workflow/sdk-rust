@@ -402,6 +402,37 @@ fn assert_context_keys(value: &Value, keys: &[&str]) -> Result<()> {
 }
 
 impl ScopedCancellationContext {
+    /// Remaining original scope authority at the last consumed durable result.
+    #[doc(hidden)]
+    pub fn remaining(&self) -> Result<Duration> {
+        let state = self
+            .root_context
+            .replay
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(cancellation_replay_clock::is_active)
+            .ok_or_else(|| {
+                invalid_context("remaining() is available only in its active scope replay")
+            })?;
+        let state = state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+        let (_, ceiling) = state
+            .scope_delivery
+            .as_ref()
+            .and_then(|replay| replay.contexts.get(self.scope_id()))
+            .filter(|(original, _)| original == self)
+            .ok_or_else(|| {
+                invalid_context("scope remaining() requires its original consumed delivery")
+            })?;
+        Ok((self.deadline().min(*ceiling) - state.cancellation_time()?)
+            .to_std()
+            .unwrap_or(Duration::ZERO))
+    }
+
+    pub(super) fn with_replay(mut self, replay: Option<Weak<Mutex<WorkflowState>>>) -> Self {
+        self.root_context = self.root_context.with_replay(replay);
+        self
+    }
+
     pub(super) fn from_run_context(context: &CancellationContext) -> Result<Self> {
         let mut root = context.to_value();
         let mut lineage = Vec::new();
