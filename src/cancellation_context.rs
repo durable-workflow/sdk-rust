@@ -402,6 +402,37 @@ fn assert_context_keys(value: &Value, keys: &[&str]) -> Result<()> {
 }
 
 impl ScopedCancellationContext {
+    pub(super) fn from_run_context(context: &CancellationContext) -> Result<Self> {
+        let mut root = context.to_value();
+        let mut lineage = Vec::new();
+        if let Some(origin) = context.scope_origin() {
+            root = origin.root_context().to_value();
+            lineage.extend(
+                origin
+                    .lineage()
+                    .iter()
+                    .map(ScopedCancellationLineage::to_value),
+            );
+            let local = context.lineage().last().unwrap();
+            lineage.push(json!({"request_id":context.request_id(),
+                "workflow_instance_id":local.workflow_instance_id(),
+                "workflow_run_id":local.workflow_run_id(), "scope_id":"root",
+                "cleanup_deadline_at":context.deadline().to_rfc3339_opts(SecondsFormat::Micros, true)}));
+        } else {
+            root["request_id"] = json!(context.root_request_id());
+            root["parent_request_id"] = Value::Null;
+            root["lineage"] = json!([context.lineage()[0].to_value()]);
+            lineage.extend(context.lineage().iter().map(|entry| json!({
+                "request_id":entry.request_id(), "workflow_instance_id":entry.workflow_instance_id(),
+                "workflow_run_id":entry.workflow_run_id(), "scope_id":"root",
+                "cleanup_deadline_at":context.deadline().to_rfc3339_opts(SecondsFormat::Micros, true)})));
+        }
+        Self::from_value(
+            &json!({"schema":"durable-workflow.scoped-cancellation-context/v1",
+            "root_context":root, "lineage":lineage}),
+        )
+    }
+
     pub fn from_value(value: &Value) -> Result<Self> {
         assert_context_keys(value, &["schema", "root_context", "lineage"])?;
         if value["schema"] != "durable-workflow.scoped-cancellation-context/v1"

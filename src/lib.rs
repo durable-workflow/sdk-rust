@@ -3,6 +3,7 @@
 mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
+mod cancellation_scope_history;
 mod cooperative_cancellation;
 mod runtime_payloads;
 mod runtime_uploads;
@@ -11,6 +12,10 @@ pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
 };
 pub use cancellation_scope::CancellationScopeOpenReceipt;
+#[doc(hidden)]
+pub use cancellation_scope_history::{
+    CancellationScopeDeliveryBudget, CancellationScopeDeliveryReceipt,
+};
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
@@ -16354,6 +16359,7 @@ mod tests {
     mod activity_cancellation_policies;
     mod cancellation_scope_admission;
     mod cancellation_scope_authoring;
+    mod cancellation_scope_history;
     mod cancellation_scope_opening;
     mod child_workflow_policies;
     mod cooperative_cancellation;
