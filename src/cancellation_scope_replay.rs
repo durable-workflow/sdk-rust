@@ -508,7 +508,7 @@ impl WorkflowState {
         let Some(replay) = &self.scope_delivery else {
             return Ok(None);
         };
-        let Some((context, _)) = replay.contexts.get(scope) else {
+        let Some(_) = replay.contexts.get(scope) else {
             return Ok(None);
         };
         let delivered = replay.consumed_delivery_for_scope(scope).ok_or_else(|| {
@@ -517,7 +517,7 @@ impl WorkflowState {
             )
         })?;
         Ok(Some(
-            json!({"scope_id":scope, "request_id":context.request_id(),
+            json!({"scope_id":delivered.context.scope_id(), "request_id":delivered.context.request_id(),
             "delivery_history_event_id":delivered.event.raw["id"]}),
         ))
     }

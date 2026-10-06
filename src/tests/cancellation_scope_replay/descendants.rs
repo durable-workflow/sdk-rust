@@ -255,8 +255,9 @@ fn next_sequence(source: &Value) -> u64 {
 
 fn snapshot_for(source: &Value, target: &str) -> Value {
     let context = ScopedCancellationContext::from_value(&source["contexts"][target]).unwrap();
-    json!({"scope_id":context.scope_id(), "operation_scope_id":context.scope_id(),
-        "request_id":context.request_id(), "root_request_id":context.root_context().root_request_id(),
+    let ancestor = ScopedCancellationContext::from_value(&source["contexts"]["parent"]).unwrap();
+    json!({"scope_id":ancestor.scope_id(), "operation_scope_id":context.scope_id(),
+        "request_id":ancestor.request_id(), "root_request_id":ancestor.root_context().root_request_id(),
         "delivery_history_event_id":"ancestor-delivered", "preparation_history_event_id":"ancestor-prepared",
         "cleanup_deadline_at":"2026-10-04T00:00:30.123456Z", "authority_deadline_at":"2026-10-04T00:00:26.123456Z"})
 }
@@ -360,7 +361,7 @@ fn descendant_cleanup_retains_ancestor_proof_narrower_authority_and_replacement_
             let snapshot = snapshot_for(&source, target);
             let sequence = next_sequence(&source);
             let wire = json!({"type":"start_timer", "delay_seconds":1,
-                "cancellation_scope_id":snapshot["scope_id"], "cancellation_cleanup":{
+                "cancellation_scope_id":snapshot["operation_scope_id"], "cancellation_cleanup":{
                     "scope_id":snapshot["scope_id"], "request_id":snapshot["request_id"],
                     "delivery_history_event_id":snapshot["delivery_history_event_id"]}});
             assert_eq!(
@@ -375,7 +376,7 @@ fn descendant_cleanup_retains_ancestor_proof_narrower_authority_and_replacement_
                 "TimerScheduled",
                 json!({"sequence":sequence,
                 "timer_id":"descendant-cleanup", "delay_seconds":1,
-                "cancellation_scope_id":snapshot["scope_id"], "cancellation_cleanup":snapshot,
+                "cancellation_scope_id":snapshot["operation_scope_id"], "cancellation_cleanup":snapshot,
                 "fire_at":"2026-10-04T00:00:11.123456Z"}),
                 "2026-10-04T00:00:10.123456Z",
             );
@@ -395,7 +396,7 @@ fn descendant_cleanup_retains_ancestor_proof_narrower_authority_and_replacement_
                 "TimerFired",
                 json!({"sequence":sequence,
                 "timer_id":"descendant-cleanup", "delay_seconds":1,
-                "cancellation_scope_id":snapshot["scope_id"]}),
+                "cancellation_scope_id":snapshot["operation_scope_id"]}),
                 "2026-10-04T00:00:11.123456Z",
             );
             assert_eq!(

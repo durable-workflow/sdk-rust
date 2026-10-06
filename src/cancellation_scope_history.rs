@@ -165,11 +165,12 @@ fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> 
     let (context, ceiling) = states
         .get(text(p, "cancellation_scope_id")?)
         .ok_or_else(|| invalid("cleanup timer changes its original frozen subtree membership"))?;
-    let expected = json!({"scope_id":context.scope_id(), "operation_scope_id":context.scope_id(),
-        "request_id":context.request_id(), "root_request_id":context.root_context().root_request_id(),
+    let ancestor = ScopedCancellationContext::from_value(&original["cancellation"])?;
+    let expected = json!({"scope_id":ancestor.scope_id(), "operation_scope_id":context.scope_id(),
+        "request_id":ancestor.request_id(), "root_request_id":ancestor.root_context().root_request_id(),
         "delivery_history_event_id":event_id(delivery)?,
         "preparation_history_event_id":original["preparation_history_event_id"],
-        "cleanup_deadline_at":canonical_time(context.deadline()),
+        "cleanup_deadline_at":canonical_time(ancestor.deadline()),
         "authority_deadline_at":canonical_time(*ceiling)});
     let boundary = CancellationDelivery::from_payload(&json!({
         "workflow_command_id":original["request_id"], "sequence":original["sequence"],
