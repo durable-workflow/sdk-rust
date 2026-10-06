@@ -12,9 +12,13 @@ on:
         type: boolean
         default: false
       local_sdk_version:
-        description: Optional exact crates.io SDK version instead of source qualification
+        description: Optional exact crates.io SDK version for local or session qualification
         type: string
         default: ""
+      session_qualification:
+        description: Qualify worker sessions, using a Server candidate when server_commit is set
+        type: boolean
+        default: false
       cooperative_qualification:
         description: Run cooperative protocol 1.20 cases against an isolated Server candidate
         type: boolean
@@ -203,8 +207,8 @@ jobs:
           python scripts/ci/test-example-base-urls.py
 
   cooperative-server:
-    name: Cooperative Server source qualification
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.cooperative_qualification }}
+    name: Worker Server source qualification
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.cooperative_qualification || (inputs.session_qualification && inputs.server_commit != '')) }}
     needs: [action-policy, test]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -264,6 +268,7 @@ jobs:
           endpoint="$(docker compose port server 8080)"
           echo "DURABLE_WORKFLOW_SERVER_URL=http://$endpoint" >> "$GITHUB_ENV"
       - name: Run actual Worker cooperative scenarios
+        if: ${{ inputs.cooperative_qualification }}
         shell: bash
         run: |
           arguments=(--ignored --nocapture --test-threads=1)
@@ -278,6 +283,13 @@ jobs:
             arguments+=(--skip server_scope_group_wait_stops_actual_remote_callback_before_cleanup)
           fi
           cargo test --test cooperative_server -- "${arguments[@]}" 2>&1 | tee cooperative-results.log
+      - name: Run actual Worker session scenarios
+        if: ${{ inputs.session_qualification }}
+        env:
+          DURABLE_WORKFLOW_SESSION_ISOLATED: '1'
+        run: |
+          set -euo pipefail
+          cargo test --test worker_session_server -- --ignored --nocapture --test-threads=1 2>&1 | tee session-results.log
       - name: Retain bounded scenario evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
@@ -285,6 +297,7 @@ jobs:
           name: cooperative-server-${{ github.sha }}
           path: |
             cooperative-results.log
+            session-results.log
             cooperative-package-provenance.txt
             cooperative-images.json
             cooperative-source-provenance.json
@@ -300,8 +313,8 @@ jobs:
           docker image rm "dw-rust-cooperative-server:$SERVER_CANDIDATE_SHA"
 
   local-server:
-    name: Local activity Server qualification
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.local_qualification }}
+    name: Published Server worker qualification
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.local_qualification || (inputs.session_qualification && inputs.server_commit == '')) }}
     needs: [action-policy, test]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -336,19 +349,36 @@ jobs:
           printf '[package]\nname = "local-activity-consumer"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\ndurable-workflow = "=%s"\nreqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }\nserde_json = "1"\ntokio = { version = "1", features = ["full"] }\n' "$LOCAL_SDK_VERSION" > .local-consumer/Cargo.toml
           printf 'fn main() {}\n' > .local-consumer/src/main.rs
           cp tests/local_activity_server.rs .local-consumer/tests/
+          cp tests/worker_session_server.rs .local-consumer/tests/
           cargo metadata --manifest-path .local-consumer/Cargo.toml --format-version 1 > local-consumer-metadata.json
           jq --arg version "$LOCAL_SDK_VERSION" -e '[.packages[] | select(.name == "durable-workflow" and .version == $version and (.source | startswith("registry+https://github.com/rust-lang/crates.io-index")))] | length == 1' local-consumer-metadata.json
       - name: Run actual Worker local activity scenarios
+        if: ${{ inputs.local_qualification }}
         run: |
           set -euo pipefail
           arguments=()
           if [ -n "$LOCAL_SDK_VERSION" ]; then arguments+=(--manifest-path .local-consumer/Cargo.toml); fi
           cargo test "${arguments[@]}" --test local_activity_server -- --ignored --nocapture --test-threads=1 2>&1 | tee local-results.log
           jq --null-input --arg sdk "$GITHUB_SHA" --arg version "$LOCAL_SDK_VERSION" \
-            '{runner_commit:$sdk,sdk_commit:(if $version == "" then $sdk else null end),published_sdk_version:($version | if length > 0 then . else null end),server_version:"2.5.0",native_version:"2.4.0"}' > local-qualification.json
+            '{runner_commit:$sdk,sdk_commit:(if $version == "" then $sdk else null end),published_sdk_version:($version | if length > 0 then . else null end)}' > local-qualification.json
           if [ -n "$LOCAL_SDK_VERSION" ]; then
             find "$HOME/.cargo/registry/cache" -name "durable-workflow-$LOCAL_SDK_VERSION.crate" -exec sha256sum '{}' \; > local-crate-sha256.txt
             test -s local-crate-sha256.txt
+          fi
+      - name: Run actual Worker session scenarios
+        if: ${{ inputs.session_qualification }}
+        env:
+          DURABLE_WORKFLOW_SESSION_ISOLATED: '1'
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [ -n "$LOCAL_SDK_VERSION" ]; then arguments+=(--manifest-path .local-consumer/Cargo.toml); fi
+          cargo test "${arguments[@]}" --test worker_session_server -- --ignored --nocapture --test-threads=1 2>&1 | tee session-results.log
+          jq --null-input --arg sdk "$GITHUB_SHA" --arg version "$LOCAL_SDK_VERSION" \
+            '{runner_commit:$sdk,sdk_commit:(if $version == "" then $sdk else null end),published_sdk_version:($version | if length > 0 then . else null end)}' > session-qualification.json
+          if [ -n "$LOCAL_SDK_VERSION" ]; then
+            find "$HOME/.cargo/registry/cache" -name "durable-workflow-$LOCAL_SDK_VERSION.crate" -exec sha256sum '{}' \; > session-crate-sha256.txt
+            test -s session-crate-sha256.txt
           fi
       - name: Retain bounded scenario evidence
         if: ${{ always() }}
@@ -357,6 +387,9 @@ jobs:
           name: local-activities-${{ github.sha }}
           path: |
             local-results.log
+            session-results.log
+            session-qualification.json
+            session-crate-sha256.txt
             local-package-provenance.txt
             local-images.json
             local-qualification.json

@@ -14,6 +14,7 @@ struct SessionState {
     expires: Option<Instant>,
     receipt: Option<Value>,
     close_receipt: Option<Value>,
+    original_ttl: Option<(i64, u32)>,
 }
 
 /// One worker's acknowledged session lease.
@@ -53,7 +54,7 @@ impl WorkerSession {
             .is_some_and(|expires| Instant::now() < expires)
     }
 
-    /// Last validated Server receipt, including holder and original TTL.
+    /// Last validated session snapshot, including holder and original TTL.
     pub fn snapshot(&self) -> Result<Option<Value>> {
         Ok(self
             .state
@@ -124,7 +125,7 @@ impl WorkerSession {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
-        state.receipt = Some(response.clone());
+        state.receipt = Some(response["session"].clone());
         state.close_receipt = Some(response.clone());
         Ok(response)
     }
@@ -158,10 +159,6 @@ impl WorkerSession {
     fn accept(&self, receipt: &Value, outcomes: &[&str]) -> Result<()> {
         self.validate_receipt(receipt, outcomes, "active")?;
         self.track(&receipt["session"])?;
-        self.state
-            .lock()
-            .map_err(|_| Error::WorkflowStatePoisoned)?
-            .receipt = Some(receipt.clone());
         Ok(())
     }
 
@@ -208,12 +205,23 @@ impl WorkerSession {
             ));
         }
         let expires = lease_deadline(affinity)?;
+        let ttl =
+            chrono::DateTime::parse_from_rfc3339(affinity["ttl_expires_at"].as_str().unwrap())
+                .map_err(|_| invalid("invalid session TTL deadline"))?;
+        let ttl = (ttl.timestamp(), ttl.timestamp_subsec_nanos());
         let mut state = self
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if state.original_ttl.is_some_and(|original| original != ttl) {
+            return Err(invalid("session renewal changed its original TTL deadline"));
+        }
+        state.original_ttl = Some(ttl);
         state.expires = Some(expires);
         state.receipt = Some(affinity.clone());
+        if let Some(receipt) = &mut state.receipt {
+            receipt["namespace"] = json!(self.client.namespace);
+        }
         state.close_receipt = None;
         Ok(())
     }

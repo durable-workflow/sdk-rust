@@ -62,6 +62,9 @@ fn responses(path: &str, body: &str, number: usize) -> Option<(&'static str, Str
         if path.starts_with("/wrong-holder/") {
             session["lease_owner"] = json!("other-worker");
         }
+        if path.starts_with("/changed-ttl/") && path.ends_with("/heartbeat") {
+            session["ttl_expires_at"] = json!("2099-01-03T00:00:00Z");
+        }
         if path.starts_with("/ambiguous-renew/") && path.ends_with("/heartbeat") {
             return Some((
                 "200 OK",
@@ -186,7 +189,7 @@ async fn worker_session_lifecycle_preserves_ttl_and_duplicate_close_receipt() {
 
 #[tokio::test]
 async fn worker_session_uncertain_receipts_never_restore_local_authority() {
-    for case in ["wrong-holder", "ambiguous-renew"] {
+    for case in ["wrong-holder", "ambiguous-renew", "changed-ttl"] {
         let (_server, worker) = setup(case);
         worker.register().await.unwrap();
         let session = worker.worker_session(options()).unwrap();

@@ -115,6 +115,30 @@ during fresh execution, rather than testing whether an ID has been assigned.
 Available since SDK 3.1.0. Default workers keep local execution disabled.
 Opted-in workers negotiate their local capability during registration.
 
+### Worker sessions
+
+Enable `Worker::worker_sessions(true)` and declare the resource requirements that
+the worker actually satisfies with `capabilities(...)`. Route a remote call with
+`ctx.activity(...).in_worker_session(options)` and use `.typed::<Output>()` or
+`.avro_value()` for its result. A parallel group's `in_worker_session(...)` applies
+the same routing to each activity leaf.
+
+Server creates a session on the first admitted activity. After registration,
+`worker.worker_session(options)` also provides an explicit shared handle for
+`create()`, `renew()` and `close(reason)`. `ActivityContext::worker_session()` exposes
+the current handle. Heartbeats renew the holder lease without extending the
+absolute TTL. Graceful worker shutdown drains activities and closes held sessions
+before deregistering.
+
+Session memory is process-local. A replacement holder must rebuild its resources,
+and an interrupted activity can execute again. Use idempotency and attempt fencing
+for external side effects. Committed results replay from history without rebuilding
+resources or rerunning callbacks. Changing recorded session options fails replay.
+Local activities cannot use session routing. Sticky execution remains unsupported.
+
+The runnable session example uses a real process-local cache and prints its resource
+generation. It requires a Server with the session history and absolute TTL fixes.
+
 ### Runnable examples
 
 | Example | Demonstrates |
@@ -122,6 +146,7 @@ Opted-in workers negotiate their local capability during registration.
 | [`hello_world.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs) | Typed worker, workflow, activities, retries, and completion |
 | [`activity_options.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/activity_options.rs) | Activity retry and timeout policies |
 | [`local_activities.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/local_activities.rs) | Explicit local execution, retries, durable timers and remote work |
+| [`worker_sessions.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/worker_sessions.rs) | Typed activity routing, holder-local resources and graceful session close |
 | [`condition_search_attributes.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/condition_search_attributes.rs) | Durable conditions and typed search attributes |
 | [`continue_as_new.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/continue_as_new.rs) | Bounded histories and continue-as-new |
 | [`parallel_saga.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/parallel_saga.rs) | Deterministic parallel work and saga compensation |
