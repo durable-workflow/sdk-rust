@@ -1,5 +1,7 @@
 use super::*;
 
+mod descendants;
+
 fn group_fixture(name: &str) -> Value {
     let source: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/populated-scope-groups.json"

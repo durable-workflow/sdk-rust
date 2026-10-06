@@ -8979,11 +8979,12 @@ impl WorkflowContext {
             if let Some(replay) = &state.scope_delivery {
                 if let Some((context, _)) = replay.contexts.get(&self.cancellation_scope_id) {
                     let delivered = replay
-                        .canonical
-                        .deliveries
-                        .values()
-                        .find(|delivered| delivered.context.request_id() == context.request_id())
-                        .unwrap();
+                        .consumed_delivery_for_scope(&self.cancellation_scope_id)
+                        .ok_or_else(|| {
+                            Error::InvalidCooperativeCancellation(
+                                "scoped request lacks its consumed original delivery".into(),
+                            )
+                        })?;
                     return Err(Error::CancellationScopeRequested(
                         CancellationScopeRequested {
                             context: context

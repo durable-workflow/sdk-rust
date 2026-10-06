@@ -172,9 +172,16 @@ span, cleanup sequence, context and deadline.
 Shielded cleanup timers carry only the original scope, request and delivery
 references. Server derives their immutable authority and rejects a timer that
 would reach its ceiling. Unsupported local, signal, selection, incomplete or
-mixed-scope groups are refused before the workflow factory runs. Descendant
-delivery and root/scope composition still require qualification. These opt-ins
-remain disabled by default and do not advertise general scoped execution.
+mixed-scope groups are refused before the workflow factory runs. An ancestor
+delivery restores each included descendant's original accepted context as code
+unwinds. Shielded branches remain unaffected. Cleanup timers in each included
+scope retain its own request, the ancestor receipt and its narrower authority
+ceiling. Replacement replay preserves the recorded clock and immutable metadata.
+Pending ancestor requests keep the original authored boundary without entering
+cleanup. Competing roots, overlapping deliveries, subtree local callbacks and
+root/scope composition remain gated. These opt-ins remain disabled by default
+and do not advertise general scoped execution. Exact connected qualification
+and the published acceptance scenario remain separate gates.
 
 ## Remaining qualification
 

@@ -1,7 +1,9 @@
 //! Candidate scope delivery. Admission remains private and disabled by default.
 
 use super::*;
-use crate::cancellation_scope_history::CommittedCancellationScopeHistory;
+use crate::cancellation_scope_history::{
+    boundary_scope_states, CommittedCancellationScopeHistory, ScopeBoundary,
+};
 use chrono::Utc;
 
 #[doc(hidden)]
@@ -26,6 +28,8 @@ pub(super) struct ScopeReplay {
     pub active_scope: String,
     pub consumed: BTreeSet<u64>,
     pub contexts: BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>,
+    pub boundary_states:
+        BTreeMap<String, BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>>,
     pub cleanup_timers: BTreeMap<u64, Value>,
     pub intent: Option<ScopeDeliveryIntent>,
 }
@@ -209,6 +213,7 @@ impl ScopeReplay {
         workflow: &str,
     ) -> Result<Self> {
         let canonical = CommittedCancellationScopeHistory::read(history, run, workflow)?;
+        let mut boundary_states = BTreeMap::new();
         for preparation in canonical.preparations.values() {
             let boundary = &preparation.boundary;
             let supported = if boundary.call_kind == CancellationCallKind::Parallel {
@@ -231,13 +236,34 @@ impl ScopeReplay {
             } else {
                 scalar(boundary.call_kind) && boundary.sequence_span == 1
             };
-            if !supported
-                || preparation.boundary.operation_sequence.is_some()
-                || preparation.event.payload["descendant_members"]
-                    .as_array()
-                    .is_none_or(|members| !members.is_empty())
-            {
+            if !supported || preparation.boundary.operation_sequence.is_some() {
                 return Err(Error::CancellationScopeExecutionUnavailable);
+            }
+            let states = boundary_scope_states(&preparation.context, &preparation.event.payload)?;
+            for event in history
+                .iter()
+                .take_while(|row| row.raw["id"] != preparation.event.raw["id"])
+            {
+                if event.event_type == "ActivityScheduled"
+                    && durable_event_sequence(event)
+                        .and_then(|sequence| tree.memberships.get(&sequence))
+                        .is_some_and(|scope| states.contains_key(scope))
+                    && (event.payload["local_activity"] == true
+                        || event.payload["execution_mode"] == "local"
+                        || event.payload["activity"]["local_activity"] == true
+                        || event.payload["activity"]["execution_mode"] == "local")
+                {
+                    return Err(Error::CancellationScopeExecutionUnavailable);
+                }
+            }
+            boundary_states.insert(preparation.context.scope_id().to_owned(), states);
+        }
+        let mut delivered_scopes = BTreeSet::new();
+        for delivery in canonical.deliveries.values() {
+            for scope in boundary_states[delivery.context.scope_id()].keys() {
+                if !delivered_scopes.insert(scope.clone()) {
+                    return Err(Error::CancellationScopeExecutionUnavailable);
+                }
             }
         }
         Ok(Self {
@@ -246,11 +272,19 @@ impl ScopeReplay {
             active_scope: "root".into(),
             consumed: BTreeSet::new(),
             contexts: BTreeMap::new(),
+            boundary_states,
             cleanup_timers: history.iter().filter(|row| row.event_type == "TimerScheduled")
                 .filter_map(|row| row.payload.get("cancellation_cleanup").map(|snapshot|
                     (row.payload["sequence"].as_u64().unwrap(), json!({"scope_id":snapshot["scope_id"],
                      "request_id":snapshot["request_id"], "delivery_history_event_id":snapshot["delivery_history_event_id"]})))).collect(),
             intent: None,
+        })
+    }
+
+    pub(super) fn consumed_delivery_for_scope(&self, scope: &str) -> Option<&ScopeBoundary> {
+        self.canonical.deliveries.values().find(|delivery| {
+            self.consumed.contains(&delivery.boundary.sequence)
+                && self.boundary_states[delivery.context.scope_id()].contains_key(scope)
         })
     }
 
@@ -327,7 +361,8 @@ impl WorkflowState {
         let sequence = descriptors[0].group_path[0].parallel_group_base_sequence;
         if let Some(delivered) = replay.canonical.deliveries.get(&sequence) {
             let delivered = delivered.clone();
-            if replay.active_scope != delivered.context.scope_id()
+            if !replay.boundary_states[delivered.context.scope_id()]
+                .contains_key(&replay.active_scope)
                 || self.cancellation_shield_depth > 0
                 || delivered.boundary.call_kind != CancellationCallKind::Parallel
             {
@@ -381,10 +416,9 @@ impl WorkflowState {
         if replay.contexts.contains_key(request.context.scope_id()) {
             return Ok(false);
         }
-        if request.context.scope_id() != replay.active_scope
-            || descriptors
-                .iter()
-                .any(|descriptor| matches!(descriptor.operation, ParallelOperation::Signal(_)))
+        if descriptors
+            .iter()
+            .any(|descriptor| matches!(descriptor.operation, ParallelOperation::Signal(_)))
         {
             return Err(Error::CancellationScopeExecutionUnavailable);
         }
@@ -477,19 +511,11 @@ impl WorkflowState {
         let Some((context, _)) = replay.contexts.get(scope) else {
             return Ok(None);
         };
-        let delivered = replay
-            .canonical
-            .deliveries
-            .values()
-            .find(|delivery| {
-                delivery.context == *context
-                    && replay.consumed.contains(&delivery.boundary.sequence)
-            })
-            .ok_or_else(|| {
-                Error::InvalidCooperativeCancellation(
-                    "scoped cleanup lacks its consumed original delivery".into(),
-                )
-            })?;
+        let delivered = replay.consumed_delivery_for_scope(scope).ok_or_else(|| {
+            Error::InvalidCooperativeCancellation(
+                "scoped cleanup lacks its consumed original delivery".into(),
+            )
+        })?;
         Ok(Some(
             json!({"scope_id":scope, "request_id":context.request_id(),
             "delivery_history_event_id":delivered.event.raw["id"]}),
@@ -564,7 +590,7 @@ impl WorkflowState {
         {
             return Ok(false);
         }
-        if !scalar(kind) || !path.is_empty() || request.context.scope_id() != replay.active_scope {
+        if !scalar(kind) || !path.is_empty() {
             return Err(Error::CancellationScopeExecutionUnavailable);
         }
         let boundary = CancellationDelivery {
@@ -629,7 +655,8 @@ impl WorkflowState {
         };
         if replay.consumed.contains(&sequence)
             || delivered.boundary.call_kind != kind
-            || replay.active_scope != delivered.context.scope_id()
+            || !replay.boundary_states[delivered.context.scope_id()]
+                .contains_key(&replay.active_scope)
             || self.cancellation_shield_depth > 0
         {
             return Err(invalid(
@@ -640,10 +667,10 @@ impl WorkflowState {
         self.observe_scope_cancellation_delivery(&delivered.event);
         let replay = self.scope_delivery.as_mut().unwrap();
         replay.consumed.insert(sequence);
-        replay.contexts.insert(
-            delivered.context.scope_id().into(),
-            (delivered.context.clone(), delivered.authority_deadline),
-        );
+        replay
+            .contexts
+            .extend(replay.boundary_states[delivered.context.scope_id()].clone());
+        let active_context = replay.contexts[&replay.active_scope].0.clone();
         self.command_cursor = index
             + if kind == CancellationCallKind::Parallel {
                 delivered.boundary.sequence_span as usize
@@ -652,9 +679,7 @@ impl WorkflowState {
             };
         Err(Error::CancellationScopeRequested(
             CancellationScopeRequested {
-                context: delivered
-                    .context
-                    .with_replay(cancellation_replay_clock::active_binding()),
+                context: active_context.with_replay(cancellation_replay_clock::active_binding()),
                 delivery: delivered.boundary,
             },
         ))

@@ -63,9 +63,88 @@ pub(super) fn timestamp(value: &Value) -> Result<DateTime<Utc>> {
         .ok_or_else(|| invalid("scope authority requires an original timestamp with timezone"))
 }
 
+pub(super) fn boundary_scope_states(
+    context: &ScopedCancellationContext,
+    preparation: &Value,
+) -> Result<BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>> {
+    let mut states = BTreeMap::from([(
+        context.scope_id().to_owned(),
+        (
+            context.clone(),
+            timestamp(&preparation["authority_deadline_at"])?,
+        ),
+    )]);
+    for member in preparation["descendant_members"]
+        .as_array()
+        .ok_or_else(|| invalid("scope preparation lacks its frozen subtree"))?
+    {
+        let descendant = ScopedCancellationContext::from_value(&member["cancellation"])?;
+        if descendant.root_context() != context.root_context()
+            || !descendant.lineage().starts_with(context.lineage())
+            || states.contains_key(descendant.scope_id())
+        {
+            return Err(invalid(
+                "scope descendant changes its original root or accepted lineage",
+            ));
+        }
+        states.insert(
+            descendant.scope_id().to_owned(),
+            (descendant, timestamp(&member["authority_deadline_at"])?),
+        );
+    }
+    Ok(states)
+}
+
+fn delivery_scope_states(
+    delivery: &HistoryEvent,
+    prefix: &[HistoryEvent],
+) -> Result<BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>> {
+    let preparations: Vec<_> = prefix
+        .iter()
+        .filter(|row| {
+            row.event_type == "CancellationScopeDeliveryPrepared"
+                && row.raw["id"] == delivery.payload["preparation_history_event_id"]
+        })
+        .collect();
+    if preparations.len() != 1
+        || preparations[0].raw["sequence"]
+            .as_u64()
+            .zip(delivery.raw["sequence"].as_u64())
+            .is_none_or(|(before, after)| before >= after)
+    {
+        return Err(invalid(
+            "cleanup timer lacks its original canonical preparation",
+        ));
+    }
+    boundary_scope_states(
+        &ScopedCancellationContext::from_value(&delivery.payload["cancellation"])?,
+        &preparations[0].payload,
+    )
+}
+
 fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> {
     let p = &event.payload;
     let Some(snapshot) = p.get("cancellation_cleanup") else {
+        if p["cancellation_scope_id"]
+            .as_str()
+            .is_some_and(|scope| scope != "root")
+        {
+            for delivery in prefix.iter().filter(|row| {
+                row.event_type == "CancellationScopeDelivered"
+                    && row.raw["sequence"]
+                        .as_u64()
+                        .zip(event.raw["sequence"].as_u64())
+                        .is_some_and(|(delivery, timer)| delivery < timer)
+            }) {
+                if delivery_scope_states(delivery, prefix)?
+                    .contains_key(text(p, "cancellation_scope_id")?)
+                {
+                    return Err(invalid(
+                        "cleanup timer omits its original delivery snapshot",
+                    ));
+                }
+            }
+        }
         return Ok(false);
     };
     let matches: Vec<_> = prefix
@@ -82,16 +161,18 @@ fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> 
     }
     let delivery = matches[0];
     let original = &delivery.payload;
-    let context = ScopedCancellationContext::from_value(&original["cancellation"])?;
+    let states = delivery_scope_states(delivery, prefix)?;
+    let (context, ceiling) = states
+        .get(text(p, "cancellation_scope_id")?)
+        .ok_or_else(|| invalid("cleanup timer changes its original frozen subtree membership"))?;
     let expected = json!({"scope_id":context.scope_id(), "operation_scope_id":context.scope_id(),
         "request_id":context.request_id(), "root_request_id":context.root_context().root_request_id(),
         "delivery_history_event_id":event_id(delivery)?,
         "preparation_history_event_id":original["preparation_history_event_id"],
         "cleanup_deadline_at":canonical_time(context.deadline()),
-        "authority_deadline_at":original["authority_deadline_at"]});
-    let ceiling = timestamp(&original["authority_deadline_at"])?;
+        "authority_deadline_at":canonical_time(*ceiling)});
     let boundary = CancellationDelivery::from_payload(&json!({
-        "workflow_command_id":context.request_id(), "sequence":original["sequence"],
+        "workflow_command_id":original["request_id"], "sequence":original["sequence"],
         "call_kind":original["call_kind"], "sequence_span":original["sequence_span"],
         "operation_sequence":original["operation_sequence"], "operation_sequence_span":original["operation_sequence_span"]}))?;
     if snapshot != &expected
@@ -105,8 +186,9 @@ fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> 
                 .is_none_or(|prior| prior >= sequence)
         })
         || event_time(event)? < event_time(delivery)?
-        || event_time(event)? >= ceiling
-        || timestamp(&p["fire_at"])? >= ceiling
+        || event_time(event)? >= *ceiling
+        || timestamp(&p["fire_at"])? < event_time(event)?
+        || timestamp(&p["fire_at"])? >= *ceiling
         || !p["timer_kind"].is_null()
     {
         return Err(invalid(
@@ -811,13 +893,12 @@ impl CommittedCancellationScopeHistory {
         for (index, event) in history.iter().enumerate() {
             let kind = event.event_type.as_str();
             let p = &event.payload;
-            if kind == "TimerScheduled" {
-                cleanup_timer(event, &history[..index])?;
-            }
+            let timer_cleanup =
+                kind == "TimerScheduled" && cleanup_timer(event, &history[..index])?;
             if kind == "CancellationScopeOpened" {
                 opened.insert(text(p, "scope_id")?);
             }
-            if admission(kind).is_some() && positive(&p["sequence"]) {
+            if admission(kind).is_some() && positive(&p["sequence"]) && !timer_cleanup {
                 let sequence = p["sequence"].as_u64().unwrap();
                 admissions.entry(kind).or_default().insert(
                     sequence,

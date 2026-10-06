@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-cancellation-scope-descendants-default-refused",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.side-effect-version",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "CancellationScopeOpened",
+      "payload": {
+        "schema": "durable-workflow.cancellation-scope/v1",
+        "workflow_run_id": "regression-corpus-run",
+        "scope_id": "parent-scope",
+        "parent_scope_id": "root",
+        "sequence": 1,
+        "shield_parent": false
+      }
+    },
+    {
+      "event_type": "CancellationScopeOpened",
+      "payload": {
+        "schema": "durable-workflow.cancellation-scope/v1",
+        "workflow_run_id": "regression-corpus-run",
+        "scope_id": "child-scope",
+        "parent_scope_id": "parent-scope",
+        "sequence": 2,
+        "shield_parent": false
+      }
+    }
+  ],
+  "expected": {"command_sequence": []},
+  "expected_failure": "cancellation_scope_execution_not_supported: Rust worker"
+}

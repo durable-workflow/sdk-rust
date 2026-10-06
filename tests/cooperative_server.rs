@@ -3,8 +3,9 @@
 
 use durable_workflow::{
     json, ActivityContext, ActivityOptions, CancellationPolicy, Client, ConditionWaitOptions,
-    CooperativeCancellationOptions, Error, ParallelOperation, ParallelResult, SelectionKey, Value,
-    Worker, WorkflowCommandOptions, WorkflowHandle, WorkflowResultOptions,
+    CooperativeCancellationOptions, Error, ParallelOperation, ParallelResult,
+    ScopedCancellationContext, SelectionKey, Value, Worker, WorkflowCommandOptions,
+    WorkflowContext, WorkflowHandle, WorkflowResultOptions,
 };
 use std::{
     sync::{
@@ -881,7 +882,44 @@ fn request_native_scope_fixture(handle: &WorkflowHandle, scope: &str) -> Value {
     serde_json::from_slice(&result.stdout).unwrap()
 }
 
-fn scope_cleanup_worker(client: &Client, queue: &str, owner: &str, grouped: bool) -> Worker {
+async fn scope_cleanup_body(
+    scope: WorkflowContext,
+    grouped: bool,
+) -> durable_workflow::Result<(ScopedCancellationContext, Value)> {
+    let pending = if grouped {
+        scope
+            .parallel(vec![
+                ParallelOperation::timer(Duration::from_secs(300)),
+                ParallelOperation::group(vec![ParallelOperation::timer(Duration::from_secs(600))]),
+            ])
+            .await
+            .map(|_| ())
+    } else {
+        scope.sleep(Duration::from_secs(300)).await
+    };
+    let cancellation = match pending {
+        Err(Error::CancellationScopeRequested(request)) => request.context,
+        Err(error) => return Err(error),
+        Ok(()) => {
+            return Err(Error::InvalidCooperativeCancellation(
+                "original timer was not interrupted".into(),
+            ))
+        }
+    };
+    assert!(scope.is_cancellation_requested()?);
+    let _shield = scope.cancellation_shield()?;
+    let metadata = scope.side_effect(|| cancellation.to_value())?;
+    scope.sleep(Duration::from_secs(1)).await?;
+    Ok((cancellation, metadata))
+}
+
+fn scope_cleanup_worker(
+    client: &Client,
+    queue: &str,
+    owner: &str,
+    grouped: bool,
+    descendants: bool,
+) -> Worker {
     let mut worker = Worker::new(client.clone(), queue)
         .worker_id(owner)
         .cooperative_cancellation(true)
@@ -892,41 +930,39 @@ fn scope_cleanup_worker(client: &Client, queue: &str, owner: &str, grouped: bool
         "tests.rust-candidate-scope-cleanup",
         move |ctx, _| async move {
             let _: String = ctx.side_effect(|| "original prefix".to_owned())?;
-            let (cancellation, metadata) = ctx
+            let (cancellation, metadata, descendant_metadata) = ctx
                 .cancellation_scope(false, move |scope| async move {
-                    let pending = if grouped {
-                        scope
-                            .parallel(vec![
-                                ParallelOperation::timer(Duration::from_secs(300)),
-                                ParallelOperation::group(vec![ParallelOperation::timer(
-                                    Duration::from_secs(600),
-                                )]),
-                            ])
-                            .await
-                            .map(|_| ())
-                    } else {
-                        scope.sleep(Duration::from_secs(300)).await
-                    };
-                    let cancellation = match pending {
+                    if !descendants {
+                        let (cancellation, metadata) = scope_cleanup_body(scope, grouped).await?;
+                        return Ok((cancellation, metadata, None));
+                    }
+                    let (_, child_metadata) = scope
+                        .cancellation_scope(false, move |child| scope_cleanup_body(child, grouped))
+                        .await?;
+                    let cancellation = match scope.throw_if_cancellation_requested() {
                         Err(Error::CancellationScopeRequested(request)) => request.context,
                         Err(error) => return Err(error),
                         Ok(()) => {
                             return Err(Error::InvalidCooperativeCancellation(
-                                "original timer was not interrupted".into(),
+                                "parent lost its original accepted request".into(),
                             ))
                         }
                     };
-                    assert!(scope.is_cancellation_requested()?);
+                    let metadata = cancellation.to_value();
+                    assert_eq!(metadata["root_context"], child_metadata["root_context"]);
+                    assert_eq!(scope.scoped_cancellation_context()?.unwrap(), cancellation);
                     let _shield = scope.cancellation_shield()?;
-                    let metadata = scope.side_effect(|| cancellation.to_value())?;
                     scope.sleep(Duration::from_secs(1)).await?;
-                    Ok((cancellation, metadata))
+                    Ok((cancellation, metadata, Some(child_metadata)))
                 })
                 .await?;
             assert!(!ctx.is_cancellation_requested()?);
             assert!(ctx.scoped_cancellation_context()?.is_none());
             ctx.sleep(Duration::from_secs(1)).await?;
-            Ok(json!({"context":metadata, "remaining":cancellation.remaining()?.as_secs_f64()}))
+            Ok(
+                json!({"context":metadata, "remaining":cancellation.remaining()?.as_secs_f64(),
+                "descendant_context":descendant_metadata}),
+            )
         },
     );
     worker
@@ -935,22 +971,40 @@ fn scope_cleanup_worker(client: &Client, queue: &str, owner: &str, grouped: bool
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
 async fn server_scope_cleanup_preserves_original_delivery_and_budget_after_replacement() {
-    qualify_scope_cleanup_replacement(false).await;
+    qualify_scope_cleanup_replacement(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
 async fn server_scope_group_cleanup_preserves_original_delivery_and_budget_after_replacement() {
-    qualify_scope_cleanup_replacement(true).await;
+    qualify_scope_cleanup_replacement(true, false).await;
 }
 
-async fn qualify_scope_cleanup_replacement(grouped: bool) {
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_descendant_cleanup_preserves_original_delivery_after_replacement() {
+    qualify_scope_cleanup_replacement(false, true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_descendant_group_cleanup_preserves_original_delivery_after_replacement() {
+    qualify_scope_cleanup_replacement(true, true).await;
+}
+
+async fn qualify_scope_cleanup_replacement(grouped: bool, descendants: bool) {
     let client = client();
     let queue = format!(
         "rust-cooperative-scope-boundary-{}",
         durable_workflow::Uuid::new_v4().simple()
     );
-    let original = scope_cleanup_worker(&client, &queue, &format!("{queue}-original"), grouped);
+    let original = scope_cleanup_worker(
+        &client,
+        &queue,
+        &format!("{queue}-original"),
+        grouped,
+        descendants,
+    );
     original.register().await.unwrap();
     let handle = client
         .start_workflow(
@@ -979,18 +1033,28 @@ async fn qualify_scope_cleanup_replacement(grouped: bool) {
         if grouped { 3 } else { 2 }
     );
     assert_eq!(count(&cleaning, "CancellationScopeDelivered"), 1);
-    let replacement =
-        scope_cleanup_worker(&client, &queue, &format!("{queue}-replacement"), grouped);
+    let replacement = scope_cleanup_worker(
+        &client,
+        &queue,
+        &format!("{queue}-replacement"),
+        grouped,
+        descendants,
+    );
     replacement.register().await.unwrap();
     let final_history = tick_until(&replacement, &handle, "WorkflowCompleted").await;
     for kind in [
-        "CancellationScopeOpened",
-        "CancellationScopeRequested",
         "CancellationScopeDeliveryPrepared",
         "CancellationScopeDelivered",
         "WorkflowCompleted",
     ] {
         assert_eq!(count(&final_history, kind), 1, "{kind}");
+    }
+    for kind in ["CancellationScopeOpened", "CancellationScopeRequested"] {
+        assert_eq!(
+            count(&final_history, kind),
+            if descendants { 2 } else { 1 },
+            "{kind}"
+        );
     }
     assert_eq!(count(&final_history, "SideEffectRecorded"), 2);
     assert_eq!(
@@ -999,9 +1063,12 @@ async fn qualify_scope_cleanup_replacement(grouped: bool) {
     );
     assert_eq!(
         count(&final_history, "TimerScheduled"),
-        if grouped { 4 } else { 3 }
+        (if grouped { 4 } else { 3 }) + usize::from(descendants)
     );
-    assert_eq!(count(&final_history, "TimerFired"), 2);
+    assert_eq!(
+        count(&final_history, "TimerFired"),
+        2 + usize::from(descendants)
+    );
     for kind in [
         "CooperativeCancellationRequested",
         "WorkflowCancelled",
@@ -1017,6 +1084,23 @@ async fn qualify_scope_cleanup_replacement(grouped: bool) {
         .await
         .unwrap();
     assert_eq!(result["context"], accepted["payload"]["cancellation"]);
+    if descendants {
+        let child = final_history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["event_type"] == "CancellationScopeRequested"
+                    && row["payload"]["scope_id"] != scope
+            })
+            .unwrap()["payload"]["cancellation"]
+            .clone();
+        assert_eq!(result["descendant_context"], child);
+        assert_eq!(child["root_context"], result["context"]["root_context"]);
+        let mut lineage = child["lineage"].as_array().unwrap().clone();
+        lineage.pop();
+        assert_eq!(json!(lineage), result["context"]["lineage"]);
+    }
     assert!(result["remaining"]
         .as_f64()
         .is_some_and(|remaining| remaining > 0.0 && remaining < 30.0));
