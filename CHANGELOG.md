@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0-rc.1
+## 3.0.0
 
 - Add cooperative whole-run cancellation with immutable request metadata,
   lineage, deterministic cleanup time helpers and the original bounded deadline.
