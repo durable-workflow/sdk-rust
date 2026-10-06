@@ -130,6 +130,17 @@ the current handle. Heartbeats renew the holder lease without extending the
 absolute TTL. Graceful worker shutdown drains activities and closes held sessions
 before deregistering.
 
+`lease_seconds(...)` bounds holder authority and `ttl_seconds(...)` bounds the
+session's total lifetime. Reacquisition retains the original TTL deadline. Renew
+the handle explicitly while keeping an idle resource alive. Activity heartbeats
+also renew the lease. An async callback is dropped when its locally observed lease
+or TTL ends, even without application heartbeats. Callbacks must yield to Tokio.
+
+Set `max_concurrent_worker_sessions(...)` to bound the worker's session registry
+and `max_concurrent_activities(...)` on the options to bound each session's activity
+concurrency. Uncreated or failed handles release their local slot when dropped.
+An admitted session keeps its slot while its holder lease is active.
+
 Session memory is process-local. A replacement holder must rebuild its resources,
 and an interrupted activity can execute again. Use idempotency and attempt fencing
 for external side effects. Committed results replay from history without rebuilding

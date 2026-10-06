@@ -345,7 +345,6 @@ impl crate::Worker {
                 .map(|state| {
                     state.close_receipt.is_none()
                         && (Arc::strong_count(&session.state) > 1
-                            || state.expires.is_none()
                             || state
                                 .expires
                                 .is_some_and(|expires| Instant::now() < expires))

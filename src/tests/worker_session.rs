@@ -220,6 +220,48 @@ async fn worker_session_registry_bounds_handles_and_refuses_identity_changes() {
 }
 
 #[tokio::test]
+async fn worker_session_failed_or_uncreated_dropped_handles_release_capacity() {
+    for case in ["capacity", "wrong-holder"] {
+        let (_server, worker) = setup(case);
+        let worker = worker.max_concurrent_worker_sessions(1);
+        worker.register().await.unwrap();
+        let first = worker.worker_session(options()).unwrap();
+        if case == "wrong-holder" {
+            assert!(first.create().await.is_err());
+        }
+        assert!(worker
+            .worker_session(WorkerSessionOptions::new("replacement"))
+            .is_err());
+        drop(first);
+        assert!(worker
+            .worker_session(WorkerSessionOptions::new("replacement"))
+            .is_ok());
+    }
+}
+
+#[tokio::test]
+async fn worker_session_admitted_dropped_handle_keeps_capacity_until_authority_ends() {
+    let (_server, worker) = setup("lifecycle");
+    let worker = worker.max_concurrent_worker_sessions(1);
+    worker.register().await.unwrap();
+    let first = worker.worker_session(options()).unwrap();
+    first.create().await.unwrap();
+    drop(first);
+    assert!(worker
+        .worker_session(WorkerSessionOptions::new("replacement"))
+        .is_err());
+    worker
+        .worker_session(options())
+        .unwrap()
+        .close("done")
+        .await
+        .unwrap();
+    assert!(worker
+        .worker_session(WorkerSessionOptions::new("replacement"))
+        .is_ok());
+}
+
+#[tokio::test]
 async fn worker_session_task_affinity_reaches_activity_without_extra_create() {
     let (server, mut worker) = setup("task");
     let calls = Arc::new(AtomicUsize::new(0));
