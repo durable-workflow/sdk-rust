@@ -265,6 +265,9 @@ jobs:
             arguments+=(--skip server_scope_cleanup_preserves_original_delivery_and_budget_after_replacement)
             arguments+=(--skip server_scope_group_cleanup_preserves_original_delivery_and_budget_after_replacement)
             arguments+=(--skip server_sigkill_scoped_cleanup_replays_before_root_with_original_30_second_deadline)
+            arguments+=(--skip server_scope_try_stops_actual_remote_callback_without_application_heartbeats)
+            arguments+=(--skip server_scope_wait_stops_actual_remote_callback_before_cleanup)
+            arguments+=(--skip server_scope_group_wait_stops_actual_remote_callback_before_cleanup)
           fi
           cargo test --test cooperative_server -- "${arguments[@]}" 2>&1 | tee cooperative-results.log
       - name: Retain bounded scenario evidence

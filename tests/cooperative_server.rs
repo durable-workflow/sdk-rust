@@ -21,6 +21,7 @@ const BLOCKED: &str = "tests.rust-cooperative-blocked";
 const REPLAY: &str = "tests.rust-cooperative-replay";
 const PROCESS: &str = "tests.rust-cooperative-process-reclaim";
 const RUN_SCOPE: &str = "tests.rust-run-scope-cleanup";
+const REMOTE_SCOPE: &str = "tests.rust-scope-remote";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ActivityGrant {
@@ -1163,6 +1164,259 @@ fn run_scope_worker(client: &Client, queue: &str, owner: &str) -> Worker {
         }
     });
     worker
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_try_stops_actual_remote_callback_without_application_heartbeats() {
+    qualify_scoped_remote_stop(false, CancellationPolicy::TryCancel).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_wait_stops_actual_remote_callback_before_cleanup() {
+    qualify_scoped_remote_stop(false, CancellationPolicy::WaitCancellationCompleted).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated cooperative Server with the Native scope candidate"]
+async fn server_scope_group_wait_stops_actual_remote_callback_before_cleanup() {
+    qualify_scoped_remote_stop(true, CancellationPolicy::WaitCancellationCompleted).await;
+}
+
+async fn qualify_scoped_remote_stop(grouped: bool, policy: CancellationPolicy) {
+    let client = client();
+    let queue = format!(
+        "rust-cooperative-scope-boundary-{}",
+        durable_workflow::Uuid::new_v4().simple()
+    );
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let cleanup_dropped = Arc::clone(&dropped);
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<ActivityContext>();
+    let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut worker = Worker::new(client.clone(), &queue)
+        .worker_id(format!("{queue}-managed"))
+        .cooperative_cancellation(true)
+        .candidate_cancellation_scope_authoring(true)
+        .candidate_cancellation_scope_delivery(true)
+        .max_concurrent_workflow_tasks(1)
+        .max_concurrent_activity_tasks(1)
+        .poll_timeout(Duration::from_secs(1))
+        .on_worker_heartbeat(move |observation| {
+            if observation.acknowledgement["acknowledged"] == true {
+                let _ = heartbeat_tx.send(());
+            }
+        });
+    worker.register_workflow(REMOTE_SCOPE, move |root, _| {
+        let dropped = Arc::clone(&cleanup_dropped);
+        async move {
+            let result = root
+                .cancellation_scope(false, move |scope| async move {
+                    let options = ActivityOptions::new().cancellation_policy(policy);
+                    let pending = if grouped {
+                        scope
+                            .parallel(vec![
+                                ParallelOperation::activity_with_options(
+                                    BLOCKED,
+                                    options,
+                                    json!([]),
+                                ),
+                                ParallelOperation::group(vec![ParallelOperation::timer(
+                                    Duration::from_secs(300),
+                                )]),
+                            ])
+                            .await
+                            .map(|_| ())
+                    } else {
+                        scope
+                            .activity_with_options(BLOCKED, options, json!([]))
+                            .await
+                            .map(|_| ())
+                    };
+                    let cancelled = match pending {
+                        Err(Error::CancellationScopeRequested(cancelled)) => cancelled,
+                        Err(error) => return Err(error),
+                        Ok(()) => panic!("blocked remote callback completed without cancellation"),
+                    };
+                    if policy == CancellationPolicy::WaitCancellationCompleted {
+                        assert_eq!(
+                            dropped.load(Ordering::SeqCst),
+                            1,
+                            "Wait cleanup preceded callback drop"
+                        );
+                    }
+                    let _shield = scope.cancellation_shield()?;
+                    scope.sleep(Duration::from_secs(1)).await?;
+                    Ok(cancelled.context.to_value())
+                })
+                .await?;
+            assert!(!root.is_cancellation_requested()?);
+            root.sleep(Duration::from_secs(1)).await?;
+            Ok(result)
+        }
+    });
+    let callback_dropped = Arc::clone(&dropped);
+    worker.register_activity(BLOCKED, move |ctx, _| {
+        let entered_tx = entered_tx.clone();
+        let dropped = Arc::clone(&callback_dropped);
+        async move {
+            let _drop = CallbackDrop(dropped);
+            entered_tx.send(ctx).unwrap();
+            std::future::pending::<durable_workflow::Result<Value>>().await
+        }
+    });
+    let run = tokio::spawn(async move {
+        worker
+            .run_until(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let _abort_on_failure = AbortWorkerOnDrop(run.abort_handle());
+    tokio::time::timeout(Duration::from_secs(10), heartbeat_rx.recv())
+        .await
+        .unwrap()
+        .expect("actual accepted worker heartbeat");
+    let handle = client
+        .start_workflow(REMOTE_SCOPE, &queue, &queue, json!([]))
+        .await
+        .unwrap();
+    let original = tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .unwrap()
+        .expect("actual scoped activity callback entered");
+    let initial = history(&handle).await;
+    let scope = initial["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["event_type"] == "CancellationScopeOpened")
+        .unwrap()["payload"]["scope_id"]
+        .as_str()
+        .unwrap();
+    let accepted = request_native_scope_fixture(&handle, scope);
+    assert_eq!(accepted, request_native_scope_fixture(&handle, scope));
+    let context =
+        ScopedCancellationContext::from_value(&accepted["payload"]["cancellation"]).unwrap();
+    let result = handle
+        .result_selected_run(WorkflowResultOptions {
+            timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, context.to_value());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = client
+                .activity_task_status(
+                    &original.task_id,
+                    &original.activity_attempt_id,
+                    &original.lease_owner,
+                )
+                .await
+                .unwrap();
+            if status["cancellation_acknowledgement"]["callback_state"] == "stopped" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("actual callback drop must leave its original stop receipt");
+    let receipt = &status["cancellation_acknowledgement"];
+    assert_eq!(receipt["callback_state"], "stopped");
+    assert_eq!(receipt["request_id"], context.request_id());
+    assert_eq!(
+        receipt["root_request_id"],
+        context.root_context().request_id()
+    );
+    assert_eq!(
+        receipt["cleanup_deadline_at"],
+        accepted["payload"]["cancellation"]["root_context"]["cleanup_deadline_at"]
+    );
+    assert_eq!(receipt["received_after_deadline"], false);
+    assert_eq!(status["can_continue"], false);
+    let duplicate = client
+        .acknowledge_activity_cancellation(
+            &original.task_id,
+            &original.activity_attempt_id,
+            &original.lease_owner,
+            context.request_id(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate["duplicate"], true);
+    assert_eq!(duplicate["history_event_id"], receipt["history_event_id"]);
+    let snapshot = history(&handle).await;
+    for kind in [
+        "CancellationScopeRequested",
+        "CancellationScopeDeliveryPrepared",
+        "CancellationScopeDelivered",
+        "ActivityCancelled",
+        "ActivityCancellationAcknowledged",
+        "WorkflowCompleted",
+    ] {
+        assert_eq!(count(&snapshot, kind), 1, "{kind}");
+    }
+    for kind in [
+        "CooperativeCancellationRequested",
+        "CooperativeCancellationDelivered",
+        "WorkflowCancelled",
+        "WorkflowFailed",
+        "ActivityHeartbeatRecorded",
+        "ActivityCompleted",
+    ] {
+        assert_eq!(count(&snapshot, kind), 0, "{kind}");
+    }
+    let events = snapshot["events"].as_array().unwrap();
+    assert_eq!(count(&snapshot, "TimerCancelled"), usize::from(grouped));
+    assert_eq!(count(&snapshot, "TimerScheduled"), 2 + usize::from(grouped));
+    assert_eq!(count(&snapshot, "TimerFired"), 2);
+    let terminal = events
+        .iter()
+        .find(|row| row["event_type"] == "WorkflowCompleted")
+        .unwrap();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(terminal["timestamp"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            < context.deadline()
+    );
+    if policy == CancellationPolicy::WaitCancellationCompleted {
+        let stopped = events
+            .iter()
+            .position(|row| row["event_type"] == "ActivityCancellationAcknowledged")
+            .unwrap();
+        let delivered = events
+            .iter()
+            .position(|row| row["event_type"] == "CancellationScopeDelivered")
+            .unwrap();
+        assert!(stopped < delivered);
+    }
+    assert!(matches!(
+        original.heartbeat(json!({"late":true})).await,
+        Err(Error::ActivityExecutionAbandoned(_))
+    ));
+    assert!(matches!(client.complete_activity_task(&original.task_id,
+        &original.activity_attempt_id, &original.lease_owner, json!("late"), "avro").await,
+        Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409));
+    assert!(matches!(client.fail_activity_task(&original.task_id,
+        &original.activity_attempt_id, &original.lease_owner, "late failure", true).await,
+        Err(Error::ActivityTaskRejected(rejection)) if rejection.status == 409));
+    assert_eq!(snapshot, history(&handle).await);
+    println!(
+        "Actual scoped callback stop and unchanged parent: {}",
+        json!({"status":status,"history":snapshot})
+    );
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[cfg(unix)]
