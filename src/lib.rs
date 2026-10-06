@@ -135,7 +135,10 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "query_task_timed_out",
 ];
 
-/// Truthful service-worker manifest for features this SDK currently refuses.
+/// Manifest for the default service-worker profile.
+///
+/// Inline local execution is enabled separately by [`Worker::local_activities`].
+/// Default workers refuse it, while sessions and sticky execution remain unavailable.
 pub fn portable_worker_affinity_capability_manifest() -> Value {
     json!({
         "local_activities": {
@@ -2912,8 +2915,8 @@ impl Client {
     /// Close the current run as cancelled immediately.
     ///
     /// Server revokes open tasks and timers without resuming workflow code for
-    /// cleanup. Embedded Laravel's cooperative `requestCancellation()` is a
-    /// separate capability, not yet available in service mode.
+    /// cleanup. Use [`Client::request_cancellation`] for a separate cooperative
+    /// request on a supporting runtime and opted-in worker.
     pub async fn cancel_workflow(
         &self,
         workflow_id: &str,

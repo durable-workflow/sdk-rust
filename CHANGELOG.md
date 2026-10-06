@@ -1,11 +1,11 @@
 # Changelog
 
-## 3.1.0-rc.1
+## 3.1.0
 
 - Add explicit inline local activity execution with typed and lossless Avro
   results, workflow-task lease renewal, bounded retry and heartbeat reports,
   timeouts, external payloads and cold replay. Enable it explicitly on an
-  ordinary Worker. Stable publication follows installed-package qualification.
+  ordinary Worker. Qualified against published Server 2.5.0 / Native 2.4.0.
 - Stop a pending local callback on worker shutdown and reclaim unfinished work
   on a replacement. Keep fresh and replayed failure categories and attempts aligned.
 - Reject local activity history replayed as remote, including top-level and
