@@ -109,7 +109,7 @@ payload fetches never follow redirects.
 
 ## Compatibility
 
-The cancellation release candidate adds cooperative requests and bounded,
+The SDK supports cooperative requests and bounded,
 replayable cleanup. Enable `Worker::cooperative_cancellation(true)` against a
 Server that advertises protocol 1.20 and the required capabilities. This profile
 supervises async Activity futures independently of application heartbeats.
