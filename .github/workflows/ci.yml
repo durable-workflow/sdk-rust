@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       local_sdk_version:
-        description: Optional exact crates.io SDK version for local or session qualification
+        description: Optional exact crates.io SDK version for published Server qualification
         type: string
         default: ""
       session_qualification:
@@ -216,6 +216,7 @@ jobs:
       COMPOSE_PROJECT_NAME: rust-cooperative-${{ github.run_id }}-${{ github.run_attempt }}
       SERVER_CANDIDATE_SHA: ${{ inputs.server_commit }}
       NATIVE_CANDIDATE_SHA: ${{ inputs.native_commit }}
+      LOCAL_SDK_VERSION: ${{ inputs.local_sdk_version }}
       DURABLE_WORKFLOW_SERVER_SOURCE: ${{ github.workspace }}/.cooperative-server-source
       DURABLE_WORKFLOW_NATIVE_SOURCE: ${{ github.workspace }}/.cooperative-native-source
       DURABLE_WORKFLOW_AUTH_TOKEN: test-token
@@ -225,7 +226,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Require an exact Server candidate
-        run: '[[ "$SERVER_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+        run: |
+          [[ "$SERVER_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test -z "$LOCAL_SDK_VERSION"
       - name: Check out the public Server candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
@@ -257,7 +260,10 @@ jobs:
         with:
           toolchain: 1.86.0
       - name: Start isolated Server stack
-        run: docker compose up -d --build --wait --wait-timeout 300
+        run: |
+          docker compose up -d --build --wait --wait-timeout 300 server worker
+          docker compose up -d repair
+          test "$(docker inspect --format '{{.State.Running}}' "$(docker compose ps -q repair)")" = true
       - name: Retain runtime identity and select endpoint
         run: |
           docker compose exec -T server cat /app/.package-provenance > cooperative-package-provenance.txt
@@ -427,6 +433,8 @@ jobs:
           COOPERATIVE_RESULT: ${{ needs.cooperative-server.result }}
           LOCAL_REQUESTED: ${{ inputs.local_qualification }}
           LOCAL_RESULT: ${{ needs.local-server.result }}
+          SESSION_REQUESTED: ${{ inputs.session_qualification }}
+          SESSION_SERVER_SOURCE: ${{ inputs.server_commit }}
         run: |
           test "$CORPUS_RESULT" = success
           test "$DOCS_RESULT" = success
@@ -438,4 +446,11 @@ jobs:
           fi
           if [ "$LOCAL_REQUESTED" = true ]; then
             test "$LOCAL_RESULT" = success
+          fi
+          if [ "$SESSION_REQUESTED" = true ]; then
+            if [ -n "$SESSION_SERVER_SOURCE" ]; then
+              test "$COOPERATIVE_RESULT" = success
+            else
+              test "$LOCAL_RESULT" = success
+            fi
           fi
