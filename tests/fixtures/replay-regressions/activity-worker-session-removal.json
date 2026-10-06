@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-activity-worker-session-removal",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.activity-policy-author", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "ActivityScheduled", "payload": {
+      "sequence": 1, "activity_type": "work",
+      "activity": {"worker_session": {"session_id": "render-1", "queue": "rust-workers"}}
+    }}
+  ],
+  "command_sequence": [{"type": "complete_workflow", "result": "unreachable"}],
+  "expected": {"type": "complete_workflow", "result": "unreachable"},
+  "expected_failure": "activity_worker_session_mismatch"
+}

@@ -1755,6 +1755,9 @@ impl Client {
 
 impl Worker {
     pub(super) async fn poll_cooperative_activity_once(&self) -> Result<ManagedPollOutcome> {
+        if self.client.worker_sessions_enabled {
+            self.require_session_registration()?;
+        }
         let poll_request_id = unique_request_id("rust-activity-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -1776,6 +1779,8 @@ impl Worker {
         let Some(task) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
+        let session = self.track_session_task(task.worker_session.as_ref())?;
+        let task = task.task;
         let guard = ActivityClaimGuard::new(&self.client, &task, &self.worker_id)?;
         let _abandon_on_drop = AbandonActivityOnDrop(guard.clone());
         if guard.observe().await.is_err() {
@@ -1783,8 +1788,12 @@ impl Worker {
         }
         let mut callback_started = false;
         let result = {
-            let invocation =
-                self.execute_cooperative_activity_task(&task, &guard, &mut callback_started);
+            let invocation = self.execute_cooperative_activity_task(
+                &task,
+                &guard,
+                &mut callback_started,
+                session,
+            );
             tokio::pin!(invocation);
             loop {
                 tokio::select! {
@@ -1857,6 +1866,7 @@ impl Worker {
         task: &ActivityTask,
         guard: &ActivityClaimGuard,
         callback_started: &mut bool,
+        worker_session: Option<crate::WorkerSession>,
     ) -> Result<AvroValue> {
         validate_activity_task_payloads(task)?;
         let handler = self
@@ -1875,6 +1885,7 @@ impl Worker {
             worker_id: self.worker_id.clone(),
             claim_guard: Some(guard.clone()),
             local_heartbeats: None,
+            worker_session,
         };
         guard.boundary()?;
         *callback_started = true;
@@ -2314,6 +2325,9 @@ impl ActivityClaimGuard {
                 || value["heartbeat_recorded"].as_bool() != Some(true)
             {
                 return Err(invalid("activity heartbeat lost its original claim"));
+            }
+            if let Some(session) = context.worker_session() {
+                session.track(&value["worker_session"])?;
             }
             serde_json::from_value(value).map_err(Error::from)
         }).await.map_err(|_| Error::Timeout).and_then(|result| result);
