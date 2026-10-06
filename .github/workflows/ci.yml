@@ -333,13 +333,14 @@ jobs:
         run: |
           [[ "$LOCAL_SDK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           mkdir -p .local-consumer/tests .local-consumer/src
-          printf '[package]\nname = "local-activity-consumer"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\ndurable-workflow = "=%s"\nreqwest = { version = "0.12", features = ["json"] }\nserde_json = "1"\ntokio = { version = "1", features = ["full"] }\n' "$LOCAL_SDK_VERSION" > .local-consumer/Cargo.toml
+          printf '[package]\nname = "local-activity-consumer"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\ndurable-workflow = "=%s"\nreqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }\nserde_json = "1"\ntokio = { version = "1", features = ["full"] }\n' "$LOCAL_SDK_VERSION" > .local-consumer/Cargo.toml
           printf 'fn main() {}\n' > .local-consumer/src/main.rs
           cp tests/local_activity_server.rs .local-consumer/tests/
           cargo metadata --manifest-path .local-consumer/Cargo.toml --format-version 1 > local-consumer-metadata.json
           jq --arg version "$LOCAL_SDK_VERSION" -e '[.packages[] | select(.name == "durable-workflow" and .version == $version and (.source | startswith("registry+https://github.com/rust-lang/crates.io-index")))] | length == 1' local-consumer-metadata.json
       - name: Run actual Worker local activity scenarios
         run: |
+          set -euo pipefail
           arguments=()
           if [ -n "$LOCAL_SDK_VERSION" ]; then arguments+=(--manifest-path .local-consumer/Cargo.toml); fi
           cargo test "${arguments[@]}" --test local_activity_server -- --ignored --nocapture --test-threads=1 2>&1 | tee local-results.log
