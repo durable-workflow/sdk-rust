@@ -1186,16 +1186,15 @@ impl CommittedCancellationScopeHistory {
             .map(|opening| (opening.scope_id.as_str(), opening))
             .collect();
         let mut id = scope;
-        let active = self.pending_requests.get(scope);
-        let mut request = active;
+        let mut request = self.pending_requests.get(scope);
         while let Some(opening) = addresses.get(id).filter(|opening| !opening.shield_parent) {
             id = &opening.parent_scope_id;
             let Some(ancestor) = self.pending_requests.get(id) else {
                 continue;
             };
-            if active.is_none_or(|active| {
-                ancestor.context.root_context() != active.context.root_context()
-                    || !active
+            if request.is_some_and(|selected| {
+                ancestor.context.root_context() != selected.context.root_context()
+                    || !selected
                         .context
                         .lineage()
                         .starts_with(ancestor.context.lineage())

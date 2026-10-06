@@ -281,11 +281,19 @@ fn descendant_original_contexts_restore_and_leave_outer_and_root_unaffected() {
 #[test]
 fn descendant_pending_ancestor_preserves_original_identity_and_range_without_cleanup() {
     for layout in ["timer", "group"] {
-        for before in [
-            "CancellationScopeDeliveryPrepared",
-            "CancellationScopeDelivered",
+        for (before, inherited) in [
+            ("CancellationScopeDeliveryPrepared", false),
+            ("CancellationScopeDeliveryPrepared", true),
+            ("CancellationScopeDelivered", true),
         ] {
-            let source = prefix(&descendant_fixture(layout), before);
+            let mut source = prefix(&descendant_fixture(layout), before);
+            if !inherited {
+                let parent = source["scopes"]["parent"].clone();
+                source["history"].as_array_mut().unwrap().retain(|row| {
+                    row["event_type"] != "CancellationScopeRequested"
+                        || row["payload"]["scope_id"] == parent
+                });
+            }
             let seen = Arc::new(Mutex::new(BTreeMap::new()));
             let decision = descendant_worker(source.clone(), Arc::clone(&seen), "", "")
                 .execute_workflow_task_decision(task(&source))
@@ -299,8 +307,48 @@ fn descendant_pending_ancestor_preserves_original_identity_and_range_without_cle
                 intent.boundary.sequence_span,
                 if layout == "timer" { 1 } else { 4 }
             );
+            let mut replacement = task(&source);
+            replacement.lease_owner = Some("replacement".into());
+            replacement.workflow_task_attempt = 17;
+            let repeated = descendant_worker(source, Arc::clone(&seen), "", "")
+                .execute_workflow_task_decision(replacement)
+                .unwrap()
+                .cancellation_scope_delivery
+                .unwrap();
+            assert_eq!(repeated.context, intent.context);
+            assert_eq!(repeated.boundary, intent.boundary);
+            assert!(seen.lock().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn descendant_pending_ancestor_cannot_bypass_competing_intermediate_request() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/committed-scope-operation-projections.json"
+    ))
+    .unwrap();
+    let mut source = prefix(&fixtures["competing"], "CancellationScopeDeliveryPrepared");
+    source["history"].as_array_mut().unwrap().retain(|row| {
+        row["event_type"] != "CancellationScopeRequested"
+            || row["payload"]["scope_id"] != "desc-grandchild"
+    });
+    let claim = task(&source);
+    let scopes = cancellation_scope::CancellationScopeHistory::read(
+        &claim.history_events,
+        claim.run_id.as_deref().unwrap(),
+    )
+    .unwrap();
+    let committed = crate::cancellation_scope_history::CommittedCancellationScopeHistory::read(
+        &claim.history_events,
+        claim.run_id.as_deref().unwrap(),
+        claim.workflow_id.as_deref().unwrap(),
+    )
+    .unwrap();
+    let error = committed
+        .pending_request_for_scope("desc-grandchild", &scopes)
+        .unwrap_err();
+    assert!(error.to_string().contains("original ancestor lineage"));
 }
 
 #[test]
