@@ -148,7 +148,8 @@ resources or rerunning callbacks. Changing recorded session options fails replay
 Local activities cannot use session routing. Sticky execution remains unsupported.
 
 The runnable session example uses a real process-local cache and prints its resource
-generation. It requires a Server with the session history and absolute TTL fixes.
+generation. Use Server 2.5.1 / Native 2.4.1 for session history and original TTL
+preservation. Session support starts with SDK 3.2.0.
 
 ### Runnable examples
 

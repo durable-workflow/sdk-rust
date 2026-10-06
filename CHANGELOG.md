@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.2.0-rc.1
+
+- Add typed worker-session options and shared create, renew and close handles.
+  Enable sessions explicitly with `Worker::worker_sessions(true)` and route
+  remote activities through a session. Declare resource requirements and bound
+  worker/session activity capacity.
+- Supervise async callbacks against their holder lease and original absolute
+  TTL without requiring application heartbeats. Rebuild process-local resources
+  after holder loss and reject changed session routing during cold replay.
+- Close held sessions before worker deregistration. Dropped failed or uncreated
+  handles release their local registry slot. Committed results replay without
+  rebuilding resources or rerunning activities. Sticky execution stays unsupported.
+- Use Server 2.5.1 / Native 2.4.1 for original TTL preservation and session history.
+
 ## 3.1.0
 
 - Add explicit inline local activity execution with typed and lossless Avro
