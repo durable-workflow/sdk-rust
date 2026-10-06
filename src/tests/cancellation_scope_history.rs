@@ -88,6 +88,24 @@ fn scope_response(path: &str, body: &str, number: usize) -> Option<(&'static str
         } else {
             "prepare-start"
         });
+        if case.starts_with("pending-")
+            && path.ends_with("/deliver")
+            && (number == 1 || case == "pending-budget")
+        {
+            result["delivered"] = json!(false);
+            result["reason"] = json!("cancellation_scope_activity_stop_not_acknowledged");
+            result.as_object_mut().unwrap().remove("history_event_id");
+            result["history_refresh_page_token"] = json!("prepare-start");
+            match case {
+                "pending-owner" => result["lease_owner"] = json!("replacement"),
+                "pending-preparation" => result["preparation_history_event_id"] = json!("borrowed"),
+                "pending-deadline" => {
+                    result["authority_deadline_at"] = json!("2026-10-04T00:00:31.123456Z")
+                }
+                "pending-delivery" => result["history_event_id"] = delivered["id"].clone(),
+                _ => {}
+            }
+        }
         match case {
             "ack-owner" => result["lease_owner"] = json!("replacement"),
             "ack-attempt" => result["workflow_task_attempt"] = json!(true),
@@ -175,6 +193,128 @@ fn scope_client(server: &MockWorkerServer, case: &str) -> Client {
         .worker_token(Some("worker-only".into()))
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn scope_history_waits_for_callback_stop_without_changing_claim_or_preparation() {
+    let server = scope_server();
+    let client = scope_client(&server, "pending-stop");
+    let value = scalar_fixture();
+    let task = claim(&value);
+    let (context, boundary) = boundary(&value);
+    let budget = CancellationScopeDeliveryBudget::new();
+    let prepared = client
+        .prepare_cancellation_scope_on_claim(&task, &context, &boundary, &budget)
+        .await
+        .unwrap();
+    let delivered = client
+        .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
+        .await
+        .unwrap();
+    assert_eq!(
+        delivered.preparation_history_event_id(),
+        prepared.preparation_history_event_id()
+    );
+    assert_eq!(delivered.context(), prepared.context());
+    assert_eq!(delivered.boundary(), prepared.boundary());
+    assert!(delivered.delivery_history_event_id().is_some());
+    let requests = server.requests.lock().unwrap();
+    let mutations: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path.ends_with("/deliver"))
+        .collect();
+    assert_eq!(mutations.len(), 2);
+    assert_eq!(mutations[0].body, mutations[1].body);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.path.ends_with("/history"))
+            .count(),
+        6
+    );
+}
+
+#[tokio::test]
+async fn scope_history_pending_stop_cannot_change_authority_or_invent_delivery() {
+    for case in [
+        "pending-owner",
+        "pending-preparation",
+        "pending-deadline",
+        "pending-delivery",
+    ] {
+        let server = scope_server();
+        let client = scope_client(&server, case);
+        let value = scalar_fixture();
+        let task = claim(&value);
+        let (context, boundary) = boundary(&value);
+        let budget = CancellationScopeDeliveryBudget::new();
+        let prepared = client
+            .prepare_cancellation_scope_on_claim(&task, &context, &boundary, &budget)
+            .await
+            .unwrap();
+        assert!(
+            client
+                .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
+                .await
+                .is_err(),
+            "{case}"
+        );
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.ends_with("/deliver"))
+                .count(),
+            1,
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scope_history_pending_stop_keeps_original_budget() {
+    let server = scope_server();
+    let client = scope_client(&server, "pending-budget");
+    let value = scalar_fixture();
+    let task = claim(&value);
+    let (context, boundary) = boundary(&value);
+    let mut budget = CancellationScopeDeliveryBudget::new();
+    let prepared = client
+        .prepare_cancellation_scope_on_claim(&task, &context, &boundary, &budget)
+        .await
+        .unwrap();
+    budget
+        .restrict(
+            DateTime::<chrono::Utc>::from_timestamp_millis(
+                i64::try_from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                )
+                .unwrap()
+                    + 250,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        client
+            .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
+            .await,
+        Err(Error::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let requests = server.requests.lock().unwrap();
+    let mutations: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path.ends_with("/deliver"))
+        .collect();
+    assert!(mutations.len() >= 2);
+    assert!(mutations.iter().all(|r| r.body == mutations[0].body));
 }
 
 #[tokio::test]

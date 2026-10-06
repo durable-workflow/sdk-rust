@@ -1557,11 +1557,25 @@ impl Client {
             let boundary_path = format!("{path}/cancellation-scopes/{}", if delivering { "deliver" } else { "prepare" });
             let request = || self.request_json::<Value, _>(reqwest::Method::POST, &boundary_path,
                 RequestProtocol::Worker("1.20"), Some(&body));
-            let receipt = match request().await {
+            loop {
+            budget.remaining()?;
+            let mut receipt = match request().await {
                 Err(error) if worker_operation_is_retryable(&error) => request().await?,
                 result => result?,
             };
-            let mut token = Some(CancellationScopeDeliveryReceipt::acknowledge(&receipt, &expected, delivering)?.to_owned());
+            let pending = delivering && receipt["reason"].as_str()
+                == Some("cancellation_scope_activity_stop_not_acknowledged");
+            if pending {
+                if receipt.get("history_event_id").is_some() {
+                    return Err(invalid("pending scope stop cannot claim a committed delivery"));
+                }
+                // A pending stop proves only the retained preparation. Never expose
+                // it to workflow cleanup as a delivery or renew the original budget.
+                receipt["reason"] = Value::Null;
+                receipt["history_event_id"] = json!(original.unwrap().preparation_history_event_id());
+            }
+            let committed = delivering && !pending;
+            let mut token = Some(CancellationScopeDeliveryReceipt::acknowledge(&receipt, &expected, committed)?.to_owned());
             let mut seen = BTreeSet::new();
             let mut history = Vec::new();
             while let Some(current) = token.take() {
@@ -1586,10 +1600,14 @@ impl Client {
                 };
                 for event in batch { history.push(serde_json::from_value(event.clone()).map_err(|_| invalid("scope history event is malformed"))?); }
             }
-            let proved = CancellationScopeDeliveryReceipt::from_history(&receipt, history, &expected, delivering)?;
+            let proved = CancellationScopeDeliveryReceipt::from_history(&receipt, history, &expected, committed)?;
             if let Some(original) = original { proved.assert_original_preparation(original)?; }
             budget.remaining()?;
-            Ok(proved)
+            if !pending { return Ok(proved); }
+            // Yield so the activity supervisor can stop and acknowledge the
+            // original callback while this workflow retains its hosting claim.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }).await.map_err(|_| Error::Timeout)?
     }
 }

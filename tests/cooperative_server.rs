@@ -1267,11 +1267,15 @@ async fn qualify_scoped_remote_stop(grouped: bool, policy: CancellationPolicy) {
         }
     });
     let run = tokio::spawn(async move {
-        worker
+        let result = worker
             .run_until(async {
                 let _ = shutdown_rx.await;
             })
-            .await
+            .await;
+        if let Err(error) = &result {
+            eprintln!("Scoped remote worker stopped before convergence: {error:?}");
+        }
+        result
     });
     let _abort_on_failure = AbortWorkerOnDrop(run.abort_handle());
     tokio::time::timeout(Duration::from_secs(10), heartbeat_rx.recv())
