@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-child-start-policy-conflict",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.child-policy-author", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "ChildWorkflowScheduled", "payload": {"sequence": 1, "child_workflow_type": "child", "parent_close_policy": "abandon", "cancellation_policy": "abandon"}},
+    {"event_type": "ChildRunStarted", "payload": {"sequence": 1, "child_workflow_type": "child", "cancellation_policy": "try_cancel"}}
+  ],
+  "command_sequence": [{"type": "complete_workflow", "result": "unreachable"}],
+  "expected": {"type": "complete_workflow", "result": "unreachable"},
+  "expected_failure": "child_workflow_policy_history_conflict"
+}

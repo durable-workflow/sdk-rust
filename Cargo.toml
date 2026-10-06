@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "2.1.5"
+version = "3.0.0-rc.1"
 edition = "2021"
 description = "Rust client and worker SDK for Durable Workflow Cloud and self-hosted Server"
 license = "MIT"
@@ -14,10 +14,10 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.durable-workflow]
-product-train = "2.1.5"
+product-train = "3.0.0-rc.1"
 compatibility-authority = "protocol-manifests"
 supported-server-versions = "2.0.0"
-qualified-server-version = "2.4.0"
+qualified-server-version = "2.5.0-rc.1"
 worker-protocol-version = "1.19"
 server-worker-protocol-versions = ">=1.19,<2.0"
 portable-worker-affinity-minimum-worker-protocol-version = "1.18"
@@ -110,7 +110,7 @@ apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
 # Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
 bon = { version = "=3.8.1", default-features = false }
-chrono = { version = "0.4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures-util = "0.3"
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.
 icu_collections = { version = "=2.2.0", default-features = false }

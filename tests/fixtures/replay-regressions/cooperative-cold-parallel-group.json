@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-cooperative-cold-parallel-group",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type":"corpus.nested-parallel", "input":[], "payload_codec":"avro"},
+  "history": [
+    {
+      "event_type":"CooperativeCancellationRequested", "workflow_command_id":"original-request",
+      "recorded_at":"2026-10-01T08:00:00Z", "payload": {
+        "workflow_command_id":"original-request", "workflow_run_id":"regression-corpus-run",
+        "cleanup_deadline_at":"2026-10-01T08:10:00Z"
+      }
+    },
+    {
+      "event_type":"CooperativeCancellationDelivered", "workflow_command_id":"original-request", "payload": {
+        "workflow_command_id":"original-request", "workflow_run_id":"regression-corpus-run",
+        "sequence":1, "call_kind":"parallel", "sequence_span":3
+      }
+    }
+  ],
+  "command_sequence": [{
+    "type":"fail_workflow", "exception_type":"WorkflowCancellationRequested", "non_retryable":true,
+    "exception": {"properties": {"request_id":"original-request", "cleanup_deadline_at":"2026-10-01T08:10:00Z"}}
+  }],
+  "expected": {
+    "type":"fail_workflow", "exception_type":"WorkflowCancellationRequested", "non_retryable":true,
+    "exception": {"properties": {"request_id":"original-request", "cleanup_deadline_at":"2026-10-01T08:10:00Z"}}
+  }
+}

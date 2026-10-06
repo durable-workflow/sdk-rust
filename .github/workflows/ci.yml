@@ -6,6 +6,19 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      cooperative_qualification:
+        description: Run cooperative protocol 1.20 cases against an isolated Server candidate
+        type: boolean
+        default: false
+      server_commit:
+        description: Exact 40-character public Server candidate SHA
+        type: string
+        default: ""
+      native_commit:
+        description: Optional exact public Native candidate SHA for readonly source qualification
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -181,10 +194,107 @@ jobs:
           python scripts/ci/test-release-package.py
           python scripts/ci/test-example-base-urls.py
 
+  cooperative-server:
+    name: Cooperative Server source qualification
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.cooperative_qualification }}
+    needs: [action-policy, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: rust-cooperative-${{ github.run_id }}-${{ github.run_attempt }}
+      SERVER_CANDIDATE_SHA: ${{ inputs.server_commit }}
+      NATIVE_CANDIDATE_SHA: ${{ inputs.native_commit }}
+      DURABLE_WORKFLOW_SERVER_SOURCE: ${{ github.workspace }}/.cooperative-server-source
+      DURABLE_WORKFLOW_NATIVE_SOURCE: ${{ github.workspace }}/.cooperative-native-source
+      DURABLE_WORKFLOW_AUTH_TOKEN: test-token
+      COMPOSE_FILE: docker-compose.cooperative.yml
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - name: Require an exact Server candidate
+        run: '[[ "$SERVER_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the public Server candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          repository: durable-workflow/server
+          ref: ${{ inputs.server_commit }}
+          path: .cooperative-server-source
+          persist-credentials: false
+      - name: Verify checked-out candidate identity
+        run: test "$(git -C .cooperative-server-source rev-parse HEAD)" = "$SERVER_CANDIDATE_SHA"
+      - name: Require an exact optional Native candidate
+        if: ${{ inputs.native_commit != '' }}
+        run: '[[ "$NATIVE_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the public Native candidate
+        if: ${{ inputs.native_commit != '' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          repository: durable-workflow/workflow
+          ref: ${{ inputs.native_commit }}
+          path: .cooperative-native-source
+          persist-credentials: false
+      - name: Verify Native identity and select its readonly source overlay
+        if: ${{ inputs.native_commit != '' }}
+        run: |
+          test "$(git -C .cooperative-native-source rev-parse HEAD)" = "$NATIVE_CANDIDATE_SHA"
+          printf 'COMPOSE_FILE=docker-compose.cooperative.yml:docker-compose.native-cancellation.yml\n' >> "$GITHUB_ENV"
+          printf 'DURABLE_WORKFLOW_NATIVE_SOURCE_QUALIFICATION=1\n' >> "$GITHUB_ENV"
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: 1.86.0
+      - name: Start isolated Server stack
+        run: docker compose up -d --build --wait --wait-timeout 300
+      - name: Retain runtime identity and select endpoint
+        run: |
+          docker compose exec -T server cat /app/.package-provenance > cooperative-package-provenance.txt
+          docker compose images --format json > cooperative-images.json
+          jq --null-input --arg sdk "$GITHUB_SHA" --arg server "$SERVER_CANDIDATE_SHA" --arg native "$NATIVE_CANDIDATE_SHA" \
+            '{qualification:"source",sdk_commit:$sdk,server_commit:$server,native_source_overlay:($native | if length > 0 then . else null end)}' \
+            > cooperative-source-provenance.json
+          endpoint="$(docker compose port server 8080)"
+          echo "DURABLE_WORKFLOW_SERVER_URL=http://$endpoint" >> "$GITHUB_ENV"
+      - name: Run actual Worker cooperative scenarios
+        shell: bash
+        run: |
+          arguments=(--ignored --nocapture --test-threads=1)
+          if [ -z "$NATIVE_CANDIDATE_SHA" ]; then
+            arguments+=(--skip server_scope_opening_proves_real_native_tree_on_original_claim)
+            arguments+=(--skip server_scope_authoring_replays_nested_tree_and_deferred_membership_on_replacement)
+            arguments+=(--skip server_scope_cleanup_preserves_original_delivery_and_budget_after_replacement)
+            arguments+=(--skip server_scope_group_cleanup_preserves_original_delivery_and_budget_after_replacement)
+            arguments+=(--skip server_sigkill_scoped_cleanup_replays_before_root_with_original_30_second_deadline)
+            arguments+=(--skip server_scope_try_stops_actual_remote_callback_without_application_heartbeats)
+            arguments+=(--skip server_scope_wait_stops_actual_remote_callback_before_cleanup)
+            arguments+=(--skip server_scope_group_wait_stops_actual_remote_callback_before_cleanup)
+          fi
+          cargo test --test cooperative_server -- "${arguments[@]}" 2>&1 | tee cooperative-results.log
+      - name: Retain bounded scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: cooperative-server-${{ github.sha }}
+          path: |
+            cooperative-results.log
+            cooperative-package-provenance.txt
+            cooperative-images.json
+            cooperative-source-provenance.json
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Emit failure diagnostics
+        if: ${{ failure() }}
+        run: docker compose logs --no-color --tail 100 bootstrap server worker repair
+      - name: Remove task runtime resources
+        if: ${{ always() }}
+        run: |
+          docker compose down -v
+          docker image rm "dw-rust-cooperative-server:$SERVER_CANDIDATE_SHA"
+
   target-branch-qualification:
     name: Target branch qualification
     if: ${{ always() }}
-    needs: [action-policy, regression-corpus, test, protocol, docs, package]
+    needs: [action-policy, regression-corpus, test, protocol, docs, package, cooperative-server]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -200,9 +310,14 @@ jobs:
           PACKAGE_RESULT: ${{ needs.package.result }}
           PROTOCOL_RESULT: ${{ needs.protocol.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          COOPERATIVE_REQUESTED: ${{ inputs.cooperative_qualification }}
+          COOPERATIVE_RESULT: ${{ needs.cooperative-server.result }}
         run: |
           test "$CORPUS_RESULT" = success
           test "$DOCS_RESULT" = success
           test "$PACKAGE_RESULT" = success
           test "$PROTOCOL_RESULT" = success
           test "$TEST_RESULT" = success
+          if [ "$COOPERATIVE_REQUESTED" = true ]; then
+            test "$COOPERATIVE_RESULT" = success
+          fi

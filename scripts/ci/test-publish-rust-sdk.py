@@ -18,10 +18,11 @@ MANIFEST = ROOT / "Cargo.toml"
 PUBLISH = ROOT / "scripts" / "ci" / "publish-rust-sdk.sh"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 RELEASE_TOOLING_INSTALLER = ROOT / "scripts" / "ci" / "install-release-tooling.sh"
-PACKAGE_VERSION = "2.1.5"
+SOURCE_PACKAGE = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))["package"]
+PACKAGE_VERSION = SOURCE_PACKAGE["version"]
 PRODUCT_TRAIN = PACKAGE_VERSION
 SERVER_VERSIONS = "2.0.0"
-QUALIFIED_SERVER_VERSION = "2.4.0"
+QUALIFIED_SERVER_VERSION = SOURCE_PACKAGE["metadata"]["durable-workflow"]["qualified-server-version"]
 WORKER_PROTOCOL_VERSION = "1.19"
 SERVER_WORKER_PROTOCOLS = ">=1.19,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -428,6 +429,17 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         result = self._publish(manifest)
         self.assertNotEqual(0, result.returncode)
+
+    def test_release_path_rejects_an_invalid_qualified_server_identity(self) -> None:
+        for version in ("3.0.0", "2.5", "2.5.0-rc.0", "2.5.0-preview.1"):
+            with self.subTest(version=version):
+                manifest = self._manifest_with(
+                    f'qualified-server-version = "{QUALIFIED_SERVER_VERSION}"',
+                    f'qualified-server-version = "{version}"',
+                )
+                result = self._publish(manifest)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("supported Server contract", result.stderr)
 
     def test_release_path_rejects_package_without_current_release_notes(self) -> None:
         changelog = self.temp / "CHANGELOG.md"

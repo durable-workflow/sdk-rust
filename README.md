@@ -109,6 +109,14 @@ payload fetches never follow redirects.
 
 ## Compatibility
 
+The cancellation release candidate adds cooperative requests and bounded,
+replayable cleanup. Enable `Worker::cooperative_cancellation(true)` against a
+Server that advertises protocol 1.20 and the required capabilities. This profile
+supervises async Activity futures independently of application heartbeats.
+Independently cancellable scopes remain disabled. See the
+[cancellation guide](https://github.com/durable-workflow/sdk-rust/blob/main/docs/cooperative-cancellation-design.md)
+and [v3 migration guide](https://github.com/durable-workflow/sdk-rust/blob/main/docs/migrating-to-v3.md).
+
 The crate publishes its supported Server and worker-protocol ranges in
 `[package.metadata.durable-workflow]` in [`Cargo.toml`](https://github.com/durable-workflow/sdk-rust/blob/main/Cargo.toml). Runtime
 capability manifests, not matching package version strings, determine protocol

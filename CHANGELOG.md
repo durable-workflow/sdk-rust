@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.0.0-rc.1
+
+- Add cooperative whole-run cancellation with immutable request metadata,
+  lineage, deterministic cleanup time helpers and the original bounded deadline.
+- Add explicit Activity and Child TryCancel, WaitCancellationCompleted and
+  Abandon policies, and cooperative RequestCancellation on parent closure.
+- Supervise opted-in async Activity callbacks independently of application
+  heartbeats, acknowledge their stop and reject stale publication. Resume
+  shielded durable cleanup from the original delivery boundary after worker loss.
+- Keep cooperation opt-in and ordinary worker protocol 1.19. Independently
+  cancellable scopes remain a disabled source preview. Portable local activities,
+  worker sessions and sticky execution remain unsupported by this Rust profile.
+- This major release adds public cancellation fields and enum variants. Follow
+  the [v3 migration guide](https://github.com/durable-workflow/sdk-rust/blob/main/docs/migrating-to-v3.md)
+  when updating struct literals and exhaustive matches. The wire protocol remains
+  compatible with older same-major workers on a supporting Server.
+
 ## 2.1.5
 
 - Allow the ordinary Worker to append and close workflow streams when Server
