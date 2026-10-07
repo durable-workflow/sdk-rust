@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.2.1
+
+- Add `Worker::recover_transient_outages(true)` for long-running service workers.
+  Retryable poll and worker-heartbeat failures keep retrying with capped backoff
+  and the original poll request identity. Shutdown interrupts retry waits.
+- Preserve bounded retries by default and for `run_once`. Disabling ordinary
+  retries still takes precedence. Authentication, protocol, codec, handler and
+  task settlement failures remain errors.
+
 ## 3.2.0
 
 - Add typed worker-session options and shared create, renew and close handles.

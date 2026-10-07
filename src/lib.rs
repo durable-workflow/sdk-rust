@@ -6343,6 +6343,9 @@ pub struct WorkerHeartbeatObservation {
 /// Explicit storage admission pauses also preserve the already-serialized worker
 /// request without consuming this budget or rerunning its handler. The delay is
 /// capped by `max_backoff`, and shutdown interrupts storage waits.
+/// [`Worker::recover_transient_outages`] can keep a long-running worker retrying
+/// poll acquisition and heartbeats beyond this budget. `run_once` stays bounded,
+/// and `max_retries = 0` disables ordinary retries in either mode.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerRetryPolicy {
     /// Number of retries after the initial request fails.
@@ -6404,6 +6407,8 @@ pub struct Worker {
     poll_timeout: Duration,
     heartbeat_interval: Duration,
     retry_policy: WorkerRetryPolicy,
+    recover_transient_outages: bool,
+    run_stop: Option<Arc<AtomicBool>>,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
     cooperative_cancellation_enabled: bool,
     allow_cancellation_scope_authoring: bool,
@@ -6430,6 +6435,8 @@ impl Worker {
             poll_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
             retry_policy: WorkerRetryPolicy::default(),
+            recover_transient_outages: false,
+            run_stop: None,
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
             allow_cancellation_scope_authoring: false,
@@ -6505,6 +6512,22 @@ impl Worker {
     /// Configure bounded retries for task-poll acquisition and worker heartbeats.
     pub fn retry_policy(mut self, policy: WorkerRetryPolicy) -> Self {
         self.retry_policy = policy;
+        self
+    }
+
+    /// Keep `run` and `run_until` alive during retryable poll and heartbeat outages.
+    ///
+    /// Retries preserve the poll request identity and use capped exponential
+    /// backoff from [`WorkerRetryPolicy`]. Shutdown interrupts a retry wait.
+    /// An in-flight poll is allowed to finish so leased work is not discarded.
+    /// Authentication, protocol, codec, handler and task settlement failures
+    /// remain errors. Registration and deregistration are not retried here.
+    ///
+    /// The default is disabled, preserving the bounded retry contract.
+    /// `run_once` always remains bounded. `max_retries = 0` disables retries,
+    /// even when this option is enabled.
+    pub fn recover_transient_outages(mut self, enabled: bool) -> Self {
+        self.recover_transient_outages = enabled;
         self
     }
 
@@ -7160,6 +7183,8 @@ impl Worker {
     /// Empty long-poll expirations do not stop the worker. Retryable poll and
     /// heartbeat failures use [`WorkerRetryPolicy`] independently, while
     /// authentication, protocol, and other non-retryable failures are returned.
+    /// Enable [`Worker::recover_transient_outages`] to keep retrying transient
+    /// poll and heartbeat outages beyond the ordinary retry budget.
     pub async fn run(&self) -> Result<()> {
         self.run_until(std::future::pending::<()>()).await
     }
@@ -7173,7 +7198,8 @@ impl Worker {
     {
         let stop = Arc::new(AtomicBool::new(false));
         let _stop_on_drop = StopWorkerOnDrop(Arc::clone(&stop));
-        let worker = self.with_storage_admission(Arc::clone(&stop));
+        let mut worker = self.with_storage_admission(Arc::clone(&stop));
+        worker.run_stop = Some(Arc::clone(&stop));
         let run = worker.run_with_storage_admission(Arc::clone(&stop));
         tokio::pin!(run);
         tokio::pin!(shutdown);
@@ -7290,7 +7316,7 @@ impl Worker {
                         .as_mut()
                         .reset(tokio::time::Instant::now() + heartbeat_interval);
                     match result {
-                        Ok(acknowledgement) => {
+                        Ok(Some(acknowledgement)) => {
                             if let Some(observer) = &self.heartbeat_observer {
                                 observer(&WorkerHeartbeatObservation {
                                     worker_id: self.worker_id.clone(),
@@ -7305,6 +7331,7 @@ impl Worker {
                                 });
                             }
                         }
+                        Ok(None) => break,
                         Err(error) => {
                             stop.store(true, Ordering::SeqCst);
                             join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await?;
@@ -7557,9 +7584,16 @@ impl Worker {
 
     async fn poll_workflows_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
-            if self.poll_workflow_once().await? == ManagedPollOutcome::Stop {
-                stop.store(true, Ordering::SeqCst);
-                break;
+            match self.poll_workflow_once().await {
+                Ok(ManagedPollOutcome::Stop) => {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+                _ => {}
             }
         }
 
@@ -7782,16 +7816,23 @@ impl Worker {
 
     async fn poll_queries_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
-            if self.poll_query_once().await? == ManagedPollOutcome::Stop {
-                stop.store(true, Ordering::SeqCst);
-                break;
+            match self.poll_query_once().await {
+                Ok(ManagedPollOutcome::Stop) => {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+                _ => {}
             }
         }
 
         Ok(())
     }
 
-    async fn retry_worker_operation<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    async fn retry_worker_operation<T, F, Fut>(&self, mut operation: F) -> Result<Option<T>>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -7799,22 +7840,44 @@ impl Worker {
         let mut retries = 0;
 
         loop {
+            if self
+                .run_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst))
+            {
+                return Ok(None);
+            }
             match operation().await {
                 Err(error)
                     if worker_operation_is_retryable(&error)
-                        && retries < self.retry_policy.max_retries =>
+                        && (retries < self.retry_policy.max_retries
+                            || (self.recover_transient_outages
+                                && self.run_stop.is_some()
+                                && self.retry_policy.max_retries > 0)) =>
                 {
-                    retries += 1;
-                    tokio::time::sleep(worker_retry_delay(self.retry_policy, retries)).await;
+                    retries = retries.saturating_add(1);
+                    let delay = worker_retry_delay(self.retry_policy, retries)
+                        .max(Duration::from_millis(1));
+                    if let Some(stop) = &self.run_stop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = wait_for_worker_stop(stop) => return Ok(None),
+                        }
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
-                result => return result,
+                result => return result.map(Some),
             }
         }
     }
 
-    async fn settle_worker_poll_response<T>(&self, response: Result<T>) -> Result<Option<T>> {
+    async fn settle_worker_poll_response<T>(
+        &self,
+        response: Result<Option<T>>,
+    ) -> Result<Option<T>> {
         match response {
-            Ok(response) => Ok(Some(response)),
+            Ok(response) => Ok(response),
             Err(error) => {
                 let Some(advertised_delay) = worker_poll_capacity_retry_after(&error) else {
                     return Err(error);
@@ -27383,6 +27446,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_recovers_all_poll_families_and_heartbeat_beyond_retry_budget() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            poll_failures_per_path: 8,
+            heartbeat_failures: 8,
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&acknowledgements);
+        let mut worker = Worker::new(client, "rust-workers")
+            .recover_transient_outages(true)
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(2),
+                max_backoff: Duration::from_millis(5),
+            })
+            .on_worker_heartbeat(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        worker.register_activity(
+            "counter.activity",
+            |_ctx, _input| async move { Ok(Value::Null) },
+        );
+        worker.register_query("counter", "current", |_ctx, _args| async move {
+            Ok(Value::Null)
+        });
+
+        worker
+            .run_until(tokio::time::sleep(Duration::from_millis(500)))
+            .await
+            .expect("a recoverable outage must not stop the service worker");
+
+        assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
+        assert_eq!(server.request_count("/api/worker/heartbeat"), 9);
+        for path in [
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+        ] {
+            let bodies = server.request_bodies(path);
+            assert!(bodies.len() >= 10, "{path} must resume after recovery");
+            let first = &bodies[0]["poll_request_id"];
+            assert!(first.as_str().is_some_and(|id| !id.is_empty()));
+            for body in &bodies[..9] {
+                assert_eq!(&body["poll_request_id"], first, "{path} retry identity");
+            }
+            assert_ne!(&bodies[9]["poll_request_id"], first);
+            let times = server.request_times(path);
+            for pair in times[..9].windows(2) {
+                assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_outage_retry_waits_are_interrupted_by_shutdown() {
+        for heartbeat_outage in [false, true] {
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                poll_failures_per_path: if heartbeat_outage { 0 } else { usize::MAX },
+                heartbeat_failures: if heartbeat_outage { usize::MAX } else { 0 },
+                ..MockWorkerBehavior::default()
+            });
+            let client = Client::builder(server.base_url()).build().expect("client");
+            let mut worker = Worker::new(client, "rust-workers")
+                .recover_transient_outages(true)
+                .retry_policy(WorkerRetryPolicy {
+                    max_retries: 1,
+                    initial_backoff: Duration::from_secs(5),
+                    max_backoff: Duration::from_secs(5),
+                });
+            worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+            let started = Instant::now();
+            worker
+                .run_until(tokio::time::sleep(Duration::from_millis(200)))
+                .await
+                .expect("shutdown during an outage is a normal stop");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let path = if heartbeat_outage {
+                "/api/worker/heartbeat"
+            } else {
+                "/api/worker/workflow-tasks/poll"
+            };
+            assert_eq!(server.request_count(path), 1);
+            assert_eq!(
+                server.request_count("/api/worker/registrations/mock-worker"),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_outage_recovery_keeps_run_once_bounded() {
+        let server = MockWorkerServer::unavailable_polls();
+        let client = Client::builder(server.base_url()).build().expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .recover_transient_outages(true)
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        assert!(matches!(worker.run_once().await, Err(Error::Transport(_))));
+        assert_eq!(server.request_count("/api/worker/workflow-tasks/poll"), 3);
+    }
+
+    #[tokio::test]
+    async fn worker_outage_recovery_respects_disabled_retries() {
+        let server = MockWorkerServer::unavailable_polls();
+        let client = Client::builder(server.base_url()).build().expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .recover_transient_outages(true)
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 0,
+                ..WorkerRetryPolicy::default()
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        assert!(matches!(worker.run().await, Err(Error::Transport(_))));
+        assert_eq!(server.request_count("/api/worker/workflow-tasks/poll"), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_fatal_poll_error_interrupts_outage_heartbeat_retries() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            heartbeat_failures: usize::MAX,
+            unauthorized_polls: true,
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url()).build().expect("client");
+        let mut worker = Worker::new(client, "rust-workers")
+            .recover_transient_outages(true)
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_secs(5),
+                max_backoff: Duration::from_secs(5),
+            });
+        worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
+        let error = tokio::time::timeout(Duration::from_secs(1), worker.run())
+            .await
+            .expect("fatal poll errors must interrupt heartbeat recovery")
+            .expect_err("authentication failure is terminal");
+        assert!(
+            matches!(error, Error::Http { status, .. } if status == reqwest::StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(server.request_count("/api/worker/workflow-tasks/poll"), 1);
+    }
+
+    #[tokio::test]
     async fn worker_bounds_transport_retries() {
         let server = MockWorkerServer::unavailable_polls();
         let client = Client::builder(server.base_url())
@@ -27446,6 +27662,7 @@ mod tests {
             .expect("client");
         let mut worker = Worker::new(client, "rust-workers")
             .worker_id("unauthorized-worker")
+            .recover_transient_outages(true)
             .poll_timeout(Duration::from_millis(10));
         worker.register_workflow("counter", |_ctx, _input| async move { Ok(Value::Null) });
 
