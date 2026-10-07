@@ -151,6 +151,20 @@ The runnable session example uses a real process-local cache and prints its reso
 generation. Use Server 2.5.1 / Native 2.4.1 for session history and original TTL
 preservation. Session support starts with SDK 3.2.0.
 
+### Recovering from Server outages
+
+For a long-running service worker, enable `.recover_transient_outages(true)`
+on `Worker`. Retryable poll and worker-heartbeat failures then keep retrying
+with capped exponential backoff. A retried poll keeps its original request ID.
+`run_until` interrupts retry waits when shutdown arrives and settles any poll
+response already in flight.
+
+The default preserves bounded retries. `run_once` remains bounded in either
+mode, and `WorkerRetryPolicy.max_retries = 0` disables ordinary retries.
+Authentication, protocol, codec, handler and task settlement failures still
+return an error. Registration and deregistration are outside this recovery
+option. Keep a process supervisor for startup failures and process crashes.
+
 ### Runnable examples
 
 | Example | Demonstrates |
