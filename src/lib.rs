@@ -6283,6 +6283,27 @@ struct RegisteredWorkflow {
     definition_fingerprint: Option<String>,
 }
 
+fn argument_vector_contracts(names: &[String]) -> Vec<Value> {
+    names
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "parameters": [{
+                    "name": "args",
+                    "position": 0,
+                    "required": false,
+                    "variadic": true,
+                    "type": null,
+                    "allows_null": true,
+                    "default_available": false,
+                    "default": null,
+                }],
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct WorkflowTaskDecision {
     commands: Vec<Value>,
@@ -7106,11 +7127,11 @@ impl Worker {
                 workflow_type.clone(),
                 json!({
                     "queries": queries,
-                    "query_contracts": [],
+                    "query_contracts": argument_vector_contracts(&queries),
                     "signals": [],
                     "signal_contracts": [],
                     "updates": updates,
-                    "update_contracts": [],
+                    "update_contracts": argument_vector_contracts(&updates),
                     "update_validators": [],
                 }),
             );
@@ -25707,6 +25728,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_registers_complete_json_and_lossless_handler_argument_contracts() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("orders", |_ctx, input| async move { Ok(input) });
+        worker.register_query("orders", "z-json", |_ctx, args| async move { Ok(args) });
+        worker.register_query_avro_value("orders", "a-avro", |_ctx, args| async move { Ok(args) });
+        worker.register_update("orders", "z-json", |_ctx, args| async move { Ok(args) });
+        worker.register_update_avro_value("orders", "a-avro", |_ctx, args| async move { Ok(args) });
+
+        worker.register().await.expect("register handler contracts");
+
+        let declaration =
+            &server.request_body("/api/worker/register")["workflow_command_contracts"]["orders"];
+        let expected_contracts = json!([
+            {
+                "name": "a-avro",
+                "parameters": [{
+                    "name": "args", "position": 0, "required": false,
+                    "variadic": true, "type": null, "allows_null": true,
+                    "default_available": false, "default": null,
+                }],
+            },
+            {
+                "name": "z-json",
+                "parameters": [{
+                    "name": "args", "position": 0, "required": false,
+                    "variadic": true, "type": null, "allows_null": true,
+                    "default_available": false, "default": null,
+                }],
+            },
+        ]);
+        assert_eq!(declaration["queries"], json!(["a-avro", "z-json"]));
+        assert_eq!(declaration["query_contracts"], expected_contracts);
+        assert_eq!(declaration["updates"], json!(["a-avro", "z-json"]));
+        assert_eq!(declaration["update_contracts"], expected_contracts);
+        assert_eq!(declaration["update_validators"], json!([]));
+    }
+
+    #[tokio::test]
     async fn low_level_registration_preserves_query_and_update_contracts() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
@@ -27290,11 +27354,25 @@ mod tests {
             server.request_body("/api/worker/register")["workflow_command_contracts"]["snapshot"],
             json!({
                 "queries": ["current"],
-                "query_contracts": [],
+                "query_contracts": [{
+                    "name": "current",
+                    "parameters": [{
+                        "name": "args", "position": 0, "required": false,
+                        "variadic": true, "type": null, "allows_null": true,
+                        "default_available": false, "default": null,
+                    }],
+                }],
                 "signals": [],
                 "signal_contracts": [],
                 "updates": ["replace"],
-                "update_contracts": [],
+                "update_contracts": [{
+                    "name": "replace",
+                    "parameters": [{
+                        "name": "args", "position": 0, "required": false,
+                        "variadic": true, "type": null, "allows_null": true,
+                        "default_available": false, "default": null,
+                    }],
+                }],
                 "update_validators": [],
             })
         );

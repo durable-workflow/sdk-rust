@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.2.2
+
+- Register complete query and update argument contracts for JSON and lossless
+  Avro handlers. Server can admit commands for new Rust workflow runs using
+  the handlers' positional argument vectors.
+- Keep unsupported update validators refused and preserve explicitly supplied
+  low-level registration metadata. Existing runs retain their original declarations.
+
 ## 3.2.1
 
 - Add `Worker::recover_transient_outages(true)` for long-running service workers.
