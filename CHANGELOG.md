@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.3.2
+
+- Expose one committed signal per immutable signal or command identity in
+  query and update snapshots. Receipt and application markers describe the
+  same signal. Preserve distinct signals, even with equal names and arguments,
+  and refuse conflicting payloads for the same identity.
+
 ## 3.3.1
 
 - Populate update handlers' `QueryContext` with the original workflow input

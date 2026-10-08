@@ -16988,7 +16988,9 @@ fn history_signal_events(
         .and_then(Value::as_str)
         .unwrap_or(payload_codec);
     let mut name_offsets: HashMap<String, usize> = HashMap::new();
-    let mut signals = Vec::new();
+    let mut signals: Vec<QuerySignal> = Vec::new();
+    let mut signal_indices = HashMap::new();
+    let mut command_indices = HashMap::new();
 
     for event in history_events {
         if event.event_type != "SignalApplied" && event.event_type != "SignalReceived" {
@@ -17055,18 +17057,48 @@ fn history_signal_events(
                     .and_then(value_as_u64)
             });
 
-        signals.push(QuerySignal {
-            id: signal_id.map(str::to_string).or_else(|| {
-                matched_export
-                    .and_then(|signal| signal.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
-            name: name.to_string(),
-            arguments,
-            avro_arguments,
-            workflow_sequence,
+        let id = signal_id.or_else(|| {
+            matched_export
+                .and_then(|signal| signal.get("id"))
+                .and_then(Value::as_str)
         });
+        let command_id = command_id.or_else(|| {
+            matched_export
+                .and_then(|signal| signal.get("command_id"))
+                .and_then(Value::as_str)
+        });
+        let duplicate = id
+            .and_then(|id| signal_indices.get(id))
+            .or_else(|| command_id.and_then(|id| command_indices.get(id)))
+            .copied();
+        let index = duplicate.unwrap_or(signals.len());
+        if let Some(index) = duplicate {
+            let original = &mut signals[index];
+            if original.name != name
+                || original.avro_arguments != avro_arguments
+                || matches!((original.id.as_deref(), id), (Some(first), Some(next)) if first != next)
+            {
+                return Err(Error::Codec("conflicting committed signal identity".into()));
+            }
+            if original.id.is_none() {
+                original.id = id.map(str::to_string);
+            }
+            original.workflow_sequence = original.workflow_sequence.or(workflow_sequence);
+        } else {
+            signals.push(QuerySignal {
+                id: id.map(str::to_string),
+                name: name.to_string(),
+                arguments,
+                avro_arguments,
+                workflow_sequence,
+            });
+        }
+        if let Some(id) = id {
+            signal_indices.insert(id.to_string(), index);
+        }
+        if let Some(id) = command_id {
+            command_indices.insert(id.to_string(), index);
+        }
     }
 
     if signals.is_empty() {
@@ -19766,6 +19798,54 @@ mod tests {
                 update_arguments
             );
         }
+    }
+
+    #[test]
+    fn committed_signal_snapshot_counts_identities_once() {
+        let arguments = encode_value_envelope(&json!([7]), DEFAULT_CODEC).expect("signal input");
+        let received = history_event(
+            "SignalReceived",
+            json!({
+                "signal_id": "signal-first", "workflow_command_id": "command-first",
+                "signal_name": "changed", "arguments": arguments.clone(),
+            }),
+        );
+        let applied = history_event(
+            "SignalApplied",
+            json!({
+                "signal_id": "signal-first", "workflow_command_id": "command-first",
+                "signal_name": "changed", "value": arguments.clone(), "workflow_sequence": 1,
+            }),
+        );
+        let distinct = history_event(
+            "SignalReceived",
+            json!({
+                "signal_id": "signal-second", "workflow_command_id": "command-second",
+                "signal_name": "changed", "arguments": arguments,
+            }),
+        );
+        let history = vec![received.clone(), applied.clone(), distinct];
+        let signals =
+            history_signal_events(&history, None, DEFAULT_CODEC).expect("signal snapshot");
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].id.as_deref(), Some("signal-first"));
+        assert_eq!(signals[1].id.as_deref(), Some("signal-second"));
+        assert_eq!(signals[0].workflow_sequence, Some(1));
+        assert_eq!(signals[0].arguments, signals[1].arguments);
+        let mut command_only = received.clone();
+        command_only
+            .payload
+            .as_object_mut()
+            .expect("payload")
+            .remove("signal_id");
+        let signals = history_signal_events(&[command_only, applied.clone()], None, DEFAULT_CODEC)
+            .expect("command identity");
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].id.as_deref(), Some("signal-first"));
+        let mut conflicting = applied;
+        conflicting.payload["value"] =
+            encode_value_envelope(&json!([8]), DEFAULT_CODEC).expect("different input");
+        assert!(history_signal_events(&[received, conflicting], None, DEFAULT_CODEC).is_err());
     }
 
     #[tokio::test]
