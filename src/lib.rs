@@ -17081,7 +17081,9 @@ fn history_signal_events(
                         [value] => value.clone(),
                         values => AvroValue::Array(values.to_vec()),
                     };
-                    decode_wire_avro_value(value, codec)? == expected
+                    let applied = decode_wire_avro_value(value, codec)?;
+                    applied == expected
+                        || applied == AvroValue::Array(original.avro_arguments.clone())
                 } else {
                     original.avro_arguments == avro_arguments
                 }
@@ -19883,26 +19885,28 @@ mod tests {
                 [value] => value.clone(),
                 values => AvroValue::Array(values.to_vec()),
             };
-            let events = vec![
-                history_event(
-                    "SignalReceived",
-                    json!({
-                        "signal_id": "original", "signal_name": "changed",
-                        "arguments": encode_typed_envelope(&AvroValue::Array(arguments.clone()), DEFAULT_CODEC).expect("signal arguments"),
-                    }),
-                ),
-                history_event(
-                    "SignalApplied",
-                    json!({
-                        "signal_id": "original", "signal_name": "changed",
-                        "value": encode_typed_envelope(&applied, DEFAULT_CODEC).expect("application value"),
-                    }),
-                ),
-            ];
-            let signals = history_signal_events(&events, None, DEFAULT_CODEC)
-                .expect("canonical signal snapshot");
-            assert_eq!(signals.len(), 1);
-            assert_eq!(signals[0].avro_arguments, arguments);
+            for applied in [applied, AvroValue::Array(arguments.clone())] {
+                let events = vec![
+                    history_event(
+                        "SignalReceived",
+                        json!({
+                            "signal_id": "original", "signal_name": "changed",
+                            "arguments": encode_typed_envelope(&AvroValue::Array(arguments.clone()), DEFAULT_CODEC).expect("signal arguments"),
+                        }),
+                    ),
+                    history_event(
+                        "SignalApplied",
+                        json!({
+                            "signal_id": "original", "signal_name": "changed",
+                            "value": encode_typed_envelope(&applied, DEFAULT_CODEC).expect("application value"),
+                        }),
+                    ),
+                ];
+                let signals = history_signal_events(&events, None, DEFAULT_CODEC)
+                    .expect("canonical signal snapshot");
+                assert_eq!(signals.len(), 1);
+                assert_eq!(signals[0].avro_arguments, arguments);
+            }
         }
     }
 

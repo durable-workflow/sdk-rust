@@ -2,7 +2,6 @@
   "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
   "fixture_schema": "durable-workflow.replay-regression/v1",
   "id": "rust-update-signal-application-values",
-  "supersedes": ["rust-update-signal-identity"],
   "protocol_version": "1.19",
   "bindings": ["rust"],
   "workflow": {"type": "corpus.update-snapshot", "input": [100], "payload_codec": "avro"},
