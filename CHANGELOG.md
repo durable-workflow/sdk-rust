@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.3.1
+
+- Populate update handlers' `QueryContext` with the original workflow input
+  and committed signals, matching the query snapshot. Preserve the separate
+  update arguments and lossless Avro values. Reject malformed snapshot payloads
+  before invoking the handler.
+
 ## 3.3.0
 
 - Add `Worker::declare_workflow_signals` for names consumed through `wait_signal`
