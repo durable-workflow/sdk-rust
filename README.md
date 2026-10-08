@@ -66,8 +66,8 @@ The namespace runtime URL is already complete. Do not append another `/api`.
 
 - `Client` starts, signals, queries, updates, cancels, terminates, describes,
   and awaits workflow executions.
-- `Worker` registers workflow, activity, signal, query, and update handlers and
-  long-polls task queues.
+- `Worker` registers workflow, activity, query and update handlers, declares
+  workflow signals, and long-polls task queues.
 - `WorkflowContext` provides durable activities, timers, conditions, child
   workflows, side effects, version markers, parallel operations, selection,
   sagas, message streams, memo, search attributes, and continue-as-new.
@@ -75,6 +75,16 @@ The namespace runtime URL is already complete. Do not append another `/api`.
   types over the fixed Avro Value protocol.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
+
+After registering a workflow, declare every signal name it reads through
+`wait_signal` or `signals` before starting the worker:
+
+```rust
+worker.declare_workflow_signals("orders", &["finish", "changed"])?;
+```
+
+Server records those names and positional argument contracts when starting a
+run. Changing worker declarations does not change existing runs.
 
 The SDK writes Avro payloads only. The fixed recursive Value schema preserves
 nulls, booleans, signed 64-bit integers, finite doubles, bytes, UTF-8 strings,

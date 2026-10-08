@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.3.0
+
+- Add `Worker::declare_workflow_signals` for names consumed through `wait_signal`
+  and `signals`. Register their positional argument contracts alongside queries
+  and updates so Server can admit those signals for new workflow runs.
+- Sort and deduplicate declarations, reject invalid names and unknown workflow
+  types, and allow an explicit empty declaration. Existing runs retain the
+  declarations captured when they started.
+
 ## 3.2.2
 
 - Register complete query and update argument contracts for JSON and lossless

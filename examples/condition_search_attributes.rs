@@ -31,5 +31,6 @@ async fn main() -> Result<()> {
         Ok(json!({"status": status}))
     });
 
+    worker.declare_workflow_signals("approve-order", &["approve"])?;
     worker.run().await
 }

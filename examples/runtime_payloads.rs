@@ -135,6 +135,7 @@ async fn worker(url: &str) -> Result<()> {
         }
         Ok(result)
     });
+    worker.declare_workflow_signals(WORKFLOW, &["release"])?;
     worker.register_query_avro_value(WORKFLOW, "value", |ctx, _| async move {
         let result = ctx
             .history_events()
