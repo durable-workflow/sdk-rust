@@ -32,6 +32,22 @@
       }
     },
     {
+      "event_type": "SignalReceived",
+      "payload": {
+        "signal_id": "signal-nested", "workflow_command_id": "command-nested",
+        "signal_name": "changed", "workflow_sequence": 3,
+        "arguments": {"codec": "avro", "blob": "wwHioz3/VYAiNwwCDAQEAgQEAAA="}
+      }
+    },
+    {
+      "event_type": "SignalApplied",
+      "payload": {
+        "signal_id": "signal-nested", "workflow_command_id": "command-nested",
+        "signal_name": "changed", "workflow_sequence": 3,
+        "value": {"codec": "avro", "blob": "wwHioz3/VYAiNwwEBAIEBAA="}
+      }
+    },
+    {
       "event_type": "UpdateAccepted",
       "payload": {
         "update_id": "update-original", "update_name": "inspect",
@@ -41,10 +57,10 @@
   ],
   "command_sequence": [
     {"type": "complete_update", "update_id": "update-original",
-     "result": {"workflow_input": [100], "signals": [[7], [7]], "update_arguments": [3]}}
+     "result": {"workflow_input": [100], "signals": [[7], [7], [[1, 2]]], "update_arguments": [3]}}
   ],
   "expected": {
     "type": "complete_update", "update_id": "update-original",
-    "result": {"workflow_input": [100], "signals": [[7], [7]], "update_arguments": [3]}
+    "result": {"workflow_input": [100], "signals": [[7], [7], [[1, 2]]], "update_arguments": [3]}
   }
 }
