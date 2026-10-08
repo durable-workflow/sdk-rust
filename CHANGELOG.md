@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.3.3
+
+- Preserve the original signal argument vector when matching its application
+  marker. Empty signals apply as `true`, single arguments apply as their value,
+  and multiple arguments apply as a list. Keep nested arrays, bytes and nulls
+  intact while checking immutable identity and conflicting data.
+
 ## 3.3.2
 
 - Expose one committed signal per immutable signal or command identity in
