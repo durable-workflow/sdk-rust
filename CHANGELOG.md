@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.4.1
+
+- Send remote activity heartbeat details as the bounded JSON progress map
+  accepted by Server, matching PHP and Python. Preserve integer, fractional,
+  boolean, null and Unicode metadata in both ordinary and cooperative workers.
+  Valid progress no longer becomes an oversized encoded envelope that Server
+  rejects while the activity's heartbeat deadline expires.
+
 ## 3.4.0
 
 - Add explicit `Worker::sticky_cache(StickyCacheOptions)` with entry and encoded

@@ -3793,19 +3793,21 @@ async fn cooperative_activity_refuses_execution_without_current_claim_deadlines_
 
 #[tokio::test]
 async fn cooperative_activity_fences_success_failure_heartbeat_and_late_context() {
+    let details: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/activity-heartbeat-progress.json"
+    ))
+    .unwrap();
     for fail in [false, true] {
         let server = remote_activity_server();
         let mut worker = coordinator_worker(&server, "remote-valid");
         let saved = Arc::new(Mutex::new(None::<ActivityContext>));
         let capture = Arc::clone(&saved);
+        let progress = details.clone();
         worker.register_activity("work", move |ctx, _| {
             *capture.lock().unwrap() = Some(ctx.clone());
+            let progress = progress.clone();
             async move {
-                assert!(
-                    ctx.heartbeat(json!({"completed":1}))
-                        .await?
-                        .heartbeat_recorded
-                );
+                assert!(ctx.heartbeat(progress).await?.heartbeat_recorded);
                 if fail {
                     return Err(Error::WorkerLoop("application failure".into()));
                 }
@@ -3834,6 +3836,17 @@ async fn cooperative_activity_fences_success_failure_heartbeat_and_late_context(
         }
         expected.push(if fail { "fail" } else { "complete" });
         assert_eq!(paths, expected);
+        let heartbeat_body: Value = serde_json::from_str(
+            &requests
+                .iter()
+                .find(|r| r.path.ends_with("/heartbeat"))
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(heartbeat_body["details"], details);
+        assert_eq!(heartbeat_body["activity_attempt_id"], "attempt-original");
+        assert_eq!(heartbeat_body["lease_owner"], "actual-owner");
         let body: Value = serde_json::from_str(&requests.last().unwrap().body).unwrap();
         assert_eq!(body["activity_attempt_id"], "attempt-original");
         assert_eq!(body["lease_owner"], "actual-owner");
