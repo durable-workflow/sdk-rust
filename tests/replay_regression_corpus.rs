@@ -15,8 +15,8 @@ use std::{
 use durable_workflow::{
     decode_payload, encode_payload, json, AvroValue, ChildWorkflowOptions, Client,
     ConditionWaitOptions, ConditionWaitResult, Error, ParallelOperation, ParallelResult,
-    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, Value, Worker, WorkerRetryPolicy,
-    WorkflowInstance, DEFAULT_CODEC,
+    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, StickyCacheOptions, Value, Worker,
+    WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 
@@ -156,6 +156,7 @@ fn handle_request(
         .map(|(_, body)| body)
         .unwrap_or_default()
         .to_string();
+    let registration: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let request_number = {
         let mut requests = requests.lock().expect("captured replay fixture requests");
         requests.push(CapturedRequest {
@@ -180,6 +181,23 @@ fn handle_request(
             "request_admitted": false
         })
         .to_string(),
+        "/api/worker/register"
+            if registration["capability_manifest"]["sticky_execution"]["supported"] == true =>
+        {
+            json!({
+                "worker_id": registration["worker_id"],
+            "namespace": "default",
+                "task_queue": registration["task_queue"],
+                "build_id": registration["build_id"],
+                "registered": true,
+                "protocol_version": "1.18",
+                "heartbeat_interval_seconds": 3600,
+                "capabilities": registration["capabilities"],
+                "capability_manifest": registration["capability_manifest"],
+                "server_capabilities": {"sticky_execution": {"supported": true}}
+            })
+            .to_string()
+        }
         "/api/worker/register" => json!({
             "worker_id": "regression-corpus-worker",
             "registered": true,
@@ -475,7 +493,13 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     {
         task["workflow_command_id"] = workflow_command_id.clone();
     }
-    for field in ["workflow_update_id", "update_name"] {
+    for field in [
+        "workflow_update_id",
+        "update_name",
+        "sticky_replay_mode",
+        "last_history_sequence",
+        "total_history_events",
+    ] {
         if let Some(value) = fixture["worker_task"].get(field) {
             task[field] = value.clone();
         }
@@ -500,6 +524,13 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
         });
+    let sticky_capacity = fixture["worker_task"]["sticky_cache_capacity"].as_u64();
+    if let Some(capacity) = sticky_capacity {
+        worker = worker
+            .build_id("regression-corpus-build")
+            .sticky_cache(StickyCacheOptions::new(capacity as usize))
+            .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
+    }
     match workflow_type {
         "corpus.update-snapshot" => {
             worker.register_workflow(workflow_type, |_ctx, _input| async move { Ok(Value::Null) });
@@ -906,6 +937,17 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if let Some(worker_registration) = worker_registration {
         observed.insert("worker_registration".to_string(), worker_registration);
     }
+    if sticky_capacity.is_some() {
+        observed.insert(
+            "sticky_cache_metrics".to_string(),
+            serde_json::to_value(
+                worker
+                    .sticky_cache_metrics()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
     observed.insert(
         "completion_attempts".to_string(),
         json!(completion_attempts),
@@ -976,6 +1018,20 @@ async fn avro_side_effect_replay_is_deterministic_across_cold_workers() {
         .expect("cold Avro replay fixture must execute");
 
     assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn sticky_hint_replays_recorded_values_identically_after_cache_loss() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/sticky-cache-start-accepted-cold-replay.json");
+    let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let first = execute_fixture_delivery(&fixture, "original-worker")
+        .await
+        .unwrap();
+    let replacement = execute_fixture_delivery(&fixture, "replacement-worker")
+        .await
+        .unwrap();
+    assert_eq!(first, replacement);
 }
 
 #[tokio::test]

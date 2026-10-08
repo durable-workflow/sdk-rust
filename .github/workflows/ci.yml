@@ -19,6 +19,10 @@ on:
         description: Qualify worker sessions, using a Server candidate when server_commit is set
         type: boolean
         default: false
+      sticky_qualification:
+        description: Qualify bounded sticky history against the exact published Server image
+        type: boolean
+        default: false
       cooperative_qualification:
         description: Run cooperative protocol 1.20 cases against an isolated Server candidate
         type: boolean
@@ -320,7 +324,7 @@ jobs:
 
   local-server:
     name: Published Server worker qualification
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.local_qualification || (inputs.session_qualification && inputs.server_commit == '')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.local_qualification || inputs.sticky_qualification || (inputs.session_qualification && inputs.server_commit == '')) }}
     needs: [action-policy, test]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -329,6 +333,8 @@ jobs:
       COMPOSE_FILE: docker-compose.local-activities.yml
       DURABLE_WORKFLOW_AUTH_TOKEN: test-token
       DURABLE_WORKFLOW_LOCAL_ISOLATED: '1'
+      DURABLE_WORKFLOW_STICKY_ISOLATED: '1'
+      DURABLE_WORKFLOW_STICKY_CACHE_QUALIFICATION: ${{ inputs.sticky_qualification && '1' || '0' }}
       LOCAL_SDK_VERSION: ${{ inputs.local_sdk_version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -356,6 +362,9 @@ jobs:
           printf 'fn main() {}\n' > .local-consumer/src/main.rs
           cp tests/local_activity_server.rs .local-consumer/tests/
           cp tests/worker_session_server.rs .local-consumer/tests/
+          cp tests/sticky_server.rs .local-consumer/tests/
+          mkdir -p .local-consumer/examples
+          cp examples/sticky_execution.rs .local-consumer/examples/
           cargo metadata --manifest-path .local-consumer/Cargo.toml --format-version 1 > local-consumer-metadata.json
           jq --arg version "$LOCAL_SDK_VERSION" -e '[.packages[] | select(.name == "durable-workflow" and .version == $version and (.source | startswith("registry+https://github.com/rust-lang/crates.io-index")))] | length == 1' local-consumer-metadata.json
       - name: Run actual Worker local activity scenarios
@@ -386,6 +395,22 @@ jobs:
             find "$HOME/.cargo/registry/cache" -name "durable-workflow-$LOCAL_SDK_VERSION.crate" -exec sha256sum '{}' \; > session-crate-sha256.txt
             test -s session-crate-sha256.txt
           fi
+      - name: Run actual Worker sticky history scenarios and runnable example
+        if: ${{ inputs.sticky_qualification }}
+        env:
+          DURABLE_WORKFLOW_TOKEN: test-token
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [ -n "$LOCAL_SDK_VERSION" ]; then arguments+=(--manifest-path .local-consumer/Cargo.toml); fi
+          cargo test "${arguments[@]}" --test sticky_server -- --ignored --nocapture --test-threads=1 2>&1 | tee sticky-results.log
+          cargo run "${arguments[@]}" --example sticky_execution 2>&1 | tee sticky-example.log
+          jq --null-input --arg sdk "$GITHUB_SHA" --arg version "$LOCAL_SDK_VERSION" \
+            '{runner_commit:$sdk,sdk_commit:(if $version == "" then $sdk else null end),published_sdk_version:($version | if length > 0 then . else null end)}' > sticky-qualification.json
+          if [ -n "$LOCAL_SDK_VERSION" ]; then
+            find "$HOME/.cargo/registry/cache" -name "durable-workflow-$LOCAL_SDK_VERSION.crate" -exec sha256sum '{}' \; > sticky-crate-sha256.txt
+            test -s sticky-crate-sha256.txt
+          fi
       - name: Retain bounded scenario evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
@@ -394,6 +419,10 @@ jobs:
           path: |
             local-results.log
             session-results.log
+            sticky-results.log
+            sticky-example.log
+            sticky-qualification.json
+            sticky-crate-sha256.txt
             session-qualification.json
             session-crate-sha256.txt
             local-package-provenance.txt
@@ -434,6 +463,7 @@ jobs:
           LOCAL_REQUESTED: ${{ inputs.local_qualification }}
           LOCAL_RESULT: ${{ needs.local-server.result }}
           SESSION_REQUESTED: ${{ inputs.session_qualification }}
+          STICKY_REQUESTED: ${{ inputs.sticky_qualification }}
           SESSION_SERVER_SOURCE: ${{ inputs.server_commit }}
         run: |
           test "$CORPUS_RESULT" = success
@@ -445,6 +475,9 @@ jobs:
             test "$COOPERATIVE_RESULT" = success
           fi
           if [ "$LOCAL_REQUESTED" = true ]; then
+            test "$LOCAL_RESULT" = success
+          fi
+          if [ "$STICKY_REQUESTED" = true ]; then
             test "$LOCAL_RESULT" = success
           fi
           if [ "$SESSION_REQUESTED" = true ]; then

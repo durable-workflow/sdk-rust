@@ -168,6 +168,7 @@ async fn cancellation_scope_admission_publishes_no_completion_or_task_failure() 
             Some("scope-run"),
             Err(Error::CancellationScopeExecutionUnavailable),
             true,
+            None,
         )
         .await
         .expect_err("unsupported scope must retain an explicit capability refusal");

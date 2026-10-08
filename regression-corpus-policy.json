@@ -60,6 +60,10 @@
             "fn recorded_activity_retry_snapshot\\b",
             "fn current_activity_retry_snapshot\\b"
           ]
+        },
+        {
+          "glob": "src/sticky_*.rs",
+          "content_patterns": ["History", "history", "Replay", "replay"]
         }
       ]
     }

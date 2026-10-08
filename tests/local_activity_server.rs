@@ -3,8 +3,8 @@
 //! DURABLE_WORKFLOW_LOCAL_ISOLATED=1. Ordinary cargo tests leave these ignored.
 
 use durable_workflow::{
-    json, ActivityRetryPolicy, AvroValue, Client, Error, LocalActivityOptions, Value, Worker,
-    WorkflowCommandOptions, WorkflowHandle, WorkflowResultOptions,
+    json, ActivityRetryPolicy, AvroValue, Client, Error, LocalActivityOptions, StickyCacheOptions,
+    Value, Worker, WorkflowCommandOptions, WorkflowHandle, WorkflowResultOptions,
 };
 use std::{
     collections::BTreeMap,
@@ -101,6 +101,9 @@ fn replay_worker(
         ))
         .poll_timeout(Duration::from_millis(10))
         .local_activities(true);
+    if std::env::var("DURABLE_WORKFLOW_STICKY_CACHE_QUALIFICATION").as_deref() == Ok("1") {
+        worker = worker.sticky_cache(StickyCacheOptions::new(2)).unwrap();
+    }
     worker.register_workflow_avro_value("tests.rust-local-replay", |ctx, _| async move {
         let value = ctx
             .local_activity_avro_value_with_options(

@@ -1,7 +1,7 @@
-# Exact published Server tuple for local activity and worker session qualification.
+# Exact published Server tuple for local activity, session and sticky qualification.
 services:
   bootstrap:
-    image: &server-image ghcr.io/durable-workflow/server@sha256:aa604d4c97219e96a4d66626f875ab119d624cb0d5c072513ec11690c2f87f43
+    image: &server-image ghcr.io/durable-workflow/server@sha256:2043e097d6eb411632386b001385cb5d8145dac1e3b5b14df901ac333d81c5ec
     command: [sh, -c, 'chown 1000:1000 /app/database/runtime-external-payloads && exec server-bootstrap']
     healthcheck: {disable: true}
     volumes: [&payload-volume 'payloads:/app/database/runtime-external-payloads']
@@ -20,6 +20,7 @@ services:
       DW_AUTH_DRIVER: token
       DW_AUTH_TOKEN: test-token
       DW_WORKFLOW_TASK_TIMEOUT: '10'
+      DW_WORKER_PROTOCOL_VERSION: '1.20'
     depends_on:
       mysql: {condition: service_healthy}
       redis: {condition: service_healthy}

@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.4.0
+
+- Add explicit `Worker::sticky_cache(StickyCacheOptions)` with entry and encoded
+  history byte limits, LRU eviction, TTL, build identity and cache counters.
+  Cache only immutable durable wire history and decode fresh replay snapshots.
+  Validate current-lease tail cursors and fall back to complete cold history
+  after expiry, eviction, invalid cursors or process loss. Clear terminal and
+  stopped-worker entries. Default workers continue to replay complete history.
+- Keep canonical cancellation delivery authoritative when caching is enabled.
+  Require confirmed sticky registration before polling.
+- Recognize buffered control-plane signal application markers separately from
+  authored signal waits. Preserve their outer history sequence without treating
+  it as a workflow command sequence during cold or warm replay.
+- Add a runnable sticky execution example. Use Server 2.5.10 or newer.
+
 ## 3.3.3
 
 - Preserve the original signal argument vector when matching its application

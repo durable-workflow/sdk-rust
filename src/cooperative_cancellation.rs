@@ -80,6 +80,7 @@ pub struct WorkflowTaskHeartbeat {
 pub struct CooperativeWorkflowTask {
     task: WorkflowTask,
     cancellation_request: Option<CancellationRequest>,
+    sticky_snapshot: Option<sticky_worker::StickySnapshot>,
 }
 
 impl CooperativeWorkflowTask {
@@ -1318,6 +1319,7 @@ impl Client {
             "poll_request_id":poll_request_id,
             "timeout_seconds":long_poll_timeout_seconds(timeout),
             "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
+            "build_id":self.worker_build_id,
         });
         tokio::time::timeout(budget, async {
             let value: Value = self
@@ -1349,8 +1351,16 @@ impl Client {
                 let mut claim = CooperativeWorkflowTask {
                     task,
                     cancellation_request,
+                    sticky_snapshot: None,
                 };
-                self.load_cooperative_claim_history(&mut claim).await?;
+                if self.sticky_cache.is_some() {
+                    claim.sticky_snapshot = Some(
+                        self.load_sticky_history(&mut claim.task, &value["task"], worker_id)
+                            .await?,
+                    );
+                } else {
+                    self.load_cooperative_claim_history(&mut claim).await?;
+                }
                 Some(claim)
             } else {
                 None
@@ -1929,6 +1939,7 @@ impl Worker {
             claim.task.run_id.as_deref(),
             Ok(decision),
             memo_updates_supported,
+            claim.sticky_snapshot.clone(),
         )
         .await
     }

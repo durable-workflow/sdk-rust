@@ -2,8 +2,8 @@
 //! Require one isolated disposable Server and retain its exact artifact identity.
 
 use durable_workflow::{
-    json, ActivityOptions, ActivityRetryPolicy, Client, Error, Value, Worker, WorkerSessionOptions,
-    WorkflowHandle, WorkflowResultOptions,
+    json, ActivityOptions, ActivityRetryPolicy, Client, Error, StickyCacheOptions, Value, Worker,
+    WorkerSessionOptions, WorkflowHandle, WorkflowResultOptions,
 };
 use std::{
     path::{Path, PathBuf},
@@ -36,11 +36,16 @@ fn options(queue: &str) -> WorkerSessionOptions {
         .ttl_seconds(45)
 }
 fn worker(client: &Client, queue: &str, holder: &str) -> Worker {
-    Worker::new(client.clone(), queue)
+    let worker = Worker::new(client.clone(), queue)
         .worker_id(format!("{queue}-{holder}"))
         .worker_sessions(true)
         .capabilities(["cache:local"])
-        .poll_timeout(Duration::from_millis(10))
+        .poll_timeout(Duration::from_millis(10));
+    if std::env::var("DURABLE_WORKFLOW_STICKY_CACHE_QUALIFICATION").as_deref() == Ok("1") {
+        worker.sticky_cache(StickyCacheOptions::new(2)).unwrap()
+    } else {
+        worker
+    }
 }
 fn refusal(error: Error, expected: &str) {
     match error {

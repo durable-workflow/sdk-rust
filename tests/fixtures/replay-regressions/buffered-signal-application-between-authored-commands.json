@@ -1,0 +1,37 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-buffered-signal-application-between-authored-commands",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.side-effect-version", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"sequence": 1, "event_type": "WorkflowStarted", "payload": {}},
+    {
+      "sequence": 2, "event_type": "SideEffectRecorded",
+      "payload": {"sequence": 1, "result": {"codec": "avro", "blob": "wwHioz3/VYAiNwoaY2FwdHVyZWQtb25jZQ=="}}
+    },
+    {
+      "sequence": 3, "event_type": "SignalReceived",
+      "payload": {
+        "workflow_command_id": "command-approve", "signal_id": "signal-approve",
+        "signal_wait_id": "signal-command:command-approve", "signal_name": "approve",
+        "arguments": {"codec": "avro", "blob": "wwHioz3/VYAiNwwCCgZBZGEA"}
+      }
+    },
+    {
+      "sequence": 4, "event_type": "SignalApplied",
+      "payload": {
+        "workflow_command_id": "command-approve", "signal_id": "signal-approve",
+        "signal_wait_id": "signal-command:command-approve", "signal_name": "approve",
+        "value": "wwHioz3/VYAiNwoGQWRh"
+      }
+    },
+    {
+      "sequence": 5, "event_type": "VersionMarkerRecorded",
+      "payload": {"sequence": 2, "change_id": "cold-restart", "version": 2, "min_supported": 1, "max_supported": 2}
+    }
+  ],
+  "command_sequence": [{"type": "complete_workflow", "result": {"captured": "captured-once", "version": 2}}],
+  "expected": {"side_effect_callback_calls": 0, "type": "complete_workflow", "result": {"captured": "captured-once", "version": 2}}
+}
