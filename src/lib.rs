@@ -6422,6 +6422,7 @@ pub struct Worker {
     workflows: HashMap<String, RegisteredWorkflow>,
     activities: HashMap<String, ActivityHandler>,
     queries: HashMap<String, HashMap<String, RegisteredQuery>>,
+    signals: HashMap<String, Vec<String>>,
     updates: HashMap<String, HashMap<String, UpdateHandler>>,
     max_concurrent_workflow_tasks: usize,
     max_concurrent_activity_tasks: usize,
@@ -6450,6 +6451,7 @@ impl Worker {
             workflows: HashMap::new(),
             activities: HashMap::new(),
             queries: HashMap::new(),
+            signals: HashMap::new(),
             updates: HashMap::new(),
             max_concurrent_workflow_tasks: 10,
             max_concurrent_activity_tasks: 10,
@@ -6785,6 +6787,42 @@ impl Worker {
                 definition_fingerprint: None,
             },
         );
+    }
+
+    /// Declare the signal names consumed by a registered workflow.
+    ///
+    /// Call this after registering the workflow and before starting the worker.
+    /// Names read through `wait_signal` or `signals` need a declaration for
+    /// Server command admission. Arguments remain arbitrary positional values,
+    /// including lossless Avro values. This replaces the previous declaration;
+    /// an empty slice declares no signals. Names are sorted and deduplicated.
+    /// Existing runs retain the declarations captured when they started.
+    pub fn declare_workflow_signals(
+        &mut self,
+        workflow_type: &str,
+        signal_names: &[&str],
+    ) -> Result<()> {
+        if !self.workflows.contains_key(workflow_type) {
+            return Err(Error::Codec(format!(
+                "workflow type {workflow_type:?} is not registered"
+            )));
+        }
+        if signal_names
+            .iter()
+            .any(|name| name.is_empty() || *name != name.trim())
+        {
+            return Err(Error::Codec(
+                "signal names must be non-empty and have no surrounding whitespace".into(),
+            ));
+        }
+        let mut names = signal_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        self.signals.insert(workflow_type.to_string(), names);
+        Ok(())
     }
 
     /// Bind a registered workflow to compile-time embedded source for safe redrive.
@@ -7123,13 +7161,14 @@ impl Worker {
                 .map(|handlers| handlers.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             updates.sort();
+            let signals = self.signals.get(workflow_type).cloned().unwrap_or_default();
             command_contracts.insert(
                 workflow_type.clone(),
                 json!({
                     "queries": queries,
                     "query_contracts": argument_vector_contracts(&queries),
-                    "signals": [],
-                    "signal_contracts": [],
+                    "signals": signals,
+                    "signal_contracts": argument_vector_contracts(&signals),
                     "updates": updates,
                     "update_contracts": argument_vector_contracts(&updates),
                     "update_validators": [],
@@ -25740,6 +25779,9 @@ mod tests {
         worker.register_query_avro_value("orders", "a-avro", |_ctx, args| async move { Ok(args) });
         worker.register_update("orders", "z-json", |_ctx, args| async move { Ok(args) });
         worker.register_update_avro_value("orders", "a-avro", |_ctx, args| async move { Ok(args) });
+        worker
+            .declare_workflow_signals("orders", &["z-json", "a-avro", "z-json"])
+            .expect("declare workflow signals");
 
         worker.register().await.expect("register handler contracts");
 
@@ -25767,7 +25809,43 @@ mod tests {
         assert_eq!(declaration["query_contracts"], expected_contracts);
         assert_eq!(declaration["updates"], json!(["a-avro", "z-json"]));
         assert_eq!(declaration["update_contracts"], expected_contracts);
+        assert_eq!(declaration["signals"], json!(["a-avro", "z-json"]));
+        assert_eq!(declaration["signal_contracts"], expected_contracts);
         assert_eq!(declaration["update_validators"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn workflow_signal_declarations_reject_invalid_configuration_without_mutation() {
+        let server = MockWorkerServer::start();
+        let client = Client::new(server.base_url()).expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("orders", |_ctx, args| async move { Ok(args) });
+        assert!(worker
+            .declare_workflow_signals("missing", &["finish"])
+            .is_err());
+        worker
+            .declare_workflow_signals("orders", &["finish"])
+            .unwrap();
+        for names in [&[""][..], &[" finish"][..], &["finish "][..]] {
+            assert!(worker.declare_workflow_signals("orders", names).is_err());
+        }
+        worker.register().await.unwrap();
+        assert_eq!(
+            server.request_body("/api/worker/register")["workflow_command_contracts"]["orders"]
+                ["signals"],
+            json!(["finish"])
+        );
+        worker.declare_workflow_signals("orders", &[]).unwrap();
+        worker.register().await.unwrap();
+        let registrations = server.request_bodies("/api/worker/register");
+        assert_eq!(
+            registrations[1]["workflow_command_contracts"]["orders"]["signals"],
+            json!([])
+        );
+        assert_eq!(
+            registrations[1]["workflow_command_contracts"]["orders"]["signal_contracts"],
+            json!([])
+        );
     }
 
     #[tokio::test]
@@ -27320,6 +27398,9 @@ mod tests {
             Ok(json!(current))
         });
         worker.register_update("snapshot", "replace", |_ctx, args| async move { Ok(args) });
+        worker
+            .declare_workflow_signals("snapshot", &["finish"])
+            .expect("declare finish signal");
 
         worker
             .run_until(tokio::time::sleep(Duration::from_millis(3_200)))
@@ -27362,8 +27443,15 @@ mod tests {
                         "default_available": false, "default": null,
                     }],
                 }],
-                "signals": [],
-                "signal_contracts": [],
+                "signals": ["finish"],
+                "signal_contracts": [{
+                    "name": "finish",
+                    "parameters": [{
+                        "name": "args", "position": 0, "required": false,
+                        "variadic": true, "type": null, "allows_null": true,
+                        "default_available": false, "default": null,
+                    }],
+                }],
                 "updates": ["replace"],
                 "update_contracts": [{
                     "name": "replace",
