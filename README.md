@@ -155,11 +155,53 @@ Session memory is process-local. A replacement holder must rebuild its resources
 and an interrupted activity can execute again. Use idempotency and attempt fencing
 for external side effects. Committed results replay from history without rebuilding
 resources or rerunning callbacks. Changing recorded session options fails replay.
-Local activities cannot use session routing. Sticky execution remains unsupported.
+Local activities cannot use session routing.
 
 The runnable session example uses a real process-local cache and prints its resource
 generation. Use Server 2.5.1 / Native 2.4.1 for session history and original TTL
 preservation. Session support starts with SDK 3.2.0.
+
+### Bounded sticky execution
+
+Enable a durable-history cache explicitly on a Worker:
+
+```rust,no_run
+use durable_workflow::{Client, Result, StickyCacheOptions, Worker};
+use std::time::Duration;
+
+fn configure(client: Client) -> Result<Worker> {
+    Worker::new(client, "rust-workers")
+        .build_id("orders-v1")
+        .sticky_cache(StickyCacheOptions::new(32)
+            .max_history_bytes(8 * 1024 * 1024)
+            .ttl(Duration::from_secs(60)))
+}
+```
+
+Caching is disabled by default. A positive capacity opts in, and zero disables it.
+The defaults are 16 MiB of retained encoded history and a 300-second TTL. Set
+whole-second TTLs between 1 and 3600 seconds. Registration must confirm the worker,
+queue, namespace, build and sticky capability before it can poll with caching.
+Use Server 2.5.10 or newer. SDK support starts with 3.4.0.
+
+The cache retains immutable wire histories, never live workflow instances or
+session resources. Replays decode a fresh snapshot. Entry and encoded-byte bounds
+use LRU eviction, and reads do not extend expiry. Decoding, replay, keys and cursor
+metadata use additional memory. Size the cache within your worker's memory budget.
+
+A warm replay validates the inline prefix and fetches the retained tail cursor
+under the current task's lease and attempt. Missing, expired, changed or invalid
+entries fall back to complete durable history. Worker replacement needs no cache
+transfer. Committed side effects replay, and cancellation delivery remains governed
+by canonical Server history. Terminal completion and worker shutdown clear entries.
+
+`worker.sticky_cache_metrics()` reports hits, misses, evictions, forced cold
+replays, retained entries and encoded history bytes. This reduces history fetching
+for warm runs. Measure CPU, memory and completion rate with your own workloads.
+
+An explicit `build_id(...)` pins new runs to that deployment build. A different
+build cannot take an existing pinned run. Omit it to retain unversioned routing.
+The runnable example below prints its result and cache counters.
 
 ### Recovering from Server outages
 
@@ -183,6 +225,7 @@ option. Keep a process supervisor for startup failures and process crashes.
 | [`activity_options.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/activity_options.rs) | Activity retry and timeout policies |
 | [`local_activities.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/local_activities.rs) | Explicit local execution, retries, durable timers and remote work |
 | [`worker_sessions.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/worker_sessions.rs) | Typed activity routing, holder-local resources and graceful session close |
+| [`sticky_execution.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/sticky_execution.rs) | Opt-in bounded history, signal replay and cache counters |
 | [`condition_search_attributes.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/condition_search_attributes.rs) | Durable conditions and typed search attributes |
 | [`continue_as_new.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/continue_as_new.rs) | Bounded histories and continue-as-new |
 | [`parallel_saga.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/parallel_saga.rs) | Deterministic parallel work and saga compensation |

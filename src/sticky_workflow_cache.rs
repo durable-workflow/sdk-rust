@@ -19,8 +19,9 @@ pub(crate) struct ResumeCursor {
     pub offset: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CacheMetrics {
+/// Replay counters and retained encoded history. Decoding/replay memory is additional.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StickyCacheMetrics {
     pub hit: u64,
     pub miss: u64,
     pub eviction: u64,
@@ -29,6 +30,7 @@ pub(crate) struct CacheMetrics {
     pub history_bytes: usize,
 }
 
+#[derive(Debug)]
 struct Entry {
     key: CacheKey,
     encoded: Box<[u8]>,
@@ -36,13 +38,42 @@ struct Entry {
     resume: Option<ResumeCursor>,
 }
 
+#[derive(Debug)]
 pub(crate) struct StickyWorkflowCache {
     capacity: usize,
     max_bytes: usize,
     ttl: Duration,
     entries: VecDeque<Entry>,
     history_bytes: usize,
-    metrics: CacheMetrics,
+    metrics: StickyCacheMetrics,
+}
+
+/// Opt-in bounds for a worker's durable-history cache.
+#[derive(Clone, Debug)]
+pub struct StickyCacheOptions {
+    pub(crate) capacity: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) ttl: Duration,
+}
+
+impl StickyCacheOptions {
+    /// Bound the retained run count. Zero disables caching. Defaults to 16 MiB and 300 seconds.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            max_bytes: 16 * 1024 * 1024,
+            ttl: Duration::from_secs(300),
+        }
+    }
+    pub fn max_history_bytes(mut self, bytes: usize) -> Self {
+        self.max_bytes = bytes;
+        self
+    }
+    /// Whole seconds, from 1 to 3600. Reads do not extend the original expiry.
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
 }
 
 pub(crate) fn complete_history(history: &[Value]) -> bool {
@@ -74,12 +105,19 @@ impl StickyWorkflowCache {
             ttl,
             entries: VecDeque::new(),
             history_bytes: 0,
-            metrics: CacheMetrics::default(),
+            metrics: StickyCacheMetrics::default(),
         })
     }
 
     pub fn enabled(&self) -> bool {
         self.capacity > 0
+    }
+
+    pub fn empty(&self) -> Self {
+        Self::new(self.capacity, self.max_bytes, self.ttl).expect("validated cache options")
+    }
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl.as_secs()
     }
 
     fn expire(&mut self, now: Instant) {
@@ -165,9 +203,9 @@ impl StickyWorkflowCache {
         }
     }
 
-    pub fn metrics(&mut self, now: Instant) -> CacheMetrics {
+    pub fn metrics(&mut self, now: Instant) -> StickyCacheMetrics {
         self.expire(now);
-        CacheMetrics {
+        StickyCacheMetrics {
             entries: self.entries.len(),
             history_bytes: self.history_bytes,
             ..self.metrics
@@ -379,11 +417,11 @@ mod tests {
         cache.clear();
         assert_eq!(
             cache.metrics(now),
-            CacheMetrics {
+            StickyCacheMetrics {
                 hit: 1,
                 miss: 1,
                 forced_cold_replay: 1,
-                ..CacheMetrics::default()
+                ..StickyCacheMetrics::default()
             }
         );
     }

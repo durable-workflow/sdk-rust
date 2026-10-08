@@ -9,7 +9,7 @@ mod cooperative_cancellation;
 mod local_activity;
 mod runtime_payloads;
 mod runtime_uploads;
-#[cfg(test)]
+mod sticky_worker;
 mod sticky_workflow_cache;
 mod worker_session;
 
@@ -59,6 +59,7 @@ use serde::{
 };
 pub use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+pub use sticky_workflow_cache::{StickyCacheMetrics, StickyCacheOptions};
 use thiserror::Error;
 pub use uuid::Uuid;
 pub use worker_session::{WorkerSession, WorkerSessionOptions};
@@ -142,7 +143,7 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
 /// Manifest for the default service-worker profile.
 ///
 /// Inline local execution is enabled separately by [`Worker::local_activities`].
-/// Default workers refuse it, while sessions and sticky execution remain unavailable.
+/// Local execution, sessions and caching require explicit Worker configuration.
 pub fn portable_worker_affinity_capability_manifest() -> Value {
     json!({
         "local_activities": {
@@ -2739,6 +2740,8 @@ pub struct Client {
     local_activities_enabled: bool,
     worker_sessions_enabled: bool,
     max_concurrent_worker_sessions: usize,
+    worker_build_id: Option<String>,
+    sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
 }
 
@@ -3647,6 +3650,19 @@ impl Client {
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
+        if let Some(build_id) = &self.worker_build_id {
+            if build_id.is_empty() || build_id.len() > 255 {
+                return Err(Error::WorkerLoop(
+                    "worker build ID must contain 1 to 255 bytes".into(),
+                ));
+            }
+            body["build_id"] = json!(build_id);
+        }
+        if self.sticky_cache.is_some() {
+            body["capability_manifest"]["sticky_execution"] = json!({"supported":true,
+                "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION,
+                "implementation":"bounded_durable_history_cache"});
+        }
         if self.local_activities_enabled {
             body["capability_manifest"]["local_activities"] = json!({"supported":true,
                 "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION});
@@ -3674,6 +3690,10 @@ impl Client {
                 Some(&body),
             )
             .await?;
+        if self.sticky_cache.is_some() {
+            self.confirm_sticky_registration(&response, worker_id, task_queue)
+                .await?;
+        }
         if self.local_activities_enabled || self.worker_sessions_enabled {
             let compatible = response["registered"].as_bool() == Some(true)
                 && response["worker_id"].as_str() == Some(worker_id)
@@ -4089,10 +4109,12 @@ impl Client {
             commands,
             Vec::new(),
             Vec::new(),
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn complete_workflow_task_with_message_streams(
         &self,
         task_id: &str,
@@ -4101,6 +4123,7 @@ impl Client {
         commands: Vec<Value>,
         message_stream_cursors: Vec<Value>,
         message_stream_waits: Vec<Value>,
+        sticky_cache: Option<Value>,
     ) -> Result<Value> {
         validate_workflow_task_commands(&commands)?;
         let has_message_stream_metadata =
@@ -4117,6 +4140,16 @@ impl Client {
             &commands,
             has_message_stream_metadata,
         );
+        let protocol_version = if sticky_cache.is_some()
+            && protocol_version
+                .strip_prefix("1.")
+                .and_then(|minor| minor.parse::<u64>().ok())
+                .is_some_and(|minor| minor < 18)
+        {
+            PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION
+        } else {
+            protocol_version
+        };
         let mut body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
@@ -4127,6 +4160,9 @@ impl Client {
         }
         if !message_stream_waits.is_empty() {
             body["message_stream_waits"] = Value::Array(message_stream_waits);
+        }
+        if let Some(claim) = sticky_cache {
+            body["sticky_cache"] = claim;
         }
         let path = format!("/worker/workflow-tasks/{task_id}/complete");
         self.request_json(
@@ -5125,6 +5161,8 @@ impl ClientBuilder {
             local_activities_enabled: false,
             worker_sessions_enabled: false,
             max_concurrent_worker_sessions: 10,
+            worker_build_id: None,
+            sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
         })
     }
@@ -6120,7 +6158,7 @@ pub struct ActivityTask {
     pub lease_owner: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEvent {
     #[serde(alias = "type")]
     pub event_type: String,
@@ -6440,6 +6478,7 @@ pub struct Worker {
     cooperative_registration_confirmed: Arc<AtomicBool>,
     local_registration_confirmed: Arc<AtomicBool>,
     session_registration_confirmed: Arc<AtomicBool>,
+    sticky_registration_confirmed: Arc<AtomicBool>,
     resource_capabilities: Vec<String>,
     sessions: Arc<Mutex<HashMap<String, WorkerSession>>>,
 }
@@ -6469,6 +6508,7 @@ impl Worker {
             cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
             local_registration_confirmed: Arc::new(AtomicBool::new(false)),
             session_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            sticky_registration_confirmed: Arc::new(AtomicBool::new(false)),
             resource_capabilities: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -6479,6 +6519,8 @@ impl Worker {
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.sticky_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.client.reset_sticky_cache();
         self.sessions = Arc::new(Mutex::new(HashMap::new()));
         self
     }
@@ -7137,6 +7179,8 @@ impl Worker {
     }
 
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
+        self.sticky_registration_confirmed
+            .store(false, Ordering::SeqCst);
         self.session_registration_confirmed
             .store(false, Ordering::SeqCst);
         for capability in &self.resource_capabilities {
@@ -7200,6 +7244,10 @@ impl Worker {
                     self.client
                         .worker_sessions_enabled
                         .then(|| "worker_sessions".to_string()),
+                    self.client
+                        .sticky_cache
+                        .is_some()
+                        .then(|| "sticky_execution".to_string()),
                     self.cooperative_cancellation_enabled
                         .then(|| "cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
@@ -7237,6 +7285,10 @@ impl Worker {
             self.session_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
+        if self.client.sticky_cache.is_some() && response.registered {
+            self.sticky_registration_confirmed
+                .store(true, Ordering::SeqCst);
+        }
         Ok(response)
     }
 
@@ -7258,6 +7310,8 @@ impl Worker {
     where
         F: Future<Output = ()>,
     {
+        let _clear_cache_on_drop =
+            sticky_worker::ClearCacheOnDrop(self.client.sticky_cache.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let _stop_on_drop = StopWorkerOnDrop(Arc::clone(&stop));
         let mut worker = self.with_storage_admission(Arc::clone(&stop));
@@ -7311,6 +7365,9 @@ impl Worker {
             .client
             .deregister_worker_registration(&registered_worker_id)
             .await;
+        self.sticky_registration_confirmed
+            .store(false, Ordering::SeqCst);
+        self.client.clear_sticky_cache()?;
 
         match (primary, deregistration) {
             (Ok(()), Ok(_)) => Ok(()),
@@ -7509,6 +7566,11 @@ impl Worker {
     }
 
     async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        if self.client.sticky_cache.is_some()
+            && !self.sticky_registration_confirmed.load(Ordering::SeqCst)
+        {
+            return Err(Error::WorkerLoop("sticky_registration_unconfirmed: register the sticky-capable worker before polling".into()));
+        }
         if self.client.local_activities_enabled
             && !self.local_registration_confirmed.load(Ordering::SeqCst)
         {
@@ -7519,17 +7581,9 @@ impl Worker {
         }
         let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
-            .retry_worker_operation(|| {
-                self.client.poll_workflow_task_response_with_request_id(
-                    &self.worker_id,
-                    &self.task_queue,
-                    self.poll_timeout,
-                    &poll_request_id,
-                    0,
-                )
-            })
+            .retry_worker_operation(|| self.poll_workflow_with_sticky_cache(&poll_request_id))
             .await;
-        let Some(response) = self.settle_worker_poll_response(response).await? else {
+        let Some((response, snapshot)) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
         if response.outcome().should_stop() {
@@ -7561,10 +7615,12 @@ impl Worker {
             run_id.as_deref(),
             decision,
             memo_updates_supported,
+            snapshot,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn settle_workflow_task_decision(
         &self,
         task_id: &str,
@@ -7573,6 +7629,7 @@ impl Worker {
         run_id: Option<&str>,
         decision: Result<WorkflowTaskDecision>,
         memo_updates_supported: bool,
+        snapshot: Option<sticky_worker::StickySnapshot>,
     ) -> Result<ManagedPollOutcome> {
         match decision {
             Ok(decision)
@@ -7614,6 +7671,7 @@ impl Worker {
                     .await?;
             }
             Ok(decision) => {
+                let sticky_claim = self.sticky_claim(snapshot.as_ref(), &decision.commands)?;
                 let completion = self
                     .client
                     .complete_workflow_task_with_message_streams(
@@ -7623,9 +7681,11 @@ impl Worker {
                         decision.commands,
                         decision.message_stream_cursors,
                         decision.message_stream_waits,
+                        sticky_claim,
                     )
                     .await;
                 if let Err(error) = completion {
+                    self.discard_sticky_snapshot(snapshot.as_ref())?;
                     if !workflow_task_completion_is_terminal_timeout(
                         &error, task_id, attempt, run_id,
                     ) {
@@ -7635,6 +7695,7 @@ impl Worker {
             }
             Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
             Err(error) => {
+                self.discard_sticky_snapshot(snapshot.as_ref())?;
                 self.client
                     .fail_workflow_task(task_id, lease_owner, attempt, error.to_string())
                     .await?;
@@ -16237,6 +16298,19 @@ fn required_signal_wait_name(event: &HistoryEvent, sequence: u64) -> Result<Stri
 }
 
 fn is_recorded_signal_wait_event(event: &HistoryEvent) -> bool {
+    // Applying a buffered control-plane signal has no authored call sequence.
+    // Its outer sequence orders history events and must not become a wait.
+    if event.event_type == "SignalApplied"
+        && event
+            .payload
+            .get("signal_wait_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("signal-command:"))
+        && event.payload.get("sequence").is_none()
+        && event.payload.get("workflow_sequence").is_none()
+    {
+        return false;
+    }
     matches!(
         event.event_type.as_str(),
         "SignalWaitOpened" | "SignalApplied"

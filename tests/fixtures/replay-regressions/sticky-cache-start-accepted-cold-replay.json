@@ -1,0 +1,55 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-sticky-cache-start-accepted-cold-replay",
+  "protocol_version": "1.18",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.side-effect-version",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "worker_task": {
+    "sticky_cache_capacity": 1,
+    "sticky_replay_mode": "sticky_hit_expected",
+    "last_history_sequence": 4,
+    "total_history_events": 4,
+    "payload_codec": "avro"
+  },
+  "worker_registration": {
+    "build_id": "regression-corpus-build",
+    "capability_manifest": {
+      "sticky_execution": {
+        "supported": true,
+        "minimum_protocol_version": "1.18",
+        "implementation": "bounded_durable_history_cache"
+      }
+    }
+  },
+  "history": [
+    {"sequence": 1, "event_type": "StartAccepted", "payload": {}},
+    {"sequence": 2, "event_type": "WorkflowStarted", "payload": {}},
+    {
+      "sequence": 3,
+      "event_type": "SideEffectRecorded",
+      "payload": {
+        "sequence": 1,
+        "result": {"codec": "avro", "blob": "wwHioz3/VYAiNwoaY2FwdHVyZWQtb25jZQ=="}
+      }
+    },
+    {
+      "sequence": 4,
+      "event_type": "VersionMarkerRecorded",
+      "payload": {"sequence": 2, "change_id": "cold-restart", "version": 2, "min_supported": 1, "max_supported": 2}
+    }
+  ],
+  "command_sequence": [
+    {"type": "complete_workflow", "result": {"captured": "captured-once", "version": 2}}
+  ],
+  "expected": {
+    "side_effect_callback_calls": 0,
+    "type": "complete_workflow",
+    "result": {"captured": "captured-once", "version": 2},
+    "sticky_cache_metrics": {"hit": 0, "miss": 1, "eviction": 0, "forced_cold_replay": 1, "entries": 0, "history_bytes": 0}
+  }
+}
