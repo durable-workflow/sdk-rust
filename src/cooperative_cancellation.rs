@@ -2320,7 +2320,7 @@ impl ActivityClaimGuard {
         }
         self.observe().await?;
         let result = tokio::time::timeout(CONTROL_BUDGET, async {
-            let details = encode_typed_envelope(&AvroValue::from_serialize(&details)?, DEFAULT_CODEC)?;
+            let details = AvroValue::from_serialize(&details)?.into_json()?;
             self.boundary()?;
             let value: Value = self.client.request_json(
                 reqwest::Method::POST,

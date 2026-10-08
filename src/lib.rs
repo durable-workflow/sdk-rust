@@ -4335,6 +4335,10 @@ impl Client {
         )
     }
 
+    /// Record a flat map of scalar/null activity progress metadata.
+    ///
+    /// Heartbeat details use the Server's bounded JSON progress contract.
+    /// They are not workflow payload envelopes.
     pub async fn heartbeat_activity_task<T: Serialize>(
         &self,
         task_id: &str,
@@ -4356,7 +4360,7 @@ impl Client {
         lease_owner: &str,
         details: T,
     ) -> Result<Value> {
-        let details = encode_typed_envelope(&AvroValue::from_serialize(&details)?, DEFAULT_CODEC)?;
+        let details = AvroValue::from_serialize(&details)?.into_json()?;
         let body = json!({
             "activity_attempt_id": activity_attempt_id,
             "lease_owner": lease_owner,
@@ -25841,13 +25845,22 @@ mod tests {
             .build()
             .expect("client");
 
+        let details: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/activity-heartbeat-progress.json"
+        ))
+        .expect("heartbeat progress fixture");
+        // Every individual field fits Server's progress contract, while the
+        // obsolete encoded envelope exceeded its 191-character string limit.
+        assert!(
+            encode_typed_envelope(&AvroValue::from_serialize(&details).unwrap(), DEFAULT_CODEC)
+                .unwrap()["blob"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 191
+        );
         let heartbeat = client
-            .heartbeat_activity_task(
-                "activity-cancel",
-                "attempt-cancel",
-                "rust-worker",
-                typed_fidelity_probe(),
-            )
+            .heartbeat_activity_task("activity-cancel", "attempt-cancel", "rust-worker", &details)
             .await
             .expect("cancellation heartbeat");
         assert!(heartbeat.cancel_requested);
@@ -25856,12 +25869,9 @@ mod tests {
         assert_eq!(heartbeat.run_closed_reason.as_deref(), Some("cancelled"));
         let heartbeat_body =
             server.request_body("/api/worker/activity-tasks/activity-cancel/heartbeat");
-        assert_eq!(heartbeat_body["details"]["codec"], DEFAULT_CODEC);
-        assert_eq!(
-            decode_wire_avro_value(&heartbeat_body["details"], DEFAULT_CODEC)
-                .expect("typed heartbeat details"),
-            typed_fidelity_probe()
-        );
+        assert_eq!(heartbeat_body["details"], details);
+        assert_eq!(heartbeat_body["activity_attempt_id"], "attempt-cancel");
+        assert_eq!(heartbeat_body["lease_owner"], "rust-worker");
 
         let error = client
             .complete_activity_task(

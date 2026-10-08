@@ -1,0 +1,10 @@
+{
+  "case_id": "sample-app-activity-recovery-progress-heartbeat-php-rust",
+  "runtime": "rust",
+  "attempt": 1,
+  "step": 5,
+  "fraction": 0.5,
+  "ready": true,
+  "optional": null,
+  "note": "café ✓"
+}
