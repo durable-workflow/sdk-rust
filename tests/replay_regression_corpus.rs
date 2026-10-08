@@ -398,6 +398,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if !matches!(
         workflow_type,
         "corpus.side-effect-version"
+            | "corpus.update-snapshot"
             | "corpus.workflow-stream"
             | "corpus.message-stream-batch"
             | "corpus.message-stream-partial-batches"
@@ -427,7 +428,12 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if !input.is_array() {
         return Err(format!("{fixture_id}.workflow.input must be an array"));
     }
-    if input != json!([]) && workflow_type != "corpus.typed-replayed" {
+    if input != json!([])
+        && !matches!(
+            workflow_type,
+            "corpus.typed-replayed" | "corpus.update-snapshot"
+        )
+    {
         return Err(format!(
             "{fixture_id}.workflow.input must use the declared empty Avro corpus input"
         ));
@@ -469,6 +475,11 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     {
         task["workflow_command_id"] = workflow_command_id.clone();
     }
+    for field in ["workflow_update_id", "update_name"] {
+        if let Some(value) = fixture["worker_task"].get(field) {
+            task[field] = value.clone();
+        }
+    }
     let completion_storage_refusals = fixture["worker_task"]["completion_storage_refusals"]
         .as_u64()
         .unwrap_or(0);
@@ -490,6 +501,16 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             max_backoff: Duration::from_millis(1),
         });
     match workflow_type {
+        "corpus.update-snapshot" => {
+            worker.register_workflow(workflow_type, |_ctx, _input| async move { Ok(Value::Null) });
+            worker.register_update(workflow_type, "inspect", |ctx, arguments| async move {
+                Ok(json!({
+                    "workflow_input": ctx.workflow_input(),
+                    "signals": ctx.signals("changed"),
+                    "update_arguments": arguments,
+                }))
+            });
+        }
         "corpus.side-effect-version" => {
             worker.register_workflow(workflow_type, move |ctx, _input| {
                 let observed_calls = Arc::clone(&observed_calls);

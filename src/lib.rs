@@ -8523,15 +8523,19 @@ impl Worker {
             .and_then(|payload| payload.get("arguments"))
             .or(task.arguments.as_ref());
         let arguments = decode_task_avro_arguments(arguments, &task.payload_codec)?;
+        let workflow_input_avro_value =
+            decode_task_avro_arguments(task.arguments.as_ref(), &task.payload_codec)?;
+        let workflow_input = workflow_input_avro_value.clone().into_json()?;
+        let signal_events = history_signal_events(&task.history_events, None, &task.payload_codec)?;
         let context = QueryContext {
             workflow_id: task.workflow_id.clone(),
             run_id: task.run_id.clone(),
             workflow_type: task.workflow_type.clone(),
             run_status: Some("running".to_string()),
-            workflow_input: Value::Null,
-            workflow_input_avro_value: AvroValue::Null,
+            workflow_input,
+            workflow_input_avro_value,
             history_events: Arc::new(task.history_events.clone()),
-            signal_events: Arc::new(Vec::new()),
+            signal_events: Arc::new(signal_events),
         };
         let mut future = handler(context, arguments);
         let mut cx = TaskContext::from_waker(noop_waker_ref());
@@ -16961,24 +16965,32 @@ fn missing_payload(value: Option<&Value>) -> bool {
 }
 
 fn query_signal_events(task: &QueryTask) -> Result<Vec<QuerySignal>> {
-    let export_signals = task
-        .history_export
-        .as_ref()
+    history_signal_events(
+        &task.history_events,
+        task.history_export.as_ref(),
+        &task.payload_codec,
+    )
+}
+
+fn history_signal_events(
+    history_events: &[HistoryEvent],
+    history_export: Option<&Value>,
+    payload_codec: &str,
+) -> Result<Vec<QuerySignal>> {
+    let export_signals = history_export
         .and_then(|export| export.get("signals"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let export_codec = task
-        .history_export
-        .as_ref()
+    let export_codec = history_export
         .and_then(|export| export.get("payloads"))
         .and_then(|payloads| payloads.get("codec"))
         .and_then(Value::as_str)
-        .unwrap_or(&task.payload_codec);
+        .unwrap_or(payload_codec);
     let mut name_offsets: HashMap<String, usize> = HashMap::new();
     let mut signals = Vec::new();
 
-    for event in &task.history_events {
+    for event in history_events {
         if event.event_type != "SignalApplied" && event.event_type != "SignalReceived" {
             continue;
         }
@@ -19654,6 +19666,140 @@ mod tests {
                 .expect("query result"),
             expected.signed
         );
+    }
+
+    #[tokio::test]
+    async fn update_context_preserves_workflow_input_and_committed_signals() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("snapshot", |_ctx, _input| async move { Ok(Value::Null) });
+        let workflow_input = AvroValue::Array(vec![typed_fidelity_probe()]);
+        let signal_arguments = vec![AvroValue::Bytes(vec![0, 255]), AvroValue::Long(7)];
+        let expected_input = workflow_input.clone();
+        let expected_signals = signal_arguments.clone();
+        let handler = move |context: QueryContext, arguments: AvroValue| {
+            let expected_input = expected_input.clone();
+            let expected_signals = expected_signals.clone();
+            async move {
+                assert_eq!(context.workflow_id.as_deref(), Some("wf-snapshot"));
+                assert_eq!(context.run_id.as_deref(), Some("run-snapshot"));
+                assert_eq!(context.workflow_input_avro_value(), &expected_input);
+                assert_eq!(context.workflow_input(), &expected_input.into_json()?);
+                assert_eq!(
+                    context.signals_avro_value("changed"),
+                    vec![expected_signals.clone()]
+                );
+                assert_eq!(
+                    context.signals("changed"),
+                    vec![expected_signals
+                        .into_iter()
+                        .map(AvroValue::into_json)
+                        .collect::<Result<Vec<_>>>()?]
+                );
+                assert_eq!(
+                    context.signal_events()[0].id.as_deref(),
+                    Some("signal-original")
+                );
+                assert_eq!(context.signal_events()[0].workflow_sequence, Some(1));
+                Ok(arguments)
+            }
+        };
+        worker.register_query_avro_value("snapshot", "inspect", handler.clone());
+        worker.register_update_avro_value("snapshot", "inspect", handler);
+        let update_arguments = AvroValue::Array(vec![AvroValue::String("update-only".into())]);
+        let update_envelope =
+            encode_typed_envelope(&update_arguments, DEFAULT_CODEC).expect("update input");
+        let mut task = workflow_task(
+            "snapshot",
+            vec![
+                history_event(
+                    "SignalReceived",
+                    json!({
+                        "signal_id": "signal-original", "signal_name": "changed", "workflow_sequence": 1,
+                        "arguments": encode_typed_envelope(&AvroValue::Array(signal_arguments), DEFAULT_CODEC).expect("signal input"),
+                    }),
+                ),
+                history_event(
+                    "UpdateAccepted",
+                    json!({
+                        "update_id": "update-original", "update_name": "inspect", "arguments": update_envelope.clone(),
+                    }),
+                ),
+            ],
+            DEFAULT_CODEC,
+        );
+        task.arguments =
+            Some(encode_typed_envelope(&workflow_input, DEFAULT_CODEC).expect("workflow input"));
+        task.workflow_update_id = Some("update-original".into());
+        task.update_name = Some("inspect".into());
+        let query = QueryTask {
+            query_task_id: "query-snapshot".into(),
+            query_task_attempt: 1,
+            lease_owner: None,
+            workflow_id: task.workflow_id.clone(),
+            run_id: task.run_id.clone(),
+            workflow_type: task.workflow_type.clone(),
+            query_name: "inspect".into(),
+            payload_codec: DEFAULT_CODEC.into(),
+            workflow_arguments: task.arguments.clone(),
+            query_arguments: Some(update_envelope),
+            history_events: task.history_events.clone(),
+            history_export: None,
+            run_status: Some("running".into()),
+        };
+        assert_eq!(
+            worker
+                .execute_query_task(query)
+                .await
+                .expect("query snapshot"),
+            update_arguments
+        );
+        for _ in 0..2 {
+            let commands = worker
+                .execute_workflow_task(task.clone())
+                .expect("cold update snapshot");
+            assert_eq!(commands[0]["type"], "complete_update");
+            assert_eq!(commands[0]["update_id"], "update-original");
+            assert_eq!(
+                decode_wire_avro_value(&commands[0]["result"], DEFAULT_CODEC)
+                    .expect("update result"),
+                update_arguments
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_context_rejects_malformed_snapshot_before_handler() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_workflow("snapshot", |_ctx, _input| async move { Ok(Value::Null) });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        worker.register_update("snapshot", "inspect", move |_ctx, _arguments| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Value::Null) }
+        });
+        let mut task = workflow_task(
+            "snapshot",
+            vec![history_event(
+                "UpdateAccepted",
+                json!({
+                    "update_id": "update-original", "update_name": "inspect",
+                    "arguments": encode_value_envelope(&json!([3]), DEFAULT_CODEC).expect("update input"),
+                }),
+            )],
+            DEFAULT_CODEC,
+        );
+        task.workflow_update_id = Some("update-original".into());
+        task.update_name = Some("inspect".into());
+        let mut bad_input = task.clone();
+        bad_input.arguments = Some(json!({"codec": DEFAULT_CODEC, "blob": "invalid"}));
+        assert!(worker.execute_workflow_task(bad_input).is_err());
+        task.history_events.insert(0, history_event("SignalReceived", json!({
+            "signal_name": "changed", "arguments": {"codec": DEFAULT_CODEC, "blob": "invalid"},
+        })));
+        assert!(worker.execute_workflow_task(task).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
