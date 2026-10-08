@@ -17074,8 +17074,22 @@ fn history_signal_events(
         let index = duplicate.unwrap_or(signals.len());
         if let Some(index) = duplicate {
             let original = &mut signals[index];
+            let same_arguments = if event.event_type == "SignalApplied" {
+                if let Some(value) = event.payload.get("value") {
+                    let expected = match original.avro_arguments.as_slice() {
+                        [] => AvroValue::Boolean(true),
+                        [value] => value.clone(),
+                        values => AvroValue::Array(values.to_vec()),
+                    };
+                    decode_wire_avro_value(value, codec)? == expected
+                } else {
+                    original.avro_arguments == avro_arguments
+                }
+            } else {
+                original.avro_arguments == avro_arguments
+            };
             if original.name != name
-                || original.avro_arguments != avro_arguments
+                || !same_arguments
                 || matches!((original.id.as_deref(), id), (Some(first), Some(next)) if first != next)
             {
                 return Err(Error::Codec("conflicting committed signal identity".into()));
@@ -19814,7 +19828,7 @@ mod tests {
             "SignalApplied",
             json!({
                 "signal_id": "signal-first", "workflow_command_id": "command-first",
-                "signal_name": "changed", "value": arguments.clone(), "workflow_sequence": 1,
+                "signal_name": "changed", "value": encode_value_envelope(&json!(7), DEFAULT_CODEC).expect("applied value"), "workflow_sequence": 1,
             }),
         );
         let distinct = history_event(
@@ -19844,8 +19858,52 @@ mod tests {
         assert_eq!(signals[0].id.as_deref(), Some("signal-first"));
         let mut conflicting = applied;
         conflicting.payload["value"] =
-            encode_value_envelope(&json!([8]), DEFAULT_CODEC).expect("different input");
+            encode_value_envelope(&json!(8), DEFAULT_CODEC).expect("different input");
         assert!(history_signal_events(&[received, conflicting], None, DEFAULT_CODEC).is_err());
+    }
+
+    #[test]
+    fn committed_signal_snapshot_preserves_argument_vectors_after_application() {
+        for arguments in [
+            vec![],
+            vec![AvroValue::Array(vec![
+                AvroValue::Long(1),
+                AvroValue::Long(2),
+            ])],
+            vec![AvroValue::Bytes(vec![0, 255])],
+            vec![AvroValue::Null],
+            vec![AvroValue::Boolean(false)],
+            vec![
+                AvroValue::Long(1),
+                AvroValue::Array(vec![AvroValue::Long(2)]),
+            ],
+        ] {
+            let applied = match arguments.as_slice() {
+                [] => AvroValue::Boolean(true),
+                [value] => value.clone(),
+                values => AvroValue::Array(values.to_vec()),
+            };
+            let events = vec![
+                history_event(
+                    "SignalReceived",
+                    json!({
+                        "signal_id": "original", "signal_name": "changed",
+                        "arguments": encode_typed_envelope(&AvroValue::Array(arguments.clone()), DEFAULT_CODEC).expect("signal arguments"),
+                    }),
+                ),
+                history_event(
+                    "SignalApplied",
+                    json!({
+                        "signal_id": "original", "signal_name": "changed",
+                        "value": encode_typed_envelope(&applied, DEFAULT_CODEC).expect("application value"),
+                    }),
+                ),
+            ];
+            let signals = history_signal_events(&events, None, DEFAULT_CODEC)
+                .expect("canonical signal snapshot");
+            assert_eq!(signals.len(), 1);
+            assert_eq!(signals[0].avro_arguments, arguments);
+        }
     }
 
     #[tokio::test]

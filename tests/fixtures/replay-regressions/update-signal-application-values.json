@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-update-signal-application-values",
+  "supersedes": ["rust-update-signal-identity"],
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.update-snapshot", "input": [100], "payload_codec": "avro"},
+  "worker_task": {"payload_codec": "avro", "workflow_update_id": "update-original", "update_name": "inspect"},
+  "history": [
+    {
+      "event_type": "SignalReceived",
+      "payload": {
+        "signal_id": "signal-first", "workflow_command_id": "command-first",
+        "signal_name": "changed", "workflow_sequence": 1,
+        "arguments": {"codec": "avro", "blob": "wwHioz3/VYAiNwwCBA4A"}
+      }
+    },
+    {
+      "event_type": "SignalApplied",
+      "payload": {
+        "signal_id": "signal-first", "workflow_command_id": "command-first",
+        "signal_name": "changed", "workflow_sequence": 1,
+        "value": {"codec": "avro", "blob": "wwHioz3/VYAiNwQO"}
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "payload": {
+        "signal_id": "signal-second", "workflow_command_id": "command-second",
+        "signal_name": "changed", "workflow_sequence": 2,
+        "arguments": {"codec": "avro", "blob": "wwHioz3/VYAiNwwCBA4A"}
+      }
+    },
+    {
+      "event_type": "UpdateAccepted",
+      "payload": {
+        "update_id": "update-original", "update_name": "inspect",
+        "arguments": {"codec": "avro", "blob": "wwHioz3/VYAiNwwCBAYA"}
+      }
+    }
+  ],
+  "command_sequence": [
+    {"type": "complete_update", "update_id": "update-original",
+     "result": {"workflow_input": [100], "signals": [[7], [7]], "update_arguments": [3]}}
+  ],
+  "expected": {
+    "type": "complete_update", "update_id": "update-original",
+    "result": {"workflow_input": [100], "signals": [[7], [7]], "update_arguments": [3]}
+  }
+}
