@@ -9,6 +9,8 @@ mod cooperative_cancellation;
 mod local_activity;
 mod runtime_payloads;
 mod runtime_uploads;
+#[cfg(test)]
+mod sticky_workflow_cache;
 mod worker_session;
 
 pub use cancellation_context::{
