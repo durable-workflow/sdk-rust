@@ -9964,6 +9964,10 @@ impl WorkflowContext {
 
     /// Select the newest supported version for a change, or replay the version
     /// already committed for that stable change ID.
+    ///
+    /// An unmarked old history that reached its next durable operation, or
+    /// already completed, selects `-1` when that version is supported. This
+    /// leaves the original operation available and writes no additional marker.
     pub fn get_version(
         &self,
         change_id: impl Into<String>,
@@ -10027,11 +10031,33 @@ impl WorkflowContext {
                     state.version_markers.insert(change_id, (version, sequence));
                     Ok(version)
                 }
-                other => Err(command_mismatch(
-                    &other,
-                    format!("version marker:{change_id}"),
-                )),
+                other => {
+                    let version = -1;
+                    let sequence = other.sequence();
+                    ensure_version_supported(
+                        &change_id,
+                        version,
+                        min_supported,
+                        max_supported,
+                        sequence,
+                    )?;
+                    // The existing operation proves this patch site was reached
+                    // before its marker existed. Keep its original cursor.
+                    state.version_markers.insert(change_id, (version, sequence));
+                    Ok(version)
+                }
             };
+        }
+
+        if state
+            .history_events
+            .iter()
+            .any(|event| event.event_type == "WorkflowCompleted")
+        {
+            let version = -1;
+            ensure_version_supported(&change_id, version, min_supported, max_supported, 0)?;
+            state.version_markers.insert(change_id, (version, 0));
+            return Ok(version);
         }
 
         let version = max_supported;
@@ -18986,6 +19012,74 @@ mod tests {
             Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
                 if reason == "recorded_command_mismatch"
         ));
+    }
+
+    #[test]
+    fn legacy_patch_preserves_pending_and_completed_activity_history() {
+        for completed in [false, true] {
+            let mut history = vec![history_event(
+                "ActivityScheduled",
+                json!({"sequence": 1, "activity_type": "old"}),
+            )];
+            if completed {
+                history.push(history_event(
+                    "ActivityCompleted",
+                    json!({
+                        "sequence": 1,
+                        "activity_type": "old",
+                        "result": encode_value_envelope(&json!(41), DEFAULT_CODEC).unwrap(),
+                    }),
+                ));
+            }
+            for _cold_replay in 0..2 {
+                let ctx = workflow_context(history.clone());
+                assert!(!ctx.patched("added-step").expect("legacy patch decision"));
+                assert!(!ctx.patched("added-step").expect("same frozen decision"));
+                ctx.deprecate_patch("added-step")
+                    .expect("retained boundary");
+                let mut activity = Box::pin(ctx.activity("old", json!([])));
+                let mut context = TaskContext::from_waker(noop_waker_ref());
+                match activity.as_mut().poll(&mut context) {
+                    Poll::Ready(result) => {
+                        assert!(completed);
+                        assert_eq!(result.expect("recorded result"), json!(41));
+                        ctx.ensure_history_consumed().expect("old command retained");
+                    }
+                    Poll::Pending => assert!(!completed),
+                }
+                assert!(ctx.take_commands().expect("commands").is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_patch_preserves_an_unmarked_completed_workflow() {
+        let ctx = workflow_context(vec![history_event("WorkflowCompleted", json!({}))]);
+        assert!(!ctx.patched("added-step").expect("legacy completed run"));
+        ctx.deprecate_patch("added-step")
+            .expect("same legacy decision");
+        assert!(ctx.take_commands().expect("commands").is_empty());
+        ctx.ensure_history_consumed().expect("completed history");
+    }
+
+    #[test]
+    fn legacy_patch_rejects_a_range_without_the_original_branch() {
+        let ctx = workflow_context(vec![history_event(
+            "ActivityScheduled",
+            json!({"sequence": 1, "activity_type": "old"}),
+        )]);
+        let error = ctx
+            .get_version("added-step", 0, 1)
+            .expect_err("legacy is unsupported");
+        assert!(matches!(
+            error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "version_marker_incompatible_range"
+        ));
+        assert!(!ctx
+            .patched("supported-step")
+            .expect("failed check did not consume history"));
+        assert!(ctx.take_commands().expect("commands").is_empty());
     }
 
     #[test]
