@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-retained-conflicting-patch-markers",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.retained-patch-activity", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "VersionMarkerRecorded", "timestamp": "2026-10-10T21:47:29.120756Z", "payload": {"sequence": 1, "change_id": "retained-patch", "version": 1, "min_supported": -1, "max_supported": 1}},
+    {"event_type": "VersionMarkerRecorded", "timestamp": "2026-10-10T21:47:29.123604Z", "payload": {"sequence": 2, "change_id": "retained-patch", "version": -1, "min_supported": -1, "max_supported": 1}}
+  ],
+  "command_sequence": [{"type": "complete_workflow", "result": {"first": true, "second": true, "result": "unexpected"}}],
+  "expected": {"type": "complete_workflow", "result": {"first": true, "second": true, "result": "unexpected"}},
+  "expected_failure": "version_marker_conflict"
+}

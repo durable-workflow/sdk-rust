@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.4.3
+
+- Replay consistent historical patch markers written by older workers at their
+  original positions. Repeated calls consume matching aliases without skipping
+  intervening operations or changing recorded history and timestamps. Fresh
+  decisions remain deduplicated. Reject conflicting selected versions, malformed
+  ranges and duplicate records of one physical command. A failed supported-range
+  check leaves replay at its original boundary.
+
 ## 3.4.2
 
 - Select the original branch when a patch is added before an unmarked recorded
