@@ -417,6 +417,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         workflow_type,
         "corpus.side-effect-version"
             | "corpus.legacy-patch-activity"
+            | "corpus.retained-patch-activity"
             | "corpus.update-snapshot"
             | "corpus.workflow-stream"
             | "corpus.message-stream-batch"
@@ -533,6 +534,15 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.retained-patch-activity" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let first = ctx.patched("retained-patch")?;
+                let second = ctx.patched("retained-patch")?;
+                ctx.deprecate_patch("retained-patch")?;
+                let result = ctx.activity("old", json!([])).await?;
+                Ok(json!({"first": first, "second": second, "result": result}))
+            });
+        }
         "corpus.legacy-patch-activity" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
                 let first = ctx.patched("added-step")?;

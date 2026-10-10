@@ -19082,6 +19082,114 @@ mod tests {
         assert!(ctx.take_commands().expect("commands").is_empty());
     }
 
+    fn retained_patch_marker(sequence: u64, version: i32, time: &str) -> HistoryEvent {
+        let mut event = history_event(
+            "VersionMarkerRecorded",
+            json!({
+                "sequence": sequence,
+                "change_id": "retained-patch",
+                "version": version,
+                "min_supported": -1,
+                "max_supported": 1,
+            }),
+        );
+        event.raw.insert("timestamp".into(), json!(time));
+        event
+    }
+
+    #[test]
+    fn retained_patch_markers_preserve_each_original_boundary() {
+        for completed in [false, true] {
+            let mut history = vec![
+                retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"),
+                retained_patch_marker(2, 1, "2026-10-10T21:47:29.123604Z"),
+                history_event(
+                    "ActivityScheduled",
+                    json!({"sequence": 3, "activity_type": "old"}),
+                ),
+            ];
+            if completed {
+                history.push(history_event(
+                    "ActivityCompleted",
+                    json!({
+                        "sequence": 3,
+                        "activity_type": "old",
+                        "result": fixture_envelope(json!(41)),
+                    }),
+                ));
+            }
+            for _cold_replay in 0..2 {
+                let ctx = workflow_context(history.clone());
+                assert!(ctx.patched("retained-patch").unwrap());
+                assert_eq!(ctx.state.lock().unwrap().command_cursor, 1);
+                assert!(ctx.patched("retained-patch").unwrap());
+                assert_eq!(ctx.state.lock().unwrap().command_cursor, 2);
+                ctx.deprecate_patch("retained-patch").unwrap();
+                assert_eq!(ctx.state.lock().unwrap().command_cursor, 2);
+                let mut activity = Box::pin(ctx.activity("old", json!([])));
+                let mut context = TaskContext::from_waker(noop_waker_ref());
+                match activity.as_mut().poll(&mut context) {
+                    Poll::Ready(result) => {
+                        assert!(completed);
+                        assert_eq!(result.unwrap(), json!(41));
+                        ctx.ensure_history_consumed().unwrap();
+                    }
+                    Poll::Pending => assert!(!completed),
+                }
+                assert!(ctx.take_commands().unwrap().is_empty());
+                let state = ctx.state.lock().unwrap();
+                for (actual, original) in state.history_events.iter().zip(&history) {
+                    assert_eq!(actual.payload, original.payload);
+                    assert_eq!(actual.raw, original.raw);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_patch_aliases_do_not_skip_intervening_operations() {
+        let ctx = workflow_context(vec![
+            retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"),
+            history_event("SideEffectRecorded", json!({
+                "sequence": 2, "result": fixture_envelope(json!("between")),
+            })),
+            retained_patch_marker(3, 1, "2026-10-10T21:47:29.123604Z"),
+            history_event("VersionMarkerRecorded", json!({
+                "sequence": 4, "change_id": "other-patch", "version": 1,
+                "min_supported": -1, "max_supported": 1,
+            })),
+        ]);
+        assert!(ctx.patched("retained-patch").unwrap());
+        assert!(ctx.patched("retained-patch").unwrap());
+        assert_eq!(ctx.state.lock().unwrap().command_cursor, 1);
+        assert_eq!(ctx.side_effect(|| "must not execute".to_string()).unwrap(), "between");
+        ctx.deprecate_patch("retained-patch").unwrap();
+        assert_eq!(ctx.state.lock().unwrap().command_cursor, 3);
+        ctx.deprecate_patch("retained-patch").unwrap();
+        assert_eq!(ctx.state.lock().unwrap().command_cursor, 3);
+        assert!(ctx.patched("other-patch").unwrap());
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_patch_alias_range_validation_leaves_the_cursor_unchanged() {
+        let mut alias = retained_patch_marker(2, 1, "2026-10-10T21:47:29.123604Z");
+        alias.payload["max_supported"] = json!(3);
+        let ctx = workflow_context(vec![
+            retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"), alias,
+        ]);
+        assert_eq!(ctx.get_version("retained-patch", -1, 2).unwrap(), 1);
+        let error = ctx.get_version("retained-patch", 2, 3).unwrap_err();
+        assert!(matches!(error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "version_marker_incompatible_range"));
+        assert_eq!(ctx.state.lock().unwrap().command_cursor, 1);
+        assert_eq!(ctx.get_version("retained-patch", -1, 3).unwrap(), 1);
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+
     #[test]
     fn version_markers_replay_across_upgrades_and_do_not_duplicate() {
         let ctx = workflow_context(Vec::new());
