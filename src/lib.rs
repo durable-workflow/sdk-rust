@@ -28532,6 +28532,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_registration_keeps_the_original_workflow() {
+        let client = Client::new("http://127.0.0.1:9").expect("client");
+        let mut worker = Worker::new(client, "registration-tests");
+        worker.register_workflow("same", |_ctx, _input| async { Ok(json!("first")) });
+        let original = Arc::clone(&worker.workflows["same"].execute);
+        worker.register_typed_workflow("same", |_ctx, _input: Value| async {
+            Ok(json!("second"))
+        });
+        assert!(Arc::ptr_eq(&original, &worker.workflows["same"].execute));
+    }
+
+    #[test]
+    fn duplicate_registration_keeps_the_original_activity() {
+        let client = Client::new("http://127.0.0.1:9").expect("client");
+        let mut worker = Worker::new(client, "registration-tests");
+        worker.register_activity("same", |_ctx, _input| async { Ok(json!("first")) });
+        let original = Arc::clone(&worker.activities["same"]);
+        worker.register_activity_avro_value("same", |_ctx, _input| async {
+            Ok(AvroValue::String("second".into()))
+        });
+        assert!(Arc::ptr_eq(&original, &worker.activities["same"]));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_fails_before_server_contact() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url()).build().expect("client");
+        let mut worker = Worker::new(client, "registration-tests")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("same", |_ctx, _input| async { Ok(json!("first")) });
+        worker.register_workflow("same", |_ctx, _input| async { Ok(json!("second")) });
+        let error = worker.run_once().await.expect_err("ambiguous worker must not poll");
+        assert!(error.to_string().contains("duplicate_registration"), "{error}");
+        assert!(server.requests.lock().expect("requests").is_empty());
+    }
+
     #[derive(Clone, Debug)]
     struct CapturedRequest {
         headers: String,
