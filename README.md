@@ -76,6 +76,23 @@ The namespace runtime URL is already complete. Do not append another `/api`.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Handler registration
+
+Register each workflow and activity wire name once per Worker. Named query and
+update handlers are also scoped to their workflow type. Dynamic, typed, Avro and
+replayed adapters share these namespaces. Repeating a registration, including
+the same callback, is an error. Different Workers or handler kinds may reuse a
+name, and queries or updates on different workflow types may reuse a name.
+
+Registration methods keep their existing signatures. A duplicate preserves the
+first handler and invalidates that Worker. Call `worker.validate_registration()?`
+after configuring it for a local check. `register`, `run`, `run_until` and
+`run_once` also reject it before contacting Server with
+`Error::DuplicateRegistration`. The diagnostic exposes the handler kind, wire
+name, optional workflow scope, and both source locations and authoring adapters.
+Construct a new Worker to correct an invalid configuration. Choose the desired
+handler before registration instead of relying on replacement order.
+
 After registering a workflow, declare every signal name it reads through
 `wait_signal` or `signals` before starting the worker:
 

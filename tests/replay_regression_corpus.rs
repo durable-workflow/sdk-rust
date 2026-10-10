@@ -536,12 +536,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     }
     match workflow_type {
         "corpus.duplicate-registration" => {
-            worker.register_workflow(workflow_type, |_ctx, _input| async {
-                Ok(json!("first"))
-            });
-            worker.register_workflow(workflow_type, |_ctx, _input| async {
-                Ok(json!("second"))
-            });
+            worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("first")) });
+            worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("second")) });
         }
         "corpus.retained-patch-activity" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
