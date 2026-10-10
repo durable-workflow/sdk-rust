@@ -240,8 +240,6 @@ pub enum Error {
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
     ActivityNotRegistered(String),
-    #[error(transparent)]
-    DuplicateRegistration(Box<DuplicateRegistrationError>),
     #[error(
         "{handler_kind} handler {handler_name:?} {value_kind} type {rust_type} is incompatible with the fixed Avro Value codec: {message}"
     )]
@@ -361,6 +359,12 @@ pub struct DuplicateRegistrationError {
     pub workflow_type: Option<String>,
     pub first_definition: HandlerRegistration,
     pub second_definition: HandlerRegistration,
+}
+
+impl From<DuplicateRegistrationError> for Error {
+    fn from(error: DuplicateRegistrationError) -> Self {
+        Self::WorkerLoop(error.to_string())
+    }
 }
 
 /// Validation failure for a durable condition-wait definition.
@@ -6685,9 +6689,9 @@ impl Worker {
     /// the original handler and makes this Worker invalid, including its clones.
     /// `register`, `run`, `run_until` and `run_once` enforce this check before
     /// any network request. Build a new Worker to correct an invalid configuration.
-    pub fn validate_registration(&self) -> Result<()> {
+    pub fn validate_registration(&self) -> std::result::Result<(), DuplicateRegistrationError> {
         match &self.registration_error {
-            Some(error) => Err(Error::DuplicateRegistration(Box::new(error.clone()))),
+            Some(error) => Err(error.clone()),
             None => Ok(()),
         }
     }

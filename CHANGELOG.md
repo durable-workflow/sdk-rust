@@ -5,10 +5,12 @@
 - Reject duplicate workflow, activity, query and update handler names before
   contacting Server. Dynamic, typed, Avro and replayed adapters share their
   handler namespaces. Preserve the original registration and report both source
-  locations and adapters through `Error::DuplicateRegistration`. Existing
-  registration method signatures remain unchanged. `validate_registration`
-  provides an explicit local check, also enforced by every worker startup and
-  polling entry point. Query/update names remain scoped to their workflow type.
+  locations and adapters through `DuplicateRegistrationError` from local
+  validation. Existing registration method signatures and the `Error` enum
+  remain unchanged. Startup returns its existing `WorkerLoop` error with the
+  duplicate diagnostic. `validate_registration` provides an explicit local
+  check, also enforced by every worker startup and polling entry point.
+  Query/update names remain scoped to their workflow type.
 
 ## 3.4.3
 

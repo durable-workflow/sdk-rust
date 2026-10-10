@@ -124,11 +124,9 @@ fn every_registration_adapter_rejects_same_kind_duplicates() {
                 first(&mut worker, "orders", "same");
                 worker.validate_registration().expect("first admission");
                 second(&mut worker, "orders", "same");
-                let Error::DuplicateRegistration(error) =
-                    worker.validate_registration().expect_err("duplicate")
-                else {
-                    panic!("expected structured duplicate diagnostic");
-                };
+                let error = worker
+                    .validate_registration()
+                    .expect_err("structured duplicate diagnostic");
                 assert_eq!(error.handler_kind, kind);
                 assert_eq!(error.handler_name, "same");
                 assert_eq!(
@@ -254,7 +252,7 @@ async fn every_worker_network_entry_point_rejects_without_connecting() {
         .await
         .expect("local rejection is immediate");
         assert!(
-            matches!(result, Err(Error::DuplicateRegistration(_))),
+            matches!(&result, Err(Error::WorkerLoop(message)) if message.contains("duplicate_registration")),
             "{result:?}"
         );
         assert_eq!(

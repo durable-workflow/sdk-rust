@@ -87,9 +87,12 @@ name, and queries or updates on different workflow types may reuse a name.
 Registration methods keep their existing signatures. A duplicate preserves the
 first handler and invalidates that Worker. Call `worker.validate_registration()?`
 after configuring it for a local check. `register`, `run`, `run_until` and
-`run_once` also reject it before contacting Server with
-`Error::DuplicateRegistration`. The diagnostic exposes the handler kind, wire
-name, optional workflow scope, and both source locations and authoring adapters.
+`run_once` also reject it before contacting Server with `Error::WorkerLoop`
+and a `duplicate_registration` diagnostic. Local validation returns the typed
+`DuplicateRegistrationError`, exposing the handler kind, wire name, optional
+workflow scope, and both source locations and authoring adapters. It converts
+into the existing worker-error variant when used with `?`, preserving exhaustive
+matches on the SDK's existing `Error` enum.
 Construct a new Worker to correct an invalid configuration. Choose the desired
 handler before registration instead of relying on replacement order.
 
