@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-ambiguous-worker-registration-rejected",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.duplicate-registration",
+    "input": [],
+    "payload_codec": "avro",
+    "worker_registrations": ["corpus.duplicate-registration", "corpus.duplicate-registration"]
+  },
+  "history": [{"event_type": "WorkflowStarted", "payload": {"payload_codec": "avro"}}],
+  "expected": {"error": "duplicate_registration"},
+  "expected_failure": "duplicate_registration"
+}

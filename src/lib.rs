@@ -309,6 +309,64 @@ pub enum Error {
     ContinueAsNew(ContinueAsNewRequest),
 }
 
+/// Handler namespaces checked independently within a Worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RegistrationKind {
+    Workflow,
+    Activity,
+    Query,
+    Update,
+}
+
+impl std::fmt::Display for RegistrationKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+            Self::Query => "query",
+            Self::Update => "update",
+        })
+    }
+}
+
+/// The authoring adapter and source location of a handler registration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandlerRegistration {
+    pub method: &'static str,
+    pub handler_type: &'static str,
+    pub file: &'static str,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl std::fmt::Display for HandlerRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} at {}:{}:{} ({})",
+            self.method, self.file, self.line, self.column, self.handler_type
+        )
+    }
+}
+
+/// Ambiguous local configuration, rejected before contacting Server.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("duplicate_registration: {handler_kind} name {handler_name:?} in workflow scope {workflow_type:?}; first {first_definition}; conflicting {second_definition}")]
+pub struct DuplicateRegistrationError {
+    pub handler_kind: RegistrationKind,
+    pub handler_name: String,
+    /// Query/update registrations are scoped to their owning workflow type.
+    pub workflow_type: Option<String>,
+    pub first_definition: HandlerRegistration,
+    pub second_definition: HandlerRegistration,
+}
+
+impl From<DuplicateRegistrationError> for Error {
+    fn from(error: DuplicateRegistrationError) -> Self {
+        Self::WorkerLoop(error.to_string())
+    }
+}
+
 /// Validation failure for a durable condition-wait definition.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ConditionWaitOptionsError {
@@ -6468,6 +6526,9 @@ pub struct Worker {
     queries: HashMap<String, HashMap<String, RegisteredQuery>>,
     signals: HashMap<String, Vec<String>>,
     updates: HashMap<String, HashMap<String, UpdateHandler>>,
+    registration_definitions:
+        HashMap<(RegistrationKind, Option<String>, String), HandlerRegistration>,
+    registration_error: Option<DuplicateRegistrationError>,
     max_concurrent_workflow_tasks: usize,
     max_concurrent_activity_tasks: usize,
     poll_timeout: Duration,
@@ -6498,6 +6559,8 @@ impl Worker {
             queries: HashMap::new(),
             signals: HashMap::new(),
             updates: HashMap::new(),
+            registration_definitions: HashMap::new(),
+            registration_error: None,
             max_concurrent_workflow_tasks: 10,
             max_concurrent_activity_tasks: 10,
             poll_timeout: Duration::from_secs(30),
@@ -6620,20 +6683,80 @@ impl Worker {
         self
     }
 
+    /// Validate local handler admission without making a Server request.
+    ///
+    /// Registration methods retain their existing signatures. A duplicate keeps
+    /// the original handler and makes this Worker invalid, including its clones.
+    /// `register`, `run`, `run_until` and `run_once` enforce this check before
+    /// any network request. Build a new Worker to correct an invalid configuration.
+    pub fn validate_registration(&self) -> std::result::Result<(), DuplicateRegistrationError> {
+        match &self.registration_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    #[track_caller]
+    fn admit_registration<F>(
+        &mut self,
+        handler_kind: RegistrationKind,
+        workflow_type: Option<&str>,
+        handler_name: &str,
+        method: &'static str,
+    ) -> bool {
+        let location = std::panic::Location::caller();
+        let definition = HandlerRegistration {
+            method,
+            handler_type: type_name::<F>(),
+            file: location.file(),
+            line: location.line(),
+            column: location.column(),
+        };
+        let key = (
+            handler_kind,
+            workflow_type.map(str::to_owned),
+            handler_name.to_owned(),
+        );
+        if let Some(first_definition) = self.registration_definitions.get(&key) {
+            if self.registration_error.is_none() {
+                self.registration_error = Some(DuplicateRegistrationError {
+                    handler_kind,
+                    workflow_type: key.1.clone(),
+                    handler_name: key.2.clone(),
+                    first_definition: first_definition.clone(),
+                    second_definition: definition,
+                });
+            }
+            return false;
+        }
+        self.registration_definitions.insert(key, definition);
+        true
+    }
+
     /// Register a workflow handler.
     ///
     /// An uncaught [`enum@Error`] returned by the handler fails the workflow run and
     /// is reported to clients as [`Error::WorkflowFailed`]. Errors that occur
     /// while acquiring or decoding a worker task remain worker-operation
     /// failures and do not get converted into workflow outcomes.
+    #[track_caller]
     pub fn register_workflow<F, Fut>(&mut self, workflow_type: impl Into<String>, handler: F)
     where
         F: Fn(WorkflowContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Workflow,
+            None,
+            &workflow_type,
+            "register_workflow",
+        ) {
+            return;
+        }
         let handler = Arc::new(handler);
         self.workflows.insert(
-            workflow_type.into(),
+            workflow_type,
             RegisteredWorkflow {
                 execute: Arc::new(move |ctx, input| {
                     let handler = Arc::clone(&handler);
@@ -6659,6 +6782,7 @@ impl Worker {
     /// See the runnable
     /// [`hello_world` example](https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs)
     /// for typed workflow and activity contracts with retry and timeout policy.
+    #[track_caller]
     pub fn register_typed_workflow<I, O, F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -6670,6 +6794,14 @@ impl Worker {
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
         let workflow_type = workflow_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Workflow,
+            None,
+            &workflow_type,
+            "register_typed_workflow",
+        ) {
+            return;
+        }
         let handler_name = workflow_type.clone();
         let handler = Arc::new(handler);
         self.workflows.insert(
@@ -6693,6 +6825,7 @@ impl Worker {
     }
 
     /// Register a workflow on the lossless fixed Avro Value surface.
+    #[track_caller]
     pub fn register_workflow_avro_value<F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -6701,8 +6834,17 @@ impl Worker {
         F: Fn(WorkflowContext, AvroValue) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Workflow,
+            None,
+            &workflow_type,
+            "register_workflow_avro_value",
+        ) {
+            return;
+        }
         self.workflows.insert(
-            workflow_type.into(),
+            workflow_type,
             RegisteredWorkflow {
                 execute: Arc::new(move |ctx, input| Box::pin(handler(ctx, input))),
                 replay: None,
@@ -6719,6 +6861,7 @@ impl Worker {
     /// transitions: it updates [`WorkflowInstance`] after activities and signals
     /// resolve. Query replay runs this same handler over committed history and
     /// discards any commands it would emit.
+    #[track_caller]
     pub fn register_replayed_workflow<S, Factory, F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -6730,6 +6873,15 @@ impl Worker {
         F: Fn(WorkflowContext, Value, WorkflowInstance<S>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Workflow,
+            None,
+            &workflow_type,
+            "register_replayed_workflow",
+        ) {
+            return;
+        }
         let state_factory = Arc::new(state_factory);
         let handler = Arc::new(handler);
 
@@ -6761,7 +6913,7 @@ impl Worker {
         });
 
         self.workflows.insert(
-            workflow_type.into(),
+            workflow_type,
             RegisteredWorkflow {
                 execute,
                 replay: Some(replay),
@@ -6776,6 +6928,7 @@ impl Worker {
     /// Normal task execution and instance-state query replay both decode and
     /// encode through the fixed Avro Value codec. The state factory and handler
     /// otherwise follow [`Worker::register_replayed_workflow`].
+    #[track_caller]
     pub fn register_typed_replayed_workflow<I, O, S, Factory, F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -6790,6 +6943,14 @@ impl Worker {
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
         let workflow_type = workflow_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Workflow,
+            None,
+            &workflow_type,
+            "register_typed_replayed_workflow",
+        ) {
+            return;
+        }
         let state_factory = Arc::new(state_factory);
         let handler = Arc::new(handler);
 
@@ -6876,8 +7037,8 @@ impl Worker {
     /// Bind a registered workflow to compile-time embedded source for safe redrive.
     ///
     /// Supply `include_str!` values for the workflow body and every helper whose
-    /// behavior can affect replay. A handler re-registration clears the local
-    /// identity; call this after registering the final handler. The server
+    /// behavior can affect replay. Register the workflow once, then set its
+    /// identity before starting the worker. Duplicate registrations are invalid. The server
     /// rejects reusing a worker ID when its prior fingerprint disappears.
     /// Workflows without source identity remain runnable but cannot be safely redriven.
     /// For example, pass `&[include_str!("workflows.rs")]` when the handler and
@@ -6908,6 +7069,7 @@ impl Worker {
     }
 
     /// Register a replayable workflow on the lossless fixed Avro Value surface.
+    #[track_caller]
     pub fn register_replayed_workflow_avro_value<S, Factory, F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -6919,6 +7081,15 @@ impl Worker {
         F: Fn(WorkflowContext, AvroValue, WorkflowInstance<S>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Workflow,
+            None,
+            &workflow_type,
+            "register_replayed_workflow_avro_value",
+        ) {
+            return;
+        }
         let state_factory = Arc::new(state_factory);
         let handler = Arc::new(handler);
 
@@ -6941,7 +7112,7 @@ impl Worker {
         });
 
         self.workflows.insert(
-            workflow_type.into(),
+            workflow_type,
             RegisteredWorkflow {
                 execute,
                 replay: Some(replay),
@@ -6951,14 +7122,24 @@ impl Worker {
         );
     }
 
+    #[track_caller]
     pub fn register_activity<F, Fut>(&mut self, activity_type: impl Into<String>, handler: F)
     where
         F: Fn(ActivityContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let activity_type = activity_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Activity,
+            None,
+            &activity_type,
+            "register_activity",
+        ) {
+            return;
+        }
         let handler = Arc::new(handler);
         self.activities.insert(
-            activity_type.into(),
+            activity_type,
             Arc::new(move |ctx, args| {
                 let handler = Arc::clone(&handler);
                 Box::pin(async move {
@@ -6974,6 +7155,7 @@ impl Worker {
     /// Inputs and results use the platform's fixed Avro Value schema. Shape
     /// mismatches and unsupported Serde values return [`Error::HandlerType`]
     /// with the activity name and Rust type.
+    #[track_caller]
     pub fn register_typed_activity<I, O, F, Fut>(
         &mut self,
         activity_type: impl Into<String>,
@@ -6985,6 +7167,14 @@ impl Worker {
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
         let activity_type = activity_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Activity,
+            None,
+            &activity_type,
+            "register_typed_activity",
+        ) {
+            return;
+        }
         let handler_name = activity_type.clone();
         let handler = Arc::new(handler);
         self.activities.insert(
@@ -7003,6 +7193,7 @@ impl Worker {
     }
 
     /// Register an activity on the lossless fixed Avro Value surface.
+    #[track_caller]
     pub fn register_activity_avro_value<F, Fut>(
         &mut self,
         activity_type: impl Into<String>,
@@ -7011,8 +7202,17 @@ impl Worker {
         F: Fn(ActivityContext, AvroValue) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
+        let activity_type = activity_type.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Activity,
+            None,
+            &activity_type,
+            "register_activity_avro_value",
+        ) {
+            return;
+        }
         self.activities.insert(
-            activity_type.into(),
+            activity_type,
             Arc::new(move |ctx, args| Box::pin(handler(ctx, args))),
         );
     }
@@ -7022,6 +7222,7 @@ impl Worker {
     /// The workflow type must also be registered with [`Worker::register_workflow`]
     /// before the worker runs. The handler receives only an immutable committed
     /// state snapshot and normalized query arguments.
+    #[track_caller]
     pub fn register_query<F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -7031,23 +7232,31 @@ impl Worker {
         F: Fn(QueryContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        let query_name = query_name.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Query,
+            Some(&workflow_type),
+            &query_name,
+            "register_query",
+        ) {
+            return;
+        }
         let handler = Arc::new(handler);
-        self.queries
-            .entry(workflow_type.into())
-            .or_default()
-            .insert(
-                query_name.into(),
-                RegisteredQuery::Snapshot(Arc::new(move |ctx, args| {
-                    let handler = Arc::clone(&handler);
-                    Box::pin(async move {
-                        let result = handler(ctx, args.into_json()?).await?;
-                        AvroValue::from_serialize(&result)
-                    })
-                })),
-            );
+        self.queries.entry(workflow_type).or_default().insert(
+            query_name,
+            RegisteredQuery::Snapshot(Arc::new(move |ctx, args| {
+                let handler = Arc::clone(&handler);
+                Box::pin(async move {
+                    let result = handler(ctx, args.into_json()?).await?;
+                    AvroValue::from_serialize(&result)
+                })
+            })),
+        );
     }
 
     /// Register a query handler on the lossless fixed Avro Value surface.
+    #[track_caller]
     pub fn register_query_avro_value<F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -7057,13 +7266,20 @@ impl Worker {
         F: Fn(QueryContext, AvroValue) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
-        self.queries
-            .entry(workflow_type.into())
-            .or_default()
-            .insert(
-                query_name.into(),
-                RegisteredQuery::Snapshot(Arc::new(move |ctx, args| Box::pin(handler(ctx, args)))),
-            );
+        let workflow_type = workflow_type.into();
+        let query_name = query_name.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Query,
+            Some(&workflow_type),
+            &query_name,
+            "register_query_avro_value",
+        ) {
+            return;
+        }
+        self.queries.entry(workflow_type).or_default().insert(
+            query_name,
+            RegisteredQuery::Snapshot(Arc::new(move |ctx, args| Box::pin(handler(ctx, args)))),
+        );
     }
 
     /// Register a named query against deterministically replayed instance state.
@@ -7072,6 +7288,7 @@ impl Worker {
     /// same state type `S`. The handler receives an immutable, detached state
     /// clone, so successful and failed queries cannot affect workflow execution
     /// or the state reconstructed by a later query.
+    #[track_caller]
     pub fn register_replayed_query<S, F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -7082,6 +7299,16 @@ impl Worker {
         F: Fn(QueryContext, Arc<S>, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        let query_name = query_name.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Query,
+            Some(&workflow_type),
+            &query_name,
+            "register_replayed_query",
+        ) {
+            return;
+        }
         let handler = Arc::new(handler);
         let erased_handler: ReplayedQueryHandler = Arc::new(move |ctx, state, args| {
             let state = state.downcast::<S>().map_err(|_| {
@@ -7094,19 +7321,17 @@ impl Worker {
             }))
         });
 
-        self.queries
-            .entry(workflow_type.into())
-            .or_default()
-            .insert(
-                query_name.into(),
-                RegisteredQuery::Replayed {
-                    state_type: TypeId::of::<S>(),
-                    handler: erased_handler,
-                },
-            );
+        self.queries.entry(workflow_type).or_default().insert(
+            query_name,
+            RegisteredQuery::Replayed {
+                state_type: TypeId::of::<S>(),
+                handler: erased_handler,
+            },
+        );
     }
 
     /// Register a replayed-state query on the lossless fixed Avro Value surface.
+    #[track_caller]
     pub fn register_replayed_query_avro_value<S, F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -7117,6 +7342,16 @@ impl Worker {
         F: Fn(QueryContext, Arc<S>, AvroValue) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        let query_name = query_name.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Query,
+            Some(&workflow_type),
+            &query_name,
+            "register_replayed_query_avro_value",
+        ) {
+            return;
+        }
         let handler = Arc::new(handler);
         let erased_handler: ReplayedQueryHandler = Arc::new(move |ctx, state, args| {
             let state = state.downcast::<S>().map_err(|_| {
@@ -7125,19 +7360,17 @@ impl Worker {
             Ok(Box::pin(handler(ctx, state, args)))
         });
 
-        self.queries
-            .entry(workflow_type.into())
-            .or_default()
-            .insert(
-                query_name.into(),
-                RegisteredQuery::Replayed {
-                    state_type: TypeId::of::<S>(),
-                    handler: erased_handler,
-                },
-            );
+        self.queries.entry(workflow_type).or_default().insert(
+            query_name,
+            RegisteredQuery::Replayed {
+                state_type: TypeId::of::<S>(),
+                handler: erased_handler,
+            },
+        );
     }
 
     /// Register a synchronous workflow update handler.
+    #[track_caller]
     pub fn register_update<F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -7147,23 +7380,31 @@ impl Worker {
         F: Fn(QueryContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
+        let workflow_type = workflow_type.into();
+        let update_name = update_name.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Update,
+            Some(&workflow_type),
+            &update_name,
+            "register_update",
+        ) {
+            return;
+        }
         let handler = Arc::new(handler);
-        self.updates
-            .entry(workflow_type.into())
-            .or_default()
-            .insert(
-                update_name.into(),
-                Arc::new(move |ctx, args| {
-                    let handler = Arc::clone(&handler);
-                    Box::pin(async move {
-                        let result = handler(ctx, args.into_json()?).await?;
-                        AvroValue::from_serialize(&result)
-                    })
-                }),
-            );
+        self.updates.entry(workflow_type).or_default().insert(
+            update_name,
+            Arc::new(move |ctx, args| {
+                let handler = Arc::clone(&handler);
+                Box::pin(async move {
+                    let result = handler(ctx, args.into_json()?).await?;
+                    AvroValue::from_serialize(&result)
+                })
+            }),
+        );
     }
 
     /// Register an update handler on the lossless fixed Avro Value surface.
+    #[track_caller]
     pub fn register_update_avro_value<F, Fut>(
         &mut self,
         workflow_type: impl Into<String>,
@@ -7173,16 +7414,24 @@ impl Worker {
         F: Fn(QueryContext, AvroValue) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<AvroValue>> + Send + 'static,
     {
-        self.updates
-            .entry(workflow_type.into())
-            .or_default()
-            .insert(
-                update_name.into(),
-                Arc::new(move |ctx, args| Box::pin(handler(ctx, args))),
-            );
+        let workflow_type = workflow_type.into();
+        let update_name = update_name.into();
+        if !self.admit_registration::<F>(
+            RegistrationKind::Update,
+            Some(&workflow_type),
+            &update_name,
+            "register_update_avro_value",
+        ) {
+            return;
+        }
+        self.updates.entry(workflow_type).or_default().insert(
+            update_name,
+            Arc::new(move |ctx, args| Box::pin(handler(ctx, args))),
+        );
     }
 
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
+        self.validate_registration()?;
         self.sticky_registration_confirmed
             .store(false, Ordering::SeqCst);
         self.session_registration_confirmed
@@ -7535,6 +7784,7 @@ impl Worker {
     /// Direct callers of [`Client::complete_workflow_task`] continue to receive
     /// the original [`Error::Http`] status and response body.
     pub async fn run_once(&self) -> Result<usize> {
+        self.validate_registration()?;
         if self.client.worker_sessions_enabled {
             self.require_session_registration()?;
         }
@@ -26576,13 +26826,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rust_worker_advertises_source_backed_definition_and_clears_it_on_reregistration() {
+    async fn rust_worker_advertises_source_identity_without_reusing_it_for_a_new_handler() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(2))
             .build()
             .expect("client");
-        let mut worker = Worker::new(client, "rust-workers");
+        let mut worker = Worker::new(client.clone(), "rust-workers");
         worker.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
 
         assert!(worker
@@ -26613,8 +26863,10 @@ mod tests {
             .to_string();
         assert_ne!(first, changed);
 
-        worker.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
-        worker
+        let mut replacement =
+            Worker::new(client, "rust-workers").worker_id(worker.worker_id.clone());
+        replacement.register_workflow("orders", |_ctx, _input| async { Ok(Value::Null) });
+        replacement
             .register()
             .await
             .expect("register replacement handler");
@@ -28530,6 +28782,79 @@ mod tests {
             1,
             "authentication failures must not be retried"
         );
+    }
+
+    #[test]
+    fn duplicate_registration_keeps_the_original_workflow() {
+        let client = Client::new("http://127.0.0.1:9").expect("client");
+        let mut worker = Worker::new(client, "registration-tests");
+        worker.register_workflow("same", |_ctx, _input| async { Ok(json!("first")) });
+        let original = Arc::clone(&worker.workflows["same"].execute);
+        worker
+            .set_workflow_definition_sources("same", &["first workflow source"])
+            .expect("source identity");
+        let fingerprint = worker.workflows["same"].definition_fingerprint.clone();
+        worker.register_typed_workflow("same", |_ctx, _input: Value| async { Ok(json!("second")) });
+        assert!(Arc::ptr_eq(&original, &worker.workflows["same"].execute));
+        assert_eq!(worker.workflows["same"].definition_fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn duplicate_registration_keeps_the_original_activity() {
+        let client = Client::new("http://127.0.0.1:9").expect("client");
+        let mut worker = Worker::new(client, "registration-tests");
+        worker.register_activity("same", |_ctx, _input| async { Ok(json!("first")) });
+        let original = Arc::clone(&worker.activities["same"]);
+        worker.register_activity_avro_value("same", |_ctx, _input| async {
+            Ok(AvroValue::String("second".into()))
+        });
+        assert!(Arc::ptr_eq(&original, &worker.activities["same"]));
+    }
+
+    #[test]
+    fn duplicate_registration_keeps_original_query_and_update_handlers() {
+        let client = Client::new("http://127.0.0.1:9").expect("client");
+        let mut worker = Worker::new(client, "registration-tests");
+        worker.register_query("orders", "same", |_ctx, _input| async {
+            Ok(json!("first"))
+        });
+        let RegisteredQuery::Snapshot(original) = worker.queries["orders"]["same"].clone() else {
+            panic!("snapshot query");
+        };
+        worker.register_replayed_query("orders", "same", |_ctx, _state: Arc<()>, _input| async {
+            Ok(json!("second"))
+        });
+        let RegisteredQuery::Snapshot(retained) = &worker.queries["orders"]["same"] else {
+            panic!("duplicate replaced the query adapter");
+        };
+        assert!(Arc::ptr_eq(&original, retained));
+        worker.register_update("orders", "same", |_ctx, _input| async {
+            Ok(json!("first"))
+        });
+        let original = Arc::clone(&worker.updates["orders"]["same"]);
+        worker.register_update_avro_value("orders", "same", |_ctx, _input| async {
+            Ok(AvroValue::Null)
+        });
+        assert!(Arc::ptr_eq(&original, &worker.updates["orders"]["same"]));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_fails_before_server_contact() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url()).build().expect("client");
+        let mut worker =
+            Worker::new(client, "registration-tests").poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("same", |_ctx, _input| async { Ok(json!("first")) });
+        worker.register_workflow("same", |_ctx, _input| async { Ok(json!("second")) });
+        let error = worker
+            .run_once()
+            .await
+            .expect_err("ambiguous worker must not poll");
+        assert!(
+            error.to_string().contains("duplicate_registration"),
+            "{error}"
+        );
+        assert!(server.requests.lock().expect("requests").is_empty());
     }
 
     #[derive(Clone, Debug)]
