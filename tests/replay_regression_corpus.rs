@@ -416,6 +416,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if !matches!(
         workflow_type,
         "corpus.side-effect-version"
+            | "corpus.legacy-patch-activity"
             | "corpus.update-snapshot"
             | "corpus.workflow-stream"
             | "corpus.message-stream-batch"
@@ -532,6 +533,18 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.legacy-patch-activity" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let first = ctx.patched("added-step")?;
+                let second = ctx.patched("added-step")?;
+                ctx.deprecate_patch("added-step")?;
+                if first || second {
+                    ctx.activity("new", json!([])).await?;
+                }
+                let result = ctx.activity("old", json!([])).await?;
+                Ok(json!({"first": first, "second": second, "result": result}))
+            });
+        }
         "corpus.update-snapshot" => {
             worker.register_workflow(workflow_type, |_ctx, _input| async move { Ok(Value::Null) });
             worker.register_update(workflow_type, "inspect", |ctx, arguments| async move {
@@ -860,6 +873,29 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         Some(completion) => completion,
         None => {
             let failure_path = format!("/api/worker/workflow-tasks/{task_id}/fail");
+            if fixture["expected"]["waiting_for_history"] == true {
+                let failure = server.request_body(&failure_path).ok_or_else(|| {
+                    format!("{fixture_id} did not acknowledge its pending history")
+                })?;
+                let observed = json!({
+                    "command_sequence": [],
+                    "waiting_for_history": true,
+                    "task_failure": failure,
+                });
+                if let Some(expected_commands) = fixture.get("command_sequence") {
+                    fixture_matches(
+                        expected_commands,
+                        &json!([]),
+                        &format!("{fixture_id}.command_sequence"),
+                    )?;
+                }
+                fixture_matches(
+                    &fixture["expected"],
+                    &observed,
+                    &format!("{fixture_id}.expected"),
+                )?;
+                return Ok(observed);
+            }
             let detail = server
                 .request_body(&failure_path)
                 .and_then(|failure| failure["failure"]["message"].as_str().map(str::to_string))

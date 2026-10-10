@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.4.2
+
+- Select the original branch when a patch is added before an unmarked recorded
+  operation or to an already completed workflow. Preserve the original command
+  and its sequence, reuse the decision for repeated calls, and reject supported
+  ranges that exclude the recorded decision.
+
 ## 3.4.1
 
 - Send remote activity heartbeat details as the bounded JSON progress map

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-legacy-patch-before-pending-activity",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.legacy-patch-activity", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "ActivityScheduled", "payload": {"sequence": 1, "activity_type": "old"}}
+  ],
+  "expected": {
+    "waiting_for_history": true,
+    "task_failure": {"failure": {"type": "WorkflowTaskWaitingForHistory", "message": "Workflow task waiting for scheduled history."}}
+  }
+}
