@@ -203,6 +203,21 @@ An explicit `build_id(...)` pins new runs to that deployment build. A different
 build cannot take an existing pinned run. Omit it to retain unversioned routing.
 The runnable example below prints its result and cache counters.
 
+### Deploying workflow patches
+
+Use a stable change ID with `ctx.patched(...)` or `ctx.get_version(...)` to
+preserve deployment decisions through replay. An old unmarked history selects
+the legacy version `-1` if the next durable operation was already recorded.
+New executions record one decision per change ID, even when code asks again.
+
+Some older workers recorded a marker for every repeated call. Rust replays
+consistent markers at their original positions, retaining the recorded history
+and timestamps. Keep those call boundaries, or replace them with
+`ctx.deprecate_patch(...)`, while such histories remain active. Replay consumes
+one matching historical marker per call and never skips an intervening activity,
+timer or side effect. Conflicting recorded versions and unsupported current
+ranges remain replay errors.
+
 ### Recovering from Server outages
 
 For a long-running service worker, enable `.recover_transient_outages(true)`

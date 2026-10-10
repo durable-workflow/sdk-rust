@@ -9968,6 +9968,9 @@ impl WorkflowContext {
     /// An unmarked old history that reached its next durable operation, or
     /// already completed, selects `-1` when that version is supported. This
     /// leaves the original operation available and writes no additional marker.
+    /// Consistent markers written by older workers retain their original ordered
+    /// positions. Repeated calls consume a matching marker at the current cursor.
+    /// Conflicting recorded decisions and unsupported ranges remain replay faults.
     pub fn get_version(
         &self,
         change_id: impl Into<String>,
@@ -9999,6 +10002,35 @@ impl WorkflowContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
         if let Some((version, sequence)) = state.version_markers.get(&change_id).copied() {
+            if let Some(RecordedCommand::VersionMarker {
+                sequence: alias_sequence,
+                change_id: alias_change_id,
+                version: alias_version,
+            }) = state.recorded_commands.get(state.command_cursor)
+            {
+                if alias_change_id == &change_id {
+                    if *alias_version != version {
+                        return Err(invalid_recorded_history(
+                            "version_marker_conflict",
+                            *alias_sequence,
+                            &format!("selected version {version} for change ID {change_id:?}"),
+                            &format!("recorded version {alias_version}"),
+                            "recorded marker conflicts with the decision already selected during replay",
+                        ));
+                    }
+                    ensure_version_supported(
+                        &change_id,
+                        version,
+                        min_supported,
+                        max_supported,
+                        *alias_sequence,
+                    )?;
+                    // Older workers could record the same decision again. Keep
+                    // each physical boundary without skipping intervening work.
+                    state.command_cursor += 1;
+                    return Ok(version);
+                }
+            }
             ensure_version_supported(&change_id, version, min_supported, max_supported, sequence)?;
             return Ok(version);
         }
@@ -15891,22 +15923,26 @@ fn recorded_commands(
         })
         .collect::<Result<_>>()?;
 
-    let mut marker_sequences = HashMap::new();
+    let mut marker_decisions = HashMap::new();
     for command in &commands {
         if let RecordedCommand::VersionMarker {
             sequence,
             change_id,
-            ..
+            version,
         } = command
         {
-            if let Some(first_sequence) = marker_sequences.insert(change_id.clone(), *sequence) {
-                return Err(invalid_recorded_history(
-                    "duplicate_version_marker",
-                    *sequence,
-                    &format!("one marker for change ID {change_id:?}"),
-                    &format!("markers at sequences {first_sequence} and {sequence}"),
-                    "workflow history contains duplicate markers for one stable change ID",
-                ));
+            if let Some((first_version, first_sequence)) = marker_decisions.get(change_id) {
+                if version != first_version {
+                    return Err(invalid_recorded_history(
+                        "version_marker_conflict",
+                        *sequence,
+                        &format!("version {first_version} for change ID {change_id:?} at sequence {first_sequence}"),
+                        &format!("version {version} at sequence {sequence}"),
+                        "workflow history contains conflicting decisions for one stable change ID",
+                    ));
+                }
+            } else {
+                marker_decisions.insert(change_id.clone(), (*version, *sequence));
             }
         }
     }
@@ -19150,19 +19186,28 @@ mod tests {
     fn retained_patch_aliases_do_not_skip_intervening_operations() {
         let ctx = workflow_context(vec![
             retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"),
-            history_event("SideEffectRecorded", json!({
-                "sequence": 2, "result": fixture_envelope(json!("between")),
-            })),
+            history_event(
+                "SideEffectRecorded",
+                json!({
+                    "sequence": 2, "result": fixture_envelope(json!("between")),
+                }),
+            ),
             retained_patch_marker(3, 1, "2026-10-10T21:47:29.123604Z"),
-            history_event("VersionMarkerRecorded", json!({
-                "sequence": 4, "change_id": "other-patch", "version": 1,
-                "min_supported": -1, "max_supported": 1,
-            })),
+            history_event(
+                "VersionMarkerRecorded",
+                json!({
+                    "sequence": 4, "change_id": "other-patch", "version": 1,
+                    "min_supported": -1, "max_supported": 1,
+                }),
+            ),
         ]);
         assert!(ctx.patched("retained-patch").unwrap());
         assert!(ctx.patched("retained-patch").unwrap());
         assert_eq!(ctx.state.lock().unwrap().command_cursor, 1);
-        assert_eq!(ctx.side_effect(|| "must not execute".to_string()).unwrap(), "between");
+        assert_eq!(
+            ctx.side_effect(|| "must not execute".to_string()).unwrap(),
+            "between"
+        );
         ctx.deprecate_patch("retained-patch").unwrap();
         assert_eq!(ctx.state.lock().unwrap().command_cursor, 3);
         ctx.deprecate_patch("retained-patch").unwrap();
@@ -19177,7 +19222,8 @@ mod tests {
         let mut alias = retained_patch_marker(2, 1, "2026-10-10T21:47:29.123604Z");
         alias.payload["max_supported"] = json!(3);
         let ctx = workflow_context(vec![
-            retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"), alias,
+            retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"),
+            alias,
         ]);
         assert_eq!(ctx.get_version("retained-patch", -1, 2).unwrap(), 1);
         let error = ctx.get_version("retained-patch", 2, 3).unwrap_err();
@@ -19404,7 +19450,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_side_effects_and_version_markers_are_rejected() {
+    fn duplicate_side_effects_and_conflicting_version_markers_are_rejected() {
         let duplicate_side_effect = WorkflowState::new(
             vec![
                 history_event(
@@ -19427,30 +19473,92 @@ mod tests {
                 if reason == "duplicate_side_effect_record"
         ));
 
-        let marker = |sequence| {
+        let marker = |sequence, version| {
             history_event(
                 "VersionMarkerRecorded",
                 json!({
                     "sequence": sequence,
                     "change_id": "same-change",
-                    "version": 1,
-                    "min_supported": 1,
+                    "version": version,
+                    "min_supported": -1,
                     "max_supported": 1,
                 }),
             )
         };
         let duplicate_marker = WorkflowState::new(
-            vec![marker(1), marker(3)],
+            vec![marker(1, 1), marker(3, -1)],
             "rust-workers".to_string(),
             DEFAULT_CODEC.to_string(),
             None,
         )
-        .expect_err("duplicate marker");
+        .expect_err("conflicting marker");
         assert!(matches!(
             duplicate_marker,
             Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
-                if reason == "duplicate_version_marker"
+                if reason == "version_marker_conflict"
         ));
+    }
+
+    #[test]
+    fn retained_patch_aliases_reject_duplicate_physical_records_and_invalid_ranges() {
+        let marker = retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z");
+        let mut invalid_alias = retained_patch_marker(2, 1, "2026-10-10T21:47:29.123604Z");
+        invalid_alias.payload["max_supported"] = json!(0);
+        for (history, expected_reason) in [
+            (
+                vec![marker.clone(), marker.clone()],
+                "duplicate_version_marker_record",
+            ),
+            (
+                vec![marker, invalid_alias],
+                "version_marker_history_range_invalid",
+            ),
+        ] {
+            let error =
+                WorkflowState::new(history, "rust-workers".into(), DEFAULT_CODEC.into(), None)
+                    .expect_err("invalid historical alias");
+            assert!(matches!(error,
+                Error::NonDeterministicReplay(ReplayFailure { reason, .. })
+                    if reason == expected_reason));
+        }
+    }
+
+    #[test]
+    fn retained_patch_aliases_require_the_original_call_boundary() {
+        let ctx = workflow_context(vec![
+            retained_patch_marker(1, 1, "2026-10-10T21:47:29.120756Z"),
+            retained_patch_marker(2, 1, "2026-10-10T21:47:29.123604Z"),
+        ]);
+        assert!(ctx.patched("retained-patch").unwrap());
+        assert!(ctx.ensure_history_consumed().is_err());
+        assert_eq!(ctx.state.lock().unwrap().command_cursor, 1);
+        ctx.deprecate_patch("retained-patch").unwrap();
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_patch_aliases_do_not_replace_an_earlier_legacy_decision() {
+        let ctx = workflow_context(vec![
+            history_event(
+                "SideEffectRecorded",
+                json!({
+                    "sequence": 1, "result": fixture_envelope(json!("old-operation")),
+                }),
+            ),
+            retained_patch_marker(2, 1, "2026-10-10T21:47:29.123604Z"),
+        ]);
+        assert!(!ctx.patched("retained-patch").unwrap());
+        assert_eq!(
+            ctx.side_effect(|| "must not execute".to_string()).unwrap(),
+            "old-operation"
+        );
+        let error = ctx.patched("retained-patch").unwrap_err();
+        assert!(matches!(error,
+            Error::NonDeterministicReplay(ReplayFailure { ref reason, .. })
+                if reason == "version_marker_conflict"));
+        assert_eq!(ctx.state.lock().unwrap().command_cursor, 1);
+        assert!(ctx.take_commands().unwrap().is_empty());
     }
 
     #[test]
