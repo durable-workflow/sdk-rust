@@ -7,8 +7,10 @@ contract is frozen and the release qualifications below pass.
 ## Source changes
 
 The minimum supported Rust version remains 1.86. Existing workflow payloads use
-the same Avro encoding. Protocol 1.19 remains the default, and cooperative
-execution requires explicit protocol 1.20 support on the Server and worker.
+the same Avro encoding. Protocol 1.20 is the default. Cooperative execution
+requires an explicit worker opt-in and compatible Server capabilities.
+For an older Server, select `WorkerProtocolVersion::V119` with
+`ClientBuilder::worker_protocol_version()`.
 
 ### Activity options
 

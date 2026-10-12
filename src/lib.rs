@@ -64,7 +64,28 @@ use thiserror::Error;
 pub use uuid::Uuid;
 pub use worker_session::{WorkerSession, WorkerSessionOptions};
 
-pub const WORKER_PROTOCOL_VERSION: &str = "1.19";
+pub const WORKER_PROTOCOL_VERSION: &str = "1.20";
+pub const MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.19";
+
+/// Select the worker request protocol without enabling optional capabilities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WorkerProtocolVersion {
+    /// Compatibility with Servers that implement only worker protocol 1.19.
+    V119,
+    /// The default worker protocol.
+    #[default]
+    V120,
+}
+
+impl WorkerProtocolVersion {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V119 => MINIMUM_WORKER_PROTOCOL_VERSION,
+            Self::V120 => WORKER_PROTOCOL_VERSION,
+        }
+    }
+}
 const WORKFLOW_HISTORY_PAGE_SIZE: usize = 500;
 /// First additive worker protocol that defines portable worker-affinity features.
 pub const PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION: &str = "1.18";
@@ -178,6 +199,7 @@ static AVRO_VALUE_ORDERED_MAP_ENCODING_SCHEMA: OnceLock<std::result::Result<Sche
 #[derive(Clone, Copy)]
 enum RequestProtocol {
     ControlPlane,
+    DefaultWorker,
     Worker(&'static str),
 }
 
@@ -2478,7 +2500,7 @@ fn workflow_completion_protocol_version(commands: &[Value]) -> &'static str {
     }) {
         SEARCH_ATTRIBUTE_UPDATE_MINIMUM_WORKER_PROTOCOL_VERSION
     } else {
-        WORKER_PROTOCOL_VERSION
+        MINIMUM_WORKER_PROTOCOL_VERSION
     }
 }
 
@@ -2795,6 +2817,7 @@ pub struct Client {
     max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
     cooperative_worker_protocol: bool,
+    worker_protocol_version: WorkerProtocolVersion,
     local_activities_enabled: bool,
     worker_sessions_enabled: bool,
     max_concurrent_worker_sessions: usize,
@@ -2817,6 +2840,7 @@ impl Client {
             namespace: "default".to_string(),
             timeout: Duration::from_secs(60),
             max_external_payload_bytes: 64 * 1024 * 1024,
+            worker_protocol_version: WorkerProtocolVersion::default(),
         }
     }
 
@@ -3744,7 +3768,7 @@ impl Client {
             .request_json(
                 reqwest::Method::POST,
                 "/worker/register",
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 Some(&body),
             )
             .await?;
@@ -3851,7 +3875,7 @@ impl Client {
         self.request_json(
             reqwest::Method::DELETE,
             &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Option::<&Value>::None,
         )
         .await
@@ -4027,7 +4051,7 @@ impl Client {
         self.request_json(
             reqwest::Method::POST,
             "/worker/heartbeat",
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Some(&body),
         )
         .await
@@ -4080,7 +4104,7 @@ impl Client {
         let mut data: PollWorkflowTaskResponse = self
             .poll_request_json(
                 "/worker/workflow-tasks/poll",
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 &body,
                 timeout + Duration::from_secs(5),
                 transport_retries,
@@ -4147,7 +4171,7 @@ impl Client {
         self.request_json(
             reqwest::Method::POST,
             &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Some(&body),
         )
         .await
@@ -4269,7 +4293,7 @@ impl Client {
         self.request_json(
             reqwest::Method::POST,
             &path,
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Some(&body),
         )
         .await
@@ -4323,7 +4347,7 @@ impl Client {
         let data: worker_session::SessionPollResponse = self
             .poll_request_json(
                 "/worker/activity-tasks/poll",
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 &body,
                 timeout + Duration::from_secs(5),
                 transport_retries,
@@ -4351,7 +4375,7 @@ impl Client {
             self.request_json(
                 reqwest::Method::POST,
                 &path,
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 Some(&body),
             )
             .await,
@@ -4383,7 +4407,7 @@ impl Client {
             self.request_json(
                 reqwest::Method::POST,
                 &path,
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 Some(&body),
             )
             .await,
@@ -4429,7 +4453,7 @@ impl Client {
             self.request_json(
                 reqwest::Method::POST,
                 &path,
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 Some(&body),
             )
             .await,
@@ -4459,16 +4483,34 @@ impl Client {
         timeout: Duration,
     ) -> Result<T> {
         let protocol = match protocol {
-            RequestProtocol::Worker(version)
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
+                let selected = self.worker_protocol_version.as_str();
                 if self.cooperative_worker_protocol
-                    && version
+                    && !cooperative_cancellation::supports_protocol(selected)
+                {
+                    return Err(Error::CooperativeCancellationUnavailable(
+                        "explicit protocol 1.19 cannot enable cooperative cancellation; select protocol 1.20".into(),
+                    ));
+                }
+                if let RequestProtocol::Worker(minimum) = protocol {
+                    let supported = minimum
                         .strip_prefix("1.")
                         .and_then(|minor| minor.parse::<u64>().ok())
-                        .is_some_and(|minor| minor < 20) =>
-            {
-                RequestProtocol::Worker("1.20")
+                        .zip(
+                            selected
+                                .strip_prefix("1.")
+                                .and_then(|minor| minor.parse::<u64>().ok()),
+                        )
+                        .is_some_and(|(minimum, selected)| selected >= minimum);
+                    if !supported {
+                        return Err(Error::WorkerLoop(format!(
+                            "worker request requires protocol {minimum}; client explicitly selects {selected}"
+                        )));
+                    }
+                }
+                RequestProtocol::Worker(selected)
             }
-            protocol => protocol,
+            RequestProtocol::ControlPlane => RequestProtocol::ControlPlane,
         };
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
@@ -4480,6 +4522,12 @@ impl Client {
             .header("X-Namespace", &self.namespace);
 
         match protocol {
+            RequestProtocol::DefaultWorker => {
+                request = request.header(
+                    "X-Durable-Workflow-Protocol-Version",
+                    self.worker_protocol_version.as_str(),
+                );
+            }
             RequestProtocol::Worker(version) => {
                 request = request.header("X-Durable-Workflow-Protocol-Version", version);
             }
@@ -4637,7 +4685,7 @@ impl Client {
 
     fn auth_token(&self, protocol: RequestProtocol) -> Result<Option<&str>> {
         match protocol {
-            RequestProtocol::Worker(_) => {
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 if let Some(token) = self.worker_token.as_deref().or(self.token.as_deref()) {
                     return Ok(Some(token));
                 }
@@ -5162,9 +5210,16 @@ pub struct ClientBuilder {
     namespace: String,
     timeout: Duration,
     max_external_payload_bytes: usize,
+    worker_protocol_version: WorkerProtocolVersion,
 }
 
 impl ClientBuilder {
+    /// Explicitly select 1.19 for an older Server. Cooperation requires 1.20.
+    pub fn worker_protocol_version(mut self, version: WorkerProtocolVersion) -> Self {
+        self.worker_protocol_version = version;
+        self
+    }
+
     pub fn token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
@@ -5220,6 +5275,7 @@ impl ClientBuilder {
             max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
             cooperative_worker_protocol: false,
+            worker_protocol_version: self.worker_protocol_version,
             local_activities_enabled: false,
             worker_sessions_enabled: false,
             max_concurrent_worker_sessions: 10,
@@ -6619,7 +6675,7 @@ impl Worker {
     /// namespace, queue and capabilities with compatible protocol 1.20. Task
     /// processing uses canonical delivery and activity ownership fences.
     /// Existing terminal cancel and terminate operations remain terminal.
-    /// The default is disabled, preserving ordinary protocol 1.19 workers.
+    /// The default is disabled. Protocol 1.20 alone does not enable cooperation.
     /// Call [`Worker::register`] before [`Worker::run_once`]. [`Worker::run`]
     /// and [`Worker::run_until`] register automatically.
     pub fn cooperative_cancellation(mut self, enabled: bool) -> Self {
@@ -8059,7 +8115,7 @@ impl Worker {
     async fn poll_activities_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
         // Each lane retains its leased response through callback settlement.
         // A bounded independent activity must not occupy the cleanup lane too.
-        // Preserve the existing serial loop for default protocol 1.19 workers.
+        // Preserve the existing serial loop unless cooperation is enabled.
         let lane_count = if self.cooperative_cancellation_enabled {
             self.max_concurrent_activity_tasks
         } else {
@@ -17681,7 +17737,7 @@ mod tests {
     fn workflow_completion_uses_the_additive_command_protocol_floor() {
         assert_eq!(
             workflow_completion_protocol_version(&[json!({"type": "complete_workflow"})]),
-            WORKER_PROTOCOL_VERSION
+            MINIMUM_WORKER_PROTOCOL_VERSION
         );
         assert_eq!(
             workflow_completion_protocol_version(&[json!({
@@ -26948,6 +27004,7 @@ mod tests {
 
     #[tokio::test]
     async fn baseline_worker_endpoints_send_the_baseline_protocol() {
+        assert_eq!(WORKER_PROTOCOL_VERSION, "1.20");
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(2))
@@ -27006,10 +27063,92 @@ mod tests {
                 .as_str()
                 .is_some_and(|id| id.starts_with("rust-activity-poll-"))
         );
+        let registration = server.request_body("/api/worker/register");
+        for optional in [
+            "cooperative_cancellation",
+            "local_activities",
+            "worker_sessions",
+            "sticky_execution",
+        ] {
+            assert!(!registration["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some(optional))));
+        }
     }
 
     #[tokio::test]
-    async fn query_task_endpoints_send_the_query_feature_protocol() {
+    async fn explicit_previous_worker_protocol_preserves_headers() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .worker_protocol_version(WorkerProtocolVersion::V119)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        client
+            .register_worker("legacy-worker", "capture", vec![], vec![], 1, 1)
+            .await
+            .expect("register");
+        client
+            .heartbeat_worker("legacy-worker", 1, 1)
+            .await
+            .expect("heartbeat");
+        client
+            .poll_workflow_task("legacy-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("workflow poll");
+        client
+            .poll_activity_task("legacy-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("activity poll");
+        client
+            .poll_query_task("legacy-worker", "capture", Duration::from_millis(10))
+            .await
+            .expect("query poll");
+        client
+            .deregister_worker_registration("legacy-worker")
+            .await
+            .expect("deregister");
+        for path in [
+            "/api/worker/register",
+            "/api/worker/heartbeat",
+            "/api/worker/workflow-tasks/poll",
+            "/api/worker/activity-tasks/poll",
+            "/api/worker/query-tasks/poll",
+            "/api/worker/registrations/legacy-worker",
+        ] {
+            assert_eq!(
+                server.worker_protocol_for(path).as_deref(),
+                Some("1.19"),
+                "{path}"
+            );
+            assert_eq!(server.control_protocol_for(path), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_previous_protocol_refuses_cooperation_before_registration() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .worker_protocol_version(WorkerProtocolVersion::V119)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "capture").cooperative_cancellation(true);
+        let error = worker
+            .register()
+            .await
+            .expect_err("legacy cooperation must be refused");
+        assert!(matches!(
+            error,
+            Error::CooperativeCancellationUnavailable(_)
+        ));
+        assert_eq!(server.worker_protocol_for("/api/worker/register"), None);
+    }
+
+    #[tokio::test]
+    async fn query_task_endpoints_send_the_selected_worker_protocol() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(2))
@@ -27049,7 +27188,7 @@ mod tests {
         ] {
             assert_eq!(
                 server.worker_protocol_for(path).as_deref(),
-                Some(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                Some(WORKER_PROTOCOL_VERSION),
                 "unexpected protocol for {path}"
             );
         }
@@ -27500,7 +27639,7 @@ mod tests {
                 .request_json(
                     reqwest::Method::POST,
                     &path[4..],
-                    RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                    RequestProtocol::DefaultWorker,
                     Some(&CountedBody(Arc::clone(&calls))),
                 )
                 .await
@@ -27533,7 +27672,7 @@ mod tests {
                     .request_json::<Value, Value>(
                         reqwest::Method::POST,
                         "/worker/register",
-                        RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                        RequestProtocol::DefaultWorker,
                         Some(&json!({})),
                     )
                     .await
@@ -27775,13 +27914,13 @@ mod tests {
         assert_eq!(failure.supported_version.as_deref(), Some("1.7"));
         assert_eq!(
             failure.requested_version.as_deref(),
-            Some(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION)
+            Some(WORKER_PROTOCOL_VERSION)
         );
         assert_eq!(
             server
                 .worker_protocol_for("/api/worker/query-tasks/poll")
                 .as_deref(),
-            Some(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION)
+            Some(WORKER_PROTOCOL_VERSION)
         );
     }
 
@@ -29421,7 +29560,7 @@ mod tests {
                 write_mock_response(
                     stream,
                     "400 Bad Request",
-                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.17","requested_version":"1.19"}"#,
+                    r#"{"reason":"unsupported_protocol_version","message":"unsupported worker protocol","supported_version":"1.17","requested_version":"1.20"}"#,
                 );
             } else if behavior.reject_deregistration {
                 write_mock_response(

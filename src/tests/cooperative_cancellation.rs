@@ -3292,7 +3292,7 @@ async fn cooperative_registration_uses_explicit_protocol_and_preserves_other_cli
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].worker_protocol.as_deref(), Some("1.20"));
-        assert_eq!(requests[1].worker_protocol.as_deref(), Some("1.19"));
+        assert_eq!(requests[1].worker_protocol.as_deref(), Some("1.20"));
         assert_eq!(
             requests[0].authorization.as_deref(),
             Some("Bearer worker-only")
@@ -3431,7 +3431,7 @@ async fn cooperative_registration_default_and_disabled_workers_keep_ordinary_pro
         };
         worker.register().await.unwrap();
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests[0].worker_protocol.as_deref(), Some("1.19"));
+        assert_eq!(requests[0].worker_protocol.as_deref(), Some("1.20"));
         let body: Value = serde_json::from_str(&requests[0].body).unwrap();
         assert!(!body["capabilities"]
             .as_array()
@@ -3597,7 +3597,7 @@ async fn cooperative_activity_stop_receipt_preserves_worker_authentication_and_d
             json!({"activity_attempt_id":"attempt-original","lease_owner":"actual-owner","request_id":"local-request"})
         );
     }
-    assert_eq!(WORKER_PROTOCOL_VERSION, "1.19");
+    assert_eq!(WORKER_PROTOCOL_VERSION, "1.20");
 }
 
 #[tokio::test]
@@ -4860,7 +4860,7 @@ async fn cooperative_poll_preflights_inputs_and_shares_the_poll_and_history_budg
 }
 
 #[tokio::test]
-async fn ordinary_workflow_heartbeat_uses_119_with_the_same_claim_fences() {
+async fn ordinary_workflow_heartbeat_uses_default_protocol_with_the_same_claim_fences() {
     let server = transport_server();
     let task = transport_task();
     let receipt = client(&server, "heartbeat-equivalent-time")
@@ -4872,7 +4872,7 @@ async fn ordinary_workflow_heartbeat_uses_119_with_the_same_claim_fences() {
     assert_eq!(receipt.lease_owner, "actual-owner");
     let requests = server.requests.lock().unwrap();
     let request = &requests[0];
-    assert_eq!(request.worker_protocol.as_deref(), Some("1.19"));
+    assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
 }
 
 #[tokio::test]
@@ -5405,7 +5405,7 @@ async fn cooperative_request_accepts_additive_minor_discovery_without_changing_w
         .request_workflow_cancellation("workflow", Default::default())
         .await
         .unwrap();
-    assert_eq!(WORKER_PROTOCOL_VERSION, "1.19");
+    assert_eq!(WORKER_PROTOCOL_VERSION, "1.20");
     let ordinary = Client::builder(server.base_url()).build().unwrap();
     let mut worker = Worker::new(ordinary, "queue");
     worker.register_workflow("example", |_ctx, _input| async { Ok(Value::Null) });
@@ -5415,7 +5415,7 @@ async fn cooperative_request_accepts_additive_minor_discovery_without_changing_w
         .iter()
         .find(|request| request.path.ends_with("/worker/register"))
         .unwrap();
-    assert_eq!(registration.worker_protocol.as_deref(), Some("1.19"));
+    assert_eq!(registration.worker_protocol.as_deref(), Some("1.20"));
     let body: Value = serde_json::from_str(&registration.body).unwrap();
     assert!(!body["capabilities"]
         .as_array()

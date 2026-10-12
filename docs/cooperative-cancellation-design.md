@@ -1,8 +1,8 @@
 # Cooperative cancellation source design
 
 This document describes the unfinished source candidate for shared cancellation
-issue 136. Default worker protocol remains 1.19. Cooperation requires explicit
-protocol 1.20 opt-in and a compatible Server and Native backend. The shared
+issue 136. Default worker protocol is 1.20. Cooperation requires an explicit
+worker opt-in and a compatible Server and Native backend. The shared
 specification and published mixed-language qualification remain pending.
 
 ## Recorded context
