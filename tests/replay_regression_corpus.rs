@@ -19,6 +19,7 @@ use durable_workflow::{
     WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
 
@@ -45,8 +46,17 @@ struct FixtureServer {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+struct ExternalInput {
+    blob: String,
+    refuse_claim: bool,
+}
+
 impl FixtureServer {
-    fn start(task: Value, completion_storage_refusals: u64) -> Self {
+    fn start(
+        task: Value,
+        completion_storage_refusals: u64,
+        external: Option<ExternalInput>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay fixture server");
         listener
             .set_nonblocking(true)
@@ -67,6 +77,7 @@ impl FixtureServer {
                             &server_requests,
                             &task,
                             completion_storage_refusals,
+                            external.as_ref(),
                         );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -120,6 +131,7 @@ fn handle_request(
     requests: &Arc<Mutex<Vec<CapturedRequest>>>,
     task: &Value,
     completion_storage_refusals: u64,
+    external: Option<&ExternalInput>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut request = Vec::new();
@@ -171,6 +183,9 @@ fn handle_request(
     let storage_refused = path.starts_with("/api/worker/workflow-tasks/")
         && path.ends_with("/complete")
         && request_number as u64 <= completion_storage_refusals;
+    let authority_refused = path.starts_with("/api/worker/workflow-tasks/")
+        && path.ends_with("/heartbeat")
+        && external.is_some_and(|input| input.refuse_claim);
     let body = match path.as_str() {
         "/api/cluster/info" => json!({"limits": {"max_payload_bytes": 2097152}}).to_string(),
         _ if storage_refused => json!({
@@ -181,6 +196,17 @@ fn handle_request(
             "request_admitted": false
         })
         .to_string(),
+        _ if authority_refused => json!({"task_id":task["task_id"], "workflow_task_attempt":1,
+            "reason":"task_not_leased", "retryable":false}).to_string(),
+        path if path.starts_with("/api/worker/workflow-tasks/") && path.ends_with("/heartbeat") => {
+            json!({"task_id":task["task_id"], "workflow_task_attempt":task["workflow_task_attempt"],
+                "lease_owner":task["lease_owner"], "renewed":true, "reason":null,
+                "task_status":"leased", "run_status":"running", "lease_expires_at":"2099-01-01T00:00:00Z",
+                "cancellation_request":null}).to_string()
+        }
+        "/api/external-payloads/v1/ep_00000000000000000000000001" if external.is_some() => {
+            external.unwrap().blob.clone()
+        }
         "/api/worker/register"
             if registration["capability_manifest"]["sticky_execution"]["supported"] == true =>
         {
@@ -217,7 +243,9 @@ fn handle_request(
         }
         _ => json!({"message": "not found"}).to_string(),
     };
-    let status = if storage_refused {
+    let status = if authority_refused {
+        "409 Conflict"
+    } else if storage_refused {
         "503 Service Unavailable"
     } else if body.contains("\"not found\"") {
         "404 Not Found"
@@ -510,7 +538,20 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     let completion_storage_refusals = fixture["worker_task"]["completion_storage_refusals"]
         .as_u64()
         .unwrap_or(0);
-    let server = FixtureServer::start(task, completion_storage_refusals);
+    let external = if fixture["worker_task"]["external_input"] == true {
+        let blob = task["arguments"]["blob"].as_str().unwrap().to_owned();
+        task["arguments"] = json!({"codec":"avro", "external_payload":{
+            "schema":"durable-workflow.v2.runtime-external-payload-reference.v1", "codec":"avro",
+            "reference_id":"ep_00000000000000000000000001", "size_bytes":blob.len(),
+            "sha256":format!("{:x}", Sha256::digest(blob.as_bytes()))}});
+        Some(ExternalInput {
+            blob,
+            refuse_claim: fixture["worker_task"]["hydration_authority_refused"] == true,
+        })
+    } else {
+        None
+    };
+    let server = FixtureServer::start(task, completion_storage_refusals, external);
     let client = Client::builder(server.base_url())
         .timeout(Duration::from_secs(2))
         .build()
@@ -875,10 +916,22 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     } else {
         None
     };
-    let handled = worker
-        .run_once()
-        .await
-        .map_err(|error| format!("{fixture_id} worker replay failed: {error}"))?;
+    let replay = worker.run_once().await;
+    if fixture["worker_task"]["hydration_authority_refused"] == true {
+        let requests = server.requests.lock().unwrap();
+        if requests.iter().any(|request| {
+            request.path.contains("/external-payloads/")
+                || request.path.ends_with("/complete")
+                || request.path.ends_with("/fail")
+        }) || callback_calls.load(Ordering::SeqCst) != 0
+            || handler_calls.load(Ordering::SeqCst) != 0
+        {
+            return Err(format!(
+                "{fixture_id} lost authority but fetched, executed or published"
+            ));
+        }
+    }
+    let handled = replay.map_err(|error| format!("{fixture_id} worker replay failed: {error}"))?;
     if handled != 1 {
         return Err(format!("{fixture_id} replay handled {handled} tasks"));
     }

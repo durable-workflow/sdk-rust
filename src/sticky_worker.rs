@@ -83,9 +83,9 @@ impl Worker {
         let body = json!({"worker_id":self.worker_id,"task_queue":self.task_queue,
             "poll_request_id":poll_request_id,"timeout_seconds":long_poll_timeout_seconds(self.poll_timeout),
             "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,"build_id":self.client.worker_build_id});
-        let wire: Value = self
+        let mut wire: Value = self
             .client
-            .poll_request_json(
+            .poll_request_json_unresolved(
                 "/worker/workflow-tasks/poll",
                 RequestProtocol::DefaultWorker,
                 &body,
@@ -93,17 +93,33 @@ impl Worker {
                 0,
             )
             .await?;
-        let mut response: PollWorkflowTaskResponse = serde_json::from_value(wire.clone())?;
-        let snapshot = if let Some(task) = response.task.as_mut() {
-            Some(
-                self.client
-                    .load_sticky_history(task, &wire["task"], &self.worker_id)
-                    .await?,
-            )
-        } else {
-            None
-        };
-        Ok((response, snapshot))
+        let claim = workflow_hydration::HydrationClaim::from_poll(
+            &wire,
+            &self.worker_id,
+            &self.client.namespace,
+        )?;
+        let (loaded, _) = workflow_hydration::HydrationClaim::protect(claim, &self.client, async {
+            self.client
+                .resolve_runtime_payloads(
+                    &mut wire,
+                    "/worker/workflow-tasks/poll",
+                    RequestProtocol::Worker(self.client.worker_protocol_version.as_str()),
+                )
+                .await?;
+            let mut response: PollWorkflowTaskResponse = serde_json::from_value(wire.clone())?;
+            let snapshot = if let Some(task) = response.task.as_mut() {
+                Some(
+                    self.client
+                        .load_sticky_history(task, &wire["task"], &self.worker_id)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            Ok((response, snapshot))
+        })
+        .await?;
+        Ok(loaded)
     }
 
     pub(super) fn sticky_claim(

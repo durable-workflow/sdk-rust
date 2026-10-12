@@ -119,6 +119,18 @@ runtime URL, namespace, and credential role, with size and SHA-256 verification.
 bytes per response (64 MiB by default). Provider credentials are not needed;
 payload fetches never follow redirects.
 
+Workers confirm and renew the exact workflow task claim while loading external
+inputs and paged history, then confirm it again before replay. Loading stops on
+lost authority or Worker shutdown without executing workflow code. Pending
+cooperative cancellation retains its original identity and cleanup deadline.
+
+The Client's default 60-second HTTP timeout includes connection and the complete
+response body. `Client::builder(...).timeout(Duration::from_secs(120))` selects a
+larger total budget before starting a Worker. Claimed input and history loading
+share that budget across all pages. Lease renewals do not restart it. Low-level
+cooperative polls retain their long-poll timeout plus five seconds, and explicit
+canonical cancellation refreshes retain their five-second budget.
+
 ## Examples
 
 ### Local activities

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-external-input-lost-authority-before-replay",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.side-effect-version", "input": [], "payload_codec": "avro"},
+  "worker_task": {"payload_codec": "avro", "external_input": true, "hydration_authority_refused": true},
+  "history": [
+    {"sequence": 1, "event_type": "StartAccepted", "payload": {}},
+    {"sequence": 2, "event_type": "WorkflowStarted", "payload": {}}
+  ],
+  "expected": {"side_effect_callback_calls": 0},
+  "expected_failure": "task_not_leased"
+}

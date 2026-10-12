@@ -12,6 +12,7 @@ mod runtime_uploads;
 mod sticky_worker;
 mod sticky_workflow_cache;
 mod worker_session;
+mod workflow_hydration;
 
 pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
@@ -2809,6 +2810,7 @@ fn avro_value_ordered_map_encoding_schema() -> Result<&'static Schema> {
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
+    hydration_timeout: Duration,
     base_url: String,
     token: Option<String>,
     control_token: Option<String>,
@@ -4101,8 +4103,8 @@ impl Client {
             "timeout_seconds": long_poll_timeout_seconds(timeout),
             "history_page_size": WORKFLOW_HISTORY_PAGE_SIZE,
         });
-        let mut data: PollWorkflowTaskResponse = self
-            .poll_request_json(
+        let mut wire: Value = self
+            .poll_request_json_unresolved(
                 "/worker/workflow-tasks/poll",
                 RequestProtocol::DefaultWorker,
                 &body,
@@ -4110,12 +4112,23 @@ impl Client {
                 transport_retries,
             )
             .await?;
-
-        if let Some(task) = data.task.as_mut() {
-            self.fetch_remaining_workflow_history(worker_id, task)
-                .await?;
-        }
-
+        let claim =
+            workflow_hydration::HydrationClaim::from_poll(&wire, worker_id, &self.namespace)?;
+        let (data, _) = workflow_hydration::HydrationClaim::protect(claim, self, async {
+            self.resolve_runtime_payloads(
+                &mut wire,
+                "/worker/workflow-tasks/poll",
+                RequestProtocol::Worker(self.worker_protocol_version.as_str()),
+            )
+            .await?;
+            let mut data: PollWorkflowTaskResponse = serde_json::from_value(wire)?;
+            if let Some(task) = data.task.as_mut() {
+                self.fetch_remaining_workflow_history(worker_id, task)
+                    .await?;
+            }
+            Ok(data)
+        })
+        .await?;
         Ok(data)
     }
 
@@ -4125,8 +4138,15 @@ impl Client {
         task: &mut WorkflowTask,
     ) -> Result<()> {
         let mut next_token = task.next_history_page_token.clone();
+        let mut seen = BTreeSet::new();
 
         while let Some(token) = next_token.take().filter(|token| !token.is_empty()) {
+            if seen.len() >= 128 || !seen.insert(token.clone()) {
+                return Err(Error::Codec(
+                    "workflow history pagination exceeded its page bound or repeated a token"
+                        .into(),
+                ));
+            }
             let lease_owner = task
                 .lease_owner
                 .clone()
@@ -4482,6 +4502,28 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        let mut value: Value = self
+            .request_json_unresolved_with_timeout(method, path, protocol, body, timeout)
+            .await?;
+        let protocol = match protocol {
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
+                RequestProtocol::Worker(self.worker_protocol_version.as_str())
+            }
+            RequestProtocol::ControlPlane => RequestProtocol::ControlPlane,
+        };
+        self.resolve_runtime_payloads(&mut value, path, protocol)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    async fn request_json_unresolved_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        protocol: RequestProtocol,
+        body: Option<&B>,
+        timeout: Duration,
+    ) -> Result<T> {
         let protocol = match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
@@ -4605,10 +4647,7 @@ impl Client {
                 return Ok(serde_json::from_value(Value::Null)?);
             }
 
-            let mut value: Value = serde_json::from_slice(&bytes)?;
-            self.resolve_runtime_payloads(&mut value, path, protocol)
-                .await?;
-            return Ok(serde_json::from_value(value)?);
+            return Ok(serde_json::from_slice(&bytes)?);
         }
     }
 
@@ -4663,18 +4702,53 @@ impl Client {
         timeout: Duration,
         max_retries: usize,
     ) -> Result<T> {
+        self.poll_request_json_inner(path, protocol, body, timeout, max_retries, true)
+            .await
+    }
+
+    async fn poll_request_json_unresolved<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        protocol: RequestProtocol,
+        body: &B,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Result<T> {
+        self.poll_request_json_inner(path, protocol, body, timeout, max_retries, false)
+            .await
+    }
+
+    async fn poll_request_json_inner<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        protocol: RequestProtocol,
+        body: &B,
+        timeout: Duration,
+        max_retries: usize,
+        resolve: bool,
+    ) -> Result<T> {
         let mut retries = 0;
 
         loop {
-            let response = self
-                .request_json_with_timeout(
+            let response = if resolve {
+                self.request_json_with_timeout(
                     reqwest::Method::POST,
                     path,
                     protocol,
                     Some(body),
                     timeout,
                 )
-                .await;
+                .await
+            } else {
+                self.request_json_unresolved_with_timeout(
+                    reqwest::Method::POST,
+                    path,
+                    protocol,
+                    Some(body),
+                    timeout,
+                )
+                .await
+            };
 
             match response {
                 Err(Error::Transport(_)) if retries < max_retries => retries += 1,
@@ -5267,6 +5341,7 @@ impl ClientBuilder {
                 .timeout(self.timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            hydration_timeout: self.timeout,
             base_url,
             token: self.token,
             control_token: self.control_token,
@@ -8281,6 +8356,15 @@ impl Worker {
                 return Ok(None);
             }
             match operation().await {
+                Err(error)
+                    if workflow_hydration::stopped(&error)
+                        && self
+                            .run_stop
+                            .as_ref()
+                            .is_some_and(|stop| stop.load(Ordering::SeqCst)) =>
+                {
+                    return Ok(None);
+                }
                 Err(error)
                     if worker_operation_is_retryable(&error)
                         && (retries < self.retry_policy.max_retries

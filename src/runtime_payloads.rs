@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) const SCHEMA: &str = "durable-workflow.v2.runtime-external-payload-reference.v1";
+pub(super) type VerifiedPayloads = HashMap<Reference, String>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +69,23 @@ impl Client {
         path: &str,
         protocol: RequestProtocol,
     ) -> Result<()> {
-        let mut fetched = HashMap::<Reference, String>::new();
+        self.resolve_runtime_payloads_with_cache(
+            response,
+            path,
+            protocol,
+            &mut VerifiedPayloads::new(),
+        )
+        .await
+    }
+
+    pub(super) async fn resolve_runtime_payloads_with_cache(
+        &self,
+        response: &mut Value,
+        path: &str,
+        protocol: RequestProtocol,
+        fetched: &mut VerifiedPayloads,
+    ) -> Result<()> {
+        let mut used = std::collections::HashSet::new();
         let mut remaining = self.max_external_payload_bytes;
         for path in envelope_paths(path, protocol) {
             let mut envelopes = Vec::new();
@@ -77,14 +94,23 @@ impl Client {
                 let Some(reference) = Reference::parse(envelope)? else {
                     continue;
                 };
-                let blob = if let Some(blob) = fetched.get(&reference) {
-                    blob.clone()
-                } else {
+                if used.insert(reference.clone()) {
                     if reference.size_bytes > remaining {
                         return Err(oversized());
                     }
+                    remaining -= reference.size_bytes;
+                }
+                let blob = if let Some(blob) = fetched.get(&reference) {
+                    blob.clone()
+                } else {
                     let blob = self.fetch_runtime_payload(&reference, protocol).await?;
-                    remaining -= blob.len();
+                    // A claim can reuse verified immutable bytes during canonical
+                    // refresh. Retention stays bounded; response limits still count hits.
+                    if fetched.values().map(String::len).sum::<usize>()
+                        > self.max_external_payload_bytes.saturating_sub(blob.len())
+                    {
+                        fetched.clear();
+                    }
                     fetched.insert(reference, blob.clone());
                     blob
                 };
@@ -169,6 +195,25 @@ impl Client {
 
 // These paths mirror Server's runtime payload transport. Do not recurse through
 // arbitrary application maps: a business field named external_payload is not a reference.
+pub(super) fn has_unresolved_payload(
+    response: &Value,
+    path: &str,
+    protocol: RequestProtocol,
+) -> bool {
+    fn contains(value: &Value, path: &[&str]) -> bool {
+        match path.split_first() {
+            None => value.get("external_payload").is_some(),
+            Some((&"*", rest)) => value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| contains(item, rest))),
+            Some((field, rest)) => value.get(*field).is_some_and(|value| contains(value, rest)),
+        }
+    }
+    envelope_paths(path, protocol)
+        .iter()
+        .any(|path| contains(response, path))
+}
+
 fn envelope_paths(path: &str, protocol: RequestProtocol) -> Vec<Vec<&'static str>> {
     let path = path.split('?').next().unwrap_or(path);
     let mut paths = Vec::new();
