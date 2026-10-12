@@ -4689,7 +4689,7 @@ async fn cooperative_poll_retains_the_actual_claim_observation_and_fenced_histor
     assert_eq!(claim.task().history_events.len(), 3);
     assert_eq!(claim.task().next_history_page_token, None);
     let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 5);
     for request in requests.iter() {
         assert_eq!(request.worker_protocol.as_deref(), Some("1.20"));
         assert_eq!(request.authorization.as_deref(), Some("Bearer worker-only"));
@@ -4700,6 +4700,10 @@ async fn cooperative_poll_retains_the_actual_claim_observation_and_fenced_histor
             assert_eq!(body["task_queue"], "queue");
             assert_eq!(body["history_page_size"], WORKFLOW_HISTORY_PAGE_SIZE);
             assert!(!body["poll_request_id"].as_str().unwrap().is_empty());
+        } else if request.path.ends_with("/heartbeat") {
+            assert!(request.path.ends_with("/task%2Fselected/heartbeat"));
+            assert_eq!(body["lease_owner"], "actual-owner");
+            assert_eq!(body["workflow_task_attempt"], 7);
         } else {
             assert!(request.path.ends_with("/task%2Fselected/history"));
             assert_eq!(body["lease_owner"], "actual-owner");
@@ -4768,7 +4772,7 @@ async fn cooperative_claim_history_rejects_changed_claims_bad_progress_and_unbou
             matches!(result, Err(Error::InvalidCooperativeCancellation(_))),
             "{case}: {result:?}"
         );
-        assert!(server.requests.lock().unwrap().len() <= 129);
+        assert!(server.requests.lock().unwrap().len() <= 130);
     }
 }
 

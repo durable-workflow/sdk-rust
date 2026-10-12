@@ -1277,9 +1277,10 @@ impl Client {
     /// The Server must have admitted a capable worker registration. This method
     /// registers no capability and does not change ordinary [`Worker`] polling.
     /// It never substitutes a worker ID for a missing lease owner or invents a
-    /// task attempt. Poll retries reuse one request ID. Polling has its long-poll
-    /// budget plus five seconds. Claimed input/history loading uses the Client
-    /// timeout and maintains the claim, with at most 128 history pages.
+    /// task attempt. Poll retries reuse one request ID. Poll and history loading
+    /// share one long-poll budget plus five seconds, with at most 128 pages.
+    /// Managed Workers separately budget claimed hydration using the Client
+    /// timeout while maintaining task authority.
     pub async fn poll_cooperative_workflow_task(
         &self,
         worker_id: &str,
@@ -1292,6 +1293,7 @@ impl Client {
             timeout,
             &unique_request_id("rust-workflow-poll"),
             1,
+            false,
         )
         .await
     }
@@ -1303,6 +1305,7 @@ impl Client {
         timeout: Duration,
         poll_request_id: &str,
         transport_retries: usize,
+        managed: bool,
     ) -> Result<CooperativeWorkflowTaskPoll> {
         if worker_id.trim().is_empty()
             || task_queue.trim().is_empty()
@@ -1322,6 +1325,7 @@ impl Client {
             "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
             "build_id":self.worker_build_id,
         });
+        let deadline = tokio::time::Instant::now() + budget;
         let mut value: Value = tokio::time::timeout(
             budget,
             self.poll_request_json_unresolved(
@@ -1335,61 +1339,63 @@ impl Client {
         .await
         .map_err(|_| Error::Timeout)??;
         let hydration =
-            workflow_hydration::HydrationClaim::from_poll(&value, worker_id, &self.namespace)?;
-        let (mut loaded, pending) =
-            workflow_hydration::HydrationClaim::protect(hydration, self, async {
-                self.resolve_runtime_payloads(
-                    &mut value,
-                    "/worker/workflow-tasks/poll",
-                    RequestProtocol::Worker("1.20"),
-                )
-                .await?;
-                let mut response: PollWorkflowTaskResponse = serde_json::from_value(value.clone())
-                    .map_err(|_| {
-                        invalid("cooperative poll returned a malformed envelope or task")
-                    })?;
-                let outcome = response.outcome();
-                let task = if let Some(task) = response.task.take() {
-                    let (owner, _) = cancellation_claim(&task)?;
-                    if owner != worker_id
-                        || value["task"]["workflow_task_attempt"].as_u64()
-                            != Some(task.workflow_task_attempt)
-                    {
-                        return Err(invalid(
-                            "cooperative poll did not return the caller's actual owner and attempt",
-                        ));
-                    }
-                    let cancellation_request = match value["task"].get("cancellation_request") {
-                        None | Some(Value::Null) => None,
-                        Some(observation) => {
-                            Some(CancellationRequest::from_observation(observation)?)
-                        }
-                    };
-                    let mut claim = CooperativeWorkflowTask {
-                        task,
-                        cancellation_request,
-                        sticky_snapshot: None,
-                    };
-                    if self.sticky_cache.is_some() {
-                        claim.sticky_snapshot = Some(
-                            self.load_sticky_history(&mut claim.task, &value["task"], worker_id)
-                                .await?,
-                        );
-                    } else {
-                        self.load_cooperative_claim_history(&mut claim).await?;
-                    }
-                    Some(claim)
-                } else {
-                    None
-                };
-                Ok(CooperativeWorkflowTaskPoll {
-                    task,
-                    outcome,
-                    protocol_version: response.protocol_version,
-                    server_capabilities: response.server_capabilities,
-                })
-            })
+            workflow_hydration::HydrationClaim::from_poll(&value, worker_id, &self.namespace)?
+                .map(workflow_hydration::HydrationClaim::cooperative);
+        let loading = workflow_hydration::HydrationClaim::protect(hydration, self, async {
+            self.resolve_runtime_payloads(
+                &mut value,
+                "/worker/workflow-tasks/poll",
+                RequestProtocol::Worker("1.20"),
+            )
             .await?;
+            let mut response: PollWorkflowTaskResponse = serde_json::from_value(value.clone())
+                .map_err(|_| invalid("cooperative poll returned a malformed envelope or task"))?;
+            let outcome = response.outcome();
+            let task = if let Some(task) = response.task.take() {
+                let (owner, _) = cancellation_claim(&task)?;
+                if owner != worker_id
+                    || value["task"]["workflow_task_attempt"].as_u64()
+                        != Some(task.workflow_task_attempt)
+                {
+                    return Err(invalid(
+                        "cooperative poll did not return the caller's actual owner and attempt",
+                    ));
+                }
+                let cancellation_request = match value["task"].get("cancellation_request") {
+                    None | Some(Value::Null) => None,
+                    Some(observation) => Some(CancellationRequest::from_observation(observation)?),
+                };
+                let mut claim = CooperativeWorkflowTask {
+                    task,
+                    cancellation_request,
+                    sticky_snapshot: None,
+                };
+                if self.sticky_cache.is_some() {
+                    claim.sticky_snapshot = Some(
+                        self.load_sticky_history(&mut claim.task, &value["task"], worker_id)
+                            .await?,
+                    );
+                } else {
+                    self.load_cooperative_claim_history(&mut claim).await?;
+                }
+                Some(claim)
+            } else {
+                None
+            };
+            Ok(CooperativeWorkflowTaskPoll {
+                task,
+                outcome,
+                protocol_version: response.protocol_version,
+                server_capabilities: response.server_capabilities,
+            })
+        });
+        let (mut loaded, pending) = if managed {
+            loading.await?
+        } else {
+            tokio::time::timeout_at(deadline, loading)
+                .await
+                .map_err(|_| Error::Timeout)??
+        };
         if let (Some(claim), Some(pending)) = (loaded.task.as_mut(), pending) {
             claim.cancellation_request = Some(pending);
         }
@@ -1932,6 +1938,7 @@ impl Worker {
                     self.poll_timeout,
                     &poll_request_id,
                     0,
+                    true,
                 )
             })
             .await;

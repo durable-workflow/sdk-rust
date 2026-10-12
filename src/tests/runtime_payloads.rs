@@ -26,12 +26,17 @@ fn envelope() -> Value {
 }
 
 fn response(path: &str) -> Option<(&'static str, String)> {
+    if path.ends_with("/workflow-tasks/external-task/heartbeat") {
+        return Some(("200 OK", json!({"task_id":"external-task", "workflow_task_attempt":1,
+            "lease_owner":"worker", "renewed":true, "reason":null, "task_status":"leased",
+            "run_status":"running", "lease_expires_at":"2099-01-01T00:00:00Z", "cancellation_request":null}).to_string()));
+    }
     if path == FETCH_PATH {
         return Some(("200 OK", blob()));
     }
     let value = if path.ends_with("/poll") {
         json!({"task": {
-            "task_id":"external-task", "workflow_task_attempt":1,
+            "task_id":"external-task", "workflow_task_attempt":1, "lease_owner":"worker",
             "workflow_id":"external-workflow", "run_id":"external-run",
             "workflow_type":"external.workflow", "payload_codec":"avro",
             "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap(),

@@ -5,6 +5,8 @@ use super::*;
 pub(super) struct HydrationClaim {
     task: WorkflowTask,
     pending: Option<CancellationRequest>,
+    namespace: String,
+    cooperative: bool,
 }
 
 #[cfg(test)]
@@ -84,13 +86,7 @@ mod tests {
 
     #[test]
     fn unhydrated_claim_requires_actual_namespace_owner_and_attempt() {
-        for field in [
-            "namespace",
-            "lease_owner",
-            "workflow_task_attempt",
-            "task_id",
-            "run_id",
-        ] {
+        for field in ["lease_owner", "workflow_task_attempt", "task_id", "run_id"] {
             let mut raw = wire();
             raw["task"].as_object_mut().unwrap().remove(field);
             assert!(
@@ -293,7 +289,9 @@ impl HydrationClaim {
             return Ok(None);
         }
         let mut task: WorkflowTask = serde_json::from_value(task.clone())?;
-        if wire["task"]["namespace"].as_str() != Some(namespace)
+        if wire["task"]
+            .get("namespace")
+            .is_some_and(|value| value.as_str() != Some(namespace))
             || task.lease_owner.as_deref() != Some(worker_id)
             || wire["task"]["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
         {
@@ -310,10 +308,25 @@ impl HydrationClaim {
             None | Some(Value::Null) => None,
             Some(value) => Some(CancellationRequest::from_observation(value)?),
         };
-        Ok(Some(Self { task, pending }))
+        // Published poll envelopes omit namespace. Bind the claim to the
+        // authenticated request namespace, and reject any contradictory echo.
+        Ok(Some(Self {
+            task,
+            pending,
+            namespace: namespace.to_owned(),
+            cooperative: false,
+        }))
+    }
+
+    pub(super) fn cooperative(mut self) -> Self {
+        self.cooperative = true;
+        self
     }
 
     async fn confirm(&mut self, client: &Client) -> Result<()> {
+        if self.namespace != client.namespace {
+            return Err(invalid("hydration changed its authenticated namespace"));
+        }
         let receipt = client
             .heartbeat_workflow_task_with_protocol(
                 &self.task,
@@ -322,7 +335,7 @@ impl HydrationClaim {
             )
             .await?;
         self.pending = receipt.cancellation_request;
-        if self.pending.is_some() && !client.cooperative_worker_protocol {
+        if self.pending.is_some() && !self.cooperative && !client.cooperative_worker_protocol {
             return Err(invalid(
                 "pending cancellation requires a cooperative Worker",
             ));
