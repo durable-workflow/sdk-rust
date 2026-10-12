@@ -221,6 +221,9 @@ fn history_paths(prefix: &[&'static str], paths: &mut Vec<Vec<&'static str>>) {
         &["activity", "result"],
         &["command", "payload"],
         &["exception", "details"],
+        &["request_payload"],
+        &["response_payload"],
+        &["service_call", "result_envelope"],
     ] {
         paths.push([prefix, &["*", "payload"], field].concat());
     }
