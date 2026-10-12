@@ -169,6 +169,25 @@ impl Client {
 
 // These paths mirror Server's runtime payload transport. Do not recurse through
 // arbitrary application maps: a business field named external_payload is not a reference.
+pub(super) fn has_unresolved_payload(
+    response: &Value,
+    path: &str,
+    protocol: RequestProtocol,
+) -> bool {
+    fn contains(value: &Value, path: &[&str]) -> bool {
+        match path.split_first() {
+            None => value.get("external_payload").is_some(),
+            Some((&"*", rest)) => value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| contains(item, rest))),
+            Some((field, rest)) => value.get(*field).is_some_and(|value| contains(value, rest)),
+        }
+    }
+    envelope_paths(path, protocol)
+        .iter()
+        .any(|path| contains(response, path))
+}
+
 fn envelope_paths(path: &str, protocol: RequestProtocol) -> Vec<Vec<&'static str>> {
     let path = path.split('?').next().unwrap_or(path);
     let mut paths = Vec::new();
