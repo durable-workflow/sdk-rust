@@ -81,6 +81,7 @@ pub struct CooperativeWorkflowTask {
     task: WorkflowTask,
     cancellation_request: Option<CancellationRequest>,
     sticky_snapshot: Option<sticky_worker::StickySnapshot>,
+    verified_payloads: runtime_payloads::VerifiedPayloads,
 }
 
 impl CooperativeWorkflowTask {
@@ -1342,10 +1343,12 @@ impl Client {
             workflow_hydration::HydrationClaim::from_poll(&value, worker_id, &self.namespace)?
                 .map(workflow_hydration::HydrationClaim::cooperative);
         let loading = workflow_hydration::HydrationClaim::protect(hydration, self, async {
-            self.resolve_runtime_payloads(
+            let mut verified_payloads = runtime_payloads::VerifiedPayloads::new();
+            self.resolve_runtime_payloads_with_cache(
                 &mut value,
                 "/worker/workflow-tasks/poll",
                 RequestProtocol::Worker("1.20"),
+                &mut verified_payloads,
             )
             .await?;
             let mut response: PollWorkflowTaskResponse = serde_json::from_value(value.clone())
@@ -1369,6 +1372,7 @@ impl Client {
                     task,
                     cancellation_request,
                     sticky_snapshot: None,
+                    verified_payloads,
                 };
                 if self.sticky_cache.is_some() {
                     claim.sticky_snapshot = Some(
@@ -1656,6 +1660,20 @@ impl Client {
         task: &WorkflowTask,
         observation: &CancellationRequest,
     ) -> Result<Vec<HistoryEvent>> {
+        self.refresh_workflow_cancellation_history_with_cache(
+            task,
+            observation,
+            &mut runtime_payloads::VerifiedPayloads::new(),
+        )
+        .await
+    }
+
+    async fn refresh_workflow_cancellation_history_with_cache(
+        &self,
+        task: &WorkflowTask,
+        observation: &CancellationRequest,
+        verified_payloads: &mut runtime_payloads::VerifiedPayloads,
+    ) -> Result<Vec<HistoryEvent>> {
         let (owner, run_id) = cancellation_claim(task)?;
         observation.validate_observation()?;
         let first_token = observation
@@ -1675,9 +1693,11 @@ impl Client {
                     "lease_owner":owner, "workflow_task_attempt":task.workflow_task_attempt,
                     "next_history_page_token":current, "history_page_size":WORKFLOW_HISTORY_PAGE_SIZE,
                 });
-                let page: Value = self.request_json(
+                let mut page: Value = self.request_json_unresolved_with_timeout(
                     reqwest::Method::POST, &path, RequestProtocol::Worker("1.20"), Some(&body),
+                    CONTROL_BUDGET,
                 ).await?;
+                self.resolve_runtime_payloads_with_cache(&mut page, &path, RequestProtocol::Worker("1.20"), verified_payloads).await?;
                 if page["task_id"].as_str() != Some(task.task_id.as_str())
                     || page["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
                 {
@@ -1975,6 +1995,7 @@ impl Worker {
         &self,
         claim: &CooperativeWorkflowTask,
     ) -> Result<Option<WorkflowTaskDecision>> {
+        let mut verified_payloads = claim.verified_payloads.clone();
         let (owner, run_id) = cancellation_claim(&claim.task)?;
         if owner != self.worker_id {
             return Err(invalid(
@@ -2043,7 +2064,11 @@ impl Worker {
         };
         task.history_events = self
             .client
-            .refresh_workflow_cancellation_history(&claim.task, observation)
+            .refresh_workflow_cancellation_history_with_cache(
+                &claim.task,
+                observation,
+                &mut verified_payloads,
+            )
             .await?;
         for _ in 0..1000 {
             // Count the actual refreshed snapshot. Its byte budget was not
@@ -2099,7 +2124,11 @@ impl Worker {
             };
             task.history_events = self
                 .client
-                .refresh_workflow_cancellation_history(&claim.task, observation)
+                .refresh_workflow_cancellation_history_with_cache(
+                    &claim.task,
+                    observation,
+                    &mut verified_payloads,
+                )
                 .await?;
             let canonical =
                 CancellationHistory::from_events(&task.history_events, run_id, Some(observation))?;
