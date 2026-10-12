@@ -102,6 +102,99 @@ async fn runtime_external_activity_result_resolves_before_cold_replay() {
     assert_eq!(server.control_protocol_for(FETCH_PATH), None);
 }
 
+fn nexus_response(path: &str) -> Option<(&'static str, String)> {
+    if path.ends_with(FETCH_PATH) {
+        return Some(("200 OK", blob()));
+    }
+    let result = if path.contains("bad-integrity") {
+        let mut result = envelope();
+        result["external_payload"]["sha256"] = json!("0".repeat(64));
+        result
+    } else {
+        envelope()
+    };
+    Some(("200 OK",json!({"task":{
+        "task_id":"external-nexus-task","workflow_task_attempt":1,
+        "workflow_id":"external-nexus","run_id":"external-nexus-run","workflow_type":"external.nexus",
+        "payload_codec":"avro","arguments":encode_value_envelope(&json!([]),DEFAULT_CODEC).unwrap(),
+        "history_events":[
+            {"event_type":"ServiceCallStarted","payload":{"sequence":1,"service_call_id":"original-external-call",
+                "endpoint_name":"endpoint","service_name":"service","operation_name":"operation",
+                "request_payload":envelope(),"operation_mode":"sync","wait_for":"completed"}},
+            {"event_type":"ServiceCallCompleted","payload":{"sequence":1,"service_call_id":"original-external-call",
+                "response_payload":result,"service_call":{"result_envelope":result}}}
+        ]
+    }}).to_string()))
+}
+
+#[tokio::test]
+async fn nexus_runtime_references_resolve_once_before_cold_replay_with_worker_credentials() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        response_override: Some(nexus_response),
+        ..Default::default()
+    });
+    let client = Client::builder(server.base_url())
+        .worker_token(Some("worker-only".into()))
+        .control_token(Some("control-only".into()))
+        .namespace("external-test")
+        .build()
+        .unwrap();
+    let task = client
+        .poll_workflow_task("worker", "queue", Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap();
+    validate_workflow_task_payloads(&task).unwrap();
+    for _ in 0..2 {
+        let ctx = workflow_context(task.history_events.clone());
+        let mut call = Box::pin(ctx.call_nexus_service(
+            "endpoint",
+            "service",
+            "operation",
+            fixture()["value"]["value"].clone(),
+        ));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let Poll::Ready(Ok(result)) = call.as_mut().poll(&mut task_context) else {
+            panic!("original result expected")
+        };
+        assert_eq!(result.service_call_id, "original-external-call");
+        assert_eq!(
+            result.result,
+            AvroValue::String(fixture()["value"]["value"].as_str().unwrap().into())
+        );
+        ctx.ensure_history_consumed().unwrap();
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+    assert_eq!(server.request_count(FETCH_PATH), 1);
+    assert_eq!(
+        server.authorization_for(FETCH_PATH).as_deref(),
+        Some("Bearer worker-only")
+    );
+    assert_eq!(
+        server.namespace_for(FETCH_PATH).as_deref(),
+        Some("external-test")
+    );
+    assert_eq!(
+        server.worker_protocol_for(FETCH_PATH).as_deref(),
+        Some(WORKER_PROTOCOL_VERSION)
+    );
+    assert_eq!(server.control_protocol_for(FETCH_PATH), None);
+    let bad = Client::builder(format!("{}/bad-integrity", server.base_url()))
+        .worker_token(Some("worker-only".into()))
+        .build()
+        .unwrap();
+    let error = bad
+        .poll_workflow_task("worker", "queue", Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("external_payload_integrity_mismatch"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn runtime_external_client_result_preserves_projections_and_role() {
     let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {

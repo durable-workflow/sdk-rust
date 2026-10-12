@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "nexus-canonical-cancellation-cold-replay",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.nexus-cancellation", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "ServiceCallStarted", "payload": {
+      "sequence": 1, "service_call_id": "original-call", "endpoint_name": "endpoint", "service_name": "service",
+      "operation_name": "operation", "operation_mode": "sync", "wait_for": "completed", "status": "started"
+    }},
+    {"event_type": "CooperativeCancellationRequested", "timestamp": "2026-10-12T14:00:00Z", "payload": {
+      "workflow_command_id": "original-request", "workflow_run_id": "regression-corpus-run",
+      "cleanup_deadline_at": "2026-10-12T14:00:30Z"
+    }},
+    {"event_type": "ServiceCallCancelled", "payload": {
+      "sequence": 1, "service_call_id": "original-call", "status": "cancelled"
+    }},
+    {"event_type": "CooperativeCancellationDelivered", "timestamp": "2026-10-12T14:00:02Z", "payload": {
+      "workflow_command_id": "original-request", "workflow_run_id": "regression-corpus-run",
+      "sequence": 1, "call_kind": "service_operation"
+    }}
+  ],
+  "expected": {"type": "complete_workflow", "result": "original-request"}
+}
