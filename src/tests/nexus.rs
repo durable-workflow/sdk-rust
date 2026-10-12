@@ -125,7 +125,7 @@ fn terminal_service_failure_is_typed_at_the_original_call() {
             else {
                 panic!("typed service failure expected")
             };
-            assert_eq!(failure.service_call_id, "original-call");
+            assert_eq!(failure.service_call_id.as_deref(), Some("original-call"));
             assert_eq!(failure.status, status);
             Ok(json!(failure.exception_type))
         });
@@ -388,6 +388,87 @@ fn partial_terminal_projection_preserves_original_target() {
         result.linked_workflow_run_id.as_deref(),
         Some("original-target-run")
     );
+}
+
+#[test]
+fn immediate_service_outcome_and_pre_admission_refusal_resume_the_original_call() {
+    for kind in [
+        "ServiceCallCompleted",
+        "ServiceCallFailed",
+        "ServiceCallCancelled",
+    ] {
+        let commands = worker()
+            .execute_workflow_task(workflow_task(
+                "nexus",
+                vec![service_event(kind)],
+                DEFAULT_CODEC,
+            ))
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0]["type"],
+            if kind == "ServiceCallCompleted" {
+                "complete_workflow"
+            } else {
+                "fail_workflow"
+            }
+        );
+    }
+    let mut refusal = service_event("ServiceCallFailed");
+    refusal.payload["service_call_id"] = Value::Null;
+    refusal.payload["service_call"]["service_call_id"] = Value::Null;
+    refusal.payload["exception_type"] = json!("endpoint_not_found");
+    let commands = worker()
+        .execute_workflow_task(workflow_task("nexus", vec![refusal], DEFAULT_CODEC))
+        .unwrap();
+    assert_eq!(commands[0]["exception_type"], "NexusOperationFailed");
+    assert_eq!(
+        commands[0]["exception"]["properties"]["caller_observed_error_type"],
+        "endpoint_not_found"
+    );
+    assert!(commands[0]["exception"]["properties"]["service_call_id"].is_null());
+}
+
+#[test]
+fn changed_authored_service_arguments_are_refused_before_delivery() {
+    let mut start = service_event("ServiceCallStarted");
+    start.payload["request_payload"] = fixture_envelope(json!(["other-argument"]));
+    for suffix in [vec![], vec![request()], vec![request(), delivery()]] {
+        let mut history = vec![start.clone()];
+        history.extend(suffix);
+        assert!(matches!(
+            worker().execute_workflow_task(workflow_task("nexus", history, DEFAULT_CODEC)),
+            Err(Error::NonDeterministicReplay(_))
+        ));
+    }
+}
+
+#[test]
+fn authored_nexus_payload_preserves_the_request_value_shape() {
+    for request in [
+        Value::Null,
+        json!("single-value"),
+        json!({"invoice":"42"}),
+        json!(["argument"]),
+    ] {
+        let mut worker = Worker::new(Client::new("http://127.0.0.1:1").unwrap(), "queue");
+        let original = request.clone();
+        worker.register_workflow("nexus", move |ctx, _| {
+            let request = request.clone();
+            async move {
+                ctx.call_nexus_service("endpoint", "service", "operation", request)
+                    .await?;
+                Ok(Value::Null)
+            }
+        });
+        let commands = worker
+            .execute_workflow_task(workflow_task("nexus", vec![], DEFAULT_CODEC))
+            .unwrap();
+        assert_eq!(
+            decode_wire_value(&commands[0]["request_payload"], DEFAULT_CODEC).unwrap(),
+            original
+        );
+    }
 }
 
 fn capabilities() -> Value {

@@ -58,9 +58,9 @@ pub struct NexusOperationResult {
 
 /// A committed service failure delivered at the original authored call.
 #[derive(Clone, Debug, PartialEq, Error)]
-#[error("Nexus service call {service_call_id} {status}: {message}")]
+#[error("Nexus service operation {status}: {message}")]
 pub struct NexusOperationFailure {
-    pub service_call_id: String,
+    pub service_call_id: Option<String>,
     pub status: String,
     pub exception_type: String,
     pub message: String,
@@ -75,7 +75,9 @@ pub(super) struct RecordedServiceCall {
     pub mode: NexusOperationMode,
     pub wait_for: NexusWaitFor,
     pub idempotency_key: Option<String>,
-    pub admission: NexusOperationResult,
+    pub target_namespace: Option<String>,
+    pub request: Option<AvroValue>,
+    pub admission: Option<NexusOperationResult>,
     pub outcome: Option<std::result::Result<NexusOperationResult, NexusOperationFailure>>,
 }
 
@@ -164,16 +166,17 @@ pub(super) fn recorded_call(
         .iter()
         .filter(|event| event.event_type == "ServiceCallStarted")
         .collect();
-    if starts.len() != 1 {
+    if events.is_empty() || starts.len() > 1 || (starts.is_empty() && events.len() != 1) {
         return Err(history_error(
             sequence,
             "service history must contain one original admission",
         ));
     }
-    let start = starts[0];
-    if events
-        .first()
-        .is_none_or(|event| event.event_type != "ServiceCallStarted")
+    let start = events[0];
+    if !starts.is_empty()
+        && events
+            .first()
+            .is_none_or(|event| event.event_type != "ServiceCallStarted")
     {
         return Err(history_error(
             sequence,
@@ -243,7 +246,18 @@ pub(super) fn recorded_call(
             .unwrap_or(json!("completed")),
     )
     .map_err(|_| history_error(sequence, "original waiting policy is invalid"))?;
-    let admission = service_result(&start.payload, codec, sequence, "started")?;
+    let admission = if starts.is_empty() {
+        None
+    } else {
+        Some(service_result(&start.payload, codec, sequence, "started")?)
+    };
+    let target_namespace = service_text(&start.payload, "target_namespace");
+    let request = start
+        .payload
+        .get("request_payload")
+        .filter(|value| !value.is_null())
+        .map(|value| decode_wire_avro_value(value, codec))
+        .transpose()?;
     let terminals: Vec<_> = events
         .iter()
         .filter(|event| event.event_type != "ServiceCallStarted")
@@ -257,9 +271,10 @@ pub(super) fn recorded_call(
     let outcome = terminals
         .first()
         .map(|event| {
-            if service_text(&event.payload, "service_call_id").as_deref()
-                != Some(&admission.service_call_id)
-            {
+            if admission.as_ref().is_some_and(|admission| {
+                service_text(&event.payload, "service_call_id").as_deref()
+                    != Some(&admission.service_call_id)
+            }) {
                 return Err(history_error(
                     sequence,
                     "terminal delivery changes the original service identity",
@@ -267,15 +282,17 @@ pub(super) fn recorded_call(
             }
             if event.event_type == "ServiceCallCompleted" {
                 let mut result = service_result(&event.payload, codec, sequence, "completed")?;
-                result.target_namespace = result
-                    .target_namespace
-                    .or_else(|| admission.target_namespace.clone());
-                result.linked_workflow_instance_id = result
-                    .linked_workflow_instance_id
-                    .or_else(|| admission.linked_workflow_instance_id.clone());
-                result.linked_workflow_run_id = result
-                    .linked_workflow_run_id
-                    .or_else(|| admission.linked_workflow_run_id.clone());
+                if let Some(admission) = &admission {
+                    result.target_namespace = result
+                        .target_namespace
+                        .or_else(|| admission.target_namespace.clone());
+                    result.linked_workflow_instance_id = result
+                        .linked_workflow_instance_id
+                        .or_else(|| admission.linked_workflow_instance_id.clone());
+                    result.linked_workflow_run_id = result
+                        .linked_workflow_run_id
+                        .or_else(|| admission.linked_workflow_run_id.clone());
+                }
                 return Ok(Ok(result));
             }
             let status = if event.event_type == "ServiceCallCancelled" {
@@ -287,7 +304,7 @@ pub(super) fn recorded_call(
                 .or_else(|| service_text(&event.payload, "exception_type"))
                 .unwrap_or_else(|| format!("service_call_{status}"));
             Ok(Err(NexusOperationFailure {
-                service_call_id: admission.service_call_id.clone(),
+                service_call_id: service_text(&event.payload, "service_call_id"),
                 status: status.to_string(),
                 exception_type,
                 message: service_text(&event.payload, "message")
@@ -307,6 +324,8 @@ pub(super) fn recorded_call(
         mode,
         wait_for,
         idempotency_key: service_text(&start.payload, "idempotency_key"),
+        target_namespace,
+        request,
         admission,
         outcome,
     })
@@ -418,12 +437,12 @@ impl Future for NexusServiceCall {
                 .options
                 .target_namespace
                 .as_ref()
-                .is_some_and(|target| call.admission.target_namespace.as_ref() != Some(target))
-                || self
-                    .options
-                    .idempotency_key
-                    .as_ref()
-                    .is_some_and(|key| call.idempotency_key.as_ref() != Some(key))
+                .is_some_and(|target| call.target_namespace.as_ref() != Some(target))
+                || self.options.idempotency_key.as_ref().is_some_and(|key| {
+                    call.idempotency_key
+                        .as_ref()
+                        .is_some_and(|original| original != key)
+                })
                 || self.options.mode != call.mode
                 || self.options.wait_for != call.wait_for
             {
@@ -431,6 +450,18 @@ impl Future for NexusServiceCall {
                     sequence,
                     "original service routing, idempotency or waiting policy changed",
                 )));
+            }
+            if let Some(original) = &call.request {
+                let arguments = match self.arguments.take().unwrap_or(Ok(AvroValue::Null)) {
+                    Ok(arguments) => arguments,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                if &arguments != original {
+                    return Poll::Ready(Err(history_error(
+                        sequence,
+                        "original service request changed",
+                    )));
+                }
             }
             if self.options.completion_wait() {
                 if let Err(error) =
@@ -453,8 +484,10 @@ impl Future for NexusServiceCall {
             }
             state.command_cursor += 1;
             if !self.options.completion_wait() {
-                state.advance_cancellation_sequence(sequence, &[]);
-                return Poll::Ready(Ok(call.admission));
+                if let Some(admission) = call.admission {
+                    state.advance_cancellation_sequence(sequence, &[]);
+                    return Poll::Ready(Ok(admission));
+                }
             }
             if let Some(outcome) = call.outcome {
                 state.advance_cancellation_sequence(sequence, &[]);
@@ -503,7 +536,7 @@ impl Future for NexusServiceCall {
             }
         }
         let arguments = match self.arguments.take().unwrap_or(Ok(AvroValue::Null)) {
-            Ok(arguments) => normalize_avro_arguments(arguments),
+            Ok(arguments) => arguments,
             Err(error) => return Poll::Ready(Err(error)),
         };
         let request_payload = match encode_typed_envelope(&arguments, &state.payload_codec) {

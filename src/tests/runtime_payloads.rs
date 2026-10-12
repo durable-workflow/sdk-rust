@@ -147,8 +147,12 @@ async fn nexus_runtime_references_resolve_once_before_cold_replay_with_worker_cr
     validate_workflow_task_payloads(&task).unwrap();
     for _ in 0..2 {
         let ctx = workflow_context(task.history_events.clone());
-        let mut call =
-            Box::pin(ctx.call_nexus_service("endpoint", "service", "operation", json!([])));
+        let mut call = Box::pin(ctx.call_nexus_service(
+            "endpoint",
+            "service",
+            "operation",
+            fixture()["value"]["value"].clone(),
+        ));
         let mut task_context = TaskContext::from_waker(noop_waker_ref());
         let Poll::Ready(Ok(result)) = call.as_mut().poll(&mut task_context) else {
             panic!("original result expected")
