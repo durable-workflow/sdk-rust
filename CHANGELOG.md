@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.5.0
+
+- Default worker requests and metadata to protocol 1.20. Select
+  `WorkerProtocolVersion::V119` with `ClientBuilder::worker_protocol_version`
+  for an older Server. Keep optional capabilities explicit and refuse
+  cooperative registration from an explicit 1.19 client before sending it.
+  Preserve control-plane protocol 2 and the existing command and feature floors.
+
 ## 3.4.4
 
 - Reject duplicate workflow, activity, query and update handler names before
