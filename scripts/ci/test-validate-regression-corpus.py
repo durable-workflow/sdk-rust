@@ -598,6 +598,33 @@ mod tests {
 
         self.assertTrue(self._guard_matches(REPLAY_GUARD))
 
+    def test_history_transport_protocol_only_change_is_not_replay(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(
+            source.read_text(encoding="utf-8")
+            + "\nfn fetch_history() {\n    send(\n        RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),\n    );\n}\n",
+            encoding="utf-8",
+        )
+        self._git("add", "src/lib.rs")
+        self._git(
+            "-c", "user.name=Corpus Guard Test", "-c", "user.email=corpus-guard@example.invalid",
+            "commit", "--quiet", "-m", "history transport baseline",
+        )
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "RequestProtocol::Worker(WORKER_PROTOCOL_VERSION)", "RequestProtocol::DefaultWorker",
+            ),
+            encoding="utf-8",
+        )
+        self.assertFalse(self._guard_matches(REPLAY_GUARD))
+
+        # A real replay change in the same diff must still require evidence.
+        source.write_text(
+            source.read_text(encoding="utf-8").replace("history.len() < 10", "history.len() < 9"),
+            encoding="utf-8",
+        )
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
     def test_continue_as_new_consumption_without_keyword_is_related(self) -> None:
         source = self.root / "src/lib.rs"
         source.write_text(

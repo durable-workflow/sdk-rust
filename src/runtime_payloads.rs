@@ -113,6 +113,12 @@ impl Client {
             .header("X-Durable-Workflow-Payload-Size", reference.size_bytes)
             .header("X-Durable-Workflow-Payload-SHA256", &reference.sha256);
         match protocol {
+            RequestProtocol::DefaultWorker => {
+                request = request.header(
+                    "X-Durable-Workflow-Protocol-Version",
+                    self.worker_protocol_version.as_str(),
+                )
+            }
             RequestProtocol::Worker(version) => {
                 request = request.header("X-Durable-Workflow-Protocol-Version", version)
             }
@@ -166,7 +172,10 @@ impl Client {
 fn envelope_paths(path: &str, protocol: RequestProtocol) -> Vec<Vec<&'static str>> {
     let path = path.split('?').next().unwrap_or(path);
     let mut paths = Vec::new();
-    if matches!(protocol, RequestProtocol::Worker(_)) {
+    if matches!(
+        protocol,
+        RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+    ) {
         for field in [
             "arguments",
             "workflow_arguments",

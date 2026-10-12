@@ -1830,6 +1830,15 @@ def _guard_matches(
                 ]
                 enclosing_items.append((indentation, stripped))
         elif inside_hunk and line.startswith(("+", "-")):
+            # A request-header selection does not change history consumption.
+            # Keep history/replay guards for every other change in the same
+            # function, rather than requiring an unrelated replay fixture for
+            # an otherwise isolated worker protocol default change.
+            if re.fullmatch(
+                r"RequestProtocol::(?:DefaultWorker|Worker\((?:MINIMUM_)?WORKER_PROTOCOL_VERSION\)),?",
+                line[1:].strip(),
+            ):
+                continue
             relevant_lines.extend(identity for _, identity in enclosing_items)
             relevant_lines.append(line[1:])
     for path in matching:

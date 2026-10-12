@@ -146,8 +146,10 @@ impl Client {
                 reference.clone()
             } else {
                 let completion = if policy.completion_context
-                    && matches!(protocol, RequestProtocol::Worker(_))
-                {
+                    && matches!(
+                        protocol,
+                        RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+                    ) {
                     completion_context(body, path, &upload.path)
                 } else {
                     None
@@ -190,7 +192,10 @@ impl Client {
     }
 
     async fn runtime_upload_policy(&self, protocol: RequestProtocol) -> Result<Policy> {
-        let role = usize::from(matches!(protocol, RequestProtocol::Worker(_)));
+        let role = usize::from(matches!(
+            protocol,
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+        ));
         let cached = self
             .runtime_upload_policy
             .lock()
@@ -230,6 +235,10 @@ impl Client {
             .header(reqwest::header::ACCEPT, "application/json")
             .header("X-Namespace", &self.namespace);
         request = match protocol {
+            RequestProtocol::DefaultWorker if !discovery => request.header(
+                "X-Durable-Workflow-Protocol-Version",
+                self.worker_protocol_version.as_str(),
+            ),
             RequestProtocol::Worker(version) if !discovery => {
                 request.header("X-Durable-Workflow-Protocol-Version", version)
             }
@@ -453,7 +462,10 @@ fn payload_paths(body: &Value, path: &str, protocol: RequestProtocol) -> Vec<Str
     let path = path.split('?').next().unwrap_or(path);
     let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
     let mut paths = Vec::new();
-    if matches!(protocol, RequestProtocol::Worker(_)) {
+    if matches!(
+        protocol,
+        RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+    ) {
         match parts.as_slice() {
             ["worker", "workflow-tasks", _, "complete"] => {
                 for (index, command) in body["commands"]

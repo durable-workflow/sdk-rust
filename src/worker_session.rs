@@ -2,7 +2,7 @@
 
 use crate::{
     percent_encode_path_segment, ActivityCall, AvroValue, Client, Error, HandlerKind, HistoryEvent,
-    RequestProtocol, Result, WORKER_PROTOCOL_VERSION,
+    RequestProtocol, Result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -636,7 +636,7 @@ impl Client {
         self.request_json(
             reqwest::Method::POST,
             "/worker/sessions",
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Some(&body),
         )
         .await
@@ -662,7 +662,7 @@ impl Client {
                 "/worker/sessions/{}/heartbeat",
                 percent_encode_path_segment(session_id)
             ),
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Some(&json!({"worker_id":worker_id,"lease_seconds":lease_seconds})),
         )
         .await
@@ -683,7 +683,7 @@ impl Client {
                 "/worker/sessions/{}",
                 percent_encode_path_segment(session_id)
             ),
-            RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+            RequestProtocol::DefaultWorker,
             Some(&json!({"worker_id":worker_id,"reason":reason})),
         )
         .await

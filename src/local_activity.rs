@@ -288,7 +288,7 @@ impl Worker {
         tokio::select! {
             biased;
             _ = self.local_worker_stopped() => false,
-            receipt = self.client.heartbeat_workflow_task_with_protocol(task, None, WORKER_PROTOCOL_VERSION) => {
+            receipt = self.client.heartbeat_workflow_task_with_protocol(task, None, MINIMUM_WORKER_PROTOCOL_VERSION) => {
                 receipt.is_ok_and(|receipt| receipt.cancellation_request.is_none())
             }
         }
@@ -319,11 +319,7 @@ impl Worker {
             "commands": commands});
         let path = format!("/worker/workflow-tasks/{}/complete", task.task_id);
         self.client
-            .externalize_runtime_payloads(
-                &mut body,
-                &path,
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
-            )
+            .externalize_runtime_payloads(&mut body, &path, RequestProtocol::DefaultWorker)
             .await?;
         *wire = body["commands"][index].take();
         Ok(())

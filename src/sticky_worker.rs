@@ -87,7 +87,7 @@ impl Worker {
             .client
             .poll_request_json(
                 "/worker/workflow-tasks/poll",
-                RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                RequestProtocol::DefaultWorker,
                 &body,
                 self.poll_timeout + Duration::from_secs(5),
                 0,
@@ -380,7 +380,7 @@ impl Client {
                         "/worker/workflow-tasks/{}/history",
                         percent_encode_path_segment(&task.task_id)
                     ),
-                    RequestProtocol::Worker(WORKER_PROTOCOL_VERSION),
+                    RequestProtocol::DefaultWorker,
                     Some(&body),
                 )
                 .await?;
@@ -727,7 +727,7 @@ mod tests {
             .unwrap();
         let requests = requests.await.unwrap();
         assert_eq!(requests[0].0, "/api/cluster/info");
-        assert_eq!(requests[1].1, "1.18");
+        assert_eq!(requests[1].1, "1.20");
         assert_eq!(requests[1].2["sticky_cache"]["run_id"], "run");
         assert_eq!(requests[1].2["workflow_task_attempt"], 7);
     }
