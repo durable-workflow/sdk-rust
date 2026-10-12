@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.5.1
+
+- Confirm and renew the exact workflow task claim while loading external inputs
+  and paged history. Abort loading on lost authority or Worker shutdown before
+  workflow code executes. Preserve the selected Client timeout across the whole
+  claimed transfer, without restarting it on renewal.
+- Reuse bounded, verified payload bytes within a cooperative claim's canonical
+  cancellation refresh. Keep the original cancellation identity, cleanup deadline
+  and committed delivery boundary. Dropped polls retain no renewal task, and
+  ordinary Worker shutdown finishes normally during input loading.
+
 ## 3.5.0
 
 - Default worker requests and metadata to protocol 1.20. Select

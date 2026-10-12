@@ -8357,6 +8357,15 @@ impl Worker {
             }
             match operation().await {
                 Err(error)
+                    if workflow_hydration::stopped(&error)
+                        && self
+                            .run_stop
+                            .as_ref()
+                            .is_some_and(|stop| stop.load(Ordering::SeqCst)) =>
+                {
+                    return Ok(None);
+                }
+                Err(error)
                     if worker_operation_is_retryable(&error)
                         && (retries < self.retry_policy.max_retries
                             || (self.recover_transient_outages

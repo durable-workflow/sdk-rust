@@ -2,6 +2,12 @@
 
 use super::*;
 
+const STOPPED: &str = "workflow_hydration_stopped: Worker stopped before hydration finished";
+
+pub(super) fn stopped(error: &Error) -> bool {
+    matches!(error, Error::WorkerLoop(message) if message == STOPPED)
+}
+
 pub(super) struct HydrationClaim {
     task: WorkflowTask,
     pending: Option<CancellationRequest>,
@@ -197,6 +203,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_shutdown_settles_interrupted_hydration_without_an_error() {
+        let (url, requests) = server(vec![(200, receipt())]).await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut worker = Worker::new(client(url), "queue").with_storage_admission(stop.clone());
+        worker.run_stop = Some(stop.clone());
+        let shutdown = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stop.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(
+            worker.retry_worker_operation(|| async {
+                HydrationClaim::protect(
+                    claim(&wire()),
+                    &worker.client,
+                    std::future::pending::<Result<()>>(),
+                )
+                .await
+            }),
+            shutdown
+        );
+        assert!(result.unwrap().is_none());
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_shutdown_does_not_hide_an_authority_rejection() {
+        let (url, requests) = server(vec![(409, json!({"reason":"task_not_leased"}))]).await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut worker = Worker::new(client(url), "queue").with_storage_admission(stop.clone());
+        worker.run_stop = Some(stop);
+        let result = worker
+            .retry_worker_operation(|| async {
+                HydrationClaim::protect(claim(&wire()), &worker.client, async { Ok(()) }).await
+            })
+            .await;
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 409));
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn explicit_hydration_budget_is_not_restarted() {
         let (url, requests) = server(vec![(200, receipt())]).await;
         let client = Client::builder(url)
@@ -384,7 +430,7 @@ impl HydrationClaim {
         };
         tokio::select! {
             biased;
-            _ = &mut stopped => Err(invalid("Worker stopped before hydration finished")),
+            _ = &mut stopped => Err(Error::WorkerLoop(STOPPED.to_owned())),
             result = tokio::time::timeout(client.hydration_timeout, protected) => {
                 result.map_err(|_| Error::Timeout)?
             }
