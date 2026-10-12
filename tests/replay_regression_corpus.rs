@@ -542,7 +542,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 ctx.call_nexus_service("endpoint", "service", "operation", json!(["world"]))
                     .await?
                     .result
-                    .into_json()
+                    .deserialize::<Value>()
             });
         }
         "corpus.nexus-cancellation" => {

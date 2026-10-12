@@ -54,7 +54,7 @@ pub struct CancellationDeliveryReceipt {
 pub enum CancellationDeliveryReply {
     Delivered(CancellationDeliveryReceipt),
     /// The current claim is completed. Return to polling without publishing
-    /// completion or failure. A child terminal event wakes a successor claim.
+    /// completion or failure. The awaited terminal event wakes a successor claim.
     ClaimReleased {
         task_id: String,
         run_id: String,

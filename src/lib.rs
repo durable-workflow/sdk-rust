@@ -6665,6 +6665,7 @@ impl Worker {
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = worker_id.into();
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.nexus_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.sticky_registration_confirmed = Arc::new(AtomicBool::new(false));
@@ -15810,7 +15811,7 @@ fn recorded_commands(
 
             if !service_events.is_empty() {
                 return Ok(RecordedCommand::ServiceOperation {
-                    sequence, call: nexus::recorded_call(&service_events, sequence, fallback_codec)?,
+                    sequence, call: nexus::recorded_call(&service_events, sequence, fallback_codec, &parent)?,
                 });
             }
 

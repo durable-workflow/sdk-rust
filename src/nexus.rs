@@ -93,6 +93,29 @@ fn service_text(payload: &Value, field: &str) -> Option<String> {
     payload_string(payload, field).or_else(|| payload_string(&payload["service_call"], field))
 }
 
+fn identity_text(payload: &Value, field: &str, sequence: u64) -> Result<Option<String>> {
+    let mut result = None;
+    for source in [payload, &payload["service_call"]] {
+        let Some(value) = source.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let text = value
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                history_error(sequence, &format!("{field} must be a non-empty string"))
+            })?;
+        if result.as_deref().is_some_and(|original| original != text) {
+            return Err(history_error(
+                sequence,
+                &format!("{field} has conflicting projections"),
+            ));
+        }
+        result = Some(text.to_owned());
+    }
+    Ok(result)
+}
+
 fn service_result(
     payload: &Value,
     codec: &str,
@@ -135,6 +158,7 @@ pub(super) fn recorded_call(
     events: &[&HistoryEvent],
     sequence: u64,
     codec: &str,
+    parent: &WorkflowIdentity,
 ) -> Result<RecordedServiceCall> {
     let starts: Vec<_> = events
         .iter()
@@ -147,6 +171,56 @@ pub(super) fn recorded_call(
         ));
     }
     let start = starts[0];
+    if events
+        .first()
+        .is_none_or(|event| event.event_type != "ServiceCallStarted")
+    {
+        return Err(history_error(
+            sequence,
+            "terminal delivery precedes original admission",
+        ));
+    }
+    for event in events {
+        for (field, expected) in [
+            ("caller_workflow_instance_id", parent.workflow_id.as_deref()),
+            ("workflow_instance_id", parent.workflow_id.as_deref()),
+            ("caller_workflow_run_id", parent.run_id.as_deref()),
+            ("workflow_run_id", parent.run_id.as_deref()),
+        ] {
+            if let Some(actual) = identity_text(&event.payload, field, sequence)? {
+                if expected.is_some_and(|expected| expected != actual) {
+                    return Err(history_error(
+                        sequence,
+                        &format!("{field} does not identify this caller"),
+                    ));
+                }
+            }
+        }
+        for field in [
+            "service_call_id",
+            "endpoint_name",
+            "service_name",
+            "operation_name",
+            "target_namespace",
+            "caller_namespace",
+            "idempotency_key",
+            "operation_mode",
+            "wait_for",
+            "linked_workflow_instance_id",
+            "linked_workflow_run_id",
+            "call_deadline_at",
+        ] {
+            let original = identity_text(&start.payload, field, sequence)?;
+            let observed = identity_text(&event.payload, field, sequence)?;
+            if matches!((&original, &observed), (Some(original), Some(observed)) if original != observed)
+            {
+                return Err(history_error(
+                    sequence,
+                    &format!("terminal delivery changes original {field}"),
+                ));
+            }
+        }
+    }
     let required = |field| {
         service_text(&start.payload, field)
             .ok_or_else(|| history_error(sequence, &format!("original {field} is missing")))
@@ -192,7 +266,17 @@ pub(super) fn recorded_call(
                 ));
             }
             if event.event_type == "ServiceCallCompleted" {
-                return service_result(&event.payload, codec, sequence, "completed").map(Ok);
+                let mut result = service_result(&event.payload, codec, sequence, "completed")?;
+                result.target_namespace = result
+                    .target_namespace
+                    .or_else(|| admission.target_namespace.clone());
+                result.linked_workflow_instance_id = result
+                    .linked_workflow_instance_id
+                    .or_else(|| admission.linked_workflow_instance_id.clone());
+                result.linked_workflow_run_id = result
+                    .linked_workflow_run_id
+                    .or_else(|| admission.linked_workflow_run_id.clone());
+                return Ok(Ok(result));
             }
             let status = if event.event_type == "ServiceCallCancelled" {
                 "cancelled"

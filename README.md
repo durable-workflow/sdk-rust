@@ -273,6 +273,32 @@ option. Keep a process supervisor for startup failures and process crashes.
 - [Self-hosted Server guide](https://durable-workflow.com/docs/2.0/polyglot/server/)
 - [Cloud early access](https://cloud.durable-workflow.com/early-access)
 
+## Nexus service calls
+
+Await a catalog operation from workflow code with Avro arguments:
+
+```rust,ignore
+let reply = ctx.call_nexus_service("billing", "invoices", "create", invoice).await?;
+let receipt: Receipt = reply.result.deserialize()?;
+```
+
+The default synchronous call waits for its committed result. Cold replay resumes
+the original call without admitting it again. `NexusServiceOptions` selects a
+target namespace, idempotency key, async mode or acceptance-only waiting. Async
+and acceptance-only calls return the original admission, even when a terminal
+result appears later. Committed failures use `Error::NexusOperationFailed`.
+Calls currently run in the root workflow scope.
+
+Enable `Worker::nexus_cooperative_cancellation(true)` for cooperative service
+waits. It enables ordinary cooperation and requires the installed Server to
+advertise protocol 1.20, both cancellation capabilities and a `workflow_run`
+binding. Cancellation reaches the original synchronous completion wait after
+owned target cleanup, preserving the original request and cleanup deadline.
+Use a cancellation shield for durable cleanup. See
+[`examples/nexus_cooperation.rs`](examples/nexus_cooperation.rs) for caller and
+target workers. Ordinary cooperative workers keep their existing registration
+behavior when Nexus cooperation is disabled.
+
 ## Compatibility
 
 The SDK supports cooperative requests and bounded,
