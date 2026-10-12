@@ -606,7 +606,10 @@ mod tests {
             encoding="utf-8",
         )
         self._git("add", "src/lib.rs")
-        self._git("commit", "--quiet", "-m", "history transport baseline")
+        self._git(
+            "-c", "user.name=Corpus Guard Test", "-c", "user.email=corpus-guard@example.invalid",
+            "commit", "--quiet", "-m", "history transport baseline",
+        )
         source.write_text(
             source.read_text(encoding="utf-8").replace(
                 "RequestProtocol::Worker(WORKER_PROTOCOL_VERSION)", "RequestProtocol::DefaultWorker",
