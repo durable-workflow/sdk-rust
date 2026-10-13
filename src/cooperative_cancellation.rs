@@ -1985,26 +1985,29 @@ impl Worker {
         };
         // Anchor the immutable cleanup deadline once, before replay. Deferring
         // completion must not grant another cleanup budget on each retry.
-        let mut completion_worker = self.clone();
-        if let (Some(request), Some(admission)) = (
+        let mut completion_worker = None;
+        if let (Some(request), Some(_)) = (
             claim.cancellation_request.as_ref(),
-            completion_worker.client.worker_storage_admission.as_mut(),
+            self.client.worker_storage_admission.as_ref(),
         ) {
+            let mut worker = self.clone();
+            let admission = worker.client.worker_storage_admission.as_mut().unwrap();
             let deadline = DateTime::parse_from_rfc3339(&request.cleanup_deadline_at)
                 .map_err(|_| invalid("invalid original cleanup deadline"))?;
             let unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Error::Timeout)?;
-            let now = DateTime::<Utc>::from_timestamp(
+            let now = DateTime::<chrono::Utc>::from_timestamp(
                 i64::try_from(unix.as_secs()).map_err(|_| Error::Timeout)?,
                 unix.subsec_nanos(),
             )
             .ok_or(Error::Timeout)?;
-            let remaining = (deadline.with_timezone(&Utc) - now)
+            let remaining = (deadline.with_timezone(&chrono::Utc) - now)
                 .to_std()
                 .unwrap_or(Duration::ZERO);
             admission.workflow_completion_retry_deadline =
                 Some(tokio::time::Instant::now() + remaining);
+            completion_worker = Some(worker);
         }
         // An uncertain observation, delivery or canonical refresh cannot become
         // an application failure or be published as a workflow-task decision.
@@ -2013,6 +2016,8 @@ impl Worker {
         };
         let (owner, _) = cancellation_claim(&claim.task)?;
         completion_worker
+            .as_ref()
+            .unwrap_or(self)
             .settle_workflow_task_decision(
                 &claim.task.task_id,
                 owner,

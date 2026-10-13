@@ -409,6 +409,7 @@ mod tests {
             client.worker_storage_admission = Some(WorkerStorageAdmission {
                 policy: WorkerRetryPolicy::default(),
                 stop: stop.clone(),
+                workflow_completion_retry_deadline: None,
             });
             let claim = claim(&wire(), &client);
             let dropped = Arc::new(AtomicBool::new(false));
