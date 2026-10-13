@@ -388,7 +388,7 @@ async fn runtime_external_chunked_body_cannot_exceed_reference_size() {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut request = [0u8; 4096];
-        stream.read(&mut request).unwrap();
+        assert!(stream.read(&mut request).unwrap() > 0);
         let response = format!("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n64\r\n{}\r\n0\r\n\r\n", "x".repeat(100));
         stream.write_all(response.as_bytes()).unwrap();
     });
