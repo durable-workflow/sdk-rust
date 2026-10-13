@@ -1,0 +1,400 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-published-php-complete-explicit-backoff",
+  "protocol_version": "1.19",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.php-zero-full",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "id": "01m4skfhr6r61cepab94hc4e95",
+      "sequence": 1,
+      "event_type": "StartAccepted",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "workflow_command_id": "01m4skfhqvnf2tc1dzfskste37",
+        "workflow_instance_id": "wf744-zero",
+        "workflow_run_id": "01m4skfhqk5hevrjsbv3c1mzbv",
+        "workflow_class": "MatrixWorkflow",
+        "workflow_type": "probe.marker744.matrix",
+        "business_key": null,
+        "visibility_labels": null,
+        "memo": null,
+        "search_attributes": null,
+        "outcome": "started_new",
+        "command": {
+          "id": "01m4skfhqvnf2tc1dzfskste37",
+          "sequence": 1,
+          "type": "start",
+          "target_scope": "instance",
+          "resolved_run_id": "01m4skfhqk5hevrjsbv3c1mzbv",
+          "payload_codec": "avro",
+          "payload": "wwHioz3/VYAiNwwA",
+          "source": "php",
+          "caller_label": "PHP API",
+          "auth_status": "not_applicable",
+          "auth_method": "none",
+          "status": "accepted",
+          "outcome": "started_new",
+          "accepted_at": "2026-10-13T03:04:15.865222Z",
+          "applied_at": "2026-10-13T03:04:15.865229Z"
+        }
+      },
+      "workflow_task_id": null,
+      "workflow_command_id": "01m4skfhqvnf2tc1dzfskste37",
+      "recorded_at": "2026-10-13T03:04:15.870019Z"
+    },
+    {
+      "id": "01m4skfhrhwceqfk85133c4xvg",
+      "sequence": 2,
+      "event_type": "WorkflowStarted",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "workflow_class": "MatrixWorkflow",
+        "workflow_type": "probe.marker744.matrix",
+        "workflow_instance_id": "wf744-zero",
+        "workflow_run_id": "01m4skfhqk5hevrjsbv3c1mzbv",
+        "workflow_command_id": "01m4skfhqvnf2tc1dzfskste37",
+        "business_key": null,
+        "visibility_labels": null,
+        "memo": null,
+        "search_attributes": null,
+        "execution_timeout_seconds": null,
+        "run_timeout_seconds": null,
+        "execution_deadline_at": null,
+        "run_deadline_at": null,
+        "workflow_definition_fingerprint": "sha256:538f09a8d90b772beb1256d56707a9af59eb3cce754ba7bb0b326b27dd1c543d",
+        "declared_queries": [],
+        "declared_query_contracts": [],
+        "declared_signals": [],
+        "declared_signal_contracts": [],
+        "declared_updates": [],
+        "declared_update_contracts": [],
+        "declared_entry_method": "handle",
+        "declared_entry_mode": "canonical",
+        "declared_entry_declaring_class": "MatrixWorkflow",
+        "command": {
+          "id": "01m4skfhqvnf2tc1dzfskste37",
+          "sequence": 1,
+          "type": "start",
+          "target_scope": "instance",
+          "resolved_run_id": "01m4skfhqk5hevrjsbv3c1mzbv",
+          "payload_codec": "avro",
+          "payload": "wwHioz3/VYAiNwwA",
+          "source": "php",
+          "caller_label": "PHP API",
+          "auth_status": "not_applicable",
+          "auth_method": "none",
+          "status": "accepted",
+          "outcome": "started_new",
+          "accepted_at": "2026-10-13T03:04:15.865222Z",
+          "applied_at": "2026-10-13T03:04:15.865229Z"
+        }
+      },
+      "workflow_task_id": null,
+      "workflow_command_id": "01m4skfhqvnf2tc1dzfskste37",
+      "recorded_at": "2026-10-13T03:04:15.888620Z"
+    },
+    {
+      "id": "01m4skfhvecz4x1px06ng2rkrg",
+      "sequence": 3,
+      "event_type": "VersionMarkerRecorded",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "sequence": 1,
+        "change_id": "frozen-zero",
+        "version": 0,
+        "min_supported": -7,
+        "max_supported": 0,
+        "task": {
+          "id": "01m4skfhrkyqqzysc25xhk4q7z",
+          "type": "workflow",
+          "status": "leased",
+          "available_at": "2026-10-13T03:04:15.890885Z",
+          "leased_at": "2026-10-13T03:04:15.967985Z",
+          "lease_owner": "01m4skfhrkyqqzysc25xhk4q7z",
+          "lease_expires_at": "2026-10-13T03:05:15.967991Z",
+          "attempt_count": 1,
+          "repair_count": 0,
+          "connection": "sqlite",
+          "queue": "default",
+          "last_dispatch_attempt_at": "2026-10-13T03:04:15.918915Z",
+          "last_dispatched_at": "2026-10-13T03:04:15.918915Z"
+        }
+      },
+      "workflow_task_id": "01m4skfhrkyqqzysc25xhk4q7z",
+      "workflow_command_id": null,
+      "recorded_at": "2026-10-13T03:04:15.981642Z"
+    },
+    {
+      "id": "01m4skfhvsmfmwwg7qjpky3872",
+      "sequence": 4,
+      "event_type": "ActivityScheduled",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "activity_execution_id": "01m4skfhvh3sy3b23s40357b37",
+        "activity_class": "MatrixActivity",
+        "activity_type": "MatrixActivity",
+        "sequence": 2,
+        "activity": {
+          "id": "01m4skfhvh3sy3b23s40357b37",
+          "idempotency_key": "01m4skfhvh3sy3b23s40357b37",
+          "sequence": 2,
+          "type": "MatrixActivity",
+          "class": "MatrixActivity",
+          "local_activity": false,
+          "status": "pending",
+          "payload_codec": "avro",
+          "attempt_count": 0,
+          "retry_policy": {
+            "snapshot_version": 1,
+            "max_attempts": 1,
+            "backoff_seconds": [
+              1,
+              2,
+              5,
+              10,
+              15,
+              30,
+              60,
+              120
+            ],
+            "start_to_close_timeout": null,
+            "schedule_to_start_timeout": null,
+            "schedule_to_close_timeout": null,
+            "heartbeat_timeout": null,
+            "non_retryable_error_types": []
+          },
+          "connection": "database",
+          "queue": "default",
+          "created_at": "2026-10-13T03:04:15.985766Z",
+          "arguments": "wwHioz3/VYAiNwwA"
+        },
+        "task": {
+          "id": "01m4skfhrkyqqzysc25xhk4q7z",
+          "type": "workflow",
+          "status": "leased",
+          "available_at": "2026-10-13T03:04:15.890885Z",
+          "leased_at": "2026-10-13T03:04:15.967985Z",
+          "lease_owner": "01m4skfhrkyqqzysc25xhk4q7z",
+          "lease_expires_at": "2026-10-13T03:05:15.967991Z",
+          "attempt_count": 1,
+          "repair_count": 0,
+          "connection": "sqlite",
+          "queue": "default",
+          "last_dispatch_attempt_at": "2026-10-13T03:04:15.918915Z",
+          "last_dispatched_at": "2026-10-13T03:04:15.918915Z"
+        }
+      },
+      "workflow_task_id": "01m4skfhrkyqqzysc25xhk4q7z",
+      "workflow_command_id": null,
+      "recorded_at": "2026-10-13T03:04:15.992916Z"
+    },
+    {
+      "id": "01m4skkxnzs5w9zzt07bmkge9k",
+      "sequence": 5,
+      "event_type": "ActivityStarted",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "activity_execution_id": "01m4skfhvh3sy3b23s40357b37",
+        "activity_attempt_id": "01M4SKKXNAT0NKGWFB5QQKMX1N",
+        "activity_class": "MatrixActivity",
+        "activity_type": "MatrixActivity",
+        "sequence": 2,
+        "attempt_number": 1,
+        "activity": {
+          "id": "01m4skfhvh3sy3b23s40357b37",
+          "idempotency_key": "01m4skfhvh3sy3b23s40357b37",
+          "sequence": 2,
+          "type": "MatrixActivity",
+          "class": "MatrixActivity",
+          "local_activity": false,
+          "attempt_id": "01M4SKKXNAT0NKGWFB5QQKMX1N",
+          "status": "running",
+          "payload_codec": "avro",
+          "attempt_count": 1,
+          "retry_policy": {
+            "snapshot_version": 1,
+            "max_attempts": 1,
+            "backoff_seconds": [
+              1,
+              2,
+              5,
+              10,
+              15,
+              30,
+              60,
+              120
+            ],
+            "start_to_close_timeout": null,
+            "schedule_to_start_timeout": null,
+            "schedule_to_close_timeout": null,
+            "heartbeat_timeout": null,
+            "non_retryable_error_types": []
+          },
+          "connection": "database",
+          "queue": "default",
+          "created_at": "2026-10-13T03:04:15.985766Z",
+          "started_at": "2026-10-13T03:06:39.145067Z",
+          "arguments": "wwHioz3/VYAiNwwA"
+        },
+        "task": {
+          "id": "01m4skfhvvq1z7fcadq9qk79nq",
+          "type": "activity",
+          "status": "leased",
+          "available_at": "2026-10-13T03:04:15.994868Z",
+          "leased_at": "2026-10-13T03:06:39.145067Z",
+          "lease_owner": "01m4skfhvvq1z7fcadq9qk79nq",
+          "lease_expires_at": "2026-10-13T03:11:39.146932Z",
+          "attempt_count": 1,
+          "repair_count": 0,
+          "connection": "sqlite",
+          "queue": "default",
+          "last_dispatch_attempt_at": "2026-10-13T03:04:16.054130Z",
+          "last_dispatched_at": "2026-10-13T03:04:16.054130Z"
+        }
+      },
+      "workflow_task_id": "01m4skfhvvq1z7fcadq9qk79nq",
+      "workflow_command_id": null,
+      "recorded_at": "2026-10-13T03:06:39.165954Z"
+    },
+    {
+      "id": "01m4skkxv5ff6mj4v9demcme98",
+      "sequence": 6,
+      "event_type": "ActivityCompleted",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "activity_execution_id": "01m4skfhvh3sy3b23s40357b37",
+        "activity_attempt_id": "01M4SKKXNAT0NKGWFB5QQKMX1N",
+        "activity_class": "MatrixActivity",
+        "activity_type": "MatrixActivity",
+        "sequence": 2,
+        "attempt_number": 1,
+        "result": "wwHioz3/VYAiNw4GDmludGVnZXIEgoCAgICAgCAQb3B0aW9uYWwADnVuaWNvZGUKEHJhbmdlIM67AA==",
+        "payload_codec": "avro",
+        "activity": {
+          "id": "01m4skfhvh3sy3b23s40357b37",
+          "idempotency_key": "01m4skfhvh3sy3b23s40357b37",
+          "sequence": 2,
+          "type": "MatrixActivity",
+          "class": "MatrixActivity",
+          "local_activity": false,
+          "attempt_id": "01M4SKKXNAT0NKGWFB5QQKMX1N",
+          "status": "completed",
+          "payload_codec": "avro",
+          "attempt_count": 1,
+          "retry_policy": {
+            "snapshot_version": 1,
+            "max_attempts": 1,
+            "backoff_seconds": [
+              1,
+              2,
+              5,
+              10,
+              15,
+              30,
+              60,
+              120
+            ],
+            "start_to_close_timeout": null,
+            "schedule_to_start_timeout": null,
+            "schedule_to_close_timeout": null,
+            "heartbeat_timeout": null,
+            "non_retryable_error_types": []
+          },
+          "connection": "database",
+          "queue": "default",
+          "created_at": "2026-10-13T03:04:15.985766Z",
+          "started_at": "2026-10-13T03:06:39.145067Z",
+          "closed_at": "2026-10-13T03:06:39.330483Z",
+          "arguments": "wwHioz3/VYAiNwwA",
+          "result": "wwHioz3/VYAiNw4GDmludGVnZXIEgoCAgICAgCAQb3B0aW9uYWwADnVuaWNvZGUKEHJhbmdlIM67AA=="
+        },
+        "task": {
+          "id": "01m4skfhvvq1z7fcadq9qk79nq",
+          "type": "activity",
+          "status": "leased",
+          "available_at": "2026-10-13T03:04:15.994868Z",
+          "leased_at": "2026-10-13T03:06:39.145067Z",
+          "lease_owner": "01m4skfhvvq1z7fcadq9qk79nq",
+          "lease_expires_at": "2026-10-13T03:11:39.146932Z",
+          "attempt_count": 1,
+          "repair_count": 0,
+          "connection": "sqlite",
+          "queue": "default",
+          "last_dispatch_attempt_at": "2026-10-13T03:04:16.054130Z",
+          "last_dispatched_at": "2026-10-13T03:04:16.054130Z"
+        }
+      },
+      "workflow_task_id": "01m4skfhvvq1z7fcadq9qk79nq",
+      "workflow_command_id": null,
+      "recorded_at": "2026-10-13T03:06:39.332514Z"
+    },
+    {
+      "id": "01m4skpn4ejq4d526b5hsa79h2",
+      "sequence": 7,
+      "event_type": "WorkflowCompleted",
+      "namespace": "wf744-matrix-alpha",
+      "payload": {
+        "output": "wwHioz3/VYAiNwwMBAACAAAEAAIADgYOaW50ZWdlcgSCgICAgICAIBBvcHRpb25hbAAOdW5pY29kZQoQcmFuZ2UgzrsAAA==",
+        "payload_codec": "avro",
+        "task": {
+          "id": "01m4skkxvbtrjt0mrrwpvsk1c6",
+          "type": "workflow",
+          "status": "leased",
+          "available_at": "2026-10-13T03:06:39.338138Z",
+          "leased_at": "2026-10-13T03:08:08.492177Z",
+          "lease_owner": "01m4skkxvbtrjt0mrrwpvsk1c6",
+          "lease_expires_at": "2026-10-13T03:09:08.492187Z",
+          "attempt_count": 1,
+          "repair_count": 0,
+          "connection": "sqlite",
+          "queue": "default",
+          "last_dispatch_attempt_at": "2026-10-13T03:06:39.367370Z",
+          "last_dispatched_at": "2026-10-13T03:06:39.367370Z"
+        }
+      },
+      "workflow_task_id": "01m4skkxvbtrjt0mrrwpvsk1c6",
+      "workflow_command_id": null,
+      "recorded_at": "2026-10-13T03:08:08.718174Z"
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": [
+        0,
+        false,
+        null,
+        0,
+        false,
+        {
+          "integer": 9007199254740993,
+          "optional": null,
+          "unicode": "range λ"
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": [
+      0,
+      false,
+      null,
+      0,
+      false,
+      {
+        "integer": 9007199254740993,
+        "optional": null,
+        "unicode": "range λ"
+      }
+    ]
+  }
+}
