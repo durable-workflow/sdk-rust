@@ -124,6 +124,15 @@ inputs and paged history, then confirm it again before replay. Loading stops on
 lost authority or Worker shutdown without executing workflow code. Pending
 cooperative cancellation retains its original identity and cleanup deadline.
 
+External activity inputs retain their original lease and execution deadline
+bounds while loading. Protocol 1.20 observes the exact activity attempt before,
+during and after the transfer, and immediately before callback entry. Unconfirmed
+authority stops loading without invoking the callback. These observations do not
+renew the lease or record application heartbeats. Explicit protocol 1.19 uses
+the original local lease/deadline bounds and completion fencing; it cannot
+observe live revocation or ownership. Live authority supervision requires 1.20.
+Shutdown and dropping a poll stop its loading and observation together.
+
 The Client's default 60-second HTTP timeout includes connection and the complete
 response body. `Client::builder(...).timeout(Duration::from_secs(120))` selects a
 larger total budget before starting a Worker. Claimed input and history loading
