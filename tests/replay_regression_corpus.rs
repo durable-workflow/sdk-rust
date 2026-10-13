@@ -1151,9 +1151,8 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
 
 #[tokio::test]
 async fn published_php_explicit_backoff_replays_across_cold_workers() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json",
-    );
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json");
     let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     let first = execute_fixture_delivery(&fixture, "first").await.unwrap();
     let cold = execute_fixture_delivery(&fixture, "cold").await.unwrap();
