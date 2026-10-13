@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.5.2
+
+- Supervise external activity input loading within the original lease and
+  execution deadlines. Protocol 1.20 confirms the exact task, attempt, owner
+  and authenticated namespace before, during and after loading, and before
+  callback entry. Unconfirmed authority, expiry, shutdown and dropped polls
+  stop loading without invoking application code. Observation does not renew
+  the lease or record application progress.
+- Preserve explicit protocol 1.19 ordinary support using immutable original
+  local bounds, without requesting an unsupported status endpoint. This path
+  cannot observe live revocation or ownership. Keep the Client's total transfer
+  budget separate from claim deadlines and preserve runtime outcome fencing.
+
 ## 3.5.1
 
 - Confirm and renew the exact workflow task claim while loading external inputs
