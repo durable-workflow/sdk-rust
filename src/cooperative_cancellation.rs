@@ -1983,22 +1983,46 @@ impl Worker {
         let Some(claim) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
+        // Anchor the immutable cleanup deadline once, before replay. Deferring
+        // completion must not grant another cleanup budget on each retry.
+        let mut completion_worker = self.clone();
+        if let (Some(request), Some(admission)) = (
+            claim.cancellation_request.as_ref(),
+            completion_worker.client.worker_storage_admission.as_mut(),
+        ) {
+            let deadline = DateTime::parse_from_rfc3339(&request.cleanup_deadline_at)
+                .map_err(|_| invalid("invalid original cleanup deadline"))?;
+            let unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| Error::Timeout)?;
+            let now = DateTime::<Utc>::from_timestamp(
+                i64::try_from(unix.as_secs()).map_err(|_| Error::Timeout)?,
+                unix.subsec_nanos(),
+            )
+            .ok_or(Error::Timeout)?;
+            let remaining = (deadline.with_timezone(&Utc) - now)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
+            admission.workflow_completion_retry_deadline =
+                Some(tokio::time::Instant::now() + remaining);
+        }
         // An uncertain observation, delivery or canonical refresh cannot become
         // an application failure or be published as a workflow-task decision.
         let Some(decision) = self.replay_cooperative_workflow_claim(&claim).await? else {
             return Ok(ManagedPollOutcome::Handled);
         };
         let (owner, _) = cancellation_claim(&claim.task)?;
-        self.settle_workflow_task_decision(
-            &claim.task.task_id,
-            owner,
-            claim.task.workflow_task_attempt,
-            claim.task.run_id.as_deref(),
-            Ok(decision),
-            memo_updates_supported,
-            claim.sticky_snapshot.clone(),
-        )
-        .await
+        completion_worker
+            .settle_workflow_task_decision(
+                &claim.task.task_id,
+                owner,
+                claim.task.workflow_task_attempt,
+                claim.task.run_id.as_deref(),
+                Ok(decision),
+                memo_updates_supported,
+                claim.sticky_snapshot.clone(),
+            )
+            .await
     }
 
     async fn replay_cooperative_workflow_claim(
