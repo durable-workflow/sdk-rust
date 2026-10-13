@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.5.4
+
+- Retry explicitly deferred workflow completions after backend lock pressure when
+  the response proves the same task, attempt and lease owner and `recorded=false`.
+  Preserve the serialized decision and honor the Server's delay without running
+  the handler again. Shutdown and the original cooperative cleanup deadline bound
+  recovery, and stale lease refusals remain errors.
+
 ## 3.5.3
 
 - Preserve all explicit activity backoff entries independently of the finite
