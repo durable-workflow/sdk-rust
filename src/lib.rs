@@ -4619,17 +4619,35 @@ impl Client {
                 .unwrap_or_default()
         });
         let mut storage_retries = 0_usize;
+        let mut deferred_workflow_completion = false;
 
         loop {
             // Keep the serialized body and lease/poll identity across admission pauses.
-            let response = self
-                .http
-                .execute(request.try_clone().ok_or_else(|| {
-                    Error::WorkerLoop("worker request body cannot be retried".to_string())
-                })?)
-                .await?;
-            let status = response.status();
-            let bytes = response.bytes().await?;
+            let receive = async {
+                let response = self
+                    .http
+                    .execute(request.try_clone().ok_or_else(|| {
+                        Error::WorkerLoop("worker request body cannot be retried".to_string())
+                    })?)
+                    .await?;
+                let status = response.status();
+                Ok::<_, Error>((status, response.bytes().await?))
+            };
+            let retry_deadline = self
+                .worker_storage_admission
+                .as_ref()
+                .and_then(|admission| admission.workflow_completion_retry_deadline);
+            if deferred_workflow_completion
+                && retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return Err(Error::Timeout);
+            }
+            let (status, bytes) = match retry_deadline.filter(|_| deferred_workflow_completion) {
+                Some(deadline) => tokio::time::timeout_at(deadline, receive)
+                    .await
+                    .map_err(|_| Error::Timeout)??,
+                None => receive.await?,
+            };
 
             if !status.is_success() {
                 let body = String::from_utf8_lossy(&bytes).to_string();
@@ -4637,6 +4655,12 @@ impl Client {
                     return Err(Error::Protocol(protocol));
                 }
                 let error = Error::Http { status, body };
+                deferred_workflow_completion |= worker_deferred_workflow_completion_retry_after(
+                    &error,
+                    path,
+                    request_body.as_ref(),
+                )
+                .is_some();
                 if self
                     .wait_for_storage_admission(
                         &error,
@@ -4677,7 +4701,11 @@ impl Client {
         else {
             return false;
         };
-        let Some(advertised_delay) = worker_storage_admission_retry_after(error, poll_request_id)
+        let completion_deferred = path.and_then(|path| {
+            worker_deferred_workflow_completion_retry_after(error, path, request_body)
+        });
+        let Some(advertised_delay) = completion_deferred
+            .or_else(|| worker_storage_admission_retry_after(error, poll_request_id))
             .or_else(|| {
                 path.and_then(|path| {
                     worker_backend_unavailable_retry_after(error, path, poll_request_id)
@@ -4691,12 +4719,24 @@ impl Client {
         let delay = worker_retry_delay(admission.policy, *retries)
             .max(advertised_delay)
             .min(admission.policy.max_backoff.max(Duration::from_millis(1)));
-        let deadline = tokio::time::Instant::now() + delay;
+        let delay = if completion_deferred.is_some() {
+            delay.max(advertised_delay)
+        } else {
+            delay
+        };
+        let wait_deadline = tokio::time::Instant::now() + delay;
         loop {
             if admission.stop.load(Ordering::SeqCst) {
                 return false;
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            if admission
+                .workflow_completion_retry_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                return false;
+            }
+            let remaining = wait_deadline.saturating_duration_since(now);
             if remaining.is_zero() {
                 return true;
             }
@@ -5229,6 +5269,47 @@ fn worker_fenced_completion_retry_after(
         return None;
     }
 
+    Some(Duration::from_secs(delay))
+}
+
+fn worker_deferred_workflow_completion_retry_after(
+    error: &Error,
+    path: &str,
+    request_body: Option<&Value>,
+) -> Option<Duration> {
+    let task_id = path
+        .strip_prefix("/worker/workflow-tasks/")?
+        .strip_suffix("/complete")?;
+    if task_id.is_empty() || task_id.contains('/') {
+        return None;
+    }
+    let request = request_body?.as_object()?;
+    let owner = request.get("lease_owner")?.as_str()?;
+    let attempt = request.get("workflow_task_attempt")?;
+    if owner.trim().is_empty() || attempt.as_u64().filter(|attempt| *attempt > 0).is_none() {
+        return None;
+    }
+    let Error::Http { status, body } = error else {
+        return None;
+    };
+    if *status != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let body: Value = serde_json::from_str(body).ok()?;
+    let delay = body.get("retry_after_seconds")?.as_u64()?;
+    if !(1..=5).contains(&delay)
+        || body.get("reason")?.as_str()? != "backend_lock_pressure"
+        || body.get("operation")?.as_str()? != "complete_workflow_task"
+        || body.get("outcome")?.as_str()? != "deferred"
+        || body.get("recorded") != Some(&Value::Bool(false))
+        || body.get("retryable") != Some(&Value::Bool(true))
+        || body.get("task_id")?.as_str()? != task_id
+        || body.get("lease_owner")?.as_str()? != owner
+        || body.get("workflow_task_attempt") != Some(attempt)
+        || body.get("backend")?.get("lock_pressure") != Some(&Value::Bool(true))
+    {
+        return None;
+    }
     Some(Duration::from_secs(delay))
 }
 
@@ -6606,7 +6687,9 @@ pub struct WorkerHeartbeatObservation {
 /// are never retried by the worker.
 /// Explicit storage admission pauses also preserve the already-serialized worker
 /// request without consuming this budget or rerunning its handler. The delay is
-/// capped by `max_backoff`, and shutdown interrupts storage waits.
+/// capped by `max_backoff`, except an explicit completion deferral must honor
+/// the Server's minimum delay. Shutdown interrupts storage waits; cooperative
+/// completion retries remain bounded by the original cleanup deadline.
 /// [`Worker::recover_transient_outages`] can keep a long-running worker retrying
 /// poll acquisition and heartbeats beyond this budget. `run_once` stays bounded,
 /// and `max_retries = 0` disables ordinary retries in either mode.
@@ -6634,6 +6717,7 @@ impl Default for WorkerRetryPolicy {
 struct WorkerStorageAdmission {
     policy: WorkerRetryPolicy,
     stop: Arc<AtomicBool>,
+    workflow_completion_retry_deadline: Option<tokio::time::Instant>,
 }
 
 struct StopWorkerOnDrop(Arc<AtomicBool>);
@@ -7727,6 +7811,7 @@ impl Worker {
         worker.client.worker_storage_admission = Some(WorkerStorageAdmission {
             policy: self.retry_policy,
             stop,
+            workflow_completion_retry_deadline: None,
         });
         worker
     }
@@ -30341,6 +30426,364 @@ mod tests {
             )),
             _ => None,
         }
+    }
+
+    fn workflow_completion_lock_pressure(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number == 1 {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_lock_pressure", "operation":"complete_workflow_task",
+                    "outcome":"deferred", "recorded":false, "retryable":true,
+                    "retry_after_seconds":1, "task_id":"recover-workflow",
+                    "lease_owner":"recover-worker", "workflow_task_attempt":3,
+                    "backend":{"driver":"sqlite", "lock_pressure":true}})
+                .to_string(),
+            ));
+        }
+        workflow_completion_backend_recovery(path, body, request_number)
+    }
+
+    fn workflow_completion_lock_pressure_forever(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" {
+            return workflow_completion_lock_pressure(path, body, 1);
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn workflow_completion_lock_pressure_then_expired(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            return Some(("409 Conflict", json!({"reason":"lease_expired", "recorded":false,
+                "task_id":"recover-workflow", "lease_owner":"recover-worker", "workflow_task_attempt":3}).to_string()));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn workflow_completion_lock_pressure_then_slow(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            thread::sleep(Duration::from_secs(2));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn workflow_completion_pressure_then_backend_loss(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_unavailable", "operation":"complete_workflow_task",
+                    "outcome":"unknown", "worker_id":"recover-worker", "task_queue":null,
+                    "retryable":true, "retry_after_seconds":3, "task_id":"recover-workflow",
+                    "lease_owner":"recover-worker", "workflow_task_attempt":3})
+                .to_string(),
+            ));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn completion_deferral_worker(server: &MockWorkerServer, calls: Arc<AtomicUsize>) -> Worker {
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(4))
+            .build()
+            .unwrap();
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("recover.workflow", move |_ctx, _args| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("done"))
+            }
+        });
+        worker
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_stops_at_original_cleanup_budget() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_forever),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline =
+            Some(tokio::time::Instant::now() + Duration::from_millis(250));
+        let result = tokio::time::timeout(Duration::from_secs(2), worker.poll_workflow_once())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server
+                .request_bodies("/api/worker/workflow-tasks/recover-workflow/complete")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_bounds_the_inflight_retry() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_then_slow),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let start = tokio::time::Instant::now();
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline = Some(start + Duration::from_millis(1_500));
+        assert!(matches!(
+            worker.poll_workflow_once().await,
+            Err(Error::Timeout)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_retains_deadline_when_backend_reason_changes() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_pressure_then_backend_loss),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let start = tokio::time::Instant::now();
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline = Some(start + Duration::from_millis(1_500));
+        let result = worker.poll_workflow_once().await;
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_shutdown_interrupts_prolonged_pressure() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_forever),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::clone(&stop));
+        let shutdown = async {
+            while server
+                .request_bodies("/api/worker/workflow-tasks/recover-workflow/complete")
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            stop.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(worker.poll_workflow_once(), shutdown)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server
+                .request_bodies("/api/worker/workflow-tasks/recover-workflow/complete")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_preserves_later_expiry_refusal() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_then_expired),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = completion_deferral_worker(&server, Arc::clone(&calls));
+        let result = worker.run_once().await;
+        assert!(
+            matches!(result, Err(Error::Http { status, ref body }) if status.as_u16() == 409 && body.contains("lease_expired"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        assert!(server
+            .request_bodies("/api/worker/workflow-tasks/recover-workflow/fail")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_workflow_completion_deferral_preserves_bytes_and_server_delay() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .recover_transient_outages(true)
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            });
+        worker.register_workflow("recover.workflow", {
+            let calls = Arc::clone(&calls);
+            move |_ctx, _args| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!("done"))
+                }
+            }
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[test]
+    fn workflow_completion_deferral_requires_an_exact_unrecorded_fence() {
+        let path = "/worker/workflow-tasks/recover-workflow/complete";
+        let request = json!({"lease_owner":"recover-worker", "workflow_task_attempt":3});
+        let response = json!({"reason":"backend_lock_pressure", "operation":"complete_workflow_task",
+            "outcome":"deferred", "recorded":false, "retryable":true, "retry_after_seconds":1,
+            "task_id":"recover-workflow", "lease_owner":"recover-worker", "workflow_task_attempt":3,
+            "backend":{"driver":"sqlite", "lock_pressure":true}});
+        let error = |body: Value| Error::Http {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: body.to_string(),
+        };
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(
+                &error(response.clone()),
+                path,
+                Some(&request)
+            ),
+            Some(Duration::from_secs(1))
+        );
+        for (field, value) in [
+            ("reason", json!("backend_unavailable")),
+            ("operation", json!("complete_activity_task")),
+            ("task_id", json!("other-task")),
+            ("lease_owner", json!("other-owner")),
+            ("workflow_task_attempt", json!(4)),
+            ("recorded", json!(true)),
+            ("recorded", Value::Null),
+            ("recorded", json!("false")),
+            ("retryable", json!(false)),
+            ("retry_after_seconds", json!(0)),
+            ("retry_after_seconds", json!(-1)),
+            ("retry_after_seconds", json!(1.0)),
+            ("retry_after_seconds", json!("1")),
+            ("retry_after_seconds", json!(6)),
+            ("backend", json!({"lock_pressure":false})),
+        ] {
+            let mut invalid = response.clone();
+            invalid[field] = value;
+            assert_eq!(
+                worker_deferred_workflow_completion_retry_after(
+                    &error(invalid),
+                    path,
+                    Some(&request)
+                ),
+                None,
+                "invalid {field}"
+            );
+        }
+        for field in [
+            "reason",
+            "operation",
+            "task_id",
+            "lease_owner",
+            "workflow_task_attempt",
+            "recorded",
+            "retryable",
+            "retry_after_seconds",
+            "backend",
+        ] {
+            let mut missing = response.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                worker_deferred_workflow_completion_retry_after(
+                    &error(missing),
+                    path,
+                    Some(&request)
+                ),
+                None,
+                "missing {field}"
+            );
+        }
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(
+                &error(response.clone()),
+                "/worker/activity-tasks/recover-workflow/complete",
+                Some(&request)
+            ),
+            None
+        );
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(&error(response.clone()), path, None),
+            None
+        );
+        let wrong_status = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: response.to_string(),
+        };
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(&wrong_status, path, Some(&request)),
+            None
+        );
     }
 
     fn activity_completion_stale_after_backend_recovery(
