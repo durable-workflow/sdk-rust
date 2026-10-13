@@ -1826,6 +1826,10 @@ impl Worker {
                 )
             })
             .await;
+        let response = match response {
+            Err(Error::ActivityExecutionAbandoned(_)) => return Ok(ManagedPollOutcome::Handled),
+            response => response,
+        };
         let Some(response) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -1836,6 +1840,7 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
         let session = self.track_session_task(task.worker_session.as_ref())?;
+        let hydration_claim = task.hydration_claim;
         let task = task.task;
         let guard = ActivityClaimGuard::new(&self.client, &task, &self.worker_id)?;
         let _abandon_on_drop = AbandonActivityOnDrop(guard.clone());
@@ -1849,6 +1854,7 @@ impl Worker {
                 &guard,
                 &mut callback_started,
                 session,
+                hydration_claim.as_ref(),
             );
             tokio::pin!(invocation);
             loop {
@@ -1923,6 +1929,7 @@ impl Worker {
         guard: &ActivityClaimGuard,
         callback_started: &mut bool,
         worker_session: Option<crate::WorkerSession>,
+        hydration_claim: Option<&crate::activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
         validate_activity_task_payloads(task)?;
         let handler = self
@@ -1943,6 +1950,9 @@ impl Worker {
             local_heartbeats: None,
             worker_session,
         };
+        if let Some(claim) = hydration_claim {
+            claim.confirm(&self.client).await?;
+        }
         guard.boundary()?;
         *callback_started = true;
         handler(context, args).await
@@ -2166,7 +2176,7 @@ impl Drop for AbandonActivityOnDrop {
 }
 
 impl ActivityClaimGuard {
-    fn new(client: &Client, task: &ActivityTask, worker_id: &str) -> Result<Self> {
+    pub(super) fn new(client: &Client, task: &ActivityTask, worker_id: &str) -> Result<Self> {
         let owner = task.lease_owner.as_deref().unwrap_or_default();
         let attempt = task
             .activity_attempt_id
@@ -2296,7 +2306,7 @@ impl ActivityClaimGuard {
         }
     }
 
-    async fn observe(&self) -> Result<()> {
+    pub(super) async fn observe(&self) -> Result<()> {
         self.boundary()?;
         let result = self
             .client

@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod activity_hydration;
 mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
@@ -4364,8 +4365,8 @@ impl Client {
             "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let data: worker_session::SessionPollResponse = self
-            .poll_request_json(
+        let mut wire: Value = self
+            .poll_request_json_unresolved(
                 "/worker/activity-tasks/poll",
                 RequestProtocol::DefaultWorker,
                 &body,
@@ -4373,6 +4374,21 @@ impl Client {
                 transport_retries,
             )
             .await?;
+        let claim = activity_hydration::HydrationClaim::from_poll(&wire, worker_id, self)?;
+        let mut data: worker_session::SessionPollResponse =
+            activity_hydration::HydrationClaim::protect(claim.as_ref(), self, async {
+                self.resolve_runtime_payloads(
+                    &mut wire,
+                    "/worker/activity-tasks/poll",
+                    RequestProtocol::DefaultWorker,
+                )
+                .await?;
+                Ok(serde_json::from_value(wire)?)
+            })
+            .await?;
+        if let Some(task) = data.task.as_mut() {
+            task.hydration_claim = claim;
+        }
         Ok(data)
     }
 
@@ -8127,6 +8143,10 @@ impl Worker {
                 )
             })
             .await;
+        let response = match response {
+            Err(Error::ActivityExecutionAbandoned(_)) => return Ok(ManagedPollOutcome::Handled),
+            response => response,
+        };
         let Some(response) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -8138,6 +8158,7 @@ impl Worker {
         };
 
         let session = self.track_session_task(task.worker_session.as_ref())?;
+        let hydration_claim = task.hydration_claim;
         let task = task.task;
 
         let task_id = task.task_id.clone();
@@ -8151,8 +8172,12 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
-        let result = self.execute_session_activity_task(task, session).await;
+        let result = self
+            .execute_session_activity_task(task, session, hydration_claim.as_ref())
+            .await;
         match result {
+            Err(Error::ActivityExecutionAbandoned(_)) => {}
+            Err(error) if activity_hydration::stopped(&error) => {}
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
                 let completion = self
@@ -8357,7 +8382,8 @@ impl Worker {
             }
             match operation().await {
                 Err(error)
-                    if workflow_hydration::stopped(&error)
+                    if (workflow_hydration::stopped(&error)
+                        || activity_hydration::stopped(&error))
                         && self
                             .run_stop
                             .as_ref()
@@ -9016,13 +9042,14 @@ impl Worker {
 
     #[cfg(test)]
     async fn execute_activity_task(&self, task: ActivityTask) -> Result<AvroValue> {
-        self.execute_session_activity_task(task, None).await
+        self.execute_session_activity_task(task, None, None).await
     }
 
     async fn execute_session_activity_task(
         &self,
         task: ActivityTask,
         worker_session: Option<WorkerSession>,
+        hydration_claim: Option<&activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
@@ -9069,6 +9096,9 @@ impl Worker {
             worker_session,
         };
 
+        if let Some(claim) = hydration_claim {
+            claim.confirm(&self.client).await?;
+        }
         let callback = handler(ctx, args);
         if let Some(session) = session {
             tokio::select! {
