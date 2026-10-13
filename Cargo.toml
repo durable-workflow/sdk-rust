@@ -17,7 +17,7 @@ include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md",
 product-train = "3.5.2"
 compatibility-authority = "protocol-manifests"
 supported-server-versions = "2.0.0"
-qualified-server-version = "2.5.10"
+qualified-server-version = "2.6.1"
 worker-protocol-version = "1.20"
 server-worker-protocol-versions = ">=1.19,<2.0"
 portable-worker-affinity-minimum-worker-protocol-version = "1.18"
