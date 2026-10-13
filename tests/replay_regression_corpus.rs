@@ -446,6 +446,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         "corpus.side-effect-version"
             | "corpus.legacy-patch-activity"
             | "corpus.retained-patch-activity"
+            | "corpus.deprecated-patch-activity"
+            | "corpus.frozen-zero"
             | "corpus.duplicate-registration"
             | "corpus.update-snapshot"
             | "corpus.workflow-stream"
@@ -579,6 +581,25 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         "corpus.duplicate-registration" => {
             worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("first")) });
             worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("second")) });
+        }
+        "corpus.frozen-zero" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let first = ctx.get_version("frozen-zero", -7, 0)?;
+                let patch = ctx.patched("frozen-zero")?;
+                ctx.deprecate_patch("frozen-zero")?;
+                let wider = ctx.get_version("frozen-zero", 0, 10)?;
+                let repeat = ctx.patched("frozen-zero")?;
+                Ok(json!([first, patch, null, wider, repeat]))
+            });
+        }
+        "corpus.deprecated-patch-activity" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.deprecate_patch("retained-patch")?;
+                let patch = ctx.patched("retained-patch")?;
+                let version = ctx.get_version("retained-patch", 0, 10)?;
+                let result = ctx.activity("old", json!([])).await?;
+                Ok(json!({"patch": patch, "version": version, "result": result}))
+            });
         }
         "corpus.retained-patch-activity" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
