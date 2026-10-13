@@ -2006,8 +2006,7 @@ impl Worker {
             let remaining = (deadline.with_timezone(&chrono::Utc) - now)
                 .to_std()
                 .unwrap_or(Duration::ZERO);
-            admission.workflow_completion_retry_deadline =
-                Some(monotonic_now + remaining);
+            admission.workflow_completion_retry_deadline = Some(monotonic_now + remaining);
             completion_worker = Some(worker);
         }
         // An uncertain observation, delivery or canonical refresh cannot become
