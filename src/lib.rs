@@ -4637,6 +4637,11 @@ impl Client {
                 .worker_storage_admission
                 .as_ref()
                 .and_then(|admission| admission.workflow_completion_retry_deadline);
+            if deferred_workflow_completion
+                && retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return Err(Error::Timeout);
+            }
             let (status, bytes) = match retry_deadline.filter(|_| deferred_workflow_completion) {
                 Some(deadline) => tokio::time::timeout_at(deadline, receive)
                     .await
@@ -4725,10 +4730,9 @@ impl Client {
                 return false;
             }
             let now = tokio::time::Instant::now();
-            if completion_deferred.is_some()
-                && admission
-                    .workflow_completion_retry_deadline
-                    .is_some_and(|deadline| now >= deadline)
+            if admission
+                .workflow_completion_retry_deadline
+                .is_some_and(|deadline| now >= deadline)
             {
                 return false;
             }
@@ -30477,6 +30481,24 @@ mod tests {
         workflow_completion_lock_pressure(path, body, request_number)
     }
 
+    fn workflow_completion_pressure_then_backend_loss(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_unavailable", "operation":"complete_workflow_task",
+                    "outcome":"unknown", "worker_id":"recover-worker", "task_queue":null,
+                    "retryable":true, "retry_after_seconds":3, "task_id":"recover-workflow",
+                    "lease_owner":"recover-worker", "workflow_task_attempt":3})
+                .to_string(),
+            ));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
     fn completion_deferral_worker(server: &MockWorkerServer, calls: Arc<AtomicUsize>) -> Worker {
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(4))
@@ -30544,6 +30566,31 @@ mod tests {
             worker.poll_workflow_once().await,
             Err(Error::Timeout)
         ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_retains_deadline_when_backend_reason_changes() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_pressure_then_backend_loss),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let start = tokio::time::Instant::now();
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline = Some(start + Duration::from_millis(1_500));
+        let result = worker.poll_workflow_once().await;
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
