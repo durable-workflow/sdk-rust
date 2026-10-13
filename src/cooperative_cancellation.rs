@@ -1994,6 +1994,7 @@ impl Worker {
             let admission = worker.client.worker_storage_admission.as_mut().unwrap();
             let deadline = DateTime::parse_from_rfc3339(&request.cleanup_deadline_at)
                 .map_err(|_| invalid("invalid original cleanup deadline"))?;
+            let monotonic_now = tokio::time::Instant::now();
             let unix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Error::Timeout)?;
@@ -2006,7 +2007,7 @@ impl Worker {
                 .to_std()
                 .unwrap_or(Duration::ZERO);
             admission.workflow_completion_retry_deadline =
-                Some(tokio::time::Instant::now() + remaining);
+                Some(monotonic_now + remaining);
             completion_worker = Some(worker);
         }
         // An uncertain observation, delivery or canonical refresh cannot become
