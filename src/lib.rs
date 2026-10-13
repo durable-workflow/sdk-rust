@@ -17747,6 +17747,7 @@ mod tests {
     mod local_activity;
     mod runtime_payloads;
     mod runtime_uploads;
+    mod version_marker_contract;
     mod worker_session;
     use std::{
         fs,
