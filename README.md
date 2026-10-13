@@ -145,6 +145,16 @@ canonical cancellation refreshes retain their five-second budget.
 
 ## Examples
 
+### Activity retry policies
+
+`ActivityRetryPolicy::new(max_attempts).backoff_intervals(...)` preserves the
+complete explicit list, including entries that the attempt budget will not use.
+One attempt uses no retry delay. The server repeats the last entry when further
+retries are allowed, while the attempt budget still limits execution. Replay
+compares the complete stored list and the other known policy fields exactly;
+changing an unused entry is also a policy change. The default remains one
+attempt with an empty backoff list.
+
 ### Local activities
 
 Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.

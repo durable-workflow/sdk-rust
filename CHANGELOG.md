@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.5.3
+
+- Preserve all explicit activity backoff entries independently of the finite
+  attempt budget, allowing matching authoring of published PHP retry snapshots.
+  Defaults and exact replay comparison remain unchanged, including unused
+  entries, attempt budgets, timeouts and non-retryable error types.
+
 ## 3.5.2
 
 - Supervise external activity input loading within the original lease and

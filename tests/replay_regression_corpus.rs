@@ -13,10 +13,10 @@ use std::{
 };
 
 use durable_workflow::{
-    decode_payload, encode_payload, json, AvroValue, ChildWorkflowOptions, Client,
-    ConditionWaitOptions, ConditionWaitResult, Error, ParallelOperation, ParallelResult,
-    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, StickyCacheOptions, Value, Worker,
-    WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
+    decode_payload, encode_payload, json, ActivityOptions, ActivityRetryPolicy, AvroValue,
+    ChildWorkflowOptions, Client, ConditionWaitOptions, ConditionWaitResult, Error,
+    ParallelOperation, ParallelResult, PayloadEnvelope, SearchAttributeUpdate, SelectionKey,
+    StickyCacheOptions, Value, Worker, WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -448,6 +448,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.retained-patch-activity"
             | "corpus.deprecated-patch-activity"
             | "corpus.frozen-zero"
+            | "corpus.php-zero-full"
             | "corpus.duplicate-registration"
             | "corpus.update-snapshot"
             | "corpus.workflow-stream"
@@ -578,6 +579,27 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.php-zero-full" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let first = ctx.get_version("frozen-zero", -7, 0)?;
+                let patch = ctx.patched("frozen-zero")?;
+                ctx.deprecate_patch("frozen-zero")?;
+                let wider = ctx.get_version("frozen-zero", 0, 10)?;
+                let repeat = ctx.patched("frozen-zero")?;
+                let result = ctx
+                    .activity_with_options(
+                        "MatrixActivity",
+                        ActivityOptions::new().task_queue("default").retry_policy(
+                            ActivityRetryPolicy::new(1).backoff_intervals(
+                                [1, 2, 5, 10, 15, 30, 60, 120].map(Duration::from_secs),
+                            ),
+                        ),
+                        json!([]),
+                    )
+                    .await?;
+                Ok(json!([first, patch, null, wider, repeat, result]))
+            });
+        }
         "corpus.duplicate-registration" => {
             worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("first")) });
             worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("second")) });
@@ -1125,6 +1147,16 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
             result.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         }
     }
+}
+
+#[tokio::test]
+async fn published_php_explicit_backoff_replays_across_cold_workers() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json");
+    let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let first = execute_fixture_delivery(&fixture, "first").await.unwrap();
+    let cold = execute_fixture_delivery(&fixture, "cold").await.unwrap();
+    assert_eq!(first, cold);
 }
 
 #[tokio::test]

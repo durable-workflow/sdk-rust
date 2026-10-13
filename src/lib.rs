@@ -1490,6 +1490,7 @@ impl ChildWorkflowOptions {
 pub enum ActivityBackoff {
     /// Use these intervals between attempts. The server repeats the final
     /// interval if the retry budget contains more attempts than entries.
+    /// All entries are retained, including those beyond the retry budget.
     Explicit(Vec<Duration>),
     /// Generate one interval for every retry using integer exponential growth.
     Exponential {
@@ -1516,6 +1517,8 @@ impl ActivityRetryPolicy {
         }
     }
 
+    /// Preserve the complete explicit list independently of the attempt budget.
+    /// Unused entries remain part of the policy compared during replay.
     pub fn backoff_intervals(mut self, intervals: impl IntoIterator<Item = Duration>) -> Self {
         self.backoff = Some(ActivityBackoff::Explicit(intervals.into_iter().collect()));
         self
@@ -1861,16 +1864,7 @@ fn validate_activity_retry_policy(
             })?;
             let retry_count = max_attempts.saturating_sub(1) as usize;
             let intervals = match backoff {
-                ActivityBackoff::Explicit(intervals) => {
-                    if intervals.len() > retry_count {
-                        return Err(ActivityOptionsError::new(
-                            ActivityOptionsErrorKind::TooManyBackoffIntervals,
-                            Some("retry_policy.backoff"),
-                            "backoff interval count must not exceed max_attempts - 1",
-                        ));
-                    }
-                    intervals.clone()
-                }
+                ActivityBackoff::Explicit(intervals) => intervals.clone(),
                 ActivityBackoff::Exponential {
                     initial_interval,
                     coefficient,
@@ -21793,6 +21787,111 @@ mod tests {
     }
 
     #[test]
+    fn activity_options_preserve_unused_explicit_backoff_entries() {
+        for max_attempts in [1, 2, 10] {
+            let ctx = workflow_context(Vec::new());
+            let options =
+                ActivityOptions::new()
+                    .retry_policy(ActivityRetryPolicy::new(max_attempts).backoff_intervals(
+                        [1, 2, 5, 10, 15, 30, 60, 120].map(Duration::from_secs),
+                    ));
+            let mut call = Box::pin(ctx.activity_with_options("work", options, json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                call.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            let commands = ctx.take_commands().expect("command");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["retry_policy"]["max_attempts"], max_attempts);
+            assert_eq!(
+                commands[0]["retry_policy"]["backoff_seconds"],
+                json!([1, 2, 5, 10, 15, 30, 60, 120])
+            );
+        }
+        let default_options = ActivityOptions::new().validate().expect("default options");
+        let default_policy = current_activity_retry_snapshot(&default_options);
+        assert_eq!(
+            default_policy.max_attempts,
+            RecordedSnapshotValue::Known(Some(1))
+        );
+        assert_eq!(
+            default_policy.backoff_seconds,
+            RecordedSnapshotValue::Known(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_php_snapshot_rejects_changed_unused_backoff_and_known_fields() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json"
+        ))
+        .expect("published PHP fixture");
+        let history: Vec<HistoryEvent> = serde_json::from_value(fixture["history"].clone())
+            .expect("unchanged published history");
+        let matching = ActivityOptions::new().task_queue("default").retry_policy(
+            ActivityRetryPolicy::new(1)
+                .backoff_intervals([1, 2, 5, 10, 15, 30, 60, 120].map(Duration::from_secs)),
+        );
+        let mut changed_tail = matching.clone();
+        changed_tail.retry_policy.as_mut().unwrap().backoff = Some(ActivityBackoff::Explicit(
+            [1, 2, 5, 10, 15, 30, 60, 121]
+                .map(Duration::from_secs)
+                .to_vec(),
+        ));
+        let mut changed_first = matching.clone();
+        changed_first.retry_policy.as_mut().unwrap().backoff = Some(ActivityBackoff::Explicit(
+            [2, 2, 5, 10, 15, 30, 60, 120]
+                .map(Duration::from_secs)
+                .to_vec(),
+        ));
+        let mut changed_attempts = matching.clone();
+        changed_attempts.retry_policy.as_mut().unwrap().max_attempts = Some(2);
+        let mut changed_types = matching.clone();
+        changed_types
+            .retry_policy
+            .as_mut()
+            .unwrap()
+            .non_retryable_error_types = vec!["ChangedError".into()];
+        let mut changed_start = matching.clone();
+        changed_start.start_to_close_timeout = Some(Duration::from_secs(30));
+        let mut changed_schedule_start = matching.clone();
+        changed_schedule_start.schedule_to_start_timeout = Some(Duration::from_secs(30));
+        let mut changed_schedule_close = matching.clone();
+        changed_schedule_close.schedule_to_close_timeout = Some(Duration::from_secs(30));
+        let mut changed_heartbeat = matching;
+        changed_heartbeat.heartbeat_timeout = Some(Duration::from_secs(30));
+        let unchanged_defaults = ActivityOptions::new().task_queue("default");
+        for options in [
+            changed_tail,
+            changed_first,
+            changed_attempts,
+            changed_types,
+            changed_start,
+            changed_schedule_start,
+            changed_schedule_close,
+            changed_heartbeat,
+            unchanged_defaults,
+        ] {
+            let ctx = workflow_context(history.clone());
+            assert_eq!(ctx.get_version("frozen-zero", -7, 0).unwrap(), 0);
+            assert!(!ctx.patched("frozen-zero").unwrap());
+            ctx.deprecate_patch("frozen-zero").unwrap();
+            let mut call =
+                Box::pin(ctx.activity_with_options("MatrixActivity", options, json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("changed explicit policy must fail replay")
+            };
+            assert_eq!(failure.reason, "activity_retry_policy_mismatch");
+            assert_eq!(failure.sequence, Some(2));
+            assert!(ctx.take_commands().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn invalid_activity_options_return_typed_errors_before_emitting_commands() {
         let cases = [
             (
@@ -21814,13 +21913,6 @@ mod tests {
                     non_retryable_error_types: Vec::new(),
                 }),
                 ActivityOptionsErrorKind::BackoffWithoutRetryBudget,
-            ),
-            (
-                ActivityOptions::new().retry_policy(
-                    ActivityRetryPolicy::new(2)
-                        .backoff_intervals([Duration::from_secs(1), Duration::from_secs(2)]),
-                ),
-                ActivityOptionsErrorKind::TooManyBackoffIntervals,
             ),
             (
                 ActivityOptions::new().retry_policy(
