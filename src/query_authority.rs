@@ -33,7 +33,9 @@ fn timestamp(
     let parsed = DateTime::parse_from_rfc3339(text)
         .map_err(|_| Lost)?
         .to_utc();
-    if canonical && parsed.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string() != text {
+    if canonical
+        && (text.len() != 27 || parsed.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string() != text)
+    {
         return Err(Lost);
     }
     Ok(parsed)
@@ -278,6 +280,7 @@ mod tests {
 
     #[test]
     fn validates_original_claim_and_canonical_immutable_timing() {
+        assert!(timestamp(&json!("+10000-01-01T00:00:00.000000Z"), true).is_err());
         let worker = worker("http://127.0.0.1:1", true);
         let original = task(Duration::from_secs(5));
         assert!(Authority::capture(&original, &worker).unwrap().is_some());
