@@ -1,5 +1,7 @@
 # Durable Workflow Rust SDK
 
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=durable-workflow_sdk-rust&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=durable-workflow_sdk-rust)
+
 [![CI](https://github.com/durable-workflow/sdk-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/durable-workflow/sdk-rust/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/durable-workflow.svg)](https://crates.io/crates/durable-workflow)
 [![API docs](https://img.shields.io/badge/docs-rust.durable--workflow.com-0f766e.svg)](https://rust.durable-workflow.com/)
