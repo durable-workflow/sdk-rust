@@ -539,7 +539,14 @@ mod tests {
             ManagedPollOutcome::Handled
         ));
         let paths = server.paths.lock().unwrap();
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[1], "/api/worker/query-tasks/query-1/complete");
+        assert!(!paths.iter().any(|path| path.contains("/status?")));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.as_str() == "/api/worker/query-tasks/query-1/complete")
+                .count(),
+            1
+        );
+        assert!(!paths.iter().any(|path| path.ends_with("/fail")));
     }
 }
