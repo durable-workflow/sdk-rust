@@ -224,18 +224,31 @@ fn handle_request(
             })
             .to_string()
         }
+        "/api/worker/register" if task.get("query_task_id").is_some() => json!({
+            "worker_id":"regression-corpus-worker","registered":true,
+            "server_capabilities":{"query_task_authority":true}
+        }).to_string(),
         "/api/worker/register" => json!({
             "worker_id": "regression-corpus-worker",
             "registered": true,
             "heartbeat_interval_seconds": 3600
         })
         .to_string(),
-        "/api/worker/workflow-tasks/poll" if request_number == 1 => {
+        "/api/worker/workflow-tasks/poll" if request_number == 1 && task.get("query_task_id").is_none() => {
             json!({"task": task}).to_string()
         }
         "/api/worker/workflow-tasks/poll" | "/api/worker/activity-tasks/poll" => {
             json!({"task": null}).to_string()
         }
+        "/api/worker/query-tasks/poll" if task.get("query_task_id").is_some() => json!({"task":task}).to_string(),
+        path if path.starts_with("/api/worker/query-tasks/") && path.contains("/status?") => {
+            let mut reply = task.clone();
+            reply["can_continue"] = json!(false);
+            reply["query_task_status"] = json!("timed_out");
+            reply["reason"] = json!("query_task_timed_out");
+            reply.to_string()
+        }
+        path if path.starts_with("/api/worker/query-tasks/") && (path.ends_with("/complete") || path.ends_with("/fail")) => json!({"recorded":true}).to_string(),
         path if path.starts_with("/api/worker/workflow-tasks/")
             && (path.ends_with("/complete") || path.ends_with("/fail")) =>
         {
@@ -441,6 +454,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{fixture_id}.workflow.type must be a string"))?;
+    if workflow_type == "corpus.expired-query-snapshot" {
+        return execute_expired_query_fixture(fixture).await;
+    }
     if !matches!(
         workflow_type,
         "corpus.side-effect-version"
@@ -1116,6 +1132,44 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         &format!("{fixture_id}.expected"),
     )?;
     Ok(Value::Object(observed))
+}
+
+async fn execute_expired_query_fixture(fixture: &Value) -> Result<Value, String> {
+    // Synthetic canonical dispatch reproducer: the same delivered query claim
+    // is terminal at observation. No history transformation or replay bypass.
+    let envelope = serde_json::to_value(
+        encode_payload(&json!([]), DEFAULT_CODEC).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut task = fixture["worker_task"].clone();
+    task["workflow_type"] = fixture["workflow"]["type"].clone();
+    task["workflow_arguments"] = envelope.clone();
+    task["query_arguments"] = envelope;
+    task["history_events"] = fixture["history"].clone();
+    let server = FixtureServer::start(task, 0, None);
+    let client = Client::builder(server.base_url())
+        .namespace("default")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut worker =
+        Worker::new(client, "regression-corpus-queue").worker_id("regression-corpus-worker");
+    worker.register_workflow("corpus.expired-query-snapshot", |_, _| async {
+        Ok(Value::Null)
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    worker.register_query("corpus.expired-query-snapshot", "value", move |_, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async { Ok(json!(7)) }
+    });
+    worker.register().await.map_err(|error| error.to_string())?;
+    worker.run_once().await.map_err(|error| error.to_string())?;
+    let requests = server.requests.lock().expect("captured query requests");
+    let actual = json!({"query_callback_calls":calls.load(Ordering::SeqCst),
+        "completion_submissions":requests.iter().filter(|request| request.path == "/api/worker/query-tasks/expired-query/complete").count(),
+        "failure_submissions":requests.iter().filter(|request| request.path == "/api/worker/query-tasks/expired-query/fail").count()});
+    fixture_matches(&fixture["expected"], &actual, "expired query dispatch")?;
+    Ok(actual)
 }
 
 async fn execute_fixture(fixture: &Value) -> Result<Value, String> {

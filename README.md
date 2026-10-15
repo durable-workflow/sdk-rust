@@ -76,6 +76,28 @@ The namespace runtime URL is already complete. Do not append another `/api`.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Query execution authority
+
+On a runtime advertising `query_task_authority` with worker protocol 1.20,
+`Worker` captures the original query claim before loading external inputs. It
+checks ownership without renewing the lease during loading and execution, before
+calling the handler, and before submitting its outcome. The original caller
+deadline and lease bound the entire operation. Expiry, shutdown or an unavailable
+observation drops the work without sending a completion or failure for it.
+
+Use `Worker::require_query_task_authority(true)` to refuse registration unless
+worker-authenticated discovery advertises this support. Without this requirement,
+older runtimes and explicit protocol 1.19 keep compatibility: disclosed original
+timing supplies a local bound, while deliveries without timing retain legacy
+behavior. This path cannot observe live revocation and never calls the 1.20
+query-status endpoint.
+
+Async handlers must yield to Tokio to be cancelled promptly. Synchronous or
+CPU-bound callbacks cannot be interrupted while they block, but their late result
+is fenced before submission. Query handlers should avoid side effects. Direct
+`Client` completion and failure methods remain available for inspecting an
+original committed receipt.
+
 ### Handler registration
 
 Register each workflow and activity wire name once per Worker. Named query and

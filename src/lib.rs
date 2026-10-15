@@ -8,6 +8,7 @@ mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
 mod local_activity;
+mod query_authority;
 mod runtime_payloads;
 mod runtime_uploads;
 mod sticky_worker;
@@ -161,6 +162,9 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "query_task_not_found",
     "query_task_not_leased",
     "query_task_timed_out",
+    "query_deadline_unavailable",
+    "lease_owner_mismatch",
+    "query_task_attempt_mismatch",
 ];
 
 /// Manifest for the default service-worker profile.
@@ -6769,6 +6773,8 @@ pub struct Worker {
     local_registration_confirmed: Arc<AtomicBool>,
     session_registration_confirmed: Arc<AtomicBool>,
     sticky_registration_confirmed: Arc<AtomicBool>,
+    require_query_task_authority: bool,
+    query_authority_confirmed: Arc<AtomicBool>,
     resource_capabilities: Vec<String>,
     sessions: Arc<Mutex<HashMap<String, WorkerSession>>>,
 }
@@ -6801,6 +6807,8 @@ impl Worker {
             local_registration_confirmed: Arc::new(AtomicBool::new(false)),
             session_registration_confirmed: Arc::new(AtomicBool::new(false)),
             sticky_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            require_query_task_authority: false,
+            query_authority_confirmed: Arc::new(AtomicBool::new(false)),
             resource_capabilities: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -6812,6 +6820,7 @@ impl Worker {
         self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.sticky_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.query_authority_confirmed = Arc::new(AtomicBool::new(false));
         self.client.reset_sticky_cache();
         self.sessions = Arc::new(Mutex::new(HashMap::new()));
         self
@@ -6824,6 +6833,16 @@ impl Worker {
 
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Require original query timing and non-renewing runtime observation.
+    ///
+    /// Registration refuses before creating a Worker unless protocol 1.20 and
+    /// the runtime's `query_task_authority` capability are available. By default,
+    /// older Servers retain their weaker, disclosed local-timing behavior.
+    pub fn require_query_task_authority(mut self, required: bool) -> Self {
+        self.require_query_task_authority = required;
         self
     }
 
@@ -7657,6 +7676,31 @@ impl Worker {
 
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
         self.validate_registration()?;
+        self.query_authority_confirmed
+            .store(false, Ordering::SeqCst);
+        if self.require_query_task_authority {
+            if self.client.worker_protocol_version != WorkerProtocolVersion::V120 {
+                return Err(Error::WorkerLoop(
+                    "query authority requires worker protocol 1.20".into(),
+                ));
+            }
+            // Discovery uses the Worker credential, including worker-only Clients.
+            let discovery: Value = self
+                .client
+                .request_json_unresolved_with_timeout::<Value, Value>(
+                    reqwest::Method::GET,
+                    "/cluster/info",
+                    RequestProtocol::Worker("1.20"),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await?;
+            if discovery["worker_protocol"]["server_capabilities"]["query_task_authority"] != true {
+                return Err(Error::WorkerLoop(
+                    "runtime does not advertise query_task_authority".into(),
+                ));
+            }
+        }
         self.sticky_registration_confirmed
             .store(false, Ordering::SeqCst);
         self.session_registration_confirmed
@@ -7767,6 +7811,15 @@ impl Worker {
             self.sticky_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
+        self.query_authority_confirmed.store(
+            response.registered
+                && self.client.worker_protocol_version == WorkerProtocolVersion::V120
+                && response
+                    .server_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities["query_task_authority"] == true),
+            Ordering::SeqCst,
+        );
         Ok(response)
     }
 
@@ -7864,6 +7917,13 @@ impl Worker {
         stop: Arc<AtomicBool>,
         registration: RegisterWorkerResponse,
     ) -> Result<()> {
+        if self.require_query_task_authority
+            && !self.query_authority_confirmed.load(Ordering::SeqCst)
+        {
+            return Err(Error::WorkerLoop(
+                "registration did not confirm query_task_authority".into(),
+            ));
+        }
         let heartbeat_interval = Duration::from_secs(
             registration
                 .heartbeat_interval_seconds
@@ -8335,18 +8395,43 @@ impl Worker {
         let poll_request_id = unique_request_id("rust-query-poll");
         let response = self
             .retry_worker_operation(|| {
-                self.client.poll_query_task_response_with_request_id(
-                    &self.worker_id,
-                    &self.task_queue,
-                    self.poll_timeout,
-                    &poll_request_id,
-                    0,
-                )
+                let body = json!({"worker_id":self.worker_id,"task_queue":self.task_queue,
+                    "poll_request_id":poll_request_id,
+                    "timeout_seconds":long_poll_timeout_seconds(self.poll_timeout)});
+                async move {
+                    self.client
+                        .poll_request_json_unresolved::<Value, Value>(
+                            "/worker/query-tasks/poll",
+                            RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                            &body,
+                            self.poll_timeout + Duration::from_secs(5),
+                            0,
+                        )
+                        .await
+                }
             })
             .await;
-        let Some(response) = self.settle_worker_poll_response(response).await? else {
+        let Some(mut wire) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
+        let authority = if wire.get("task").is_some_and(|task| !task.is_null()) {
+            match query_authority::Authority::capture(&wire["task"], self) {
+                Ok(authority) => authority,
+                Err(_) => return Ok(ManagedPollOutcome::Handled),
+            }
+        } else {
+            None
+        };
+        let loading = self.client.resolve_runtime_payloads(
+            &mut wire,
+            "/worker/query-tasks/poll",
+            RequestProtocol::Worker(self.client.worker_protocol_version.as_str()),
+        );
+        match query_authority::Authority::protect(authority.as_ref(), self, loading).await {
+            Err(_) => return Ok(ManagedPollOutcome::Handled),
+            Ok(result) => result?,
+        }
+        let response: PollQueryTaskResponse = serde_json::from_value(wire)?;
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
         }
@@ -8362,22 +8447,40 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
 
-        match self.execute_query_task(task).await {
+        let execution = query_authority::Authority::protect(
+            authority.as_ref(),
+            self,
+            self.execute_query_task_with_authority(task, authority.as_ref()),
+        )
+        .await;
+        let execution = match execution {
+            Err(_) => return Ok(ManagedPollOutcome::Handled),
+            Ok(Err(failure)) if failure.reason == "query_authority_lost" => {
+                return Ok(ManagedPollOutcome::Handled)
+            }
+            Ok(result) => result,
+        };
+        match execution {
             Ok(value) => {
                 let result_envelope = match encode_typed_envelope(&value, &codec) {
                     Ok(result_envelope) => result_envelope,
                     Err(error) => {
-                        let failure = self
-                            .client
-                            .fail_query_task(
+                        let failure = query_authority::Authority::protect(
+                            authority.as_ref(),
+                            self,
+                            self.client.fail_query_task(
                                 &query_task_id,
                                 &lease_owner,
                                 attempt,
                                 error.to_string(),
                                 "query_result_encode_failed",
                                 "QueryResultEncodeFailed",
-                            )
-                            .await;
+                            ),
+                        )
+                        .await;
+                        let Ok(failure) = failure else {
+                            return Ok(ManagedPollOutcome::Handled);
+                        };
                         if let Err(error) = failure {
                             if !query_task_rejection_is_final(&error) {
                                 return Err(error);
@@ -8387,34 +8490,44 @@ impl Worker {
                     }
                 };
 
-                if let Err(error) = self
-                    .client
-                    .complete_query_task_with_envelope(
+                let completion = query_authority::Authority::protect(
+                    authority.as_ref(),
+                    self,
+                    self.client.complete_query_task_with_envelope(
                         &query_task_id,
                         &lease_owner,
                         attempt,
                         value.clone().into_json()?,
                         result_envelope,
-                    )
-                    .await
-                {
+                    ),
+                )
+                .await;
+                let Ok(completion) = completion else {
+                    return Ok(ManagedPollOutcome::Handled);
+                };
+                if let Err(error) = completion {
                     if !query_task_rejection_is_final(&error) {
                         return Err(error);
                     }
                 }
             }
             Err(failure) => {
-                let result = self
-                    .client
-                    .fail_query_task(
+                let result = query_authority::Authority::protect(
+                    authority.as_ref(),
+                    self,
+                    self.client.fail_query_task(
                         &query_task_id,
                         &lease_owner,
                         attempt,
                         failure.message,
                         failure.reason,
                         failure.failure_type,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
+                let Ok(result) = result else {
+                    return Ok(ManagedPollOutcome::Handled);
+                };
                 if let Err(error) = result {
                     if !query_task_rejection_is_final(&error) {
                         return Err(error);
@@ -8515,9 +8628,18 @@ impl Worker {
         }
     }
 
+    #[cfg(test)]
     async fn execute_query_task(
         &self,
+        task: QueryTask,
+    ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
+        self.execute_query_task_with_authority(task, None).await
+    }
+
+    async fn execute_query_task_with_authority(
+        &self,
         mut task: QueryTask,
+        authority: Option<&query_authority::Authority>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         validate_query_task_payloads(&task).map_err(|error| {
             QueryTaskExecutionFailure::new(
@@ -8611,7 +8733,10 @@ impl Worker {
         };
 
         let future = match query {
-            RegisteredQuery::Snapshot(handler) => handler(context, args),
+            RegisteredQuery::Snapshot(handler) => {
+                query_authority::before_handler(authority, &self.client).await?;
+                handler(context, args)
+            }
             RegisteredQuery::Replayed {
                 state_type,
                 handler,
@@ -8658,9 +8783,10 @@ impl Worker {
                     state: workflow_state,
                     cancellation_scope_id: "root".into(),
                 };
+                query_authority::before_handler(authority, &self.client).await?;
                 let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone());
-                let mut cx = TaskContext::from_waker(noop_waker_ref());
                 let outcome = {
+                    let mut cx = TaskContext::from_waker(noop_waker_ref());
                     let _replay = cancellation_replay_clock::ReplayGuard::enter(&workflow_context)
                         .map_err(|error| {
                             QueryTaskExecutionFailure::new(
@@ -8724,6 +8850,7 @@ impl Worker {
                         "QueryWorkflowStateUnavailable",
                     )
                 })?;
+                query_authority::before_handler(authority, &self.client).await?;
                 handler(context, state, args).map_err(|message| {
                     QueryTaskExecutionFailure::new(
                         "query_workflow_state_unavailable",
