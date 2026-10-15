@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-expired-query-before-snapshot-callback",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.expired-query-snapshot", "input": [], "payload_codec": "avro"},
+  "worker_task": {
+    "query_task_id": "expired-query", "query_task_attempt": 1,
+    "lease_owner": "regression-corpus-worker", "task_queue": "regression-corpus-queue",
+    "workflow_id": "query-workflow", "run_id": "query-run", "query_name": "value",
+    "payload_codec": "avro", "run_status": "waiting",
+    "query_admitted_at": "2000-01-01T00:00:00.000000Z",
+    "query_deadline_at": "2000-01-01T00:00:04.000000Z",
+    "lease_expires_at": "2000-01-01T00:00:04.000000Z",
+    "server_time": "2000-01-01T00:00:01.000000Z"
+  },
+  "history": [
+    {"sequence": 1, "event_type": "WorkflowStarted", "payload": {"timestamp": "2000-01-01T00:00:00.000000Z"}}
+  ],
+  "expected": {"query_callback_calls": 0, "completion_submissions": 0, "failure_submissions": 0}
+}

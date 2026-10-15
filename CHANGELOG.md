@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.5.5
+
+- Fence managed queries with their original claim and caller deadline before
+  external loading, replay, handler entry and outcome submission. Protocol 1.20
+  observes authority without renewing it. Expiry and unavailable authority drop
+  yielding work without sending a fabricated failure acknowledgement.
+- Add `Worker::require_query_task_authority(true)` for pre-registration refusal
+  when strong query authority is unavailable. Explicit 1.19 and older Servers
+  retain their documented weaker timing behavior. Public `QueryTask` construction
+  and direct Client completion/receipt operations stay compatible.
+- Synchronous or CPU-bound handlers cannot be interrupted while they block, but
+  their results are fenced after the callback returns.
+
 ## 3.5.4
 
 - Retry explicitly deferred workflow completions after backend lock pressure when
