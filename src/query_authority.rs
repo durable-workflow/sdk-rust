@@ -534,7 +534,10 @@ mod tests {
         worker.client.worker_protocol_version = WorkerProtocolVersion::V119;
         worker.register_workflow("workflow", |_, _| async { Ok(Value::Null) });
         worker.register_query("workflow", "value", |_, _| async { Ok(json!(7)) });
-        assert!(matches!(worker.poll_query_once().await.unwrap(), ManagedPollOutcome::Handled));
+        assert!(matches!(
+            worker.poll_query_once().await.unwrap(),
+            ManagedPollOutcome::Handled
+        ));
         let paths = server.paths.lock().unwrap();
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[1], "/api/worker/query-tasks/query-1/complete");
