@@ -63,7 +63,6 @@ if [[ "${1:-cancellation}" == admission ]]; then
           start_worker "$target" target "$case_id-target" "$target_container"
           start_worker "$caller" caller "$case_id-caller" "$caller_container"
           admission_observe prepare "$namespace" "$case_id" "$caller" "$target" "$profile" "$schedule"
-          admission_observe admitted "$namespace" "$case_id"
           docker logs "$caller_container" > "$NEXUS_STATE_DIR/admissions/$case_id-caller-original.log" 2>&1
           if [[ "$schedule" == cold ]]; then
             docker kill --signal KILL "$caller_container" >/dev/null

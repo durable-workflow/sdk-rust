@@ -61,6 +61,9 @@ async def prepare(case, caller, target, profile, schedule, namespace, http, clie
               "rust_binary_sha256": os.environ["NEXUS_RUST_BINARY_SHA256"], "workflow_outcome": "pending"}
     save(record)
     print(json.dumps({"phase": "admitted", "case": case, "caller_run": handle.run_id}), flush=True)
+    async with asyncio.timeout(remaining(record)):
+        await admitted(record, http)
+    save(record)
 
 
 async def admitted(record, http):
