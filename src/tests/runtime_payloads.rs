@@ -147,6 +147,11 @@ async fn runtime_external_activity_result_resolves_before_cold_replay() {
 }
 
 fn nexus_response(path: &str) -> Option<(&'static str, String)> {
+    if path.ends_with("/workflow-tasks/external-nexus-task/heartbeat") {
+        return Some(("200 OK", json!({"task_id":"external-nexus-task", "workflow_task_attempt":1,
+            "lease_owner":"worker", "renewed":true, "reason":null, "task_status":"leased",
+            "run_status":"running", "lease_expires_at":"2099-01-01T00:00:00Z", "cancellation_request":null}).to_string()));
+    }
     if path.ends_with(FETCH_PATH) {
         return Some(("200 OK", blob()));
     }
@@ -159,6 +164,8 @@ fn nexus_response(path: &str) -> Option<(&'static str, String)> {
     };
     Some(("200 OK",json!({"task":{
         "task_id":"external-nexus-task","workflow_task_attempt":1,
+        "lease_owner":if path.contains("missing-claim") {Value::Null} else {json!("worker")},
+        "namespace":if path.contains("foreign-namespace") {"other"} else {"external-test"},
         "workflow_id":"external-nexus","run_id":"external-nexus-run","workflow_type":"external.nexus",
         "payload_codec":"avro","arguments":encode_value_envelope(&json!([]),DEFAULT_CODEC).unwrap(),
         "history_events":[
@@ -225,6 +232,7 @@ async fn nexus_runtime_references_resolve_once_before_cold_replay_with_worker_cr
     assert_eq!(server.control_protocol_for(FETCH_PATH), None);
     let bad = Client::builder(format!("{}/bad-integrity", server.base_url()))
         .worker_token(Some("worker-only".into()))
+        .namespace("external-test")
         .build()
         .unwrap();
     let error = bad
@@ -237,6 +245,35 @@ async fn nexus_runtime_references_resolve_once_before_cold_replay_with_worker_cr
             .contains("external_payload_integrity_mismatch"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn unconfirmed_nexus_claims_never_fetch_external_history() {
+    for case in ["missing-claim", "foreign-namespace"] {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            response_override: Some(nexus_response),
+            ..Default::default()
+        });
+        let client = Client::builder(format!("{}/{case}", server.base_url()))
+            .worker_token(Some("worker-only".into()))
+            .namespace("external-test")
+            .build()
+            .unwrap();
+        let error = client
+            .poll_workflow_task("worker", "queue", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workflow_hydration_authority_unconfirmed"),
+            "{error}"
+        );
+        assert!(server
+            .captured_paths()
+            .iter()
+            .all(|path| !path.ends_with(FETCH_PATH)));
+    }
 }
 
 #[tokio::test]

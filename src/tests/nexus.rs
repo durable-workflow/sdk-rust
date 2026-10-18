@@ -480,6 +480,12 @@ fn transport_response(path: &str, body: &str, number: usize) -> Option<(&'static
     let case = path.split('/').nth(1).unwrap_or_default();
     if path.ends_with("/cluster/info") {
         let mut caps = capabilities();
+        if case.starts_with("joint-") {
+            caps["query_task_authority"] = json!(case != "joint-no-query");
+            if case == "joint-no-nexus" || (case == "joint-reregister" && number > 2) {
+                caps["nexus_cooperative_cancellation"] = json!(false);
+            }
+        }
         match case {
             "no-nexus" => caps["nexus_cooperative_cancellation"] = json!(false),
             "no-cooperation" => caps["cooperative_cancellation"] = json!(false),
@@ -500,6 +506,9 @@ fn transport_response(path: &str, body: &str, number: usize) -> Option<(&'static
             "namespace":"nexus-test","task_queue":request["task_queue"],
             "capabilities":request["capabilities"],"heartbeat_interval_seconds":3600,
             "protocol_version":"1.20","server_capabilities":capabilities()});
+        if case.starts_with("joint-") {
+            reply["server_capabilities"]["query_task_authority"] = json!(true);
+        }
         match case {
             "ack-no-nexus" => {
                 reply["server_capabilities"]["nexus_cooperative_cancellation"] = json!(false)
@@ -651,6 +660,64 @@ async fn nexus_registration_requires_installed_discovery_and_exact_acknowledgmen
             );
         }
     }
+}
+
+#[tokio::test]
+async fn nexus_and_query_authority_preserve_both_registration_requirements() {
+    for case in ["joint-supported", "joint-no-query", "joint-no-nexus"] {
+        let server = transport_server();
+        let mut worker = transport_worker(&server, case).require_query_task_authority(true);
+        worker.register_query("nexus", "status", |_, _| async { Ok(json!("ready")) });
+        let result = worker.register().await;
+        let supported = case == "joint-supported";
+        assert_eq!(result.is_ok(), supported, "{case}: {result:?}");
+        assert_eq!(
+            worker.nexus_registration_confirmed.load(Ordering::SeqCst),
+            supported
+        );
+        assert_eq!(
+            worker.query_authority_confirmed.load(Ordering::SeqCst),
+            supported
+        );
+        let requests = server.requests.lock().unwrap();
+        let registration = requests
+            .iter()
+            .find(|request| request.path.ends_with("/register"));
+        assert_eq!(registration.is_some(), supported);
+        if let Some(request) = registration {
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            assert!(body["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("query_tasks")));
+            assert!(body["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("nexus_cooperative_cancellation")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_nexus_rediscovery_cannot_keep_an_old_query_confirmation() {
+    let server = transport_server();
+    let mut worker =
+        transport_worker(&server, "joint-reregister").require_query_task_authority(true);
+    worker.register_query("nexus", "status", |_, _| async { Ok(json!("ready")) });
+    worker.register().await.unwrap();
+    assert!(worker.nexus_registration_confirmed.load(Ordering::SeqCst));
+    assert!(worker.query_authority_confirmed.load(Ordering::SeqCst));
+    assert!(worker.register().await.is_err());
+    assert!(!worker.nexus_registration_confirmed.load(Ordering::SeqCst));
+    assert!(!worker.query_authority_confirmed.load(Ordering::SeqCst));
+    assert_eq!(
+        server
+            .captured_paths()
+            .iter()
+            .filter(|path| path.ends_with("/register"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
