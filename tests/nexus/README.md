@@ -33,9 +33,9 @@ Prepare dependencies using the declared language runtimes:
 
 ```sh
 mkdir -p "$NEXUS_STATE_DIR/php" "$NEXUS_STATE_DIR/python"
-cp tests/nexus/composer.json "$NEXUS_STATE_DIR/php/composer.json"
+cp tests/nexus/composer.json tests/nexus/composer.lock "$NEXUS_STATE_DIR/php/"
 composer install --working-dir="$NEXUS_STATE_DIR/php" --no-dev --prefer-dist
-python -m pip install --target "$NEXUS_STATE_DIR/python" -r tests/nexus/requirements.txt
+python -m pip install --target "$NEXUS_STATE_DIR/python" -r tests/nexus/requirements.txt -c tests/nexus/requirements.lock
 CARGO_TARGET_DIR="$NEXUS_STATE_DIR/target" cargo build --example nexus_cooperation
 ```
 
