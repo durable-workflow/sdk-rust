@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {test} from 'node:test';
-import {validateDetail, validateOutput} from './catalog-contract.mjs';
+import {originalCases, validateDetail, validateOutput} from './catalog-contract.mjs';
+
+test('process-state sidecars do not become extra originals or hide unfinished cases', () => {
+  const completed = {case: 'original-completed', outcome: 'pass'};
+  const pending = {case: 'original-pending'};
+  assert.deepEqual(originalCases([completed, {ExitCode: 0}, pending, {Running: false}]), [completed, pending]);
+});
 
 function fixture() {
   const data = 'x'.repeat(17);

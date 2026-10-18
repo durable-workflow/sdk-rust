@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 
+export function originalCases(documents) {
+  return documents.filter(row => typeof row.case === 'string');
+}
+
 export function logicalPreview(value) {
   if (value?.$type === 'map') {
     return Object.fromEntries(value.entries.map(row => [row.key, logicalPreview(row.value)]));

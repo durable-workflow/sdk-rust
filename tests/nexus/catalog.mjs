@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {createRequire} from 'node:module';
-import {validateDetail, validateOutput} from './catalog-contract.mjs';
+import {originalCases, validateDetail, validateOutput} from './catalog-contract.mjs';
 
 const root = '/state';
-const records = fs.readdirSync(`${root}/outcomes`).filter(name => name.endsWith('.json'))
-  .map(name => JSON.parse(fs.readFileSync(`${root}/outcomes/${name}`, 'utf8')));
+const records = originalCases(fs.readdirSync(`${root}/outcomes`).filter(name => name.endsWith('.json'))
+  .map(name => JSON.parse(fs.readFileSync(`${root}/outcomes/${name}`, 'utf8'))));
 assert.equal(records.length, 40);
 assert.equal(new Set(records.map(row => row.service_call_id)).size, 40);
 const directions = ['rust:php', 'php:rust', 'rust:rust', 'rust:python', 'python:rust'];
