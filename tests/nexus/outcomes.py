@@ -82,7 +82,9 @@ async def run(case, caller, target, scenario, namespace, http, client):
         call_id = one(final, "ServiceCallStarted")["payload"]["service_call_id"]
         call_path = f"/api/service-endpoints/{case}/services/cleanup/operations/{scenario}/service-calls/{call_id}"
         call = await request(http, "GET", call_path)
-    require(call["caller_workflow_instance_id"] == case and call["caller_workflow_run_id"] == handle.run_id,
+    caller_identity = failure if scenario == "missing" else call
+    require(caller_identity["caller_workflow_instance_id"] == case
+            and caller_identity["caller_workflow_run_id"] == handle.run_id,
             "Service call lost original caller identity")
     require(call["namespace"] == namespace, "Service call escaped its original namespace")
     if scenario != "missing":
@@ -91,6 +93,8 @@ async def run(case, caller, target, scenario, namespace, http, client):
     target_history = None
     if scenario == "missing":
         require(target_id is None and target_run is None, "Missing operation created target work")
+        require(call["accepted_at"] is None and call["started_at"] is None and call["call_deadline_at"] is None,
+                "Unresolved operation fabricated admission or an operation deadline")
     else:
         require(target_id and target_run, "Committed call lost its target identity")
         target_history = await history(http, target_id, target_run)
