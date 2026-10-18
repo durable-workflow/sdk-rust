@@ -101,6 +101,29 @@ results must pass; the original faulted/killed process is recorded separately.
 Run `node scripts/ci/test-completion-ack-proxy.mjs` to check the fault selector
 and unchanged local-activity proxy default without any SDK or Server fixture.
 
+## Published Waterline inspection
+
+`bash tests/nexus/run.sh catalog` extends the cross-namespace result profile
+with real published Waterline inspection. The same forty originals cover five
+SDK directions, both namespace directions and success, typed failure, external
+payload and missing-operation outcomes. Original workflow budgets stay unchanged.
+Browser inspection occurs after completion with bounded request/navigation timeouts.
+
+Prepare the locked browser dependency in `STATE/browser`: copy
+`browser-package.json` to `package.json` and `browser-package-lock.json` to
+`package-lock.json`, then run `npm ci --ignore-scripts` there. The pinned browser
+image supplies matching Playwright Chromium. Also create a writable
+`STATE/provider/nexus-unrelated` directory for the unrelated observer namespace.
+
+The profile starts three read-only Waterline instances on the isolated Docker
+network, with no published ports. Owner and caller views must preserve original
+identities, typed values, exact deadlines and opaque foreign references. The
+unrelated namespace and wrong selectors must refuse. Desktop/dark and
+mobile/light pages must fit, expose their actual terminal result or failure,
+and leave both original histories unchanged. No API mocks or observer writes
+are permitted. Reports and representative screenshots go to `STATE/catalog`.
+`node --test tests/nexus/test-catalog.mjs` checks the identity/type/redaction guards.
+
 Use fresh case identities after a failure. Keep the original outcome separate;
 do not retry a failed workflow by replacing its recorded state or widening a
 deadline. Review bounded summaries and retire generated state after recording

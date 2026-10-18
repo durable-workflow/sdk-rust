@@ -5,7 +5,7 @@ fixture_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$fixture_dir/../.." && pwd)"
 : "${NEXUS_STATE_DIR:?set the disposable state directory}"
 : "${NEXUS_ENV_FILE:?set the Compose input file}"
-export NEXUS_QUALIFY_ADMISSION=0 NEXUS_QUALIFY_OUTCOMES=0
+export NEXUS_QUALIFY_ADMISSION=0 NEXUS_QUALIFY_OUTCOMES=0 NEXUS_QUALIFY_UI=0
 source_sha="$(git -C "$repo_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$NEXUS_STATE_DIR/target/debug/examples/nexus_cooperation" | cut -d ' ' -f 1)"
 compose=(docker compose --env-file "$NEXUS_ENV_FILE" -f "$fixture_dir/docker-compose.yml")
@@ -163,15 +163,20 @@ if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
   exit 0
 fi
 
-if [[ "${1:-cancellation}" == outcomes || "${1:-}" == cross-outcomes ]]; then
+if [[ "${1:-cancellation}" == outcomes || "${1:-}" == cross-outcomes || "${1:-}" == catalog ]]; then
   export NEXUS_QUALIFY_OUTCOMES=1
+  if [[ "$1" == catalog ]]; then export NEXUS_QUALIFY_UI=1; fi
   for namespace in default nexus-source; do
     "${compose[@]}" run --rm --no-deps -T --entrypoint python observe /fixture/outcomes.py setup "$namespace"
   done
+  if [[ "$1" == catalog ]]; then
+    "${compose[@]}" run --rm --no-deps -T --entrypoint python observe /fixture/outcomes.py setup nexus-unrelated
+    "${compose[@]}" --profile catalog up -d --no-build --wait catalog-default catalog-named catalog-unrelated
+  fi
   for namespace in default nexus-source; do
     export NEXUS_NAMESPACE="$namespace"
     export NEXUS_TARGET_NAMESPACE="$namespace"
-    if [[ "$1" == cross-outcomes ]]; then
+    if [[ "$1" == cross-outcomes || "$1" == catalog ]]; then
       if [[ "$namespace" == default ]]; then
         NEXUS_TARGET_NAMESPACE=nexus-source
       else
@@ -207,6 +212,10 @@ if [[ "${1:-cancellation}" == outcomes || "${1:-}" == cross-outcomes ]]; then
       done
     done
   done
+  if [[ "$1" == catalog ]]; then
+    "${compose[@]}" run --rm --no-deps -T \
+      -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" browser
+  fi
   exit 0
 fi
 

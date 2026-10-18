@@ -95,6 +95,8 @@ jobs:
         run: python -m pip install --target "$RUNNER_TEMP/nexus-observer" -r tests/nexus/requirements.txt -c tests/nexus/requirements.lock
       - name: Check delivery-before-claim observation
         run: PYTHONPATH="$RUNNER_TEMP/nexus-observer" python tests/nexus/test-acknowledgements.py
+      - name: Check catalog observer identity, types and redaction
+        run: docker run --rm --user "$(id -u):$(id -g)" --network none --volume "$PWD:/sdk:ro" node@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 node --test /sdk/tests/nexus/test-catalog.mjs
 
   regression-corpus:
     name: Regression corpus

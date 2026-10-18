@@ -146,6 +146,16 @@ async def run(case, caller, target, scenario, namespace, target_namespace, http,
                "rust_source": os.environ["NEXUS_RUST_SOURCE"],
                "rust_binary_sha256": os.environ["NEXUS_RUST_BINARY_SHA256"],
                "foreign_namespace_refusals": foreign_refusals, "workflow_outcome": "pass"}
+    if os.environ.get("NEXUS_QUALIFY_UI") == "1":
+        fields = ("namespace", "endpoint_name", "service_name", "operation_name", "status",
+                  "outcome", "accepted_at", "call_deadline_at", "idempotency_key")
+        original = {key: call[key] for key in fields if key in call}
+        original.update({"id": call_id, "caller_namespace": namespace,
+                         "target_namespace": target_namespace,
+                         "caller_workflow_instance_id": case, "caller_workflow_run_id": handle.run_id,
+                         "linked_workflow_instance_id": target_id, "linked_workflow_run_id": target_run})
+        summary["catalog"] = {"original": original, "caller_history": final,
+                              "target_history": target_history}
     path.write_text(json.dumps(summary), encoding="utf-8")
     print(json.dumps(summary), flush=True)
 
