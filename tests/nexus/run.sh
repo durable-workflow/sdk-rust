@@ -61,6 +61,7 @@ for direction in rust:php php:rust rust:rust rust:python python:rust rust:rust:k
     docker inspect "$container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/cases/$container-exit.json"
     jq -e '.ExitCode==0 and .OOMKilled==false' "$NEXUS_STATE_DIR/cases/$container-exit.json" >/dev/null
   done
+  observe finished "$case_id"
   cleanup
   owned=()
 done

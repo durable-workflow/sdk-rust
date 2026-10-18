@@ -247,11 +247,25 @@ async def verify(record, client):
             continue
         raise AssertionError("Cold SDK result did not return typed workflow cancellation")
     record["reader_refusals"] = refusal_controls(record)
-    record["outcome"] = "pass"
+    record["workflow_outcome"] = "pass"
     print(json.dumps({"phase": "verified", "case": record["case"], "caller": record["caller"], "target": record["target"],
                       "request_id": record["admission"]["cancellation_request"]["request_id"],
                       "caller_events": len(record["after"]["caller"]["events"]),
                       "target_events": len(record["after"]["target"]["events"])}), flush=True)
+
+
+def finished(record):
+    require(record.get("workflow_outcome") == "pass", "Workflow component is incomplete")
+    exits = []
+    for role in ("caller", "target"):
+        paths = list(DIRECTORY.glob(f"{record['case']}-{role}*-exit.json"))
+        require(len(paths) == 1, "Expected one final worker exit per role")
+        state = json.loads(paths[0].read_text(encoding="utf-8"))
+        require(state["ExitCode"] == 0 and state["OOMKilled"] is False, "Worker shutdown was not successful")
+        exits.append({"role": role, "exit_code": state["ExitCode"], "oom_killed": state["OOMKilled"]})
+    record["worker_exits"] = exits
+    record["outcome"] = "pass"
+    print(json.dumps({"phase": "finished", "case": record["case"], "outcome": "pass", "reader_refusals": record["reader_refusals"]}), flush=True)
 
 
 async def main():
@@ -272,6 +286,8 @@ async def main():
             await terminal(record, http)
         elif phase == "verify":
             await verify(record, client)
+        elif phase == "finished":
+            finished(record)
         else:
             raise ValueError("Unknown observation phase")
         save(case, record)

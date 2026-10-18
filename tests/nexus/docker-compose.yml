@@ -23,6 +23,7 @@ x-runtime: &runtime
 
 x-worker: &worker
   init: true
+  stop_signal: SIGTERM
   user: "${NEXUS_UID:?set the invoking UID}:${NEXUS_GID:?set the invoking GID}"
   mem_limit: 256m
   cpus: 0.5
