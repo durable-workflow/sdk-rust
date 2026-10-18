@@ -42,8 +42,10 @@ start_worker() {
 if [[ "${1:-cancellation}" == outcomes ]]; then
   export NEXUS_QUALIFY_OUTCOMES=1
   for namespace in default nexus-source; do
-    export NEXUS_NAMESPACE="$namespace"
     "${compose[@]}" run --rm --no-deps -T --entrypoint python observe /fixture/outcomes.py setup "$namespace"
+  done
+  for namespace in default nexus-source; do
+    export NEXUS_NAMESPACE="$namespace"
     for direction in rust:php php:rust rust:rust rust:python python:rust; do
       caller="${direction%%:*}"
       target="${direction#*:}"

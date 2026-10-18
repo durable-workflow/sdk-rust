@@ -80,6 +80,7 @@ async def run(case, caller, target, scenario, namespace, http, client):
         call = await request(http, "GET", call_path)
     require(call["caller_workflow_instance_id"] == case and call["caller_workflow_run_id"] == handle.run_id,
             "Service call lost original caller identity")
+    require(call["namespace"] == namespace, "Service call escaped its original namespace")
     if scenario != "missing":
         require(call["deadline_policy"]["timeout_seconds"] == 180, "Original service policy changed")
     target_id, target_run = call.get("linked_workflow_instance_id"), call.get("linked_workflow_run_id")
@@ -113,13 +114,15 @@ async def run(case, caller, target, scenario, namespace, http, client):
     require(await history(http, case, handle.run_id) == final, "Cold read mutated caller history")
     if target_history is not None:
         require(await history(http, target_id, target_run) == target_history, "Cold read mutated target history")
+    foreign_refusals = await foreign_namespace(http, namespace, case, handle.run_id, target_id, target_run)
     summary = {"case": case, "namespace": namespace, "caller": caller, "target": target,
                "scenario": scenario, "caller_run": handle.run_id, "service_call_id": call_id,
                "target_id": target_id, "target_run": target_run, "status": call["status"],
                "caller_events": len(final["events"]), "target_events": len(target_history["events"]) if target_history else 0,
                "data_bytes": len(expected["data"]), "data_sha256": hashlib.sha256(expected["data"].encode()).hexdigest(),
                "rust_source": os.environ["NEXUS_RUST_SOURCE"],
-               "rust_binary_sha256": os.environ["NEXUS_RUST_BINARY_SHA256"], "workflow_outcome": "pass"}
+               "rust_binary_sha256": os.environ["NEXUS_RUST_BINARY_SHA256"],
+               "foreign_namespace_refusals": foreign_refusals, "workflow_outcome": "pass"}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(summary), encoding="utf-8")
     print(json.dumps(summary), flush=True)
@@ -136,6 +139,18 @@ async def cold_target(client, scenario, target_id, target_run, expected):
             raise AssertionError("Target did not retain typed workflow failure")
     else:
         exact_value(await handle.result(timeout=1), expected)
+
+
+async def foreign_namespace(http, namespace, caller_id, caller_run, target_id, target_run):
+    foreign = "nexus-source" if namespace == "default" else "default"
+    selected = [(caller_id, caller_run)]
+    if target_id is not None:
+        selected.append((target_id, target_run))
+    for workflow_id, run_id in selected:
+        response = await http.get(f"/api/workflows/{workflow_id}/runs/{run_id}/history",
+                                  headers={"X-Namespace": foreign})
+        require(response.status_code == 404, "Foreign namespace exposed the original run")
+    return len(selected)
 
 
 async def main():
