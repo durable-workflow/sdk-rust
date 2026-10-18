@@ -157,7 +157,7 @@ async def run(case, caller, target, scenario, namespace, target_namespace, http,
         summary["catalog"] = {"original": original, "caller_history": final,
                               "target_history": target_history}
     path.write_text(json.dumps(summary), encoding="utf-8")
-    print(json.dumps(summary), flush=True)
+    print(json.dumps({key: value for key, value in summary.items() if key != "catalog"}), flush=True)
 
 
 async def cold_target(client, scenario, target_id, target_run, expected):

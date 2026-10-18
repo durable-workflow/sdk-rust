@@ -32,6 +32,11 @@ export function validateDetail(detail, row, scope) {
     assert.equal(detail.accepted_at, null);
     assert.equal(detail.call_deadline_at, null);
     assert.equal(detail.linked_run_ref, null);
+    assert.equal(detail.failure_type, null);
+    assert.equal(detail.outcome, 'rejected_not_found');
+    assert.equal(detail.metadata.failure_reason, 'resolution_failure');
+    assert.equal(detail.metadata.resolution_failed_at, 'operation');
+    assert.ok(typeof detail.failure_message === 'string' && detail.failure_message.trim());
   } else {
     assert.equal(detail.deadline_policy.timeout_seconds, 180);
     assert.equal(detail.idempotency_key, row.case);
@@ -50,7 +55,7 @@ export function validateDetail(detail, row, scope) {
     validateOutput(detail.output, row);
   } else {
     assert.equal(detail.output_available, false);
-    assert.ok(detail.failure_type, 'typed failure remains inspectable');
+    if (row.scenario !== 'missing') assert.ok(detail.failure_type, 'typed failure remains inspectable');
     if (row.scenario === 'failure') assert.match(detail.failure_message, /nexus-target-failure/);
   }
 }

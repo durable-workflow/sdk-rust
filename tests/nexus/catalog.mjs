@@ -96,7 +96,12 @@ try {
           } else if (row.status === 'completed') {
             validateOutput(JSON.parse(await result.locator('pre').innerText()), row);
           } else {
-            assert.ok(text.includes(response.body.failure_type));
+            if (row.scenario === 'missing') {
+              assert.ok(text.includes(response.body.failure_message));
+              assert.ok(text.toLowerCase().includes('rejected not found'));
+            } else {
+              assert.ok(text.includes(response.body.failure_type));
+            }
             assert.equal(await result.locator('pre').count(), 0);
           }
           assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'no page overflow');

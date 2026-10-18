@@ -51,8 +51,17 @@ test('missing-operation diagnostic preserves no admission, deadline or target', 
   row.scenario = 'missing'; row.status = 'failed';
   row.catalog.original.call_deadline_at = null;
   detail.call_deadline_at = null; detail.accepted_at = null; detail.linked_run_ref = null;
-  detail.output_available = false; delete detail.output; detail.failure_type = 'operation_not_found';
+  detail.output_available = false; delete detail.output;
+  detail.failure_type = null; detail.outcome = 'rejected_not_found';
+  detail.failure_message = 'Service contract component [operation] did not resolve.';
+  detail.metadata = {failure_reason: 'resolution_failure', resolution_failed_at: 'operation'};
   validateDetail(detail, row, 'owner');
   detail.accepted_at = '2026-10-18T20:00:00.123456Z';
+  assert.throws(() => validateDetail(detail, row, 'owner'));
+  detail.accepted_at = null;
+  detail.failure_type = 'invented-target-exception';
+  assert.throws(() => validateDetail(detail, row, 'owner'));
+  detail.failure_type = null;
+  detail.metadata.resolution_failed_at = 'service';
   assert.throws(() => validateDetail(detail, row, 'owner'));
 });
