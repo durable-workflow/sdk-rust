@@ -55,6 +55,15 @@ docker compose --env-file "$NEXUS_ENV_FILE" -f tests/nexus/docker-compose.yml \
   down --volumes --remove-orphans
 ```
 
+For successful typed results, target failures, missing-operation failures and
+3 MiB external arguments/results across the five directions and default/named
+namespaces, run `bash tests/nexus/run.sh outcomes` against a fresh backend.
+This enables local namespace payload storage under the disposable provider mount.
+Create writable `STATE/provider/default` and `STATE/provider/nexus-source`
+directories before starting the backend. Each original retains its 30-second
+observation and 180-second service policy. Exact types/bytes, cold selected-run
+results, immutable histories and successful final Worker shutdown are required.
+
 Use fresh case identities after a failure. Keep the original outcome separate;
 do not retry a failed workflow by replacing its recorded state or widening a
 deadline. Review bounded summaries and retire generated state after recording

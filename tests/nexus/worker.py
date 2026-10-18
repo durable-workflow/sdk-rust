@@ -6,7 +6,7 @@ import os
 import signal
 
 from durable_workflow import Client, Worker, workflow
-from durable_workflow.errors import WorkflowCancelled
+from durable_workflow.errors import NexusOperationFailed, WorkflowCancelled
 
 ROLE = os.environ.get("NEXUS_ROLE", "caller")
 if ROLE not in {"caller", "target"}:
@@ -23,13 +23,23 @@ class Neighbor:
 
 @workflow.defn(name=os.environ.get("WORKFLOW_TYPE", f"nexus.{ROLE}"))
 class NexusFixture:
-    def run(self, ctx, operation):
+    def run(self, ctx, operation, value=None):
         try:
             if ROLE == "caller":
-                result = yield ctx.call_nexus_service(ENDPOINT, SERVICE, operation, [operation])
+                arguments = [operation, value] if os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1" else [operation]
+                result = yield ctx.call_nexus_service(ENDPOINT, SERVICE, operation, arguments)
                 return result.result
+            if os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1":
+                if operation == "failure":
+                    raise RuntimeError("nexus-target-failure")
+                return value
             yield ctx.start_timer(300)
             return operation
+        except NexusOperationFailed as failure:
+            if os.environ.get("NEXUS_QUALIFY_OUTCOMES") != "1":
+                raise
+            return {"caught_class": type(failure).__name__, "call_id": failure.service_call_id,
+                    "message": str(failure), "status": failure.status}
         except WorkflowCancelled as cancelled:
             print(json.dumps({"event": f"{ROLE}.cleanup", "context": cancelled.context.to_dict()}), flush=True)
             with ctx.cancellation_shield():
@@ -41,6 +51,7 @@ async def main():
     async with Client(
         os.environ.get("DURABLE_WORKFLOW_RUNTIME_URL", "http://server:8080"),
         token=os.environ.get("DURABLE_WORKFLOW_WORKER_TOKEN", "test-token"),
+        namespace=os.environ.get("DURABLE_WORKFLOW_RUNTIME_NAMESPACE", "default"),
     ) as client:
         worker = Worker(
             client, task_queue=os.environ.get("TASK_QUEUE", "nexus-workers"),

@@ -39,6 +39,42 @@ start_worker() {
   owned+=("$container")
 }
 
+if [[ "${1:-cancellation}" == outcomes ]]; then
+  export NEXUS_QUALIFY_OUTCOMES=1
+  for namespace in default nexus-source; do
+    export NEXUS_NAMESPACE="$namespace"
+    "${compose[@]}" run --rm --no-deps -T --entrypoint python observe /fixture/outcomes.py setup "$namespace"
+    for direction in rust:php php:rust rust:rust rust:python python:rust; do
+      caller="${direction%%:*}"
+      target="${direction#*:}"
+      for scenario in success failure external missing; do
+        require_backend
+        case_id="r87o-${namespace}-${direction//:/-}-${scenario}-$(date -u +%s)-$RANDOM"
+        caller_container="$case_id-caller"
+        target_container="$case_id-target"
+        start_worker "$target" target "$case_id-target" "$target_container"
+        start_worker "$caller" caller "$case_id-caller" "$caller_container"
+        "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+          -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
+          observe /fixture/outcomes.py run "$namespace" "$case_id" "$caller" "$target" "$scenario"
+        for container in "$caller_container" "$target_container"; do
+          docker logs "$container" > "$NEXUS_STATE_DIR/outcomes/$container.log" 2>&1
+          docker stop --time 15 "$container" >/dev/null
+          docker inspect "$container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/outcomes/$container-exit.json"
+          jq -e '.ExitCode==0 and .OOMKilled==false' "$NEXUS_STATE_DIR/outcomes/$container-exit.json" >/dev/null
+        done
+        jq '.outcome="pass" | .worker_exits=[{role:"caller",exit_code:0,oom_killed:false},{role:"target",exit_code:0,oom_killed:false}]' \
+          "$NEXUS_STATE_DIR/outcomes/$case_id.json" > "$NEXUS_STATE_DIR/outcomes/$case_id.finished"
+        mv -- "$NEXUS_STATE_DIR/outcomes/$case_id.finished" "$NEXUS_STATE_DIR/outcomes/$case_id.json"
+        require_backend
+        cleanup
+        owned=()
+      done
+    done
+  done
+  exit 0
+fi
+
 for direction in rust:php php:rust rust:rust rust:python python:rust rust:rust:kill; do
   require_backend
   caller="${direction%%:*}"
