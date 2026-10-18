@@ -3,6 +3,7 @@
 //! The installed Server must advertise Nexus workflow-run cooperation.
 use durable_workflow::{
     json, Client, Error, NexusOperationMode, NexusServiceOptions, NexusWaitFor, Result, Worker,
+    WorkflowContext,
 };
 use std::time::Duration;
 
@@ -62,51 +63,7 @@ async fn main() -> Result<()> {
         let endpoint = std::env::var("NEXUS_ENDPOINT").unwrap_or_else(|_| "cooperative".into());
         let service = std::env::var("NEXUS_SERVICE").unwrap_or_else(|_| "cleanup".into());
         worker.register_workflow(workflow_type, move |ctx, input| {
-            let endpoint = endpoint.clone();
-            let service = service.clone();
-            async move {
-                let operation = input.get(0).and_then(|value|value.as_str())
-                    .ok_or_else(||Error::WorkerLoop("expected one operation argument".into()))?;
-                if qualify_admission {
-                    let options = admission_options(
-                        operation,
-                        input.get(2).and_then(|value| value.as_str()),
-                        input.get(3).and_then(|value| value.as_str()),
-                    )?;
-                    let result = ctx.call_nexus_service_with_options(endpoint, service, operation, options, input.clone()).await?;
-                    let snapshot = json!({"call_id":result.service_call_id, "status":result.status,
-                        "response":result.result.deserialize::<serde_json::Value>()?,
-                        "details":{"target_namespace":result.target_namespace,
-                            "linked_workflow_instance_id":result.linked_workflow_instance_id,
-                            "linked_workflow_run_id":result.linked_workflow_run_id}});
-                    let event = if operation == "sync-completed" { "caller.result" } else { "caller.admission" };
-                    println!("{}", json!({"event":event, "snapshot":snapshot}));
-                    ctx.sleep(Duration::from_secs(3)).await?;
-                    return Ok(snapshot);
-                }
-                let arguments = if qualify_outcomes { input.clone() } else { json!([operation]) };
-                let options = if qualify_outcomes {
-                    NexusServiceOptions {
-                        target_namespace: input.get(3).and_then(|value| value.as_str()).map(str::to_owned),
-                        idempotency_key: input.get(2).and_then(|value| value.as_str()).map(str::to_owned),
-                        ..NexusServiceOptions::default()
-                    }
-                } else { NexusServiceOptions::default() };
-                match ctx.call_nexus_service_with_options(endpoint,service,operation,options,arguments).await {
-                    Err(Error::NexusOperationFailed(failure)) if qualify_outcomes => Ok(json!({
-                        "caught_class":"NexusOperationFailed", "call_id":failure.service_call_id,
-                        "message":failure.message, "status":failure.status,
-                    })),
-                    Err(Error::CooperativeCancellationRequested(cancelled)) => {
-                        println!("{}",json!({"event":"caller.cleanup","context":cancelled.request.context.as_ref().map(|ctx|ctx.to_value())}));
-                        let _shield = ctx.cancellation_shield()?;
-                        ctx.sleep(Duration::from_secs(1)).await?;
-                        Err(Error::CooperativeCancellationRequested(cancelled))
-                    }
-                    Err(error) => Err(error),
-                    Ok(result) => result.result.deserialize(),
-                }
-            }
+            run_caller(ctx, input, endpoint.clone(), service.clone(), qualify_admission, qualify_outcomes)
         });
     } else {
         return Err(Error::WorkerLoop(
@@ -114,6 +71,57 @@ async fn main() -> Result<()> {
         ));
     }
     worker.run_until(shutdown()).await
+}
+
+async fn run_caller(
+    ctx: WorkflowContext,
+    input: serde_json::Value,
+    endpoint: String,
+    service: String,
+    qualify_admission: bool,
+    qualify_outcomes: bool,
+) -> Result<serde_json::Value> {
+    let operation = input.get(0).and_then(|value|value.as_str())
+        .ok_or_else(||Error::WorkerLoop("expected one operation argument".into()))?;
+    if qualify_admission {
+        let options = admission_options(
+            operation,
+            input.get(2).and_then(|value| value.as_str()),
+            input.get(3).and_then(|value| value.as_str()),
+        )?;
+        let result = ctx.call_nexus_service_with_options(endpoint, service, operation, options, input.clone()).await?;
+        let snapshot = json!({"call_id":result.service_call_id, "status":result.status,
+            "response":result.result.deserialize::<serde_json::Value>()?,
+            "details":{"target_namespace":result.target_namespace,
+                "linked_workflow_instance_id":result.linked_workflow_instance_id,
+                "linked_workflow_run_id":result.linked_workflow_run_id}});
+        let event = if operation == "sync-completed" { "caller.result" } else { "caller.admission" };
+        println!("{}", json!({"event":event, "snapshot":snapshot}));
+        ctx.sleep(Duration::from_secs(3)).await?;
+        return Ok(snapshot);
+    }
+    let arguments = if qualify_outcomes { input.clone() } else { json!([operation]) };
+    let options = if qualify_outcomes {
+        NexusServiceOptions {
+            target_namespace: input.get(3).and_then(|value| value.as_str()).map(str::to_owned),
+            idempotency_key: input.get(2).and_then(|value| value.as_str()).map(str::to_owned),
+            ..NexusServiceOptions::default()
+        }
+    } else { NexusServiceOptions::default() };
+    match ctx.call_nexus_service_with_options(endpoint,service,operation,options,arguments).await {
+        Err(Error::NexusOperationFailed(failure)) if qualify_outcomes => Ok(json!({
+            "caught_class":"NexusOperationFailed", "call_id":failure.service_call_id,
+            "message":failure.message, "status":failure.status,
+        })),
+        Err(Error::CooperativeCancellationRequested(cancelled)) => {
+            println!("{}",json!({"event":"caller.cleanup","context":cancelled.request.context.as_ref().map(|ctx|ctx.to_value())}));
+            let _shield = ctx.cancellation_shield()?;
+            ctx.sleep(Duration::from_secs(1)).await?;
+            Err(Error::CooperativeCancellationRequested(cancelled))
+        }
+        Err(error) => Err(error),
+        Ok(result) => result.result.deserialize(),
+    }
 }
 
 fn admission_options(
