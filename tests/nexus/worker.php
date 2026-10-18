@@ -45,6 +45,7 @@ $worker->registerWorkflow(
                     $snapshot = ['call_id' => $result->serviceCallId, 'status' => $result->status,
                         'response' => $result->responsePayload, 'details' => $result->serviceCall];
                     echo json_encode(['event' => 'caller.admission', 'snapshot' => $snapshot], JSON_THROW_ON_ERROR).PHP_EOL;
+                    fflush(STDOUT);
                     $ctx->sleep(3);
                     return $snapshot;
                 }

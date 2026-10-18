@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 import httpx
@@ -184,6 +185,7 @@ async def main():
             await setup(http, namespace)
             return
         case, *roles = args
+        require(re.fullmatch(r"[a-z0-9-]{1,80}", case) is not None, "Use a bounded fixture case name")
         async with Client(URL, token=TOKEN, namespace=namespace) as client:
             if phase == "prepare":
                 await prepare(case, *roles, namespace, http, client)
