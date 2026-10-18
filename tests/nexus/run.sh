@@ -38,6 +38,7 @@ start_worker() {
   fi
   "${compose[@]}" run -d --no-deps --name "$container" \
     -e "DURABLE_WORKFLOW_RUNTIME_NAMESPACE=$worker_namespace" \
+    -e "DURABLE_WORKFLOW_RUNTIME_URL=${5:-http://server:8080}" \
     -e "NEXUS_ROLE=$role" -e "NEXUS_ENDPOINT=$case_id" \
     -e "TASK_QUEUE=$case_id-$role" -e "WORKER_ID=$worker_id" \
     -e "WORKFLOW_TYPE=nexus.$role" "$language" >/dev/null
@@ -50,6 +51,59 @@ admission_observe() {
     -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
     observe /fixture/admissions.py "$@"
 }
+
+ack_observe() {
+  "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+    -e "NEXUS_TARGET_NAMESPACE=$NEXUS_TARGET_NAMESPACE" \
+    -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
+    observe /fixture/acknowledgements.py "$@"
+}
+
+if [[ "${1:-}" == acknowledgement ]]; then
+  export NEXUS_QUALIFY_ADMISSION=1
+  for namespace in default nexus-source; do admission_observe setup "$namespace"; done
+  mkdir -p "$NEXUS_STATE_DIR/acknowledgements"
+  for pair in default:default nexus-source:nexus-source default:nexus-source nexus-source:default; do
+    export NEXUS_NAMESPACE="${pair%%:*}" NEXUS_TARGET_NAMESPACE="${pair#*:}"
+    for direction in rust:php php:rust rust:rust rust:python python:rust; do
+      require_backend
+      caller="${direction%%:*}"
+      target="${direction#*:}"
+      case_id="r87k-${pair//:/-}-${direction//:/-}-$(date -u +%s)-$RANDOM"
+      caller_container="$case_id-caller"
+      target_container="$case_id-target"
+      proxy_container="$case_id-proxy"
+      "${compose[@]}" run -d --no-deps --use-aliases --name "$proxy_container" ack-proxy >/dev/null
+      owned+=("$proxy_container")
+      start_worker "$target" target "$case_id-target" "$target_container"
+      start_worker "$caller" caller "$case_id-caller" "$caller_container" http://ack-proxy:3000
+      ack_observe prepare "$NEXUS_NAMESPACE" "$case_id" "$caller" "$target"
+      docker inspect "$caller_container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/acknowledgements/$case_id-original-before-retirement.json"
+      if [[ "$(docker inspect "$caller_container" --format '{{.State.Running}}')" == true ]]; then
+        docker kill --signal KILL "$caller_container" >/dev/null
+      fi
+      docker logs "$caller_container" > "$NEXUS_STATE_DIR/acknowledgements/$case_id-original.log" 2>&1
+      docker inspect "$caller_container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/acknowledgements/$case_id-original-exit.json"
+      ack_observe retire "$NEXUS_NAMESPACE" "$case_id"
+      ack_observe target "$NEXUS_NAMESPACE" "$case_id"
+      caller_container="$case_id-caller-cold"
+      start_worker "$caller" caller "$case_id-caller-cold" "$caller_container"
+      ack_observe caller "$NEXUS_NAMESPACE" "$case_id"
+      for role in caller target; do
+        container="$caller_container"
+        [[ "$role" == target ]] && container="$target_container"
+        docker stop --time 15 "$container" >/dev/null
+        docker logs "$container" > "$NEXUS_STATE_DIR/acknowledgements/$case_id-$role-final.log" 2>&1
+        docker inspect "$container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/acknowledgements/$case_id-$role-exit.json"
+      done
+      ack_observe verify "$NEXUS_NAMESPACE" "$case_id"
+      require_backend
+      cleanup
+      owned=()
+    done
+  done
+  exit 0
+fi
 
 if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
   export NEXUS_QUALIFY_ADMISSION=1

@@ -81,6 +81,19 @@ Both default-to-named and named-to-default calls retain the original caller
 authority. Each history must refuse reads from the other namespace. Target
 selection uses the SDK's explicit service namespace option.
 
+`bash tests/nexus/run.sh acknowledgement` runs twenty fresh synchronous calls
+across the five directions and all four caller/target namespace pairs. A
+disposable proxy forwards the original service command, receives an actual
+`recorded=true` completion and closes that one response before the caller sees
+it. It preserves ordinary traffic and sends no replacement commands. Retire the
+original caller, wait for the target and start a cold caller. Its retained
+history must contain one original admission and terminal result, with unchanged
+caller/target authority, idempotency and budgets. The proxy's task/body hash is
+correlated with the physical admission. Final Workers and independent cold
+results must pass; the original faulted/killed process is recorded separately.
+Run `node scripts/ci/test-completion-ack-proxy.mjs` to check the fault selector
+and unchanged local-activity proxy default without any SDK or Server fixture.
+
 Use fresh case identities after a failure. Keep the original outcome separate;
 do not retry a failed workflow by replacing its recorded state or widening a
 deadline. Review bounded summaries and retire generated state after recording

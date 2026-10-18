@@ -165,14 +165,14 @@ async def caller_complete(record, http, client):
     record["result"], record["caller_history"] = value, current
 
 
-def snapshots(path):
+def snapshots(path, event="caller.admission"):
     values = []
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "caller.admission":
+        if isinstance(value, dict) and value.get("event") == event:
             values.append(value["snapshot"])
     return values
 

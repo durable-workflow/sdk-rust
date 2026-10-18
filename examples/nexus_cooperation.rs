@@ -79,7 +79,8 @@ async fn main() -> Result<()> {
                         "details":{"target_namespace":result.target_namespace,
                             "linked_workflow_instance_id":result.linked_workflow_instance_id,
                             "linked_workflow_run_id":result.linked_workflow_run_id}});
-                    println!("{}", json!({"event":"caller.admission", "snapshot":snapshot}));
+                    let event = if operation == "sync-completed" { "caller.result" } else { "caller.admission" };
+                    println!("{}", json!({"event":event, "snapshot":snapshot}));
                     ctx.sleep(Duration::from_secs(3)).await?;
                     return Ok(snapshot);
                 }
@@ -114,6 +115,7 @@ fn admission_options(
     target_namespace: Option<&str>,
 ) -> Result<NexusServiceOptions> {
     let (mode, wait_for) = match operation {
+        "sync-completed" => (NexusOperationMode::Sync, NexusWaitFor::Completed),
         "sync-accepted" => (NexusOperationMode::Sync, NexusWaitFor::Accepted),
         "async-completed" => (NexusOperationMode::Async, NexusWaitFor::Completed),
         "async-accepted" => (NexusOperationMode::Async, NexusWaitFor::Accepted),

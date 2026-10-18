@@ -34,7 +34,7 @@ $worker->registerWorkflow(
         try {
             if ($role === 'caller') {
                 if (getenv('NEXUS_QUALIFY_ADMISSION') === '1') {
-                    if (!in_array($operation, ['sync-accepted', 'async-completed', 'async-accepted'], true) || $key === null || $key === '') {
+                    if (!in_array($operation, ['sync-completed', 'sync-accepted', 'async-completed', 'async-accepted'], true) || $key === null || $key === '') {
                         throw new InvalidArgumentException('Expected an admission profile and original idempotency key.');
                     }
                     $result = $ctx->serviceOperation($endpoint, $service, $operation, [$operation, $value, $key, $targetNamespace], [
@@ -45,7 +45,8 @@ $worker->registerWorkflow(
                     ]);
                     $snapshot = ['call_id' => $result->serviceCallId, 'status' => $result->status,
                         'response' => $result->responsePayload, 'details' => $result->serviceCall];
-                    echo json_encode(['event' => 'caller.admission', 'snapshot' => $snapshot], JSON_THROW_ON_ERROR).PHP_EOL;
+                    $event = $operation === 'sync-completed' ? 'caller.result' : 'caller.admission';
+                    echo json_encode(['event' => $event, 'snapshot' => $snapshot], JSON_THROW_ON_ERROR).PHP_EOL;
                     fflush(STDOUT);
                     $ctx->sleep(3);
                     return $snapshot;

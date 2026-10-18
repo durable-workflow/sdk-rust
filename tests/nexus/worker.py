@@ -27,7 +27,7 @@ class NexusFixture:
         try:
             if ROLE == "caller":
                 if os.environ.get("NEXUS_QUALIFY_ADMISSION") == "1":
-                    if operation not in {"sync-accepted", "async-completed", "async-accepted"} or not key:
+                    if operation not in {"sync-completed", "sync-accepted", "async-completed", "async-accepted"} or not key:
                         raise ValueError("Expected an admission profile and original idempotency key")
                     result = yield ctx.call_nexus_service(
                         ENDPOINT, SERVICE, operation, [operation, value, key, target_namespace], idempotency_key=key,
@@ -37,7 +37,8 @@ class NexusFixture:
                     )
                     snapshot = {"call_id": result.service_call_id, "status": result.status,
                                 "response": result.result, "details": result.response_or_failure_surface}
-                    print(json.dumps({"event": "caller.admission", "snapshot": snapshot}), flush=True)
+                    event = "caller.result" if operation == "sync-completed" else "caller.admission"
+                    print(json.dumps({"event": event, "snapshot": snapshot}), flush=True)
                     yield ctx.start_timer(3)
                     return snapshot
                 arguments = [operation, value] if os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1" else [operation]
