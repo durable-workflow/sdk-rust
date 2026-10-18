@@ -20,6 +20,7 @@ x-runtime: &runtime
   environment: *runtime-env
   mem_limit: 512m
   cpus: 1
+  stop_signal: SIGTERM
 
 x-worker: &worker
   init: true
@@ -95,7 +96,7 @@ services:
         condition: service_healthy
   repair:
     <<: *runtime
-    command: [sh, -c, "while true; do php artisan workflow:v2:repair-pass --json || exit; sleep 1; done"]
+    command: [sh, -c, "while true; do php artisan workflow:v2:repair-pass --json; sleep 10; done"]
     depends_on:
       server:
         condition: service_healthy

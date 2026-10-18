@@ -26,6 +26,22 @@ Create a Compose environment file declaring `COMPOSE_PROJECT_NAME`, `NEXUS_UID`,
 runtime images. Preserve the published Server digest unless qualifying a
 separately named cohort.
 
+Prepare dependencies using the declared language runtimes:
+
+```sh
+mkdir -p "$NEXUS_STATE_DIR/php" "$NEXUS_STATE_DIR/python"
+cp tests/nexus/composer.json "$NEXUS_STATE_DIR/php/composer.json"
+composer install --working-dir="$NEXUS_STATE_DIR/php" --no-dev --prefer-dist
+python -m pip install --target "$NEXUS_STATE_DIR/python" -r tests/nexus/requirements.txt
+CARGO_TARGET_DIR="$NEXUS_STATE_DIR/target" cargo build --example nexus_cooperation
+```
+
+The recurring repair role follows the existing cooperative fixture's 10-second
+cadence. Each command reports its actual result, including transient database
+failures, and the next scheduled pass still runs. The control checks every
+backend role before and after each original; a dead maintenance loop cannot be
+reported as a complete profile.
+
 ```sh
 export NEXUS_ENV_FILE=/absolute/path/to/fixture.env
 export NEXUS_STATE_DIR=/absolute/path/to/state

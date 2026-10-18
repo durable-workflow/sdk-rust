@@ -17,6 +17,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+require_backend() {
+  local service container
+  for service in server queue repair mysql redis; do
+    container="$("${compose[@]}" ps -q "$service")"
+    [[ -n "$container" ]]
+    [[ "$(docker inspect "$container" --format '{{.State.Running}}')" == true ]]
+  done
+}
+
 observe() {
   "${compose[@]}" run --rm --no-deps -T \
     -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" observe "$@"
@@ -31,6 +40,7 @@ start_worker() {
 }
 
 for direction in rust:php php:rust rust:rust rust:python python:rust rust:rust:kill; do
+  require_backend
   caller="${direction%%:*}"
   rest="${direction#*:}"
   target="${rest%%:*}"
@@ -62,6 +72,7 @@ for direction in rust:php php:rust rust:rust rust:python python:rust rust:rust:k
     jq -e '.ExitCode==0 and .OOMKilled==false' "$NEXUS_STATE_DIR/cases/$container-exit.json" >/dev/null
   done
   observe finished "$case_id"
+  require_backend
   cleanup
   owned=()
 done
