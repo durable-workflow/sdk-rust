@@ -48,7 +48,7 @@ class PendingDelivery(unittest.IsolatedAsyncioTestCase):
 
         with (patch.object(reader, "request", AsyncMock(return_value=call)),
               patch.object(reader, "history", history),
-              patch.object(reader, "WorkflowHandle", lambda *_: TargetValue())):
+              patch.object(reader, "WorkflowHandle", return_value=TargetValue())):
             await asyncio.wait_for(reader.target_complete(record, object(), object(), object()), 0.25)
         return record
 
