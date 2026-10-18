@@ -49,6 +49,9 @@ async def prepare(case, caller, target, profile, schedule, namespace, http, clie
     handle = await client.start_workflow(workflow_type="nexus.caller", task_queue=f"{case}-caller",
                                          workflow_id=case, input=[profile, specimen("success"), case])
     initial = await history(http, case, handle.run_id)
+    origin = one(initial, "WorkflowStarted")["payload"]
+    require(origin["workflow_instance_id"] == case and origin["workflow_run_id"] == handle.run_id,
+            "Initial history selected another original run")
     start = stamp(one(initial, "WorkflowStarted")["timestamp"])
     record = {"case": case, "caller": caller, "target": target, "profile": profile,
               "schedule": schedule, "namespace": namespace, "caller_run": handle.run_id,
@@ -74,7 +77,7 @@ async def admitted(record, http):
                 "Caller finished before the cold-replacement boundary")
     admission = one(current, "ServiceCallStarted")["payload"]
     mode, wait_for = record["profile"].split("-")
-    require(admission["operation_mode"] == mode and admission["wait_for"] == wait_for,
+    require(admission["sequence"] == 1 and admission["operation_mode"] == mode and admission["wait_for"] == wait_for,
             "Original authored mode/wait policy changed")
     record["admission_history"] = current
     record["call_id"] = admission["service_call_id"]
@@ -86,7 +89,8 @@ async def admitted(record, http):
 
 async def retire(record, client):
     reply = await client.deregister_worker_registration(f"{record['case']}-caller")
-    require(reply["recovered_workflow_task_count"] == 0, "Killed caller retained a lease at its durable boundary")
+    require(type(reply["recovered_workflow_task_count"]) is int and reply["recovered_workflow_task_count"] == 0,
+            "Killed caller retained a lease at its durable boundary")
     record["retired_registration"] = reply
 
 
@@ -98,6 +102,13 @@ async def target_complete(record, http, client):
         selected = await history(http, call["linked_workflow_instance_id"], call["linked_workflow_run_id"])
         return (call, selected) if any(event["event_type"] == "WorkflowCompleted" for event in selected["events"]) else None
     call, selected = await until(complete)
+    require(call["id"] == record["call_id"] and call["namespace"] == record["namespace"]
+            and call["target_namespace"] == record["namespace"]
+            and call["caller_workflow_instance_id"] == record["case"]
+            and call["caller_workflow_run_id"] == record["caller_run"], "Original call authority changed")
+    origin = one(selected, "WorkflowStarted")["payload"]
+    require(origin["workflow_instance_id"] == call["linked_workflow_instance_id"]
+            and origin["workflow_run_id"] == call["linked_workflow_run_id"], "Target history selected another run")
     require(call["idempotency_key"] == record["case"] and call["deadline_policy"]["timeout_seconds"] == 180,
             "Original call identity or policy changed")
     before = record["original_call"]
