@@ -73,6 +73,22 @@ jobs:
           --target sdk-rust
           --workflow-directory .github/workflows
 
+  completion-ack-fixture:
+    name: Completion acknowledgement fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - name: Check Nexus selection and local-activity compatibility
+        run: >-
+          docker run --rm --init --network none
+          --user "$(id -u):$(id -g)" --cpus 1 --memory 256m --memory-swap 256m
+          --volume "$PWD:/sdk:ro"
+          node@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+          node /sdk/scripts/ci/test-completion-ack-proxy.mjs
+
   regression-corpus:
     name: Regression corpus
     runs-on: ubuntu-latest
@@ -442,7 +458,7 @@ jobs:
   target-branch-qualification:
     name: Target branch qualification
     if: ${{ always() }}
-    needs: [action-policy, regression-corpus, test, protocol, docs, package, cooperative-server, local-server]
+    needs: [action-policy, completion-ack-fixture, regression-corpus, test, protocol, docs, package, cooperative-server, local-server]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -454,6 +470,7 @@ jobs:
       - name: Require the supported Rust and package checks
         env:
           CORPUS_RESULT: ${{ needs.regression-corpus.result }}
+          ACK_FIXTURE_RESULT: ${{ needs.completion-ack-fixture.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
           PROTOCOL_RESULT: ${{ needs.protocol.result }}
@@ -467,6 +484,7 @@ jobs:
           SESSION_SERVER_SOURCE: ${{ inputs.server_commit }}
         run: |
           test "$CORPUS_RESULT" = success
+          test "$ACK_FIXTURE_RESULT" = success
           test "$DOCS_RESULT" = success
           test "$PACKAGE_RESULT" = success
           test "$PROTOCOL_RESULT" = success
