@@ -20,8 +20,9 @@ Use a disposable state directory, a PHP CLI with `pcntl` and `posix`, Python 3.1
 and Rust 1.86 or later. Build this checkout's `nexus_cooperation` example into
 `STATE/target`, install `composer.json` into `STATE/php` and `requirements.txt`
 into `STATE/python`. The state directory is an absolute path outside the checkout.
-The Rust library normally resolves its own Cargo lock; keep the generated lock
-and source/binary identities until the immediate run review finishes.
+The fixture's Cargo lock records the resolved input used for its actor build.
+Copy it to the checkout root and retain the source/binary identities during the
+immediate run review.
 
 Create a Compose environment file declaring `COMPOSE_PROJECT_NAME`, `NEXUS_UID`,
 `NEXUS_GID`, `NEXUS_STATE_DIR` and `NEXUS_PHP_IMAGE`. Optional `NEXUS_RUST_IMAGE`,
@@ -36,7 +37,8 @@ mkdir -p "$NEXUS_STATE_DIR/php" "$NEXUS_STATE_DIR/python"
 cp tests/nexus/composer.json tests/nexus/composer.lock "$NEXUS_STATE_DIR/php/"
 composer install --working-dir="$NEXUS_STATE_DIR/php" --no-dev --prefer-dist
 python -m pip install --target "$NEXUS_STATE_DIR/python" -r tests/nexus/requirements.txt -c tests/nexus/requirements.lock
-CARGO_TARGET_DIR="$NEXUS_STATE_DIR/target" cargo build --example nexus_cooperation
+cp tests/nexus/Cargo.lock Cargo.lock
+CARGO_TARGET_DIR="$NEXUS_STATE_DIR/target" cargo build --locked --example nexus_cooperation
 ```
 
 The recurring repair role follows the existing cooperative fixture's 10-second
