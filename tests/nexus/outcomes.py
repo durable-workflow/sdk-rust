@@ -150,7 +150,11 @@ async def external_result(http, envelope):
     require(reference["schema"] == "durable-workflow.v2.runtime-external-payload-reference.v1"
             and reference["codec"] == "avro" and reference["size_bytes"] > 3 * 1024 * 1024,
             "External result metadata changed")
-    response = await http.get(f"/api/external-payloads/v1/{reference['reference_id']}")
+    response = await http.get(f"/api/external-payloads/v1/{reference['reference_id']}", headers={
+        "X-Durable-Workflow-Payload-Codec": reference["codec"],
+        "X-Durable-Workflow-Payload-Size": str(reference["size_bytes"]),
+        "X-Durable-Workflow-Payload-SHA256": reference["sha256"],
+    })
     require(response.status_code == 200 and len(response.content) == reference["size_bytes"],
             "External transport lost the exact original byte count")
     require(hashlib.sha256(response.content).hexdigest() == reference["sha256"],
