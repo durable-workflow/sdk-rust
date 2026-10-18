@@ -51,8 +51,10 @@ $worker->registerWorkflow(
                     $ctx->sleep(3);
                     return $snapshot;
                 }
-                $arguments = getenv('NEXUS_QUALIFY_OUTCOMES') === '1' ? [$operation, $value] : [$operation];
-                return $ctx->serviceOperation($endpoint, $service, $operation, $arguments)->responsePayload;
+                $qualifyOutcomes = getenv('NEXUS_QUALIFY_OUTCOMES') === '1';
+                $arguments = $qualifyOutcomes ? [$operation, $value, $key, $targetNamespace] : [$operation];
+                $options = $qualifyOutcomes ? ['namespace' => $targetNamespace, 'idempotency_key' => $key] : [];
+                return $ctx->serviceOperation($endpoint, $service, $operation, $arguments, $options)->responsePayload;
             }
             if (getenv('NEXUS_QUALIFY_ADMISSION') === '1') {
                 $ctx->sleep(8);

@@ -1,6 +1,7 @@
 """Actual typed Nexus results/failures with independently cold SDK reads."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import httpx
 from durable_workflow import Client, WorkflowHandle
 from durable_workflow.errors import WorkflowFailed
 
-from observe import history, one, request, require, until
+from observe import history, one, request, require, stamp, until
 
 URL = os.environ.get("DURABLE_WORKFLOW_RUNTIME_URL", "http://server:8080")
 TOKEN = os.environ.get("DURABLE_WORKFLOW_WORKER_TOKEN", "test-token")
@@ -41,20 +42,22 @@ async def setup(http, namespace):
         "nexus_cooperative_cancellation_binding_kinds", []), "Installed workflow-run binding unavailable")
 
 
-async def run(case, caller, target, scenario, namespace, http, client):
+async def run(case, caller, target, scenario, namespace, target_namespace, http, client, target_http, target_client):
     path = Path(f"/state/outcomes/{case}.json")
     require(not path.exists(), "Use a fresh original case identity")
 
     async def registered():
-        rows = (await request(http, "GET", "/api/workers"))["workers"]
-        selected = [row for row in rows if row["worker_id"] in {f"{case}-caller", f"{case}-target"}]
+        callers = (await request(http, "GET", "/api/workers"))["workers"]
+        targets = (await request(target_http, "GET", "/api/workers"))["workers"]
+        selected = ([row for row in callers if row["worker_id"] == f"{case}-caller"]
+                    + [row for row in targets if row["worker_id"] == f"{case}-target"])
         return selected if len(selected) == 2 else None
 
     await until(registered)
-    await request(http, "POST", "/api/service-endpoints", {"endpoint_name": case}, statuses=(201,))
-    await request(http, "POST", f"/api/service-endpoints/{case}/services", {"service_name": "cleanup"}, statuses=(201,))
+    await request(target_http, "POST", "/api/service-endpoints", {"endpoint_name": case}, statuses=(201,))
+    await request(target_http, "POST", f"/api/service-endpoints/{case}/services", {"service_name": "cleanup"}, statuses=(201,))
     if scenario != "missing":
-        await request(http, "POST", f"/api/service-endpoints/{case}/services/cleanup/operations", {
+        await request(target_http, "POST", f"/api/service-endpoints/{case}/services/cleanup/operations", {
             "operation_name": scenario, "operation_mode": "sync", "handler_binding_kind": "start_workflow",
             "handler_target_reference": "nexus.target",
             "handler_binding": {"workflow_type": "nexus.target", "queue": f"{case}-target"},
@@ -62,14 +65,22 @@ async def run(case, caller, target, scenario, namespace, http, client):
         }, statuses=(201,))
     expected = specimen(scenario)
     handle = await client.start_workflow(workflow_type="nexus.caller", task_queue=f"{case}-caller",
-                                         workflow_id=case, input=[scenario, expected])
+                                         workflow_id=case, input=[scenario, expected, case, target_namespace])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"case": case, "namespace": namespace, "scenario": scenario,
-                                "caller_run": handle.run_id, "workflow_outcome": "pending"}), encoding="utf-8")
+    pending = {"case": case, "namespace": namespace, "target_namespace": target_namespace,
+               "scenario": scenario, "caller_run": handle.run_id, "workflow_outcome": "pending",
+               "rust_source": os.environ["NEXUS_RUST_SOURCE"]}
+    path.write_text(json.dumps(pending), encoding="utf-8")
     print(json.dumps({"phase": "admitted", "case": case, "caller_run": handle.run_id}), flush=True)
     first = await history(http, case, handle.run_id)
-    value = await handle.result(timeout=30, poll_interval=0.1)
+    deadline = stamp(one(first, "WorkflowStarted")["timestamp"]) + timedelta(seconds=30)
+    pending["observation_deadline"] = deadline.isoformat()
+    path.write_text(json.dumps(pending), encoding="utf-8")
+    available = (deadline - datetime.now(timezone.utc)).total_seconds()
+    require(available > 0, "Original thirty-second observation expired")
+    value = await handle.result(timeout=available, poll_interval=0.1)
     final = await history(http, case, handle.run_id)
+    require(stamp(one(final, "WorkflowCompleted")["timestamp"]) <= deadline, "Original observation budget changed")
     require(final["events"][:len(first["events"])] == first["events"], "Committed caller prefix changed")
     if scenario == "missing":
         failure = one(final, "ServiceCallFailed")["payload"]
@@ -81,14 +92,16 @@ async def run(case, caller, target, scenario, namespace, http, client):
     else:
         call_id = one(final, "ServiceCallStarted")["payload"]["service_call_id"]
         call_path = f"/api/service-endpoints/{case}/services/cleanup/operations/{scenario}/service-calls/{call_id}"
-        call = await request(http, "GET", call_path)
+        call = await request(target_http, "GET", call_path)
     caller_identity = failure if scenario == "missing" else call
     require(caller_identity["caller_workflow_instance_id"] == case
             and caller_identity["caller_workflow_run_id"] == handle.run_id,
             "Service call lost original caller identity")
-    require(call["namespace"] == namespace, "Service call escaped its original namespace")
+    require(call["namespace"] == target_namespace, "Service call escaped its selected namespace")
     if scenario != "missing":
         require(call["deadline_policy"]["timeout_seconds"] == 180, "Original service policy changed")
+        require(call["caller_namespace"] == namespace and call["target_namespace"] == target_namespace
+                and call["idempotency_key"] == case, "Original namespace or idempotency authority changed")
     target_id, target_run = call.get("linked_workflow_instance_id"), call.get("linked_workflow_run_id")
     target_history = None
     if scenario == "missing":
@@ -97,8 +110,8 @@ async def run(case, caller, target, scenario, namespace, http, client):
                 "Unresolved operation fabricated admission or an operation deadline")
     else:
         require(target_id and target_run, "Committed call lost its target identity")
-        target_history = await history(http, target_id, target_run)
-        await cold_target(client, scenario, target_id, target_run, expected)
+        target_history = await history(target_http, target_id, target_run)
+        await cold_target(target_client, scenario, target_id, target_run, expected)
     if scenario in {"success", "external"}:
         exact_value(value, expected)
         require(call["status"] == "completed", "Successful operation did not commit completed")
@@ -121,9 +134,11 @@ async def run(case, caller, target, scenario, namespace, http, client):
         require(repeated == value, "Cold selected-run result changed")
     require(await history(http, case, handle.run_id) == final, "Cold read mutated caller history")
     if target_history is not None:
-        require(await history(http, target_id, target_run) == target_history, "Cold read mutated target history")
-    foreign_refusals = await foreign_namespace(http, namespace, case, handle.run_id, target_id, target_run)
-    summary = {"case": case, "namespace": namespace, "caller": caller, "target": target,
+        require(await history(target_http, target_id, target_run) == target_history, "Cold read mutated target history")
+    foreign_refusals = await foreign_namespace(http, namespace, case, handle.run_id, target_id, target_run,
+                                             target_namespace=target_namespace)
+    summary = {"case": case, "namespace": namespace, "target_namespace": target_namespace,
+               "caller": caller, "target": target, "observation_deadline": deadline.isoformat(),
                "scenario": scenario, "caller_run": handle.run_id, "service_call_id": call_id,
                "target_id": target_id, "target_run": target_run, "status": call["status"],
                "caller_events": len(final["events"]), "target_events": len(target_history["events"]) if target_history else 0,
@@ -165,14 +180,15 @@ async def external_result(http, envelope):
             "External transport changed the exact original byte hash")
 
 
-async def foreign_namespace(http, namespace, caller_id, caller_run, target_id, target_run):
+async def foreign_namespace(http, namespace, caller_id, caller_run, target_id, target_run, target_namespace=None):
     foreign = "nexus-source" if namespace == "default" else "default"
-    selected = [(caller_id, caller_run)]
+    selected = [(caller_id, caller_run, foreign)]
     if target_id is not None:
-        selected.append((target_id, target_run))
-    for workflow_id, run_id in selected:
+        target_foreign = "nexus-source" if (target_namespace or namespace) == "default" else "default"
+        selected.append((target_id, target_run, target_foreign))
+    for workflow_id, run_id, selected_namespace in selected:
         response = await http.get(f"/api/workflows/{workflow_id}/runs/{run_id}/history",
-                                  headers={"X-Namespace": foreign})
+                                  headers={"X-Namespace": selected_namespace})
         require(response.status_code == 404, "Foreign namespace exposed the original run")
     return len(selected)
 
@@ -181,12 +197,15 @@ async def main():
     phase, namespace, *args = sys.argv[1:]
     headers = {"Authorization": f"Bearer {TOKEN}", "X-Namespace": namespace,
                "X-Durable-Workflow-Control-Plane-Version": "2"}
-    async with httpx.AsyncClient(base_url=URL, headers=headers, timeout=30) as http:
+    target_namespace = os.environ.get("NEXUS_TARGET_NAMESPACE", namespace)
+    async with (httpx.AsyncClient(base_url=URL, headers=headers, timeout=30) as http,
+                httpx.AsyncClient(base_url=URL, headers={**headers, "X-Namespace": target_namespace}, timeout=30) as target_http):
         if phase == "setup":
             await setup(http, namespace)
         elif phase == "run":
-            async with Client(URL, token=TOKEN, namespace=namespace) as client:
-                await run(*args, namespace, http, client)
+            async with (Client(URL, token=TOKEN, namespace=namespace) as client,
+                        Client(URL, token=TOKEN, namespace=target_namespace) as target_client):
+                await run(*args, namespace, target_namespace, http, client, target_http, target_client)
         else:
             raise ValueError("Unknown outcome phase")
 

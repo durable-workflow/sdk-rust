@@ -41,8 +41,11 @@ class NexusFixture:
                     print(json.dumps({"event": event, "snapshot": snapshot}), flush=True)
                     yield ctx.start_timer(3)
                     return snapshot
-                arguments = [operation, value] if os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1" else [operation]
-                result = yield ctx.call_nexus_service(ENDPOINT, SERVICE, operation, arguments)
+                qualify_outcomes = os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1"
+                arguments = [operation, value, key, target_namespace] if qualify_outcomes else [operation]
+                result = yield ctx.call_nexus_service(ENDPOINT, SERVICE, operation, arguments,
+                    target_namespace=target_namespace if qualify_outcomes else None,
+                    idempotency_key=key if qualify_outcomes else None)
                 return result.result
             if os.environ.get("NEXUS_QUALIFY_ADMISSION") == "1":
                 yield ctx.start_timer(8)

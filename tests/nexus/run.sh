@@ -5,6 +5,7 @@ fixture_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$fixture_dir/../.." && pwd)"
 : "${NEXUS_STATE_DIR:?set the disposable state directory}"
 : "${NEXUS_ENV_FILE:?set the Compose input file}"
+export NEXUS_QUALIFY_ADMISSION=0 NEXUS_QUALIFY_OUTCOMES=0
 source_sha="$(git -C "$repo_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$NEXUS_STATE_DIR/target/debug/examples/nexus_cooperation" | cut -d ' ' -f 1)"
 compose=(docker compose --env-file "$NEXUS_ENV_FILE" -f "$fixture_dir/docker-compose.yml")
@@ -162,13 +163,21 @@ if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
   exit 0
 fi
 
-if [[ "${1:-cancellation}" == outcomes ]]; then
+if [[ "${1:-cancellation}" == outcomes || "${1:-}" == cross-outcomes ]]; then
   export NEXUS_QUALIFY_OUTCOMES=1
   for namespace in default nexus-source; do
     "${compose[@]}" run --rm --no-deps -T --entrypoint python observe /fixture/outcomes.py setup "$namespace"
   done
   for namespace in default nexus-source; do
     export NEXUS_NAMESPACE="$namespace"
+    export NEXUS_TARGET_NAMESPACE="$namespace"
+    if [[ "$1" == cross-outcomes ]]; then
+      if [[ "$namespace" == default ]]; then
+        NEXUS_TARGET_NAMESPACE=nexus-source
+      else
+        NEXUS_TARGET_NAMESPACE=default
+      fi
+    fi
     for direction in rust:php php:rust rust:rust rust:python python:rust; do
       caller="${direction%%:*}"
       target="${direction#*:}"
@@ -180,6 +189,7 @@ if [[ "${1:-cancellation}" == outcomes ]]; then
         start_worker "$target" target "$case_id-target" "$target_container"
         start_worker "$caller" caller "$case_id-caller" "$caller_container"
         "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+          -e "NEXUS_TARGET_NAMESPACE=$NEXUS_TARGET_NAMESPACE" \
           -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
           observe /fixture/outcomes.py run "$namespace" "$case_id" "$caller" "$target" "$scenario"
         for container in "$caller_container" "$target_container"; do

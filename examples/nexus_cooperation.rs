@@ -85,7 +85,14 @@ async fn main() -> Result<()> {
                     return Ok(snapshot);
                 }
                 let arguments = if qualify_outcomes { input.clone() } else { json!([operation]) };
-                match ctx.call_nexus_service(endpoint,service,operation,arguments).await {
+                let options = if qualify_outcomes {
+                    NexusServiceOptions {
+                        target_namespace: input.get(3).and_then(|value| value.as_str()).map(str::to_owned),
+                        idempotency_key: input.get(2).and_then(|value| value.as_str()).map(str::to_owned),
+                        ..NexusServiceOptions::default()
+                    }
+                } else { NexusServiceOptions::default() };
+                match ctx.call_nexus_service_with_options(endpoint,service,operation,options,arguments).await {
                     Err(Error::NexusOperationFailed(failure)) if qualify_outcomes => Ok(json!({
                         "caught_class":"NexusOperationFailed", "call_id":failure.service_call_id,
                         "message":failure.message, "status":failure.status,

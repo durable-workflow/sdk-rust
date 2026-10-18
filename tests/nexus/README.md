@@ -66,6 +66,13 @@ directories before starting the backend. Each original retains its 30-second
 observation and 180-second service policy. Exact types/bytes, cold selected-run
 results, immutable histories and successful final Worker shutdown are required.
 
+`bash tests/nexus/run.sh cross-outcomes` runs that same synchronous-result profile
+with the catalog and target in the other namespace. Successful and external
+results must reach the original caller; target failures and missing operations
+keep their typed refusals. Cold target reads use its own namespace. Wrong-scope
+caller and target histories must refuse independently. The published runtime
+must translate external result references into the caller's payload boundary.
+
 `bash tests/nexus/run.sh admission` exercises sync/accepted, async/completed and
 async/accepted across the same directions/namespaces. Ordinary callers continue
 before their eight-second target finishes. Cold controls kill the caller after
