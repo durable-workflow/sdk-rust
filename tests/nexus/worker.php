@@ -30,11 +30,30 @@ $worker = new Worker(
 $worker->registerWorkflow('nexus.qualification.neighbor', static fn (WorkflowContext $ctx): array => ['alive' => true, 'runtime' => 'php']);
 $worker->registerWorkflow(
     getenv('WORKFLOW_TYPE') ?: 'nexus.'.$role,
-    static function (WorkflowContext $ctx, string $operation, mixed $value = null) use ($role, $endpoint, $service): mixed {
+    static function (WorkflowContext $ctx, string $operation, mixed $value = null, ?string $key = null) use ($role, $endpoint, $service): mixed {
         try {
             if ($role === 'caller') {
+                if (getenv('NEXUS_QUALIFY_ADMISSION') === '1') {
+                    if (!in_array($operation, ['sync-accepted', 'async-completed', 'async-accepted'], true) || $key === null || $key === '') {
+                        throw new InvalidArgumentException('Expected an admission profile and original idempotency key.');
+                    }
+                    $result = $ctx->serviceOperation($endpoint, $service, $operation, [$operation, $value, $key], [
+                        'mode_override' => str_starts_with($operation, 'async-') ? 'async' : 'sync',
+                        'wait_for' => str_ends_with($operation, '-accepted') ? 'accepted' : 'completed',
+                        'idempotency_key' => $key,
+                    ]);
+                    $snapshot = ['call_id' => $result->serviceCallId, 'status' => $result->status,
+                        'response' => $result->responsePayload, 'details' => $result->serviceCall];
+                    echo json_encode(['event' => 'caller.admission', 'snapshot' => $snapshot], JSON_THROW_ON_ERROR).PHP_EOL;
+                    $ctx->sleep(3);
+                    return $snapshot;
+                }
                 $arguments = getenv('NEXUS_QUALIFY_OUTCOMES') === '1' ? [$operation, $value] : [$operation];
                 return $ctx->serviceOperation($endpoint, $service, $operation, $arguments)->responsePayload;
+            }
+            if (getenv('NEXUS_QUALIFY_ADMISSION') === '1') {
+                $ctx->sleep(8);
+                return $value;
             }
             if (getenv('NEXUS_QUALIFY_OUTCOMES') === '1') {
                 if ($operation === 'failure') {

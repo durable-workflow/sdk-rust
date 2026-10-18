@@ -39,6 +39,62 @@ start_worker() {
   owned+=("$container")
 }
 
+admission_observe() {
+  "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+    -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
+    observe /fixture/admissions.py "$@"
+}
+
+if [[ "${1:-cancellation}" == admission ]]; then
+  export NEXUS_QUALIFY_ADMISSION=1
+  for namespace in default nexus-source; do admission_observe setup "$namespace"; done
+  mkdir -p "$NEXUS_STATE_DIR/admissions"
+  for namespace in default nexus-source; do
+    export NEXUS_NAMESPACE="$namespace"
+    for direction in rust:php php:rust rust:rust rust:python python:rust; do
+      caller="${direction%%:*}"
+      target="${direction#*:}"
+      for profile in sync-accepted async-completed async-accepted; do
+        for schedule in ordinary cold; do
+          require_backend
+          case_id="r87a-${namespace}-${direction//:/-}-${profile}-${schedule}-$(date -u +%s)-$RANDOM"
+          caller_container="$case_id-caller"
+          target_container="$case_id-target"
+          start_worker "$target" target "$case_id-target" "$target_container"
+          start_worker "$caller" caller "$case_id-caller" "$caller_container"
+          admission_observe prepare "$namespace" "$case_id" "$caller" "$target" "$profile" "$schedule"
+          admission_observe admitted "$namespace" "$case_id"
+          docker logs "$caller_container" > "$NEXUS_STATE_DIR/admissions/$case_id-caller-original.log" 2>&1
+          if [[ "$schedule" == cold ]]; then
+            docker kill --signal KILL "$caller_container" >/dev/null
+            docker inspect "$caller_container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/admissions/$case_id-killed.json"
+            jq -e '.ExitCode==137 and .OOMKilled==false' "$NEXUS_STATE_DIR/admissions/$case_id-killed.json" >/dev/null
+            admission_observe retire "$namespace" "$case_id"
+          fi
+          admission_observe target "$namespace" "$case_id"
+          if [[ "$schedule" == cold ]]; then
+            caller_container="$case_id-caller-cold"
+            start_worker "$caller" caller "$case_id-caller-cold" "$caller_container"
+          fi
+          admission_observe caller "$namespace" "$case_id"
+          for role in caller target; do
+            container="$caller_container"
+            [[ "$role" == target ]] && container="$target_container"
+            docker stop --time 15 "$container" >/dev/null
+            docker logs "$container" > "$NEXUS_STATE_DIR/admissions/$case_id-$role-final.log" 2>&1
+            docker inspect "$container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/admissions/$case_id-$role-exit.json"
+          done
+          admission_observe verify "$namespace" "$case_id"
+          require_backend
+          cleanup
+          owned=()
+        done
+      done
+    done
+  done
+  exit 0
+fi
+
 if [[ "${1:-cancellation}" == outcomes ]]; then
   export NEXUS_QUALIFY_OUTCOMES=1
   for namespace in default nexus-source; do

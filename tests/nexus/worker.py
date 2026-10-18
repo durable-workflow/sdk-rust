@@ -23,12 +23,28 @@ class Neighbor:
 
 @workflow.defn(name=os.environ.get("WORKFLOW_TYPE", f"nexus.{ROLE}"))
 class NexusFixture:
-    def run(self, ctx, operation, value=None):
+    def run(self, ctx, operation, value=None, key=None):
         try:
             if ROLE == "caller":
+                if os.environ.get("NEXUS_QUALIFY_ADMISSION") == "1":
+                    if operation not in {"sync-accepted", "async-completed", "async-accepted"} or not key:
+                        raise ValueError("Expected an admission profile and original idempotency key")
+                    result = yield ctx.call_nexus_service(
+                        ENDPOINT, SERVICE, operation, [operation, value, key], idempotency_key=key,
+                        mode="async" if operation.startswith("async-") else "sync",
+                        wait_for="accepted" if operation.endswith("-accepted") else "completed",
+                    )
+                    snapshot = {"call_id": result.service_call_id, "status": result.status,
+                                "response": result.result, "details": result.response_or_failure_surface}
+                    print(json.dumps({"event": "caller.admission", "snapshot": snapshot}), flush=True)
+                    yield ctx.start_timer(3)
+                    return snapshot
                 arguments = [operation, value] if os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1" else [operation]
                 result = yield ctx.call_nexus_service(ENDPOINT, SERVICE, operation, arguments)
                 return result.result
+            if os.environ.get("NEXUS_QUALIFY_ADMISSION") == "1":
+                yield ctx.start_timer(8)
+                return value
             if os.environ.get("NEXUS_QUALIFY_OUTCOMES") == "1":
                 if operation == "failure":
                     raise RuntimeError("nexus-target-failure")

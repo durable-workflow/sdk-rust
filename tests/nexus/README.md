@@ -64,6 +64,15 @@ directories before starting the backend. Each original retains its 30-second
 observation and 180-second service policy. Exact types/bytes, cold selected-run
 results, immutable histories and successful final Worker shutdown are required.
 
+`bash tests/nexus/run.sh admission` exercises sync/accepted, async/completed and
+async/accepted across the same directions/namespaces. Ordinary callers continue
+before their eight-second target finishes. Cold controls kill the caller after
+its three-second continuation timer commits, retire that registration, wait for
+the target and start a replacement. The original admission snapshot and explicit
+idempotency key must survive replay and an independent cold read. Accepted calls
+do not gain a terminal service delivery in caller history. The configured service
+policy remains 180 seconds and each original has a 30-second observation bound.
+
 Use fresh case identities after a failure. Keep the original outcome separate;
 do not retry a failed workflow by replacing its recorded state or widening a
 deadline. Review bounded summaries and retire generated state after recording
