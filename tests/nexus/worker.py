@@ -23,14 +23,15 @@ class Neighbor:
 
 @workflow.defn(name=os.environ.get("WORKFLOW_TYPE", f"nexus.{ROLE}"))
 class NexusFixture:
-    def run(self, ctx, operation, value=None, key=None):
+    def run(self, ctx, operation, value=None, key=None, target_namespace=None):
         try:
             if ROLE == "caller":
                 if os.environ.get("NEXUS_QUALIFY_ADMISSION") == "1":
                     if operation not in {"sync-accepted", "async-completed", "async-accepted"} or not key:
                         raise ValueError("Expected an admission profile and original idempotency key")
                     result = yield ctx.call_nexus_service(
-                        ENDPOINT, SERVICE, operation, [operation, value, key], idempotency_key=key,
+                        ENDPOINT, SERVICE, operation, [operation, value, key, target_namespace], idempotency_key=key,
+                        target_namespace=target_namespace,
                         mode="async" if operation.startswith("async-") else "sync",
                         wait_for="accepted" if operation.endswith("-accepted") else "completed",
                     )

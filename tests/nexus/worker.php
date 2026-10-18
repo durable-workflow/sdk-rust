@@ -30,17 +30,18 @@ $worker = new Worker(
 $worker->registerWorkflow('nexus.qualification.neighbor', static fn (WorkflowContext $ctx): array => ['alive' => true, 'runtime' => 'php']);
 $worker->registerWorkflow(
     getenv('WORKFLOW_TYPE') ?: 'nexus.'.$role,
-    static function (WorkflowContext $ctx, string $operation, mixed $value = null, ?string $key = null) use ($role, $endpoint, $service): mixed {
+    static function (WorkflowContext $ctx, string $operation, mixed $value = null, ?string $key = null, ?string $targetNamespace = null) use ($role, $endpoint, $service): mixed {
         try {
             if ($role === 'caller') {
                 if (getenv('NEXUS_QUALIFY_ADMISSION') === '1') {
                     if (!in_array($operation, ['sync-accepted', 'async-completed', 'async-accepted'], true) || $key === null || $key === '') {
                         throw new InvalidArgumentException('Expected an admission profile and original idempotency key.');
                     }
-                    $result = $ctx->serviceOperation($endpoint, $service, $operation, [$operation, $value, $key], [
+                    $result = $ctx->serviceOperation($endpoint, $service, $operation, [$operation, $value, $key, $targetNamespace], [
                         'mode_override' => str_starts_with($operation, 'async-') ? 'async' : 'sync',
                         'wait_for' => str_ends_with($operation, '-accepted') ? 'accepted' : 'completed',
                         'idempotency_key' => $key,
+                        'namespace' => $targetNamespace,
                     ]);
                     $snapshot = ['call_id' => $result->serviceCallId, 'status' => $result->status,
                         'response' => $result->responsePayload, 'details' => $result->serviceCall];

@@ -32,7 +32,12 @@ observe() {
 }
 start_worker() {
   local language="$1" role="$2" worker_id="$3" container="$4"
+  local worker_namespace="${NEXUS_NAMESPACE:-default}"
+  if [[ "$role" == target ]]; then
+    worker_namespace="${NEXUS_TARGET_NAMESPACE:-$worker_namespace}"
+  fi
   "${compose[@]}" run -d --no-deps --name "$container" \
+    -e "DURABLE_WORKFLOW_RUNTIME_NAMESPACE=$worker_namespace" \
     -e "NEXUS_ROLE=$role" -e "NEXUS_ENDPOINT=$case_id" \
     -e "TASK_QUEUE=$case_id-$role" -e "WORKER_ID=$worker_id" \
     -e "WORKFLOW_TYPE=nexus.$role" "$language" >/dev/null
@@ -41,16 +46,25 @@ start_worker() {
 
 admission_observe() {
   "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+    -e "NEXUS_TARGET_NAMESPACE=${NEXUS_TARGET_NAMESPACE:-${NEXUS_NAMESPACE:-default}}" \
     -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
     observe /fixture/admissions.py "$@"
 }
 
-if [[ "${1:-cancellation}" == admission ]]; then
+if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
   export NEXUS_QUALIFY_ADMISSION=1
   for namespace in default nexus-source; do admission_observe setup "$namespace"; done
   mkdir -p "$NEXUS_STATE_DIR/admissions"
   for namespace in default nexus-source; do
     export NEXUS_NAMESPACE="$namespace"
+    export NEXUS_TARGET_NAMESPACE="$namespace"
+    if [[ "$1" == cross-namespace ]]; then
+      if [[ "$namespace" == default ]]; then
+        NEXUS_TARGET_NAMESPACE=nexus-source
+      else
+        NEXUS_TARGET_NAMESPACE=default
+      fi
+    fi
     for direction in rust:php php:rust rust:rust rust:python python:rust; do
       caller="${direction%%:*}"
       target="${direction#*:}"

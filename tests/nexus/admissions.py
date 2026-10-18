@@ -31,30 +31,33 @@ def remaining(record):
     return seconds
 
 
-async def prepare(case, caller, target, profile, schedule, namespace, http, client):
+async def prepare(case, caller, target, profile, schedule, namespace, target_namespace, http, client, target_http):
     require(not (DIRECTORY / f"{case}.json").exists(), "Use a fresh original identity")
     async def registered():
         workers = (await request(http, "GET", "/api/workers"))["workers"]
-        selected = [row for row in workers if row["worker_id"] in {f"{case}-caller", f"{case}-target"}]
+        target_workers = (await request(target_http, "GET", "/api/workers"))["workers"]
+        selected = ([row for row in workers if row["worker_id"] == f"{case}-caller"]
+                    + [row for row in target_workers if row["worker_id"] == f"{case}-target"])
         return selected if len(selected) == 2 else None
     registrations = await until(registered)
-    await request(http, "POST", "/api/service-endpoints", {"endpoint_name": case}, statuses=(201,))
-    await request(http, "POST", f"/api/service-endpoints/{case}/services", {"service_name": "cleanup"}, statuses=(201,))
-    await request(http, "POST", f"/api/service-endpoints/{case}/services/cleanup/operations", {
+    await request(target_http, "POST", "/api/service-endpoints", {"endpoint_name": case}, statuses=(201,))
+    await request(target_http, "POST", f"/api/service-endpoints/{case}/services", {"service_name": "cleanup"}, statuses=(201,))
+    await request(target_http, "POST", f"/api/service-endpoints/{case}/services/cleanup/operations", {
         "operation_name": profile, "operation_mode": profile.split("-")[0],
         "handler_binding_kind": "start_workflow", "handler_target_reference": "nexus.target",
         "handler_binding": {"workflow_type": "nexus.target", "queue": f"{case}-target"},
         "deadline_policy": {"timeout_seconds": 180},
     }, statuses=(201,))
     handle = await client.start_workflow(workflow_type="nexus.caller", task_queue=f"{case}-caller",
-                                         workflow_id=case, input=[profile, specimen("success"), case])
+                                         workflow_id=case, input=[profile, specimen("success"), case, target_namespace])
     initial = await history(http, case, handle.run_id)
     origin = one(initial, "WorkflowStarted")["payload"]
     require(origin["workflow_instance_id"] == case and origin["workflow_run_id"] == handle.run_id,
             "Initial history selected another original run")
     start = stamp(one(initial, "WorkflowStarted")["timestamp"])
     record = {"case": case, "caller": caller, "target": target, "profile": profile,
-              "schedule": schedule, "namespace": namespace, "caller_run": handle.run_id,
+              "schedule": schedule, "namespace": namespace, "target_namespace": target_namespace,
+              "caller_run": handle.run_id,
               "observation_deadline": (start + timedelta(seconds=30)).isoformat(),
               "initial_history": initial, "registrations": registrations,
               "rust_source": os.environ["NEXUS_RUST_SOURCE"],
@@ -62,11 +65,11 @@ async def prepare(case, caller, target, profile, schedule, namespace, http, clie
     save(record)
     print(json.dumps({"phase": "admitted", "case": case, "caller_run": handle.run_id}), flush=True)
     async with asyncio.timeout(remaining(record)):
-        await admitted(record, http)
+        await admitted(record, http, target_http)
     save(record)
 
 
-async def admitted(record, http):
+async def admitted(record, http, target_http):
     async def committed():
         current = await history(http, record["case"], record["caller_run"])
         if not any(event["event_type"] == "TimerScheduled" for event in current["events"]):
@@ -82,11 +85,12 @@ async def admitted(record, http):
     mode, wait_for = record["profile"].split("-")
     require(admission["sequence"] == 1 and admission["operation_mode"] == mode and admission["wait_for"] == wait_for,
             "Original authored mode/wait policy changed")
+    require(admission["target_namespace"] == record["target_namespace"], "Original target namespace changed")
     record["admission_history"] = current
     record["call_id"] = admission["service_call_id"]
     record["call_path"] = (f"/api/service-endpoints/{record['case']}/services/cleanup/operations/"
                            f"{record['profile']}/service-calls/{record['call_id']}")
-    record["original_call"] = await request(http, "GET", record["call_path"])
+    record["original_call"] = await request(target_http, "GET", record["call_path"])
     require(record["original_call"]["idempotency_key"] == record["case"], "Original idempotency key changed")
 
 
@@ -97,16 +101,17 @@ async def retire(record, client):
     record["retired_registration"] = reply
 
 
-async def target_complete(record, http, client):
+async def target_complete(record, http, target_http, target_client):
     async def complete():
-        call = await request(http, "GET", record["call_path"])
+        call = await request(target_http, "GET", record["call_path"])
         if call["status"] != "completed":
             return None
-        selected = await history(http, call["linked_workflow_instance_id"], call["linked_workflow_run_id"])
+        selected = await history(target_http, call["linked_workflow_instance_id"], call["linked_workflow_run_id"])
         return (call, selected) if any(event["event_type"] == "WorkflowCompleted" for event in selected["events"]) else None
     call, selected = await until(complete)
-    require(call["id"] == record["call_id"] and call["namespace"] == record["namespace"]
-            and call["target_namespace"] == record["namespace"]
+    require(call["id"] == record["call_id"] and call["namespace"] == record["target_namespace"]
+            and call["target_namespace"] == record["target_namespace"]
+            and call["caller_namespace"] == record["namespace"]
             and call["caller_workflow_instance_id"] == record["case"]
             and call["caller_workflow_run_id"] == record["caller_run"], "Original call authority changed")
     origin = one(selected, "WorkflowStarted")["payload"]
@@ -121,7 +126,7 @@ async def target_complete(record, http, client):
     timer = one(selected, "TimerScheduled")["payload"]
     require(timer["sequence"] == 1 and timer["delay_seconds"] == 8, "Target timer changed")
     require(one(selected, "TimerFired")["payload"]["timer_id"] == timer["timer_id"], "Target resumed another timer")
-    exact_value(await WorkflowHandle(client, call["linked_workflow_instance_id"],
+    exact_value(await WorkflowHandle(target_client, call["linked_workflow_instance_id"],
                                      call["linked_workflow_run_id"]).result(timeout=1), specimen("success"))
     record["final_call"], record["target_history"] = call, selected
     if record["schedule"] == "cold":
@@ -170,7 +175,7 @@ def snapshots(path):
     return values
 
 
-async def verify(record, http):
+async def verify(record, http, target_http):
     case = record["case"]
     original = snapshots(DIRECTORY / f"{case}-caller-original.log")
     final = snapshots(DIRECTORY / f"{case}-caller-final.log")
@@ -182,11 +187,16 @@ async def verify(record, http):
         require(state["ExitCode"] == 0 and state["OOMKilled"] is False, "Final Worker shutdown failed")
         states.append({"role": role, "exit_code": 0, "oom_killed": False})
     call = record["final_call"]
-    record["foreign_namespace_refusals"] = await foreign_namespace(
-        http, record["namespace"], case, record["caller_run"], call["linked_workflow_instance_id"], call["linked_workflow_run_id"])
+    if record["namespace"] == record["target_namespace"]:
+        record["foreign_namespace_refusals"] = await foreign_namespace(
+            http, record["namespace"], case, record["caller_run"], call["linked_workflow_instance_id"], call["linked_workflow_run_id"])
+    else:
+        await request(target_http, "GET", f"/api/workflows/{case}/runs/{record['caller_run']}/history", statuses=(404,))
+        await request(http, "GET", f"/api/workflows/{call['linked_workflow_instance_id']}/runs/{call['linked_workflow_run_id']}/history", statuses=(404,))
+        record["foreign_namespace_refusals"] = 2
     record["worker_exits"] = states
     record["workflow_outcome"], record["outcome"] = "pass", "pass"
-    print(json.dumps({key: record[key] for key in ("case", "namespace", "caller", "target", "profile",
+    print(json.dumps({key: record[key] for key in ("case", "namespace", "target_namespace", "caller", "target", "profile",
                      "schedule", "caller_run", "call_id", "foreign_namespace_refusals", "rust_source", "outcome")}), flush=True)
 
 
@@ -194,27 +204,33 @@ async def main():
     phase, namespace, *args = sys.argv[1:]
     headers = {"Authorization": f"Bearer {TOKEN}", "X-Namespace": namespace,
                "X-Durable-Workflow-Control-Plane-Version": "2"}
-    async with httpx.AsyncClient(base_url=URL, headers=headers, timeout=10) as http:
+    target_namespace = os.environ.get("NEXUS_TARGET_NAMESPACE", namespace)
+    target_headers = {**headers, "X-Namespace": target_namespace}
+    async with (httpx.AsyncClient(base_url=URL, headers=headers, timeout=10) as http,
+                httpx.AsyncClient(base_url=URL, headers=target_headers, timeout=10) as target_http):
         if phase == "setup":
             await setup(http, namespace)
             return
         case, *roles = args
         require(re.fullmatch(r"[a-z0-9-]{1,80}", case) is not None, "Use a bounded fixture case name")
-        async with Client(URL, token=TOKEN, namespace=namespace) as client:
+        async with (Client(URL, token=TOKEN, namespace=namespace) as client,
+                    Client(URL, token=TOKEN, namespace=target_namespace) as target_client):
             if phase == "prepare":
-                await prepare(case, *roles, namespace, http, client)
+                await prepare(case, *roles, namespace, target_namespace, http, client, target_http)
                 return
             record = json.loads((DIRECTORY / f"{case}.json").read_text(encoding="utf-8"))
+            require(record["namespace"] == namespace and record["target_namespace"] == target_namespace,
+                    "Observer namespace changed during the original")
             if phase == "verify":
-                await verify(record, http)
+                await verify(record, http, target_http)
             else:
                 async with asyncio.timeout(remaining(record)):
                     if phase == "admitted":
-                        await admitted(record, http)
+                        await admitted(record, http, target_http)
                     elif phase == "retire":
                         await retire(record, client)
                     elif phase == "target":
-                        await target_complete(record, http, client)
+                        await target_complete(record, http, target_http, target_client)
                     elif phase == "caller":
                         await caller_complete(record, http, client)
                     else:

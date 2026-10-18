@@ -68,7 +68,11 @@ async fn main() -> Result<()> {
                 let operation = input.get(0).and_then(|value|value.as_str())
                     .ok_or_else(||Error::WorkerLoop("expected one operation argument".into()))?;
                 if qualify_admission {
-                    let options = admission_options(operation, input.get(2).and_then(|value| value.as_str()))?;
+                    let options = admission_options(
+                        operation,
+                        input.get(2).and_then(|value| value.as_str()),
+                        input.get(3).and_then(|value| value.as_str()),
+                    )?;
                     let result = ctx.call_nexus_service_with_options(endpoint, service, operation, options, input.clone()).await?;
                     let snapshot = json!({"call_id":result.service_call_id, "status":result.status,
                         "response":result.result.deserialize::<serde_json::Value>()?,
@@ -104,7 +108,11 @@ async fn main() -> Result<()> {
     worker.run_until(shutdown()).await
 }
 
-fn admission_options(operation: &str, key: Option<&str>) -> Result<NexusServiceOptions> {
+fn admission_options(
+    operation: &str,
+    key: Option<&str>,
+    target_namespace: Option<&str>,
+) -> Result<NexusServiceOptions> {
     let (mode, wait_for) = match operation {
         "sync-accepted" => (NexusOperationMode::Sync, NexusWaitFor::Accepted),
         "async-completed" => (NexusOperationMode::Async, NexusWaitFor::Completed),
@@ -118,6 +126,7 @@ fn admission_options(operation: &str, key: Option<&str>) -> Result<NexusServiceO
         mode,
         wait_for,
         idempotency_key: Some(key.to_owned()),
+        target_namespace: target_namespace.map(str::to_owned),
         ..NexusServiceOptions::default()
     })
 }

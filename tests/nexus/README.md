@@ -73,6 +73,12 @@ idempotency key must survive replay and an independent cold read. Accepted calls
 do not gain a terminal service delivery in caller history. The configured service
 policy remains 180 seconds and each original has a 30-second observation bound.
 
+`bash tests/nexus/run.sh cross-namespace` uses the same admission and cold-replay
+controls with the service catalog and target Worker in the other namespace.
+Both default-to-named and named-to-default calls retain the original caller
+authority. Each history must refuse reads from the other namespace. Target
+selection uses the SDK's explicit service namespace option.
+
 Use fresh case identities after a failure. Keep the original outcome separate;
 do not retry a failed workflow by replacing its recorded state or widening a
 deadline. Review bounded summaries and retire generated state after recording
