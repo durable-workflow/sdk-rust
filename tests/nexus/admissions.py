@@ -85,7 +85,9 @@ async def admitted(record, http, target_http):
     mode, wait_for = record["profile"].split("-")
     require(admission["sequence"] == 1 and admission["operation_mode"] == mode and admission["wait_for"] == wait_for,
             "Original authored mode/wait policy changed")
-    require(admission["target_namespace"] == record["target_namespace"], "Original target namespace changed")
+    require(admission["service_call"]["target_namespace"] == record["target_namespace"]
+            and admission["service_call"]["caller_namespace"] == record["namespace"],
+            "Original service admission changed namespace authority")
     record["admission_history"] = current
     record["call_id"] = admission["service_call_id"]
     record["call_path"] = (f"/api/service-endpoints/{record['case']}/services/cleanup/operations/"
