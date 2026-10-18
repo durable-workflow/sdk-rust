@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
     let workflow_type = std::env::var("WORKFLOW_TYPE").unwrap_or_else(|_| format!("nexus.{role}"));
     let mut worker = Worker::new(client, queue)
         .worker_id(std::env::var("WORKER_ID").unwrap_or_else(|_| format!("nexus-{role}")))
+        .poll_timeout(Duration::from_secs(1))
         .max_concurrent_workflow_tasks(1)
         .max_concurrent_activity_tasks(1)
         .nexus_cooperative_cancellation(true);
@@ -62,5 +63,21 @@ async fn main() -> Result<()> {
             "NEXUS_ROLE must be caller or target".into(),
         ));
     }
-    worker.run().await
+    worker.run_until(shutdown()).await
+}
+
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
