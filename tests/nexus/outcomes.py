@@ -63,6 +63,10 @@ async def run(case, caller, target, scenario, namespace, http, client):
     expected = specimen(scenario)
     handle = await client.start_workflow(workflow_type="nexus.caller", task_queue=f"{case}-caller",
                                          workflow_id=case, input=[scenario, expected])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"case": case, "namespace": namespace, "scenario": scenario,
+                                "caller_run": handle.run_id, "workflow_outcome": "pending"}), encoding="utf-8")
+    print(json.dumps({"phase": "admitted", "case": case, "caller_run": handle.run_id}), flush=True)
     first = await history(http, case, handle.run_id)
     value = await handle.result(timeout=30, poll_interval=0.1)
     final = await history(http, case, handle.run_id)
@@ -123,7 +127,6 @@ async def run(case, caller, target, scenario, namespace, http, client):
                "rust_source": os.environ["NEXUS_RUST_SOURCE"],
                "rust_binary_sha256": os.environ["NEXUS_RUST_BINARY_SHA256"],
                "foreign_namespace_refusals": foreign_refusals, "workflow_outcome": "pass"}
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(summary), encoding="utf-8")
     print(json.dumps(summary), flush=True)
 
