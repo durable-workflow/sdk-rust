@@ -67,13 +67,21 @@ async def run(case, caller, target, scenario, namespace, http, client):
     value = await handle.result(timeout=30, poll_interval=0.1)
     final = await history(http, case, handle.run_id)
     require(final["events"][:len(first["events"])] == first["events"], "Committed caller prefix changed")
-    started = one(final, "ServiceCallStarted")["payload"]
-    call_id = started["service_call_id"]
-    call_path = f"/api/service-endpoints/{case}/services/cleanup/operations/{scenario}/service-calls/{call_id}"
-    call = await request(http, "GET", call_path)
+    if scenario == "missing":
+        failure = one(final, "ServiceCallFailed")["payload"]
+        require(not any(event["event_type"] == "ServiceCallStarted" for event in final["events"]),
+                "Unresolved operation was reported as started")
+        call_id = failure["service_call_id"]
+        call = failure["service_call"]
+        require(call["reason"] == "operation_not_found", "Missing operation failed for another reason")
+    else:
+        call_id = one(final, "ServiceCallStarted")["payload"]["service_call_id"]
+        call_path = f"/api/service-endpoints/{case}/services/cleanup/operations/{scenario}/service-calls/{call_id}"
+        call = await request(http, "GET", call_path)
     require(call["caller_workflow_instance_id"] == case and call["caller_workflow_run_id"] == handle.run_id,
             "Service call lost original caller identity")
-    require(call["deadline_policy"]["timeout_seconds"] == 180, "Original service policy changed")
+    if scenario != "missing":
+        require(call["deadline_policy"]["timeout_seconds"] == 180, "Original service policy changed")
     target_id, target_run = call.get("linked_workflow_instance_id"), call.get("linked_workflow_run_id")
     target_history = None
     if scenario == "missing":
