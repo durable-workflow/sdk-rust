@@ -88,6 +88,13 @@ jobs:
           --volume "$PWD:/sdk:ro"
           node@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
           node /sdk/scripts/ci/test-completion-ack-proxy.mjs
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.13'
+      - name: Install the locked observer SDK
+        run: python -m pip install --target "$RUNNER_TEMP/nexus-observer" -r tests/nexus/requirements.txt -c tests/nexus/requirements.lock
+      - name: Check delivery-before-claim observation
+        run: PYTHONPATH="$RUNNER_TEMP/nexus-observer" python tests/nexus/test-acknowledgements.py
 
   regression-corpus:
     name: Regression corpus

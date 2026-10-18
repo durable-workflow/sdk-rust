@@ -111,16 +111,20 @@ async def target_complete(record, http, target_http, target_client):
         if call["status"] != "completed":
             return None
         caller = await history(http, record["case"], record["caller_run"])
-        if not any(row["event_type"] == "ServiceCallCompleted" for row in caller["events"]):
-            return None
         return call, caller
 
     call, caller = await until(complete)
     require(not any(row["event_type"] in TERMINAL for row in caller["events"]),
             "Original caller completed without cold replacement")
     require(one(caller, "ServiceCallStarted")["payload"]["service_call_id"]
-            == one(caller, "ServiceCallCompleted")["payload"]["service_call_id"]
             == call["id"] == record["call_id"], "Terminal result changed original call identity")
+    # Core stages terminal delivery durably; recordForClaim appends its history
+    # event only after the replacement claims the original caller task.
+    deliveries = [row for row in caller["events"]
+                  if row["event_type"] in {"ServiceCallCompleted", "ServiceCallFailed", "ServiceCallCancelled"}]
+    require(len(deliveries) <= 1 and all(row["event_type"] == "ServiceCallCompleted"
+            and row["payload"]["service_call_id"] == record["call_id"] for row in deliveries),
+            "Pending delivery contradicts the original completed call")
     for key in ("id", "namespace", "caller_namespace", "caller_workflow_instance_id", "caller_workflow_run_id",
                 "target_namespace", "linked_workflow_instance_id", "linked_workflow_run_id",
                 "idempotency_key", "deadline_policy", "accepted_at", "call_deadline_at"):
