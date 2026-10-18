@@ -101,8 +101,8 @@ async def run(case, caller, target, scenario, namespace, http, client):
         require(one(final, "ServiceCallCompleted")["payload"]["service_call_id"] == call_id,
                 "Completion refers to another call")
         if scenario == "external":
-            require("external_storage" in one(final, "ServiceCallCompleted")["payload"]["response_payload"],
-                    "Large service result was not externally retained")
+            envelope = one(final, "ServiceCallCompleted")["payload"]["response_payload"]
+            await external_result(http, envelope)
     else:
         expected_class = "ServiceOperationFailed" if caller == "php" else "NexusOperationFailed"
         require(value["caught_class"] == expected_class and value["call_id"] == call_id,
@@ -142,6 +142,19 @@ async def cold_target(client, scenario, target_id, target_run, expected):
             raise AssertionError("Target did not retain typed workflow failure")
     else:
         exact_value(await handle.result(timeout=1), expected)
+
+
+async def external_result(http, envelope):
+    reference = envelope.get("external_payload")
+    require(isinstance(reference, dict), "Large service result lacks its opaque runtime reference")
+    require(reference["schema"] == "durable-workflow.v2.runtime-external-payload-reference.v1"
+            and reference["codec"] == "avro" and reference["size_bytes"] > 3 * 1024 * 1024,
+            "External result metadata changed")
+    response = await http.get(f"/api/external-payloads/v1/{reference['reference_id']}")
+    require(response.status_code == 200 and len(response.content) == reference["size_bytes"],
+            "External transport lost the exact original byte count")
+    require(hashlib.sha256(response.content).hexdigest() == reference["sha256"],
+            "External transport changed the exact original byte hash")
 
 
 async def foreign_namespace(http, namespace, caller_id, caller_run, target_id, target_run):
