@@ -1,5 +1,6 @@
 # Durable Workflow Rust SDK
 
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=durable-workflow_sdk-rust&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=durable-workflow_sdk-rust)
 [![CI](https://github.com/durable-workflow/sdk-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/durable-workflow/sdk-rust/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/durable-workflow.svg)](https://crates.io/crates/durable-workflow)
 [![API docs](https://img.shields.io/badge/docs-rust.durable--workflow.com-0f766e.svg)](https://rust.durable-workflow.com/)
@@ -76,6 +77,28 @@ The namespace runtime URL is already complete. Do not append another `/api`.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Query execution authority
+
+On a runtime advertising `query_task_authority` with worker protocol 1.20,
+`Worker` captures the original query claim before loading external inputs. It
+checks ownership without renewing the lease during loading and execution, before
+calling the handler, and before submitting its outcome. The original caller
+deadline and lease bound the entire operation. Expiry, shutdown or an unavailable
+observation drops the work without sending a completion or failure for it.
+
+Use `Worker::require_query_task_authority(true)` to refuse registration unless
+worker-authenticated discovery advertises this support. Without this requirement,
+older runtimes and explicit protocol 1.19 keep compatibility: disclosed original
+timing supplies a local bound, while deliveries without timing retain legacy
+behavior. This path cannot observe live revocation and never calls the 1.20
+query-status endpoint.
+
+Async handlers must yield to Tokio to be cancelled promptly. Synchronous or
+CPU-bound callbacks cannot be interrupted while they block, but their late result
+is fenced before submission. Query handlers should avoid side effects. Direct
+`Client` completion and failure methods remain available for inspecting an
+original committed receipt.
+
 ### Handler registration
 
 Register each workflow and activity wire name once per Worker. Named query and
@@ -119,7 +142,41 @@ runtime URL, namespace, and credential role, with size and SHA-256 verification.
 bytes per response (64 MiB by default). Provider credentials are not needed;
 payload fetches never follow redirects.
 
+Workers confirm and renew the exact workflow task claim while loading external
+inputs and paged history, then confirm it again before replay. Loading stops on
+lost authority or Worker shutdown without executing workflow code. Pending
+cooperative cancellation retains its original identity and cleanup deadline.
+
+External activity inputs retain their original lease and execution deadline
+bounds while loading. Protocol 1.20 observes the exact activity attempt before,
+during and after the transfer, and immediately before callback entry. Unconfirmed
+authority stops loading without invoking the callback. These observations do not
+renew the lease or record application heartbeats. Explicit protocol 1.19 uses
+the original local lease/deadline bounds and completion fencing; it cannot
+observe live revocation or ownership. Live authority supervision requires 1.20.
+Shutdown and dropping a poll stop its loading and observation together.
+Completion still uses the runtime's attempt fence. Server 2.6.1 refuses
+superseded attempts but can accept an expired, unreclaimed attempt; see
+[Workflow #769](https://github.com/durable-workflow/workflow/issues/769).
+
+The Client's default 60-second HTTP timeout includes connection and the complete
+response body. `Client::builder(...).timeout(Duration::from_secs(120))` selects a
+larger total budget before starting a Worker. Claimed input and history loading
+share that budget across all pages. Lease renewals do not restart it. Low-level
+cooperative polls retain their long-poll timeout plus five seconds, and explicit
+canonical cancellation refreshes retain their five-second budget.
+
 ## Examples
+
+### Activity retry policies
+
+`ActivityRetryPolicy::new(max_attempts).backoff_intervals(...)` preserves the
+complete explicit list, including entries that the attempt budget will not use.
+One attempt uses no retry delay. The server repeats the last entry when further
+retries are allowed, while the attempt budget still limits execution. Replay
+compares the complete stored list and the other known policy fields exactly;
+changing an unused entry is also a policy change. The default remains one
+attempt with an empty backoff list.
 
 ### Local activities
 

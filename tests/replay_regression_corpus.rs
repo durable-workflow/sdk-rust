@@ -13,12 +13,13 @@ use std::{
 };
 
 use durable_workflow::{
-    decode_payload, encode_payload, json, AvroValue, ChildWorkflowOptions, Client,
-    ConditionWaitOptions, ConditionWaitResult, Error, ParallelOperation, ParallelResult,
-    PayloadEnvelope, SearchAttributeUpdate, SelectionKey, StickyCacheOptions, Value, Worker,
-    WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
+    decode_payload, encode_payload, json, ActivityOptions, ActivityRetryPolicy, AvroValue,
+    ChildWorkflowOptions, Client, ConditionWaitOptions, ConditionWaitResult, Error,
+    ParallelOperation, ParallelResult, PayloadEnvelope, SearchAttributeUpdate, SelectionKey,
+    StickyCacheOptions, Value, Worker, WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
 
@@ -45,8 +46,17 @@ struct FixtureServer {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+struct ExternalInput {
+    blob: String,
+    refuse_claim: bool,
+}
+
 impl FixtureServer {
-    fn start(task: Value, completion_storage_refusals: u64) -> Self {
+    fn start(
+        task: Value,
+        completion_storage_refusals: u64,
+        external: Option<ExternalInput>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay fixture server");
         listener
             .set_nonblocking(true)
@@ -67,6 +77,7 @@ impl FixtureServer {
                             &server_requests,
                             &task,
                             completion_storage_refusals,
+                            external.as_ref(),
                         );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -120,6 +131,7 @@ fn handle_request(
     requests: &Arc<Mutex<Vec<CapturedRequest>>>,
     task: &Value,
     completion_storage_refusals: u64,
+    external: Option<&ExternalInput>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut request = Vec::new();
@@ -171,6 +183,9 @@ fn handle_request(
     let storage_refused = path.starts_with("/api/worker/workflow-tasks/")
         && path.ends_with("/complete")
         && request_number as u64 <= completion_storage_refusals;
+    let authority_refused = path.starts_with("/api/worker/workflow-tasks/")
+        && path.ends_with("/heartbeat")
+        && external.is_some_and(|input| input.refuse_claim);
     let body = match path.as_str() {
         "/api/cluster/info" => json!({"limits": {"max_payload_bytes": 2097152}}).to_string(),
         _ if storage_refused => json!({
@@ -181,6 +196,17 @@ fn handle_request(
             "request_admitted": false
         })
         .to_string(),
+        _ if authority_refused => json!({"task_id":task["task_id"], "workflow_task_attempt":1,
+            "reason":"task_not_leased", "retryable":false}).to_string(),
+        path if path.starts_with("/api/worker/workflow-tasks/") && path.ends_with("/heartbeat") => {
+            json!({"task_id":task["task_id"], "workflow_task_attempt":task["workflow_task_attempt"],
+                "lease_owner":task["lease_owner"], "renewed":true, "reason":null,
+                "task_status":"leased", "run_status":"running", "lease_expires_at":"2099-01-01T00:00:00Z",
+                "cancellation_request":null}).to_string()
+        }
+        "/api/external-payloads/v1/ep_00000000000000000000000001" if external.is_some() => {
+            external.unwrap().blob.clone()
+        }
         "/api/worker/register"
             if registration["capability_manifest"]["sticky_execution"]["supported"] == true =>
         {
@@ -198,18 +224,31 @@ fn handle_request(
             })
             .to_string()
         }
+        "/api/worker/register" if task.get("query_task_id").is_some() => json!({
+            "worker_id":"regression-corpus-worker","registered":true,
+            "server_capabilities":{"query_task_authority":true}
+        }).to_string(),
         "/api/worker/register" => json!({
             "worker_id": "regression-corpus-worker",
             "registered": true,
             "heartbeat_interval_seconds": 3600
         })
         .to_string(),
-        "/api/worker/workflow-tasks/poll" if request_number == 1 => {
+        "/api/worker/workflow-tasks/poll" if request_number == 1 && task.get("query_task_id").is_none() => {
             json!({"task": task}).to_string()
         }
         "/api/worker/workflow-tasks/poll" | "/api/worker/activity-tasks/poll" => {
             json!({"task": null}).to_string()
         }
+        "/api/worker/query-tasks/poll" if task.get("query_task_id").is_some() => json!({"task":task}).to_string(),
+        path if path.starts_with("/api/worker/query-tasks/") && path.contains("/status?") => {
+            let mut reply = task.clone();
+            reply["can_continue"] = json!(false);
+            reply["query_task_status"] = json!("timed_out");
+            reply["reason"] = json!("query_task_timed_out");
+            reply.to_string()
+        }
+        path if path.starts_with("/api/worker/query-tasks/") && (path.ends_with("/complete") || path.ends_with("/fail")) => json!({"recorded":true}).to_string(),
         path if path.starts_with("/api/worker/workflow-tasks/")
             && (path.ends_with("/complete") || path.ends_with("/fail")) =>
         {
@@ -217,7 +256,9 @@ fn handle_request(
         }
         _ => json!({"message": "not found"}).to_string(),
     };
-    let status = if storage_refused {
+    let status = if authority_refused {
+        "409 Conflict"
+    } else if storage_refused {
         "503 Service Unavailable"
     } else if body.contains("\"not found\"") {
         "404 Not Found"
@@ -413,11 +454,17 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{fixture_id}.workflow.type must be a string"))?;
+    if workflow_type == "corpus.expired-query-snapshot" {
+        return execute_expired_query_fixture(fixture).await;
+    }
     if !matches!(
         workflow_type,
         "corpus.side-effect-version"
             | "corpus.legacy-patch-activity"
             | "corpus.retained-patch-activity"
+            | "corpus.deprecated-patch-activity"
+            | "corpus.frozen-zero"
+            | "corpus.php-zero-full"
             | "corpus.duplicate-registration"
             | "corpus.update-snapshot"
             | "corpus.workflow-stream"
@@ -512,7 +559,20 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     let completion_storage_refusals = fixture["worker_task"]["completion_storage_refusals"]
         .as_u64()
         .unwrap_or(0);
-    let server = FixtureServer::start(task, completion_storage_refusals);
+    let external = if fixture["worker_task"]["external_input"] == true {
+        let blob = task["arguments"]["blob"].as_str().unwrap().to_owned();
+        task["arguments"] = json!({"codec":"avro", "external_payload":{
+            "schema":"durable-workflow.v2.runtime-external-payload-reference.v1", "codec":"avro",
+            "reference_id":"ep_00000000000000000000000001", "size_bytes":blob.len(),
+            "sha256":format!("{:x}", Sha256::digest(blob.as_bytes()))}});
+        Some(ExternalInput {
+            blob,
+            refuse_claim: fixture["worker_task"]["hydration_authority_refused"] == true,
+        })
+    } else {
+        None
+    };
+    let server = FixtureServer::start(task, completion_storage_refusals, external);
     let client = Client::builder(server.base_url())
         .timeout(Duration::from_secs(2))
         .build()
@@ -558,9 +618,49 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 Ok(json!(cancelled.request.request_id))
             });
         }
+        "corpus.php-zero-full" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let first = ctx.get_version("frozen-zero", -7, 0)?;
+                let patch = ctx.patched("frozen-zero")?;
+                ctx.deprecate_patch("frozen-zero")?;
+                let wider = ctx.get_version("frozen-zero", 0, 10)?;
+                let repeat = ctx.patched("frozen-zero")?;
+                let result = ctx
+                    .activity_with_options(
+                        "MatrixActivity",
+                        ActivityOptions::new().task_queue("default").retry_policy(
+                            ActivityRetryPolicy::new(1).backoff_intervals(
+                                [1, 2, 5, 10, 15, 30, 60, 120].map(Duration::from_secs),
+                            ),
+                        ),
+                        json!([]),
+                    )
+                    .await?;
+                Ok(json!([first, patch, null, wider, repeat, result]))
+            });
+        }
         "corpus.duplicate-registration" => {
             worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("first")) });
             worker.register_workflow(workflow_type, |_ctx, _input| async { Ok(json!("second")) });
+        }
+        "corpus.frozen-zero" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let first = ctx.get_version("frozen-zero", -7, 0)?;
+                let patch = ctx.patched("frozen-zero")?;
+                ctx.deprecate_patch("frozen-zero")?;
+                let wider = ctx.get_version("frozen-zero", 0, 10)?;
+                let repeat = ctx.patched("frozen-zero")?;
+                Ok(json!([first, patch, null, wider, repeat]))
+            });
+        }
+        "corpus.deprecated-patch-activity" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.deprecate_patch("retained-patch")?;
+                let patch = ctx.patched("retained-patch")?;
+                let version = ctx.get_version("retained-patch", 0, 10)?;
+                let result = ctx.activity("old", json!([])).await?;
+                Ok(json!({"patch": patch, "version": version, "result": result}))
+            });
         }
         "corpus.retained-patch-activity" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
@@ -898,10 +998,22 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     } else {
         None
     };
-    let handled = worker
-        .run_once()
-        .await
-        .map_err(|error| format!("{fixture_id} worker replay failed: {error}"))?;
+    let replay = worker.run_once().await;
+    if fixture["worker_task"]["hydration_authority_refused"] == true {
+        let requests = server.requests.lock().unwrap();
+        if requests.iter().any(|request| {
+            request.path.contains("/external-payloads/")
+                || request.path.ends_with("/complete")
+                || request.path.ends_with("/fail")
+        }) || callback_calls.load(Ordering::SeqCst) != 0
+            || handler_calls.load(Ordering::SeqCst) != 0
+        {
+            return Err(format!(
+                "{fixture_id} lost authority but fetched, executed or published"
+            ));
+        }
+    }
+    let handled = replay.map_err(|error| format!("{fixture_id} worker replay failed: {error}"))?;
     if handled != 1 {
         return Err(format!("{fixture_id} replay handled {handled} tasks"));
     }
@@ -1045,6 +1157,44 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     Ok(Value::Object(observed))
 }
 
+async fn execute_expired_query_fixture(fixture: &Value) -> Result<Value, String> {
+    // Synthetic canonical dispatch reproducer: the same delivered query claim
+    // is terminal at observation. No history transformation or replay bypass.
+    let envelope = serde_json::to_value(
+        encode_payload(&json!([]), DEFAULT_CODEC).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut task = fixture["worker_task"].clone();
+    task["workflow_type"] = fixture["workflow"]["type"].clone();
+    task["workflow_arguments"] = envelope.clone();
+    task["query_arguments"] = envelope;
+    task["history_events"] = fixture["history"].clone();
+    let server = FixtureServer::start(task, 0, None);
+    let client = Client::builder(server.base_url())
+        .namespace("default")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut worker =
+        Worker::new(client, "regression-corpus-queue").worker_id("regression-corpus-worker");
+    worker.register_workflow("corpus.expired-query-snapshot", |_, _| async {
+        Ok(Value::Null)
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    worker.register_query("corpus.expired-query-snapshot", "value", move |_, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async { Ok(json!(7)) }
+    });
+    worker.register().await.map_err(|error| error.to_string())?;
+    worker.run_once().await.map_err(|error| error.to_string())?;
+    let requests = server.requests.lock().expect("captured query requests");
+    let actual = json!({"query_callback_calls":calls.load(Ordering::SeqCst),
+        "completion_submissions":requests.iter().filter(|request| request.path == "/api/worker/query-tasks/expired-query/complete").count(),
+        "failure_submissions":requests.iter().filter(|request| request.path == "/api/worker/query-tasks/expired-query/fail").count()});
+    fixture_matches(&fixture["expected"], &actual, "expired query dispatch")?;
+    Ok(actual)
+}
+
 async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
     execute_fixture_delivery(fixture, "default").await
 }
@@ -1074,6 +1224,16 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
             result.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         }
     }
+}
+
+#[tokio::test]
+async fn published_php_explicit_backoff_replays_across_cold_workers() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json");
+    let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let first = execute_fixture_delivery(&fixture, "first").await.unwrap();
+    let cold = execute_fixture_delivery(&fixture, "cold").await.unwrap();
+    assert_eq!(first, cold);
 }
 
 #[tokio::test]

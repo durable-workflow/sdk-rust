@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-frozen-zero-mixed-helpers",
+  "protocol_version": "1.19",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.frozen-zero", "input": [], "payload_codec": "avro"},
+  "history": [{"event_type":"WorkflowStarted", "payload":{"payload_codec":"avro"}}],
+  "command_sequence": [
+    {"type": "record_version_marker", "change_id": "frozen-zero", "version": 0, "min_supported": -7, "max_supported": 0},
+    {"type": "complete_workflow", "result": [0, false, null, 0, false]}
+  ],
+  "expected": {"command_sequence": [
+    {"type": "record_version_marker", "change_id": "frozen-zero", "version": 0},
+    {"type": "complete_workflow", "result": [0, false, null, 0, false]}
+  ]}
+}

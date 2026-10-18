@@ -26,12 +26,17 @@ fn envelope() -> Value {
 }
 
 fn response(path: &str) -> Option<(&'static str, String)> {
+    if path.ends_with("/workflow-tasks/external-task/heartbeat") {
+        return Some(("200 OK", json!({"task_id":"external-task", "workflow_task_attempt":1,
+            "lease_owner":"worker", "renewed":true, "reason":null, "task_status":"leased",
+            "run_status":"running", "lease_expires_at":"2099-01-01T00:00:00Z", "cancellation_request":null}).to_string()));
+    }
     if path == FETCH_PATH {
         return Some(("200 OK", blob()));
     }
     let value = if path.ends_with("/poll") {
         json!({"task": {
-            "task_id":"external-task", "workflow_task_attempt":1,
+            "task_id":"external-task", "workflow_task_attempt":1, "lease_owner":"worker",
             "workflow_id":"external-workflow", "run_id":"external-run",
             "workflow_type":"external.workflow", "payload_codec":"avro",
             "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap(),
@@ -44,6 +49,45 @@ fn response(path: &str) -> Option<(&'static str, String)> {
         json!({"output_envelope":envelope(), "memo":{"external_payload":"business data"}})
     };
     Some(("200 OK", value.to_string()))
+}
+
+#[tokio::test]
+async fn claim_scoped_verified_payloads_reuse_bytes_without_bypassing_response_limits() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        response_override: Some(response),
+        ..MockWorkerBehavior::default()
+    });
+    let client = Client::new(server.base_url()).unwrap();
+    let mut cache = crate::runtime_payloads::VerifiedPayloads::new();
+    for _ in 0..2 {
+        let mut wire = json!({"output_envelope":envelope()});
+        client
+            .resolve_runtime_payloads_with_cache(
+                &mut wire,
+                "/workflows/selected",
+                RequestProtocol::ControlPlane,
+                &mut cache,
+            )
+            .await
+            .unwrap();
+        assert_eq!(wire["output_envelope"]["blob"], blob());
+    }
+    assert_eq!(server.request_count(FETCH_PATH), 1);
+    let limited = Client::builder(server.base_url())
+        .max_external_payload_bytes(blob().len() - 1)
+        .build()
+        .unwrap();
+    let error = limited
+        .resolve_runtime_payloads_with_cache(
+            &mut json!({"output_envelope":envelope()}),
+            "/workflows/selected",
+            RequestProtocol::ControlPlane,
+            &mut cache,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("external_payload_oversized"));
+    assert_eq!(server.request_count(FETCH_PATH), 1);
 }
 
 #[tokio::test]
@@ -437,7 +481,7 @@ async fn runtime_external_chunked_body_cannot_exceed_reference_size() {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut request = [0u8; 4096];
-        stream.read(&mut request).unwrap();
+        assert!(stream.read(&mut request).unwrap() > 0);
         let response = format!("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n64\r\n{}\r\n0\r\n\r\n", "x".repeat(100));
         stream.write_all(response.as_bytes()).unwrap();
     });

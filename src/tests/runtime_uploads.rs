@@ -314,6 +314,7 @@ async fn runtime_upload_drain_budget_refusal_resumes_ordinary_upload_after_capac
     let mut client = Client::new(format!("{}/lease-budget", server.base_url())).unwrap();
     client.worker_storage_admission = Some(WorkerStorageAdmission {
         stop: Arc::new(AtomicBool::new(false)),
+        workflow_completion_retry_deadline: None,
         policy: WorkerRetryPolicy {
             max_backoff: Duration::from_millis(1),
             ..WorkerRetryPolicy::default()
@@ -814,6 +815,7 @@ async fn runtime_upload_storage_admission_reuses_identical_bytes_and_shutdown_in
         let stop = Arc::new(AtomicBool::new(prefix == "stopped"));
         client.worker_storage_admission = Some(WorkerStorageAdmission {
             stop,
+            workflow_completion_retry_deadline: None,
             policy: WorkerRetryPolicy {
                 max_backoff: Duration::from_millis(1),
                 ..WorkerRetryPolicy::default()

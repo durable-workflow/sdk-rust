@@ -1,5 +1,57 @@
 # Changelog
 
+## 3.5.5
+
+- Fence managed queries with their original claim and caller deadline before
+  external loading, replay, handler entry and outcome submission. Protocol 1.20
+  observes authority without renewing it. Expiry and unavailable authority drop
+  yielding work without sending a fabricated failure acknowledgement.
+- Add `Worker::require_query_task_authority(true)` for pre-registration refusal
+  when strong query authority is unavailable. Explicit 1.19 and older Servers
+  retain their documented weaker timing behavior. Public `QueryTask` construction
+  and direct Client completion/receipt operations stay compatible.
+- Synchronous or CPU-bound handlers cannot be interrupted while they block, but
+  their results are fenced after the callback returns.
+
+## 3.5.4
+
+- Retry explicitly deferred workflow completions after backend lock pressure when
+  the response proves the same task, attempt and lease owner and `recorded=false`.
+  Preserve the serialized decision and honor the Server's delay without running
+  the handler again. Shutdown and the original cooperative cleanup deadline bound
+  recovery, and stale lease refusals remain errors.
+
+## 3.5.3
+
+- Preserve all explicit activity backoff entries independently of the finite
+  attempt budget, allowing matching authoring of published PHP retry snapshots.
+  Defaults and exact replay comparison remain unchanged, including unused
+  entries, attempt budgets, timeouts and non-retryable error types.
+
+## 3.5.2
+
+- Supervise external activity input loading within the original lease and
+  execution deadlines. Protocol 1.20 confirms the exact task, attempt, owner
+  and authenticated namespace before, during and after loading, and before
+  callback entry. Unconfirmed authority, expiry, shutdown and dropped polls
+  stop loading without invoking application code. Observation does not renew
+  the lease or record application progress.
+- Preserve explicit protocol 1.19 ordinary support using immutable original
+  local bounds, without requesting an unsupported status endpoint. This path
+  cannot observe live revocation or ownership. Keep the Client's total transfer
+  budget separate from claim deadlines and preserve runtime outcome fencing.
+
+## 3.5.1
+
+- Confirm and renew the exact workflow task claim while loading external inputs
+  and paged history. Abort loading on lost authority or Worker shutdown before
+  workflow code executes. Preserve the selected Client timeout across the whole
+  claimed transfer, without restarting it on renewal.
+- Reuse bounded, verified payload bytes within a cooperative claim's canonical
+  cancellation refresh. Keep the original cancellation identity, cleanup deadline
+  and committed delivery boundary. Dropped polls retain no renewal task, and
+  ordinary Worker shutdown finishes normally during input loading.
+
 ## 3.5.0
 
 - Default worker requests and metadata to protocol 1.20. Select

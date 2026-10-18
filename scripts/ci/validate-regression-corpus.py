@@ -947,6 +947,10 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
                 "workflow_type": workflow_type,
                 "expected_failure": "unsupported_payload_codec",
             }
+    if document.get("worker_task", {}).get("hydration_authority_refused") is True:
+        if document["worker_task"].get("external_input") is not True or document.get("expected_failure") != "task_not_leased":
+            raise CorpusError(f"{path} hydration refusal must execute external input and assert task_not_leased")
+        semantic = {"replay": semantic, "hydration": {"external_input": True, "expected_failure": "task_not_leased"}}
     return [
         _fixture_evidence(
             category="replay",

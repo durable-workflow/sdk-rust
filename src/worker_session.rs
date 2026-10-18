@@ -260,6 +260,8 @@ pub(super) struct SessionActivityTask {
     pub(super) task: crate::ActivityTask,
     #[serde(default)]
     pub(super) worker_session: Option<Value>,
+    #[serde(skip)]
+    pub(super) hydration_claim: Option<crate::activity_hydration::HydrationClaim>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod activity_hydration;
 mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
@@ -8,11 +9,13 @@ mod cancellation_scope_replay;
 mod cooperative_cancellation;
 mod local_activity;
 mod nexus;
+mod query_authority;
 mod runtime_payloads;
 mod runtime_uploads;
 mod sticky_worker;
 mod sticky_workflow_cache;
 mod worker_session;
+mod workflow_hydration;
 
 pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
@@ -160,6 +163,9 @@ const QUERY_TASK_FINAL_REJECTION_REASONS: &[&str] = &[
     "query_task_not_found",
     "query_task_not_leased",
     "query_task_timed_out",
+    "query_deadline_unavailable",
+    "lease_owner_mismatch",
+    "query_task_attempt_mismatch",
 ];
 
 /// Manifest for the default service-worker profile.
@@ -1496,6 +1502,7 @@ impl ChildWorkflowOptions {
 pub enum ActivityBackoff {
     /// Use these intervals between attempts. The server repeats the final
     /// interval if the retry budget contains more attempts than entries.
+    /// All entries are retained, including those beyond the retry budget.
     Explicit(Vec<Duration>),
     /// Generate one interval for every retry using integer exponential growth.
     Exponential {
@@ -1522,6 +1529,8 @@ impl ActivityRetryPolicy {
         }
     }
 
+    /// Preserve the complete explicit list independently of the attempt budget.
+    /// Unused entries remain part of the policy compared during replay.
     pub fn backoff_intervals(mut self, intervals: impl IntoIterator<Item = Duration>) -> Self {
         self.backoff = Some(ActivityBackoff::Explicit(intervals.into_iter().collect()));
         self
@@ -1867,16 +1876,7 @@ fn validate_activity_retry_policy(
             })?;
             let retry_count = max_attempts.saturating_sub(1) as usize;
             let intervals = match backoff {
-                ActivityBackoff::Explicit(intervals) => {
-                    if intervals.len() > retry_count {
-                        return Err(ActivityOptionsError::new(
-                            ActivityOptionsErrorKind::TooManyBackoffIntervals,
-                            Some("retry_policy.backoff"),
-                            "backoff interval count must not exceed max_attempts - 1",
-                        ));
-                    }
-                    intervals.clone()
-                }
+                ActivityBackoff::Explicit(intervals) => intervals.clone(),
                 ActivityBackoff::Exponential {
                     initial_interval,
                     coefficient,
@@ -2817,6 +2817,7 @@ fn avro_value_ordered_map_encoding_schema() -> Result<&'static Schema> {
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
+    hydration_timeout: Duration,
     base_url: String,
     token: Option<String>,
     control_token: Option<String>,
@@ -4122,8 +4123,8 @@ impl Client {
             "timeout_seconds": long_poll_timeout_seconds(timeout),
             "history_page_size": WORKFLOW_HISTORY_PAGE_SIZE,
         });
-        let mut data: PollWorkflowTaskResponse = self
-            .poll_request_json(
+        let mut wire: Value = self
+            .poll_request_json_unresolved(
                 "/worker/workflow-tasks/poll",
                 RequestProtocol::DefaultWorker,
                 &body,
@@ -4131,12 +4132,23 @@ impl Client {
                 transport_retries,
             )
             .await?;
-
-        if let Some(task) = data.task.as_mut() {
-            self.fetch_remaining_workflow_history(worker_id, task)
-                .await?;
-        }
-
+        let claim =
+            workflow_hydration::HydrationClaim::from_poll(&wire, worker_id, &self.namespace)?;
+        let (data, _) = workflow_hydration::HydrationClaim::protect(claim, self, async {
+            self.resolve_runtime_payloads(
+                &mut wire,
+                "/worker/workflow-tasks/poll",
+                RequestProtocol::Worker(self.worker_protocol_version.as_str()),
+            )
+            .await?;
+            let mut data: PollWorkflowTaskResponse = serde_json::from_value(wire)?;
+            if let Some(task) = data.task.as_mut() {
+                self.fetch_remaining_workflow_history(worker_id, task)
+                    .await?;
+            }
+            Ok(data)
+        })
+        .await?;
         Ok(data)
     }
 
@@ -4146,8 +4158,15 @@ impl Client {
         task: &mut WorkflowTask,
     ) -> Result<()> {
         let mut next_token = task.next_history_page_token.clone();
+        let mut seen = BTreeSet::new();
 
         while let Some(token) = next_token.take().filter(|token| !token.is_empty()) {
+            if seen.len() >= 128 || !seen.insert(token.clone()) {
+                return Err(Error::Codec(
+                    "workflow history pagination exceeded its page bound or repeated a token"
+                        .into(),
+                ));
+            }
             let lease_owner = task
                 .lease_owner
                 .clone()
@@ -4365,8 +4384,8 @@ impl Client {
             "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
-        let data: worker_session::SessionPollResponse = self
-            .poll_request_json(
+        let mut wire: Value = self
+            .poll_request_json_unresolved(
                 "/worker/activity-tasks/poll",
                 RequestProtocol::DefaultWorker,
                 &body,
@@ -4374,6 +4393,21 @@ impl Client {
                 transport_retries,
             )
             .await?;
+        let claim = activity_hydration::HydrationClaim::from_poll(&wire, worker_id, self)?;
+        let mut data: worker_session::SessionPollResponse =
+            activity_hydration::HydrationClaim::protect(claim.as_ref(), self, async {
+                self.resolve_runtime_payloads(
+                    &mut wire,
+                    "/worker/activity-tasks/poll",
+                    RequestProtocol::DefaultWorker,
+                )
+                .await?;
+                Ok(serde_json::from_value(wire)?)
+            })
+            .await?;
+        if let Some(task) = data.task.as_mut() {
+            task.hydration_claim = claim;
+        }
         Ok(data)
     }
 
@@ -4503,6 +4537,28 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        let mut value: Value = self
+            .request_json_unresolved_with_timeout(method, path, protocol, body, timeout)
+            .await?;
+        let protocol = match protocol {
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
+                RequestProtocol::Worker(self.worker_protocol_version.as_str())
+            }
+            RequestProtocol::ControlPlane => RequestProtocol::ControlPlane,
+        };
+        self.resolve_runtime_payloads(&mut value, path, protocol)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    async fn request_json_unresolved_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        protocol: RequestProtocol,
+        body: Option<&B>,
+        timeout: Duration,
+    ) -> Result<T> {
         let protocol = match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
@@ -4588,17 +4644,35 @@ impl Client {
                 .unwrap_or_default()
         });
         let mut storage_retries = 0_usize;
+        let mut deferred_workflow_completion = false;
 
         loop {
             // Keep the serialized body and lease/poll identity across admission pauses.
-            let response = self
-                .http
-                .execute(request.try_clone().ok_or_else(|| {
-                    Error::WorkerLoop("worker request body cannot be retried".to_string())
-                })?)
-                .await?;
-            let status = response.status();
-            let bytes = response.bytes().await?;
+            let receive = async {
+                let response = self
+                    .http
+                    .execute(request.try_clone().ok_or_else(|| {
+                        Error::WorkerLoop("worker request body cannot be retried".to_string())
+                    })?)
+                    .await?;
+                let status = response.status();
+                Ok::<_, Error>((status, response.bytes().await?))
+            };
+            let retry_deadline = self
+                .worker_storage_admission
+                .as_ref()
+                .and_then(|admission| admission.workflow_completion_retry_deadline);
+            if deferred_workflow_completion
+                && retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return Err(Error::Timeout);
+            }
+            let (status, bytes) = match retry_deadline.filter(|_| deferred_workflow_completion) {
+                Some(deadline) => tokio::time::timeout_at(deadline, receive)
+                    .await
+                    .map_err(|_| Error::Timeout)??,
+                None => receive.await?,
+            };
 
             if !status.is_success() {
                 let body = String::from_utf8_lossy(&bytes).to_string();
@@ -4606,6 +4680,12 @@ impl Client {
                     return Err(Error::Protocol(protocol));
                 }
                 let error = Error::Http { status, body };
+                deferred_workflow_completion |= worker_deferred_workflow_completion_retry_after(
+                    &error,
+                    path,
+                    request_body.as_ref(),
+                )
+                .is_some();
                 if self
                     .wait_for_storage_admission(
                         &error,
@@ -4626,10 +4706,7 @@ impl Client {
                 return Ok(serde_json::from_value(Value::Null)?);
             }
 
-            let mut value: Value = serde_json::from_slice(&bytes)?;
-            self.resolve_runtime_payloads(&mut value, path, protocol)
-                .await?;
-            return Ok(serde_json::from_value(value)?);
+            return Ok(serde_json::from_slice(&bytes)?);
         }
     }
 
@@ -4649,7 +4726,11 @@ impl Client {
         else {
             return false;
         };
-        let Some(advertised_delay) = worker_storage_admission_retry_after(error, poll_request_id)
+        let completion_deferred = path.and_then(|path| {
+            worker_deferred_workflow_completion_retry_after(error, path, request_body)
+        });
+        let Some(advertised_delay) = completion_deferred
+            .or_else(|| worker_storage_admission_retry_after(error, poll_request_id))
             .or_else(|| {
                 path.and_then(|path| {
                     worker_backend_unavailable_retry_after(error, path, poll_request_id)
@@ -4663,12 +4744,24 @@ impl Client {
         let delay = worker_retry_delay(admission.policy, *retries)
             .max(advertised_delay)
             .min(admission.policy.max_backoff.max(Duration::from_millis(1)));
-        let deadline = tokio::time::Instant::now() + delay;
+        let delay = if completion_deferred.is_some() {
+            delay.max(advertised_delay)
+        } else {
+            delay
+        };
+        let wait_deadline = tokio::time::Instant::now() + delay;
         loop {
             if admission.stop.load(Ordering::SeqCst) {
                 return false;
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            if admission
+                .workflow_completion_retry_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                return false;
+            }
+            let remaining = wait_deadline.saturating_duration_since(now);
             if remaining.is_zero() {
                 return true;
             }
@@ -4684,18 +4777,53 @@ impl Client {
         timeout: Duration,
         max_retries: usize,
     ) -> Result<T> {
+        self.poll_request_json_inner(path, protocol, body, timeout, max_retries, true)
+            .await
+    }
+
+    async fn poll_request_json_unresolved<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        protocol: RequestProtocol,
+        body: &B,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Result<T> {
+        self.poll_request_json_inner(path, protocol, body, timeout, max_retries, false)
+            .await
+    }
+
+    async fn poll_request_json_inner<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        protocol: RequestProtocol,
+        body: &B,
+        timeout: Duration,
+        max_retries: usize,
+        resolve: bool,
+    ) -> Result<T> {
         let mut retries = 0;
 
         loop {
-            let response = self
-                .request_json_with_timeout(
+            let response = if resolve {
+                self.request_json_with_timeout(
                     reqwest::Method::POST,
                     path,
                     protocol,
                     Some(body),
                     timeout,
                 )
-                .await;
+                .await
+            } else {
+                self.request_json_unresolved_with_timeout(
+                    reqwest::Method::POST,
+                    path,
+                    protocol,
+                    Some(body),
+                    timeout,
+                )
+                .await
+            };
 
             match response {
                 Err(Error::Transport(_)) if retries < max_retries => retries += 1,
@@ -5169,6 +5297,47 @@ fn worker_fenced_completion_retry_after(
     Some(Duration::from_secs(delay))
 }
 
+fn worker_deferred_workflow_completion_retry_after(
+    error: &Error,
+    path: &str,
+    request_body: Option<&Value>,
+) -> Option<Duration> {
+    let task_id = path
+        .strip_prefix("/worker/workflow-tasks/")?
+        .strip_suffix("/complete")?;
+    if task_id.is_empty() || task_id.contains('/') {
+        return None;
+    }
+    let request = request_body?.as_object()?;
+    let owner = request.get("lease_owner")?.as_str()?;
+    let attempt = request.get("workflow_task_attempt")?;
+    if owner.trim().is_empty() || attempt.as_u64().filter(|attempt| *attempt > 0).is_none() {
+        return None;
+    }
+    let Error::Http { status, body } = error else {
+        return None;
+    };
+    if *status != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let body: Value = serde_json::from_str(body).ok()?;
+    let delay = body.get("retry_after_seconds")?.as_u64()?;
+    if !(1..=5).contains(&delay)
+        || body.get("reason")?.as_str()? != "backend_lock_pressure"
+        || body.get("operation")?.as_str()? != "complete_workflow_task"
+        || body.get("outcome")?.as_str()? != "deferred"
+        || body.get("recorded") != Some(&Value::Bool(false))
+        || body.get("retryable") != Some(&Value::Bool(true))
+        || body.get("task_id")?.as_str()? != task_id
+        || body.get("lease_owner")?.as_str()? != owner
+        || body.get("workflow_task_attempt") != Some(attempt)
+        || body.get("backend")?.get("lock_pressure") != Some(&Value::Bool(true))
+    {
+        return None;
+    }
+    Some(Duration::from_secs(delay))
+}
+
 fn worker_backend_unavailable_body(error: &Error) -> Option<Value> {
     let Error::Http { status, body } = error else {
         return None;
@@ -5288,6 +5457,7 @@ impl ClientBuilder {
                 .timeout(self.timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            hydration_timeout: self.timeout,
             base_url,
             token: self.token,
             control_token: self.control_token,
@@ -6542,7 +6712,9 @@ pub struct WorkerHeartbeatObservation {
 /// are never retried by the worker.
 /// Explicit storage admission pauses also preserve the already-serialized worker
 /// request without consuming this budget or rerunning its handler. The delay is
-/// capped by `max_backoff`, and shutdown interrupts storage waits.
+/// capped by `max_backoff`, except an explicit completion deferral must honor
+/// the Server's minimum delay. Shutdown interrupts storage waits; cooperative
+/// completion retries remain bounded by the original cleanup deadline.
 /// [`Worker::recover_transient_outages`] can keep a long-running worker retrying
 /// poll acquisition and heartbeats beyond this budget. `run_once` stays bounded,
 /// and `max_retries = 0` disables ordinary retries in either mode.
@@ -6570,6 +6742,7 @@ impl Default for WorkerRetryPolicy {
 struct WorkerStorageAdmission {
     policy: WorkerRetryPolicy,
     stop: Arc<AtomicBool>,
+    workflow_completion_retry_deadline: Option<tokio::time::Instant>,
 }
 
 struct StopWorkerOnDrop(Arc<AtomicBool>);
@@ -6623,6 +6796,8 @@ pub struct Worker {
     local_registration_confirmed: Arc<AtomicBool>,
     session_registration_confirmed: Arc<AtomicBool>,
     sticky_registration_confirmed: Arc<AtomicBool>,
+    require_query_task_authority: bool,
+    query_authority_confirmed: Arc<AtomicBool>,
     resource_capabilities: Vec<String>,
     sessions: Arc<Mutex<HashMap<String, WorkerSession>>>,
 }
@@ -6657,6 +6832,8 @@ impl Worker {
             local_registration_confirmed: Arc::new(AtomicBool::new(false)),
             session_registration_confirmed: Arc::new(AtomicBool::new(false)),
             sticky_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            require_query_task_authority: false,
+            query_authority_confirmed: Arc::new(AtomicBool::new(false)),
             resource_capabilities: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -6669,6 +6846,7 @@ impl Worker {
         self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.sticky_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.query_authority_confirmed = Arc::new(AtomicBool::new(false));
         self.client.reset_sticky_cache();
         self.sessions = Arc::new(Mutex::new(HashMap::new()));
         self
@@ -6681,6 +6859,16 @@ impl Worker {
 
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Require original query timing and non-renewing runtime observation.
+    ///
+    /// Registration refuses before creating a Worker unless protocol 1.20 and
+    /// the runtime's `query_task_authority` capability are available. By default,
+    /// older Servers retain their weaker, disclosed local-timing behavior.
+    pub fn require_query_task_authority(mut self, required: bool) -> Self {
+        self.require_query_task_authority = required;
         self
     }
 
@@ -7535,6 +7723,8 @@ impl Worker {
         self.validate_registration()?;
         self.nexus_registration_confirmed
             .store(false, Ordering::SeqCst);
+        self.query_authority_confirmed
+            .store(false, Ordering::SeqCst);
         if self.nexus_cooperative_cancellation_enabled {
             let info: Value = self
                 .client
@@ -7548,6 +7738,29 @@ impl Worker {
             if !nexus::installed_cooperation(&info["worker_protocol"]["server_capabilities"]) {
                 return Err(Error::CooperativeCancellationUnavailable(
                     "nexus_cooperative_cancellation_not_supported: Server must advertise the installed workflow_run bridge".into(),
+                ));
+            }
+        }
+        if self.require_query_task_authority {
+            if self.client.worker_protocol_version != WorkerProtocolVersion::V120 {
+                return Err(Error::WorkerLoop(
+                    "query authority requires worker protocol 1.20".into(),
+                ));
+            }
+            // Discovery uses the Worker credential, including worker-only Clients.
+            let discovery: Value = self
+                .client
+                .request_json_unresolved_with_timeout::<Value, Value>(
+                    reqwest::Method::GET,
+                    "/cluster/info",
+                    RequestProtocol::Worker("1.20"),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await?;
+            if discovery["worker_protocol"]["server_capabilities"]["query_task_authority"] != true {
+                return Err(Error::WorkerLoop(
+                    "runtime does not advertise query_task_authority".into(),
                 ));
             }
         }
@@ -7667,6 +7880,15 @@ impl Worker {
             self.sticky_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
+        self.query_authority_confirmed.store(
+            response.registered
+                && self.client.worker_protocol_version == WorkerProtocolVersion::V120
+                && response
+                    .server_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities["query_task_authority"] == true),
+            Ordering::SeqCst,
+        );
         Ok(response)
     }
 
@@ -7711,6 +7933,7 @@ impl Worker {
         worker.client.worker_storage_admission = Some(WorkerStorageAdmission {
             policy: self.retry_policy,
             stop,
+            workflow_completion_retry_deadline: None,
         });
         worker
     }
@@ -7763,6 +7986,13 @@ impl Worker {
         stop: Arc<AtomicBool>,
         registration: RegisterWorkerResponse,
     ) -> Result<()> {
+        if self.require_query_task_authority
+            && !self.query_authority_confirmed.load(Ordering::SeqCst)
+        {
+            return Err(Error::WorkerLoop(
+                "registration did not confirm query_task_authority".into(),
+            ));
+        }
         let heartbeat_interval = Duration::from_secs(
             registration
                 .heartbeat_interval_seconds
@@ -8121,6 +8351,10 @@ impl Worker {
                 )
             })
             .await;
+        let response = match response {
+            Err(Error::ActivityExecutionAbandoned(_)) => return Ok(ManagedPollOutcome::Handled),
+            response => response,
+        };
         let Some(response) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -8132,6 +8366,7 @@ impl Worker {
         };
 
         let session = self.track_session_task(task.worker_session.as_ref())?;
+        let hydration_claim = task.hydration_claim;
         let task = task.task;
 
         let task_id = task.task_id.clone();
@@ -8145,8 +8380,12 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
-        let result = self.execute_session_activity_task(task, session).await;
+        let result = self
+            .execute_session_activity_task(task, session, hydration_claim.as_ref())
+            .await;
         match result {
+            Err(Error::ActivityExecutionAbandoned(_)) => {}
+            Err(error) if activity_hydration::stopped(&error) => {}
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
                 let completion = self
@@ -8225,18 +8464,43 @@ impl Worker {
         let poll_request_id = unique_request_id("rust-query-poll");
         let response = self
             .retry_worker_operation(|| {
-                self.client.poll_query_task_response_with_request_id(
-                    &self.worker_id,
-                    &self.task_queue,
-                    self.poll_timeout,
-                    &poll_request_id,
-                    0,
-                )
+                let body = json!({"worker_id":self.worker_id,"task_queue":self.task_queue,
+                    "poll_request_id":poll_request_id,
+                    "timeout_seconds":long_poll_timeout_seconds(self.poll_timeout)});
+                async move {
+                    self.client
+                        .poll_request_json_unresolved::<Value, Value>(
+                            "/worker/query-tasks/poll",
+                            RequestProtocol::Worker(QUERY_TASK_MINIMUM_WORKER_PROTOCOL_VERSION),
+                            &body,
+                            self.poll_timeout + Duration::from_secs(5),
+                            0,
+                        )
+                        .await
+                }
             })
             .await;
-        let Some(response) = self.settle_worker_poll_response(response).await? else {
+        let Some(mut wire) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
+        let authority = if wire.get("task").is_some_and(|task| !task.is_null()) {
+            match query_authority::Authority::capture(&wire["task"], self) {
+                Ok(authority) => authority,
+                Err(_) => return Ok(ManagedPollOutcome::Handled),
+            }
+        } else {
+            None
+        };
+        let loading = self.client.resolve_runtime_payloads(
+            &mut wire,
+            "/worker/query-tasks/poll",
+            RequestProtocol::Worker(self.client.worker_protocol_version.as_str()),
+        );
+        match query_authority::Authority::protect(authority.as_ref(), self, loading).await {
+            Err(_) => return Ok(ManagedPollOutcome::Handled),
+            Ok(result) => result?,
+        }
+        let response: PollQueryTaskResponse = serde_json::from_value(wire)?;
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
         }
@@ -8252,22 +8516,40 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
 
-        match self.execute_query_task(task).await {
+        let execution = query_authority::Authority::protect(
+            authority.as_ref(),
+            self,
+            self.execute_query_task_with_authority(task, authority.as_ref()),
+        )
+        .await;
+        let execution = match execution {
+            Err(_) => return Ok(ManagedPollOutcome::Handled),
+            Ok(Err(failure)) if failure.reason == "query_authority_lost" => {
+                return Ok(ManagedPollOutcome::Handled)
+            }
+            Ok(result) => result,
+        };
+        match execution {
             Ok(value) => {
                 let result_envelope = match encode_typed_envelope(&value, &codec) {
                     Ok(result_envelope) => result_envelope,
                     Err(error) => {
-                        let failure = self
-                            .client
-                            .fail_query_task(
+                        let failure = query_authority::Authority::protect(
+                            authority.as_ref(),
+                            self,
+                            self.client.fail_query_task(
                                 &query_task_id,
                                 &lease_owner,
                                 attempt,
                                 error.to_string(),
                                 "query_result_encode_failed",
                                 "QueryResultEncodeFailed",
-                            )
-                            .await;
+                            ),
+                        )
+                        .await;
+                        let Ok(failure) = failure else {
+                            return Ok(ManagedPollOutcome::Handled);
+                        };
                         if let Err(error) = failure {
                             if !query_task_rejection_is_final(&error) {
                                 return Err(error);
@@ -8277,34 +8559,44 @@ impl Worker {
                     }
                 };
 
-                if let Err(error) = self
-                    .client
-                    .complete_query_task_with_envelope(
+                let completion = query_authority::Authority::protect(
+                    authority.as_ref(),
+                    self,
+                    self.client.complete_query_task_with_envelope(
                         &query_task_id,
                         &lease_owner,
                         attempt,
                         value.clone().into_json()?,
                         result_envelope,
-                    )
-                    .await
-                {
+                    ),
+                )
+                .await;
+                let Ok(completion) = completion else {
+                    return Ok(ManagedPollOutcome::Handled);
+                };
+                if let Err(error) = completion {
                     if !query_task_rejection_is_final(&error) {
                         return Err(error);
                     }
                 }
             }
             Err(failure) => {
-                let result = self
-                    .client
-                    .fail_query_task(
+                let result = query_authority::Authority::protect(
+                    authority.as_ref(),
+                    self,
+                    self.client.fail_query_task(
                         &query_task_id,
                         &lease_owner,
                         attempt,
                         failure.message,
                         failure.reason,
                         failure.failure_type,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
+                let Ok(result) = result else {
+                    return Ok(ManagedPollOutcome::Handled);
+                };
                 if let Err(error) = result {
                     if !query_task_rejection_is_final(&error) {
                         return Err(error);
@@ -8351,6 +8643,16 @@ impl Worker {
             }
             match operation().await {
                 Err(error)
+                    if (workflow_hydration::stopped(&error)
+                        || activity_hydration::stopped(&error))
+                        && self
+                            .run_stop
+                            .as_ref()
+                            .is_some_and(|stop| stop.load(Ordering::SeqCst)) =>
+                {
+                    return Ok(None);
+                }
+                Err(error)
                     if worker_operation_is_retryable(&error)
                         && (retries < self.retry_policy.max_retries
                             || (self.recover_transient_outages
@@ -8395,9 +8697,18 @@ impl Worker {
         }
     }
 
+    #[cfg(test)]
     async fn execute_query_task(
         &self,
+        task: QueryTask,
+    ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
+        self.execute_query_task_with_authority(task, None).await
+    }
+
+    async fn execute_query_task_with_authority(
+        &self,
         mut task: QueryTask,
+        authority: Option<&query_authority::Authority>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         validate_query_task_payloads(&task).map_err(|error| {
             QueryTaskExecutionFailure::new(
@@ -8491,7 +8802,10 @@ impl Worker {
         };
 
         let future = match query {
-            RegisteredQuery::Snapshot(handler) => handler(context, args),
+            RegisteredQuery::Snapshot(handler) => {
+                query_authority::before_handler(authority, &self.client).await?;
+                handler(context, args)
+            }
             RegisteredQuery::Replayed {
                 state_type,
                 handler,
@@ -8538,9 +8852,10 @@ impl Worker {
                     state: workflow_state,
                     cancellation_scope_id: "root".into(),
                 };
+                query_authority::before_handler(authority, &self.client).await?;
                 let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone());
-                let mut cx = TaskContext::from_waker(noop_waker_ref());
                 let outcome = {
+                    let mut cx = TaskContext::from_waker(noop_waker_ref());
                     let _replay = cancellation_replay_clock::ReplayGuard::enter(&workflow_context)
                         .map_err(|error| {
                             QueryTaskExecutionFailure::new(
@@ -8604,6 +8919,7 @@ impl Worker {
                         "QueryWorkflowStateUnavailable",
                     )
                 })?;
+                query_authority::before_handler(authority, &self.client).await?;
                 handler(context, state, args).map_err(|message| {
                     QueryTaskExecutionFailure::new(
                         "query_workflow_state_unavailable",
@@ -9001,13 +9317,14 @@ impl Worker {
 
     #[cfg(test)]
     async fn execute_activity_task(&self, task: ActivityTask) -> Result<AvroValue> {
-        self.execute_session_activity_task(task, None).await
+        self.execute_session_activity_task(task, None, None).await
     }
 
     async fn execute_session_activity_task(
         &self,
         task: ActivityTask,
         worker_session: Option<WorkerSession>,
+        hydration_claim: Option<&activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
@@ -9054,6 +9371,9 @@ impl Worker {
             worker_session,
         };
 
+        if let Some(claim) = hydration_claim {
+            claim.confirm(&self.client).await?;
+        }
         let callback = handler(ctx, args);
         if let Some(session) = session {
             tokio::select! {
@@ -17729,6 +18049,7 @@ mod tests {
     mod nexus;
     mod runtime_payloads;
     mod runtime_uploads;
+    mod version_marker_contract;
     mod worker_session;
     use std::{
         fs,
@@ -21774,6 +22095,111 @@ mod tests {
     }
 
     #[test]
+    fn activity_options_preserve_unused_explicit_backoff_entries() {
+        for max_attempts in [1, 2, 10] {
+            let ctx = workflow_context(Vec::new());
+            let options =
+                ActivityOptions::new()
+                    .retry_policy(ActivityRetryPolicy::new(max_attempts).backoff_intervals(
+                        [1, 2, 5, 10, 15, 30, 60, 120].map(Duration::from_secs),
+                    ));
+            let mut call = Box::pin(ctx.activity_with_options("work", options, json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(matches!(
+                call.as_mut().poll(&mut task_context),
+                Poll::Pending
+            ));
+            let commands = ctx.take_commands().expect("command");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["retry_policy"]["max_attempts"], max_attempts);
+            assert_eq!(
+                commands[0]["retry_policy"]["backoff_seconds"],
+                json!([1, 2, 5, 10, 15, 30, 60, 120])
+            );
+        }
+        let default_options = ActivityOptions::new().validate().expect("default options");
+        let default_policy = current_activity_retry_snapshot(&default_options);
+        assert_eq!(
+            default_policy.max_attempts,
+            RecordedSnapshotValue::Known(Some(1))
+        );
+        assert_eq!(
+            default_policy.backoff_seconds,
+            RecordedSnapshotValue::Known(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_php_snapshot_rejects_changed_unused_backoff_and_known_fields() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json"
+        ))
+        .expect("published PHP fixture");
+        let history: Vec<HistoryEvent> = serde_json::from_value(fixture["history"].clone())
+            .expect("unchanged published history");
+        let matching = ActivityOptions::new().task_queue("default").retry_policy(
+            ActivityRetryPolicy::new(1)
+                .backoff_intervals([1, 2, 5, 10, 15, 30, 60, 120].map(Duration::from_secs)),
+        );
+        let mut changed_tail = matching.clone();
+        changed_tail.retry_policy.as_mut().unwrap().backoff = Some(ActivityBackoff::Explicit(
+            [1, 2, 5, 10, 15, 30, 60, 121]
+                .map(Duration::from_secs)
+                .to_vec(),
+        ));
+        let mut changed_first = matching.clone();
+        changed_first.retry_policy.as_mut().unwrap().backoff = Some(ActivityBackoff::Explicit(
+            [2, 2, 5, 10, 15, 30, 60, 120]
+                .map(Duration::from_secs)
+                .to_vec(),
+        ));
+        let mut changed_attempts = matching.clone();
+        changed_attempts.retry_policy.as_mut().unwrap().max_attempts = Some(2);
+        let mut changed_types = matching.clone();
+        changed_types
+            .retry_policy
+            .as_mut()
+            .unwrap()
+            .non_retryable_error_types = vec!["ChangedError".into()];
+        let mut changed_start = matching.clone();
+        changed_start.start_to_close_timeout = Some(Duration::from_secs(30));
+        let mut changed_schedule_start = matching.clone();
+        changed_schedule_start.schedule_to_start_timeout = Some(Duration::from_secs(30));
+        let mut changed_schedule_close = matching.clone();
+        changed_schedule_close.schedule_to_close_timeout = Some(Duration::from_secs(30));
+        let mut changed_heartbeat = matching;
+        changed_heartbeat.heartbeat_timeout = Some(Duration::from_secs(30));
+        let unchanged_defaults = ActivityOptions::new().task_queue("default");
+        for options in [
+            changed_tail,
+            changed_first,
+            changed_attempts,
+            changed_types,
+            changed_start,
+            changed_schedule_start,
+            changed_schedule_close,
+            changed_heartbeat,
+            unchanged_defaults,
+        ] {
+            let ctx = workflow_context(history.clone());
+            assert_eq!(ctx.get_version("frozen-zero", -7, 0).unwrap(), 0);
+            assert!(!ctx.patched("frozen-zero").unwrap());
+            ctx.deprecate_patch("frozen-zero").unwrap();
+            let mut call =
+                Box::pin(ctx.activity_with_options("MatrixActivity", options, json!([])));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+                call.as_mut().poll(&mut task_context)
+            else {
+                panic!("changed explicit policy must fail replay")
+            };
+            assert_eq!(failure.reason, "activity_retry_policy_mismatch");
+            assert_eq!(failure.sequence, Some(2));
+            assert!(ctx.take_commands().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn invalid_activity_options_return_typed_errors_before_emitting_commands() {
         let cases = [
             (
@@ -21795,13 +22221,6 @@ mod tests {
                     non_retryable_error_types: Vec::new(),
                 }),
                 ActivityOptionsErrorKind::BackoffWithoutRetryBudget,
-            ),
-            (
-                ActivityOptions::new().retry_policy(
-                    ActivityRetryPolicy::new(2)
-                        .backoff_intervals([Duration::from_secs(1), Duration::from_secs(2)]),
-                ),
-                ActivityOptionsErrorKind::TooManyBackoffIntervals,
             ),
             (
                 ActivityOptions::new().retry_policy(
@@ -30230,6 +30649,364 @@ mod tests {
             )),
             _ => None,
         }
+    }
+
+    fn workflow_completion_lock_pressure(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number == 1 {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_lock_pressure", "operation":"complete_workflow_task",
+                    "outcome":"deferred", "recorded":false, "retryable":true,
+                    "retry_after_seconds":1, "task_id":"recover-workflow",
+                    "lease_owner":"recover-worker", "workflow_task_attempt":3,
+                    "backend":{"driver":"sqlite", "lock_pressure":true}})
+                .to_string(),
+            ));
+        }
+        workflow_completion_backend_recovery(path, body, request_number)
+    }
+
+    fn workflow_completion_lock_pressure_forever(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" {
+            return workflow_completion_lock_pressure(path, body, 1);
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn workflow_completion_lock_pressure_then_expired(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            return Some(("409 Conflict", json!({"reason":"lease_expired", "recorded":false,
+                "task_id":"recover-workflow", "lease_owner":"recover-worker", "workflow_task_attempt":3}).to_string()));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn workflow_completion_lock_pressure_then_slow(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            thread::sleep(Duration::from_secs(2));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn workflow_completion_pressure_then_backend_loss(
+        path: &str,
+        body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/recover-workflow/complete" && request_number > 1 {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_unavailable", "operation":"complete_workflow_task",
+                    "outcome":"unknown", "worker_id":"recover-worker", "task_queue":null,
+                    "retryable":true, "retry_after_seconds":3, "task_id":"recover-workflow",
+                    "lease_owner":"recover-worker", "workflow_task_attempt":3})
+                .to_string(),
+            ));
+        }
+        workflow_completion_lock_pressure(path, body, request_number)
+    }
+
+    fn completion_deferral_worker(server: &MockWorkerServer, calls: Arc<AtomicUsize>) -> Worker {
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(4))
+            .build()
+            .unwrap();
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("recover.workflow", move |_ctx, _args| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("done"))
+            }
+        });
+        worker
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_stops_at_original_cleanup_budget() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_forever),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline =
+            Some(tokio::time::Instant::now() + Duration::from_millis(250));
+        let result = tokio::time::timeout(Duration::from_secs(2), worker.poll_workflow_once())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server
+                .request_bodies("/api/worker/workflow-tasks/recover-workflow/complete")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_bounds_the_inflight_retry() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_then_slow),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let start = tokio::time::Instant::now();
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline = Some(start + Duration::from_millis(1_500));
+        assert!(matches!(
+            worker.poll_workflow_once().await,
+            Err(Error::Timeout)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_retains_deadline_when_backend_reason_changes() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_pressure_then_backend_loss),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::new(AtomicBool::new(false)));
+        let start = tokio::time::Instant::now();
+        worker
+            .client
+            .worker_storage_admission
+            .as_mut()
+            .unwrap()
+            .workflow_completion_retry_deadline = Some(start + Duration::from_millis(1_500));
+        let result = worker.poll_workflow_once().await;
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_shutdown_interrupts_prolonged_pressure() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_forever),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = completion_deferral_worker(&server, Arc::clone(&calls))
+            .with_storage_admission(Arc::clone(&stop));
+        let shutdown = async {
+            while server
+                .request_bodies("/api/worker/workflow-tasks/recover-workflow/complete")
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            stop.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(worker.poll_workflow_once(), shutdown)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Http { status, .. }) if status.as_u16() == 503));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server
+                .request_bodies("/api/worker/workflow-tasks/recover-workflow/complete")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_deferral_preserves_later_expiry_refusal() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure_then_expired),
+            ..MockWorkerBehavior::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = completion_deferral_worker(&server, Arc::clone(&calls));
+        let result = worker.run_once().await;
+        assert!(
+            matches!(result, Err(Error::Http { status, ref body }) if status.as_u16() == 409 && body.contains("lease_expired"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        assert!(server
+            .request_bodies("/api/worker/workflow-tasks/recover-workflow/fail")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_workflow_completion_deferral_preserves_bytes_and_server_delay() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(workflow_completion_lock_pressure),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(client, "recover-queue")
+            .worker_id("recover-worker")
+            .recover_transient_outages(true)
+            .poll_timeout(Duration::from_millis(10))
+            .retry_policy(WorkerRetryPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            });
+        worker.register_workflow("recover.workflow", {
+            let calls = Arc::clone(&calls);
+            move |_ctx, _args| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!("done"))
+                }
+            }
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = server.request_bodies("/api/worker/workflow-tasks/recover-workflow/complete");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[test]
+    fn workflow_completion_deferral_requires_an_exact_unrecorded_fence() {
+        let path = "/worker/workflow-tasks/recover-workflow/complete";
+        let request = json!({"lease_owner":"recover-worker", "workflow_task_attempt":3});
+        let response = json!({"reason":"backend_lock_pressure", "operation":"complete_workflow_task",
+            "outcome":"deferred", "recorded":false, "retryable":true, "retry_after_seconds":1,
+            "task_id":"recover-workflow", "lease_owner":"recover-worker", "workflow_task_attempt":3,
+            "backend":{"driver":"sqlite", "lock_pressure":true}});
+        let error = |body: Value| Error::Http {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: body.to_string(),
+        };
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(
+                &error(response.clone()),
+                path,
+                Some(&request)
+            ),
+            Some(Duration::from_secs(1))
+        );
+        for (field, value) in [
+            ("reason", json!("backend_unavailable")),
+            ("operation", json!("complete_activity_task")),
+            ("task_id", json!("other-task")),
+            ("lease_owner", json!("other-owner")),
+            ("workflow_task_attempt", json!(4)),
+            ("recorded", json!(true)),
+            ("recorded", Value::Null),
+            ("recorded", json!("false")),
+            ("retryable", json!(false)),
+            ("retry_after_seconds", json!(0)),
+            ("retry_after_seconds", json!(-1)),
+            ("retry_after_seconds", json!(1.0)),
+            ("retry_after_seconds", json!("1")),
+            ("retry_after_seconds", json!(6)),
+            ("backend", json!({"lock_pressure":false})),
+        ] {
+            let mut invalid = response.clone();
+            invalid[field] = value;
+            assert_eq!(
+                worker_deferred_workflow_completion_retry_after(
+                    &error(invalid),
+                    path,
+                    Some(&request)
+                ),
+                None,
+                "invalid {field}"
+            );
+        }
+        for field in [
+            "reason",
+            "operation",
+            "task_id",
+            "lease_owner",
+            "workflow_task_attempt",
+            "recorded",
+            "retryable",
+            "retry_after_seconds",
+            "backend",
+        ] {
+            let mut missing = response.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                worker_deferred_workflow_completion_retry_after(
+                    &error(missing),
+                    path,
+                    Some(&request)
+                ),
+                None,
+                "missing {field}"
+            );
+        }
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(
+                &error(response.clone()),
+                "/worker/activity-tasks/recover-workflow/complete",
+                Some(&request)
+            ),
+            None
+        );
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(&error(response.clone()), path, None),
+            None
+        );
+        let wrong_status = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: response.to_string(),
+        };
+        assert_eq!(
+            worker_deferred_workflow_completion_retry_after(&wrong_status, path, Some(&request)),
+            None
+        );
     }
 
     fn activity_completion_stale_after_backend_recovery(
