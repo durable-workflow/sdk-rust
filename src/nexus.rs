@@ -1,4 +1,17 @@
-use super::*;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::{
+    command_mismatch, decode_wire_avro_value, encode_typed_envelope, invalid_recorded_history,
+    payload_string, AvroValue, CancellationCallKind, Error, HistoryEvent, RecordedCommand, Result,
+    WorkflowContext, WorkflowIdentity,
+};
 
 pub(super) fn installed_cooperation(capabilities: &Value) -> bool {
     capabilities["cooperative_cancellation"] == true
@@ -118,6 +131,25 @@ fn identity_text(payload: &Value, field: &str, sequence: u64) -> Result<Option<S
     Ok(result)
 }
 
+fn validate_caller(event: &HistoryEvent, sequence: u64, parent: &WorkflowIdentity) -> Result<()> {
+    for (field, expected) in [
+        ("caller_workflow_instance_id", parent.workflow_id.as_deref()),
+        ("workflow_instance_id", parent.workflow_id.as_deref()),
+        ("caller_workflow_run_id", parent.run_id.as_deref()),
+        ("workflow_run_id", parent.run_id.as_deref()),
+    ] {
+        if let Some(actual) = identity_text(&event.payload, field, sequence)? {
+            if expected.is_some_and(|expected| expected != actual) {
+                return Err(history_error(
+                    sequence,
+                    &format!("{field} does not identify this caller"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn service_result(
     payload: &Value,
     codec: &str,
@@ -184,21 +216,7 @@ pub(super) fn recorded_call(
         ));
     }
     for event in events {
-        for (field, expected) in [
-            ("caller_workflow_instance_id", parent.workflow_id.as_deref()),
-            ("workflow_instance_id", parent.workflow_id.as_deref()),
-            ("caller_workflow_run_id", parent.run_id.as_deref()),
-            ("workflow_run_id", parent.run_id.as_deref()),
-        ] {
-            if let Some(actual) = identity_text(&event.payload, field, sequence)? {
-                if expected.is_some_and(|expected| expected != actual) {
-                    return Err(history_error(
-                        sequence,
-                        &format!("{field} does not identify this caller"),
-                    ));
-                }
-            }
-        }
+        validate_caller(event, sequence, parent)?;
         for field in [
             "service_call_id",
             "endpoint_name",
@@ -380,6 +398,63 @@ impl WorkflowContext {
     }
 }
 
+impl NexusServiceCall {
+    fn validate_recorded_call(&mut self, call: &RecordedServiceCall, sequence: u64) -> Result<()> {
+        for (field, expected, actual) in [
+            (
+                "endpoint_name",
+                call.endpoint_name.as_str(),
+                self.endpoint_name.as_str(),
+            ),
+            (
+                "service_name",
+                call.service_name.as_str(),
+                self.service_name.as_str(),
+            ),
+            (
+                "operation_name",
+                call.operation_name.as_str(),
+                self.operation_name.as_str(),
+            ),
+        ] {
+            if expected != actual {
+                return Err(invalid_recorded_history(
+                    &format!("nexus_{field}_changed"),
+                    sequence,
+                    expected,
+                    actual,
+                    "original service intent changed",
+                ));
+            }
+        }
+        if self
+            .options
+            .target_namespace
+            .as_ref()
+            .is_some_and(|target| call.target_namespace.as_ref() != Some(target))
+            || self.options.idempotency_key.as_ref().is_some_and(|key| {
+                call.idempotency_key
+                    .as_ref()
+                    .is_some_and(|original| original != key)
+            })
+            || self.options.mode != call.mode
+            || self.options.wait_for != call.wait_for
+        {
+            return Err(history_error(
+                sequence,
+                "original service routing, idempotency or waiting policy changed",
+            ));
+        }
+        if let Some(original) = &call.request {
+            let arguments = self.arguments.take().unwrap_or(Ok(AvroValue::Null))?;
+            if &arguments != original {
+                return Err(history_error(sequence, "original service request changed"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Future for NexusServiceCall {
     type Output = Result<NexusOperationResult>;
 
@@ -406,62 +481,8 @@ impl Future for NexusServiceCall {
             let RecordedCommand::ServiceOperation { sequence, call } = recorded else {
                 return Poll::Ready(Err(command_mismatch(&recorded, "service operation")));
             };
-            for (field, expected, actual) in [
-                (
-                    "endpoint_name",
-                    call.endpoint_name.as_str(),
-                    self.endpoint_name.as_str(),
-                ),
-                (
-                    "service_name",
-                    call.service_name.as_str(),
-                    self.service_name.as_str(),
-                ),
-                (
-                    "operation_name",
-                    call.operation_name.as_str(),
-                    self.operation_name.as_str(),
-                ),
-            ] {
-                if expected != actual {
-                    return Poll::Ready(Err(invalid_recorded_history(
-                        &format!("nexus_{field}_changed"),
-                        sequence,
-                        expected,
-                        actual,
-                        "original service intent changed",
-                    )));
-                }
-            }
-            if self
-                .options
-                .target_namespace
-                .as_ref()
-                .is_some_and(|target| call.target_namespace.as_ref() != Some(target))
-                || self.options.idempotency_key.as_ref().is_some_and(|key| {
-                    call.idempotency_key
-                        .as_ref()
-                        .is_some_and(|original| original != key)
-                })
-                || self.options.mode != call.mode
-                || self.options.wait_for != call.wait_for
-            {
-                return Poll::Ready(Err(history_error(
-                    sequence,
-                    "original service routing, idempotency or waiting policy changed",
-                )));
-            }
-            if let Some(original) = &call.request {
-                let arguments = match self.arguments.take().unwrap_or(Ok(AvroValue::Null)) {
-                    Ok(arguments) => arguments,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
-                if &arguments != original {
-                    return Poll::Ready(Err(history_error(
-                        sequence,
-                        "original service request changed",
-                    )));
-                }
+            if let Err(error) = self.validate_recorded_call(&call, sequence) {
+                return Poll::Ready(Err(error));
             }
             if self.options.completion_wait() {
                 if let Err(error) =
