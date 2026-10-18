@@ -38,6 +38,7 @@ x-worker: &worker
     NEXUS_ROLE: "${NEXUS_ROLE:-caller}"
     NEXUS_ENDPOINT: "${NEXUS_ENDPOINT:-cooperative}"
     NEXUS_SERVICE: cleanup
+    NEXUS_QUALIFY_NEIGHBOR: "1"
     TASK_QUEUE: "${NEXUS_QUEUE:-nexus-workers}"
     WORKER_ID: "${NEXUS_WORKER_ID:-nexus-worker}"
     WORKFLOW_TYPE: "${NEXUS_WORKFLOW_TYPE:-nexus.caller}"

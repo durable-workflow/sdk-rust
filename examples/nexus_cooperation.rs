@@ -24,6 +24,11 @@ async fn main() -> Result<()> {
         .max_concurrent_workflow_tasks(1)
         .max_concurrent_activity_tasks(1)
         .nexus_cooperative_cancellation(true);
+    if std::env::var("NEXUS_QUALIFY_NEIGHBOR").as_deref() == Ok("1") {
+        worker.register_workflow("nexus.qualification.neighbor", |_, _| async {
+            Ok(json!({"alive":true,"runtime":"rust"}))
+        });
+    }
     if role == "target" {
         worker.register_workflow(workflow_type, |ctx, input| async move {
             match ctx.sleep(Duration::from_secs(300)).await {

@@ -5,7 +5,10 @@ Rust/PHP, PHP/Rust, Rust/Rust, Rust/Python and Python/Rust cancellation, plus a
 Rust target killed after its cleanup timer commits and replaced by a cold worker.
 They retain one original service admission, the original 30-second cleanup and
 separate 180-second service deadline, canonical context/lineage, typed cold
-results, duplicate identity, worker shutdown and six actual-record reader refusals.
+results, duplicate identity, worker shutdown and nine actual-record reader refusals.
+The same caller Worker must complete an unrelated workflow while its original
+Nexus target is still cleaning up. The original caller cannot receive canonical
+cancellation delivery before the target finishes.
 
 The Rust crate under test is source. A passing run does not add Nexus to published
 3.5.5 or authorize a Rust major release. PHP Server 2.9.4, PHP SDK 2.5.1 and Python

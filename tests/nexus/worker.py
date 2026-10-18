@@ -15,6 +15,12 @@ ENDPOINT = os.environ.get("NEXUS_ENDPOINT", "cooperative")
 SERVICE = os.environ.get("NEXUS_SERVICE", "cleanup")
 
 
+@workflow.defn(name="nexus.qualification.neighbor")
+class Neighbor:
+    def run(self, ctx):
+        return {"alive": True, "runtime": "python"}
+
+
 @workflow.defn(name=os.environ.get("WORKFLOW_TYPE", f"nexus.{ROLE}"))
 class NexusFixture:
     def run(self, ctx, operation):
@@ -38,7 +44,7 @@ async def main():
     ) as client:
         worker = Worker(
             client, task_queue=os.environ.get("TASK_QUEUE", "nexus-workers"),
-            worker_id=os.environ.get("WORKER_ID", f"nexus-{ROLE}"), workflows=[NexusFixture],
+            worker_id=os.environ.get("WORKER_ID", f"nexus-{ROLE}"), workflows=[NexusFixture, Neighbor],
             capabilities=["cooperative_cancellation", "nexus_cooperative_cancellation"],
             poll_timeout=1, max_concurrent_workflow_tasks=1, max_concurrent_activity_tasks=1,
         )

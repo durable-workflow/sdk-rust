@@ -25,6 +25,7 @@ $worker = new Worker(
     workerId: getenv('WORKER_ID') ?: 'nexus-'.$role,
     enableCooperativeCancellation: true,
 );
+$worker->registerWorkflow('nexus.qualification.neighbor', static fn (WorkflowContext $ctx): array => ['alive' => true, 'runtime' => 'php']);
 $worker->registerWorkflow(
     getenv('WORKFLOW_TYPE') ?: 'nexus.'.$role,
     static function (WorkflowContext $ctx, string $operation) use ($role, $endpoint, $service): mixed {

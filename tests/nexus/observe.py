@@ -140,7 +140,7 @@ async def cancel(record, client):
     record["admission"] = reply
 
 
-async def cleanup(record, http):
+async def cleanup(record, http, client):
     async def committed():
         target = await history(http, record["before"]["target_id"], record["before"]["target_run"])
         delivered = [event for event in target["events"] if event["event_type"] == "CooperativeCancellationDelivered"]
@@ -148,6 +148,18 @@ async def cleanup(record, http):
                   and event["payload"].get("delay_seconds") == 8]
         return target if delivered and timers else None
     record["committed_cleanup"] = await until(committed)
+    caller = await history(http, record["caller_id"], record["caller_run"])
+    forbidden = {"CooperativeCancellationDelivered", "WorkflowCompleted", "WorkflowFailed", "WorkflowCancelled"}
+    require(not any(event["event_type"] in forbidden for event in caller["events"]), "Caller settled while target cleanup was pending")
+    neighbor = await client.start_workflow(workflow_type="nexus.qualification.neighbor",
+                                          task_queue=f"{record['case']}-caller", workflow_id=f"{record['case']}-neighbor", input=[])
+    result = await neighbor.result(timeout=30, poll_interval=0.1)
+    require(result == {"alive": True, "runtime": record["caller"]}, "Original cleanup prevented unrelated work or leaked cancellation")
+    record["neighbor"] = await history(http, neighbor.workflow_id, neighbor.run_id)
+    pending_target = await history(http, record["before"]["target_id"], record["before"]["target_run"])
+    require(not any(event["event_type"] in {"WorkflowCompleted", "WorkflowFailed", "WorkflowCancelled"}
+                    for event in pending_target["events"]), "Unrelated work only ran after target cleanup ended")
+    record["pending_caller"] = caller
 
 
 def validate(record):
@@ -178,6 +190,13 @@ def validate(record):
         observations = record["callback_contexts"][role]
         require(observations and all(snapshot == context for snapshot in observations), "Workflow-facing context differs from committed authority")
     root, child = contexts["caller"], contexts["target"]
+    target_terminal = stamp(one(after["target"], "WorkflowCancelled")["timestamp"])
+    require(stamp(one(after["caller"], "CooperativeCancellationDelivered")["timestamp"]) >= target_terminal,
+            "Caller delivery preceded original target cleanup")
+    require(stamp(one(record["neighbor"], "WorkflowCompleted")["timestamp"]) < target_terminal,
+            "Unrelated work did not progress during target cleanup")
+    require(not any(event["event_type"] in {"CooperativeCancellationDelivered", "WorkflowCompleted", "WorkflowFailed", "WorkflowCancelled"}
+                    for event in record["pending_caller"]["events"]), "Pending caller had already settled")
     require(root["request_id"] == receipt["request_id"] and root["parent_request_id"] is None, "Root request was replaced")
     require(stamp(root["cleanup_deadline_at"]) - stamp(root["requested_at"]) == timedelta(seconds=30), "Original cleanup budget is not 30 seconds")
     require(child["parent_request_id"] == root["request_id"] and child["requested_at"] == root["requested_at"], "Child lost original root origin")
@@ -212,6 +231,9 @@ def refusal_controls(record):
         lambda row: row["after"]["caller"]["events"][0]["payload"].update(corrupted=True),
         lambda row: row["after"]["call"].update(call_deadline_at="2099-01-01T00:00:00.000000Z"),
         lambda row: one(row["after"]["target"], "WorkflowCancelled").update(timestamp="2099-01-01T00:00:00.000000Z"),
+        lambda row: one(row["after"]["caller"], "CooperativeCancellationDelivered").update(timestamp="2000-01-01T00:00:00.000000Z"),
+        lambda row: one(row["neighbor"], "WorkflowCompleted").update(timestamp="2099-01-01T00:00:00.000000Z"),
+        lambda row: row["pending_caller"]["events"].append(copy.deepcopy(one(row["after"]["caller"], "WorkflowCancelled"))),
     ]
     for mutate in mutations:
         changed = copy.deepcopy(record)
@@ -281,7 +303,7 @@ async def main():
         elif phase == "cancel":
             await cancel(record, client)
         elif phase == "cleanup":
-            await cleanup(record, http)
+            await cleanup(record, http, client)
         elif phase == "terminal":
             await terminal(record, http)
         elif phase == "verify":
