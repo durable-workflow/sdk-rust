@@ -54,7 +54,7 @@ docker compose --env-file "$NEXUS_ENV_FILE" -f tests/nexus/docker-compose.yml \
   up -d --no-build --wait server queue repair
 bash tests/nexus/run.sh
 docker compose --env-file "$NEXUS_ENV_FILE" -f tests/nexus/docker-compose.yml \
-  down --volumes --remove-orphans
+  --profile '*' down --volumes --remove-orphans
 ```
 
 For successful typed results, target failures, missing-operation failures and
@@ -108,6 +108,7 @@ with real published Waterline inspection. The same forty originals cover five
 SDK directions, both namespace directions and success, typed failure, external
 payload and missing-operation outcomes. Original workflow budgets stay unchanged.
 Browser inspection occurs after completion with bounded request/navigation timeouts.
+The default image pins the installed-qualified Waterline 2.11.3 layout correction.
 
 Prepare the locked browser dependency in `STATE/browser`: copy
 `browser-package.json` to `package.json` and `browser-package-lock.json` to
@@ -119,7 +120,9 @@ The profile starts three read-only Waterline instances on the isolated Docker
 network, with no published ports. Owner and caller views must preserve original
 identities, typed values, exact deadlines and opaque foreign references. The
 unrelated namespace and wrong selectors must refuse. Desktop/dark and
-mobile/light pages must fit, expose their actual terminal result or failure,
+mobile/light pages and their internal detail sections must fit. Large result
+previews must stay in bounded scroll regions. Both presentations expose their
+actual terminal result or failure,
 and leave both original histories unchanged. No API mocks or observer writes
 are permitted. Reports and representative screenshots go to `STATE/catalog`.
 `node --test tests/nexus/test-catalog.mjs` checks the identity/type/redaction guards.

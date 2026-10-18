@@ -143,7 +143,7 @@ services:
       DURABLE_WORKFLOW_ACK_COMMAND: start_service_operation
       PORT: "3000"
   catalog-default: &catalog
-    image: "${NEXUS_WATERLINE_IMAGE:-durableworkflow/waterline@sha256:55afbf7b587e5c6b8670959bc9aed4615f1e1fad0b1014865e65735ab1ccea2d}"
+    image: "${NEXUS_WATERLINE_IMAGE:-durableworkflow/waterline@sha256:297616026bd18baa99c5cf0826c25efac0f308fd238e5839171c6bd3a2e50fe6}"
     profiles: [catalog]
     init: true
     mem_limit: 512m

@@ -105,13 +105,24 @@ try {
             assert.equal(await result.locator('pre').count(), 0);
           }
           assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'no page overflow');
+          const bounds = await panel.evaluate(element => ({
+            regions: [...element.querySelectorAll('.service-catalog-view__detail-grid, section')]
+              .map(region => ({width: region.clientWidth, content: region.scrollWidth})),
+            results: [...element.querySelectorAll('pre')].map(result => ({
+              width: result.clientWidth, parent: result.parentElement.clientWidth,
+              height: result.clientHeight, overflow: getComputedStyle(result).overflowY,
+            })),
+          }));
+          assert.ok(bounds.regions.every(region => region.content <= region.width + 1), 'detail regions must fit internally');
+          assert.ok(bounds.results.every(result => result.width <= result.parent + 1
+            && result.height <= 420 && ['auto', 'scroll'].includes(result.overflow)), 'result previews need bounded scroll regions');
           let screenshot;
           if (row.caller === 'rust' && row.target === 'php' && row.namespace === 'default') {
             screenshot = `${row.scenario}-${scope}-${width}-${theme}.png`;
             await page.screenshot({path: path.join(output, screenshot)});
           }
           reports.push({case: row.case, call_id: row.service_call_id, scope, namespace,
-            scenario: row.scenario, width, theme, screenshot, outcome: 'pass'});
+            scenario: row.scenario, width, theme, screenshot, bounds, outcome: 'pass'});
         } finally {
           await context.close();
         }
