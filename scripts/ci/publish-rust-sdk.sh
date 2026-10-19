@@ -12,6 +12,8 @@ release_tag="${RELEASE_TAG:-}"
 release_commit="${RELEASE_COMMIT:-}"
 release_run_id="${RELEASE_RUN_ID:-}"
 release_run_attempt="${RELEASE_RUN_ATTEMPT:-}"
+release_tooling_commit="$(git -C "$script_dir" rev-parse HEAD)"
+lockfile_source="source_checkout"
 
 for command in cargo curl git jq python3 rustc sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -237,6 +239,8 @@ write_evidence() {
         --arg release_commit "$release_commit" \
         --arg release_run_id "$release_run_id" \
         --arg release_run_attempt "$release_run_attempt" \
+        --arg release_tooling_commit "$release_tooling_commit" \
+        --arg lockfile_source "$lockfile_source" \
         --arg archive_vcs_commit "$archive_vcs_commit" \
         --arg archive_vcs_dirty "$archive_vcs_dirty" \
         --arg published_archive_vcs_commit "$published_archive_vcs_commit" \
@@ -329,6 +333,10 @@ write_evidence() {
                 run_id: $release_run_id,
                 run_attempt: $release_run_attempt
             },
+            release_tooling: {
+                commit: $release_tooling_commit,
+                lockfile_source: $lockfile_source
+            },
             fresh_consumer: {
                 rust_version: $rust_version,
                 exact_dependency: ($package + " = \"=" + $version + "\""),
@@ -342,7 +350,38 @@ write_evidence() {
         }' > "$evidence_path"
 }
 
-if ! cargo package --manifest-path "$manifest_path"; then
+# Older immutable tags ignored Cargo.lock. Recover only that missing input from
+# their verified registry archive; complete local/archive equality still follows.
+lockfile_path="$(dirname "$manifest_path")/Cargo.lock"
+if [[ ! -f "$lockfile_path" || -L "$lockfile_path" ]]; then
+    if [[ -e "$lockfile_path" || -L "$lockfile_path" ]] || \
+       ! git check-ignore -q -- "$lockfile_path"; then
+        write_evidence "failed" "release_lockfile_missing_or_invalid"
+        printf 'release source must include Cargo.lock; legacy recovery requires an ignored missing lockfile\n' >&2
+        exit 1
+    fi
+    if ! legacy_status="$(crates_io_version_lookup "$version_api" "$version_response" "$user_agent")" || \
+       [[ "$legacy_status" != "200" ]]; then
+        write_evidence "failed" "legacy_release_lockfile_unavailable"
+        exit 1
+    fi
+    if ! published_checksum="$(jq -er --arg version "$package_version" \
+        '.version | select(.num == $version) | .checksum | select(test("^[0-9a-f]{64}$"))' \
+        "$version_response")" || \
+       ! crates_io_request --fail --silent --show-error --location \
+        --header "User-Agent: ${user_agent}" --output "$published_archive" "$download_url" || \
+       ! python3 "$script_dir/release_package.py" \
+        --manifest "$manifest_path" --changelog "$changelog_path" \
+        --archive "$published_archive" --expected-vcs-commit "$release_commit" \
+        --expected-archive-sha256 "$published_checksum" \
+        --restore-missing-lockfile > "$tmp_dir/restored-lockfile.json"; then
+        write_evidence "failed" "legacy_release_lockfile_verification_failed"
+        exit 1
+    fi
+    lockfile_source="verified_registry_archive"
+fi
+
+if ! cargo package --locked --manifest-path "$manifest_path"; then
     write_evidence "failed" "local_package_archive_build_failed"
     exit 1
 fi

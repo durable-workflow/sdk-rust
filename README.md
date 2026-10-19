@@ -349,10 +349,17 @@ compatibility. Stable releases follow semantic versioning.
 
 ```sh
 cargo fmt --all --check
-cargo test --all-targets --all-features
-cargo doc --all-features --no-deps
-cargo package
+cargo test --locked --all-targets --all-features
+cargo doc --locked --all-features --no-deps
+cargo package --locked
 ```
+
+The committed lockfile records the dependency graph used by CI and packaging.
+Fresh-consumer checks resolve dependencies independently to verify the published
+crate also builds for new consumers. Release verification runs tooling pinned to
+the workflow commit against a separate immutable source tag. For older tags that
+ignored the lockfile, it restores only the missing lock from the checksum-verified
+published crate, then requires the complete regenerated archive to match.
 
 Replay and codec defects require a minimal regression fixture. See
 [`CONTRIBUTING.md`](https://github.com/durable-workflow/sdk-rust/blob/main/CONTRIBUTING.md) for the corpus rules.

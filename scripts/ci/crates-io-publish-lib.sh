@@ -69,7 +69,7 @@ publish_exact_crate_if_absent() {
                 publish_error="registry_token_missing"
                 return 1
             fi
-            if ! cargo publish --manifest-path "$manifest_path" --registry crates-io; then
+            if ! cargo publish --locked --manifest-path "$manifest_path" --registry crates-io; then
                 publish_error="cargo_publish_failed"
                 return 1
             fi

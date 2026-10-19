@@ -46,8 +46,8 @@ jobs:
             sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
               docs/analytics/analytics.js
           fi
-          cargo doc --all-features --no-deps
-          cargo doc --all-features --no-deps --examples
+          cargo doc --locked --all-features --no-deps
+          cargo doc --locked --all-features --no-deps --examples
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html

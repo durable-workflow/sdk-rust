@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import ssl
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -29,6 +30,7 @@ QUALIFIED_SERVER_VERSION = SOURCE_PACKAGE["metadata"]["durable-workflow"]["quali
 WORKER_PROTOCOL_VERSION = "1.20"
 SERVER_WORKER_PROTOCOLS = ">=1.19,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+TOOLING_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
 CHECKSUM = "a" * 64
 
 
@@ -54,6 +56,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
             #!/usr/bin/env python3
             import json
             import io
+            import gzip
             import os
             from pathlib import Path
             import sys
@@ -77,6 +80,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
                     "target_directory": str(target),
                 }))
             elif command == "package":
+                if not os.environ.get("MOCK_FIXTURE_CREATION") and "--locked" not in sys.argv:
+                    raise SystemExit("release packaging must use --locked")
                 archive = target / "package" / f'{package["name"]}-{package["version"]}.crate'
                 archive.parent.mkdir(parents=True, exist_ok=True)
                 root = f'{package["name"]}-{package["version"]}'
@@ -91,12 +96,15 @@ class PublishRustSdkContractTest(unittest.TestCase):
                             "dirty": False,
                         }
                     }).encode(),
+                    f"{root}/Cargo.lock": (manifest.parent / "Cargo.lock").read_bytes(),
                 }
-                with tarfile.open(archive, "w:gz") as crate:
-                    for name, content in entries.items():
-                        member = tarfile.TarInfo(name)
-                        member.size = len(content)
-                        crate.addfile(member, io.BytesIO(content))
+                with archive.open("wb") as output:
+                    with gzip.GzipFile(fileobj=output, mode="wb", mtime=0, filename="") as compressed:
+                        with tarfile.open(fileobj=compressed, mode="w") as crate:
+                            for name, content in entries.items():
+                                member = tarfile.TarInfo(name)
+                                member.size = len(content)
+                                crate.addfile(member, io.BytesIO(content))
             elif command == "build":
                 if os.environ.get("MOCK_CONSUMER_BUILD_OUTCOME") == "fail":
                     raise SystemExit("mock fresh consumer build failed")
@@ -136,7 +144,11 @@ class PublishRustSdkContractTest(unittest.TestCase):
             import sys
 
             command = sys.argv[1]
-            if command == "status":
+            if command == "-C":
+                print(os.environ["MOCK_TOOLING_COMMIT"])
+            elif command == "check-ignore":
+                raise SystemExit(0 if os.environ.get("MOCK_IGNORED_LOCKFILE") else 1)
+            elif command == "status":
                 pass
             elif command in {"rev-parse", "rev-list"}:
                 print(os.environ["MOCK_RELEASE_COMMIT"])
@@ -157,8 +169,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
             args = sys.argv[1:]
             output = Path(args[args.index("--output") + 1])
             url = args[-1]
-            archive = next((Path(os.environ["CARGO_TARGET_DIR"]) / "package").glob("*.crate"))
-            checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+            archive = Path(os.environ["MOCK_REGISTRY_ARCHIVE"])
+            checksum = os.environ.get("MOCK_REGISTRY_CHECKSUM", hashlib.sha256(archive.read_bytes()).hexdigest())
             if url.endswith("/download"):
                 output.write_bytes(archive.read_bytes())
             elif url.endswith("/{PACKAGE_VERSION}"):
@@ -174,13 +186,14 @@ class PublishRustSdkContractTest(unittest.TestCase):
             else:
                 raise SystemExit(f"unexpected curl URL: {{url}}")
             if "--write-out" in args:
-                print("200", end="")
+                print(os.environ.get("MOCK_LOOKUP_STATUS", "200"), end="")
             ''',
         )
     def _publish(
         self,
         manifest: Path = MANIFEST,
         environment: dict[str, str] | None = None,
+        cwd: Path = ROOT,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
@@ -188,16 +201,28 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
                 "CARGO_TARGET_DIR": str(self.temp / "target"),
                 "MOCK_RELEASE_COMMIT": RELEASE_COMMIT,
+                "MOCK_TOOLING_COMMIT": TOOLING_COMMIT,
                 "MOCK_PACKAGE_VERSION": PACKAGE_VERSION,
+                "MOCK_REGISTRY_ARCHIVE": str(self.temp / "registry" / "package" / f"durable-workflow-{PACKAGE_VERSION}.crate"),
                 "RELEASE_TAG": PACKAGE_VERSION,
                 "RUST_SDK_MANIFEST_PATH": str(manifest),
                 "RUST_SDK_RELEASE_EVIDENCE_PATH": str(self.evidence),
             }
         )
         env.update(environment or {})
+        fixture_env = {
+            **env,
+            "CARGO_TARGET_DIR": str(self.temp / "registry"),
+            "RUST_SDK_CHANGELOG_PATH": str(ROOT / "CHANGELOG.md"),
+            "MOCK_FIXTURE_CREATION": "1",
+        }
+        subprocess.run(
+            [str(self.bin_dir / "cargo"), "package", "--manifest-path", str(MANIFEST)],
+            env=fixture_env, check=True,
+        )
         return subprocess.run(
             ["bash", str(PUBLISH)],
-            cwd=ROOT,
+            cwd=cwd,
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -211,6 +236,62 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertIn(old, source)
         manifest.write_text(source.replace(old, new, 1), encoding="utf-8")
         return manifest
+
+    def _source_checkout(self, *, legacy: bool = False) -> Path:
+        source = self.temp / "source"
+        source.mkdir()
+        for name in ("Cargo.toml", "CHANGELOG.md"):
+            shutil.copyfile(ROOT / name, source / name)
+        if not legacy:
+            shutil.copyfile(ROOT / "Cargo.lock", source / "Cargo.lock")
+        return source
+
+    def test_maintained_tooling_keeps_separate_source_identity(self) -> None:
+        source = self._source_checkout()
+        old_script = source / "scripts" / "ci" / "publish-rust-sdk.sh"
+        old_script.parent.mkdir(parents=True)
+        old_script.write_text("exit 99\n", encoding="utf-8")
+        result = self._publish(source / "Cargo.toml", cwd=source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(RELEASE_COMMIT, evidence["release"]["commit"])
+        self.assertEqual(TOOLING_COMMIT, evidence["release_tooling"]["commit"])
+        self.assertEqual("source_checkout", evidence["release_tooling"]["lockfile_source"])
+
+    def test_legacy_release_restores_only_verified_missing_ignored_lockfile(self) -> None:
+        source = self._source_checkout(legacy=True)
+        result = self._publish(source / "Cargo.toml", {"MOCK_IGNORED_LOCKFILE": "1"}, cwd=source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual((ROOT / "Cargo.lock").read_bytes(), (source / "Cargo.lock").read_bytes())
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertTrue(evidence["exact_registry_archive_matches_release_checkout"])
+        self.assertEqual("verified_registry_archive", evidence["release_tooling"]["lockfile_source"])
+
+    def test_legacy_lock_rejects_wrong_registry_checksum_before_writing(self) -> None:
+        source = self._source_checkout(legacy=True)
+        result = self._publish(source / "Cargo.toml", {
+            "MOCK_IGNORED_LOCKFILE": "1", "MOCK_REGISTRY_CHECKSUM": "0" * 64,
+        }, cwd=source)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((source / "Cargo.lock").exists())
+        self.assertIn("checksum differs", result.stderr)
+
+    def test_missing_unignored_lock_cannot_authorize_recovery(self) -> None:
+        source = self._source_checkout(legacy=True)
+        result = self._publish(source / "Cargo.toml", cwd=source)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((source / "Cargo.lock").exists())
+        self.assertEqual("release_lockfile_missing_or_invalid", json.loads(self.evidence.read_text())["reason"])
+
+    def test_existing_lock_difference_cannot_be_repaired_from_registry(self) -> None:
+        source = self._source_checkout()
+        lockfile = source / "Cargo.lock"
+        lockfile.write_bytes(lockfile.read_bytes() + b"\n# different authorized source\n")
+        before = lockfile.read_bytes()
+        result = self._publish(source / "Cargo.toml", cwd=source)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(before, lockfile.read_bytes())
+        self.assertEqual("published_source_archive_mismatch", json.loads(self.evidence.read_text())["reason"])
 
     def test_manifest_declares_component_and_qualified_baseline(self) -> None:
         package = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))["package"]
@@ -480,6 +561,11 @@ class PublishRustSdkContractTest(unittest.TestCase):
             workflow.index("CARGO_REGISTRY_TOKEN"),
         )
         self.assertEqual(1, workflow.count("secrets.CARGO_REGISTRY_TOKEN"))
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
+        self.assertIn("working-directory: release-source", workflow)
+        self.assertIn("run: ../release-tools/scripts/ci/publish-rust-sdk.sh", workflow)
+        self.assertIn("path: release-source/rust-sdk-release-evidence.json", workflow)
+        self.assertEqual(2, workflow.count("persist-credentials: false"))
 
 
 class RegistryHttpsTest(unittest.TestCase):

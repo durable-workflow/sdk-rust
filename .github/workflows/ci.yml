@@ -116,7 +116,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt
       - run: cargo fmt --all --check
-      - run: cargo test --all-targets --all-features
+      - run: cargo test --locked --all-targets --all-features
 
   protocol:
     name: Avro protocol
@@ -144,7 +144,7 @@ jobs:
           composer install --working-dir=scripts/ci/official-avro-consumers --no-interaction --no-progress --prefer-dist
           OFFICIAL_AVRO_PYTHON="${RUNNER_TEMP}/official-avro-python/bin/python" scripts/ci/qualify-cross-language-avro-consumers.sh
       - name: Enforce the Avro Value regression budget
-        run: cargo run --release --example avro_value_benchmark -- --enforce
+        run: cargo run --locked --release --example avro_value_benchmark -- --enforce
 
   docs:
     name: Documentation
@@ -162,8 +162,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings --html-in-header docs/analytics-head.html
         run: |
-          cargo doc --all-features --no-deps
-          cargo doc --all-features --no-deps --examples
+          cargo doc --locked --all-features --no-deps
+          cargo doc --locked --all-features --no-deps --examples
           printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
           touch target/doc/.nojekyll
           cp docs/index.html target/doc/index.html
@@ -198,7 +198,7 @@ jobs:
         run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
       - name: Build and verify the publishable crate
         run: |
-          cargo package
+          cargo package --locked
           archive="target/package/durable-workflow-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])').crate"
           python3 scripts/ci/release_package.py --archive "$archive"
           python3 scripts/ci/verify-fresh-consumer.py package
