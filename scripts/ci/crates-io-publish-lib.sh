@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# Registry metadata and archives must stay on HTTPS across redirects.
+crates_io_request() {
+    curl --proto '=https' --proto-redir '=https' "$@"
+}
+
 # Look up an exact crate version, retrying only failures that can be transient.
 # The five attempts and exponential delays bound a failed lookup to 30 seconds
 # of backoff while allowing crates.io to recover from a short interruption.
@@ -13,7 +18,7 @@ crates_io_version_lookup() {
 
     for ((attempt = 1; attempt <= 5; attempt++)); do
         http_status=""
-        if http_status="$(curl --silent --show-error --location \
+        if http_status="$(crates_io_request --silent --show-error --location \
             --header "User-Agent: ${user_agent}" \
             --output "$version_response" \
             --write-out '%{http_code}' \
