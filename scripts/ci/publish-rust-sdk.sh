@@ -392,7 +392,7 @@ fi
 
 if [[ "$publish_outcome" == "published" ]]; then
     for _attempt in $(seq 1 24); do
-        http_status="$(curl --silent --show-error --location \
+        http_status="$(crates_io_request --silent --show-error --location \
             --header "User-Agent: ${user_agent}" \
             --output "$version_response" \
             --write-out '%{http_code}' \
@@ -407,7 +407,7 @@ if [[ "$publish_outcome" == "published" ]]; then
     fi
 fi
 
-if ! curl --fail --silent --show-error --location \
+if ! crates_io_request --fail --silent --show-error --location \
     --header "User-Agent: ${user_agent}" \
     --output "$crate_response" \
     "$registry_api"; then
@@ -436,7 +436,7 @@ if [[ ! "$published_checksum" =~ ^[0-9a-f]{64}$ ]]; then
     exit 1
 fi
 
-if ! curl --fail --silent --show-error --location \
+if ! crates_io_request --fail --silent --show-error --location \
     --header "User-Agent: ${user_agent}" \
     --output "$published_archive" \
     "$download_url"; then

@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import tempfile
 import textwrap
+import threading
 import tomllib
 import unittest
 
@@ -477,6 +480,118 @@ class PublishRustSdkContractTest(unittest.TestCase):
             workflow.index("CARGO_REGISTRY_TOKEN"),
         )
         self.assertEqual(1, workflow.count("secrets.CARGO_REGISTRY_TOKEN"))
+
+
+class RegistryHttpsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.certificate = Path(cls.temp.name) / "certificate.pem"
+        private_key = Path(cls.temp.name) / "key.pem"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(private_key), "-out", str(cls.certificate),
+                "-days", "1", "-subj", "/CN=localhost",
+                "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        cls.http_requests: list[str] = []
+        cls.https_requests: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle(self) -> None:
+                try:
+                    super().handle()
+                except ConnectionResetError:
+                    # A rejected TLS certificate can close the peer before HTTP.
+                    if self.server is not cls.https:
+                        raise
+
+            def do_GET(self) -> None:
+                requests = cls.http_requests if self.server is cls.http else cls.https_requests
+                requests.append(self.path)
+                if self.path in {"/redirect-https", "/redirect-http"}:
+                    destination = cls.https_url if self.path == "/redirect-https" else cls.http_url
+                    self.send_response(302)
+                    self.send_header("Location", destination + "/version")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path == "/version":
+                    body = b'{"version":"test"}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_error(404)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        cls.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.addClassCleanup(cls.http.server_close)
+        cls.https = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.addClassCleanup(cls.https.server_close)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cls.certificate, private_key)
+        cls.https.socket = context.wrap_socket(cls.https.socket, server_side=True)
+        cls.http_url = f"http://127.0.0.1:{cls.http.server_port}"
+        cls.https_url = f"https://127.0.0.1:{cls.https.server_port}"
+        for server in (cls.http, cls.https):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            cls.addClassCleanup(server.shutdown)
+
+    def setUp(self) -> None:
+        self.http_requests.clear()
+        self.https_requests.clear()
+
+    def _lookup(
+        self, url: str, *, trust_certificate: bool = True,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        response = Path(self.temp.name) / f"{self.id()}.json"
+        env = os.environ.copy()
+        if trust_certificate:
+            env["CURL_CA_BUNDLE"] = str(self.certificate)
+        else:
+            env.pop("CURL_CA_BUNDLE", None)
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        result = subprocess.run(
+            [
+                "bash", "-c",
+                'source "$1"; sleep() { :; }; crates_io_version_lookup "$2" "$3" test-agent',
+                "bash", str(PUBLISH.with_name("crates-io-publish-lib.sh")), url, str(response),
+            ],
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+        )
+        return result, response
+
+    def test_https_redirect_is_accepted(self) -> None:
+        result, response = self._lookup(self.https_url + "/redirect-https")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("200", result.stdout.strip())
+        self.assertEqual({"version": "test"}, json.loads(response.read_text()))
+        self.assertEqual(["/redirect-https", "/version"], self.https_requests)
+        self.assertEqual([], self.http_requests)
+
+    def test_untrusted_certificate_is_refused(self) -> None:
+        result, _ = self._lookup(self.https_url + "/version", trust_certificate=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("certificate", result.stderr.lower())
+        self.assertEqual([], self.https_requests)
+
+    def test_initial_http_is_refused_before_any_request(self) -> None:
+        result, _ = self._lookup(self.http_url + "/version")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self.http_requests)
+
+    def test_https_redirect_cannot_downgrade_to_http(self) -> None:
+        result, _ = self._lookup(self.https_url + "/redirect-http")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(["/redirect-http"] * 5, self.https_requests)
+        self.assertEqual([], self.http_requests)
 
 
 if __name__ == "__main__":
