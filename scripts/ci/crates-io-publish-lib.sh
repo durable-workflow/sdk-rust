@@ -3,6 +3,7 @@
 # Registry metadata and archives must stay on HTTPS across redirects.
 crates_io_request() {
     curl --proto '=https' --proto-redir '=https' "$@"
+    return "$?"
 }
 
 # Look up an exact crate version, retrying only failures that can be transient.
