@@ -106,29 +106,35 @@ class ReleasePackageTest(unittest.TestCase):
         )
         for options in cases:
             with self.subTest(options=options):
+                archive = self.archive(**options)
                 with self.assertRaises(ReleasePackageError):
-                    self.restore(self.archive(**options))
+                    self.restore(archive)
                 self.assertFalse((self.root / "Cargo.lock").exists())
 
     def test_restore_refuses_unbounded_or_malformed_lock(self) -> None:
-        for content in (b" " * (1024 * 1024 + 1), b"\xff", b"not TOML", b"version = 4\n"):
+        for content in (
+            b" " * (1024 * 1024 + 1), b"\xff", b"not TOML", b"version = 4\n",
+            b"version = [4]\npackage = []\n", b"version = 4.0\npackage = []\n",
+        ):
             with self.subTest(size=len(content)):
+                archive = self.archive(lockfile=content)
                 with self.assertRaises(ReleasePackageError):
-                    self.restore(self.archive(lockfile=content))
+                    self.restore(archive)
                 self.assertFalse((self.root / "Cargo.lock").exists())
 
     def test_restore_never_replaces_existing_file_or_symlink(self) -> None:
         target = self.root / "Cargo.lock"
         target.write_bytes(b"existing lock")
+        archive = self.archive()
         with self.assertRaises(ReleasePackageError):
-            self.restore(self.archive())
+            self.restore(archive)
         self.assertEqual(b"existing lock", target.read_bytes())
         target.unlink()
         other = self.root / "other"
         other.write_bytes(b"other file")
         target.symlink_to(other)
         with self.assertRaises(ReleasePackageError):
-            self.restore(self.archive())
+            self.restore(archive)
         self.assertTrue(target.is_symlink())
         self.assertEqual(b"other file", other.read_bytes())
 

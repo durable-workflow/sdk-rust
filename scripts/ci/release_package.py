@@ -328,7 +328,8 @@ def restore_missing_lockfile(
                 raise ReleasePackageError("packaged Cargo.lock exceeds the 1 MiB limit")
             lockfile = _member_bytes(archive, member)
         parsed = tomllib.loads(lockfile.decode("utf-8"))
-        if parsed.get("version") not in {3, 4} or not isinstance(parsed.get("package"), list):
+        version = parsed.get("version")
+        if not isinstance(version, int) or version not in (3, 4) or not isinstance(parsed.get("package"), list):
             raise ReleasePackageError("packaged Cargo.lock has no supported dependency graph")
         with (manifest.parent / "Cargo.lock").open("xb") as output:
             output.write(lockfile)
