@@ -83,7 +83,7 @@ test_404_publishes_once() (
 
     cargo() {
         local count
-        [[ "$*" == "publish --manifest-path Cargo.toml --registry crates-io" ]] || return 2
+        [[ "$*" == "publish --locked --manifest-path Cargo.toml --registry crates-io" ]] || return 2
         count="$(<"$tmp_dir/publishes")"
         printf '%d\n' "$((count + 1))" > "$tmp_dir/publishes"
     }

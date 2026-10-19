@@ -15,6 +15,7 @@ from release_package import (
     ReleasePackageError,
     load_package,
     release_entry,
+    restore_missing_lockfile,
     verify_archive,
     verify_source,
 )
@@ -41,6 +42,9 @@ class ReleasePackageTest(unittest.TestCase):
         commit: str = COMMIT,
         dirty: bool | None = None,
         name: str = "candidate.crate",
+        lockfile: bytes | None = None,
+        lockfile_kind: bytes = tarfile.REGTYPE,
+        lockfile_copies: int = 1,
     ) -> Path:
         path = self.root / name
         root = f"{self.package['name']}-{self.package['version']}"
@@ -60,7 +64,73 @@ class ReleasePackageTest(unittest.TestCase):
                 member = tarfile.TarInfo(name)
                 member.size = len(content)
                 archive.addfile(member, io.BytesIO(content))
+            content = lockfile if lockfile is not None else (ROOT / "Cargo.lock").read_bytes()
+            for _ in range(lockfile_copies):
+                member = tarfile.TarInfo(f"{root}/Cargo.lock")
+                member.type = lockfile_kind
+                if member.isfile():
+                    member.size = len(content)
+                    archive.addfile(member, io.BytesIO(content))
+                else:
+                    member.linkname = "outside-lockfile"
+                    archive.addfile(member)
         return path
+
+    def restore(self, archive: Path, *, checksum: str | None = None, commit: str = COMMIT) -> dict:
+        manifest = self.root / "Cargo.toml"
+        changelog = self.root / "CHANGELOG.md"
+        manifest.write_bytes(MANIFEST.read_bytes())
+        changelog.write_bytes(CHANGELOG.read_bytes())
+        return restore_missing_lockfile(
+            archive, manifest, changelog, commit,
+            checksum if checksum is not None else hashlib.sha256(archive.read_bytes()).hexdigest(),
+        )
+
+    def test_restore_verified_registry_lockfile_exactly(self) -> None:
+        identity = self.restore(self.archive())
+        self.assertEqual((ROOT / "Cargo.lock").read_bytes(), (self.root / "Cargo.lock").read_bytes())
+        self.assertEqual("verified_registry_archive", identity["lockfile"]["source"])
+
+    def test_restore_refuses_wrong_archive_or_source_before_writing(self) -> None:
+        archive = self.archive()
+        for options in ({"checksum": "0" * 64}, {"commit": "f" * 40}):
+            with self.subTest(options=options):
+                with self.assertRaises(ReleasePackageError):
+                    self.restore(archive, **options)
+                self.assertFalse((self.root / "Cargo.lock").exists())
+
+    def test_restore_refuses_missing_duplicate_or_nonregular_lock(self) -> None:
+        cases = (
+            {"lockfile_copies": 0}, {"lockfile_copies": 2},
+            {"lockfile_kind": tarfile.SYMTYPE}, {"lockfile_kind": tarfile.LNKTYPE},
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                with self.assertRaises(ReleasePackageError):
+                    self.restore(self.archive(**options))
+                self.assertFalse((self.root / "Cargo.lock").exists())
+
+    def test_restore_refuses_unbounded_or_malformed_lock(self) -> None:
+        for content in (b" " * (1024 * 1024 + 1), b"\xff", b"not TOML", b"version = 4\n"):
+            with self.subTest(size=len(content)):
+                with self.assertRaises(ReleasePackageError):
+                    self.restore(self.archive(lockfile=content))
+                self.assertFalse((self.root / "Cargo.lock").exists())
+
+    def test_restore_never_replaces_existing_file_or_symlink(self) -> None:
+        target = self.root / "Cargo.lock"
+        target.write_bytes(b"existing lock")
+        with self.assertRaises(ReleasePackageError):
+            self.restore(self.archive())
+        self.assertEqual(b"existing lock", target.read_bytes())
+        target.unlink()
+        other = self.root / "other"
+        other.write_bytes(b"other file")
+        target.symlink_to(other)
+        with self.assertRaises(ReleasePackageError):
+            self.restore(self.archive())
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(b"other file", other.read_bytes())
 
     def test_current_source_has_one_nonempty_current_version_entry(self) -> None:
         identity = verify_source(MANIFEST, CHANGELOG)

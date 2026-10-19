@@ -306,16 +306,59 @@ def verify_archive(
     }
 
 
+def restore_missing_lockfile(
+    archive_path: Path,
+    manifest: Path,
+    changelog: Path,
+    expected_vcs_commit: str,
+    expected_archive_sha256: str,
+) -> dict[str, Any]:
+    identity = verify_archive(archive_path, manifest, changelog, expected_vcs_commit)
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_archive_sha256)
+        or identity["archive"]["sha256"] != expected_archive_sha256
+    ):
+        raise ReleasePackageError("registry archive checksum differs from expected SHA-256")
+    try:
+        with tarfile.open(archive_path, "r:*") as archive:
+            member = _regular_member(
+                archive, f"{identity['package']}-{identity['package_version']}/Cargo.lock"
+            )
+            if not 0 < member.size <= 1024 * 1024:
+                raise ReleasePackageError("packaged Cargo.lock exceeds the 1 MiB limit")
+            lockfile = _member_bytes(archive, member)
+        parsed = tomllib.loads(lockfile.decode("utf-8"))
+        if parsed.get("version") not in {3, 4} or not isinstance(parsed.get("package"), list):
+            raise ReleasePackageError("packaged Cargo.lock has no supported dependency graph")
+        with (manifest.parent / "Cargo.lock").open("xb") as output:
+            output.write(lockfile)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, tarfile.TarError) as error:
+        raise ReleasePackageError(f"could not restore missing Cargo.lock: {error}") from error
+    identity["lockfile"] = {"sha256": sha256(lockfile), "source": "verified_registry_archive"}
+    return identity
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=Path("Cargo.toml"))
     parser.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--expected-vcs-commit")
+    parser.add_argument("--expected-archive-sha256")
+    parser.add_argument("--restore-missing-lockfile", action="store_true")
     arguments = parser.parse_args()
+    if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
+        parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
 
     try:
-        if arguments.archive is None:
+        if arguments.restore_missing_lockfile:
+            if not all((arguments.archive, arguments.expected_vcs_commit, arguments.expected_archive_sha256)):
+                parser.error("lockfile recovery requires archive, source commit and registry checksum")
+            evidence = restore_missing_lockfile(
+                arguments.archive, arguments.manifest, arguments.changelog,
+                arguments.expected_vcs_commit, arguments.expected_archive_sha256,
+            )
+        elif arguments.archive is None:
             if arguments.expected_vcs_commit is not None:
                 parser.error("--expected-vcs-commit requires --archive")
             evidence = {

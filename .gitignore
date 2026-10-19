@@ -3,7 +3,6 @@
 /.zig/
 /zig.tar.xz
 /target/
-/Cargo.lock
 /.cargo/
 /.rustup/
 /rustup-init
