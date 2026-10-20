@@ -128,6 +128,12 @@ if [[ "${1:-}" == acknowledgement ]]; then
 fi
 
 if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
+  selected_cell="${2:-}"
+  if [[ -n "$selected_cell" ]] && [[ ! "$selected_cell" =~ ^(default|nexus-source):(rust:php|php:rust|rust:rust|rust:python|python:rust):(sync-accepted|async-completed|async-accepted)$ ]]; then
+    printf 'invalid admission cell: %s\n' "$selected_cell" >&2
+    exit 2
+  fi
+  completed_cells=0
   export NEXUS_QUALIFY_ADMISSION=1
   for namespace in default nexus-source; do admission_observe setup "$namespace"; done
   mkdir -p "$NEXUS_STATE_DIR/admissions"
@@ -145,6 +151,9 @@ if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
       caller="${direction%%:*}"
       target="${direction#*:}"
       for profile in sync-accepted async-completed async-accepted; do
+        if [[ -n "$selected_cell" && "$namespace:$direction:$profile" != "$selected_cell" ]]; then
+          continue
+        fi
         for schedule in ordinary cold; do
           require_backend
           case_id="r87a-${namespace}-${direction//:/-}-${profile}-${schedule}-$(date -u +%s)-$RANDOM"
@@ -179,10 +188,15 @@ if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
           require_backend
           cleanup
           owned=()
+          completed_cells=$((completed_cells + 1))
         done
       done
     done
   done
+  expected_cells=60
+  if [[ -n "$selected_cell" ]]; then expected_cells=2; fi
+  [[ "$completed_cells" -eq "$expected_cells" ]]
+  printf 'Completed %d admission cells with backend roles active.\n' "$completed_cells"
   exit 0
 fi
 

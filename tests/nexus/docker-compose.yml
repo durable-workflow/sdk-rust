@@ -97,7 +97,7 @@ services:
       retries: 30
   queue:
     <<: *runtime
-    command: [php, artisan, "queue:work", "--sleep=1", "--tries=3", "--max-time=1800"]
+    command: [php, artisan, "queue:work", "--sleep=1", "--tries=3", "--max-time=3600"]
     depends_on:
       server:
         condition: service_healthy

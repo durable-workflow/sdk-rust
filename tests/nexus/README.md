@@ -113,6 +113,19 @@ Each phase executes a fresh Python process against the original receipt. This
 avoids repeated container startup inside the unchanged thirty-second recovery
 window; it does not cache SDK state or extend an original deadline.
 
+For a bounded admission supplement, supply one validated caller namespace,
+direction and profile. Both ordinary and cold schedules still run with all
+original controls, and an empty or partial selection cannot pass:
+
+```sh
+bash tests/nexus/run.sh cross-namespace nexus-source:python:rust:async-accepted
+```
+
+The disposable queue role lasts at most one hour so a sixty-cell matrix can
+finish with startup and shutdown overhead. This is a runner lifetime, separate
+from each original thirty-second observation and 180-second service policy.
+Retire the backend immediately after its selected cases finish.
+
 ## Published Waterline inspection
 
 `bash tests/nexus/run.sh catalog` extends the cross-namespace result profile
