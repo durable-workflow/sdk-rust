@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "durable-workflow"
-version = "3.5.5"
+version = "3.5.6"
 dependencies = [
  "apache-avro",
  "base64 0.22.1",
