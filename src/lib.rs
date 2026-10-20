@@ -13,6 +13,8 @@ mod runtime_payloads;
 mod runtime_uploads;
 mod sticky_worker;
 mod sticky_workflow_cache;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 mod worker_session;
 mod workflow_hydration;
 
@@ -6777,6 +6779,8 @@ enum ManagedPollOutcome {
 
 #[derive(Clone)]
 pub struct Worker {
+    #[cfg(feature = "telemetry")]
+    telemetry: Option<telemetry::ExecutionTelemetry>,
     client: Client,
     worker_id: String,
     task_queue: String,
@@ -6812,6 +6816,8 @@ pub struct Worker {
 impl Worker {
     pub fn new(client: Client, task_queue: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "telemetry")]
+            telemetry: None,
             client,
             worker_id: default_worker_id(),
             task_queue: task_queue.into(),
@@ -6858,6 +6864,14 @@ impl Worker {
 
     pub fn poll_timeout(mut self, timeout: Duration) -> Self {
         self.poll_timeout = timeout;
+        self
+    }
+
+    /// Opt in to execution spans using application-owned OpenTelemetry providers.
+    /// No exporter, logging bridge, global provider or Server carrier is installed.
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry(mut self, telemetry: telemetry::ExecutionTelemetry) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 
@@ -8690,6 +8704,25 @@ impl Worker {
 
     async fn execute_query_task_with_authority(
         &self,
+        task: QueryTask,
+        authority: Option<&query_authority::Authority>,
+    ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry
+                .run(
+                    "durable.query.task",
+                    self.query_telemetry_fields(&task),
+                    false,
+                    self.execute_query_task_inner(task, authority),
+                )
+                .await;
+        }
+        self.execute_query_task_inner(task, authority).await
+    }
+
+    async fn execute_query_task_inner(
+        &self,
         mut task: QueryTask,
         authority: Option<&query_authority::Authority>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
@@ -8935,6 +8968,22 @@ impl Worker {
     }
 
     fn execute_workflow_task_decision_with_cancellation(
+        &self,
+        task: WorkflowTask,
+        observation: Option<&CancellationRequest>,
+    ) -> Result<WorkflowTaskDecision> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry.run_sync(
+                "durable.workflow.task",
+                self.workflow_telemetry_fields(&task),
+                || self.execute_workflow_task_decision_inner(task, observation),
+            );
+        }
+        self.execute_workflow_task_decision_inner(task, observation)
+    }
+
+    fn execute_workflow_task_decision_inner(
         &self,
         task: WorkflowTask,
         observation: Option<&CancellationRequest>,
@@ -9316,6 +9365,27 @@ impl Worker {
         worker_session: Option<WorkerSession>,
         hydration_claim: Option<&activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry
+                .run(
+                    "durable.activity.task",
+                    self.activity_telemetry_fields(&task),
+                    false,
+                    self.execute_session_activity_task_inner(task, worker_session, hydration_claim),
+                )
+                .await;
+        }
+        self.execute_session_activity_task_inner(task, worker_session, hydration_claim)
+            .await
+    }
+
+    async fn execute_session_activity_task_inner(
+        &self,
+        task: ActivityTask,
+        worker_session: Option<WorkerSession>,
+        hydration_claim: Option<&activity_hydration::HydrationClaim>,
+    ) -> Result<AvroValue> {
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
             if task.lease_owner.as_deref() != Some(self.worker_id.as_str())
@@ -9364,7 +9434,7 @@ impl Worker {
         if let Some(claim) = hydration_claim {
             claim.confirm(&self.client).await?;
         }
-        let callback = handler(ctx, args);
+        let callback = self.activity_callback(handler, ctx, args, false);
         if let Some(session) = session {
             tokio::select! {
                 biased;
@@ -9376,6 +9446,39 @@ impl Worker {
         } else {
             callback.await
         }
+    }
+
+    fn activity_callback(
+        &self,
+        handler: &ActivityHandler,
+        context: ActivityContext,
+        args: AvroValue,
+        local: bool,
+    ) -> ActivityFuture {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            let telemetry = telemetry.clone();
+            let fields = self.callback_telemetry_fields(&context, local);
+            let handler = handler.clone();
+            let name = if local {
+                "durable.local_activity.attempt"
+            } else {
+                "durable.activity.attempt"
+            };
+            return Box::pin(async move {
+                telemetry
+                    .run(
+                        name,
+                        fields,
+                        true,
+                        async move { handler(context, args).await },
+                    )
+                    .await
+            });
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = local;
+        handler(context, args)
     }
 }
 

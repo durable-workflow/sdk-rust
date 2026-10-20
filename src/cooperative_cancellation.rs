@@ -1931,6 +1931,41 @@ impl Worker {
         worker_session: Option<crate::WorkerSession>,
         hydration_claim: Option<&crate::activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry
+                .run(
+                    "durable.activity.task",
+                    self.activity_telemetry_fields(task),
+                    false,
+                    self.execute_cooperative_activity_task_inner(
+                        task,
+                        guard,
+                        callback_started,
+                        worker_session,
+                        hydration_claim,
+                    ),
+                )
+                .await;
+        }
+        self.execute_cooperative_activity_task_inner(
+            task,
+            guard,
+            callback_started,
+            worker_session,
+            hydration_claim,
+        )
+        .await
+    }
+
+    async fn execute_cooperative_activity_task_inner(
+        &self,
+        task: &ActivityTask,
+        guard: &ActivityClaimGuard,
+        callback_started: &mut bool,
+        worker_session: Option<crate::WorkerSession>,
+        hydration_claim: Option<&crate::activity_hydration::HydrationClaim>,
+    ) -> Result<AvroValue> {
         validate_activity_task_payloads(task)?;
         let handler = self
             .activities
@@ -1955,7 +1990,7 @@ impl Worker {
         }
         guard.boundary()?;
         *callback_started = true;
-        handler(context, args).await
+        self.activity_callback(handler, context, args, false).await
     }
 
     pub(super) async fn poll_cooperative_workflow_once(&self) -> Result<ManagedPollOutcome> {

@@ -322,6 +322,45 @@ option. Keep a process supervisor for startup failures and process crashes.
 | [`continue_as_new.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/continue_as_new.rs) | Bounded histories and continue-as-new |
 | [`parallel_saga.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/parallel_saga.rs) | Deterministic parallel work and saga compensation |
 
+### Optional execution telemetry
+
+Enable the `telemetry` Cargo feature and configure your application's
+OpenTelemetry provider, exporter, sampling and bounded export timeouts before
+constructing the worker:
+
+```rust,no_run
+# #[cfg(feature = "telemetry")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use durable_workflow::{Client, Worker};
+use durable_workflow::telemetry::ExecutionTelemetry;
+let client = Client::builder("http://localhost:8080").build()?;
+let worker = Worker::new(client, "orders").telemetry(ExecutionTelemetry::new());
+# Ok(())
+# }
+# #[cfg(not(feature = "telemetry"))]
+# fn main() {}
+```
+
+The default build has no OpenTelemetry dependency. The optional feature needs
+only its API; the application owns the SDK/exporter and provider shutdown.
+Task spans start fresh traces; actual remote/local activity attempts have
+separate child spans. Durable Server admission/queue carriers are not yet
+adopted, so this component does not connect separate task deliveries or retries.
+Replay emits workflow work spans without pretending completed activities ran
+again. No span stays open during durable waiting.
+
+Use `telemetry::current_log_context()` in a logging adapter, or wrap an existing
+OpenTelemetry logger provider in `telemetry::ExecutionLoggerProvider` before
+passing it to your application's logging bridge. It adds bounded namespace,
+worker, queue, task and available workflow/attempt IDs; trace/span IDs follow
+the current application child span. Request IDs and log messages remain owned
+by the application. The SDK installs no global logging bridge or provider.
+Tokio contexts attach during each poll and restore on yield, completion, panic
+and cancellation. Spawned application tasks must explicitly propagate their
+context when that is intended. Export failures do not change business results;
+applications must bound exporter I/O and drain their providers during shutdown.
+Abrupt process death may lose spans; telemetry is not exactly-once delivery.
+
 ## Documentation
 
 - [Rust SDK landing page](https://rust.durable-workflow.com/)
