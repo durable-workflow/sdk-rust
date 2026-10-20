@@ -6378,6 +6378,13 @@ fn worker_poll_outcome(
 #[derive(Clone, Debug, Deserialize)]
 pub struct QueryTask {
     pub query_task_id: String,
+    /// Optional, untrusted observability metadata. Receiving it does not authorize execution.
+    #[serde(default)]
+    pub observability_context: Option<Value>,
+    #[serde(default)]
+    pub dispatch_observability_context: Option<Value>,
+    #[serde(default)]
+    pub observability_links: Option<Value>,
     #[serde(default = "default_workflow_task_attempt")]
     pub query_task_attempt: u64,
     #[serde(default)]
@@ -6408,6 +6415,13 @@ pub struct QueryTask {
 #[derive(Clone, Debug, Deserialize)]
 pub struct WorkflowTask {
     pub task_id: String,
+    /// Optional, untrusted observability metadata. Receiving it does not authorize execution.
+    #[serde(default)]
+    pub observability_context: Option<Value>,
+    #[serde(default)]
+    pub dispatch_observability_context: Option<Value>,
+    #[serde(default)]
+    pub observability_links: Option<Value>,
     #[serde(default)]
     pub workflow_command_id: Option<String>,
     #[serde(default)]
@@ -6479,6 +6493,19 @@ struct WorkflowTaskHistoryPage {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ActivityTask {
     pub task_id: String,
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub activity_execution_id: Option<String>,
+    /// Optional, untrusted observability metadata. Receiving it does not authorize execution.
+    #[serde(default)]
+    pub observability_context: Option<Value>,
+    #[serde(default)]
+    pub dispatch_observability_context: Option<Value>,
+    #[serde(default)]
+    pub observability_links: Option<Value>,
     #[serde(default)]
     pub activity_attempt_id: Option<String>,
     #[serde(default)]
@@ -19643,6 +19670,72 @@ mod tests {
         assert_eq!(commands[0]["activity_type"], "trip.cancel-flight");
     }
 
+    #[test]
+    fn optional_task_observability_fields_round_trip_without_interpretation() {
+        let context = json!({"schema": "unknown", "carrier": {"traceparent": "untrusted"}});
+        let dispatch = json!({"task_id": "other-task"});
+        let links = json!({"links": []});
+        let mut value = json!({
+            "task_id": "task", "query_task_id": "query", "workflow_type": "workflow",
+            "activity_type": "activity", "query_name": "query", "payload_codec": "avro"
+        });
+        let workflow: WorkflowTask =
+            serde_json::from_value(value.clone()).expect("legacy workflow task");
+        let activity: ActivityTask =
+            serde_json::from_value(value.clone()).expect("legacy activity task");
+        let query: QueryTask = serde_json::from_value(value.clone()).expect("legacy query task");
+        assert!(workflow.observability_context.is_none());
+        assert!(activity.observability_context.is_none());
+        assert!(query.observability_context.is_none());
+        assert!(activity.workflow_id.is_none());
+        assert!(activity.run_id.is_none());
+        assert!(activity.activity_execution_id.is_none());
+
+        value["observability_context"] = context.clone();
+        value["dispatch_observability_context"] = dispatch.clone();
+        value["observability_links"] = links.clone();
+        value["workflow_id"] = json!("workflow-id");
+        value["run_id"] = json!("run-id");
+        value["activity_execution_id"] = json!("activity-id");
+        let workflow: WorkflowTask =
+            serde_json::from_value(value.clone()).expect("workflow metadata");
+        let activity: ActivityTask =
+            serde_json::from_value(value.clone()).expect("activity metadata");
+        let query: QueryTask = serde_json::from_value(value).expect("query metadata");
+        for fields in [
+            (
+                workflow.observability_context,
+                workflow.dispatch_observability_context,
+                workflow.observability_links,
+            ),
+            (
+                activity.observability_context,
+                activity.dispatch_observability_context,
+                activity.observability_links,
+            ),
+            (
+                query.observability_context,
+                query.dispatch_observability_context,
+                query.observability_links,
+            ),
+        ] {
+            assert_eq!(
+                fields,
+                (
+                    Some(context.clone()),
+                    Some(dispatch.clone()),
+                    Some(links.clone())
+                )
+            );
+        }
+        assert_eq!(activity.workflow_id.as_deref(), Some("workflow-id"));
+        assert_eq!(activity.run_id.as_deref(), Some("run-id"));
+        assert_eq!(
+            activity.activity_execution_id.as_deref(),
+            Some("activity-id")
+        );
+    }
+
     fn workflow_task(
         workflow_type: &str,
         history_events: Vec<HistoryEvent>,
@@ -19650,6 +19743,9 @@ mod tests {
     ) -> WorkflowTask {
         WorkflowTask {
             task_id: format!("wft-{workflow_type}"),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some(format!("wf-{workflow_type}")),
             run_id: Some(format!("run-{workflow_type}")),
@@ -20515,6 +20611,9 @@ mod tests {
         fn task(history_events: Vec<HistoryEvent>) -> WorkflowTask {
             WorkflowTask {
                 task_id: "wft-side-effect-version".to_string(),
+                observability_context: None,
+                dispatch_observability_context: None,
+                observability_links: None,
                 workflow_command_id: None,
                 workflow_id: Some("wf-side-effect-version".to_string()),
                 run_id: Some("run-side-effect-version".to_string()),
@@ -20728,6 +20827,12 @@ mod tests {
 
         let activity = ActivityTask {
             task_id: "typed-contract-activity".to_string(),
+            workflow_id: None,
+            run_id: None,
+            activity_execution_id: None,
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             activity_attempt_id: Some("typed-contract-attempt".to_string()),
             attempt_id: None,
             activity_type: "typed.contract.activity".to_string(),
@@ -20923,6 +21028,12 @@ mod tests {
 
         let activity = ActivityTask {
             task_id: "typed-unsupported-activity".to_string(),
+            workflow_id: None,
+            run_id: None,
+            activity_execution_id: None,
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             activity_attempt_id: Some("typed-unsupported-attempt".to_string()),
             attempt_id: None,
             activity_type: "typed.unsupported.activity".to_string(),
@@ -20989,6 +21100,9 @@ mod tests {
         let result = encode_typed_envelope(&typed_value, DEFAULT_CODEC).expect("activity result");
         let task = QueryTask {
             query_task_id: "typed-replay-query".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             query_task_attempt: 1,
             lease_owner: Some("rust-worker".to_string()),
             workflow_id: Some("typed-replay".to_string()),
@@ -21100,6 +21214,9 @@ mod tests {
         task.update_name = Some("inspect".into());
         let query = QueryTask {
             query_task_id: "query-snapshot".into(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             query_task_attempt: 1,
             lease_owner: None,
             workflow_id: task.workflow_id.clone(),
@@ -21298,6 +21415,12 @@ mod tests {
 
         let activity = ActivityTask {
             task_id: "activity-typed".to_string(),
+            workflow_id: None,
+            run_id: None,
+            activity_execution_id: None,
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             activity_attempt_id: Some("attempt-typed".to_string()),
             attempt_id: None,
             activity_type: "typed.activity".to_string(),
@@ -21316,6 +21439,9 @@ mod tests {
 
         let query = QueryTask {
             query_task_id: "query-typed".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             query_task_attempt: 1,
             lease_owner: Some("rust-worker".to_string()),
             workflow_id: Some("typed-1".to_string()),
@@ -21507,6 +21633,9 @@ mod tests {
             encode_typed_envelope(&arguments, DEFAULT_CODEC).expect("typed query signal arguments");
         let task = QueryTask {
             query_task_id: "query-typed-replay".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             query_task_attempt: 1,
             lease_owner: Some("rust-worker".to_string()),
             workflow_id: Some("typed-replay".to_string()),
@@ -21903,6 +22032,12 @@ mod tests {
 
         let activity = ActivityTask {
             task_id: "activity-invalid-codec".to_string(),
+            workflow_id: None,
+            run_id: None,
+            activity_execution_id: None,
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             activity_attempt_id: None,
             attempt_id: None,
             activity_type: "codec.activity".to_string(),
@@ -21996,6 +22131,12 @@ mod tests {
 
         let unknown_activity = ActivityTask {
             task_id: "activity-unknown".to_string(),
+            workflow_id: None,
+            run_id: None,
+            activity_execution_id: None,
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             activity_attempt_id: None,
             attempt_id: None,
             activity_type: "missing".to_string(),
@@ -25206,6 +25347,9 @@ mod tests {
 
         let task = |history_events| WorkflowTask {
             task_id: "wft-rust-timer-1".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
@@ -25407,6 +25551,9 @@ mod tests {
         });
         let task = WorkflowTask {
             task_id: "wft-rust-failing-1".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-rust-failing".to_string()),
             run_id: Some("run-rust-failing".to_string()),
@@ -25683,6 +25830,9 @@ mod tests {
 
         let task = WorkflowTask {
             task_id: "wft-rust-timer-pending".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
@@ -25730,6 +25880,9 @@ mod tests {
         });
         let task = WorkflowTask {
             task_id: "wft-rust-timer-removed".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-rust-timer".to_string()),
             run_id: Some("run-rust-timer".to_string()),
@@ -25852,6 +26005,9 @@ mod tests {
     fn child_parent_task(event_type: &str, payload: Value) -> WorkflowTask {
         WorkflowTask {
             task_id: "wft-child-parent".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-parent".to_string()),
             run_id: Some("run-parent".to_string()),
@@ -26126,6 +26282,9 @@ mod tests {
             encode_value_envelope(&json!(["Rust"]), DEFAULT_CODEC).expect("signal arguments");
         let task = WorkflowTask {
             task_id: "wft-rust-signal-1".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-rust-hello".to_string()),
             run_id: Some("run-rust-hello".to_string()),
@@ -26170,6 +26329,9 @@ mod tests {
     fn workflow_task_appends_paginated_history_events() {
         let mut task = WorkflowTask {
             task_id: "wft-rust-pages-1".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             workflow_command_id: None,
             workflow_id: Some("wf-rust-pages".to_string()),
             run_id: Some("run-rust-pages".to_string()),
@@ -26257,6 +26419,9 @@ mod tests {
 
         let task = QueryTask {
             query_task_id: "query-rust-counter".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             query_task_attempt: 1,
             lease_owner: Some("rust-worker".to_string()),
             workflow_id: Some("counter-1".to_string()),
@@ -26579,6 +26744,9 @@ mod tests {
 
         let base_task = QueryTask {
             query_task_id: "query-errors".to_string(),
+            observability_context: None,
+            dispatch_observability_context: None,
+            observability_links: None,
             query_task_attempt: 1,
             lease_owner: None,
             workflow_id: Some("counter-errors".to_string()),
