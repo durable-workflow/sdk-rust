@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.5.6
+
+- Refuse incompatible typed workflow entry arguments before invoking workflow
+  code, including cold replay with recorded history. Preserve the original task,
+  input and history for diagnosis and compatible-code recovery; exceptions from
+  an invoked workflow handler remain ordinary workflow failures.
+- Advertise pre-entry argument validation so supporting Servers can safely
+  select a compatible worker after a definition changes. Server 2.9.9 or later
+  provides the corresponding replay-blocked classification and recovery path;
+  older Servers retain their existing failure handling.
+
 ## 3.5.5
 
 - Fence managed queries with their original claim and caller deadline before
