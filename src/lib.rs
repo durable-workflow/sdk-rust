@@ -278,13 +278,6 @@ pub enum Error {
         rust_type: &'static str,
         message: String,
     },
-    #[error(
-        "workflow_entry_arguments_mismatch: workflow {workflow_type:?} recorded input does not match {rust_type}; restore compatible entry code before retrying the original task"
-    )]
-    WorkflowEntryArgumentsMismatch {
-        workflow_type: String,
-        rust_type: &'static str,
-    },
     #[error("workflow future yielded without emitting a durable command")]
     WorkflowYieldedWithoutCommand,
     #[error(
@@ -2313,10 +2306,12 @@ fn decode_workflow_entry<T: DeserializeOwned>(
     decode_handler_input(arguments, HandlerKind::Workflow, workflow_type).map_err(|_| {
         // Serde errors may contain recorded values. The entry refusal exposes
         // only the registered workflow and expected Rust type.
-        Error::WorkflowEntryArgumentsMismatch {
-            workflow_type: workflow_type.to_string(),
-            rust_type: type_name::<T>(),
-        }
+        handler_type_error::<T>(
+            HandlerKind::Workflow,
+            workflow_type,
+            HandlerValueKind::Input,
+            "workflow_entry_arguments_mismatch: restore compatible entry code before retrying the original task",
+        )
     })
 }
 
@@ -8270,7 +8265,14 @@ impl Worker {
             Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
             Err(error) => {
                 self.discard_sticky_snapshot(snapshot.as_ref())?;
-                if matches!(error, Error::WorkflowEntryArgumentsMismatch { .. }) {
+                if matches!(
+                    error,
+                    Error::HandlerType {
+                        handler_kind: HandlerKind::Workflow,
+                        value_kind: HandlerValueKind::Input,
+                        ..
+                    }
+                ) {
                     self.client
                         .fail_workflow_task_with_failure(
                             task_id,
@@ -20664,7 +20666,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(error
             .to_string()
-            .starts_with("workflow_entry_arguments_mismatch:"));
+            .contains("workflow_entry_arguments_mismatch:"));
         assert!(!error.to_string().contains("private-original-value"));
 
         let mut compatible = Worker::new(client, "rust-workers");
@@ -20706,7 +20708,7 @@ mod tests {
         assert_eq!(factories.load(Ordering::SeqCst), 0);
         assert!(error
             .to_string()
-            .starts_with("workflow_entry_arguments_mismatch:"));
+            .contains("workflow_entry_arguments_mismatch:"));
         assert!(!error.to_string().contains("private-replayed-value"));
 
         let replay = worker.workflows["entry.replayed"].replay.as_ref().unwrap();
@@ -20775,10 +20777,12 @@ mod tests {
         let client = Client::new("http://127.0.0.1:8080").expect("client");
         let mut worker = Worker::new(client, "rust-workers");
         worker.register_typed_workflow("entry.body.refusal", |_ctx, _input: i64| async move {
-            Err::<i64, _>(Error::WorkflowEntryArgumentsMismatch {
-                workflow_type: "deliberate body error".into(),
-                rust_type: "i64",
-            })
+            Err::<i64, _>(handler_type_error::<i64>(
+                HandlerKind::Workflow,
+                "entry.body.refusal",
+                HandlerValueKind::Input,
+                "workflow_entry_arguments_mismatch: deliberate body error",
+            ))
         });
         let mut task = workflow_task("entry.body.refusal", Vec::new(), DEFAULT_CODEC);
         task.arguments = Some(fixture_envelope(json!([7])));
