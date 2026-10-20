@@ -99,8 +99,32 @@ history must contain one original admission and terminal result, with unchanged
 caller/target authority, idempotency and budgets. The proxy's task/body hash is
 correlated with the physical admission. Final Workers and independent cold
 results must pass; the original faulted/killed process is recorded separately.
+Before and after retirement, the worker history endpoint must positively report
+the original physical task and attempt as completed. A distinct follow-up claim
+may be recovered when an in-flight poll outlives the killed process; require
+matching physical repair receipts in the same run and preserve committed
+history. A positive aggregate recovery count alone does not identify which
+task was recovered. Recovering an original committed task remains a failure.
 Run `node scripts/ci/test-completion-ack-proxy.mjs` to check the fault selector
 and unchanged local-activity proxy default without any SDK or Server fixture.
+
+Admission and lost-ack profiles keep one bounded observer container until cleanup.
+Each phase executes a fresh Python process against the original receipt. This
+avoids repeated container startup inside the unchanged thirty-second recovery
+window; it does not cache SDK state or extend an original deadline.
+
+For a bounded admission supplement, supply one validated caller namespace,
+direction and profile. Both ordinary and cold schedules still run with all
+original controls, and an empty or partial selection cannot pass:
+
+```sh
+bash tests/nexus/run.sh cross-namespace nexus-source:python:rust:async-accepted
+```
+
+The disposable queue role lasts at most one hour so a sixty-cell matrix can
+finish with startup and shutdown overhead. This is a runner lifetime, separate
+from each original thirty-second observation and 180-second service policy.
+Retire the backend immediately after its selected cases finish.
 
 ## Published Waterline inspection
 
