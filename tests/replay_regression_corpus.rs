@@ -1220,10 +1220,9 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
 
 #[tokio::test]
 async fn typed_entry_refusal_before_history_preserves_the_task_claim() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/replay-regressions/typed-entry-input-refusal.json"
-    ))
-    .unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/typed-entry-input-refusal.json");
+    let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     execute_fixture(&fixture)
         .await
         .expect("typed nonterminal entry refusal");
@@ -1231,10 +1230,9 @@ async fn typed_entry_refusal_before_history_preserves_the_task_claim() {
 
 #[tokio::test]
 async fn typed_entry_refusal_with_cold_history_preserves_the_task_claim() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "fixtures/replay-regressions/typed-entry-cold-history-refusal.json"
-    ))
-    .unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions/typed-entry-cold-history-refusal.json");
+    let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     execute_fixture(&fixture)
         .await
         .expect("typed nonterminal cold refusal");
