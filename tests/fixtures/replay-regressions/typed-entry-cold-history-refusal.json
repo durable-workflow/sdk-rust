@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-typed-entry-cold-history-refusal",
+  "protocol_version": "1.15",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.typed-replayed",
+    "input": ["private-cold-entry"],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ActivityScheduled",
+      "payload": {"sequence": 1, "activity_type": "corpus.typed.activity"}
+    }
+  ],
+  "command_sequence": [],
+  "expected": {
+    "command_sequence": [],
+    "handler_invocations": 0,
+    "side_effect_callback_calls": 0,
+    "task_failure": {
+      "lease_owner": "regression-corpus-worker",
+      "workflow_task_attempt": 1,
+      "failure": {
+        "type": "WorkflowEntryArgumentsMismatch",
+        "reason": "workflow_entry_arguments_mismatch"
+      }
+    }
+  }
+}

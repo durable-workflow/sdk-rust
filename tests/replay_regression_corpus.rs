@@ -1000,6 +1000,21 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         Some(completion) => completion,
         None => {
             let failure_path = format!("/api/worker/workflow-tasks/{task_id}/fail");
+            if fixture["expected"].get("task_failure").is_some()
+                && fixture["expected"]["waiting_for_history"] != true
+            {
+                let failure = server.request_body(&failure_path).ok_or_else(|| {
+                    format!("{fixture_id} did not publish its typed task refusal")
+                })?;
+                let observed = json!({
+                    "command_sequence": [],
+                    "task_failure": failure,
+                    "handler_invocations": handler_calls.load(Ordering::SeqCst),
+                    "side_effect_callback_calls": callback_calls.load(Ordering::SeqCst),
+                });
+                fixture_matches(&fixture["expected"], &observed, fixture_id)?;
+                return Ok(observed);
+            }
             if fixture["expected"]["waiting_for_history"] == true {
                 let failure = server.request_body(&failure_path).ok_or_else(|| {
                     format!("{fixture_id} did not acknowledge its pending history")
@@ -1201,6 +1216,28 @@ async fn checked_in_replay_regression_corpus_uses_official_worker_replay() {
             result.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         }
     }
+}
+
+#[tokio::test]
+async fn typed_entry_refusal_before_history_preserves_the_task_claim() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/replay-regressions/typed-entry-input-refusal.json"
+    ))
+    .unwrap();
+    execute_fixture(&fixture)
+        .await
+        .expect("typed nonterminal entry refusal");
+}
+
+#[tokio::test]
+async fn typed_entry_refusal_with_cold_history_preserves_the_task_claim() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/replay-regressions/typed-entry-cold-history-refusal.json"
+    ))
+    .unwrap();
+    execute_fixture(&fixture)
+        .await
+        .expect("typed nonterminal cold refusal");
 }
 
 #[tokio::test]
