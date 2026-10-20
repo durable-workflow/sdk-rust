@@ -7786,6 +7786,7 @@ impl Worker {
                 self.max_concurrent_activity_tasks,
                 [
                     Some(CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY.to_string()),
+                    Some("workflow_entry_arguments_validation".to_string()),
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
@@ -29120,6 +29121,7 @@ mod tests {
             server.request_body("/api/worker/register")["capabilities"],
             json!([
                 CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY,
+                "workflow_entry_arguments_validation",
                 DURABLE_SELECTION_CAPABILITY,
                 MEMO_UPSERTS_CAPABILITY,
                 TYPED_SEARCH_ATTRIBUTES_CAPABILITY,

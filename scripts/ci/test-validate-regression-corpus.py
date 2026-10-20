@@ -720,6 +720,15 @@ class EntryRefusalEvidenceTest(unittest.TestCase):
                 with self.assertRaises(VALIDATOR.CorpusError):
                     VALIDATOR._replay_fixture(fixture, "invalid.json", "rust")
 
+    def test_existing_waiting_acknowledgement_keeps_its_semantics(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        fixture = json.loads((root / "tests/fixtures/replay-regressions/legacy-patch-before-pending-activity.json").read_text())
+        evidence = VALIDATOR._replay_fixture(fixture, "waiting.json", "rust")
+        self.assertEqual(1, len(evidence))
+        fixture["history"] = []
+        with self.assertRaises(VALIDATOR.CorpusError):
+            VALIDATOR._replay_fixture(fixture, "invalid-waiting.json", "rust")
+
     def test_entry_refusal_cannot_hide_commands_or_change_the_failure(self) -> None:
         for mutation in ("commands", "type", "reason", "owner", "attempt"):
             with self.subTest(mutation=mutation):

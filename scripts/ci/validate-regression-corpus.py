@@ -707,7 +707,7 @@ def _canonical_executed_commands(
 ) -> Any:
     """Collapse every consumer-supported command assertion onto one output."""
 
-    if "task_failure" in expected:
+    if "task_failure" in expected and expected.get("waiting_for_history") is not True:
         return _entry_refusal_assertions(command_sequence, expected)
 
     executed_commands = (
@@ -933,7 +933,7 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     expected = _object(document.get("expected"), f"{path}.expected")
     if not expected:
         raise CorpusError(f"{path}.expected must not be empty")
-    entry_refusal = "task_failure" in expected
+    entry_refusal = "task_failure" in expected and expected.get("waiting_for_history") is not True
     declared_history = document.get("history")
     commands = document.get("command_sequence")
     if declared_history is None and commands is None:
