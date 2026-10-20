@@ -2299,6 +2299,22 @@ fn decode_handler_input<T: DeserializeOwned>(
     })
 }
 
+fn decode_workflow_entry<T: DeserializeOwned>(
+    arguments: AvroValue,
+    workflow_type: &str,
+) -> Result<T> {
+    decode_handler_input(arguments, HandlerKind::Workflow, workflow_type).map_err(|_| {
+        // Serde errors may contain recorded values. The entry refusal exposes
+        // only the registered workflow and expected Rust type.
+        handler_type_error::<T>(
+            HandlerKind::Workflow,
+            workflow_type,
+            HandlerValueKind::Input,
+            "workflow_entry_arguments_mismatch: restore compatible entry code before retrying the original task",
+        )
+    })
+}
+
 fn encode_handler_result<T: Serialize>(
     result: &T,
     handler_kind: HandlerKind,
@@ -4300,13 +4316,26 @@ impl Client {
         message: impl Into<String>,
         failure_type: &str,
     ) -> Result<Value> {
+        self.fail_workflow_task_with_failure(
+            task_id,
+            lease_owner,
+            workflow_task_attempt,
+            json!({"message": message.into(), "type": failure_type}),
+        )
+        .await
+    }
+
+    async fn fail_workflow_task_with_failure(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        workflow_task_attempt: u64,
+        failure: Value,
+    ) -> Result<Value> {
         let body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
-            "failure": {
-                "message": message.into(),
-                "type": failure_type
-            }
+            "failure": failure,
         });
         let path = format!("/worker/workflow-tasks/{task_id}/fail");
         self.request_json(
@@ -6581,11 +6610,12 @@ fn default_attempt_number() -> u64 {
 }
 
 type WorkflowFuture = Pin<Box<dyn Future<Output = Result<AvroValue>> + Send + 'static>>;
-type WorkflowHandler = Arc<dyn Fn(WorkflowContext, AvroValue) -> WorkflowFuture + Send + Sync>;
+type WorkflowHandler =
+    Arc<dyn Fn(WorkflowContext, AvroValue) -> Result<WorkflowFuture> + Send + Sync>;
 type ErasedWorkflowState = Arc<dyn Any + Send + Sync>;
 type WorkflowStateSnapshot = Arc<dyn Fn() -> Result<ErasedWorkflowState> + Send + Sync>;
 type ReplayedWorkflowHandler =
-    Arc<dyn Fn(WorkflowContext, AvroValue) -> ReplayedWorkflowInvocation + Send + Sync>;
+    Arc<dyn Fn(WorkflowContext, AvroValue) -> Result<ReplayedWorkflowInvocation> + Send + Sync>;
 type ActivityFuture = Pin<Box<dyn Future<Output = Result<AvroValue>> + Send + 'static>>;
 type ActivityHandler = Arc<dyn Fn(ActivityContext, AvroValue) -> ActivityFuture + Send + Sync>;
 type QueryFuture = Pin<Box<dyn Future<Output = Result<AvroValue>> + Send + 'static>>;
@@ -7004,10 +7034,10 @@ impl Worker {
             RegisteredWorkflow {
                 execute: Arc::new(move |ctx, input| {
                     let handler = Arc::clone(&handler);
-                    Box::pin(async move {
+                    Ok(Box::pin(async move {
                         let result = handler(ctx, input.into_json()?).await?;
                         AvroValue::from_serialize(&result)
-                    })
+                    }))
                 }),
                 replay: None,
                 state_type: None,
@@ -7052,14 +7082,13 @@ impl Worker {
             workflow_type,
             RegisteredWorkflow {
                 execute: Arc::new(move |ctx, input| {
+                    let input = decode_workflow_entry::<I>(input, &handler_name)?;
                     let handler = Arc::clone(&handler);
                     let handler_name = handler_name.clone();
-                    Box::pin(async move {
-                        let input =
-                            decode_handler_input::<I>(input, HandlerKind::Workflow, &handler_name)?;
+                    Ok(Box::pin(async move {
                         let result = handler(ctx, input).await?;
                         encode_handler_result(&result, HandlerKind::Workflow, &handler_name)
-                    })
+                    }))
                 }),
                 replay: None,
                 state_type: None,
@@ -7090,7 +7119,7 @@ impl Worker {
         self.workflows.insert(
             workflow_type,
             RegisteredWorkflow {
-                execute: Arc::new(move |ctx, input| Box::pin(handler(ctx, input))),
+                execute: Arc::new(move |ctx, input| Ok(Box::pin(handler(ctx, input)))),
                 replay: None,
                 state_type: None,
                 definition_fingerprint: None,
@@ -7134,10 +7163,10 @@ impl Worker {
         let execute = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
             let state = WorkflowInstance::new(execute_factory());
             let handler = Arc::clone(&execute_handler);
-            Box::pin(async move {
+            Ok(Box::pin(async move {
                 let result = handler(ctx, input.into_json()?, state).await?;
                 AvroValue::from_serialize(&result)
-            }) as WorkflowFuture
+            }) as WorkflowFuture)
         });
 
         let replay = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
@@ -7150,10 +7179,10 @@ impl Worker {
                 let result = replay_handler(ctx, input.into_json()?, state).await?;
                 AvroValue::from_serialize(&result)
             };
-            ReplayedWorkflowInvocation {
+            Ok(ReplayedWorkflowInvocation {
                 future: Box::pin(future),
                 snapshot,
-            }
+            })
         });
 
         self.workflows.insert(
@@ -7202,18 +7231,19 @@ impl Worker {
         let execute_factory = Arc::clone(&state_factory);
         let execute_handler = Arc::clone(&handler);
         let execute = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
+            let input = decode_workflow_entry::<I>(input, &execute_name)?;
             let state = WorkflowInstance::new(execute_factory());
             let handler = Arc::clone(&execute_handler);
             let handler_name = execute_name.clone();
-            Box::pin(async move {
-                let input = decode_handler_input::<I>(input, HandlerKind::Workflow, &handler_name)?;
+            Ok(Box::pin(async move {
                 let result = handler(ctx, input, state).await?;
                 encode_handler_result(&result, HandlerKind::Workflow, &handler_name)
-            }) as WorkflowFuture
+            }) as WorkflowFuture)
         });
 
         let replay_name = workflow_type.clone();
         let replay = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
+            let input = decode_workflow_entry::<I>(input, &replay_name)?;
             let state = WorkflowInstance::new(state_factory());
             let snapshot_state = state.clone();
             let snapshot: WorkflowStateSnapshot =
@@ -7221,14 +7251,13 @@ impl Worker {
             let handler = Arc::clone(&handler);
             let handler_name = replay_name.clone();
             let future = async move {
-                let input = decode_handler_input::<I>(input, HandlerKind::Workflow, &handler_name)?;
                 let result = handler(ctx, input, state).await?;
                 encode_handler_result(&result, HandlerKind::Workflow, &handler_name)
             };
-            ReplayedWorkflowInvocation {
+            Ok(ReplayedWorkflowInvocation {
                 future: Box::pin(future),
                 snapshot,
-            }
+            })
         });
 
         self.workflows.insert(
@@ -7341,7 +7370,7 @@ impl Worker {
         let execute_handler = Arc::clone(&handler);
         let execute = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
             let state = WorkflowInstance::new(execute_factory());
-            Box::pin(execute_handler(ctx, input, state)) as WorkflowFuture
+            Ok(Box::pin(execute_handler(ctx, input, state)) as WorkflowFuture)
         });
 
         let replay = Arc::new(move |ctx: WorkflowContext, input: AvroValue| {
@@ -7349,10 +7378,10 @@ impl Worker {
             let snapshot_state = state.clone();
             let snapshot: WorkflowStateSnapshot =
                 Arc::new(move || Ok(Arc::new(snapshot_state.snapshot()?) as ErasedWorkflowState));
-            ReplayedWorkflowInvocation {
+            Ok(ReplayedWorkflowInvocation {
                 future: Box::pin(handler(ctx, input, state)),
                 snapshot,
-            }
+            })
         });
 
         self.workflows.insert(
@@ -7757,6 +7786,7 @@ impl Worker {
                 self.max_concurrent_activity_tasks,
                 [
                     Some(CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY.to_string()),
+                    Some("workflow_entry_arguments_validation".to_string()),
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
@@ -8236,9 +8266,31 @@ impl Worker {
             Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
             Err(error) => {
                 self.discard_sticky_snapshot(snapshot.as_ref())?;
-                self.client
-                    .fail_workflow_task(task_id, lease_owner, attempt, error.to_string())
-                    .await?;
+                if matches!(
+                    error,
+                    Error::HandlerType {
+                        handler_kind: HandlerKind::Workflow,
+                        value_kind: HandlerValueKind::Input,
+                        ..
+                    }
+                ) {
+                    self.client
+                        .fail_workflow_task_with_failure(
+                            task_id,
+                            lease_owner,
+                            attempt,
+                            json!({
+                                "message": error.to_string(),
+                                "type": "WorkflowEntryArgumentsMismatch",
+                                "reason": "workflow_entry_arguments_mismatch",
+                            }),
+                        )
+                        .await?;
+                } else {
+                    self.client
+                        .fail_workflow_task(task_id, lease_owner, attempt, error.to_string())
+                        .await?;
+                }
             }
         }
 
@@ -8784,7 +8836,14 @@ impl Worker {
                     cancellation_scope_id: "root".into(),
                 };
                 query_authority::before_handler(authority, &self.client).await?;
-                let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone());
+                let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone())
+                    .map_err(|error| {
+                        QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            error.to_string(),
+                            "QueryWorkflowStateUnavailable",
+                        )
+                    })?;
                 let outcome = {
                     let mut cx = TaskContext::from_waker(noop_waker_ref());
                     let _replay = cancellation_replay_clock::ReplayGuard::enter(&workflow_context)
@@ -8989,7 +9048,7 @@ impl Worker {
             state,
             cancellation_scope_id: "root".into(),
         };
-        let future = (workflow.execute)(ctx.clone(), input);
+        let future = (workflow.execute)(ctx.clone(), input)?;
         Ok(PreparedWorkflowTask::Execution {
             task,
             context: ctx,
@@ -20589,6 +20648,151 @@ mod tests {
         assert_eq!(activity_result, expected);
     }
 
+    #[test]
+    fn typed_entry_mismatch_refuses_before_body_and_preserves_original_input() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client.clone(), "rust-workers");
+        worker.register_typed_workflow("entry.safe", move |_ctx, input: i64| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(input) }
+        });
+        let mut task = workflow_task("entry.safe", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!(["private-original-value"])));
+        let original = task.clone();
+        let error = worker
+            .execute_workflow_task(task)
+            .expect_err("incompatible entry must refuse the task, not fail the run");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(error
+            .to_string()
+            .contains("workflow_entry_arguments_mismatch:"));
+        assert!(!error.to_string().contains("private-original-value"));
+
+        let mut compatible = Worker::new(client, "rust-workers");
+        compatible
+            .register_typed_workflow("entry.safe", |_ctx, input: String| async move { Ok(input) });
+        let commands = compatible
+            .execute_workflow_task(original)
+            .expect("same recorded input");
+        assert_eq!(commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+            json!("private-original-value")
+        );
+    }
+
+    #[test]
+    fn typed_entry_replayed_mismatch_refuses_before_state_factory_and_body() {
+        let factories = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&factories);
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_replayed_workflow(
+            "entry.replayed",
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ()
+            },
+            |_ctx, _input: i64, _state| async move {
+                panic!("body must not start");
+                #[allow(unreachable_code)]
+                Ok(0_i64)
+            },
+        );
+        let mut task = workflow_task("entry.replayed", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!(["private-replayed-value"])));
+        let error = worker
+            .execute_workflow_task(task)
+            .expect_err("entry refusal");
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+        assert!(error
+            .to_string()
+            .contains("workflow_entry_arguments_mismatch:"));
+        assert!(!error.to_string().contains("private-replayed-value"));
+
+        let replay = worker.workflows["entry.replayed"].replay.as_ref().unwrap();
+        let Err(error) = replay(
+            workflow_context(Vec::new()),
+            AvroValue::Array(vec![AvroValue::String("private-replayed-value".into())]),
+        ) else {
+            panic!("query replay must refuse before creating application state");
+        };
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+        assert!(!error.to_string().contains("private-replayed-value"));
+    }
+
+    #[test]
+    fn typed_entry_deserializes_once_before_entering_application_code() {
+        static DECODES: AtomicUsize = AtomicUsize::new(0);
+        struct Counted(i64);
+        impl<'de> Deserialize<'de> for Counted {
+            fn deserialize<D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> std::result::Result<Self, D::Error> {
+                DECODES.fetch_add(1, Ordering::SeqCst);
+                i64::deserialize(deserializer).map(Self)
+            }
+        }
+        DECODES.store(0, Ordering::SeqCst);
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_workflow(
+            "entry.once",
+            |_ctx, input: Counted| async move { Ok(input.0) },
+        );
+        let mut task = workflow_task("entry.once", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!([7])));
+        let commands = worker.execute_workflow_task(task).expect("typed result");
+        assert_eq!(commands[0]["type"], "complete_workflow");
+        assert_eq!(DECODES.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn typed_entry_body_input_error_remains_a_business_failure() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_workflow("entry.body", |_ctx, _input: i64| async move {
+            Err::<i64, _>(handler_type_error::<i64>(
+                HandlerKind::Workflow,
+                "entry.body",
+                HandlerValueKind::Input,
+                "deliberate body error",
+            ))
+        });
+        let mut task = workflow_task("entry.body", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!([7])));
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("business failure command");
+        assert_eq!(commands[0]["type"], "fail_workflow");
+        assert!(commands[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deliberate body error"));
+    }
+
+    #[test]
+    fn typed_entry_body_cannot_claim_the_adapter_refusal() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_workflow("entry.body.refusal", |_ctx, _input: i64| async move {
+            Err::<i64, _>(handler_type_error::<i64>(
+                HandlerKind::Workflow,
+                "entry.body.refusal",
+                HandlerValueKind::Input,
+                "workflow_entry_arguments_mismatch: deliberate body error",
+            ))
+        });
+        let mut task = workflow_task("entry.body.refusal", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!([7])));
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("business failure");
+        assert_eq!(commands[0]["type"], "fail_workflow");
+    }
+
     #[tokio::test]
     async fn typed_handler_errors_include_handler_name_direction_and_rust_type() {
         let client = Client::new("http://127.0.0.1:8080").expect("client");
@@ -20612,13 +20816,13 @@ mod tests {
             )
             .expect("malformed typed arguments"),
         );
-        let commands = worker
+        let error = worker
             .execute_workflow_task(workflow)
-            .expect("shape mismatch becomes a workflow failure");
-        let message = commands[0]["message"].as_str().expect("failure message");
-        assert!(message.contains("workflow handler \"typed.shape.workflow\" input type"));
+            .expect_err("entry shape mismatch refuses the task");
+        let message = error.to_string();
+        assert!(message.contains("workflow_entry_arguments_mismatch:"));
+        assert!(message.contains("typed.shape.workflow"));
         assert!(message.contains(type_name::<TypedContract>()));
-        assert!(message.contains("task carried 2 arguments"));
 
         let activity = ActivityTask {
             task_id: "typed-unsupported-activity".to_string(),
@@ -28917,6 +29121,7 @@ mod tests {
             server.request_body("/api/worker/register")["capabilities"],
             json!([
                 CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY,
+                "workflow_entry_arguments_validation",
                 DURABLE_SELECTION_CAPABILITY,
                 MEMO_UPSERTS_CAPABILITY,
                 TYPED_SEARCH_ATTRIBUTES_CAPABILITY,

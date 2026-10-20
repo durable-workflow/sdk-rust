@@ -695,6 +695,57 @@ mod tests {
         self.assertFalse(self._guard_matches())
 
 
+class EntryRefusalEvidenceTest(unittest.TestCase):
+    def fixture(self) -> dict:
+        root = Path(__file__).resolve().parents[2]
+        return json.loads((root / "tests/fixtures/replay-regressions/typed-entry-input-refusal.json").read_text())
+
+    def test_command_free_entry_refusal_is_executable_evidence(self) -> None:
+        evidence = VALIDATOR._replay_fixture(self.fixture(), "entry.json", "rust")
+        self.assertEqual(1, len(evidence))
+
+    def test_cold_entry_refusal_preserves_its_history_identity(self) -> None:
+        fixture = self.fixture()
+        empty = VALIDATOR._replay_fixture(fixture, "empty.json", "rust")[0]
+        fixture["history"] = [{"event_type": "ActivityScheduled", "payload": {"sequence": 1, "activity_type": "echo"}}]
+        cold = VALIDATOR._replay_fixture(fixture, "cold.json", "rust")[0]
+        self.assertNotEqual(empty.semantic_digest, cold.semantic_digest)
+
+    def test_empty_history_cannot_replace_a_real_entry_refusal(self) -> None:
+        for field, value in [("handler_invocations", 1), ("handler_invocations", False),
+                             ("side_effect_callback_calls", 1), ("task_failure", {})]:
+            with self.subTest(field=field, value=value):
+                fixture = self.fixture()
+                fixture["expected"][field] = value
+                with self.assertRaises(VALIDATOR.CorpusError):
+                    VALIDATOR._replay_fixture(fixture, "invalid.json", "rust")
+
+    def test_existing_waiting_acknowledgement_keeps_its_semantics(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        fixture = json.loads((root / "tests/fixtures/replay-regressions/legacy-patch-before-pending-activity.json").read_text())
+        evidence = VALIDATOR._replay_fixture(fixture, "waiting.json", "rust")
+        self.assertEqual(1, len(evidence))
+        fixture["history"] = []
+        with self.assertRaises(VALIDATOR.CorpusError):
+            VALIDATOR._replay_fixture(fixture, "invalid-waiting.json", "rust")
+
+    def test_entry_refusal_cannot_hide_commands_or_change_the_failure(self) -> None:
+        for mutation in ("commands", "type", "reason", "owner", "attempt"):
+            with self.subTest(mutation=mutation):
+                fixture = self.fixture()
+                failure = fixture["expected"]["task_failure"]
+                if mutation == "commands":
+                    fixture["command_sequence"] = [{"type": "complete_workflow", "result": 1}]
+                elif mutation in ("type", "reason"):
+                    failure["failure"][mutation] = "RuntimeError"
+                elif mutation == "owner":
+                    failure["lease_owner"] = ""
+                else:
+                    failure["workflow_task_attempt"] = 0
+                with self.assertRaises(VALIDATOR.CorpusError):
+                    VALIDATOR._replay_fixture(fixture, "invalid.json", "rust")
+
+
 class ReplaySemanticIdentityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="regression-corpus-replay-")

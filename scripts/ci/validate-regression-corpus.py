@@ -707,6 +707,9 @@ def _canonical_executed_commands(
 ) -> Any:
     """Collapse every consumer-supported command assertion onto one output."""
 
+    if "task_failure" in expected and expected.get("waiting_for_history") is not True:
+        return _entry_refusal_assertions(command_sequence, expected)
+
     executed_commands = (
         _canonical_replay_commands(command_sequence)
         if command_sequence is not None
@@ -750,6 +753,29 @@ def _canonical_executed_commands(
             ]
 
     return executed_commands
+
+
+def _entry_refusal_assertions(command_sequence: Any, expected: Mapping[str, Any]) -> Any:
+    """Keep a real command-free Worker refusal distinct from empty evidence."""
+
+    fields = {"command_sequence", "handler_invocations", "side_effect_callback_calls", "task_failure"}
+    if set(expected) != fields or command_sequence != [] or expected["command_sequence"] != []:
+        raise CorpusError("entry refusal must assert zero commands and complete Worker observations")
+    for field in ("handler_invocations", "side_effect_callback_calls"):
+        if type(expected[field]) is not int or expected[field] != 0:
+            raise CorpusError("entry refusal must assert zero handler and callback invocations")
+    task = _object(expected["task_failure"], "entry refusal task_failure")
+    if set(task) != {"lease_owner", "workflow_task_attempt", "failure"}:
+        raise CorpusError("entry refusal must assert the original task ownership and attempt")
+    _string(task["lease_owner"], "entry refusal lease_owner")
+    if type(task["workflow_task_attempt"]) is not int or task["workflow_task_attempt"] < 1:
+        raise CorpusError("entry refusal workflow_task_attempt must be a positive integer")
+    if task["failure"] != {
+        "type": "WorkflowEntryArgumentsMismatch",
+        "reason": "workflow_entry_arguments_mismatch",
+    }:
+        raise CorpusError("entry refusal must assert the exact structured pre-entry failure")
+    return dict(expected)
 
 
 def _replay_semantic(
@@ -904,18 +930,19 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
     if not isinstance(fallback_codec, str):
         raise CorpusError(f"{path}.workflow.payload_codec must be a string")
     _list(workflow_input, f"{path}.workflow.input")
+    expected = _object(document.get("expected"), f"{path}.expected")
+    if not expected:
+        raise CorpusError(f"{path}.expected must not be empty")
+    entry_refusal = "task_failure" in expected and expected.get("waiting_for_history") is not True
     declared_history = document.get("history")
     commands = document.get("command_sequence")
     if declared_history is None and commands is None:
         raise CorpusError(f"{path} must include history or command_sequence")
     if declared_history is not None:
-        _list(declared_history, f"{path}.history", nonempty=True)
+        _list(declared_history, f"{path}.history", nonempty=not entry_refusal)
     if commands is not None:
-        _list(commands, f"{path}.command_sequence", nonempty=True)
+        _list(commands, f"{path}.command_sequence", nonempty=not entry_refusal)
     history = declared_history if declared_history is not None else []
-    expected = _object(document.get("expected"), f"{path}.expected")
-    if not expected:
-        raise CorpusError(f"{path}.expected must not be empty")
     supersedes = tuple(
         _string(item, f"{path}.supersedes[]")
         for item in _list(document.get("supersedes", []), f"{path}.supersedes")
