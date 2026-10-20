@@ -98,11 +98,54 @@ async def prepare(case, caller, target, namespace, target_namespace, http, clien
                       "call_id": record["call_id"]}), flush=True)
 
 
-async def retire(record, client):
+async def completed_claim(http, task):
+    reply = await http.post(f"/api/worker/workflow-tasks/{task['id']}/history",
+        headers={"X-Durable-Workflow-Protocol-Version": "1.20"},
+        json={"lease_owner": task["lease_owner"], "workflow_task_attempt": task["attempt_count"],
+              "next_history_page_token": "MA==", "history_page_size": 1})
+    value = reply.json()
+    require(reply.status_code == 409 and value.get("task_id") == task["id"]
+            and type(value.get("workflow_task_attempt")) is int
+            and value.get("workflow_task_attempt") == task["attempt_count"]
+            and value.get("reason") in {"task_not_leased", "run_closed"}
+            and value.get("task_status") == "completed",
+            "The original committed task is not positively confirmed completed")
+    return {key: value[key] for key in ("task_id", "workflow_task_attempt", "reason", "task_status")}
+
+
+def retirement_recoveries(before, after, reply, task, worker_path, run_id):
+    count = reply["recovered_workflow_task_count"]
+    require(type(count) is int and count >= 0, "Invalid recovered workflow-task count")
+    prefix = before["events"]
+    require(after["events"][:len(prefix)] == prefix, "Retirement changed committed history")
+    committed = {row["payload"]["task"]["id"] for row in prefix
+                 if row["event_type"] in {"ServiceCallStarted", "TimerScheduled"}
+                 and isinstance(row.get("payload", {}).get("task"), dict)}
+    committed.add(task["id"])
+    repairs = [row["payload"] for row in after["events"][len(prefix):]
+               if row["event_type"] == "RepairRequested"
+               and row["payload"].get("command", {}).get("request_path") == worker_path]
+    require(len(repairs) == count, "Retirement recovery count lacks physical repair receipts")
+    require(all(row.get("workflow_run_id") == run_id and row["task"].get("type") == "workflow"
+                for row in repairs), "Retirement recovered work outside the original workflow run")
+    recovered = [row["task"]["id"] for row in repairs]
+    require(len(set(recovered)) == count and not committed.intersection(recovered),
+            "Retirement recovered an original committed task or duplicated a recovery")
+    return recovered
+
+
+async def retire(record, client, http):
+    task = one(record["admission_history"], "ServiceCallStarted")["payload"]["task"]
+    record["original_claim_before_retirement"] = await completed_claim(http, task)
+    before = await history(http, record["case"], record["caller_run"])
     reply = await client.deregister_worker_registration(f"{record['case']}-caller")
-    require(type(reply["recovered_workflow_task_count"]) is int and reply["recovered_workflow_task_count"] == 0,
-            "Original completed claim was recovered as an active lease")
-    record["retired_registration"] = reply
+    record["original_claim_after_retirement"] = await completed_claim(http, task)
+    after = await history(http, record["case"], record["caller_run"])
+    require(not any(row["event_type"] in TERMINAL for row in after["events"]),
+            "Caller completed before its cold replacement")
+    record["recovered_followup_tasks"] = retirement_recoveries(before, after, reply, task,
+        f"/api/worker/registrations/{record['case']}-caller", record["caller_run"])
+    record["retired_registration"], record["retirement_history"] = reply, after
 
 
 async def target_complete(record, http, target_http, target_client):
@@ -220,7 +263,7 @@ async def main():
         else:
             async with asyncio.timeout(remaining(record)):
                 if phase == "retire":
-                    await retire(record, client)
+                    await retire(record, client, http)
                 elif phase == "target":
                     await target_complete(record, http, target_http, target_client)
                 elif phase == "caller":

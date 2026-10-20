@@ -99,6 +99,12 @@ history must contain one original admission and terminal result, with unchanged
 caller/target authority, idempotency and budgets. The proxy's task/body hash is
 correlated with the physical admission. Final Workers and independent cold
 results must pass; the original faulted/killed process is recorded separately.
+Before and after retirement, the worker history endpoint must positively report
+the original physical task and attempt as completed. A distinct follow-up claim
+may be recovered when an in-flight poll outlives the killed process; require
+matching physical repair receipts in the same run and preserve committed
+history. A positive aggregate recovery count alone does not identify which
+task was recovered. Recovering an original committed task remains a failure.
 Run `node scripts/ci/test-completion-ack-proxy.mjs` to check the fault selector
 and unchanged local-activity proxy default without any SDK or Server fixture.
 

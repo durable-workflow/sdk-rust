@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 path = Path(os.environ.get("ACK_READER_PATH", Path(__file__).with_name("acknowledgements.py")))
 spec = importlib.util.spec_from_file_location("ack_reader", path)
@@ -93,6 +94,64 @@ class PendingDelivery(unittest.IsolatedAsyncioTestCase):
         rows[2]["events"][0]["payload"]["service_call_id"] = "another-call"
         with self.assertRaises(AssertionError):
             await self.observe(rows)
+
+
+class CompletedClaim(unittest.IsolatedAsyncioTestCase):
+    async def check(self, **changes):
+        value = {"task_id": "committed-task", "workflow_task_attempt": 1,
+                 "reason": "task_not_leased", "task_status": "completed", **changes}
+        http = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(
+            status_code=409, json=lambda: value)))
+        return await reader.completed_claim(http, {
+            "id": "committed-task", "attempt_count": 1, "lease_owner": "original-worker"})
+
+    async def test_completed_physical_claim_is_required(self):
+        self.assertEqual((await self.check())["task_status"], "completed")
+        self.assertEqual((await self.check(reason="run_closed"))["task_status"], "completed")
+
+    async def test_recovered_ready_or_leased_original_is_refused(self):
+        for state in ("ready", "leased", None):
+            with self.subTest(state=state), self.assertRaises(AssertionError):
+                await self.check(task_status=state)
+
+    async def test_another_task_attempt_or_unknown_refusal_is_refused(self):
+        for change in ({"task_id": "followup"}, {"workflow_task_attempt": 2},
+                       {"workflow_task_attempt": True}, {"reason": "task_not_found"}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                await self.check(**change)
+
+
+class RetirementIdentity(unittest.TestCase):
+    def check(self, task_id="followup", count=1, mutate=False, run_id="run"):
+        before = {"events": [{"event_type": "ServiceCallStarted", "payload": {
+            "task": {"id": "committed-task"}}}]}
+        after = copy.deepcopy(before)
+        if mutate:
+            after["events"][0]["payload"]["task"]["id"] = "rewritten"
+        after["events"].append({"event_type": "RepairRequested", "payload": {
+            "task": {"id": task_id, "type": "workflow"}, "workflow_run_id": run_id,
+            "command": {"request_path": "/original-retirement"}}})
+        return reader.retirement_recoveries(before, after,
+            {"recovered_workflow_task_count": count}, {"id": "committed-task"},
+            "/original-retirement", "run")
+
+    def test_recovery_of_a_distinct_followup_is_valid(self):
+        self.assertEqual(self.check(), ["followup"])
+
+    def test_recovery_of_original_committed_claim_is_refused(self):
+        with self.assertRaises(AssertionError):
+            self.check(task_id="committed-task")
+
+    def test_missing_or_untyped_count_and_wrong_run_are_refused(self):
+        for count in (0, 2, True, "1", -1):
+            with self.subTest(count=count), self.assertRaises(AssertionError):
+                self.check(count=count)
+        with self.assertRaises(AssertionError):
+            self.check(run_id="other-run")
+
+    def test_original_history_cannot_change(self):
+        with self.assertRaises(AssertionError):
+            self.check(mutate=True)
 
 
 if __name__ == "__main__":
