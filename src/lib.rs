@@ -20589,6 +20589,95 @@ mod tests {
         assert_eq!(activity_result, expected);
     }
 
+    #[test]
+    fn typed_entry_mismatch_refuses_before_body_and_preserves_original_input() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client.clone(), "rust-workers");
+        worker.register_typed_workflow("entry.safe", move |_ctx, input: i64| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(input) }
+        });
+        let mut task = workflow_task("entry.safe", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!(["private-original-value"])));
+        let original = task.clone();
+        let error = worker
+            .execute_workflow_task(task)
+            .expect_err("incompatible entry must refuse the task, not fail the run");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(error
+            .to_string()
+            .starts_with("workflow_entry_arguments_mismatch:"));
+        assert!(!error.to_string().contains("private-original-value"));
+
+        let mut compatible = Worker::new(client, "rust-workers");
+        compatible
+            .register_typed_workflow("entry.safe", |_ctx, input: String| async move { Ok(input) });
+        let commands = compatible
+            .execute_workflow_task(original)
+            .expect("same recorded input");
+        assert_eq!(commands[0]["type"], "complete_workflow");
+        assert_eq!(
+            decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap(),
+            json!("private-original-value")
+        );
+    }
+
+    #[test]
+    fn typed_entry_replayed_mismatch_refuses_before_state_factory_and_body() {
+        let factories = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&factories);
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_replayed_workflow(
+            "entry.replayed",
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ()
+            },
+            |_ctx, _input: i64, _state| async move {
+                panic!("body must not start");
+                #[allow(unreachable_code)]
+                Ok(0_i64)
+            },
+        );
+        let mut task = workflow_task("entry.replayed", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!(["private-replayed-value"])));
+        let error = worker
+            .execute_workflow_task(task)
+            .expect_err("entry refusal");
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+        assert!(error
+            .to_string()
+            .starts_with("workflow_entry_arguments_mismatch:"));
+        assert!(!error.to_string().contains("private-replayed-value"));
+    }
+
+    #[test]
+    fn typed_entry_body_input_error_remains_a_business_failure() {
+        let client = Client::new("http://127.0.0.1:8080").expect("client");
+        let mut worker = Worker::new(client, "rust-workers");
+        worker.register_typed_workflow("entry.body", |_ctx, _input: i64| async move {
+            Err::<i64, _>(handler_type_error::<i64>(
+                HandlerKind::Workflow,
+                "entry.body",
+                HandlerValueKind::Input,
+                "deliberate body error",
+            ))
+        });
+        let mut task = workflow_task("entry.body", Vec::new(), DEFAULT_CODEC);
+        task.arguments = Some(fixture_envelope(json!([7])));
+        let commands = worker
+            .execute_workflow_task(task)
+            .expect("business failure command");
+        assert_eq!(commands[0]["type"], "fail_workflow");
+        assert!(commands[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deliberate body error"));
+    }
+
     #[tokio::test]
     async fn typed_handler_errors_include_handler_name_direction_and_rust_type() {
         let client = Client::new("http://127.0.0.1:8080").expect("client");
