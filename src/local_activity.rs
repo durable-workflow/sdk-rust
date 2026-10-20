@@ -235,11 +235,20 @@ impl Worker {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &self.telemetry {
             return telemetry
-                .run(
+                .run_observed(
                     "durable.workflow.task",
                     self.workflow_telemetry_fields(&task),
                     false,
-                    self.execute_workflow_with_local_activities_inner(task),
+                    self.workflow_observations(&task),
+                    async {
+                        let mut decision = self
+                            .execute_workflow_with_local_activities_inner(task)
+                            .await?;
+                        if let Some(decision) = &mut decision {
+                            self.stamp_observability_commands(&mut decision.commands);
+                        }
+                        Ok(decision)
+                    },
                 )
                 .await;
         }

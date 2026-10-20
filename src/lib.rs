@@ -2975,9 +2975,40 @@ pub struct Client {
     worker_build_id: Option<String>,
     sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
+    #[cfg(feature = "telemetry")]
+    execution_telemetry: Option<telemetry::ExecutionTelemetry>,
+    #[cfg(feature = "telemetry")]
+    observability_context_supported: Arc<AtomicBool>,
 }
 
 impl Client {
+    /// Configure optional propagation. Actual cluster discovery must advertise
+    /// the exact supported capability before any command carries context.
+    #[cfg(feature = "telemetry")]
+    pub fn with_telemetry(mut self, telemetry: telemetry::ExecutionTelemetry) -> Self {
+        self.execution_telemetry = Some(telemetry);
+        self
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn with_observability_context(&self, mut body: Value) -> Value {
+        if self.observability_context_supported.load(Ordering::SeqCst) {
+            if let Some(context) = self
+                .execution_telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.capture())
+            {
+                body["observability_context"] = context;
+            }
+        }
+        body
+    }
+
+    #[cfg(not(feature = "telemetry"))]
+    fn with_observability_context(&self, body: Value) -> Value {
+        body
+    }
+
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
         Self::builder(base_url).build()
     }
@@ -3045,14 +3076,14 @@ impl Client {
         options.validate()?;
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
-        let body = json!({
+        let body = self.with_observability_context(json!({
             "workflow_id": workflow_id,
             "workflow_type": workflow_type,
             "task_queue": task_queue,
             "input": input_envelope,
             "execution_timeout_seconds": options.execution_timeout_seconds,
             "run_timeout_seconds": options.run_timeout_seconds
-        });
+        }));
 
         let data: Value = self
             .request_json(
@@ -3201,10 +3232,10 @@ impl Client {
         validate_request_id(request_id)?;
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
-        let body = json!({
+        let body = self.with_observability_context(json!({
             "input": input_envelope,
             "request_id": request_id,
-        });
+        }));
         let path = match run_id {
             Some(run_id) => {
                 format!("/workflows/{workflow_id}/runs/{run_id}/signal/{signal_name}")
@@ -3340,6 +3371,14 @@ impl Client {
         command: WorkflowCommandKind,
         options: WorkflowCommandOptions,
     ) -> Result<WorkflowCommandResult> {
+        #[cfg(feature = "telemetry")]
+        let body = if command == WorkflowCommandKind::Cancel {
+            self.with_observability_context(serde_json::to_value(&options)?)
+        } else {
+            serde_json::to_value(&options)?
+        };
+        #[cfg(not(feature = "telemetry"))]
+        let body = &options;
         let path = match run_id {
             Some(run_id) => format!(
                 "/workflows/{workflow_id}/runs/{run_id}/{}",
@@ -3352,7 +3391,7 @@ impl Client {
                 reqwest::Method::POST,
                 &path,
                 RequestProtocol::ControlPlane,
-                Some(&options),
+                Some(&body),
             )
             .await
         {
@@ -3574,11 +3613,11 @@ impl Client {
             None => Self::generate_update_request_id(),
         };
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
-        let body = json!({
+        let body = self.with_observability_context(json!({
             "input": encode_typed_envelope(&input, DEFAULT_CODEC)?,
             "wait_for": "completed",
             "request_id": request_id,
-        });
+        }));
         let receipt = self
             .request_json(
                 reqwest::Method::POST,
@@ -4501,6 +4540,25 @@ impl Client {
             "workflow_task_attempt": workflow_task_attempt,
             "commands": commands
         });
+        #[cfg(feature = "telemetry")]
+        if self.observability_context_supported.load(Ordering::SeqCst)
+            && opentelemetry::Context::current()
+                .get::<telemetry::ExecutionFields>()
+                .is_some()
+        {
+            if let Some(commands) = body["commands"].as_array_mut() {
+                for command in commands {
+                    if command.get("observability_context").is_none()
+                        && matches!(
+                            command["type"].as_str(),
+                            Some("start_child_workflow" | "continue_as_new")
+                        )
+                    {
+                        *command = self.with_observability_context(command.take());
+                    }
+                }
+            }
+        }
         if !message_stream_cursors.is_empty() {
             body["message_stream_cursors"] = Value::Array(message_stream_cursors);
         }
@@ -4796,6 +4854,11 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        #[cfg(feature = "telemetry")]
+        if method == reqwest::Method::GET && path == "/cluster/info" {
+            self.observability_context_supported
+                .store(false, Ordering::SeqCst);
+        }
         let protocol = match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
@@ -4941,6 +5004,34 @@ impl Client {
 
             if bytes.is_empty() {
                 return Ok(serde_json::from_value(Value::Null)?);
+            }
+
+            #[cfg(feature = "telemetry")]
+            if method == reqwest::Method::POST
+                && self.execution_telemetry.is_some()
+                && matches!(
+                    path,
+                    "/worker/workflow-tasks/poll"
+                        | "/worker/activity-tasks/poll"
+                        | "/worker/query-tasks/poll"
+                )
+            {
+                let mut wire: Value = serde_json::from_slice(&bytes)?;
+                telemetry::carrier::retain_poll_observations(
+                    &mut wire,
+                    request_body.as_ref().unwrap_or(&Value::Null),
+                    path,
+                    &self.namespace,
+                );
+                return Ok(serde_json::from_value(wire)?);
+            }
+
+            #[cfg(feature = "telemetry")]
+            if method == reqwest::Method::GET && path == "/cluster/info" {
+                let info: Value = serde_json::from_slice(&bytes)?;
+                self.observability_context_supported
+                    .store(telemetry::carrier::supported(&info), Ordering::SeqCst);
+                return Ok(serde_json::from_value(info)?);
             }
 
             return Ok(serde_json::from_slice(&bytes)?);
@@ -5710,6 +5801,10 @@ impl ClientBuilder {
             worker_build_id: None,
             sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
+            #[cfg(feature = "telemetry")]
+            execution_telemetry: None,
+            #[cfg(feature = "telemetry")]
+            observability_context_supported: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -7166,6 +7261,7 @@ impl Worker {
     /// No exporter, logging bridge, global provider or Server carrier is installed.
     #[cfg(feature = "telemetry")]
     pub fn telemetry(mut self, telemetry: telemetry::ExecutionTelemetry) -> Self {
+        self.client.execution_telemetry = Some(telemetry.clone());
         self.telemetry = Some(telemetry);
         self
     }
@@ -8121,6 +8217,29 @@ impl Worker {
 
         self.cooperative_registration_confirmed
             .store(false, Ordering::SeqCst);
+        #[cfg(feature = "telemetry")]
+        if self
+            .telemetry
+            .as_ref()
+            .is_some_and(telemetry::ExecutionTelemetry::is_enabled)
+            && !self
+                .client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        {
+            // Optional startup discovery is bounded and cached. Its failure
+            // cannot refuse registration or add retries to a business command.
+            let _ = self
+                .client
+                .request_json_unresolved_with_timeout::<Value, Value>(
+                    reqwest::Method::GET,
+                    "/cluster/info",
+                    RequestProtocol::DefaultWorker,
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
         let response = self
             .client
             .register_worker_with_definition_fingerprints(
@@ -9048,10 +9167,11 @@ impl Worker {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &self.telemetry {
             return telemetry
-                .run(
+                .run_observed(
                     "durable.query.task",
                     self.query_telemetry_fields(&task),
                     false,
+                    authority.and_then(|_| self.query_observations(&task)),
                     self.execute_query_task_inner(task, authority),
                 )
                 .await;
@@ -9312,10 +9432,16 @@ impl Worker {
     ) -> Result<WorkflowTaskDecision> {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &self.telemetry {
-            return telemetry.run_sync(
+            return telemetry.run_sync_observed(
                 "durable.workflow.task",
                 self.workflow_telemetry_fields(&task),
-                || self.execute_workflow_task_decision_inner(task, observation),
+                self.workflow_observations(&task),
+                || {
+                    let mut decision =
+                        self.execute_workflow_task_decision_inner(task, observation)?;
+                    self.stamp_observability_commands(&mut decision.commands);
+                    Ok(decision)
+                },
             );
         }
         self.execute_workflow_task_decision_inner(task, observation)
@@ -9704,7 +9830,12 @@ impl Worker {
         hydration_claim: Option<&activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
         #[cfg(feature = "telemetry")]
-        if let Some(telemetry) = &self.telemetry {
+        if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
+            !self
+                .client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        }) {
             return telemetry
                 .run(
                     "durable.activity.task",
@@ -9755,6 +9886,13 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let session = worker_session.clone();
+        if let Some(claim) = hydration_claim {
+            claim.confirm(&self.client).await?;
+        }
+        #[cfg(feature = "telemetry")]
+        let observations = self.activity_observations(&task);
+        #[cfg(feature = "telemetry")]
+        let fields = self.activity_telemetry_fields(&task);
         let ctx = ActivityContext {
             client: self.client.clone(),
             task_id: task.task_id,
@@ -9769,21 +9907,37 @@ impl Worker {
             worker_session,
         };
 
-        if let Some(claim) = hydration_claim {
-            claim.confirm(&self.client).await?;
-        }
-        let callback = self.activity_callback(handler, ctx, args, false);
-        if let Some(session) = session {
-            tokio::select! {
-                biased;
-                _ = session.wait_until_unavailable() => Err(Error::ActivityExecutionAbandoned("worker-session lease or TTL expired, closed or became uncertain".into())),
-                result = callback => if session.active() { result } else {
-                    Err(Error::ActivityExecutionAbandoned("worker-session authority ended before callback settlement".into()))
-                },
+        let operation = async {
+            let callback = self.activity_callback(handler, ctx, args, false);
+            if let Some(session) = session {
+                tokio::select! {
+                    biased;
+                    _ = session.wait_until_unavailable() => Err(Error::ActivityExecutionAbandoned("worker-session lease or TTL expired, closed or became uncertain".into())),
+                    result = callback => if session.active() { result } else {
+                        Err(Error::ActivityExecutionAbandoned("worker-session authority ended before callback settlement".into()))
+                    },
+                }
+            } else {
+                callback.await
             }
-        } else {
-            callback.await
+        };
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
+            self.client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        }) {
+            return telemetry
+                .run_observed(
+                    "durable.activity.task",
+                    fields,
+                    false,
+                    observations,
+                    operation,
+                )
+                .await;
         }
+        operation.await
     }
 
     fn activity_callback(
@@ -18468,6 +18622,9 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "telemetry")]
+    static OBSERVABILITY_PROPAGATOR_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
     mod activity_cancellation_policies;
     mod cancellation_scope_admission;
     mod cancellation_scope_authoring;
@@ -27169,6 +27326,336 @@ mod tests {
     const KEYED_SIGNAL_PATH: &str = "/api/workflows/keyed-1/signal/approve";
     const KEYED_RUN_SIGNAL_PATH: &str = "/api/workflows/keyed-1/runs/run-keyed-1/signal/approve";
     const KEYED_UPDATE_PATH: &str = "/api/workflows/keyed-1/update/adjust";
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn optional_observability_client_uses_actual_discovery_and_preserves_business_intent() {
+        let _propagator_guard = OBSERVABILITY_PROPAGATOR_TEST_LOCK.lock().await;
+        static PHASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        PHASE.store(0, Ordering::SeqCst);
+        use opentelemetry::{
+            propagation::TextMapPropagator,
+            trace::{FutureExt, TracerProvider},
+        };
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                opentelemetry::global::set_text_map_propagator(
+                    opentelemetry::propagation::TextMapCompositePropagator::new(Vec::new()),
+                );
+            }
+        }
+        let _restore = Restore;
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let headers = HashMap::from([(
+            "traceparent".to_string(),
+            "00-12345678901234567890123456789012-1234567890123456-01".to_string(),
+        )]);
+        let parent = TraceContextPropagator::new().extract(&headers);
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(|path, body, _number| {
+                if path == "/api/cluster/info" {
+                    return Some(if PHASE.load(Ordering::SeqCst) == 2 {
+                        ("503 Service Unavailable", "{}".into())
+                    } else {
+                        ("200 OK", json!({"worker_protocol": {"server_capabilities": {"observability_context": {
+                            "supported": true, "schema": "durable-workflow.trace-context", "version": if PHASE.load(Ordering::SeqCst) == 0 {1} else {99},
+                            "dispatch_schema": "durable-workflow.queue-trace", "links_schema": "durable-workflow.trace-links",
+                            "max_context_bytes": 4096, "max_links": 32, "max_links_bytes": 4096
+                        }}}}).to_string())
+                    });
+                }
+                let body: Value = serde_json::from_str(body).ok()?;
+                Some(("200 OK", json!({"workflow_id": "order", "run_id": "run", "workflow_type": "orders",
+                    "outcome": "accepted", "command_id": "command", "request_id": body["request_id"],
+                    "result": "original"}).to_string()))
+            }),
+            ..MockWorkerBehavior::default()
+        });
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let client = Client::new(server.base_url()).unwrap().with_telemetry(
+            telemetry::ExecutionTelemetry::from_tracer(provider.tracer("test")),
+        );
+        let input = json!([{"observability_context": {"business": "preserved"}}]);
+        async {
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            assert!(server
+                .request_body("/api/workflows")
+                .get("observability_context")
+                .is_none());
+            client.cluster_info().await.unwrap();
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            client
+                .signal_workflow_with_request_id("order", "ready", &input, "signal-original")
+                .await
+                .unwrap();
+            client
+                .update_workflow("order", "status", &input, Some("update-original"))
+                .await
+                .unwrap();
+            client
+                .cancel_workflow("order", WorkflowCommandOptions::default())
+                .await
+                .unwrap();
+            for path in [
+                "/api/workflows",
+                "/api/workflows/order/signal/ready",
+                "/api/workflows/order/update/status",
+                "/api/workflows/order/cancel",
+            ] {
+                let bodies = server.request_bodies(path);
+                let body = bodies.last().unwrap();
+                assert_eq!(
+                    body["observability_context"]["carrier"]["traceparent"],
+                    headers["traceparent"]
+                );
+                assert!(body["observability_context"]["carrier"]
+                    .get("baggage")
+                    .is_none());
+            }
+            let starts = server.request_bodies("/api/workflows");
+            assert_eq!(
+                decode_wire_value(&starts[1]["input"], DEFAULT_CODEC).unwrap(),
+                input
+            );
+            assert_eq!(
+                server.request_body("/api/workflows/order/signal/ready")["request_id"],
+                "signal-original"
+            );
+            assert_eq!(
+                server.request_body("/api/workflows/order/update/status")["request_id"],
+                "update-original"
+            );
+            PHASE.store(1, Ordering::SeqCst);
+            client.cluster_info().await.unwrap();
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            assert!(server
+                .request_bodies("/api/workflows")
+                .last()
+                .unwrap()
+                .get("observability_context")
+                .is_none());
+            PHASE.store(2, Ordering::SeqCst);
+            assert!(client.cluster_info().await.is_err());
+            let before = server.captured_paths().len();
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            assert_eq!(server.captured_paths().len(), before + 1);
+            assert!(server
+                .request_bodies("/api/workflows")
+                .last()
+                .unwrap()
+                .get("observability_context")
+                .is_none());
+        }
+        .with_context(parent)
+        .await;
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn observability_worker_server(
+        path: &str,
+        _body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let context = json!({"schema": "durable-workflow.trace-context", "version": 1,
+            "carrier": {"traceparent": "00-12345678901234567890123456789012-1234567890123456-01",
+                        "baggage": "credential=private"}});
+        let link_context = json!({"schema": "durable-workflow.trace-context", "version": 1,
+            "carrier": {"traceparent": "00-abcdef78901234567890123456789012-abcdef7890123456-01"}});
+        if path == "/api/cluster/info" {
+            return Some(("200 OK", json!({"worker_protocol": {"server_capabilities": {"observability_context": {
+                "supported": true, "schema": "durable-workflow.trace-context", "version": 1,
+                "dispatch_schema": "durable-workflow.queue-trace", "links_schema": "durable-workflow.trace-links",
+                "max_context_bytes": 4096, "max_links": 32, "max_links_bytes": 4096
+            }}}}).to_string()));
+        }
+        if path.ends_with("/complete") {
+            return Some(("200 OK", json!({"recorded": true}).to_string()));
+        }
+        let task_id = match path {
+            "/api/worker/workflow-tasks/poll" => "workflow-task",
+            "/api/worker/activity-tasks/poll" => "activity-task",
+            "/api/worker/query-tasks/poll" => "query-task",
+            _ => return None,
+        };
+        let input = encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap();
+        let mut task = json!({"task_id": task_id, "query_task_id": task_id,
+        "workflow_id": "workflow", "run_id": "run", "workflow_type": "wire.workflow",
+        "activity_type": "wire.activity", "activity_execution_id": "activity",
+        "activity_attempt_id": "attempt", "attempt_number": 3, "workflow_task_attempt": 1,
+        "query_task_attempt": 1, "query_name": "state", "lease_owner": "test-worker",
+        "namespace": "shipping", "task_queue": "shipping", "lease_expires_at": "2099-01-01T00:00:00Z",
+        "payload_codec": DEFAULT_CODEC, "arguments": input, "workflow_arguments": input,
+        "query_arguments": input, "history_events": [], "observability_context": context,
+        "dispatch_observability_context": {"schema": "durable-workflow.queue-trace", "version": 1,
+            "task_id": task_id, "context": link_context},
+        "observability_links": {"schema": "durable-workflow.trace-links", "version": 1,
+            "task_id": task_id, "run_id": "run", "namespace": "shipping", "links": [
+                {"kind": "command", "command_id": "accepted-command", "context": link_context},
+                {"kind": "child_outcome", "workflow_link_id": "link", "child_run_id": "child",
+                 "child_task_id": null, "event_id": "terminal", "sequence": 7,
+                 "event_type": "WorkflowCancelled", "context": link_context}
+            ]}});
+        if task_id == "workflow-task" {
+            task["arguments"] = encode_value_envelope(
+                &json!([{"observability_context": {"business": "preserved"}}]),
+                DEFAULT_CODEC,
+            )
+            .unwrap();
+        }
+        Some((
+            "200 OK",
+            json!({"task": task, "poll_status": "leased"}).to_string(),
+        ))
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn observability_polled_tasks_recover_parent_links_and_capture_the_actual_child_producer()
+    {
+        use opentelemetry::trace::TracerProvider;
+        let _propagator_guard = OBSERVABILITY_PROPAGATOR_TEST_LOCK.lock().await;
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let telemetry = telemetry::ExecutionTelemetry::from_tracer(provider.tracer("test"));
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(observability_worker_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .namespace("shipping")
+            .build()
+            .unwrap();
+        client.cluster_info().await.unwrap();
+        let mut worker = Worker::new(client, "shipping")
+            .worker_id("test-worker")
+            .telemetry(telemetry);
+        worker.register_workflow("wire.workflow", |ctx, input| async move {
+            assert_eq!(telemetry::current_log_context()["workflow_run_id"], "run");
+            assert_eq!(
+                input,
+                json!([{"observability_context": {"business": "preserved"}}])
+            );
+            ctx.start_child_workflow("child", ChildWorkflowOptions::new("child-workers"), input)
+                .await?;
+            Ok(Value::Null)
+        });
+        worker.register_activity("wire.activity", |_, _| async {
+            let fields = telemetry::current_log_context();
+            assert_eq!(fields["workflow_run_id"], "run");
+            assert_eq!(fields["activity_id"], "activity");
+            assert_eq!(fields["activity_attempt_id"], "attempt");
+            assert_eq!(fields["activity_attempt_number"], "3");
+            Ok(json!("original-result"))
+        });
+        worker.register_query("wire.workflow", "state", |_, _| async {
+            assert_eq!(telemetry::current_log_context()["task_id"], "query-task");
+            Ok(json!("original-query"))
+        });
+        assert_eq!(worker.run_once().await.unwrap(), 3);
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 4);
+        let origin_trace = "12345678901234567890123456789012";
+        for span in spans
+            .iter()
+            .filter(|span| span.name.as_ref() != "durable.activity.attempt")
+        {
+            assert_eq!(span.span_context.trace_id().to_string(), origin_trace);
+            assert_eq!(span.parent_span_id.to_string(), "1234567890123456");
+            assert_eq!(span.links.len(), 3);
+            assert!(!format!("{:?}", span.attributes).contains("credential"));
+        }
+        let task = spans
+            .iter()
+            .find(|span| span.name.as_ref() == "durable.workflow.task")
+            .unwrap();
+        let body = server.request_body("/api/worker/workflow-tasks/workflow-task/complete");
+        assert_eq!(body["commands"][0]["type"], "start_child_workflow");
+        let parent = body["commands"][0]["observability_context"]["carrier"]["traceparent"]
+            .as_str()
+            .unwrap();
+        assert_eq!(&parent[36..52], task.span_context.span_id().to_string());
+        assert!(telemetry::current_log_context().is_empty());
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry::propagation::TextMapCompositePropagator::new(Vec::new()),
+        );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn observability_never_enters_a_query_with_a_refused_original_claim() {
+        use opentelemetry::trace::TracerProvider;
+        static REFUSAL: AtomicUsize = AtomicUsize::new(0);
+        fn refused_query(path: &str, body: &str, count: usize) -> Option<(&'static str, String)> {
+            let (status, reply) = observability_worker_server(path, body, count)?;
+            if path != "/api/worker/query-tasks/poll" {
+                return Some((status, reply));
+            }
+            let mut reply: Value = serde_json::from_str(&reply).unwrap();
+            match REFUSAL.load(Ordering::SeqCst) {
+                0 => reply["task"]["lease_owner"] = json!("other-worker"),
+                1 => reply["task"]["query_task_attempt"] = json!(0),
+                _ => reply["task"]["lease_expires_at"] = json!("2000-01-01T00:00:00Z"),
+            }
+            Some((status, reply.to_string()))
+        }
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(refused_query),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .namespace("shipping")
+            .build()
+            .unwrap();
+        client.cluster_info().await.unwrap();
+        let mut worker = Worker::new(client, "shipping")
+            .worker_id("test-worker")
+            .telemetry(telemetry::ExecutionTelemetry::from_tracer(
+                provider.tracer("test"),
+            ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let query_calls = calls.clone();
+        worker.register_query("wire.workflow", "state", move |_, _| {
+            query_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Value::Null) }
+        });
+        for refusal in 0..3 {
+            REFUSAL.store(refusal, Ordering::SeqCst);
+            assert!(matches!(
+                worker.poll_query_once().await.unwrap(),
+                ManagedPollOutcome::Handled
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(exporter.get_finished_spans().unwrap().is_empty());
+            assert!(telemetry::current_log_context().is_empty());
+        }
+        assert!(!server
+            .captured_paths()
+            .iter()
+            .any(|path| path.ends_with("/complete") || path.ends_with("/fail")));
+    }
 
     fn keyed_command_request(path: &str, body: &str) -> Option<Value> {
         if path != KEYED_SIGNAL_PATH && path != KEYED_RUN_SIGNAL_PATH && path != KEYED_UPDATE_PATH {

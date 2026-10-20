@@ -136,8 +136,11 @@ handler before registration instead of relying on replacement order.
 After registering a workflow, declare every signal name it reads through
 `wait_signal` or `signals` before starting the worker:
 
-```rust
+```rust,no_run
+# fn declare_signals(worker: &mut durable_workflow::Worker) -> durable_workflow::Result<()> {
 worker.declare_workflow_signals("orders", &["finish", "changed"])?;
+# Ok(())
+# }
 ```
 
 Server records those names and positional argument contracts when starting a
@@ -356,12 +359,34 @@ let worker = Worker::new(client, "orders").telemetry(ExecutionTelemetry::new());
 ```
 
 The default build has no OpenTelemetry dependency. The optional feature needs
-only its API; the application owns the SDK/exporter and provider shutdown.
-Task spans start fresh traces; actual remote/local activity attempts have
-separate child spans. Durable Server admission/queue carriers are not yet
-adopted, so this component does not connect separate task deliveries or retries.
+the API and official W3C propagators supplied by the OpenTelemetry SDK crate;
+the application owns provider/exporter configuration and shutdown.
+Servers without the exact optional capability use independent task traces.
+When available, a valid run origin parents task spans; task-bound dispatch and
+validated command/outcome contexts become links. The original poll identity,
+generation and existing hydration, query and cooperative fences precede their
+use. Missing or insufficient authority omits propagation without changing
+business execution. Actual remote/local activity attempts have separate child
+spans. Current published Server persistence/delivery remains unavailable; real
+combined propagation is still part of Workflow #773 qualification.
 Replay emits workflow work spans without pretending completed activities ran
 again. No span stays open during durable waiting.
+
+Configure admission/command clients with `client.with_telemetry(telemetry)` and
+use existing `client.cluster_info().await` discovery during setup. Worker startup
+can perform one bounded optional discovery; its failure does not refuse business
+registration or add business retries. Only the exact supported
+`worker_protocol.server_capabilities.observability_context` object enables
+carriers. No mandatory protocol floor or Server version inference is added.
+Caller capture precedes HTTP transport. Worker child/continue commands capture
+their actual workflow scope before settlement and preserve business arguments
+and request keys.
+
+Official W3C propagation validates the agreed byte limits. Baggage defaults empty;
+`with_baggage_allowlist` retains explicit keys only on run parents. Links never
+carry baggage. Envelopes are bounded to 4096 bytes and at most 32 links. Malformed
+metadata is ignored with fixed `discarded`/`filtered` span diagnostics. Use
+`with_enabled(false)` to disable spans and propagation explicitly.
 
 Use `telemetry::current_log_context()` in a logging adapter, or wrap an existing
 OpenTelemetry logger provider in `telemetry::ExecutionLoggerProvider` before

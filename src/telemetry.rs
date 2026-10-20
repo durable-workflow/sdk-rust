@@ -1,9 +1,11 @@
 //! Optional execution spans and application log correlation.
 //!
 //! Applications own providers, exporters, sampling and shutdown. Enabling this
-//! feature installs none of those components and does not change Server wire
-//! messages. Each received task starts a fresh trace until portable carriers are
-//! qualified with Server. Attempt spans are children of their executing task.
+//! feature installs none of those components. Propagation requires the exact
+//! advertised capability and existing original claim gates. Current published
+//! Server support is unavailable. Attempt spans are children of their task.
+
+pub mod carrier;
 
 use std::{
     borrow::Cow, collections::BTreeMap, future::Future, panic::AssertUnwindSafe, sync::Arc,
@@ -13,9 +15,12 @@ use std::{
 use opentelemetry::{
     global::BoxedTracer,
     logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity},
-    trace::{FutureExt, Status, TraceContextExt, Tracer},
+    propagation::TextMapPropagator,
+    trace::{FutureExt, Link, Status, TraceContextExt, Tracer},
     Context, InstrumentationScope, Key, KeyValue, SpanId, TraceFlags, TraceId,
 };
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+use serde_json::Value;
 
 use crate::{ActivityContext, ActivityTask, QueryTask, Worker, WorkflowTask};
 
@@ -40,6 +45,12 @@ pub fn current_log_context() -> BTreeMap<String, String> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExecutionFields(BTreeMap<String, String>);
 
+pub(crate) struct ObservationContext {
+    parent: Context,
+    links: Vec<Link>,
+    diagnostics: Vec<KeyValue>,
+}
+
 impl ExecutionFields {
     fn insert(mut self, name: &'static str, value: Option<&str>) -> Self {
         if let Some(value) = value.filter(|value| {
@@ -57,7 +68,7 @@ impl ExecutionFields {
     fn attributes(&self) -> Vec<KeyValue> {
         self.0
             .iter()
-            .map(|(key, value)| KeyValue::new(format!("durable.{key}"), value.clone()))
+            .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
             .collect()
     }
 }
@@ -65,10 +76,12 @@ impl ExecutionFields {
 /// Opt-in worker telemetry using an application-owned tracer.
 ///
 /// This value is cloneable; it never shuts down or replaces a global provider.
-/// No SDK or exporter is required by the production dependency graph.
+/// No exporter is required; official W3C validation uses the SDK propagators.
 #[derive(Clone, Debug)]
 pub struct ExecutionTelemetry {
     tracer: Arc<BoxedTracer>,
+    enabled: bool,
+    baggage_allowlist: Vec<String>,
 }
 
 impl ExecutionTelemetry {
@@ -90,25 +103,59 @@ impl ExecutionTelemetry {
     {
         Self {
             tracer: Arc::new(BoxedTracer::new(Box::new(tracer))),
+            enabled: true,
+            baggage_allowlist: Vec::new(),
         }
     }
 
-    fn scope(&self, name: &'static str, fields: ExecutionFields, nested: bool) -> ExecutionScope {
+    /// Disable spans and propagation without changing business execution.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Retain only these baggage keys on admission/run parents. Default empty.
+    pub fn with_baggage_allowlist(mut self, keys: Vec<String>) -> Self {
+        self.baggage_allowlist = keys;
+        self
+    }
+
+    pub(crate) fn capture(&self) -> Option<serde_json::Value> {
+        self.enabled
+            .then(|| carrier::capture(&self.baggage_allowlist).0)
+            .flatten()
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn scope(
+        &self,
+        name: &'static str,
+        fields: ExecutionFields,
+        nested: bool,
+        observations: Option<ObservationContext>,
+    ) -> ExecutionScope {
         // Only an existing SDK execution may parent another SDK scope. Poller
         // ambient spans and baggage must not leak into unrelated durable work.
         let current = Context::current();
-        let parent = if nested && current.get::<ExecutionFields>().is_some() {
+        let mut parent = if nested && current.get::<ExecutionFields>().is_some() {
             current
         } else {
             Context::new()
         };
         let context = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let span = self.tracer.build_with_context(
-                self.tracer
-                    .span_builder(name)
-                    .with_attributes(fields.attributes()),
-                &parent,
-            );
+            let mut attributes = fields.attributes();
+            let mut builder = self.tracer.span_builder(name);
+            if let Some(observations) = observations {
+                parent = observations.parent;
+                attributes.extend(observations.diagnostics);
+                builder = builder.with_links(observations.links);
+            }
+            let span = self
+                .tracer
+                .build_with_context(builder.with_attributes(attributes), &parent);
             parent.with_span(span)
         }))
         .unwrap_or_else(|_| Context::new())
@@ -129,25 +176,175 @@ impl ExecutionTelemetry {
     where
         F: Future<Output = Result<T, E>>,
     {
-        let mut scope = self.scope(name, fields, nested);
+        self.run_observed(name, fields, nested, None, future).await
+    }
+
+    pub(crate) async fn run_observed<T, E, F>(
+        &self,
+        name: &'static str,
+        fields: ExecutionFields,
+        nested: bool,
+        observations: Option<ObservationContext>,
+        future: F,
+    ) -> Result<T, E>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        if !self.enabled {
+            return future.await;
+        }
+        let mut scope = self.scope(name, fields, nested, observations);
         // Attaches only during each poll, never across an await on a Tokio thread.
         let result = future.with_context(scope.context.clone()).await;
         scope.finish(result.is_err());
         result
     }
 
+    #[cfg(test)]
     pub(crate) fn run_sync<T, E>(
         &self,
         name: &'static str,
         fields: ExecutionFields,
         callback: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        let mut scope = self.scope(name, fields, false);
+        self.run_sync_observed(name, fields, None, callback)
+    }
+
+    pub(crate) fn run_sync_observed<T, E>(
+        &self,
+        name: &'static str,
+        fields: ExecutionFields,
+        observations: Option<ObservationContext>,
+        callback: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        if !self.enabled {
+            return callback();
+        }
+        let mut scope = self.scope(name, fields, false, observations);
         let result = {
             let _guard = scope.context.clone().attach();
             callback()
         };
         scope.finish(result.is_err());
+        result
+    }
+
+    fn observations(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        namespace: &str,
+        origin: Option<&Value>,
+        dispatch: Option<&Value>,
+        secondary: Option<&Value>,
+    ) -> ObservationContext {
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.observations_inner(task_id, run_id, namespace, origin, dispatch, secondary)
+        }))
+        .unwrap_or_else(|_| ObservationContext {
+            parent: Context::new(),
+            links: Vec::new(),
+            diagnostics: vec![KeyValue::new("durable.observability_context", "discarded")],
+        })
+    }
+
+    fn observations_inner(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        namespace: &str,
+        origin: Option<&Value>,
+        dispatch: Option<&Value>,
+        secondary: Option<&Value>,
+    ) -> ObservationContext {
+        let mut result = ObservationContext {
+            parent: Context::new(),
+            links: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let propagator = TraceContextPropagator::new();
+        let extract = |value: &Value| {
+            let headers: std::collections::HashMap<_, _> = value["carrier"]
+                .as_object()
+                .expect("normalized carrier")
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        value.as_str().expect("normalized header").to_string(),
+                    )
+                })
+                .collect();
+            let parent = propagator.extract_with_context(&Context::new(), &headers);
+            BaggagePropagator::new().extract_with_context(&parent, &headers)
+        };
+        let diagnostic = |name: &'static str, value: Option<carrier::Diagnostic>| {
+            value.map(|value| {
+                KeyValue::new(
+                    name,
+                    match value {
+                        carrier::Diagnostic::Discarded => "discarded",
+                        carrier::Diagnostic::Filtered => "filtered",
+                    },
+                )
+            })
+        };
+        let (origin, origin_diagnostic) =
+            carrier::normalize(origin.unwrap_or(&Value::Null), &self.baggage_allowlist);
+        if let Some(origin) = origin {
+            result.parent = extract(&origin);
+        }
+        result.diagnostics.extend(diagnostic(
+            "durable.observability_context",
+            origin_diagnostic,
+        ));
+        let (dispatch, dispatch_diagnostic) =
+            carrier::dispatch(dispatch.unwrap_or(&Value::Null), task_id);
+        if let Some(dispatch) = dispatch {
+            let linked = extract(&dispatch);
+            result.links.push(Link::new(
+                linked.span().span_context().clone(),
+                vec![
+                    KeyValue::new("durable.link.type", "dispatch"),
+                    KeyValue::new("task_id", task_id.to_string()),
+                ],
+                0,
+            ));
+        }
+        result
+            .diagnostics
+            .extend(diagnostic("durable.dispatch_context", dispatch_diagnostic));
+        let (entries, links_diagnostic) = carrier::links(
+            secondary.unwrap_or(&Value::Null),
+            task_id,
+            run_id,
+            namespace,
+        );
+        for entry in entries {
+            let linked = extract(&entry["context"]);
+            let mut attributes = vec![KeyValue::new(
+                "durable.link.type",
+                entry["kind"].as_str().unwrap().to_string(),
+            )];
+            for (key, value) in entry.as_object().expect("normalized link") {
+                if matches!(key.as_str(), "kind" | "context") || value.is_null() {
+                    continue;
+                }
+                if let Some(value) = value.as_str() {
+                    attributes.push(KeyValue::new(key.clone(), value.to_string()));
+                } else if let Some(value) = value.as_i64() {
+                    attributes.push(KeyValue::new(key.clone(), value));
+                }
+            }
+            result.links.push(Link::new(
+                linked.span().span_context().clone(),
+                attributes,
+                0,
+            ));
+        }
+        result
+            .diagnostics
+            .extend(diagnostic("durable.observability_links", links_diagnostic));
         result
     }
 }
@@ -290,6 +487,111 @@ impl<R: LogRecord> LogRecord for ExecutionLogRecord<R> {
 }
 
 impl Worker {
+    fn allows_observations(
+        &self,
+        task_id: &str,
+        run_id: Option<&str>,
+        owner: Option<&str>,
+        attempt: u64,
+    ) -> bool {
+        self.client
+            .observability_context_supported
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .telemetry
+                .as_ref()
+                .is_some_and(ExecutionTelemetry::is_enabled)
+            && carrier::identity(task_id)
+            && run_id.is_some_and(carrier::identity)
+            && carrier::identity(&self.client.namespace)
+            && owner == Some(self.worker_id.as_str())
+            && attempt > 0
+            && attempt <= i64::MAX as u64
+    }
+
+    pub(crate) fn workflow_observations(&self, task: &WorkflowTask) -> Option<ObservationContext> {
+        if !self.allows_observations(
+            &task.task_id,
+            task.run_id.as_deref(),
+            task.lease_owner.as_deref(),
+            task.workflow_task_attempt,
+        ) || !self.workflows.contains_key(&task.workflow_type)
+        {
+            return None;
+        }
+        Some(self.telemetry.as_ref()?.observations(
+            &task.task_id,
+            task.run_id.as_deref()?,
+            &self.client.namespace,
+            task.observability_context.as_ref(),
+            task.dispatch_observability_context.as_ref(),
+            task.observability_links.as_ref(),
+        ))
+    }
+
+    pub(crate) fn query_observations(&self, task: &QueryTask) -> Option<ObservationContext> {
+        if !self.allows_observations(
+            &task.query_task_id,
+            task.run_id.as_deref(),
+            task.lease_owner.as_deref(),
+            task.query_task_attempt,
+        ) || !self.workflows.contains_key(&task.workflow_type)
+            || !self
+                .queries
+                .get(&task.workflow_type)
+                .is_some_and(|queries| queries.contains_key(&task.query_name))
+        {
+            return None;
+        }
+        Some(self.telemetry.as_ref()?.observations(
+            &task.query_task_id,
+            task.run_id.as_deref()?,
+            &self.client.namespace,
+            task.observability_context.as_ref(),
+            task.dispatch_observability_context.as_ref(),
+            task.observability_links.as_ref(),
+        ))
+    }
+
+    pub(crate) fn activity_observations(&self, task: &ActivityTask) -> Option<ObservationContext> {
+        if !self.allows_observations(
+            &task.task_id,
+            task.run_id.as_deref(),
+            task.lease_owner.as_deref(),
+            task.attempt_number,
+        ) || !self.activities.contains_key(&task.activity_type)
+            || !task
+                .activity_attempt_id
+                .as_deref()
+                .or(task.attempt_id.as_deref())
+                .is_some_and(carrier::identity)
+        {
+            return None;
+        }
+        Some(self.telemetry.as_ref()?.observations(
+            &task.task_id,
+            task.run_id.as_deref()?,
+            &self.client.namespace,
+            task.observability_context.as_ref(),
+            task.dispatch_observability_context.as_ref(),
+            task.observability_links.as_ref(),
+        ))
+    }
+
+    pub(crate) fn stamp_observability_commands(&self, commands: &mut [Value]) {
+        if Context::current().get::<ExecutionFields>().is_none() {
+            return;
+        }
+        for command in commands {
+            if matches!(
+                command["type"].as_str(),
+                Some("start_child_workflow" | "continue_as_new")
+            ) {
+                *command = self.client.with_observability_context(command.take());
+            }
+        }
+    }
+
     fn telemetry_fields(&self) -> ExecutionFields {
         ExecutionFields::default()
             .insert("namespace", Some(&self.client.namespace))
@@ -318,6 +620,9 @@ impl Worker {
 
     pub(crate) fn activity_telemetry_fields(&self, task: &ActivityTask) -> ExecutionFields {
         self.telemetry_fields()
+            .insert("workflow_instance_id", task.workflow_id.as_deref())
+            .insert("workflow_run_id", task.run_id.as_deref())
+            .insert("activity_id", task.activity_execution_id.as_deref())
             .insert("task_id", Some(&task.task_id))
             .insert("activity_type", Some(&task.activity_type))
             .insert(
@@ -334,14 +639,11 @@ impl Worker {
         context: &ActivityContext,
         local: bool,
     ) -> ExecutionFields {
-        let fields = if local {
-            Context::current()
-                .get::<ExecutionFields>()
-                .cloned()
-                .unwrap_or_else(|| self.telemetry_fields())
-        } else {
-            self.telemetry_fields()
-        };
+        let fields = Context::current()
+            .get::<ExecutionFields>()
+            .filter(|fields| local || fields.0.get("task_id") == Some(&context.task_id))
+            .cloned()
+            .unwrap_or_else(|| self.telemetry_fields());
         fields
             .insert("task_id", Some(&context.task_id))
             .insert("activity_type", Some(&context.activity_type))

@@ -1943,7 +1943,12 @@ impl Worker {
         hydration_claim: Option<&crate::activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
         #[cfg(feature = "telemetry")]
-        if let Some(telemetry) = &self.telemetry {
+        if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
+            !self
+                .client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        }) {
             return telemetry
                 .run(
                     "durable.activity.task",
@@ -2001,6 +2006,22 @@ impl Worker {
         }
         guard.boundary()?;
         *callback_started = true;
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
+            self.client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        }) {
+            return telemetry
+                .run_observed(
+                    "durable.activity.task",
+                    self.activity_telemetry_fields(task),
+                    false,
+                    self.activity_observations(task),
+                    async { self.activity_callback(handler, context, args, false).await },
+                )
+                .await;
+        }
         self.activity_callback(handler, context, args, false).await
     }
 
