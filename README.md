@@ -72,6 +72,12 @@ error or cancellation kinds can be handled without another exhaustive-match
 migration. Handle a Nexus failure at its original durable call; a committed
 admission is separate from a synchronous completion.
 
+`WorkflowTask`, `ActivityTask` and `QueryTask` retain optional, untrusted
+observability metadata. `ActivityTask` also exposes optional workflow, run and
+activity execution identities supplied by the runtime. When constructing task
+structs directly, initialize the new optional fields to `None`. Receiving these
+fields does not enable tracing, authorize work or invent missing correlation.
+
 Existing workflow histories are unchanged. Preserve the workflow's recorded
 command sequence and verify representative histories before deployment. Nexus
 authoring requires explicit worker opt-in and an installed Server capability;

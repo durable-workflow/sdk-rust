@@ -10,13 +10,21 @@ source_sha="$(git -C "$repo_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$NEXUS_STATE_DIR/target/debug/examples/nexus_cooperation" | cut -d ' ' -f 1)"
 compose=(docker compose --env-file "$NEXUS_ENV_FILE" -f "$fixture_dir/docker-compose.yml")
 owned=()
+ack_observer=''
 cleanup() {
   for container in "${owned[@]}"; do
     docker stop --time 15 "$container" >/dev/null 2>&1 || true
     docker rm --volumes "$container" >/dev/null 2>&1 || true
   done
 }
-trap cleanup EXIT
+finish() {
+  cleanup
+  if [[ -n "$ack_observer" ]]; then
+    docker stop --time 5 "$ack_observer" >/dev/null 2>&1 || true
+    docker rm --volumes "$ack_observer" >/dev/null 2>&1 || true
+  fi
+}
+trap finish EXIT
 
 require_backend() {
   local service container
@@ -54,10 +62,18 @@ admission_observe() {
 }
 
 ack_observe() {
-  "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+  # Each phase still starts a fresh Python process and reads the original
+  # durable receipt. Repeated container creation must not consume the fixed
+  # observation budget before the cold caller has a chance to execute.
+  if [[ -z "$ack_observer" ]]; then
+    ack_observer="r87k-observer-$(date -u +%s)-$$"
+    "${compose[@]}" run -d --no-deps --name "$ack_observer" \
+      --entrypoint sleep observe infinity >/dev/null
+  fi
+  docker exec \
     -e "NEXUS_TARGET_NAMESPACE=$NEXUS_TARGET_NAMESPACE" \
     -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
-    observe /fixture/acknowledgements.py "$@"
+    "$ack_observer" python /fixture/acknowledgements.py "$@"
 }
 
 if [[ "${1:-}" == acknowledgement ]]; then

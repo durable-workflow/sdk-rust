@@ -12,6 +12,10 @@
 - Add `Error::NexusOperationFailed` and `CancellationCallKind::ServiceOperation`.
   Mark both enums `non_exhaustive`; downstream matches must include a fallback
   arm. This is the Rust 4 migration boundary.
+- Retain optional observability metadata on public workflow, activity and query
+  task models, and optional activity workflow/run/execution identities. Direct
+  task struct literals must initialize the new fields. The metadata remains
+  untrusted and does not enable tracing or affect execution authority.
 
 ## 3.5.6
 

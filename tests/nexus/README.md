@@ -102,6 +102,11 @@ results must pass; the original faulted/killed process is recorded separately.
 Run `node scripts/ci/test-completion-ack-proxy.mjs` to check the fault selector
 and unchanged local-activity proxy default without any SDK or Server fixture.
 
+The lost-ack profile keeps one bounded observer container until profile cleanup.
+Each phase executes a fresh Python process against the original receipt. This
+avoids repeated container startup inside the unchanged thirty-second recovery
+window; it does not cache SDK state or extend an original deadline.
+
 ## Published Waterline inspection
 
 `bash tests/nexus/run.sh catalog` extends the cross-namespace result profile
