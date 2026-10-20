@@ -147,13 +147,13 @@ fn validate_user_signal_name(signal_name: &str) -> Result<()> {
 }
 
 const REQUEST_ID_CONFLICT_REASON: &str = "request_id_conflict";
-const MAX_REQUEST_ID_BYTES: usize = 255;
+const MAX_REQUEST_ID_CHARACTERS: usize = 255;
 
-/// The caller command key is an opaque, case-sensitive body field of 1 to 255 bytes.
+/// The caller command key is a case-sensitive body field of 1 to 255 Unicode characters.
 fn validate_request_id(request_id: &str) -> Result<()> {
-    if request_id.is_empty() || request_id.len() > MAX_REQUEST_ID_BYTES {
+    if request_id.is_empty() || request_id.chars().count() > MAX_REQUEST_ID_CHARACTERS {
         return Err(Error::Codec(format!(
-            "request_id must be 1 to {MAX_REQUEST_ID_BYTES} bytes"
+            "request_id must be 1 to {MAX_REQUEST_ID_CHARACTERS} Unicode characters"
         )));
     }
     Ok(())
@@ -3091,7 +3091,7 @@ impl Client {
             .await
     }
 
-    /// Send a signal with an explicit caller command key (1 to 255 bytes).
+    /// Send a signal with an explicit caller command key (1 to 255 Unicode characters).
     ///
     /// Resend the identical signal with the same key after an uncertain
     /// outcome: the Server returns the retained receipt instead of admitting a
@@ -3162,7 +3162,7 @@ impl Client {
     }
 
     /// Signal only if `run_id` is still the current run for this instance,
-    /// with an explicit caller command key (1 to 255 bytes).
+    /// with an explicit caller command key (1 to 255 Unicode characters).
     ///
     /// The selected run is part of the signal's intent: retrying with the same
     /// key and a different run target is a `request_id_conflict` refusal.
@@ -3500,7 +3500,7 @@ impl Client {
 
     /// Send a synchronous update using fixed Avro Value arguments.
     ///
-    /// `request_id` is the caller command key (1 to 255 bytes), sent as the
+    /// `request_id` is the caller command key (1 to 255 Unicode characters), sent as the
     /// `request_id` body field; `None` generates one with
     /// [`Client::generate_update_request_id`]. A Server that already retains the
     /// key for the same update intent returns the original update's receipt and
@@ -5721,7 +5721,7 @@ impl WorkflowHandle {
             .await
     }
 
-    /// Signal this workflow with an explicit caller command key (1 to 255 bytes).
+    /// Signal this workflow with an explicit caller command key (1 to 255 Unicode characters).
     pub async fn signal_with_request_id<T: Serialize>(
         &self,
         signal_name: &str,
@@ -5760,7 +5760,7 @@ impl WorkflowHandle {
     }
 
     /// Signal only if this handle's selected run is still current, with an
-    /// explicit caller command key (1 to 255 bytes).
+    /// explicit caller command key (1 to 255 Unicode characters).
     pub async fn signal_selected_run_with_request_id<T: Serialize>(
         &self,
         signal_name: &str,
@@ -26929,7 +26929,7 @@ mod tests {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
             "lowercase hex suffix: {request_id:?}"
         );
-        assert!(request_id.len() <= MAX_REQUEST_ID_BYTES);
+        assert!(request_id.len() <= MAX_REQUEST_ID_CHARACTERS);
     }
 
     fn assert_key_sent_only_in_body(server: &MockWorkerServer, path: &str) {
@@ -27269,7 +27269,7 @@ mod tests {
     async fn invalid_command_keys_are_refused_before_sending() {
         let server = MockWorkerServer::start();
         let client = keyed_client(&server);
-        let too_long = "k".repeat(MAX_REQUEST_ID_BYTES + 1);
+        let too_long = "k".repeat(MAX_REQUEST_ID_CHARACTERS + 1);
 
         for request_id in ["", too_long.as_str()] {
             let error = client
@@ -27277,7 +27277,7 @@ mod tests {
                 .await
                 .expect_err("invalid signal key");
             assert!(
-                matches!(error, Error::Codec(ref message) if message.contains("1 to 255 bytes")),
+                matches!(error, Error::Codec(ref message) if message.contains("1 to 255 Unicode characters")),
                 "{error:?}"
             );
             let error = client
@@ -27288,7 +27288,7 @@ mod tests {
         }
         assert!(server.captured_paths().is_empty(), "nothing was sent");
 
-        let longest = "k".repeat(MAX_REQUEST_ID_BYTES);
+        let longest = "k".repeat(MAX_REQUEST_ID_CHARACTERS);
         let _ = client
             .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &longest)
             .await;
