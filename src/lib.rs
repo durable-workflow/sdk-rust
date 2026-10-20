@@ -146,6 +146,36 @@ fn validate_user_signal_name(signal_name: &str) -> Result<()> {
     Ok(())
 }
 
+const REQUEST_ID_CONFLICT_REASON: &str = "request_id_conflict";
+const MAX_REQUEST_ID_BYTES: usize = 255;
+
+/// The caller command key is an opaque, case-sensitive body field of 1 to 255 bytes.
+fn validate_request_id(request_id: &str) -> Result<()> {
+    if request_id.is_empty() || request_id.len() > MAX_REQUEST_ID_BYTES {
+        return Err(Error::Codec(format!(
+            "request_id must be 1 to {MAX_REQUEST_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn generated_request_id(command: &str) -> String {
+    format!("sdk-rust-{command}-{}", Uuid::new_v4().simple())
+}
+
+/// Guarantee the sent caller command key on a receipt from a Server that does not echo it.
+fn with_request_id(mut receipt: Value, request_id: &str) -> Value {
+    if receipt.is_null() {
+        return json!({ "request_id": request_id });
+    }
+    if let Some(receipt) = receipt.as_object_mut() {
+        receipt
+            .entry("request_id")
+            .or_insert_with(|| Value::String(request_id.to_string()));
+    }
+    receipt
+}
+
 const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
 const WORKFLOW_TASK_WAITING_FOR_HISTORY_MESSAGE: &str =
     "Workflow task waiting for scheduled history.";
@@ -335,6 +365,99 @@ pub enum Error {
     #[doc(hidden)]
     #[error("workflow requested continue as new")]
     ContinueAsNew(ContinueAsNewRequest),
+}
+
+impl Error {
+    /// The caller command key echoed by the Server in a refusal body.
+    ///
+    /// Signals and updates send their key as the `request_id` body field, and a
+    /// Server refusal such as `request_id_conflict` echoes it. Transport failures
+    /// and refusals without an echoed key return `None`: keep the key you passed
+    /// to a `*_with_request_id` method, or obtained from
+    /// [`Client::generate_signal_request_id`] or
+    /// [`Client::generate_update_request_id`], to retry the same logical command
+    /// after an uncertain outcome.
+    pub fn request_id(&self) -> Option<String> {
+        self.refusal_body()?
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|request_id| !request_id.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether the Server refused a signal or update because its caller command
+    /// key is retained for a command with a different intent
+    /// (HTTP 409, `reason: "request_id_conflict"`).
+    pub fn is_request_id_conflict(&self) -> bool {
+        self.request_id_conflict().is_some()
+    }
+
+    /// The retained-command details of a `request_id_conflict` refusal.
+    pub fn request_id_conflict(&self) -> Option<RequestIdConflict> {
+        let status = match self {
+            Self::Http { status, .. } => status.as_u16(),
+            Self::WorkflowCommandRejected(rejection) => rejection.status,
+            _ => return None,
+        };
+        request_id_conflict(status, self.refusal_body()?)
+    }
+
+    fn refusal_body(&self) -> Option<Value> {
+        match self {
+            Self::Http { body, .. } => serde_json::from_str(body).ok(),
+            Self::WorkflowCommandRejected(rejection) => Some(rejection.body.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A refused signal or update whose caller command key is already retained for
+/// a command with a different intent.
+///
+/// Nothing was admitted or recorded, and the key stays bound to the retained
+/// command. Send a new key for a different command, or repeat the retained
+/// command's exact intent to receive its receipt. `conflict` lists the
+/// mismatched intent parts among `name`, `arguments` and `target`.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RequestIdConflict {
+    pub status: u16,
+    pub request_id: String,
+    pub message: String,
+    pub retained_command_id: Option<String>,
+    pub retained_command_type: Option<String>,
+    pub retained_outcome: Option<String>,
+    pub conflict: Vec<String>,
+    pub body: Value,
+}
+
+fn request_id_conflict(status: u16, body: Value) -> Option<RequestIdConflict> {
+    if body.get("reason").and_then(Value::as_str) != Some(REQUEST_ID_CONFLICT_REASON) {
+        return None;
+    }
+    let string = |name: &str| body.get(name).and_then(Value::as_str).map(str::to_string);
+    Some(RequestIdConflict {
+        status,
+        request_id: string("request_id").unwrap_or_default(),
+        message: string("message")
+            .or_else(|| string("error"))
+            .unwrap_or_else(|| "request id is retained for a different command intent".to_string()),
+        retained_command_id: string("retained_command_id"),
+        retained_command_type: string("retained_command_type"),
+        retained_outcome: string("retained_outcome"),
+        conflict: body
+            .get("conflict")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        body,
+    })
 }
 
 /// Handler namespaces checked independently within a Worker.
@@ -2948,14 +3071,58 @@ impl Client {
         })
     }
 
+    /// Send a signal with an SDK-generated caller command key.
+    ///
+    /// The key is sent as the `request_id` body field and is present in the
+    /// returned receipt's `request_id`. A Server that already retains the key
+    /// for the same signal intent returns the original receipt with
+    /// `retained: true`; a different intent is refused with
+    /// [`Error::is_request_id_conflict`]. Choose the key yourself with
+    /// [`Client::signal_workflow_with_request_id`] when the application must be
+    /// able to retry the same logical signal after a transport failure.
     pub async fn signal_workflow<T: Serialize>(
         &self,
         workflow_id: &str,
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
-        self.signal_workflow_target(workflow_id, None, signal_name, input)
+        let request_id = Self::generate_signal_request_id();
+        self.signal_workflow_target(workflow_id, None, signal_name, input, &request_id)
             .await
+    }
+
+    /// Send a signal with an explicit caller command key (1 to 255 bytes).
+    ///
+    /// Resend the identical signal with the same key after an uncertain
+    /// outcome: the Server returns the retained receipt instead of admitting a
+    /// second signal, for as long as the retained run's details are kept.
+    pub async fn signal_workflow_with_request_id<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        self.signal_workflow_target(workflow_id, None, signal_name, input, request_id)
+            .await
+    }
+
+    /// A fresh caller command key for one logical signal (`sdk-rust-signal-<uuid>`).
+    ///
+    /// Methods without an explicit key generate one of these per call. Obtain it
+    /// up front and pass it to [`Client::signal_workflow_with_request_id`] so a
+    /// transport failure does not lose the key needed for a safe retry.
+    pub fn generate_signal_request_id() -> String {
+        generated_request_id("signal")
+    }
+
+    /// A fresh caller command key for one logical update (`sdk-rust-update-<uuid>`).
+    ///
+    /// [`Client::update_workflow`] generates one of these when `request_id` is
+    /// `None`. Obtain it up front and pass it explicitly so a transport failure
+    /// does not lose the key needed for a safe retry.
+    pub fn generate_update_request_id() -> String {
+        generated_request_id("update")
     }
 
     /// Append one idempotently identified item to an instance-scoped input stream.
@@ -2980,7 +3147,8 @@ impl Client {
         .await
     }
 
-    /// Signal only if `run_id` is still the current run for this instance.
+    /// Signal only if `run_id` is still the current run for this instance,
+    /// with an SDK-generated caller command key.
     pub async fn signal_workflow_run<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -2988,7 +3156,25 @@ impl Client {
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
-        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input)
+        let request_id = Self::generate_signal_request_id();
+        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input, &request_id)
+            .await
+    }
+
+    /// Signal only if `run_id` is still the current run for this instance,
+    /// with an explicit caller command key (1 to 255 bytes).
+    ///
+    /// The selected run is part of the signal's intent: retrying with the same
+    /// key and a different run target is a `request_id_conflict` refusal.
+    pub async fn signal_workflow_run_with_request_id<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input, request_id)
             .await
     }
 
@@ -2998,12 +3184,15 @@ impl Client {
         run_id: Option<&str>,
         signal_name: &str,
         input: T,
+        request_id: &str,
     ) -> Result<Value> {
         validate_user_signal_name(signal_name)?;
+        validate_request_id(request_id)?;
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
         let body = json!({
-            "input": input_envelope
+            "input": input_envelope,
+            "request_id": request_id,
         });
         let path = match run_id {
             Some(run_id) => {
@@ -3011,13 +3200,15 @@ impl Client {
             }
             None => format!("/workflows/{workflow_id}/signal/{signal_name}"),
         };
-        self.request_json(
-            reqwest::Method::POST,
-            &path,
-            RequestProtocol::ControlPlane,
-            Some(&body),
-        )
-        .await
+        let receipt = self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        Ok(with_request_id(receipt, request_id))
     }
 
     /// Close the current run as cancelled immediately.
@@ -3308,6 +3499,13 @@ impl Client {
     }
 
     /// Send a synchronous update using fixed Avro Value arguments.
+    ///
+    /// `request_id` is the caller command key (1 to 255 bytes), sent as the
+    /// `request_id` body field; `None` generates one with
+    /// [`Client::generate_update_request_id`]. A Server that already retains the
+    /// key for the same update intent returns the original update's receipt and
+    /// result instead of admitting a second update; a different intent is
+    /// refused with [`Error::is_request_id_conflict`].
     pub async fn update_workflow<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -3357,21 +3555,28 @@ impl Client {
         input: T,
         request_id: Option<&str>,
     ) -> Result<Value> {
+        let request_id = match request_id {
+            Some(request_id) => {
+                validate_request_id(request_id)?;
+                request_id.to_string()
+            }
+            None => Self::generate_update_request_id(),
+        };
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
-        let mut body = json!({
+        let body = json!({
             "input": encode_typed_envelope(&input, DEFAULT_CODEC)?,
             "wait_for": "completed",
+            "request_id": request_id,
         });
-        if let Some(request_id) = request_id {
-            body["request_id"] = json!(request_id);
-        }
-        self.request_json(
-            reqwest::Method::POST,
-            &format!("/workflows/{workflow_id}/update/{update_name}"),
-            RequestProtocol::ControlPlane,
-            Some(&body),
-        )
-        .await
+        let receipt = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!("/workflows/{workflow_id}/update/{update_name}"),
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        Ok(with_request_id(receipt, &request_id))
     }
 
     pub async fn describe_workflow(&self, workflow_id: &str) -> Result<WorkflowDescription> {
@@ -5509,9 +5714,22 @@ impl WorkflowHandle {
             .await
     }
 
+    /// Signal this workflow with an SDK-generated caller command key.
     pub async fn signal<T: Serialize>(&self, signal_name: &str, input: T) -> Result<Value> {
         self.client
             .signal_workflow(&self.workflow_id, signal_name, input)
+            .await
+    }
+
+    /// Signal this workflow with an explicit caller command key (1 to 255 bytes).
+    pub async fn signal_with_request_id<T: Serialize>(
+        &self,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        self.client
+            .signal_workflow_with_request_id(&self.workflow_id, signal_name, input, request_id)
             .await
     }
 
@@ -5526,7 +5744,8 @@ impl WorkflowHandle {
             .await
     }
 
-    /// Signal only if this handle's selected run is still current.
+    /// Signal only if this handle's selected run is still current, with an
+    /// SDK-generated caller command key.
     pub async fn signal_selected_run<T: Serialize>(
         &self,
         signal_name: &str,
@@ -5537,6 +5756,28 @@ impl WorkflowHandle {
         })?;
         self.client
             .signal_workflow_run(&self.workflow_id, run_id, signal_name, input)
+            .await
+    }
+
+    /// Signal only if this handle's selected run is still current, with an
+    /// explicit caller command key (1 to 255 bytes).
+    pub async fn signal_selected_run_with_request_id<T: Serialize>(
+        &self,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run signaling".to_string())
+        })?;
+        self.client
+            .signal_workflow_run_with_request_id(
+                &self.workflow_id,
+                run_id,
+                signal_name,
+                input,
+                request_id,
+            )
             .await
     }
 
@@ -26557,6 +26798,567 @@ mod tests {
         assert_eq!(failure.reason, "rejected_unknown_query");
     }
 
+    const KEYED_SIGNAL_PATH: &str = "/api/workflows/keyed-1/signal/approve";
+    const KEYED_RUN_SIGNAL_PATH: &str = "/api/workflows/keyed-1/runs/run-keyed-1/signal/approve";
+    const KEYED_UPDATE_PATH: &str = "/api/workflows/keyed-1/update/adjust";
+
+    fn keyed_command_request(path: &str, body: &str) -> Option<Value> {
+        if path != KEYED_SIGNAL_PATH && path != KEYED_RUN_SIGNAL_PATH && path != KEYED_UPDATE_PATH {
+            return None;
+        }
+        serde_json::from_str(body).ok()
+    }
+
+    /// A #216 Server: echoes the key with `retained` and `intent_verified`.
+    fn keyed_command_server(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let mut receipt = json!({
+            "outcome": "accepted",
+            "command_status": "accepted",
+            "command_id": "cmd-keyed-1",
+            "request_id": request["request_id"],
+            "retained": false,
+            "intent_verified": true,
+        });
+        if path == KEYED_UPDATE_PATH {
+            receipt["update_id"] = json!("upd-keyed-1");
+            receipt["result_envelope"] =
+                encode_typed_envelope(&AvroValue::Long(42), DEFAULT_CODEC).expect("result");
+        }
+        Some(("202 Accepted", receipt.to_string()))
+    }
+
+    /// A Server released before #216: accepts the body field but echoes nothing.
+    fn legacy_command_server(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+        keyed_command_request(path, body)?;
+        Some((
+            "202 Accepted",
+            r#"{"outcome":"accepted","command_status":"accepted","command_id":"cmd-legacy"}"#
+                .to_string(),
+        ))
+    }
+
+    fn retained_command_server(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        Some((
+            "202 Accepted",
+            json!({
+                "outcome": "accepted",
+                "command_status": "accepted",
+                "command_id": "cmd-first",
+                "request_id": request["request_id"],
+                "retained": true,
+                "intent_verified": true,
+            })
+            .to_string(),
+        ))
+    }
+
+    fn conflicting_command_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let retained_type = if path == KEYED_UPDATE_PATH {
+            "update"
+        } else {
+            "signal"
+        };
+        Some((
+            "409 Conflict",
+            json!({
+                "reason": "request_id_conflict",
+                "message": format!("request id is retained for a different {retained_type} intent"),
+                "request_id": request["request_id"],
+                "retained_command_id": "cmd-retained-1",
+                "retained_command_type": retained_type,
+                "retained_outcome": "accepted",
+                "conflict": ["arguments", "target"],
+                "control_plane": {"operation": retained_type},
+            })
+            .to_string(),
+        ))
+    }
+
+    fn closed_run_command_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        Some((
+            "409 Conflict",
+            json!({
+                "reason": "run_not_active",
+                "message": "run is closed",
+                "request_id": request["request_id"],
+            })
+            .to_string(),
+        ))
+    }
+
+    fn drop_first_keyed_signal(path: &str, request_number: usize) -> bool {
+        path == KEYED_SIGNAL_PATH && request_number == 1
+    }
+
+    fn keyed_client(server: &MockWorkerServer) -> Client {
+        Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client")
+    }
+
+    fn keyed_handle(client: &Client) -> WorkflowHandle {
+        WorkflowHandle {
+            client: client.clone(),
+            workflow_id: "keyed-1".to_string(),
+            run_id: Some("run-keyed-1".to_string()),
+            workflow_type: "keyed".to_string(),
+        }
+    }
+
+    fn assert_generated_request_id(request_id: &str, prefix: &str) {
+        let suffix = request_id
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("{request_id:?} does not start with {prefix:?}"));
+        assert_eq!(suffix.len(), 32, "uuid4 simple hex suffix: {request_id:?}");
+        assert!(
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "lowercase hex suffix: {request_id:?}"
+        );
+        assert!(request_id.len() <= MAX_REQUEST_ID_BYTES);
+    }
+
+    fn assert_key_sent_only_in_body(server: &MockWorkerServer, path: &str) {
+        let headers = server.request_headers(path);
+        assert!(!headers.is_empty(), "no request captured for {path}");
+        for headers in headers {
+            let header_names: Vec<String> = headers
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, _)| name.trim().to_ascii_lowercase())
+                .collect();
+            assert!(
+                !header_names.iter().any(|name| name == "x-request-id"),
+                "the caller command key is a body field, never an X-Request-Id header: {headers}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_without_key_sends_a_generated_sdk_rust_signal_key_and_returns_it() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(legacy_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let receipt = client
+            .signal_workflow("keyed-1", "approve", json!(["ok"]))
+            .await
+            .expect("signal receipt");
+
+        let sent = server.request_body(KEYED_SIGNAL_PATH);
+        let request_id = sent["request_id"].as_str().expect("generated request_id");
+        assert_generated_request_id(request_id, "sdk-rust-signal-");
+        assert_eq!(
+            receipt,
+            json!({
+                "outcome": "accepted",
+                "command_status": "accepted",
+                "command_id": "cmd-legacy",
+                "request_id": request_id,
+            }),
+            "the sent key is added when an older Server omits it"
+        );
+        assert_key_sent_only_in_body(&server, KEYED_SIGNAL_PATH);
+
+        let receipt = keyed_handle(&client)
+            .signal_selected_run("approve", json!(["ok"]))
+            .await
+            .expect("selected-run signal receipt");
+        let run_sent = server.request_body(KEYED_RUN_SIGNAL_PATH);
+        let run_request_id = run_sent["request_id"]
+            .as_str()
+            .expect("generated request_id");
+        assert_generated_request_id(run_request_id, "sdk-rust-signal-");
+        assert_eq!(receipt["request_id"], run_request_id);
+        assert_ne!(
+            run_request_id, request_id,
+            "each logical call gets its own key"
+        );
+        assert_key_sent_only_in_body(&server, KEYED_RUN_SIGNAL_PATH);
+    }
+
+    #[tokio::test]
+    async fn update_without_key_sends_a_generated_sdk_rust_update_key() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(keyed_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let result = client
+            .update_workflow("keyed-1", "adjust", json!([1]), None)
+            .await
+            .expect("update result");
+        assert_eq!(
+            result,
+            json!(42),
+            "the decoded update result is returned unchanged"
+        );
+        let typed = client
+            .update_workflow_avro_value("keyed-1", "adjust", json!([1]), None)
+            .await
+            .expect("typed update result");
+        assert_eq!(typed, AvroValue::Long(42));
+        keyed_handle(&client)
+            .update("adjust", json!([1]), None)
+            .await
+            .expect("handle update result");
+
+        let bodies = server.request_bodies(KEYED_UPDATE_PATH);
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies {
+            assert_generated_request_id(
+                body["request_id"].as_str().expect("generated request_id"),
+                "sdk-rust-update-",
+            );
+            assert_eq!(body["wait_for"], "completed");
+        }
+        assert_ne!(bodies[0]["request_id"], bodies[1]["request_id"]);
+        assert_ne!(bodies[1]["request_id"], bodies[2]["request_id"]);
+        assert_key_sent_only_in_body(&server, KEYED_UPDATE_PATH);
+    }
+
+    #[tokio::test]
+    async fn explicit_command_keys_are_sent_verbatim_as_the_request_id_body_field() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(keyed_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+        let handle = keyed_handle(&client);
+
+        let receipt = client
+            .signal_workflow_with_request_id(
+                "keyed-1",
+                "approve",
+                json!(["ok"]),
+                "Order-42/approve",
+            )
+            .await
+            .expect("signal receipt");
+        assert_eq!(receipt["request_id"], "Order-42/approve");
+        assert_eq!(receipt["retained"], false);
+        assert_eq!(receipt["intent_verified"], true);
+        handle
+            .signal_with_request_id("approve", json!(["ok"]), "handle-signal-key")
+            .await
+            .expect("handle signal receipt");
+        client
+            .signal_workflow_run_with_request_id(
+                "keyed-1",
+                "run-keyed-1",
+                "approve",
+                json!(["ok"]),
+                "run-signal-key",
+            )
+            .await
+            .expect("selected-run signal receipt");
+        handle
+            .signal_selected_run_with_request_id("approve", json!(["ok"]), "handle-run-signal-key")
+            .await
+            .expect("handle selected-run signal receipt");
+        let result = client
+            .update_workflow("keyed-1", "adjust", json!([1]), Some("update-key"))
+            .await
+            .expect("update result");
+        assert_eq!(result, json!(42));
+        handle
+            .update("adjust", json!([1]), Some("handle-update-key"))
+            .await
+            .expect("handle update result");
+        handle
+            .update_avro_value("adjust", json!([1]), Some("handle-typed-update-key"))
+            .await
+            .expect("handle typed update result");
+
+        let signal_keys: Vec<Value> = server
+            .request_bodies(KEYED_SIGNAL_PATH)
+            .into_iter()
+            .map(|body| body["request_id"].clone())
+            .collect();
+        assert_eq!(
+            signal_keys,
+            [json!("Order-42/approve"), json!("handle-signal-key")]
+        );
+        let run_signal_keys: Vec<Value> = server
+            .request_bodies(KEYED_RUN_SIGNAL_PATH)
+            .into_iter()
+            .map(|body| body["request_id"].clone())
+            .collect();
+        assert_eq!(
+            run_signal_keys,
+            [json!("run-signal-key"), json!("handle-run-signal-key")]
+        );
+        let update_keys: Vec<Value> = server
+            .request_bodies(KEYED_UPDATE_PATH)
+            .into_iter()
+            .map(|body| body["request_id"].clone())
+            .collect();
+        assert_eq!(
+            update_keys,
+            [
+                json!("update-key"),
+                json!("handle-update-key"),
+                json!("handle-typed-update-key")
+            ]
+        );
+        for path in [KEYED_SIGNAL_PATH, KEYED_RUN_SIGNAL_PATH, KEYED_UPDATE_PATH] {
+            assert_key_sent_only_in_body(&server, path);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_receipts_are_returned_unchanged() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(retained_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let receipt = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), "retry-key")
+            .await
+            .expect("retained receipt");
+
+        assert_eq!(
+            receipt,
+            json!({
+                "outcome": "accepted",
+                "command_status": "accepted",
+                "command_id": "cmd-first",
+                "request_id": "retry-key",
+                "retained": true,
+                "intent_verified": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_conflict_refusal_keeps_error_http_and_classifies_the_sent_key() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(conflicting_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let error = client
+            .signal_workflow_with_request_id(
+                "keyed-1",
+                "approve",
+                json!(["changed"]),
+                "Order-42/approve",
+            )
+            .await
+            .expect_err("different intent under a retained key");
+        assert!(
+            matches!(error, Error::Http { status, .. } if status == reqwest::StatusCode::CONFLICT),
+            "existing Error::Http matching keeps working: {error:?}"
+        );
+        assert!(error.is_request_id_conflict());
+        assert_eq!(error.request_id().as_deref(), Some("Order-42/approve"));
+        let conflict = error.request_id_conflict().expect("conflict details");
+        assert_eq!(conflict.status, 409);
+        assert_eq!(conflict.request_id, "Order-42/approve");
+        assert_eq!(
+            conflict.message,
+            "request id is retained for a different signal intent"
+        );
+        assert_eq!(
+            conflict.retained_command_id.as_deref(),
+            Some("cmd-retained-1")
+        );
+        assert_eq!(conflict.retained_command_type.as_deref(), Some("signal"));
+        assert_eq!(conflict.retained_outcome.as_deref(), Some("accepted"));
+        assert_eq!(conflict.conflict, ["arguments", "target"]);
+        assert_eq!(conflict.body["control_plane"]["operation"], "signal");
+
+        let error = client
+            .update_workflow("keyed-1", "adjust", json!([2]), None)
+            .await
+            .expect_err("different intent under a retained generated key");
+        let sent = server.request_body(KEYED_UPDATE_PATH);
+        assert_eq!(
+            error.request_id(),
+            sent["request_id"].as_str().map(str::to_string)
+        );
+        assert_eq!(
+            error
+                .request_id_conflict()
+                .expect("conflict details")
+                .retained_command_type
+                .as_deref(),
+            Some("update")
+        );
+    }
+
+    #[tokio::test]
+    async fn other_refusals_echoing_the_key_are_not_request_id_conflicts() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(closed_run_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let error = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), "closed-key")
+            .await
+            .expect_err("closed run");
+
+        assert!(matches!(error, Error::Http { status, .. } if status.as_u16() == 409));
+        assert!(!error.is_request_id_conflict());
+        assert_eq!(error.request_id_conflict(), None);
+        assert_eq!(error.request_id().as_deref(), Some("closed-key"));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_error_transport_and_the_held_key_retries_identically() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(keyed_command_server),
+            drop_request: Some(drop_first_keyed_signal),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+        let request_id = Client::generate_signal_request_id();
+
+        let error = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &request_id)
+            .await
+            .expect_err("connection closed before any response");
+        assert!(
+            matches!(error, Error::Transport(_)),
+            "the transport variant is unchanged: {error:?}"
+        );
+        assert_eq!(
+            error.request_id(),
+            None,
+            "nothing was echoed; the application holds the key it chose"
+        );
+
+        let receipt = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &request_id)
+            .await
+            .expect("manual retry with the same key");
+        assert_eq!(receipt["request_id"], request_id);
+        let bodies = server.request_bodies(KEYED_SIGNAL_PATH);
+        assert_eq!(bodies.len(), 2, "one attempt per call, no automatic retry");
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the retry resends the identical key and input"
+        );
+        assert_eq!(bodies[0]["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn invalid_command_keys_are_refused_before_sending() {
+        let server = MockWorkerServer::start();
+        let client = keyed_client(&server);
+        let too_long = "k".repeat(MAX_REQUEST_ID_BYTES + 1);
+
+        for request_id in ["", too_long.as_str()] {
+            let error = client
+                .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), request_id)
+                .await
+                .expect_err("invalid signal key");
+            assert!(
+                matches!(error, Error::Codec(ref message) if message.contains("1 to 255 bytes")),
+                "{error:?}"
+            );
+            let error = client
+                .update_workflow("keyed-1", "adjust", json!([1]), Some(request_id))
+                .await
+                .expect_err("invalid update key");
+            assert!(matches!(error, Error::Codec(_)), "{error:?}");
+        }
+        assert!(server.captured_paths().is_empty(), "nothing was sent");
+
+        let longest = "k".repeat(MAX_REQUEST_ID_BYTES);
+        let _ = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &longest)
+            .await;
+        assert_eq!(
+            server.request_body(KEYED_SIGNAL_PATH)["request_id"],
+            longest
+        );
+    }
+
+    #[test]
+    fn generated_command_keys_are_distinct_and_well_formed() {
+        let signal = Client::generate_signal_request_id();
+        let update = Client::generate_update_request_id();
+        assert_generated_request_id(&signal, "sdk-rust-signal-");
+        assert_generated_request_id(&update, "sdk-rust-update-");
+        assert_ne!(Client::generate_signal_request_id(), signal);
+        assert!(validate_request_id(&signal).is_ok());
+    }
+
+    #[test]
+    fn request_id_accessors_read_only_echoed_refusal_bodies() {
+        let conflict = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_conflict","request_id":"k1","retained_command_id":"cmd-1","retained_command_type":"signal","retained_outcome":"accepted","conflict":["name"]}"#.to_string(),
+        };
+        assert!(conflict.is_request_id_conflict());
+        assert_eq!(conflict.request_id().as_deref(), Some("k1"));
+        let details = conflict.request_id_conflict().expect("conflict details");
+        assert_eq!(details.conflict, ["name"]);
+        assert_eq!(
+            details.message,
+            "request id is retained for a different command intent"
+        );
+
+        let echoed = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"run_not_active","request_id":"k2"}"#.to_string(),
+        };
+        assert!(!echoed.is_request_id_conflict());
+        assert_eq!(echoed.request_id().as_deref(), Some("k2"));
+
+        let blank = Error::Http {
+            status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            body: r#"{"request_id":""}"#.to_string(),
+        };
+        assert_eq!(blank.request_id(), None);
+        let text = Error::Http {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: "upstream unavailable".to_string(),
+        };
+        assert_eq!(text.request_id(), None);
+        assert!(!text.is_request_id_conflict());
+
+        let rejection = Error::WorkflowCommandRejected(WorkflowCommandRejection {
+            command: WorkflowCommandKind::Cancel,
+            status: 409,
+            reason: "request_id_conflict".to_string(),
+            message: "retained".to_string(),
+            workflow_id: "wf".to_string(),
+            run_id: None,
+            target_scope: None,
+            body: json!({"reason": "request_id_conflict", "request_id": "k3", "conflict": []}),
+        });
+        assert!(rejection.is_request_id_conflict());
+        assert_eq!(rejection.request_id().as_deref(), Some("k3"));
+
+        assert_eq!(Error::Timeout.request_id(), None);
+        assert!(!Error::Codec("local".to_string()).is_request_id_conflict());
+    }
+
     #[tokio::test]
     async fn public_client_surfaces_send_and_receive_lossless_avro_values() {
         let server = MockWorkerServer::start();
@@ -29646,6 +30448,8 @@ mod tests {
     struct MockWorkerBehavior {
         response_override: Option<fn(&str) -> Option<(&'static str, String)>>,
         request_override: Option<RequestOverride>,
+        /// Close the connection after reading the request, without any response.
+        drop_request: Option<fn(&str, usize) -> bool>,
         storage_refusals: usize,
         storage_path: Option<&'static str>,
         storage_unavailable: bool,
@@ -29991,6 +30795,16 @@ mod tests {
                 })
                 .collect()
         }
+
+        fn request_headers(&self, path: &str) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .filter(|request| request.path == path)
+                .map(|request| request.headers.clone())
+                .collect()
+        }
     }
 
     impl Drop for MockWorkerServer {
@@ -30091,6 +30905,12 @@ mod tests {
                 .count()
         };
 
+        if behavior
+            .drop_request
+            .is_some_and(|dropped| dropped(path, request_number))
+        {
+            return;
+        }
         if let Some(response) = behavior
             .request_override
             .and_then(|handler| handler(path, body, request_number))
