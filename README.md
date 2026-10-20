@@ -145,8 +145,11 @@ handler before registration instead of relying on replacement order.
 After registering a workflow, declare every signal name it reads through
 `wait_signal` or `signals` before starting the worker:
 
-```rust
+```rust,no_run
+# fn declare_signals(worker: &mut durable_workflow::Worker) -> durable_workflow::Result<()> {
 worker.declare_workflow_signals("orders", &["finish", "changed"])?;
+# Ok(())
+# }
 ```
 
 Server records those names and positional argument contracts when starting a
