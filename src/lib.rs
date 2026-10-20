@@ -27309,6 +27309,13 @@ mod tests {
     }
 
     #[test]
+    fn command_keys_preserve_the_published_server_unicode_character_limit() {
+        assert!(validate_request_id(&"é".repeat(255)).is_ok());
+        assert!(validate_request_id(&"😀".repeat(255)).is_ok());
+        assert!(validate_request_id(&"é".repeat(256)).is_err());
+    }
+
+    #[test]
     fn request_id_accessors_read_only_echoed_refusal_bodies() {
         let conflict = Error::Http {
             status: reqwest::StatusCode::CONFLICT,
