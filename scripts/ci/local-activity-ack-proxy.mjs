@@ -6,6 +6,10 @@ import { createHash } from 'node:crypto';
 
 const upstream = process.env.DURABLE_WORKFLOW_ACK_UPSTREAM;
 if (!upstream) throw new Error('DURABLE_WORKFLOW_ACK_UPSTREAM is required');
+const commandType = process.env.DURABLE_WORKFLOW_ACK_COMMAND || 'record_local_activity';
+if (!['record_local_activity', 'start_service_operation'].includes(commandType)) {
+  throw new Error('Expected a local activity or service operation completion command');
+}
 let receipt = null;
 
 createServer(async (request, response) => {
@@ -30,9 +34,19 @@ createServer(async (request, response) => {
     const bytes = Buffer.from(await result.arrayBuffer());
     if (!receipt && result.ok && /\/worker\/workflow-tasks\/[^/]+\/complete$/.test(request.url)) {
       const commands = JSON.parse(body.toString()).commands;
-      if (commands.some(command => command.type === 'record_local_activity')) {
+      const selected = commands.find(command => command.type === commandType);
+      const confirmed = selected && (commandType !== 'start_service_operation'
+        || JSON.parse(bytes.toString()).recorded === true);
+      if (confirmed) {
         receipt = { upstream_status: result.status, path: request.url,
-          command_sha256: createHash('sha256').update(body).digest('hex'), acknowledgement_dropped: true };
+          command_sha256: createHash('sha256').update(body).digest('hex'), acknowledgement_dropped: true,
+          command_type: commandType };
+        if (commandType === 'start_service_operation') {
+          receipt.upstream_recorded = true;
+          receipt.intent = { endpoint_name: selected.endpoint_name, service_name: selected.service_name,
+            operation_name: selected.operation_name, namespace: selected.namespace,
+            idempotency_key: selected.idempotency_key };
+        }
         response.destroy();
         return;
       }

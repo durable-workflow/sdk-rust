@@ -1,0 +1,208 @@
+x-runtime-env: &runtime-env
+  APP_ENV: testing
+  APP_DEBUG: "false"
+  APP_KEY: "base64:dGVzdGluZy1rZXktMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMg=="
+  DB_CONNECTION: mysql
+  DB_HOST: mysql
+  DB_DATABASE: durable_workflow
+  DB_USERNAME: workflow
+  DB_PASSWORD: workflow
+  REDIS_HOST: redis
+  QUEUE_CONNECTION: redis
+  CACHE_STORE: redis
+  WORKFLOW_SERVER_AUTH_DRIVER: token
+  WORKFLOW_SERVER_AUTH_TOKEN: test-token
+  DW_WORKFLOW_TASK_TIMEOUT: 10
+  DW_WORKER_PROTOCOL_VERSION: "1.20"
+
+x-runtime: &runtime
+  image: "${NEXUS_SERVER_IMAGE:-durableworkflow/server@sha256:64fa21868ca41582575f2893ce4fda49b0f4eb7f1ade464145ff09adec21df19}"
+  environment: *runtime-env
+  mem_limit: 512m
+  cpus: 1
+  stop_signal: SIGTERM
+  volumes:
+    - "${NEXUS_STATE_DIR}/provider:/nexus-payloads"
+
+x-worker: &worker
+  init: true
+  stop_signal: SIGTERM
+  user: "${NEXUS_UID:?set the invoking UID}:${NEXUS_GID:?set the invoking GID}"
+  mem_limit: 256m
+  cpus: 0.5
+  volumes:
+    - "${NEXUS_STATE_DIR:?set the disposable state directory}:/state:ro"
+    - ".:/fixture:ro"
+  environment: &worker-env
+    DURABLE_WORKFLOW_RUNTIME_URL: http://server:8080
+    DURABLE_WORKFLOW_WORKER_TOKEN: test-token
+    DURABLE_WORKFLOW_WORKER_PROTOCOL_VERSION: "1.20"
+    DURABLE_WORKFLOW_RUNTIME_NAMESPACE: "${NEXUS_NAMESPACE:-default}"
+    NEXUS_QUALIFY_OUTCOMES: "${NEXUS_QUALIFY_OUTCOMES:-0}"
+    NEXUS_QUALIFY_ADMISSION: "${NEXUS_QUALIFY_ADMISSION:-0}"
+    NEXUS_QUALIFY_UI: "${NEXUS_QUALIFY_UI:-0}"
+    NEXUS_ROLE: "${NEXUS_ROLE:-caller}"
+    NEXUS_ENDPOINT: "${NEXUS_ENDPOINT:-cooperative}"
+    NEXUS_SERVICE: cleanup
+    NEXUS_QUALIFY_NEIGHBOR: "1"
+    TASK_QUEUE: "${NEXUS_QUEUE:-nexus-workers}"
+    WORKER_ID: "${NEXUS_WORKER_ID:-nexus-worker}"
+    WORKFLOW_TYPE: "${NEXUS_WORKFLOW_TYPE:-nexus.caller}"
+  depends_on:
+    server:
+      condition: service_healthy
+
+services:
+  mysql:
+    image: "${NEXUS_MYSQL_IMAGE:-mysql:8.4.5}"
+    mem_limit: 1g
+    cpus: 1
+    environment:
+      MYSQL_DATABASE: durable_workflow
+      MYSQL_USER: workflow
+      MYSQL_PASSWORD: workflow
+      MYSQL_ROOT_PASSWORD: root
+    tmpfs: [/var/lib/mysql]
+    healthcheck:
+      test: [CMD, mysqladmin, ping, -h, localhost]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: "${NEXUS_REDIS_IMAGE:-redis:7-alpine}"
+    mem_limit: 128m
+    cpus: 0.25
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+  bootstrap:
+    <<: *runtime
+    command: [server-bootstrap]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  server:
+    <<: *runtime
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:8080/api/health]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+  queue:
+    <<: *runtime
+    command: [php, artisan, "queue:work", "--sleep=1", "--tries=3", "--max-time=3600"]
+    depends_on:
+      server:
+        condition: service_healthy
+  repair:
+    <<: *runtime
+    command: [sh, -c, "while true; do php artisan workflow:v2:repair-pass --json; sleep 10; done"]
+    depends_on:
+      server:
+        condition: service_healthy
+  rust:
+    <<: *worker
+    profiles: [workers]
+    image: "${NEXUS_RUST_IMAGE:-rust:1.86-bookworm}"
+    entrypoint: [/state/target/debug/examples/nexus_cooperation]
+  php:
+    <<: *worker
+    profiles: [workers]
+    image: "${NEXUS_PHP_IMAGE:?set a PHP CLI image with pcntl and posix}"
+    entrypoint: [php, /fixture/worker.php]
+    healthcheck:
+      disable: true
+    environment:
+      <<: *worker-env
+      NEXUS_PHP_AUTOLOAD: /state/php/vendor/autoload.php
+  python:
+    <<: *worker
+    profiles: [workers]
+    image: "${NEXUS_PYTHON_IMAGE:-python:3.13-slim}"
+    entrypoint: [python, /fixture/worker.py]
+    environment:
+      <<: *worker-env
+      PYTHONPATH: /state/python
+      PYTHONDONTWRITEBYTECODE: "1"
+  ack-proxy:
+    <<: *worker
+    profiles: [observers]
+    image: "${NEXUS_NODE_IMAGE:-node@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392}"
+    entrypoint: [node, /fault/local-activity-ack-proxy.mjs]
+    volumes:
+      - "../../scripts/ci:/fault:ro"
+    environment:
+      DURABLE_WORKFLOW_ACK_UPSTREAM: http://server:8080
+      DURABLE_WORKFLOW_ACK_COMMAND: start_service_operation
+      PORT: "3000"
+  catalog-default: &catalog
+    image: "${NEXUS_WATERLINE_IMAGE:-durableworkflow/waterline@sha256:297616026bd18baa99c5cf0826c25efac0f308fd238e5839171c6bd3a2e50fe6}"
+    profiles: [catalog]
+    init: true
+    mem_limit: 512m
+    cpus: 0.5
+    stop_signal: SIGTERM
+    environment: &catalog-env
+      WATERLINE_SERVER_ENDPOINT: http://server:8080
+      WATERLINE_SERVER_TOKEN: test-token
+      WATERLINE_NAMESPACE: default
+      WATERLINE_ACCESS_MODE: read_only
+      WATERLINE_ALLOW_UNAUTHENTICATED: "true"
+      DB_CONNECTION: sqlite
+      DB_DATABASE: /data/waterline.sqlite
+    volumes: [catalog-default:/data]
+    healthcheck:
+      test: [CMD, php, -r, "exit(@file_get_contents('http://127.0.0.1:8080/up') === false ? 1 : 0);"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    depends_on:
+      server:
+        condition: service_healthy
+  catalog-named:
+    <<: *catalog
+    environment:
+      <<: *catalog-env
+      WATERLINE_NAMESPACE: nexus-source
+    volumes: [catalog-named:/data]
+  catalog-unrelated:
+    <<: *catalog
+    environment:
+      <<: *catalog-env
+      WATERLINE_NAMESPACE: nexus-unrelated
+    volumes: [catalog-unrelated:/data]
+  browser:
+    <<: *worker
+    profiles: [catalog]
+    image: "${NEXUS_BROWSER_IMAGE:-mcr.microsoft.com/playwright@sha256:bc6ab0d6d44ff4826e4cb8c1e6d801e185bfc42bb0753f8e2a30efc70db054c7}"
+    mem_limit: 2g
+    cpus: 2
+    shm_size: 256m
+    entrypoint: [node, /fixture/catalog.mjs]
+    volumes:
+      - "${NEXUS_STATE_DIR}:/state"
+      - ".:/fixture:ro"
+  observe:
+    <<: *worker
+    profiles: [observers]
+    image: "${NEXUS_PYTHON_IMAGE:-python:3.13-slim}"
+    entrypoint: [python, /fixture/observe.py]
+    volumes:
+      - "${NEXUS_STATE_DIR}:/state"
+      - ".:/fixture:ro"
+    environment:
+      <<: *worker-env
+      PYTHONPATH: /state/python
+      PYTHONDONTWRITEBYTECODE: "1"
+
+volumes:
+  catalog-default:
+  catalog-named:
+  catalog-unrelated:
