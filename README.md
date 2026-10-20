@@ -77,6 +77,9 @@ observability metadata. `ActivityTask` also exposes optional workflow, run and
 activity execution identities supplied by the runtime. When constructing task
 structs directly, initialize the new optional fields to `None`. Receiving these
 fields does not enable tracing, authorize work or invent missing correlation.
+Task structs remain directly constructible. Future additions to their public
+fields require another major release; extensible metadata inside the existing
+optional JSON fields does not require new task literal fields.
 
 Existing workflow histories are unchanged. Preserve the workflow's recorded
 command sequence and verify representative histories before deployment. Nexus

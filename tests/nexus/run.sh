@@ -10,7 +10,7 @@ source_sha="$(git -C "$repo_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$NEXUS_STATE_DIR/target/debug/examples/nexus_cooperation" | cut -d ' ' -f 1)"
 compose=(docker compose --env-file "$NEXUS_ENV_FILE" -f "$fixture_dir/docker-compose.yml")
 owned=()
-ack_observer=''
+control_observer=''
 cleanup() {
   for container in "${owned[@]}"; do
     docker stop --time 15 "$container" >/dev/null 2>&1 || true
@@ -19,9 +19,9 @@ cleanup() {
 }
 finish() {
   cleanup
-  if [[ -n "$ack_observer" ]]; then
-    docker stop --time 5 "$ack_observer" >/dev/null 2>&1 || true
-    docker rm --volumes "$ack_observer" >/dev/null 2>&1 || true
+  if [[ -n "$control_observer" ]]; then
+    docker stop --time 5 "$control_observer" >/dev/null 2>&1 || true
+    docker rm --volumes "$control_observer" >/dev/null 2>&1 || true
   fi
 }
 trap finish EXIT
@@ -54,26 +54,31 @@ start_worker() {
   owned+=("$container")
 }
 
+ensure_control_observer() {
+  if [[ -z "$control_observer" ]]; then
+    control_observer="r87-control-observer-$(date -u +%s)-$$"
+    "${compose[@]}" run -d --no-deps --name "$control_observer" \
+      --entrypoint sleep observe infinity >/dev/null
+  fi
+}
+
 admission_observe() {
-  "${compose[@]}" run --rm --no-deps -T --entrypoint python \
+  ensure_control_observer
+  docker exec \
     -e "NEXUS_TARGET_NAMESPACE=${NEXUS_TARGET_NAMESPACE:-${NEXUS_NAMESPACE:-default}}" \
     -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
-    observe /fixture/admissions.py "$@"
+    "$control_observer" python /fixture/admissions.py "$@"
 }
 
 ack_observe() {
   # Each phase still starts a fresh Python process and reads the original
   # durable receipt. Repeated container creation must not consume the fixed
   # observation budget before the cold caller has a chance to execute.
-  if [[ -z "$ack_observer" ]]; then
-    ack_observer="r87k-observer-$(date -u +%s)-$$"
-    "${compose[@]}" run -d --no-deps --name "$ack_observer" \
-      --entrypoint sleep observe infinity >/dev/null
-  fi
+  ensure_control_observer
   docker exec \
     -e "NEXUS_TARGET_NAMESPACE=$NEXUS_TARGET_NAMESPACE" \
     -e "NEXUS_RUST_SOURCE=$source_sha" -e "NEXUS_RUST_BINARY_SHA256=$binary_sha" \
-    "$ack_observer" python /fixture/acknowledgements.py "$@"
+    "$control_observer" python /fixture/acknowledgements.py "$@"
 }
 
 if [[ "${1:-}" == acknowledgement ]]; then
@@ -148,12 +153,14 @@ if [[ "${1:-cancellation}" == admission || "${1:-}" == cross-namespace ]]; then
           start_worker "$target" target "$case_id-target" "$target_container"
           start_worker "$caller" caller "$case_id-caller" "$caller_container"
           admission_observe prepare "$namespace" "$case_id" "$caller" "$target" "$profile" "$schedule"
-          docker logs "$caller_container" > "$NEXUS_STATE_DIR/admissions/$case_id-caller-original.log" 2>&1
           if [[ "$schedule" == cold ]]; then
             docker kill --signal KILL "$caller_container" >/dev/null
+            docker logs "$caller_container" > "$NEXUS_STATE_DIR/admissions/$case_id-caller-original.log" 2>&1
             docker inspect "$caller_container" --format '{{json .State}}' > "$NEXUS_STATE_DIR/admissions/$case_id-killed.json"
             jq -e '.ExitCode==137 and .OOMKilled==false' "$NEXUS_STATE_DIR/admissions/$case_id-killed.json" >/dev/null
             admission_observe retire "$namespace" "$case_id"
+          else
+            docker logs "$caller_container" > "$NEXUS_STATE_DIR/admissions/$case_id-caller-original.log" 2>&1
           fi
           admission_observe target "$namespace" "$case_id"
           if [[ "$schedule" == cold ]]; then
