@@ -1,0 +1,1 @@
+durable-workflow==2.6.0

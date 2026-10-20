@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "nexus-original-terminal-result",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.nexus-result", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "ServiceCallStarted", "payload": {
+      "sequence": 1, "service_call_id": "original-call", "endpoint_name": "endpoint", "service_name": "service",
+      "operation_name": "operation", "operation_mode": "sync", "wait_for": "completed", "status": "started"
+    }},
+    {"event_type": "ServiceCallCompleted", "payload": {
+      "sequence": 1, "service_call_id": "original-call", "status": "completed",
+      "response_payload": {"codec": "avro", "blob": "wwHioz3/VYAiNwoaY2FwdHVyZWQtb25jZQ=="}
+    }}
+  ],
+  "expected": {"type": "complete_workflow", "result": "captured-once"}
+}

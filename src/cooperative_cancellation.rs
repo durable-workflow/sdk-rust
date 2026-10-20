@@ -54,7 +54,7 @@ pub struct CancellationDeliveryReceipt {
 pub enum CancellationDeliveryReply {
     Delivered(CancellationDeliveryReceipt),
     /// The current claim is completed. Return to polling without publishing
-    /// completion or failure. A child terminal event wakes a successor claim.
+    /// completion or failure. The awaited terminal event wakes a successor claim.
     ClaimReleased {
         task_id: String,
         run_id: String,
@@ -231,6 +231,7 @@ const MAX_SEQUENCE: u64 = i64::MAX as u64;
 /// The authored durable call where canonical cancellation is delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CancellationCallKind {
     Activity,
     LocalActivity,
@@ -240,6 +241,7 @@ pub enum CancellationCallKind {
     Child,
     Parallel,
     SelectionHandle,
+    ServiceOperation,
 }
 
 /// One committed delivery marker, bound to the original cancellation request.
@@ -421,6 +423,7 @@ impl CancellationHistory {
                 | CancellationCallKind::Signal
                 | CancellationCallKind::Child
                 | CancellationCallKind::SelectionHandle
+                | CancellationCallKind::ServiceOperation
         ) {
             return Ok(commands);
         }
@@ -697,6 +700,9 @@ impl CancellationHistory {
                     | "ChildRunFailed"
                     | "ChildRunCancelled"
                     | "ChildRunTerminated"
+                    | "ServiceCallCompleted"
+                    | "ServiceCallFailed"
+                    | "ServiceCallCancelled"
             ) {
                 state.resolved_before_request.insert(sequence);
                 if matches!(
@@ -707,6 +713,8 @@ impl CancellationHistory {
                         | "ChildRunFailed"
                         | "ChildRunCancelled"
                         | "ChildRunTerminated"
+                        | "ServiceCallFailed"
+                        | "ServiceCallCancelled"
                 ) {
                     state.failed_before_request.insert(sequence);
                 }
@@ -1580,6 +1588,9 @@ impl Client {
                 .await?;
             if response["delivered"].as_bool() == Some(false)
                 && match response["reason"].as_str() {
+                    Some("cancellation_waiting_for_service_operation") => {
+                        delivery.call_kind == CancellationCallKind::ServiceOperation
+                    }
                     Some("cancellation_waiting_for_child") => matches!(
                         delivery.call_kind,
                         CancellationCallKind::Child
@@ -2186,6 +2197,13 @@ impl Worker {
                 // and its successor replays their durable results before delivery.
                 decision.cancellation_delivery = None;
                 return Ok(Some(decision));
+            }
+            if intent.call_kind == CancellationCallKind::ServiceOperation
+                && !self.nexus_registration_confirmed.load(Ordering::SeqCst)
+            {
+                return Err(Error::CooperativeCancellationUnavailable(
+                    "nexus_cooperative_cancellation_not_supported: new delivery requires confirmed Nexus registration".into(),
+                ));
             }
             let delivery_error = match self
                 .client
