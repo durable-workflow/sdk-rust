@@ -483,6 +483,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.redrive-boundary"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
+            | "corpus.nexus-result"
+            | "corpus.nexus-cancellation"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -595,6 +597,27 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.nexus-result" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                ctx.call_nexus_service("endpoint", "service", "operation", json!(["world"]))
+                    .await?
+                    .result
+                    .deserialize::<Value>()
+            });
+        }
+        "corpus.nexus-cancellation" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let Err(Error::CooperativeCancellationRequested(cancelled)) = ctx
+                    .call_nexus_service("endpoint", "service", "operation", json!(["world"]))
+                    .await
+                else {
+                    return Err(Error::WorkerLoop(
+                        "expected original service cancellation".into(),
+                    ));
+                };
+                Ok(json!(cancelled.request.request_id))
+            });
+        }
         "corpus.php-zero-full" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
                 let first = ctx.get_version("frozen-zero", -7, 0)?;

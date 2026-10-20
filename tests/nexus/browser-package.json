@@ -1,0 +1,7 @@
+{
+  "name": "durable-workflow-nexus-browser",
+  "private": true,
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}

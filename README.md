@@ -63,6 +63,20 @@ cargo run --example hello_world
 
 The namespace runtime URL is already complete. Do not append another `/api`.
 
+## Migrate from Rust SDK 3
+
+Nexus calls add `Error::NexusOperationFailed` and
+`CancellationCallKind::ServiceOperation`. Both enums are now `non_exhaustive`.
+Include a fallback arm when matching either enum outside this crate so future
+error or cancellation kinds can be handled without another exhaustive-match
+migration. Handle a Nexus failure at its original durable call; a committed
+admission is separate from a synchronous completion.
+
+Existing workflow histories are unchanged. Preserve the workflow's recorded
+command sequence and verify representative histories before deployment. Nexus
+authoring requires explicit worker opt-in and an installed Server capability;
+ordinary worker registration does not enable it.
+
 ## Core API
 
 - `Client` starts, signals, queries, updates, cancels, terminates, describes,
@@ -329,6 +343,32 @@ option. Keep a process supervisor for startup failures and process crashes.
 - [Rust SDK guide](https://durable-workflow.com/docs/2.0/polyglot/rust/)
 - [Self-hosted Server guide](https://durable-workflow.com/docs/2.0/polyglot/server/)
 - [Cloud early access](https://cloud.durable-workflow.com/early-access)
+
+## Nexus service calls
+
+Await a catalog operation from workflow code with Avro arguments:
+
+```rust,ignore
+let reply = ctx.call_nexus_service("billing", "invoices", "create", invoice).await?;
+let receipt: Receipt = reply.result.deserialize()?;
+```
+
+The default synchronous call waits for its committed result. Cold replay resumes
+the original call without admitting it again. `NexusServiceOptions` selects a
+target namespace, idempotency key, async mode or acceptance-only waiting. Async
+and acceptance-only calls return the original admission, even when a terminal
+result appears later. Committed failures use `Error::NexusOperationFailed`.
+Calls currently run in the root workflow scope.
+
+Enable `Worker::nexus_cooperative_cancellation(true)` for cooperative service
+waits. It enables ordinary cooperation and requires the installed Server to
+advertise protocol 1.20, both cancellation capabilities and a `workflow_run`
+binding. Cancellation reaches the original synchronous completion wait after
+owned target cleanup, preserving the original request and cleanup deadline.
+Use a cancellation shield for durable cleanup. See
+[`examples/nexus_cooperation.rs`](examples/nexus_cooperation.rs) for caller and
+target workers. Ordinary cooperative workers keep their existing registration
+behavior when Nexus cooperation is disabled.
 
 ## Compatibility
 

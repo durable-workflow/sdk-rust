@@ -8,6 +8,7 @@ mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
 mod local_activity;
+mod nexus;
 mod query_authority;
 mod runtime_payloads;
 mod runtime_uploads;
@@ -211,7 +212,13 @@ enum RequestProtocol {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub use nexus::{
+    NexusOperationFailure, NexusOperationMode, NexusOperationResult, NexusServiceCall,
+    NexusServiceOptions, NexusWaitFor,
+};
+
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("transport error: {0}")]
     Transport(#[from] reqwest::Error),
@@ -238,6 +245,8 @@ pub enum Error {
     ChildWorkflowFailed(ChildWorkflowFailure),
     #[error(transparent)]
     ActivityFailed(ActivityFailure),
+    #[error(transparent)]
+    NexusOperationFailed(Box<NexusOperationFailure>),
     #[error(transparent)]
     ParallelFailed(ParallelFailure),
     #[error(transparent)]
@@ -3749,6 +3758,15 @@ impl Client {
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
+        if capabilities
+            .iter()
+            .any(|capability| capability == "nexus_cooperative_cancellation")
+        {
+            body["capability_manifest"]["nexus_cooperative_cancellation"] = json!({
+                "supported":true, "minimum_protocol_version":"1.20",
+                "implementation":"owned_workflow_run_canonical_delivery", "binding_kinds":["workflow_run"],
+            });
+        }
         if let Some(build_id) = &self.worker_build_id {
             if build_id.is_empty() || build_id.len() > 255 {
                 return Err(Error::WorkerLoop(
@@ -3847,6 +3865,10 @@ impl Client {
                     .is_some_and(cooperative_cancellation::supports_protocol)
                 && response["server_capabilities"]["cooperative_cancellation"].as_bool()
                     == Some(true)
+                && (!capabilities
+                    .iter()
+                    .any(|capability| capability == "nexus_cooperative_cancellation")
+                    || nexus::installed_cooperation(&response["server_capabilities"]))
                 && response["capabilities"].as_array().is_some_and(|accepted| {
                     capabilities.iter().all(|capability| {
                         accepted
@@ -6797,9 +6819,11 @@ pub struct Worker {
     run_stop: Option<Arc<AtomicBool>>,
     heartbeat_observer: Option<WorkerHeartbeatObserver>,
     cooperative_cancellation_enabled: bool,
+    nexus_cooperative_cancellation_enabled: bool,
     allow_cancellation_scope_authoring: bool,
     allow_cancellation_scope_delivery: bool,
     cooperative_registration_confirmed: Arc<AtomicBool>,
+    nexus_registration_confirmed: Arc<AtomicBool>,
     local_registration_confirmed: Arc<AtomicBool>,
     session_registration_confirmed: Arc<AtomicBool>,
     sticky_registration_confirmed: Arc<AtomicBool>,
@@ -6831,9 +6855,11 @@ impl Worker {
             run_stop: None,
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
+            nexus_cooperative_cancellation_enabled: false,
             allow_cancellation_scope_authoring: false,
             allow_cancellation_scope_delivery: false,
             cooperative_registration_confirmed: Arc::new(AtomicBool::new(false)),
+            nexus_registration_confirmed: Arc::new(AtomicBool::new(false)),
             local_registration_confirmed: Arc::new(AtomicBool::new(false)),
             session_registration_confirmed: Arc::new(AtomicBool::new(false)),
             sticky_registration_confirmed: Arc::new(AtomicBool::new(false)),
@@ -6847,6 +6873,7 @@ impl Worker {
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = worker_id.into();
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.nexus_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.local_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.sticky_registration_confirmed = Arc::new(AtomicBool::new(false));
@@ -6900,7 +6927,26 @@ impl Worker {
         self.cooperative_cancellation_enabled = enabled;
         self.client.cooperative_worker_protocol = enabled;
         self.cooperative_registration_confirmed = Arc::new(AtomicBool::new(false));
+        self.nexus_registration_confirmed = Arc::new(AtomicBool::new(false));
+        if !enabled {
+            self.nexus_cooperative_cancellation_enabled = false;
+        }
         self
+    }
+
+    /// Opt in to cooperative Nexus completion waits on an installed workflow binding.
+    ///
+    /// This also enables ordinary cooperative cancellation. Registration checks
+    /// protocol 1.20 and Server's installed `workflow_run` bridge before advertising.
+    pub fn nexus_cooperative_cancellation(self, enabled: bool) -> Self {
+        let mut worker = if enabled {
+            self.cooperative_cancellation(true)
+        } else {
+            self
+        };
+        worker.nexus_cooperative_cancellation_enabled = enabled;
+        worker.nexus_registration_confirmed = Arc::new(AtomicBool::new(false));
+        worker
     }
 
     /// Enable candidate scope authoring without advertising scoped execution.
@@ -7705,8 +7751,26 @@ impl Worker {
 
     pub async fn register(&self) -> Result<RegisterWorkerResponse> {
         self.validate_registration()?;
+        self.nexus_registration_confirmed
+            .store(false, Ordering::SeqCst);
         self.query_authority_confirmed
             .store(false, Ordering::SeqCst);
+        if self.nexus_cooperative_cancellation_enabled {
+            let info: Value = self
+                .client
+                .request_json(
+                    reqwest::Method::GET,
+                    "/cluster/info",
+                    RequestProtocol::Worker("1.20"),
+                    Option::<&Value>::None,
+                )
+                .await?;
+            if !nexus::installed_cooperation(&info["worker_protocol"]["server_capabilities"]) {
+                return Err(Error::CooperativeCancellationUnavailable(
+                    "nexus_cooperative_cancellation_not_supported: Server must advertise the installed workflow_run bridge".into(),
+                ));
+            }
+        }
         if self.require_query_task_authority {
             if self.client.worker_protocol_version != WorkerProtocolVersion::V120 {
                 return Err(Error::WorkerLoop(
@@ -7802,6 +7866,8 @@ impl Worker {
                         .then(|| "sticky_execution".to_string()),
                     self.cooperative_cancellation_enabled
                         .then(|| "cooperative_cancellation".to_string()),
+                    self.nexus_cooperative_cancellation_enabled
+                        .then(|| "nexus_cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
                     worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
@@ -7827,6 +7893,10 @@ impl Worker {
             .await?;
         if self.cooperative_cancellation_enabled && response.registered {
             self.cooperative_registration_confirmed
+                .store(true, Ordering::SeqCst);
+        }
+        if self.nexus_cooperative_cancellation_enabled && response.registered {
+            self.nexus_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
         if self.client.local_activities_enabled && response.registered {
@@ -11410,6 +11480,10 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
 
 #[derive(Clone, Debug)]
 enum RecordedCommand {
+    ServiceOperation {
+        sequence: u64,
+        call: nexus::RecordedServiceCall,
+    },
     CancellationScope {
         sequence: u64,
         scope_id: String,
@@ -12164,6 +12238,7 @@ impl RecordedCommand {
             | Self::SideEffect { sequence, .. }
             | Self::VersionMarker { sequence, .. }
             | Self::Memo { sequence, .. } => *sequence,
+            Self::ServiceOperation { sequence, .. } => *sequence,
         }
     }
 
@@ -12182,6 +12257,7 @@ impl RecordedCommand {
             Self::SideEffect { .. } => "side effect",
             Self::VersionMarker { .. } => "version marker",
             Self::Memo { .. } => "memo upsert",
+            Self::ServiceOperation { .. } => "service operation",
         }
     }
 }
@@ -13873,6 +13949,7 @@ fn recorded_selection_member_is_terminal(
             | RecordedCommand::Memo { .. }
             | RecordedCommand::CancellationBoundary { .. }
             | RecordedCommand::CancellationGroup { .. } => false,
+            RecordedCommand::ServiceOperation { .. } => false,
         };
         if !terminal {
             all_completed = false;
@@ -15972,6 +16049,7 @@ fn recorded_commands(
         let is_side_effect = event.event_type == "SideEffectRecorded";
         let is_version_marker = event.event_type == "VersionMarkerRecorded";
         let is_memo = event.event_type == "MemoUpserted";
+        let is_service_operation = nexus::is_service_event(event);
         if !is_activity
             && !is_workflow_timer
             && !is_child_workflow
@@ -15981,6 +16059,7 @@ fn recorded_commands(
             && !is_side_effect
             && !is_version_marker
             && !is_memo
+            && !is_service_operation
         {
             continue;
         }
@@ -16071,6 +16150,8 @@ fn recorded_commands(
                 .copied()
                 .filter(|event| event.event_type == "MemoUpserted")
                 .collect();
+            let service_events: Vec<_> = sequence_events.iter().copied()
+                .filter(|event| nexus::is_service_event(event)).collect();
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
@@ -16080,7 +16161,8 @@ fn recorded_commands(
                 + usize::from(!search_attribute_events.is_empty())
                 + usize::from(!side_effect_events.is_empty())
                 + usize::from(!version_marker_events.is_empty())
-                + usize::from(!memo_events.is_empty());
+                + usize::from(!memo_events.is_empty())
+                + usize::from(!service_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
@@ -16092,6 +16174,7 @@ fn recorded_commands(
                     (!side_effect_events.is_empty()).then_some("side effect"),
                     (!version_marker_events.is_empty()).then_some("version marker"),
                     (!memo_events.is_empty()).then_some("memo upsert"),
+                    (!service_events.is_empty()).then_some("service operation"),
                 ]
                 .into_iter()
                 .flatten()
@@ -16104,6 +16187,12 @@ fn recorded_commands(
                     &actual,
                     "one workflow sequence records more than one durable command kind",
                 ));
+            }
+
+            if !service_events.is_empty() {
+                return Ok(RecordedCommand::ServiceOperation {
+                    sequence, call: nexus::recorded_call(&service_events, sequence, fallback_codec, &parent)?,
+                });
             }
 
             if !activity_events.is_empty() {
@@ -17412,6 +17501,12 @@ fn workflow_failure_command(
     failed_activity_boundary: Option<(u64, String)>,
 ) -> Value {
     let (exception_type, exception_class, properties) = match error {
+        Error::NexusOperationFailed(failure) => (
+            "NexusOperationFailed",
+            "durable_workflow::NexusOperationFailure",
+            json!({"service_call_id":failure.service_call_id, "status":failure.status,
+                "caller_observed_error_type":failure.exception_type, "service_exception":failure.exception}),
+        ),
         Error::ActivityFailed(failure) => (
             match failure.kind {
                 ActivityFailureKind::Failed => "ActivityFailed",
@@ -17546,6 +17641,7 @@ fn workflow_failure_command(
 
 fn workflow_error_type(error: &Error) -> &'static str {
     match error {
+        Error::NexusOperationFailed(_) => "NexusOperationFailed",
         Error::ActivityFailed(failure) => match failure.kind {
             ActivityFailureKind::Failed => "ActivityFailed",
             ActivityFailureKind::Cancelled => "ActivityCancelled",
@@ -18010,6 +18106,7 @@ mod tests {
     mod child_workflow_policies;
     mod cooperative_cancellation;
     mod local_activity;
+    mod nexus;
     mod runtime_payloads;
     mod runtime_uploads;
     mod version_marker_contract;

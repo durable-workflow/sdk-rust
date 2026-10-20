@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.0.0
+
+- Author Nexus service calls with deterministic intent, typed Avro outcomes,
+  original call identities and deadlines. Explicit acceptance-only calls keep
+  their admission snapshot across cold replay. Synchronous calls wait for the
+  committed result or typed failure.
+- Deliver cooperative cancellation at the original service call after confirming
+  the installed runtime capability. Preserve canonical cancellation identity,
+  cleanup deadlines and matching-claim ownership through cold recovery.
+- Add `Error::NexusOperationFailed` and `CancellationCallKind::ServiceOperation`.
+  Mark both enums `non_exhaustive`; downstream matches must include a fallback
+  arm. This is the Rust 4 migration boundary.
+
 ## 3.5.6
 
 - Refuse incompatible typed workflow entry arguments before invoking workflow
