@@ -1,5 +1,5 @@
 anyio==4.15.1
-certifi==2026.10.18
+certifi==2026.10.19
 durable-workflow==2.6.0
 fastavro==1.13.1
 h11==0.16.0
