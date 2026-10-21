@@ -1829,6 +1829,8 @@ def _guard_matches(
     relevant_lines: list[str] = []
     inside_hunk = False
     enclosing_items: list[tuple[int, str]] = []
+    pending_test_attribute: int | None = None
+    test_module_indent: int | None = None
     item_declaration = re.compile(
         r"^(?:(?:pub(?:\([^)]*\))?|async|const|unsafe)\s+)*"
         r"(?:fn|impl|struct|enum|trait|mod|const|static)\b"
@@ -1838,22 +1840,33 @@ def _guard_matches(
         if line.startswith("diff --git "):
             inside_hunk = False
             enclosing_items.clear()
+            pending_test_attribute = None
+            test_module_indent = None
         elif line.startswith("@@"):
             inside_hunk = True
             enclosing_items.clear()
+            pending_test_attribute = None
+            test_module_indent = None
             # Git's hunk label may name the preceding, unchanged function.
             # --function-context supplies actual declarations below instead.
         elif inside_hunk and line.startswith(" "):
             content = line[1:]
             stripped = content.lstrip()
             indentation = len(content) - len(stripped)
+            if stripped == "#[cfg(test)]":
+                pending_test_attribute = indentation
             if closing_scope.fullmatch(stripped):
+                if test_module_indent is not None and indentation <= test_module_indent:
+                    test_module_indent = None
                 enclosing_items = [
                     item
                     for item in enclosing_items
                     if item[0] < indentation
                 ]
             elif item_declaration.match(stripped):
+                if pending_test_attribute == indentation and re.match(r"mod\s+\w+\s*\{", stripped):
+                    test_module_indent = indentation
+                pending_test_attribute = None
                 enclosing_items = [
                     item
                     for item in enclosing_items
@@ -1861,6 +1874,11 @@ def _guard_matches(
                 ]
                 enclosing_items.append((indentation, stripped))
         elif inside_hunk and line.startswith(("+", "-")):
+            # An unchanged cfg(test) module is absent from production builds.
+            # A history literal in its fixtures is not a replay implementation
+            # change. Other production hunks in the same diff remain guarded.
+            if test_module_indent is not None:
+                continue
             # A request-header selection does not change history consumption.
             # Keep history/replay guards for every other change in the same
             # function, rather than requiring an unrelated replay fixture for

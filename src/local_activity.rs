@@ -232,6 +232,34 @@ impl Worker {
         &self,
         task: WorkflowTask,
     ) -> Result<Option<WorkflowTaskDecision>> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry
+                .run_observed(
+                    "durable.workflow.task",
+                    self.workflow_telemetry_fields(&task),
+                    false,
+                    self.workflow_observations(&task),
+                    async {
+                        let mut decision = self
+                            .execute_workflow_with_local_activities_inner(task)
+                            .await?;
+                        if let Some(decision) = &mut decision {
+                            self.stamp_observability_commands(&mut decision.commands);
+                        }
+                        Ok(decision)
+                    },
+                )
+                .await;
+        }
+        self.execute_workflow_with_local_activities_inner(task)
+            .await
+    }
+
+    async fn execute_workflow_with_local_activities_inner(
+        &self,
+        task: WorkflowTask,
+    ) -> Result<Option<WorkflowTaskDecision>> {
         let (task, context, mut future) = match self.prepare_workflow_task_execution(task, None)? {
             PreparedWorkflowTask::Decision(decision) => return Ok(Some(decision)),
             PreparedWorkflowTask::Execution {
@@ -402,7 +430,9 @@ impl Worker {
                 .get(&activity_type)
                 .filter(|_| !total_deadline.is_some_and(|deadline| Instant::now() >= deadline));
             let mut future: ActivityFuture = match callback {
-                Some(callback) => callback(ctx, request.arguments.clone()),
+                Some(callback) => {
+                    self.activity_callback(callback, ctx, request.arguments.clone(), true)
+                }
                 None if total_deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
                     Box::pin(std::future::pending())
                 }

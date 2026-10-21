@@ -14,6 +14,8 @@ mod runtime_payloads;
 mod runtime_uploads;
 mod sticky_worker;
 mod sticky_workflow_cache;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 mod worker_session;
 mod workflow_hydration;
 
@@ -145,6 +147,36 @@ fn validate_user_signal_name(signal_name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+const REQUEST_ID_CONFLICT_REASON: &str = "request_id_conflict";
+const MAX_REQUEST_ID_CHARACTERS: usize = 255;
+
+/// The caller command key is a case-sensitive body field of 1 to 255 Unicode characters.
+fn validate_request_id(request_id: &str) -> Result<()> {
+    if request_id.is_empty() || request_id.chars().count() > MAX_REQUEST_ID_CHARACTERS {
+        return Err(Error::Codec(format!(
+            "request_id must be 1 to {MAX_REQUEST_ID_CHARACTERS} Unicode characters"
+        )));
+    }
+    Ok(())
+}
+
+fn generated_request_id(command: &str) -> String {
+    format!("sdk-rust-{command}-{}", Uuid::new_v4().simple())
+}
+
+/// Guarantee the sent caller command key on a receipt from a Server that does not echo it.
+fn with_request_id(mut receipt: Value, request_id: &str) -> Value {
+    if receipt.is_null() {
+        return json!({ "request_id": request_id });
+    }
+    if let Some(receipt) = receipt.as_object_mut() {
+        receipt
+            .entry("request_id")
+            .or_insert_with(|| Value::String(request_id.to_string()));
+    }
+    receipt
 }
 
 const MAX_LONG_POLL_TIMEOUT_SECONDS: u64 = 60;
@@ -344,6 +376,99 @@ pub enum Error {
     #[doc(hidden)]
     #[error("workflow requested continue as new")]
     ContinueAsNew(ContinueAsNewRequest),
+}
+
+impl Error {
+    /// The caller command key echoed by the Server in a refusal body.
+    ///
+    /// Signals and updates send their key as the `request_id` body field, and a
+    /// Server refusal such as `request_id_conflict` echoes it. Transport failures
+    /// and refusals without an echoed key return `None`: keep the key you passed
+    /// to a `*_with_request_id` method, or obtained from
+    /// [`Client::generate_signal_request_id`] or
+    /// [`Client::generate_update_request_id`], to retry the same logical command
+    /// after an uncertain outcome.
+    pub fn request_id(&self) -> Option<String> {
+        self.refusal_body()?
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|request_id| !request_id.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether the Server refused a signal or update because its caller command
+    /// key is retained for a command with a different intent
+    /// (HTTP 409, `reason: "request_id_conflict"`).
+    pub fn is_request_id_conflict(&self) -> bool {
+        self.request_id_conflict().is_some()
+    }
+
+    /// The retained-command details of a `request_id_conflict` refusal.
+    pub fn request_id_conflict(&self) -> Option<RequestIdConflict> {
+        let status = match self {
+            Self::Http { status, .. } => status.as_u16(),
+            Self::WorkflowCommandRejected(rejection) => rejection.status,
+            _ => return None,
+        };
+        request_id_conflict(status, self.refusal_body()?)
+    }
+
+    fn refusal_body(&self) -> Option<Value> {
+        match self {
+            Self::Http { body, .. } => serde_json::from_str(body).ok(),
+            Self::WorkflowCommandRejected(rejection) => Some(rejection.body.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A refused signal or update whose caller command key is already retained for
+/// a command with a different intent.
+///
+/// Nothing was admitted or recorded, and the key stays bound to the retained
+/// command. Send a new key for a different command, or repeat the retained
+/// command's exact intent to receive its receipt. `conflict` lists the
+/// mismatched intent parts among `name`, `arguments` and `target`.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RequestIdConflict {
+    pub status: u16,
+    pub request_id: String,
+    pub message: String,
+    pub retained_command_id: Option<String>,
+    pub retained_command_type: Option<String>,
+    pub retained_outcome: Option<String>,
+    pub conflict: Vec<String>,
+    pub body: Value,
+}
+
+fn request_id_conflict(status: u16, body: Value) -> Option<RequestIdConflict> {
+    if body.get("reason").and_then(Value::as_str) != Some(REQUEST_ID_CONFLICT_REASON) {
+        return None;
+    }
+    let string = |name: &str| body.get(name).and_then(Value::as_str).map(str::to_string);
+    Some(RequestIdConflict {
+        status,
+        request_id: string("request_id").unwrap_or_default(),
+        message: string("message")
+            .or_else(|| string("error"))
+            .unwrap_or_else(|| "request id is retained for a different command intent".to_string()),
+        retained_command_id: string("retained_command_id"),
+        retained_command_type: string("retained_command_type"),
+        retained_outcome: string("retained_outcome"),
+        conflict: body
+            .get("conflict")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        body,
+    })
 }
 
 /// Handler namespaces checked independently within a Worker.
@@ -2850,9 +2975,40 @@ pub struct Client {
     worker_build_id: Option<String>,
     sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
+    #[cfg(feature = "telemetry")]
+    execution_telemetry: Option<telemetry::ExecutionTelemetry>,
+    #[cfg(feature = "telemetry")]
+    observability_context_supported: Arc<AtomicBool>,
 }
 
 impl Client {
+    /// Configure optional propagation. Actual cluster discovery must advertise
+    /// the exact supported capability before any command carries context.
+    #[cfg(feature = "telemetry")]
+    pub fn with_telemetry(mut self, telemetry: telemetry::ExecutionTelemetry) -> Self {
+        self.execution_telemetry = Some(telemetry);
+        self
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn with_observability_context(&self, mut body: Value) -> Value {
+        if self.observability_context_supported.load(Ordering::SeqCst) {
+            if let Some(context) = self
+                .execution_telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.capture())
+            {
+                body["observability_context"] = context;
+            }
+        }
+        body
+    }
+
+    #[cfg(not(feature = "telemetry"))]
+    fn with_observability_context(&self, body: Value) -> Value {
+        body
+    }
+
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
         Self::builder(base_url).build()
     }
@@ -2920,14 +3076,14 @@ impl Client {
         options.validate()?;
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
-        let body = json!({
+        let body = self.with_observability_context(json!({
             "workflow_id": workflow_id,
             "workflow_type": workflow_type,
             "task_queue": task_queue,
             "input": input_envelope,
             "execution_timeout_seconds": options.execution_timeout_seconds,
             "run_timeout_seconds": options.run_timeout_seconds
-        });
+        }));
 
         let data: Value = self
             .request_json(
@@ -2957,14 +3113,58 @@ impl Client {
         })
     }
 
+    /// Send a signal with an SDK-generated caller command key.
+    ///
+    /// The key is sent as the `request_id` body field and is present in the
+    /// returned receipt's `request_id`. A Server that already retains the key
+    /// for the same signal intent returns the original receipt with
+    /// `retained: true`; a different intent is refused with
+    /// [`Error::is_request_id_conflict`]. Choose the key yourself with
+    /// [`Client::signal_workflow_with_request_id`] when the application must be
+    /// able to retry the same logical signal after a transport failure.
     pub async fn signal_workflow<T: Serialize>(
         &self,
         workflow_id: &str,
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
-        self.signal_workflow_target(workflow_id, None, signal_name, input)
+        let request_id = Self::generate_signal_request_id();
+        self.signal_workflow_target(workflow_id, None, signal_name, input, &request_id)
             .await
+    }
+
+    /// Send a signal with an explicit caller command key (1 to 255 Unicode characters).
+    ///
+    /// Resend the identical signal with the same key after an uncertain
+    /// outcome: the Server returns the retained receipt instead of admitting a
+    /// second signal, for as long as the retained run's details are kept.
+    pub async fn signal_workflow_with_request_id<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        self.signal_workflow_target(workflow_id, None, signal_name, input, request_id)
+            .await
+    }
+
+    /// A fresh caller command key for one logical signal (`sdk-rust-signal-<uuid>`).
+    ///
+    /// Methods without an explicit key generate one of these per call. Obtain it
+    /// up front and pass it to [`Client::signal_workflow_with_request_id`] so a
+    /// transport failure does not lose the key needed for a safe retry.
+    pub fn generate_signal_request_id() -> String {
+        generated_request_id("signal")
+    }
+
+    /// A fresh caller command key for one logical update (`sdk-rust-update-<uuid>`).
+    ///
+    /// [`Client::update_workflow`] generates one of these when `request_id` is
+    /// `None`. Obtain it up front and pass it explicitly so a transport failure
+    /// does not lose the key needed for a safe retry.
+    pub fn generate_update_request_id() -> String {
+        generated_request_id("update")
     }
 
     /// Append one idempotently identified item to an instance-scoped input stream.
@@ -2989,7 +3189,8 @@ impl Client {
         .await
     }
 
-    /// Signal only if `run_id` is still the current run for this instance.
+    /// Signal only if `run_id` is still the current run for this instance,
+    /// with an SDK-generated caller command key.
     pub async fn signal_workflow_run<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -2997,7 +3198,25 @@ impl Client {
         signal_name: &str,
         input: T,
     ) -> Result<Value> {
-        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input)
+        let request_id = Self::generate_signal_request_id();
+        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input, &request_id)
+            .await
+    }
+
+    /// Signal only if `run_id` is still the current run for this instance,
+    /// with an explicit caller command key (1 to 255 Unicode characters).
+    ///
+    /// The selected run is part of the signal's intent: retrying with the same
+    /// key and a different run target is a `request_id_conflict` refusal.
+    pub async fn signal_workflow_run_with_request_id<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        self.signal_workflow_target(workflow_id, Some(run_id), signal_name, input, request_id)
             .await
     }
 
@@ -3007,26 +3226,31 @@ impl Client {
         run_id: Option<&str>,
         signal_name: &str,
         input: T,
+        request_id: &str,
     ) -> Result<Value> {
         validate_user_signal_name(signal_name)?;
+        validate_request_id(request_id)?;
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
-        let body = json!({
-            "input": input_envelope
-        });
+        let body = self.with_observability_context(json!({
+            "input": input_envelope,
+            "request_id": request_id,
+        }));
         let path = match run_id {
             Some(run_id) => {
                 format!("/workflows/{workflow_id}/runs/{run_id}/signal/{signal_name}")
             }
             None => format!("/workflows/{workflow_id}/signal/{signal_name}"),
         };
-        self.request_json(
-            reqwest::Method::POST,
-            &path,
-            RequestProtocol::ControlPlane,
-            Some(&body),
-        )
-        .await
+        let receipt = self
+            .request_json(
+                reqwest::Method::POST,
+                &path,
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        Ok(with_request_id(receipt, request_id))
     }
 
     /// Close the current run as cancelled immediately.
@@ -3147,6 +3371,14 @@ impl Client {
         command: WorkflowCommandKind,
         options: WorkflowCommandOptions,
     ) -> Result<WorkflowCommandResult> {
+        #[cfg(feature = "telemetry")]
+        let body = if command == WorkflowCommandKind::Cancel {
+            self.with_observability_context(serde_json::to_value(&options)?)
+        } else {
+            serde_json::to_value(&options)?
+        };
+        #[cfg(not(feature = "telemetry"))]
+        let body = &options;
         let path = match run_id {
             Some(run_id) => format!(
                 "/workflows/{workflow_id}/runs/{run_id}/{}",
@@ -3159,7 +3391,7 @@ impl Client {
                 reqwest::Method::POST,
                 &path,
                 RequestProtocol::ControlPlane,
-                Some(&options),
+                Some(&body),
             )
             .await
         {
@@ -3317,6 +3549,13 @@ impl Client {
     }
 
     /// Send a synchronous update using fixed Avro Value arguments.
+    ///
+    /// `request_id` is the caller command key (1 to 255 Unicode characters), sent as the
+    /// `request_id` body field; `None` generates one with
+    /// [`Client::generate_update_request_id`]. A Server that already retains the
+    /// key for the same update intent returns the original update's receipt and
+    /// result instead of admitting a second update; a different intent is
+    /// refused with [`Error::is_request_id_conflict`].
     pub async fn update_workflow<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -3366,21 +3605,28 @@ impl Client {
         input: T,
         request_id: Option<&str>,
     ) -> Result<Value> {
+        let request_id = match request_id {
+            Some(request_id) => {
+                validate_request_id(request_id)?;
+                request_id.to_string()
+            }
+            None => Self::generate_update_request_id(),
+        };
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
-        let mut body = json!({
+        let body = self.with_observability_context(json!({
             "input": encode_typed_envelope(&input, DEFAULT_CODEC)?,
             "wait_for": "completed",
-        });
-        if let Some(request_id) = request_id {
-            body["request_id"] = json!(request_id);
-        }
-        self.request_json(
-            reqwest::Method::POST,
-            &format!("/workflows/{workflow_id}/update/{update_name}"),
-            RequestProtocol::ControlPlane,
-            Some(&body),
-        )
-        .await
+            "request_id": request_id,
+        }));
+        let receipt = self
+            .request_json(
+                reqwest::Method::POST,
+                &format!("/workflows/{workflow_id}/update/{update_name}"),
+                RequestProtocol::ControlPlane,
+                Some(&body),
+            )
+            .await?;
+        Ok(with_request_id(receipt, &request_id))
     }
 
     pub async fn describe_workflow(&self, workflow_id: &str) -> Result<WorkflowDescription> {
@@ -4294,6 +4540,25 @@ impl Client {
             "workflow_task_attempt": workflow_task_attempt,
             "commands": commands
         });
+        #[cfg(feature = "telemetry")]
+        if self.observability_context_supported.load(Ordering::SeqCst)
+            && opentelemetry::Context::current()
+                .get::<telemetry::ExecutionFields>()
+                .is_some()
+        {
+            if let Some(commands) = body["commands"].as_array_mut() {
+                for command in commands {
+                    if command.get("observability_context").is_none()
+                        && matches!(
+                            command["type"].as_str(),
+                            Some("start_child_workflow" | "continue_as_new")
+                        )
+                    {
+                        *command = self.with_observability_context(command.take());
+                    }
+                }
+            }
+        }
         if !message_stream_cursors.is_empty() {
             body["message_stream_cursors"] = Value::Array(message_stream_cursors);
         }
@@ -4589,6 +4854,8 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
+        #[cfg(feature = "telemetry")]
+        self.begin_observability_discovery(&method, path);
         let protocol = match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
@@ -4736,8 +5003,60 @@ impl Client {
                 return Ok(serde_json::from_value(Value::Null)?);
             }
 
+            #[cfg(feature = "telemetry")]
+            return self.decode_observability_response(
+                &method,
+                path,
+                request_body.as_ref(),
+                &bytes,
+            );
+
+            #[cfg(not(feature = "telemetry"))]
             return Ok(serde_json::from_slice(&bytes)?);
         }
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn begin_observability_discovery(&self, method: &reqwest::Method, path: &str) {
+        if *method == reqwest::Method::GET && path == "/cluster/info" {
+            self.observability_context_supported
+                .store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn decode_observability_response<T: DeserializeOwned>(
+        &self,
+        method: &reqwest::Method,
+        path: &str,
+        request_body: Option<&Value>,
+        bytes: &[u8],
+    ) -> Result<T> {
+        if *method == reqwest::Method::POST
+            && self.execution_telemetry.is_some()
+            && matches!(
+                path,
+                "/worker/workflow-tasks/poll"
+                    | "/worker/activity-tasks/poll"
+                    | "/worker/query-tasks/poll"
+            )
+        {
+            let mut wire: Value = serde_json::from_slice(bytes)?;
+            telemetry::carrier::retain_poll_observations(
+                &mut wire,
+                request_body.unwrap_or(&Value::Null),
+                path,
+                &self.namespace,
+            );
+            return Ok(serde_json::from_value(wire)?);
+        }
+        if *method == reqwest::Method::GET && path == "/cluster/info" {
+            let info: Value = serde_json::from_slice(bytes)?;
+            self.observability_context_supported
+                .store(telemetry::carrier::supported(&info), Ordering::SeqCst);
+            return Ok(serde_json::from_value(info)?);
+        }
+        Ok(serde_json::from_slice(bytes)?)
     }
 
     async fn wait_for_storage_admission(
@@ -5503,6 +5822,10 @@ impl ClientBuilder {
             worker_build_id: None,
             sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
+            #[cfg(feature = "telemetry")]
+            execution_telemetry: None,
+            #[cfg(feature = "telemetry")]
+            observability_context_supported: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -5531,9 +5854,22 @@ impl WorkflowHandle {
             .await
     }
 
+    /// Signal this workflow with an SDK-generated caller command key.
     pub async fn signal<T: Serialize>(&self, signal_name: &str, input: T) -> Result<Value> {
         self.client
             .signal_workflow(&self.workflow_id, signal_name, input)
+            .await
+    }
+
+    /// Signal this workflow with an explicit caller command key (1 to 255 Unicode characters).
+    pub async fn signal_with_request_id<T: Serialize>(
+        &self,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        self.client
+            .signal_workflow_with_request_id(&self.workflow_id, signal_name, input, request_id)
             .await
     }
 
@@ -5548,7 +5884,8 @@ impl WorkflowHandle {
             .await
     }
 
-    /// Signal only if this handle's selected run is still current.
+    /// Signal only if this handle's selected run is still current, with an
+    /// SDK-generated caller command key.
     pub async fn signal_selected_run<T: Serialize>(
         &self,
         signal_name: &str,
@@ -5559,6 +5896,28 @@ impl WorkflowHandle {
         })?;
         self.client
             .signal_workflow_run(&self.workflow_id, run_id, signal_name, input)
+            .await
+    }
+
+    /// Signal only if this handle's selected run is still current, with an
+    /// explicit caller command key (1 to 255 Unicode characters).
+    pub async fn signal_selected_run_with_request_id<T: Serialize>(
+        &self,
+        signal_name: &str,
+        input: T,
+        request_id: &str,
+    ) -> Result<Value> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            Error::Codec("run_id is required for selected-run signaling".to_string())
+        })?;
+        self.client
+            .signal_workflow_run_with_request_id(
+                &self.workflow_id,
+                run_id,
+                signal_name,
+                input,
+                request_id,
+            )
             .await
     }
 
@@ -6826,6 +7185,8 @@ enum ManagedPollOutcome {
 
 #[derive(Clone)]
 pub struct Worker {
+    #[cfg(feature = "telemetry")]
+    telemetry: Option<telemetry::ExecutionTelemetry>,
     client: Client,
     worker_id: String,
     task_queue: String,
@@ -6863,6 +7224,8 @@ pub struct Worker {
 impl Worker {
     pub fn new(client: Client, task_queue: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "telemetry")]
+            telemetry: None,
             client,
             worker_id: default_worker_id(),
             task_queue: task_queue.into(),
@@ -6912,6 +7275,15 @@ impl Worker {
 
     pub fn poll_timeout(mut self, timeout: Duration) -> Self {
         self.poll_timeout = timeout;
+        self
+    }
+
+    /// Opt in to execution spans using application-owned OpenTelemetry providers.
+    /// No exporter, logging bridge, global provider or Server carrier is installed.
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry(mut self, telemetry: telemetry::ExecutionTelemetry) -> Self {
+        self.client.execution_telemetry = Some(telemetry.clone());
+        self.telemetry = Some(telemetry);
         self
     }
 
@@ -7866,6 +8238,29 @@ impl Worker {
 
         self.cooperative_registration_confirmed
             .store(false, Ordering::SeqCst);
+        #[cfg(feature = "telemetry")]
+        if self
+            .telemetry
+            .as_ref()
+            .is_some_and(telemetry::ExecutionTelemetry::is_enabled)
+            && !self
+                .client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        {
+            // Optional startup discovery is bounded and cached. Its failure
+            // cannot refuse registration or add retries to a business command.
+            let _ = self
+                .client
+                .request_json_unresolved_with_timeout::<Value, Value>(
+                    reqwest::Method::GET,
+                    "/cluster/info",
+                    RequestProtocol::DefaultWorker,
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
         let response = self
             .client
             .register_worker_with_definition_fingerprints(
@@ -8787,6 +9182,26 @@ impl Worker {
 
     async fn execute_query_task_with_authority(
         &self,
+        task: QueryTask,
+        authority: Option<&query_authority::Authority>,
+    ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry
+                .run_observed(
+                    "durable.query.task",
+                    self.query_telemetry_fields(&task),
+                    false,
+                    authority.and_then(|_| self.query_observations(&task)),
+                    self.execute_query_task_inner(task, authority),
+                )
+                .await;
+        }
+        self.execute_query_task_inner(task, authority).await
+    }
+
+    async fn execute_query_task_inner(
+        &self,
         mut task: QueryTask,
         authority: Option<&query_authority::Authority>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
@@ -9032,6 +9447,28 @@ impl Worker {
     }
 
     fn execute_workflow_task_decision_with_cancellation(
+        &self,
+        task: WorkflowTask,
+        observation: Option<&CancellationRequest>,
+    ) -> Result<WorkflowTaskDecision> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            return telemetry.run_sync_observed(
+                "durable.workflow.task",
+                self.workflow_telemetry_fields(&task),
+                self.workflow_observations(&task),
+                || {
+                    let mut decision =
+                        self.execute_workflow_task_decision_inner(task, observation)?;
+                    self.stamp_observability_commands(&mut decision.commands);
+                    Ok(decision)
+                },
+            );
+        }
+        self.execute_workflow_task_decision_inner(task, observation)
+    }
+
+    fn execute_workflow_task_decision_inner(
         &self,
         task: WorkflowTask,
         observation: Option<&CancellationRequest>,
@@ -9413,6 +9850,32 @@ impl Worker {
         worker_session: Option<WorkerSession>,
         hydration_claim: Option<&activity_hydration::HydrationClaim>,
     ) -> Result<AvroValue> {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
+            !self
+                .client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        }) {
+            return telemetry
+                .run(
+                    "durable.activity.task",
+                    self.activity_telemetry_fields(&task),
+                    false,
+                    self.execute_session_activity_task_inner(task, worker_session, hydration_claim),
+                )
+                .await;
+        }
+        self.execute_session_activity_task_inner(task, worker_session, hydration_claim)
+            .await
+    }
+
+    async fn execute_session_activity_task_inner(
+        &self,
+        task: ActivityTask,
+        worker_session: Option<WorkerSession>,
+        hydration_claim: Option<&activity_hydration::HydrationClaim>,
+    ) -> Result<AvroValue> {
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
             if task.lease_owner.as_deref() != Some(self.worker_id.as_str())
@@ -9444,6 +9907,13 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let session = worker_session.clone();
+        if let Some(claim) = hydration_claim {
+            claim.confirm(&self.client).await?;
+        }
+        #[cfg(feature = "telemetry")]
+        let observations = self.activity_observations(&task);
+        #[cfg(feature = "telemetry")]
+        let fields = self.activity_telemetry_fields(&task);
         let ctx = ActivityContext {
             client: self.client.clone(),
             task_id: task.task_id,
@@ -9458,21 +9928,70 @@ impl Worker {
             worker_session,
         };
 
-        if let Some(claim) = hydration_claim {
-            claim.confirm(&self.client).await?;
-        }
-        let callback = handler(ctx, args);
-        if let Some(session) = session {
-            tokio::select! {
-                biased;
-                _ = session.wait_until_unavailable() => Err(Error::ActivityExecutionAbandoned("worker-session lease or TTL expired, closed or became uncertain".into())),
-                result = callback => if session.active() { result } else {
-                    Err(Error::ActivityExecutionAbandoned("worker-session authority ended before callback settlement".into()))
-                },
+        let operation = async {
+            let callback = self.activity_callback(handler, ctx, args, false);
+            if let Some(session) = session {
+                tokio::select! {
+                    biased;
+                    _ = session.wait_until_unavailable() => Err(Error::ActivityExecutionAbandoned("worker-session lease or TTL expired, closed or became uncertain".into())),
+                    result = callback => if session.active() { result } else {
+                        Err(Error::ActivityExecutionAbandoned("worker-session authority ended before callback settlement".into()))
+                    },
+                }
+            } else {
+                callback.await
             }
-        } else {
-            callback.await
+        };
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
+            self.client
+                .observability_context_supported
+                .load(Ordering::SeqCst)
+        }) {
+            return telemetry
+                .run_observed(
+                    "durable.activity.task",
+                    fields,
+                    false,
+                    observations,
+                    operation,
+                )
+                .await;
         }
+        operation.await
+    }
+
+    fn activity_callback(
+        &self,
+        handler: &ActivityHandler,
+        context: ActivityContext,
+        args: AvroValue,
+        local: bool,
+    ) -> ActivityFuture {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = &self.telemetry {
+            let telemetry = telemetry.clone();
+            let fields = self.callback_telemetry_fields(&context, local);
+            let handler = handler.clone();
+            let name = if local {
+                "durable.local_activity.attempt"
+            } else {
+                "durable.activity.attempt"
+            };
+            return Box::pin(async move {
+                telemetry
+                    .run(
+                        name,
+                        fields,
+                        true,
+                        async move { handler(context, args).await },
+                    )
+                    .await
+            });
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = local;
+        handler(context, args)
     }
 }
 
@@ -18124,6 +18643,9 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "telemetry")]
+    static OBSERVABILITY_PROPAGATOR_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
     mod activity_cancellation_policies;
     mod cancellation_scope_admission;
     mod cancellation_scope_authoring;
@@ -26822,6 +27344,904 @@ mod tests {
         assert_eq!(failure.reason, "rejected_unknown_query");
     }
 
+    const KEYED_SIGNAL_PATH: &str = "/api/workflows/keyed-1/signal/approve";
+    const KEYED_RUN_SIGNAL_PATH: &str = "/api/workflows/keyed-1/runs/run-keyed-1/signal/approve";
+    const KEYED_UPDATE_PATH: &str = "/api/workflows/keyed-1/update/adjust";
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn optional_observability_client_uses_actual_discovery_and_preserves_business_intent() {
+        let _propagator_guard = OBSERVABILITY_PROPAGATOR_TEST_LOCK.lock().await;
+        static PHASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        PHASE.store(0, Ordering::SeqCst);
+        use opentelemetry::{
+            propagation::TextMapPropagator,
+            trace::{FutureExt, TracerProvider},
+        };
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                opentelemetry::global::set_text_map_propagator(
+                    opentelemetry::propagation::TextMapCompositePropagator::new(Vec::new()),
+                );
+            }
+        }
+        let _restore = Restore;
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let headers = HashMap::from([(
+            "traceparent".to_string(),
+            "00-12345678901234567890123456789012-1234567890123456-01".to_string(),
+        )]);
+        let parent = TraceContextPropagator::new().extract(&headers);
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(|path, body, _number| {
+                if path == "/api/cluster/info" {
+                    return Some(if PHASE.load(Ordering::SeqCst) == 2 {
+                        ("503 Service Unavailable", "{}".into())
+                    } else {
+                        ("200 OK", json!({"worker_protocol": {"server_capabilities": {"observability_context": {
+                            "supported": true, "schema": "durable-workflow.trace-context", "version": if PHASE.load(Ordering::SeqCst) == 0 {1} else {99},
+                            "dispatch_schema": "durable-workflow.queue-trace", "links_schema": "durable-workflow.trace-links",
+                            "max_context_bytes": 4096, "max_links": 32, "max_links_bytes": 4096
+                        }}}}).to_string())
+                    });
+                }
+                let body: Value = serde_json::from_str(body).ok()?;
+                Some(("200 OK", json!({"workflow_id": "order", "run_id": "run", "workflow_type": "orders",
+                    "outcome": "accepted", "command_id": "command", "request_id": body["request_id"],
+                    "result": "original"}).to_string()))
+            }),
+            ..MockWorkerBehavior::default()
+        });
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let client = Client::new(server.base_url()).unwrap().with_telemetry(
+            telemetry::ExecutionTelemetry::from_tracer(provider.tracer("test")),
+        );
+        let input = json!([{"observability_context": {"business": "preserved"}}]);
+        async {
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            assert!(server
+                .request_body("/api/workflows")
+                .get("observability_context")
+                .is_none());
+            client.cluster_info().await.unwrap();
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            client
+                .signal_workflow_with_request_id("order", "ready", &input, "signal-original")
+                .await
+                .unwrap();
+            client
+                .update_workflow("order", "status", &input, Some("update-original"))
+                .await
+                .unwrap();
+            client
+                .cancel_workflow("order", WorkflowCommandOptions::default())
+                .await
+                .unwrap();
+            for path in [
+                "/api/workflows",
+                "/api/workflows/order/signal/ready",
+                "/api/workflows/order/update/status",
+                "/api/workflows/order/cancel",
+            ] {
+                let bodies = server.request_bodies(path);
+                let body = bodies.last().unwrap();
+                assert_eq!(
+                    body["observability_context"]["carrier"]["traceparent"],
+                    headers["traceparent"]
+                );
+                assert!(body["observability_context"]["carrier"]
+                    .get("baggage")
+                    .is_none());
+            }
+            let starts = server.request_bodies("/api/workflows");
+            assert_eq!(
+                decode_wire_value(&starts[1]["input"], DEFAULT_CODEC).unwrap(),
+                input
+            );
+            assert_eq!(
+                server.request_body("/api/workflows/order/signal/ready")["request_id"],
+                "signal-original"
+            );
+            assert_eq!(
+                server.request_body("/api/workflows/order/update/status")["request_id"],
+                "update-original"
+            );
+            PHASE.store(1, Ordering::SeqCst);
+            client.cluster_info().await.unwrap();
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            assert!(server
+                .request_bodies("/api/workflows")
+                .last()
+                .unwrap()
+                .get("observability_context")
+                .is_none());
+            PHASE.store(2, Ordering::SeqCst);
+            assert!(client.cluster_info().await.is_err());
+            let before = server.captured_paths().len();
+            client
+                .start_workflow("orders", "orders", "order", &input)
+                .await
+                .unwrap();
+            assert_eq!(server.captured_paths().len(), before + 1);
+            assert!(server
+                .request_bodies("/api/workflows")
+                .last()
+                .unwrap()
+                .get("observability_context")
+                .is_none());
+        }
+        .with_context(parent)
+        .await;
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn observability_worker_server(
+        path: &str,
+        _body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let context = json!({"schema": "durable-workflow.trace-context", "version": 1,
+            "carrier": {"traceparent": "00-12345678901234567890123456789012-1234567890123456-01",
+                        "baggage": "credential=private"}});
+        let link_context = json!({"schema": "durable-workflow.trace-context", "version": 1,
+            "carrier": {"traceparent": "00-abcdef78901234567890123456789012-abcdef7890123456-01"}});
+        if path == "/api/cluster/info" {
+            return Some(("200 OK", json!({"worker_protocol": {"server_capabilities": {"observability_context": {
+                "supported": true, "schema": "durable-workflow.trace-context", "version": 1,
+                "dispatch_schema": "durable-workflow.queue-trace", "links_schema": "durable-workflow.trace-links",
+                "max_context_bytes": 4096, "max_links": 32, "max_links_bytes": 4096
+            }}}}).to_string()));
+        }
+        if path.ends_with("/complete") {
+            return Some(("200 OK", json!({"recorded": true}).to_string()));
+        }
+        let task_id = match path {
+            "/api/worker/workflow-tasks/poll" => "workflow-task",
+            "/api/worker/activity-tasks/poll" => "activity-task",
+            "/api/worker/query-tasks/poll" => "query-task",
+            _ => return None,
+        };
+        let input = encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap();
+        let mut task = json!({"task_id": task_id, "query_task_id": task_id,
+        "workflow_id": "workflow", "run_id": "run", "workflow_type": "wire.workflow",
+        "activity_type": "wire.activity", "activity_execution_id": "activity",
+        "activity_attempt_id": "attempt", "attempt_number": 3, "workflow_task_attempt": 1,
+        "query_task_attempt": 1, "query_name": "state", "lease_owner": "test-worker",
+        "namespace": "shipping", "task_queue": "shipping", "lease_expires_at": "2099-01-01T00:00:00Z",
+        "payload_codec": DEFAULT_CODEC, "arguments": input, "workflow_arguments": input,
+        "query_arguments": input, "history_events": [], "observability_context": context,
+        "dispatch_observability_context": {"schema": "durable-workflow.queue-trace", "version": 1,
+            "task_id": task_id, "context": link_context},
+        "observability_links": {"schema": "durable-workflow.trace-links", "version": 1,
+            "task_id": task_id, "run_id": "run", "namespace": "shipping", "links": [
+                {"kind": "command", "command_id": "accepted-command", "context": link_context},
+                {"kind": "child_outcome", "workflow_link_id": "link", "child_run_id": "child",
+                 "child_task_id": null, "event_id": "terminal", "sequence": 7,
+                 "event_type": "WorkflowCancelled", "context": link_context}
+            ]}});
+        if task_id == "workflow-task" {
+            task["arguments"] = encode_value_envelope(
+                &json!([{"observability_context": {"business": "preserved"}}]),
+                DEFAULT_CODEC,
+            )
+            .unwrap();
+        }
+        Some((
+            "200 OK",
+            json!({"task": task, "poll_status": "leased"}).to_string(),
+        ))
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn observability_polled_tasks_recover_parent_links_and_capture_the_actual_child_producer()
+    {
+        use opentelemetry::trace::TracerProvider;
+        let _propagator_guard = OBSERVABILITY_PROPAGATOR_TEST_LOCK.lock().await;
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let telemetry = telemetry::ExecutionTelemetry::from_tracer(provider.tracer("test"));
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(observability_worker_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .namespace("shipping")
+            .build()
+            .unwrap();
+        client.cluster_info().await.unwrap();
+        let mut worker = Worker::new(client, "shipping")
+            .worker_id("test-worker")
+            .telemetry(telemetry);
+        worker.register_workflow("wire.workflow", |ctx, input| async move {
+            assert_eq!(telemetry::current_log_context()["workflow_run_id"], "run");
+            assert_eq!(
+                input,
+                json!([{"observability_context": {"business": "preserved"}}])
+            );
+            ctx.start_child_workflow("child", ChildWorkflowOptions::new("child-workers"), input)
+                .await?;
+            Ok(Value::Null)
+        });
+        worker.register_activity("wire.activity", |_, _| async {
+            let fields = telemetry::current_log_context();
+            assert_eq!(fields["workflow_run_id"], "run");
+            assert_eq!(fields["activity_id"], "activity");
+            assert_eq!(fields["activity_attempt_id"], "attempt");
+            assert_eq!(fields["activity_attempt_number"], "3");
+            Ok(json!("original-result"))
+        });
+        worker.register_query("wire.workflow", "state", |_, _| async {
+            assert_eq!(telemetry::current_log_context()["task_id"], "query-task");
+            Ok(json!("original-query"))
+        });
+        assert_eq!(worker.run_once().await.unwrap(), 3);
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 4);
+        let origin_trace = "12345678901234567890123456789012";
+        for span in spans
+            .iter()
+            .filter(|span| span.name.as_ref() != "durable.activity.attempt")
+        {
+            assert_eq!(span.span_context.trace_id().to_string(), origin_trace);
+            assert_eq!(span.parent_span_id.to_string(), "1234567890123456");
+            assert_eq!(span.links.len(), 3);
+            assert!(!format!("{:?}", span.attributes).contains("credential"));
+        }
+        let task = spans
+            .iter()
+            .find(|span| span.name.as_ref() == "durable.workflow.task")
+            .unwrap();
+        let body = server.request_body("/api/worker/workflow-tasks/workflow-task/complete");
+        assert_eq!(body["commands"][0]["type"], "start_child_workflow");
+        let parent = body["commands"][0]["observability_context"]["carrier"]["traceparent"]
+            .as_str()
+            .unwrap();
+        assert_eq!(&parent[36..52], task.span_context.span_id().to_string());
+        assert!(telemetry::current_log_context().is_empty());
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry::propagation::TextMapCompositePropagator::new(Vec::new()),
+        );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn observability_never_enters_a_query_with_a_refused_original_claim() {
+        use opentelemetry::trace::TracerProvider;
+        static REFUSAL: AtomicUsize = AtomicUsize::new(0);
+        fn refused_query(path: &str, body: &str, count: usize) -> Option<(&'static str, String)> {
+            let (status, reply) = observability_worker_server(path, body, count)?;
+            if path != "/api/worker/query-tasks/poll" {
+                return Some((status, reply));
+            }
+            let mut reply: Value = serde_json::from_str(&reply).unwrap();
+            match REFUSAL.load(Ordering::SeqCst) {
+                0 => reply["task"]["lease_owner"] = json!("other-worker"),
+                1 => reply["task"]["query_task_attempt"] = json!(0),
+                _ => reply["task"]["lease_expires_at"] = json!("2000-01-01T00:00:00Z"),
+            }
+            Some((status, reply.to_string()))
+        }
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(refused_query),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .namespace("shipping")
+            .build()
+            .unwrap();
+        client.cluster_info().await.unwrap();
+        let mut worker = Worker::new(client, "shipping")
+            .worker_id("test-worker")
+            .telemetry(telemetry::ExecutionTelemetry::from_tracer(
+                provider.tracer("test"),
+            ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let query_calls = calls.clone();
+        worker.register_query("wire.workflow", "state", move |_, _| {
+            query_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Value::Null) }
+        });
+        for refusal in 0..3 {
+            REFUSAL.store(refusal, Ordering::SeqCst);
+            assert!(matches!(
+                worker.poll_query_once().await.unwrap(),
+                ManagedPollOutcome::Handled
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(exporter.get_finished_spans().unwrap().is_empty());
+            assert!(telemetry::current_log_context().is_empty());
+        }
+        assert!(!server
+            .captured_paths()
+            .iter()
+            .any(|path| path.ends_with("/complete") || path.ends_with("/fail")));
+    }
+
+    fn keyed_command_request(path: &str, body: &str) -> Option<Value> {
+        if path != KEYED_SIGNAL_PATH && path != KEYED_RUN_SIGNAL_PATH && path != KEYED_UPDATE_PATH {
+            return None;
+        }
+        serde_json::from_str(body).ok()
+    }
+
+    /// A #216 Server: echoes the key with `retained` and `intent_verified`.
+    fn keyed_command_server(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let mut receipt = json!({
+            "outcome": "accepted",
+            "command_status": "accepted",
+            "command_id": "cmd-keyed-1",
+            "request_id": request["request_id"],
+            "retained": false,
+            "intent_verified": true,
+        });
+        if path == KEYED_UPDATE_PATH {
+            receipt["update_id"] = json!("upd-keyed-1");
+            receipt["result_envelope"] =
+                encode_typed_envelope(&AvroValue::Long(42), DEFAULT_CODEC).expect("result");
+        }
+        Some(("202 Accepted", receipt.to_string()))
+    }
+
+    /// A Server released before #216: accepts the body field but echoes nothing.
+    fn legacy_command_server(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+        keyed_command_request(path, body)?;
+        Some((
+            "202 Accepted",
+            r#"{"outcome":"accepted","command_status":"accepted","command_id":"cmd-legacy"}"#
+                .to_string(),
+        ))
+    }
+
+    fn retained_command_server(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        Some((
+            "202 Accepted",
+            json!({
+                "outcome": "accepted",
+                "command_status": "accepted",
+                "command_id": "cmd-first",
+                "request_id": request["request_id"],
+                "retained": true,
+                "intent_verified": true,
+            })
+            .to_string(),
+        ))
+    }
+
+    fn conflicting_command_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let retained_type = if path == KEYED_UPDATE_PATH {
+            "update"
+        } else {
+            "signal"
+        };
+        Some((
+            "409 Conflict",
+            json!({
+                "reason": "request_id_conflict",
+                "message": format!("request id is retained for a different {retained_type} intent"),
+                "request_id": request["request_id"],
+                "retained_command_id": "cmd-retained-1",
+                "retained_command_type": retained_type,
+                "retained_outcome": "accepted",
+                "conflict": ["arguments", "target"],
+                "control_plane": {"operation": retained_type},
+            })
+            .to_string(),
+        ))
+    }
+
+    fn closed_run_command_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        Some((
+            "409 Conflict",
+            json!({
+                "reason": "run_not_active",
+                "message": "run is closed",
+                "request_id": request["request_id"],
+            })
+            .to_string(),
+        ))
+    }
+
+    fn drop_first_keyed_signal(path: &str, request_number: usize) -> bool {
+        path == KEYED_SIGNAL_PATH && request_number == 1
+    }
+
+    fn keyed_client(server: &MockWorkerServer) -> Client {
+        Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client")
+    }
+
+    fn keyed_handle(client: &Client) -> WorkflowHandle {
+        WorkflowHandle {
+            client: client.clone(),
+            workflow_id: "keyed-1".to_string(),
+            run_id: Some("run-keyed-1".to_string()),
+            workflow_type: "keyed".to_string(),
+        }
+    }
+
+    fn assert_generated_request_id(request_id: &str, prefix: &str) {
+        let suffix = request_id
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("{request_id:?} does not start with {prefix:?}"));
+        assert_eq!(suffix.len(), 32, "uuid4 simple hex suffix: {request_id:?}");
+        assert!(
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "lowercase hex suffix: {request_id:?}"
+        );
+        assert!(request_id.len() <= MAX_REQUEST_ID_CHARACTERS);
+    }
+
+    fn assert_key_sent_only_in_body(server: &MockWorkerServer, path: &str) {
+        let headers = server.request_headers(path);
+        assert!(!headers.is_empty(), "no request captured for {path}");
+        for headers in headers {
+            let header_names: Vec<String> = headers
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, _)| name.trim().to_ascii_lowercase())
+                .collect();
+            assert!(
+                !header_names.iter().any(|name| name == "x-request-id"),
+                "the caller command key is a body field, never an X-Request-Id header: {headers}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_without_key_sends_a_generated_sdk_rust_signal_key_and_returns_it() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(legacy_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let receipt = client
+            .signal_workflow("keyed-1", "approve", json!(["ok"]))
+            .await
+            .expect("signal receipt");
+
+        let sent = server.request_body(KEYED_SIGNAL_PATH);
+        let request_id = sent["request_id"].as_str().expect("generated request_id");
+        assert_generated_request_id(request_id, "sdk-rust-signal-");
+        assert_eq!(
+            receipt,
+            json!({
+                "outcome": "accepted",
+                "command_status": "accepted",
+                "command_id": "cmd-legacy",
+                "request_id": request_id,
+            }),
+            "the sent key is added when an older Server omits it"
+        );
+        assert_key_sent_only_in_body(&server, KEYED_SIGNAL_PATH);
+
+        let receipt = keyed_handle(&client)
+            .signal_selected_run("approve", json!(["ok"]))
+            .await
+            .expect("selected-run signal receipt");
+        let run_sent = server.request_body(KEYED_RUN_SIGNAL_PATH);
+        let run_request_id = run_sent["request_id"]
+            .as_str()
+            .expect("generated request_id");
+        assert_generated_request_id(run_request_id, "sdk-rust-signal-");
+        assert_eq!(receipt["request_id"], run_request_id);
+        assert_ne!(
+            run_request_id, request_id,
+            "each logical call gets its own key"
+        );
+        assert_key_sent_only_in_body(&server, KEYED_RUN_SIGNAL_PATH);
+    }
+
+    #[tokio::test]
+    async fn update_without_key_sends_a_generated_sdk_rust_update_key() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(keyed_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let result = client
+            .update_workflow("keyed-1", "adjust", json!([1]), None)
+            .await
+            .expect("update result");
+        assert_eq!(
+            result,
+            json!(42),
+            "the decoded update result is returned unchanged"
+        );
+        let typed = client
+            .update_workflow_avro_value("keyed-1", "adjust", json!([1]), None)
+            .await
+            .expect("typed update result");
+        assert_eq!(typed, AvroValue::Long(42));
+        keyed_handle(&client)
+            .update("adjust", json!([1]), None)
+            .await
+            .expect("handle update result");
+
+        let bodies = server.request_bodies(KEYED_UPDATE_PATH);
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies {
+            assert_generated_request_id(
+                body["request_id"].as_str().expect("generated request_id"),
+                "sdk-rust-update-",
+            );
+            assert_eq!(body["wait_for"], "completed");
+        }
+        assert_ne!(bodies[0]["request_id"], bodies[1]["request_id"]);
+        assert_ne!(bodies[1]["request_id"], bodies[2]["request_id"]);
+        assert_key_sent_only_in_body(&server, KEYED_UPDATE_PATH);
+    }
+
+    #[tokio::test]
+    async fn explicit_command_keys_are_sent_verbatim_as_the_request_id_body_field() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(keyed_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+        let handle = keyed_handle(&client);
+
+        let receipt = client
+            .signal_workflow_with_request_id(
+                "keyed-1",
+                "approve",
+                json!(["ok"]),
+                "Order-42/approve",
+            )
+            .await
+            .expect("signal receipt");
+        assert_eq!(receipt["request_id"], "Order-42/approve");
+        assert_eq!(receipt["retained"], false);
+        assert_eq!(receipt["intent_verified"], true);
+        handle
+            .signal_with_request_id("approve", json!(["ok"]), "handle-signal-key")
+            .await
+            .expect("handle signal receipt");
+        client
+            .signal_workflow_run_with_request_id(
+                "keyed-1",
+                "run-keyed-1",
+                "approve",
+                json!(["ok"]),
+                "run-signal-key",
+            )
+            .await
+            .expect("selected-run signal receipt");
+        handle
+            .signal_selected_run_with_request_id("approve", json!(["ok"]), "handle-run-signal-key")
+            .await
+            .expect("handle selected-run signal receipt");
+        let result = client
+            .update_workflow("keyed-1", "adjust", json!([1]), Some("update-key"))
+            .await
+            .expect("update result");
+        assert_eq!(result, json!(42));
+        handle
+            .update("adjust", json!([1]), Some("handle-update-key"))
+            .await
+            .expect("handle update result");
+        handle
+            .update_avro_value("adjust", json!([1]), Some("handle-typed-update-key"))
+            .await
+            .expect("handle typed update result");
+
+        let signal_keys: Vec<Value> = server
+            .request_bodies(KEYED_SIGNAL_PATH)
+            .into_iter()
+            .map(|body| body["request_id"].clone())
+            .collect();
+        assert_eq!(
+            signal_keys,
+            [json!("Order-42/approve"), json!("handle-signal-key")]
+        );
+        let run_signal_keys: Vec<Value> = server
+            .request_bodies(KEYED_RUN_SIGNAL_PATH)
+            .into_iter()
+            .map(|body| body["request_id"].clone())
+            .collect();
+        assert_eq!(
+            run_signal_keys,
+            [json!("run-signal-key"), json!("handle-run-signal-key")]
+        );
+        let update_keys: Vec<Value> = server
+            .request_bodies(KEYED_UPDATE_PATH)
+            .into_iter()
+            .map(|body| body["request_id"].clone())
+            .collect();
+        assert_eq!(
+            update_keys,
+            [
+                json!("update-key"),
+                json!("handle-update-key"),
+                json!("handle-typed-update-key")
+            ]
+        );
+        for path in [KEYED_SIGNAL_PATH, KEYED_RUN_SIGNAL_PATH, KEYED_UPDATE_PATH] {
+            assert_key_sent_only_in_body(&server, path);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_receipts_are_returned_unchanged() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(retained_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let receipt = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), "retry-key")
+            .await
+            .expect("retained receipt");
+
+        assert_eq!(
+            receipt,
+            json!({
+                "outcome": "accepted",
+                "command_status": "accepted",
+                "command_id": "cmd-first",
+                "request_id": "retry-key",
+                "retained": true,
+                "intent_verified": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_conflict_refusal_keeps_error_http_and_classifies_the_sent_key() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(conflicting_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let error = client
+            .signal_workflow_with_request_id(
+                "keyed-1",
+                "approve",
+                json!(["changed"]),
+                "Order-42/approve",
+            )
+            .await
+            .expect_err("different intent under a retained key");
+        assert!(
+            matches!(error, Error::Http { status, .. } if status == reqwest::StatusCode::CONFLICT),
+            "existing Error::Http matching keeps working: {error:?}"
+        );
+        assert!(error.is_request_id_conflict());
+        assert_eq!(error.request_id().as_deref(), Some("Order-42/approve"));
+        let conflict = error.request_id_conflict().expect("conflict details");
+        assert_eq!(conflict.status, 409);
+        assert_eq!(conflict.request_id, "Order-42/approve");
+        assert_eq!(
+            conflict.message,
+            "request id is retained for a different signal intent"
+        );
+        assert_eq!(
+            conflict.retained_command_id.as_deref(),
+            Some("cmd-retained-1")
+        );
+        assert_eq!(conflict.retained_command_type.as_deref(), Some("signal"));
+        assert_eq!(conflict.retained_outcome.as_deref(), Some("accepted"));
+        assert_eq!(conflict.conflict, ["arguments", "target"]);
+        assert_eq!(conflict.body["control_plane"]["operation"], "signal");
+
+        let error = client
+            .update_workflow("keyed-1", "adjust", json!([2]), None)
+            .await
+            .expect_err("different intent under a retained generated key");
+        let sent = server.request_body(KEYED_UPDATE_PATH);
+        assert_eq!(
+            error.request_id(),
+            sent["request_id"].as_str().map(str::to_string)
+        );
+        assert_eq!(
+            error
+                .request_id_conflict()
+                .expect("conflict details")
+                .retained_command_type
+                .as_deref(),
+            Some("update")
+        );
+    }
+
+    #[tokio::test]
+    async fn other_refusals_echoing_the_key_are_not_request_id_conflicts() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(closed_run_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let error = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), "closed-key")
+            .await
+            .expect_err("closed run");
+
+        assert!(matches!(error, Error::Http { status, .. } if status.as_u16() == 409));
+        assert!(!error.is_request_id_conflict());
+        assert_eq!(error.request_id_conflict(), None);
+        assert_eq!(error.request_id().as_deref(), Some("closed-key"));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_error_transport_and_the_held_key_retries_identically() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(keyed_command_server),
+            drop_request: Some(drop_first_keyed_signal),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+        let request_id = Client::generate_signal_request_id();
+
+        let error = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &request_id)
+            .await
+            .expect_err("connection closed before any response");
+        assert!(
+            matches!(error, Error::Transport(_)),
+            "the transport variant is unchanged: {error:?}"
+        );
+        assert_eq!(
+            error.request_id(),
+            None,
+            "nothing was echoed; the application holds the key it chose"
+        );
+
+        let receipt = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &request_id)
+            .await
+            .expect("manual retry with the same key");
+        assert_eq!(receipt["request_id"], request_id);
+        let bodies = server.request_bodies(KEYED_SIGNAL_PATH);
+        assert_eq!(bodies.len(), 2, "one attempt per call, no automatic retry");
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the retry resends the identical key and input"
+        );
+        assert_eq!(bodies[0]["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn invalid_command_keys_are_refused_before_sending() {
+        let server = MockWorkerServer::start();
+        let client = keyed_client(&server);
+        let too_long = "k".repeat(MAX_REQUEST_ID_CHARACTERS + 1);
+
+        for request_id in ["", too_long.as_str()] {
+            let error = client
+                .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), request_id)
+                .await
+                .expect_err("invalid signal key");
+            assert!(
+                matches!(error, Error::Codec(ref message) if message.contains("1 to 255 Unicode characters")),
+                "{error:?}"
+            );
+            let error = client
+                .update_workflow("keyed-1", "adjust", json!([1]), Some(request_id))
+                .await
+                .expect_err("invalid update key");
+            assert!(matches!(error, Error::Codec(_)), "{error:?}");
+        }
+        assert!(server.captured_paths().is_empty(), "nothing was sent");
+
+        let longest = "k".repeat(MAX_REQUEST_ID_CHARACTERS);
+        let _ = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), &longest)
+            .await;
+        assert_eq!(
+            server.request_body(KEYED_SIGNAL_PATH)["request_id"],
+            longest
+        );
+    }
+
+    #[test]
+    fn generated_command_keys_are_distinct_and_well_formed() {
+        let signal = Client::generate_signal_request_id();
+        let update = Client::generate_update_request_id();
+        assert_generated_request_id(&signal, "sdk-rust-signal-");
+        assert_generated_request_id(&update, "sdk-rust-update-");
+        assert_ne!(Client::generate_signal_request_id(), signal);
+        assert!(validate_request_id(&signal).is_ok());
+    }
+
+    #[test]
+    fn command_keys_preserve_the_published_server_unicode_character_limit() {
+        assert!(validate_request_id(&"é".repeat(255)).is_ok());
+        assert!(validate_request_id(&"😀".repeat(255)).is_ok());
+        assert!(validate_request_id(&"é".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn request_id_accessors_read_only_echoed_refusal_bodies() {
+        let conflict = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_conflict","request_id":"k1","retained_command_id":"cmd-1","retained_command_type":"signal","retained_outcome":"accepted","conflict":["name"]}"#.to_string(),
+        };
+        assert!(conflict.is_request_id_conflict());
+        assert_eq!(conflict.request_id().as_deref(), Some("k1"));
+        let details = conflict.request_id_conflict().expect("conflict details");
+        assert_eq!(details.conflict, ["name"]);
+        assert_eq!(
+            details.message,
+            "request id is retained for a different command intent"
+        );
+
+        let echoed = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"run_not_active","request_id":"k2"}"#.to_string(),
+        };
+        assert!(!echoed.is_request_id_conflict());
+        assert_eq!(echoed.request_id().as_deref(), Some("k2"));
+
+        let blank = Error::Http {
+            status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            body: r#"{"request_id":""}"#.to_string(),
+        };
+        assert_eq!(blank.request_id(), None);
+        let text = Error::Http {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: "upstream unavailable".to_string(),
+        };
+        assert_eq!(text.request_id(), None);
+        assert!(!text.is_request_id_conflict());
+
+        let rejection = Error::WorkflowCommandRejected(WorkflowCommandRejection {
+            command: WorkflowCommandKind::Cancel,
+            status: 409,
+            reason: "request_id_conflict".to_string(),
+            message: "retained".to_string(),
+            workflow_id: "wf".to_string(),
+            run_id: None,
+            target_scope: None,
+            body: json!({"reason": "request_id_conflict", "request_id": "k3", "conflict": []}),
+        });
+        assert!(rejection.is_request_id_conflict());
+        assert_eq!(rejection.request_id().as_deref(), Some("k3"));
+
+        assert_eq!(Error::Timeout.request_id(), None);
+        assert!(!Error::Codec("local".to_string()).is_request_id_conflict());
+    }
+
     #[tokio::test]
     async fn public_client_surfaces_send_and_receive_lossless_avro_values() {
         let server = MockWorkerServer::start();
@@ -29911,6 +31331,8 @@ mod tests {
     struct MockWorkerBehavior {
         response_override: Option<fn(&str) -> Option<(&'static str, String)>>,
         request_override: Option<RequestOverride>,
+        /// Close the connection after reading the request, without any response.
+        drop_request: Option<fn(&str, usize) -> bool>,
         storage_refusals: usize,
         storage_path: Option<&'static str>,
         storage_unavailable: bool,
@@ -30256,6 +31678,16 @@ mod tests {
                 })
                 .collect()
         }
+
+        fn request_headers(&self, path: &str) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .iter()
+                .filter(|request| request.path == path)
+                .map(|request| request.headers.clone())
+                .collect()
+        }
     }
 
     impl Drop for MockWorkerServer {
@@ -30356,6 +31788,12 @@ mod tests {
                 .count()
         };
 
+        if behavior
+            .drop_request
+            .is_some_and(|dropped| dropped(path, request_number))
+        {
+            return;
+        }
         if let Some(response) = behavior
             .request_override
             .and_then(|handler| handler(path, body, request_number))

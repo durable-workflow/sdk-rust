@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.1.0
+
+- Add optional execution spans and application log correlation for workflow,
+  query and actual activity attempts. The default build has no OpenTelemetry
+  dependency. Applications own providers, propagators, exporters and shutdown.
+- Propagate bounded W3C contexts only when actual Server discovery advertises
+  the optional observability capability. Run origins parent tasks; validated
+  dispatch, command and outcome contexts become links after original authority
+  fences. Baggage defaults empty and is excluded from links.
+- Restore Tokio context on yield, completion, cancellation and panic. Cold
+  replay does not emit attempts for completed activities. Existing request IDs,
+  task identities, business values and retry budgets retain their meaning.
+
 ## 4.0.0
 
 - Author Nexus service calls with deterministic intent, typed Avro outcomes,

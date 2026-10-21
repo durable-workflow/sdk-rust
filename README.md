@@ -348,6 +348,75 @@ option. Keep a process supervisor for startup failures and process crashes.
 | [`continue_as_new.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/continue_as_new.rs) | Bounded histories and continue-as-new |
 | [`parallel_saga.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/parallel_saga.rs) | Deterministic parallel work and saga compensation |
 
+### Optional execution telemetry
+
+Enable the `telemetry` Cargo feature and configure your application's
+OpenTelemetry provider, exporter, sampling and bounded export timeouts before
+constructing the worker. Configure the application's global W3C propagator
+before making admission calls or starting workers:
+
+```rust,no_run
+# #[cfg(feature = "telemetry")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use durable_workflow::{Client, Worker};
+use durable_workflow::telemetry::ExecutionTelemetry;
+opentelemetry::global::set_text_map_propagator(
+    opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+);
+let client = Client::builder("http://localhost:8080").build()?;
+let worker = Worker::new(client, "orders").telemetry(ExecutionTelemetry::new());
+# Ok(())
+# }
+# #[cfg(not(feature = "telemetry"))]
+# fn main() {}
+```
+
+The default build has no OpenTelemetry dependency. The optional feature needs
+the API and official W3C propagators supplied by the OpenTelemetry SDK crate;
+the application owns provider/exporter configuration and shutdown.
+If the application already uses a composite propagator, retain its other
+propagators and include W3C trace context. A missing propagator leaves task
+spans independent even when the Server supports carriers. The SDK does not
+replace the application's global configuration.
+Servers without the exact optional capability use independent task traces.
+When available, a valid run origin parents task spans; task-bound dispatch and
+validated command/outcome contexts become links. The original poll identity,
+generation and existing hydration, query and cooperative fences precede their
+use. Missing or insufficient authority omits propagation without changing
+business execution. Actual remote/local activity attempts have separate child
+spans. Use the configured Server/SDK tuple qualified in
+[Workflow #773](https://github.com/durable-workflow/workflow/issues/773).
+Replay emits workflow work spans without pretending completed activities ran
+again. No span stays open during durable waiting.
+
+Configure admission/command clients with `client.with_telemetry(telemetry)` and
+use existing `client.cluster_info().await` discovery during setup. Worker startup
+can perform one bounded optional discovery; its failure does not refuse business
+registration or add business retries. Only the exact supported
+`worker_protocol.server_capabilities.observability_context` object enables
+carriers. No mandatory protocol floor or Server version inference is added.
+Caller capture precedes HTTP transport. Worker child/continue commands capture
+their actual workflow scope before settlement and preserve business arguments
+and request keys.
+
+Official W3C propagation validates the agreed byte limits. Baggage defaults empty;
+`with_baggage_allowlist` retains explicit keys only on run parents. Links never
+carry baggage. Envelopes are bounded to 4096 bytes and at most 32 links. Malformed
+metadata is ignored with fixed `discarded`/`filtered` span diagnostics. Use
+`with_enabled(false)` to disable spans and propagation explicitly.
+
+Use `telemetry::current_log_context()` in a logging adapter, or wrap an existing
+OpenTelemetry logger provider in `telemetry::ExecutionLoggerProvider` before
+passing it to your application's logging bridge. It adds bounded namespace,
+worker, queue, task and available workflow/attempt IDs; trace/span IDs follow
+the current application child span. Request IDs and log messages remain owned
+by the application. The SDK installs no global logging bridge or provider.
+Tokio contexts attach during each poll and restore on yield, completion, panic
+and cancellation. Spawned application tasks must explicitly propagate their
+context when that is intended. Export failures do not change business results;
+applications must bound exporter I/O and drain their providers during shutdown.
+Abrupt process death may lose spans; telemetry is not exactly-once delivery.
+
 ## Documentation
 
 - [Rust SDK landing page](https://rust.durable-workflow.com/)
