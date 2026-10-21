@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.2.0
+
 - Let a select-member cancellation request complete within its original workflow
   task so subsequent workflow commands can commit. The unit result does not
   report that cancellation won a race: recorded history still governs the
