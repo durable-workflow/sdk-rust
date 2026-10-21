@@ -4855,10 +4855,7 @@ impl Client {
         timeout: Duration,
     ) -> Result<T> {
         #[cfg(feature = "telemetry")]
-        if method == reqwest::Method::GET && path == "/cluster/info" {
-            self.observability_context_supported
-                .store(false, Ordering::SeqCst);
-        }
+        self.begin_observability_discovery(&method, path);
         let protocol = match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
@@ -5016,6 +5013,14 @@ impl Client {
 
             #[cfg(not(feature = "telemetry"))]
             return Ok(serde_json::from_slice(&bytes)?);
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn begin_observability_discovery(&self, method: &reqwest::Method, path: &str) {
+        if *method == reqwest::Method::GET && path == "/cluster/info" {
+            self.observability_context_supported
+                .store(false, Ordering::SeqCst);
         }
     }
 
