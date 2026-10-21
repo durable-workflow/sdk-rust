@@ -384,8 +384,8 @@ validated command/outcome contexts become links. The original poll identity,
 generation and existing hydration, query and cooperative fences precede their
 use. Missing or insufficient authority omits propagation without changing
 business execution. Actual remote/local activity attempts have separate child
-spans. Current published Server persistence/delivery remains unavailable; real
-combined propagation is still part of Workflow #773 qualification.
+spans. Use the configured Server/SDK tuple qualified in
+[Workflow #773](https://github.com/durable-workflow/workflow/issues/773).
 Replay emits workflow work spans without pretending completed activities ran
 again. No span stays open during durable waiting.
 
