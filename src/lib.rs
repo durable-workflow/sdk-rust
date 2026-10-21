@@ -18650,6 +18650,7 @@ mod tests {
     static OBSERVABILITY_PROPAGATOR_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
     mod activity_cancellation_policies;
+    mod activity_lease_worker;
     mod cancellation_scope_admission;
     mod cancellation_scope_authoring;
     mod cancellation_scope_history;
