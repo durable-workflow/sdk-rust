@@ -57,9 +57,11 @@ fn worker(server: &MockWorkerServer) -> Worker {
         Client::builder(server.base_url())
             .namespace("named-test")
             .worker_token(Some("worker-test-token".into()))
-            .build().unwrap(),
+            .build()
+            .unwrap(),
         "lease-queue",
-    ).worker_id("lease-worker")
+    )
+    .worker_id("lease-worker")
 }
 
 fn server(overrides: RequestOverride) -> MockWorkerServer {
@@ -79,7 +81,10 @@ async fn automatic_renewal_keeps_a_callback_past_its_original_lease() {
         Ok(json!({"value":9_223_372_036_854_775_000_i64,"optional":null,"text":"継続"}))
     });
     worker.poll_activity_once().await.unwrap();
-    assert!(server.request_count(RENEW) >= 2, "original claim must be maintained");
+    assert!(
+        server.request_count(RENEW) >= 2,
+        "original claim must be maintained"
+    );
     assert_eq!(server.request_count(COMPLETE), 1);
     assert_eq!(server.request_count(HEARTBEAT), 0);
     assert_eq!(server.request_count(FAIL), 0);
@@ -112,12 +117,17 @@ async fn affirmative_capability_requires_original_identity_before_callback() {
 
 struct Dropped(Arc<AtomicBool>);
 impl Drop for Dropped {
-    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn revoked(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
     if path == RENEW && number > 1 {
-        return Some(("409 Conflict", json!({"reason":"stale_attempt","can_continue":false}).to_string()));
+        return Some((
+            "409 Conflict",
+            json!({"reason":"stale_attempt","can_continue":false}).to_string(),
+        ));
     }
     replies(path, body, number)
 }
@@ -199,7 +209,9 @@ async fn retained_callback_client_cannot_publish_after_worker_settlement() {
     });
     worker.poll_activity_once().await.unwrap();
     let client = retained.lock().unwrap().take().unwrap();
-    let result = client.complete_activity_task("lease-task", "lease-attempt", "lease-worker", true, "avro").await;
+    let result = client
+        .complete_activity_task("lease-task", "lease-attempt", "lease-worker", true, "avro")
+        .await;
     assert!(matches!(result, Err(Error::ActivityExecutionAbandoned(_))));
     assert_eq!(server.request_count(COMPLETE), 1);
 }
@@ -217,6 +229,7 @@ async fn canonical_client_discovery_cannot_be_bypassed_by_missing_poll_capabilit
     }
     let server = server(cached);
     let mut worker = worker(&server);
+    worker.client.control_token = Some("control-test-token".to_owned());
     worker.client.cluster_info().await.unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&calls);
