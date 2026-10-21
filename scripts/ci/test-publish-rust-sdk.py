@@ -622,6 +622,7 @@ class RegistryHttpsTest(unittest.TestCase):
         cls.https = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.addClassCleanup(cls.https.server_close)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cls.certificate, private_key)
         cls.https.socket = context.wrap_socket(cls.https.socket, server_side=True)
         cls.http_url = f"http://127.0.0.1:{cls.http.server_port}"
