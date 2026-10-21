@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Let a select-member cancellation request complete within its original workflow
+  task so subsequent workflow commands can commit. The unit result does not
+  report that cancellation won a race: recorded history still governs the
+  member outcome, replay validation and `await_result()`.
 - Add a bounded activity lease-renewal client request behind affirmative
   runtime discovery. It uses worker credentials and preserves original claim
   identity without recording application progress.
