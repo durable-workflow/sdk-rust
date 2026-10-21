@@ -19775,12 +19775,14 @@ mod tests {
         let mut cancel = Box::pin(slow.cancel());
         assert!(matches!(
             cancel.as_mut().poll(&mut task_context),
-            Poll::Pending
+            Poll::Ready(Ok(()))
         ));
         assert!(matches!(
             cancel.as_mut().poll(&mut task_context),
-            Poll::Pending
+            Poll::Ready(Ok(()))
         ));
+        let mut outcome = Box::pin(slow.await_result());
+        assert!(matches!(outcome.as_mut().poll(&mut task_context), Poll::Pending));
         let commands = ctx.take_commands().expect("cancel command");
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["type"], json!("cancel_selection_operation"));
