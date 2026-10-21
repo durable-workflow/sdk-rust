@@ -181,6 +181,16 @@ renew the lease or record application heartbeats. Explicit protocol 1.19 uses
 the original local lease/deadline bounds and completion fencing; it cannot
 observe live revocation or ownership. Live authority supervision requires 1.20.
 Shutdown and dropping a poll stop its loading and observation together.
+
+The optional `Client::renew_activity_task_lease` request is available only when
+actual runtime discovery advertises `activity_lease_renewal=true`. Pass the
+original task ID, attempt ID, lease owner and a positive request window of at
+most five seconds. Discovery and renewal share that window and use worker
+credentials. This request records no application progress. Validate the full
+original identity, granted lease and business deadlines before using its reply
+to extend local authority. This client method does not yet schedule automatic
+activity-worker renewal.
+
 Completion still uses the runtime's attempt fence. Server 2.6.1 refuses
 superseded attempts but can accept an expired, unreclaimed attempt; see
 [Workflow #769](https://github.com/durable-workflow/workflow/issues/769).

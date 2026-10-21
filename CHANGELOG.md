@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add a bounded activity lease-renewal client request behind affirmative
+  runtime discovery. It uses worker credentials and preserves original claim
+  identity without recording application progress. Automatic worker maintenance
+  and published long-activity acceptance remain separate work.
+
 ## 4.1.0
 
 - Add optional execution spans and application log correlation for workflow,

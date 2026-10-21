@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod activity_hydration;
+mod activity_lease;
 mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
@@ -305,6 +306,8 @@ pub enum Error {
     WorkflowTimedOut(WorkflowTerminalOutcome),
     #[error(transparent)]
     ActivityTaskRejected(ActivityTaskRejection),
+    #[error("activity lease renewal unavailable: {0}")]
+    ActivityLeaseRenewalUnavailable(String),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
