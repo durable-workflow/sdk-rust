@@ -1,4 +1,4 @@
-const requestTargetBase = new URL('http://request-target.invalid');
+const requestTargetBase = new URL('https://request-target.invalid');
 
 export function parseProxyOrigin(value) {
   let origin;
