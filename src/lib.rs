@@ -5007,35 +5007,51 @@ impl Client {
             }
 
             #[cfg(feature = "telemetry")]
-            if method == reqwest::Method::POST
-                && self.execution_telemetry.is_some()
-                && matches!(
-                    path,
-                    "/worker/workflow-tasks/poll"
-                        | "/worker/activity-tasks/poll"
-                        | "/worker/query-tasks/poll"
-                )
-            {
-                let mut wire: Value = serde_json::from_slice(&bytes)?;
-                telemetry::carrier::retain_poll_observations(
-                    &mut wire,
-                    request_body.as_ref().unwrap_or(&Value::Null),
-                    path,
-                    &self.namespace,
-                );
-                return Ok(serde_json::from_value(wire)?);
-            }
+            return self.decode_observability_response(
+                &method,
+                path,
+                request_body.as_ref(),
+                &bytes,
+            );
 
-            #[cfg(feature = "telemetry")]
-            if method == reqwest::Method::GET && path == "/cluster/info" {
-                let info: Value = serde_json::from_slice(&bytes)?;
-                self.observability_context_supported
-                    .store(telemetry::carrier::supported(&info), Ordering::SeqCst);
-                return Ok(serde_json::from_value(info)?);
-            }
-
+            #[cfg(not(feature = "telemetry"))]
             return Ok(serde_json::from_slice(&bytes)?);
         }
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn decode_observability_response<T: DeserializeOwned>(
+        &self,
+        method: &reqwest::Method,
+        path: &str,
+        request_body: Option<&Value>,
+        bytes: &[u8],
+    ) -> Result<T> {
+        if *method == reqwest::Method::POST
+            && self.execution_telemetry.is_some()
+            && matches!(
+                path,
+                "/worker/workflow-tasks/poll"
+                    | "/worker/activity-tasks/poll"
+                    | "/worker/query-tasks/poll"
+            )
+        {
+            let mut wire: Value = serde_json::from_slice(bytes)?;
+            telemetry::carrier::retain_poll_observations(
+                &mut wire,
+                request_body.unwrap_or(&Value::Null),
+                path,
+                &self.namespace,
+            );
+            return Ok(serde_json::from_value(wire)?);
+        }
+        if *method == reqwest::Method::GET && path == "/cluster/info" {
+            let info: Value = serde_json::from_slice(bytes)?;
+            self.observability_context_supported
+                .store(telemetry::carrier::supported(&info), Ordering::SeqCst);
+            return Ok(serde_json::from_value(info)?);
+        }
+        Ok(serde_json::from_slice(bytes)?)
     }
 
     async fn wait_for_storage_admission(
