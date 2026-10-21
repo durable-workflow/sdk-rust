@@ -14820,10 +14820,11 @@ impl Future for CancelDurableOperationCall {
             }));
             self.emitted = true;
         }
-        // The cancellation command is only a request. Do not expose workflow
-        // state after cancel until committed SelectionOperationCancelled
-        // history proves that the request won the race with member completion.
-        Poll::Pending
+        // Unit completes the request, not the member's outcome. Following
+        // workflow commands commit atomically with this cancellation request.
+        // Waiting here would need another workflow task that cancellation
+        // alone does not create. await_result still requires recorded history.
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -19775,10 +19776,15 @@ mod tests {
         let mut cancel = Box::pin(slow.cancel());
         assert!(matches!(
             cancel.as_mut().poll(&mut task_context),
-            Poll::Pending
+            Poll::Ready(Ok(()))
         ));
         assert!(matches!(
             cancel.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(()))
+        ));
+        let mut outcome = Box::pin(slow.await_result());
+        assert!(matches!(
+            outcome.as_mut().poll(&mut task_context),
             Poll::Pending
         ));
         let commands = ctx.take_commands().expect("cancel command");
@@ -31793,6 +31799,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn closed_mock_connection_is_not_a_worker_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed connection control");
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        drop(client);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        handle_mock_worker_request(
+            &mut stream,
+            &requests,
+            MockWorkerBehavior {
+                request_override: Some(|_, _, _| {
+                    panic!("closed connection cannot invoke an HTTP handler")
+                }),
+                ..MockWorkerBehavior::default()
+            },
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
     fn handle_mock_worker_request(
         stream: &mut TcpStream,
         requests: &Arc<Mutex<Vec<CapturedRequest>>>,
@@ -31821,6 +31847,10 @@ mod tests {
                 }
                 Err(_) => return,
             }
+        }
+
+        if !mock_request_is_complete(&request) {
+            return;
         }
 
         let request = String::from_utf8_lossy(&request);

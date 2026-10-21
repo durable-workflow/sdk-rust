@@ -480,6 +480,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.cancellation-remaining-condition"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
+            | "corpus.selection-cancel-request"
             | "corpus.redrive-boundary"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
@@ -931,8 +932,11 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 Ok(json!({"status": status, "waits": outcomes}))
             });
         }
-        "corpus.durable-selection" | "corpus.durable-selection-portable-affinity" => {
-            worker.register_workflow(workflow_type, |ctx, _input| async move {
+        "corpus.durable-selection"
+        | "corpus.durable-selection-portable-affinity"
+        | "corpus.selection-cancel-request" => {
+            let cancel_request = workflow_type == "corpus.selection-cancel-request";
+            worker.register_workflow(workflow_type, move |ctx, _input| async move {
                 let selected = ctx
                     .select_keyed(vec![
                         (
@@ -953,6 +957,10 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                             "durable selection replay did not preserve the slow handle".to_string(),
                         )
                     })?;
+                if cancel_request {
+                    slow.cancel().await?;
+                    return Ok(json!("cancel-requested"));
+                }
                 let winner = match &selected.key {
                     SelectionKey::Name(key) => key.clone(),
                     SelectionKey::Index(index) => index.to_string(),
@@ -1459,6 +1467,24 @@ async fn portable_affinity_refusals_survive_durable_selection_cold_replay() {
         .expect("cold portable-affinity selection replay must execute");
 
     assert_eq!(first, restarted);
+}
+
+#[tokio::test]
+async fn selection_cancellation_request_completes_the_original_task_after_cold_replay() {
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "tests/fixtures/replay-regressions/selection-cancellation-request-completes.json",
+        ))
+        .expect("read cancellation request fixture"),
+    )
+    .expect("parse cancellation request fixture");
+    let first = execute_fixture(&fixture)
+        .await
+        .expect("cancel and complete original task");
+    let cold = execute_fixture(&fixture)
+        .await
+        .expect("cold worker cancels and completes");
+    assert_eq!(first, cold);
 }
 
 #[tokio::test]
