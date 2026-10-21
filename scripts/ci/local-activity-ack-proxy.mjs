@@ -3,9 +3,9 @@
 // the acknowledgement. This does not modify task, history or lease state.
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
+import { parseProxyOrigin, proxyTargetUrl } from './proxy-target-url.mjs';
 
-const upstream = process.env.DURABLE_WORKFLOW_ACK_UPSTREAM;
-if (!upstream) throw new Error('DURABLE_WORKFLOW_ACK_UPSTREAM is required');
+const upstream = parseProxyOrigin(process.env.DURABLE_WORKFLOW_ACK_UPSTREAM || '');
 const commandType = process.env.DURABLE_WORKFLOW_ACK_COMMAND || 'record_local_activity';
 if (!['record_local_activity', 'start_service_operation'].includes(commandType)) {
   throw new Error('Expected a local activity or service operation completion command');
@@ -24,7 +24,7 @@ createServer(async (request, response) => {
     const body = Buffer.concat(chunks);
     const headers = { ...request.headers };
     for (const name of ['host', 'connection', 'content-length', 'transfer-encoding']) delete headers[name];
-    const result = await fetch(new URL(request.url, upstream), {
+    const result = await fetch(proxyTargetUrl(request.url, upstream), {
       method: request.method,
       headers,
       body: body.length ? body : undefined,
