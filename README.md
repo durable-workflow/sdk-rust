@@ -352,13 +352,17 @@ option. Keep a process supervisor for startup failures and process crashes.
 
 Enable the `telemetry` Cargo feature and configure your application's
 OpenTelemetry provider, exporter, sampling and bounded export timeouts before
-constructing the worker:
+constructing the worker. Configure the application's global W3C propagator
+before making admission calls or starting workers:
 
 ```rust,no_run
 # #[cfg(feature = "telemetry")]
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 use durable_workflow::{Client, Worker};
 use durable_workflow::telemetry::ExecutionTelemetry;
+opentelemetry::global::set_text_map_propagator(
+    opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+);
 let client = Client::builder("http://localhost:8080").build()?;
 let worker = Worker::new(client, "orders").telemetry(ExecutionTelemetry::new());
 # Ok(())
@@ -370,6 +374,10 @@ let worker = Worker::new(client, "orders").telemetry(ExecutionTelemetry::new());
 The default build has no OpenTelemetry dependency. The optional feature needs
 the API and official W3C propagators supplied by the OpenTelemetry SDK crate;
 the application owns provider/exporter configuration and shutdown.
+If the application already uses a composite propagator, retain its other
+propagators and include W3C trace context. A missing propagator leaves task
+spans independent even when the Server supports carriers. The SDK does not
+replace the application's global configuration.
 Servers without the exact optional capability use independent task traces.
 When available, a valid run origin parents task spans; task-bound dispatch and
 validated command/outcome contexts become links. The original poll identity,

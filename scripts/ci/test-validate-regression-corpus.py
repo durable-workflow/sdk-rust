@@ -598,6 +598,45 @@ mod tests {
 
         self.assertTrue(self._guard_matches(REPLAY_GUARD))
 
+    def test_history_fixture_in_unchanged_test_module_is_not_production_replay(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,5 +1,6 @@
+ #[cfg(test)]
+ mod tests {
+     fn query_fixture() {
++        let task = json!({"history_events": []});
+     }
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertFalse(self._guard_matches(REPLAY_GUARD))
+
+        diff += """\
+@@ -10,3 +11,3 @@
+ fn consume_history(history: &[Event]) {
+-    consume(history, 1);
++    consume(history, 2);
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_removing_test_configuration_keeps_history_changes_guarded(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,5 +1,4 @@
+-#[cfg(test)]
+ mod tests {
+     fn query_fixture() {
+-        let task = json!({"history_events": []});
++        let task = json!({"history_events": [event]});
+     }
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
     def test_history_transport_protocol_only_change_is_not_replay(self) -> None:
         source = self.root / "src/lib.rs"
         source.write_text(
