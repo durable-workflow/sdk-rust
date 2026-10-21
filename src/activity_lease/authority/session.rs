@@ -1,6 +1,8 @@
 //! Only acknowledged same-holder session grants extend session authority.
 
-use super::*;
+use super::{lost, timestamp, until, Clock, Timestamp};
+use crate::{Result, WorkerSession, WorkerSessionOptions};
+use serde_json::Value;
 
 #[derive(Debug)]
 pub(super) struct Session {

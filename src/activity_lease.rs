@@ -1,6 +1,11 @@
 //! Optional runtime lease maintenance, independent of application progress.
 
-use super::*;
+use crate::{
+    activity_task_response, percent_encode_path_segment, Client, Error, RequestProtocol, Result,
+};
+use serde_json::{json, Value};
+use std::sync::{atomic::Ordering, Arc};
+use std::time::Duration;
 
 pub(crate) mod authority;
 
@@ -113,6 +118,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkerProtocolVersion;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Debug)]

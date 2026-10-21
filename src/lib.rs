@@ -4884,17 +4884,8 @@ impl Client {
         Ok(serde_json::from_value(value)?)
     }
 
-    async fn request_json_unresolved_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        protocol: RequestProtocol,
-        body: Option<&B>,
-        timeout: Duration,
-    ) -> Result<T> {
-        #[cfg(feature = "telemetry")]
-        self.begin_observability_discovery(&method, path);
-        let protocol = match protocol {
+    fn worker_request_protocol(&self, protocol: RequestProtocol) -> Result<RequestProtocol> {
+        Ok(match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
                 if self.cooperative_worker_protocol
@@ -4923,7 +4914,27 @@ impl Client {
                 RequestProtocol::Worker(selected)
             }
             RequestProtocol::ControlPlane => RequestProtocol::ControlPlane,
-        };
+        })
+    }
+
+    fn check_activity_lease_request(&self, path: &str, body: Option<&Value>) -> Result<()> {
+        match &self.activity_lease_authority {
+            Some(authority) => authority.check(path, body),
+            None => Ok(()),
+        }
+    }
+
+    async fn request_json_unresolved_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        protocol: RequestProtocol,
+        body: Option<&B>,
+        timeout: Duration,
+    ) -> Result<T> {
+        #[cfg(feature = "telemetry")]
+        self.begin_observability_discovery(&method, path);
+        let protocol = self.worker_request_protocol(protocol)?;
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
             .http
@@ -4961,14 +4972,10 @@ impl Client {
                 method,
                 reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
             ) {
-                if let Some(authority) = &self.activity_lease_authority {
-                    authority.check(path, Some(&body))?;
-                }
+                self.check_activity_lease_request(path, Some(&body))?;
                 self.externalize_runtime_payloads(&mut body, path, protocol)
                     .await?;
-                if let Some(authority) = &self.activity_lease_authority {
-                    authority.check(path, Some(&body))?;
-                }
+                self.check_activity_lease_request(path, Some(&body))?;
             }
             request = request.json(&body);
         }
@@ -4989,9 +4996,7 @@ impl Client {
 
         loop {
             // Keep the serialized body and lease/poll identity across admission pauses.
-            if let Some(authority) = &self.activity_lease_authority {
-                authority.check(path, request_body.as_ref())?;
-            }
+            self.check_activity_lease_request(path, request_body.as_ref())?;
             let receive = async {
                 let response = self
                     .http
