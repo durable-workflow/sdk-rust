@@ -262,6 +262,8 @@ pub(super) struct SessionActivityTask {
     pub(super) worker_session: Option<Value>,
     #[serde(skip)]
     pub(super) hydration_claim: Option<crate::activity_hydration::HydrationClaim>,
+    #[serde(skip)]
+    pub(super) activity_lease: Option<Arc<crate::activity_lease::authority::Lease>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,7 +358,11 @@ impl crate::Worker {
         if sessions.len() >= self.client.max_concurrent_worker_sessions {
             return Err(invalid("local worker session capacity exhausted"));
         }
-        let session = WorkerSession::new(self.client.clone(), self.worker_id.clone(), options);
+        let session = WorkerSession::new(
+            self.client.with_activity_lease_authority(None),
+            self.worker_id.clone(),
+            options,
+        );
         sessions.insert(session.options.session_id.clone(), session.clone());
         Ok(session)
     }
@@ -384,6 +390,9 @@ impl crate::Worker {
         let options: WorkerSessionOptions = serde_json::from_value(affinity.clone())?;
         let session = self.worker_session(options)?;
         session.track(affinity)?;
+        if let Some(authority) = &self.client.activity_lease_authority {
+            authority.attach_session(Some(&session))?;
+        }
         Ok(Some(session))
     }
 

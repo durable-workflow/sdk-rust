@@ -1821,35 +1821,10 @@ impl Client {
 }
 
 impl Worker {
-    pub(super) async fn poll_cooperative_activity_once(&self) -> Result<ManagedPollOutcome> {
-        if self.client.worker_sessions_enabled {
-            self.require_session_registration()?;
-        }
-        let poll_request_id = unique_request_id("rust-activity-poll");
-        let response = self
-            .retry_worker_operation(|| {
-                self.client.poll_activity_task_response_with_request_id(
-                    &self.worker_id,
-                    &self.task_queue,
-                    self.poll_timeout,
-                    &poll_request_id,
-                    0,
-                )
-            })
-            .await;
-        let response = match response {
-            Err(Error::ActivityExecutionAbandoned(_)) => return Ok(ManagedPollOutcome::Handled),
-            response => response,
-        };
-        let Some(response) = self.settle_worker_poll_response(response).await? else {
-            return Ok(ManagedPollOutcome::Idle);
-        };
-        if response.outcome().should_stop() {
-            return Ok(ManagedPollOutcome::Stop);
-        }
-        let Some(task) = response.task else {
-            return Ok(ManagedPollOutcome::Idle);
-        };
+    pub(super) async fn settle_cooperative_activity(
+        &self,
+        task: worker_session::SessionActivityTask,
+    ) -> Result<ManagedPollOutcome> {
         let session = self.track_session_task(task.worker_session.as_ref())?;
         let hydration_claim = task.hydration_claim;
         let task = task.task;

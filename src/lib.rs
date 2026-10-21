@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod activity_hydration;
+mod activity_lease;
 mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
@@ -305,6 +306,8 @@ pub enum Error {
     WorkflowTimedOut(WorkflowTerminalOutcome),
     #[error(transparent)]
     ActivityTaskRejected(ActivityTaskRejection),
+    #[error("activity lease renewal unavailable: {0}")]
+    ActivityLeaseRenewalUnavailable(String),
     #[error("workflow handler {0:?} is not registered")]
     WorkflowNotRegistered(String),
     #[error("activity handler {0:?} is not registered")]
@@ -2975,6 +2978,8 @@ pub struct Client {
     worker_build_id: Option<String>,
     sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
+    activity_lease_renewal_supported: Arc<AtomicBool>,
+    activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
     execution_telemetry: Option<telemetry::ExecutionTelemetry>,
     #[cfg(feature = "telemetry")]
@@ -3037,13 +3042,18 @@ impl Client {
     }
 
     pub async fn cluster_info(&self) -> Result<Value> {
-        self.request_json(
-            reqwest::Method::GET,
-            "/cluster/info",
-            RequestProtocol::ControlPlane,
-            Option::<&Value>::None,
-        )
-        .await
+        let discovery: Value = self
+            .request_json(
+                reqwest::Method::GET,
+                "/cluster/info",
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+            )
+            .await?;
+        self.observe_activity_lease_capabilities(
+            &discovery["worker_protocol"]["server_capabilities"],
+        );
+        Ok(discovery)
     }
 
     pub async fn start_workflow<T: Serialize>(
@@ -4053,6 +4063,9 @@ impl Client {
                 Some(&body),
             )
             .await?;
+        if response["registered"] == true && response["worker_id"].as_str() == Some(worker_id) {
+            self.observe_activity_lease_capabilities(&response["server_capabilities"]);
+        }
         if self.sticky_cache.is_some() {
             self.confirm_sticky_registration(&response, worker_id, task_queue)
                 .await?;
@@ -4688,20 +4701,40 @@ impl Client {
                 transport_retries,
             )
             .await?;
-        let claim = activity_hydration::HydrationClaim::from_poll(&wire, worker_id, self)?;
-        let mut data: worker_session::SessionPollResponse =
-            activity_hydration::HydrationClaim::protect(claim.as_ref(), self, async {
-                self.resolve_runtime_payloads(
+        let lease =
+            activity_lease::authority::Lease::confirm(self, &wire, worker_id, task_queue).await?;
+        let observed = self.with_activity_lease_authority(
+            lease.as_ref().map(|lease| Arc::clone(&lease.authority)),
+        );
+        let claim = if lease.is_none() {
+            activity_hydration::HydrationClaim::from_poll(&wire, worker_id, self)?
+        } else {
+            None
+        };
+        let loading = async {
+            observed
+                .resolve_runtime_payloads(
                     &mut wire,
                     "/worker/activity-tasks/poll",
                     RequestProtocol::DefaultWorker,
                 )
                 .await?;
-                Ok(serde_json::from_value(wire)?)
-            })
-            .await?;
+            if let Some(lease) = &lease {
+                lease
+                    .authority
+                    .refresh_delivery_session(&mut wire["task"])?;
+            }
+            Ok(serde_json::from_value(wire)?)
+        };
+        let mut data: worker_session::SessionPollResponse = match lease.as_ref() {
+            Some(lease) => lease.authority.protect(loading).await?,
+            None => {
+                activity_hydration::HydrationClaim::protect(claim.as_ref(), self, loading).await?
+            }
+        };
         if let Some(task) = data.task.as_mut() {
             task.hydration_claim = claim;
+            task.activity_lease = lease;
         }
         Ok(data)
     }
@@ -4799,7 +4832,8 @@ impl Client {
             "details": details
         });
         let path = format!("/worker/activity-tasks/{task_id}/heartbeat");
-        activity_task_response(
+        let started = tokio::time::Instant::now();
+        let response = activity_task_response(
             self.request_json(
                 reqwest::Method::POST,
                 &path,
@@ -4810,7 +4844,11 @@ impl Client {
             "heartbeat",
             task_id,
             activity_attempt_id,
-        )
+        )?;
+        if let Some(authority) = &self.activity_lease_authority {
+            authority.progress(&response, started)?;
+        }
+        Ok(response)
     }
 
     async fn request_json<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -4846,17 +4884,8 @@ impl Client {
         Ok(serde_json::from_value(value)?)
     }
 
-    async fn request_json_unresolved_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        protocol: RequestProtocol,
-        body: Option<&B>,
-        timeout: Duration,
-    ) -> Result<T> {
-        #[cfg(feature = "telemetry")]
-        self.begin_observability_discovery(&method, path);
-        let protocol = match protocol {
+    fn worker_request_protocol(&self, protocol: RequestProtocol) -> Result<RequestProtocol> {
+        Ok(match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
                 if self.cooperative_worker_protocol
@@ -4885,7 +4914,27 @@ impl Client {
                 RequestProtocol::Worker(selected)
             }
             RequestProtocol::ControlPlane => RequestProtocol::ControlPlane,
-        };
+        })
+    }
+
+    fn check_activity_lease_request(&self, path: &str, body: Option<&Value>) -> Result<()> {
+        match &self.activity_lease_authority {
+            Some(authority) => authority.check(path, body),
+            None => Ok(()),
+        }
+    }
+
+    async fn request_json_unresolved_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        protocol: RequestProtocol,
+        body: Option<&B>,
+        timeout: Duration,
+    ) -> Result<T> {
+        #[cfg(feature = "telemetry")]
+        self.begin_observability_discovery(&method, path);
+        let protocol = self.worker_request_protocol(protocol)?;
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
             .http
@@ -4923,8 +4972,10 @@ impl Client {
                 method,
                 reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
             ) {
+                self.check_activity_lease_request(path, Some(&body))?;
                 self.externalize_runtime_payloads(&mut body, path, protocol)
                     .await?;
+                self.check_activity_lease_request(path, Some(&body))?;
             }
             request = request.json(&body);
         }
@@ -4945,6 +4996,7 @@ impl Client {
 
         loop {
             // Keep the serialized body and lease/poll identity across admission pauses.
+            self.check_activity_lease_request(path, request_body.as_ref())?;
             let receive = async {
                 let response = self
                     .http
@@ -4964,11 +5016,21 @@ impl Client {
             {
                 return Err(Error::Timeout);
             }
-            let (status, bytes) = match retry_deadline.filter(|_| deferred_workflow_completion) {
-                Some(deadline) => tokio::time::timeout_at(deadline, receive)
-                    .await
-                    .map_err(|_| Error::Timeout)??,
-                None => receive.await?,
+            let received = async {
+                match retry_deadline.filter(|_| deferred_workflow_completion) {
+                    Some(deadline) => tokio::time::timeout_at(deadline, receive)
+                        .await
+                        .map_err(|_| Error::Timeout)?,
+                    None => receive.await,
+                }
+            };
+            let (status, bytes) = match self
+                .activity_lease_authority
+                .as_ref()
+                .filter(|authority| authority.governs(path))
+            {
+                Some(authority) => authority.protect(received).await?,
+                None => received.await?,
             };
 
             if !status.is_success() {
@@ -5822,6 +5884,8 @@ impl ClientBuilder {
             worker_build_id: None,
             sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
+            activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
+            activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
             execution_telemetry: None,
             #[cfg(feature = "telemetry")]
@@ -8811,9 +8875,6 @@ impl Worker {
         if self.client.worker_sessions_enabled {
             self.require_session_registration()?;
         }
-        if self.cooperative_cancellation_enabled {
-            return self.poll_cooperative_activity_once().await;
-        }
         let poll_request_id = unique_request_id("rust-activity-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -8840,6 +8901,36 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        self.settle_polled_activity(task).await
+    }
+
+    async fn settle_polled_activity(
+        &self,
+        task: worker_session::SessionActivityTask,
+    ) -> Result<ManagedPollOutcome> {
+        let lease = task.activity_lease.clone();
+        let mut worker = self.clone();
+        worker.client = self.client.with_activity_lease_authority(
+            lease.as_ref().map(|lease| Arc::clone(&lease.authority)),
+        );
+        let operation = worker.execute_polled_activity(task);
+        let result = match lease.as_ref() {
+            Some(lease) => lease.authority.protect(operation).await,
+            None => operation.await,
+        };
+        match result {
+            Err(Error::ActivityExecutionAbandoned(_)) => Ok(ManagedPollOutcome::Handled),
+            result => result,
+        }
+    }
+
+    async fn execute_polled_activity(
+        &self,
+        task: worker_session::SessionActivityTask,
+    ) -> Result<ManagedPollOutcome> {
+        if self.cooperative_cancellation_enabled {
+            return self.settle_cooperative_activity(task).await;
+        }
         let session = self.track_session_task(task.worker_session.as_ref())?;
         let hydration_claim = task.hydration_claim;
         let task = task.task;
@@ -18647,6 +18738,7 @@ mod tests {
     static OBSERVABILITY_PROPAGATOR_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
     mod activity_cancellation_policies;
+    mod activity_lease_worker;
     mod cancellation_scope_admission;
     mod cancellation_scope_authoring;
     mod cancellation_scope_history;
