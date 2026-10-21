@@ -2,8 +2,17 @@
 //!
 //! Applications own providers, exporters, sampling and shutdown. Enabling this
 //! feature installs none of those components. Propagation requires the exact
-//! advertised capability and existing original claim gates. Current published
-//! Server support is unavailable. Attempt spans are children of their task.
+//! advertised capability and existing original claim gates. A configured
+//! [PHP Server](https://github.com/durable-workflow/server/blob/2.10.0/docs/observability-context.md)
+//! can advertise support. Missing, malformed or unknown capabilities use
+//! independent task traces. A Server version alone does not enable propagation.
+//! Attempt spans are children of their task.
+//!
+//! See the [setup example](https://github.com/durable-workflow/sdk-rust/blob/4.1.0/README.md#optional-execution-telemetry)
+//! for the optional Cargo feature, application-owned provider/exporter and W3C
+//! propagator configuration. Native Server and Cloud adoption require separate
+//! qualification, as described in the
+//! [runtime support matrix](https://durable-workflow.com/docs/monitoring/#service-mode-tracing).
 
 pub mod carrier;
 
