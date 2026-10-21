@@ -174,7 +174,7 @@ lost authority or Worker shutdown without executing workflow code. Pending
 cooperative cancellation retains its original identity and cleanup deadline.
 
 External activity inputs retain their original lease and execution deadline
-bounds while loading. Protocol 1.20 observes the exact activity attempt before,
+bounds while loading. Without the optional lease-renewal capability, protocol 1.20 observes the exact activity attempt before,
 during and after the transfer, and immediately before callback entry. Unconfirmed
 authority stops loading without invoking the callback. These observations do not
 renew the lease or record application heartbeats. Explicit protocol 1.19 uses
@@ -188,8 +188,23 @@ original task ID, attempt ID, lease owner and a positive request window of at
 most five seconds. Discovery and renewal share that window and use worker
 credentials. This request records no application progress. Validate the full
 original identity, granted lease and business deadlines before using its reply
-to extend local authority. This client method does not yet schedule automatic
-activity-worker renewal.
+to extend local authority. Direct Client users manage their own renewal lifecycle.
+
+When registration, cluster discovery or the actual poll advertises that boolean
+capability, `Worker` confirms and automatically maintains the original activity
+claim throughout input loading, the yielding callback and terminal publication.
+Missing or changed task, attempt, holder or run identity prevents callback entry.
+Lost authority, exhausted original timeouts or managed shutdown drop the callback
+future and fence retained callback Clients against late completion, failure,
+heartbeat or result upload. Retryable renewal errors grant no additional time.
+Older runtimes keep their existing path.
+
+Runtime lease pings do not record application progress or satisfy a configured
+heartbeat timeout. Continue calling `ctx.heartbeat(...)` for real progress; only
+acknowledged same-attempt progress advances that recorded interval. Session-bound
+activities also require an acknowledged same-holder session grant and retain
+their original absolute TTL. Automatic maintenance requires callbacks to yield
+to Tokio; it cannot stop detached threads or reverse external side effects.
 
 Completion still uses the runtime's attempt fence. Server 2.6.1 refuses
 superseded attempts but can accept an expired, unreclaimed attempt; see

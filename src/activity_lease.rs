@@ -2,6 +2,8 @@
 
 use super::*;
 
+pub(crate) mod authority;
+
 const MAX_REQUEST_WINDOW: Duration = Duration::from_secs(5);
 
 fn unavailable(message: &str) -> Error {
@@ -9,6 +11,22 @@ fn unavailable(message: &str) -> Error {
 }
 
 impl Client {
+    pub(crate) fn observe_activity_lease_capabilities(&self, capabilities: &Value) {
+        if capabilities["activity_lease_renewal"].as_bool() == Some(true) {
+            self.activity_lease_renewal_supported
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn with_activity_lease_authority(
+        &self,
+        authority: Option<Arc<authority::Authority>>,
+    ) -> Self {
+        let mut client = self.clone();
+        client.activity_lease_authority = authority;
+        client
+    }
+
     /// Renew one original activity claim without recording application progress.
     ///
     /// Actual worker-authenticated discovery must advertise the boolean
@@ -52,6 +70,9 @@ impl Client {
                     request_window,
                 )
                 .await?;
+            self.observe_activity_lease_capabilities(
+                &discovery["worker_protocol"]["server_capabilities"],
+            );
             if discovery["worker_protocol"]["server_capabilities"]["activity_lease_renewal"]
                 .as_bool()
                 != Some(true)

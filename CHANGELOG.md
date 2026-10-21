@@ -4,8 +4,12 @@
 
 - Add a bounded activity lease-renewal client request behind affirmative
   runtime discovery. It uses worker credentials and preserves original claim
-  identity without recording application progress. Automatic worker maintenance
-  and published long-activity acceptance remain separate work.
+  identity without recording application progress.
+- Automatically maintain activity claims when the runtime advertises the lease
+  renewal capability. Preserve original business and heartbeat deadlines, session
+  identity and TTL, callback shutdown and late-publication fences through payload
+  loading, callbacks and settlement. Application progress still requires genuine
+  heartbeats. Published long-activity and killed-worker acceptance remain pending.
 
 ## 4.1.0
 
