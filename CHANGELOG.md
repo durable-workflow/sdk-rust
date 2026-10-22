@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 4.2.2
+
+- Require patched TLS certificate verification and root bundles that reject
+  the compromised emSign intermediates. Apply the minimum versions to library
+  consumers as well as this repository's lockfile, preserving normal hostname
+  validation and configured private certificate authorities.
+
 ## 4.2.1
 
 - Start the runtime activity lease maintainer before callback entry. A temporary
