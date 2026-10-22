@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 4.2.1
+
+- Start the runtime activity lease maintainer before callback entry. A temporary
+  blocking callback no longer strands the maintainer in the polling task's
+  scheduler slot when a spare Tokio executor thread is available. Original
+  claim, timeout, shutdown and late-publication fences remain unchanged.
+- Clarify that async callbacks must still yield to Tokio. Blocking I/O and CPU
+  work need `spawn_blocking` and their own cancellation or process boundary;
+  dropping a future cannot stop a detached thread or reverse an external effect.
+
 ## 4.2.0
 
 - Let a select-member cancellation request complete within its original workflow
