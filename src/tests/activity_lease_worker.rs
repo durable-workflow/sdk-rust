@@ -99,6 +99,45 @@ fn missing_identity(path: &str, body: &str, number: usize) -> Option<(&'static s
     replies(path, body, number)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_activity_poll_maintains_a_cooperative_callback() {
+    let server = server(replies);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async {
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        Ok(json!(true))
+    });
+    tokio::spawn(async move { worker.poll_activity_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(server.request_count(RENEW) >= 2);
+    assert_eq!(server.request_count(COMPLETE), 1);
+    assert_eq!(server.request_count(FAIL), 0);
+    assert_eq!(server.request_count(HEARTBEAT), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_activity_poll_maintains_a_blocking_callback_with_a_spare_thread() {
+    let server = server(replies);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async {
+        std::thread::sleep(Duration::from_millis(850));
+        Ok(json!(true))
+    });
+    tokio::spawn(async move { worker.poll_activity_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        server.request_count(RENEW) >= 2,
+        "maintenance must run on the available executor thread during the callback"
+    );
+    assert_eq!(server.request_count(COMPLETE), 1);
+    assert_eq!(server.request_count(FAIL), 0);
+    assert_eq!(server.request_count(HEARTBEAT), 0);
+}
+
 #[tokio::test]
 async fn affirmative_capability_requires_original_identity_before_callback() {
     let server = server(missing_identity);
