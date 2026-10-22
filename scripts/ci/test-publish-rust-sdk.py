@@ -560,7 +560,16 @@ class PublishRustSdkContractTest(unittest.TestCase):
             workflow.index("Install hash-locked release tooling"),
             workflow.index("CARGO_REGISTRY_TOKEN"),
         )
-        self.assertEqual(1, workflow.count("secrets.CARGO_REGISTRY_TOKEN"))
+        self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", workflow)
+        self.assertIn("environment: crates-io", workflow)
+        self.assertEqual(1, workflow.count("id-token: write"))
+        self.assertIn(
+            "uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18",
+            workflow,
+        )
+        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}", workflow)
+        self.assertLess(workflow.index("id: crates-auth"), workflow.index("CARGO_REGISTRY_TOKEN"))
+        self.assertLess(workflow.index("Bootstrap patched pip trust"), workflow.index("Install hash-locked release tooling"))
         self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
         self.assertIn("working-directory: release-source", workflow)
         self.assertIn("run: ../release-tools/scripts/ci/publish-rust-sdk.sh", workflow)
