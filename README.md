@@ -203,8 +203,13 @@ Runtime lease pings do not record application progress or satisfy a configured
 heartbeat timeout. Continue calling `ctx.heartbeat(...)` for real progress; only
 acknowledged same-attempt progress advances that recorded interval. Session-bound
 activities also require an acknowledged same-holder session grant and retain
-their original absolute TTL. Automatic maintenance requires callbacks to yield
-to Tokio; it cannot stop detached threads or reverse external side effects.
+their original absolute TTL. The maintainer starts before callback entry, so
+a spare executor thread can keep it running if a callback temporarily blocks.
+Callbacks must still yield to Tokio: maintenance cannot progress if every
+executor thread is blocked. Use `tokio::task::spawn_blocking` for blocking I/O
+and CPU work, and give that work its own cancellation or process boundary.
+Dropping an async callback cannot stop detached threads or reverse external
+side effects.
 
 Completion still uses the runtime's attempt fence. Server 2.6.1 refuses
 superseded attempts but can accept an expired, unreclaimed attempt; see
