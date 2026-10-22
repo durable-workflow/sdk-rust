@@ -12,7 +12,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant as Clock;
 
 mod session;
@@ -582,16 +582,28 @@ impl Lease {
             return Err(authority.invalidate("initial lease confirmation unavailable"));
         }
         let maintained = Arc::clone(&authority);
+        let (started_tx, started_rx) = oneshot::channel();
         let maintenance = tokio::spawn(async move {
             let _exit = MaintenanceExit(Arc::clone(&maintained));
+            let _ = started_tx.send(());
             if let Err(error) = maintained.maintain().await {
                 maintained.invalidate(&error.to_string());
             }
         });
-        Ok(Some(Arc::new(Self {
+        let lease = Arc::new(Self {
             authority,
             maintenance,
-        })))
+        });
+        // Poll the maintainer before callback entry. A newly spawned task can
+        // remain in Tokio's non-stealable LIFO slot while its spawning task
+        // blocks, even when another executor thread is available.
+        started_rx.await.map_err(|_| {
+            lease
+                .authority
+                .invalidate("lease-maintenance task stopped before callback entry")
+        })?;
+        lease.authority.remaining()?;
+        Ok(Some(lease))
     }
 }
 
