@@ -17,8 +17,9 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 release_tooling_venv="$1"
 
-python3 -m venv "$release_tooling_venv"
-"$release_tooling_venv/bin/python" -m pip install --disable-pip-version-check \
+python3 -m venv --without-pip "$release_tooling_venv"
+# Keep dependency requests on the bootstrapped client, outside ensurepip's bundle.
+python3 -I -m pip --python "$release_tooling_venv/bin/python" install --disable-pip-version-check \
     --require-hashes --only-binary=:all: \
     --requirement "$script_dir/release-tooling-requirements.txt"
 printf '%s\n' "$release_tooling_venv/bin" >> "$GITHUB_PATH"

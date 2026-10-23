@@ -90,7 +90,9 @@ jobs:
           python-version: '3.12'
 
       - name: Bootstrap patched pip trust
-        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@ff93e15dd3d3aa0b5ba8991fe5101a9e1be49c10  # patched-pip
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
 
       - name: Install hash-locked release tooling
         run: ../release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
@@ -101,6 +103,11 @@ jobs:
       - name: Obtain a short-lived crates.io publication token
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
+        env:
+          NODE_OPTIONS: --use-openssl-ca
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_SYSTEM_CA: '0'
+          NODE_TLS_REJECT_UNAUTHORIZED: '1'
 
       - name: Publish and verify exact crate
         env:

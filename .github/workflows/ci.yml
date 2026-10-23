@@ -66,7 +66,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Bootstrap patched pip trust
-        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@ff93e15dd3d3aa0b5ba8991fe5101a9e1be49c10  # patched-pip
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
       - run: python -m pip install PyYAML==6.0.2
       - name: Require centrally approved immutable action commits
         run: >-
@@ -93,6 +93,10 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: '3.13'
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python
       - name: Install the locked observer SDK
         run: python -m pip install --target "$RUNNER_TEMP/nexus-observer" -r tests/nexus/requirements.txt -c tests/nexus/requirements.lock
       - name: Check delivery-before-claim observation
@@ -109,6 +113,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
@@ -137,6 +148,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
@@ -153,23 +171,39 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,composer,curl,git,cargo
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: 1.86.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
-        with:
-          python-version: "3.12"
       - name: Require the official Apache Avro encoder
         run: |
           python3 scripts/ci/verify-official-avro-encoder.py
           python3 scripts/ci/test-official-avro-encoder.py
-      - name: Verify Rust payloads with the official PHP and Python Avro bindings
+      - name: Install official Python Avro bindings with the verified pip client
         run: |
-          python3 -m venv "${RUNNER_TEMP}/official-avro-python"
-          "${RUNNER_TEMP}/official-avro-python/bin/pip" install --requirement scripts/ci/official-avro-consumers/requirements.txt
-          composer install --working-dir=scripts/ci/official-avro-consumers --no-interaction --no-progress --prefer-dist
-          OFFICIAL_AVRO_PYTHON="${RUNNER_TEMP}/official-avro-python/bin/python" scripts/ci/qualify-cross-language-avro-consumers.sh
+          python3 -m venv --without-pip "${RUNNER_TEMP}/official-avro-python"
+          python3 -I -m pip --python "${RUNNER_TEMP}/official-avro-python/bin/python" install --requirement scripts/ci/official-avro-consumers/requirements.txt
+      - name: Set up the fixed Composer client
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240  # v2
+        with:
+          php-version: '8.3'
+          tools: composer:2.10.3
+      - name: Verify actual Composer dependency trust
+        uses: durable-workflow/.github/.github/actions/verify-composer-trust@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          working-directory: scripts/ci/official-avro-consumers
+      - name: Install official PHP Avro bindings
+        working-directory: scripts/ci/official-avro-consumers
+        run: composer install --no-interaction --no-progress --prefer-dist
+      - name: Verify Rust payloads with the official PHP and Python Avro bindings
+        run: OFFICIAL_AVRO_PYTHON="${RUNNER_TEMP}/official-avro-python/bin/python" scripts/ci/qualify-cross-language-avro-consumers.sh
       - name: Enforce the Avro Value regression budget
         run: cargo run --locked --release --example avro_value_benchmark -- --enforce
 
@@ -181,6 +215,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
@@ -214,13 +255,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: 1.86.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
-        with:
-          python-version: "3.12"
       - name: Install release tooling
         run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
       - name: Build and verify the publishable crate
@@ -286,6 +331,13 @@ jobs:
           test "$(git -C .cooperative-native-source rev-parse HEAD)" = "$NATIVE_CANDIDATE_SHA"
           printf 'COMPOSE_FILE=docker-compose.cooperative.yml:docker-compose.native-cancellation.yml\n' >> "$GITHUB_ENV"
           printf 'DURABLE_WORKFLOW_NATIVE_SOURCE_QUALIFICATION=1\n' >> "$GITHUB_ENV"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
@@ -367,6 +419,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:

@@ -10,6 +10,7 @@ from pathlib import Path
 import ssl
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -541,7 +542,6 @@ class PublishRustSdkContractTest(unittest.TestCase):
 
     def test_release_workflow_only_publishes_planned_dispatches(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        installer = RELEASE_TOOLING_INSTALLER.read_text(encoding="utf-8")
         triggers = workflow.split("\njobs:\n", maxsplit=1)[0]
         self.assertIn("workflow_dispatch:", triggers)
         self.assertNotIn("push:", triggers)
@@ -550,12 +550,6 @@ class PublishRustSdkContractTest(unittest.TestCase):
             'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
             workflow,
         )
-        self.assertLess(
-            installer.index('python3 -m venv "$release_tooling_venv"'),
-            installer.index('"$release_tooling_venv/bin/python" -m pip install'),
-        )
-        self.assertIn("--require-hashes --only-binary=:all:", installer)
-        self.assertIn('>> "$GITHUB_PATH"', installer)
         self.assertLess(
             workflow.index("Install hash-locked release tooling"),
             workflow.index("CARGO_REGISTRY_TOKEN"),
@@ -575,6 +569,47 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertIn("run: ../release-tools/scripts/ci/publish-rust-sdk.sh", workflow)
         self.assertIn("path: release-source/rust-sdk-release-evidence.json", workflow)
         self.assertEqual(2, workflow.count("persist-credentials: false"))
+
+
+class ReleaseToolingInstallerTrustTest(unittest.TestCase):
+    def test_isolated_tools_use_the_bootstrapped_pip_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command_directory = root / "bin"
+            command_directory.mkdir()
+            calls_file = root / "calls.jsonl"
+            github_path = root / "github-path"
+            venv = root / "tools"
+            python = command_directory / "python3"
+            python.write_text(textwrap.dedent(f"""\
+                #!{sys.executable}
+                import json, os, pathlib, sys
+                arguments = sys.argv[1:]
+                with pathlib.Path(os.environ["INSTALLER_CALLS"]).open("a") as handle:
+                    handle.write(json.dumps(arguments) + "\\n")
+                if arguments[:2] == ["-m", "venv"]:
+                    binary_directory = pathlib.Path(arguments[-1]) / "bin"
+                    binary_directory.mkdir(parents=True)
+                    bundled = binary_directory / "python"
+                    bundled.write_text("#!/bin/sh\\necho unverified-venv-pip >&2\\nexit 42\\n")
+                    bundled.chmod(0o755)
+                elif arguments[:3] != ["-I", "-m", "pip"]:
+                    raise SystemExit("unexpected installer client")
+                """), encoding="utf-8")
+            python.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(RELEASE_TOOLING_INSTALLER), str(venv)],
+                env={**os.environ, "PATH": f"{command_directory}:{os.environ['PATH']}",
+                     "INSTALLER_CALLS": str(calls_file), "GITHUB_PATH": str(github_path)},
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            calls = [json.loads(line) for line in calls_file.read_text().splitlines()]
+            self.assertEqual(["-m", "venv", "--without-pip", str(venv)], calls[0])
+            self.assertEqual(["-I", "-m", "pip", "--python", str(venv / "bin/python")], calls[1][:5])
+            self.assertIn("--require-hashes", calls[1])
+            self.assertIn("--only-binary=:all:", calls[1])
+            self.assertEqual(str(venv / "bin") + "\n", github_path.read_text())
 
 
 class RegistryHttpsTest(unittest.TestCase):

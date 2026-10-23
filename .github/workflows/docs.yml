@@ -31,6 +31,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
+      - name: Set up Python for dependency trust
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
       - name: Build and check the documentation
