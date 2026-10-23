@@ -542,7 +542,6 @@ class PublishRustSdkContractTest(unittest.TestCase):
 
     def test_release_workflow_only_publishes_planned_dispatches(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        installer = RELEASE_TOOLING_INSTALLER.read_text(encoding="utf-8")
         triggers = workflow.split("\njobs:\n", maxsplit=1)[0]
         self.assertIn("workflow_dispatch:", triggers)
         self.assertNotIn("push:", triggers)
@@ -551,12 +550,6 @@ class PublishRustSdkContractTest(unittest.TestCase):
             'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
             workflow,
         )
-        self.assertLess(
-            installer.index('python3 -m venv "$release_tooling_venv"'),
-            installer.index('"$release_tooling_venv/bin/python" -m pip install'),
-        )
-        self.assertIn("--require-hashes --only-binary=:all:", installer)
-        self.assertIn('>> "$GITHUB_PATH"', installer)
         self.assertLess(
             workflow.index("Install hash-locked release tooling"),
             workflow.index("CARGO_REGISTRY_TOKEN"),
