@@ -522,6 +522,29 @@ Other errors retain the generic `RustActivityFailure` type for remote execution
 and `RustActivityError` for local execution. Use `ActivityError` when a retry
 policy must match the same application failure in both modes.
 
+### Failure report limits
+
+Outgoing failure reports bound UTF-8 messages to 64 KiB, stacks to 128 KiB and
+combined serialized details, diagnostics and optional metadata to 64 KiB. The
+complete encoded request is at most 1 MiB, including JSON escaping, markers,
+identity and every other field, or less when a lower transport limit is known.
+Oversized messages include a visible truncation marker. Existing
+`diagnostics.sdk_failure_truncation` records original byte sizes and omitted
+fields; local command messages carry their original size in the marker instead.
+Small reports keep their original content. Incoming history is never truncated.
+
+`Client::fail_activity_task_with_failure` and
+`Client::fail_workflow_task_with_failure` accept the published Server failure
+schema for low-level task consumers. Keep `details` as valid Avro envelopes or
+runtime references. Oversized details are omitted whole and marked, never cut as
+base64. Original type and retry flags are preserved. Claim identity is exact;
+`Error::FailureReporting` refuses a report whose required data cannot fit.
+This reporting failure does not decide the application's retry outcome.
+
+Local failures are bounded before returning to workflow code. The final request
+check never rewrites already observed local messages or unrelated business
+payloads; if those fixed inputs cannot fit, reporting refuses explicitly.
+
 ### Local activities
 
 Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.

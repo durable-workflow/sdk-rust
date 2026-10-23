@@ -83,6 +83,42 @@ struct Upload {
 }
 
 impl Client {
+    pub(super) async fn discover_failure_request_limit(
+        &self,
+        body: &Value,
+        path: &str,
+        protocol: RequestProtocol,
+    ) -> Result<usize> {
+        // Inline details already require this discovery for ordinary payload
+        // handling. Learn a lower request cap before its aggregate-size check.
+        let inline = payload_paths(body, path, protocol).iter().any(|pointer| {
+            body.pointer(pointer).is_some_and(|value| {
+                value.is_string() || (value["codec"] == DEFAULT_CODEC && value["blob"].is_string())
+            })
+        });
+        if inline {
+            self.runtime_upload_policy(protocol).await?;
+        }
+        self.known_failure_request_limit(protocol)
+    }
+
+    pub(super) fn known_failure_request_limit(&self, protocol: RequestProtocol) -> Result<usize> {
+        let role = usize::from(matches!(
+            protocol,
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+        ));
+        let cached = self
+            .runtime_upload_policy
+            .lock()
+            .map_err(|_| unsupported("discovery cache poisoned"))?;
+        Ok(cached[role]
+            .as_ref()
+            .map_or(crate::failure_reporting::REQUEST_BYTES, |(_, p)| {
+                p.request_bytes
+            })
+            .min(crate::failure_reporting::REQUEST_BYTES))
+    }
+
     pub(super) async fn externalize_runtime_payloads(
         &self,
         body: &mut Value,

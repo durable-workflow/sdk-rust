@@ -10,6 +10,7 @@ mod cancellation_scope;
 mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
+mod failure_reporting;
 mod local_activity;
 pub mod metrics;
 mod nexus;
@@ -43,6 +44,7 @@ pub use cancellation_scope_history::{
 };
 #[doc(hidden)]
 pub use cancellation_scope_replay::CancellationScopeRequested;
+pub use failure_reporting::FailureReportError;
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
@@ -272,6 +274,8 @@ pub enum Error {
     InvalidBaseUrl,
     #[error("invalid additional root certificates: {0}")]
     InvalidRootCertificates(String),
+    #[error(transparent)]
+    FailureReporting(#[from] FailureReportError),
     #[error(transparent)]
     Testing(#[from] testing::TestingError),
     #[error(transparent)]
@@ -4655,7 +4659,11 @@ impl Client {
         .await
     }
 
-    async fn fail_workflow_task_with_failure(
+    /// Report a workflow-task failure using the existing Server failure schema.
+    /// Message, stack and diagnostic data are bounded before transport. Details
+    /// must be valid Avro envelopes/references; oversized details may be omitted
+    /// with an explicit diagnostic rather than sliced as encoded bytes.
+    pub async fn fail_workflow_task_with_failure(
         &self,
         task_id: &str,
         lease_owner: &str,
@@ -4824,14 +4832,24 @@ impl Client {
         error: &ActivityError,
     ) -> Result<Value> {
         let error = error.validated();
+        self.fail_activity_task_with_failure(task_id,activity_attempt_id,lease_owner,json!({
+            "message":error.message,"type":error.exception_type,"non_retryable":error.non_retryable
+        })).await
+    }
+
+    /// Report a structured activity failure using existing Server fields such as
+    /// `message`, `type`, `stack_trace`, `non_retryable` and Avro `details`.
+    /// The final encoded report is bounded without changing claim identity or
+    /// retry flags. Invalid or unfit required data is a reporting error.
+    pub async fn fail_activity_task_with_failure(
+        &self,
+        task_id: &str,
+        activity_attempt_id: &str,
+        lease_owner: &str,
+        failure: Value,
+    ) -> Result<Value> {
         let body = json!({
-            "activity_attempt_id": activity_attempt_id,
-            "lease_owner": lease_owner,
-            "failure": {
-                "message": error.message,
-                "type": error.exception_type,
-                "non_retryable": error.non_retryable
-            }
+            "activity_attempt_id":activity_attempt_id,"lease_owner":lease_owner,"failure":failure
         });
         let path = format!("/worker/activity-tasks/{task_id}/fail");
         activity_task_response(
@@ -5019,6 +5037,13 @@ impl Client {
 
         if let Some(body) = body {
             let mut body = serde_json::to_value(body)?;
+            let mut report = failure_reporting::Prepared::new(&mut body, path, failure_reporting::REQUEST_BYTES)?;
+            if let Some(report) = report.as_mut() {
+                let limit = self
+                    .discover_failure_request_limit(&body, path, protocol)
+                    .await?;
+                report.encode(&mut body, limit)?;
+            }
             if matches!(
                 method,
                 reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
@@ -5028,7 +5053,12 @@ impl Client {
                     .await?;
                 self.check_activity_lease_request(path, Some(&body))?;
             }
-            request = request.json(&body);
+            if let Some(mut report) = report {
+                let limit = self.known_failure_request_limit(protocol)?;
+                request = request.body(report.encode(&mut body, limit)?);
+            } else {
+                request = request.json(&body);
+            }
         }
 
         let request = request.build()?;
@@ -8890,7 +8920,9 @@ impl Worker {
                     }
                 }
             }
-            Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
+            Err(
+                error @ (Error::CancellationScopeExecutionUnavailable | Error::FailureReporting(_)),
+            ) => return Err(error),
             Err(error) => {
                 self.discard_sticky_snapshot(snapshot.as_ref())?;
                 if matches!(
