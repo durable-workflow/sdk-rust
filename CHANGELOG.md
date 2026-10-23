@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 4.9.0
+
+- Expose optional immutable activity execution, workflow instance and run IDs
+  from the original claim, including worker-session activities. Preserve absence
+  on older claims without deriving stable identity from task or attempt IDs.
+  Inline local callbacks expose their received parent workflow/run IDs and no
+  Server activity ID; Server-free tests report no Server identities.
+
 ## 4.8.0
 
 - Expose immutable `ActivityContext::retry_info()` with the original attempt

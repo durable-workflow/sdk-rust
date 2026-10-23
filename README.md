@@ -445,6 +445,29 @@ compares the complete stored list and the other known policy fields exactly;
 changing an unused entry is also a policy change. The default remains one
 attempt with an empty backoff list.
 
+Activity handlers can use `ctx.activity_execution_id()` as the logical Server
+activity key, stable across retries, and read its `workflow_id()` and `run_id()`.
+These immutable optional accessors preserve the original claim. An older Server
+can omit an ID; use an application business key in that case. Task IDs and attempt
+IDs identify individual attempts and are not substitutes for a logical key.
+
+```rust
+# use durable_workflow::{json, Client, Worker};
+# let mut worker = Worker::new(Client::builder("http://localhost:8080").build()?, "orders");
+worker.register_activity("charge", |ctx, _| async move {
+    let key = ctx.activity_execution_id();
+    // Pass the available key (or an explicit business key) to your payment API.
+    Ok(json!({"activity_key": key, "workflow": ctx.workflow_id(), "run": ctx.run_id()}))
+});
+# Ok::<(), durable_workflow::Error>(())
+```
+
+Worker-session activities expose the same received IDs. Inline local activities
+expose their parent workflow/run IDs when present, but have no Server activity
+execution ID before their command is recorded. Server-free activity/workflow
+tests report no Server IDs. Use application business keys for those paths rather
+than inferring a key from a task or attempt ID.
+
 In a service activity, `ctx.retry_info()` exposes the original attempt number
 and immutable Server retry snapshot. Use the configured budget for a final-attempt
 fallback:
