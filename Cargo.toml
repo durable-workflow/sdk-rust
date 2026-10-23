@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "4.3.1"
+version = "4.4.0"
 edition = "2021"
 description = "Rust client and worker SDK for Durable Workflow Cloud and self-hosted Server"
 license = "MIT"
@@ -14,7 +14,7 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json"]
 
 [package.metadata.durable-workflow]
-product-train = "4.3.1"
+product-train = "4.4.0"
 compatibility-authority = "protocol-manifests"
 supported-server-versions = "2.0.0"
 qualified-server-version = "2.8.0"
@@ -142,5 +142,7 @@ uuid = { version = "=1.26.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "logs", "testing", "internal-logs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_bytes = "0.11"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
