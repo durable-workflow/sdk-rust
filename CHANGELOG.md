@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.8.0
+
 - Expose immutable `ActivityContext::retry_info()` with the original attempt
   number and received retry policy, including unknown fields. Distinguish bounded,
   explicit unlimited and unknown attempt budgets and check the final configured

@@ -70,7 +70,7 @@ impl Server {
                     serde_json::from_slice(&bytes[header_end..header_end + length])
                         .unwrap_or(Value::Null);
                 let body = if path.ends_with("/register") {
-                    json!({"registered":true,"worker_id":"retry-worker"})
+                    json!({"registered":true,"worker_id":"retry-worker", "namespace":"default", "task_queue":"retry-queue", "protocol_version":"1.20", "server_capabilities":{"cooperative_cancellation":true}, "capabilities":request["capabilities"]})
                 } else if path.ends_with("/workflow-tasks/poll") {
                     json!({"task":null})
                 } else if path.ends_with("/activity-tasks/poll") {
@@ -119,6 +119,8 @@ async fn check_worker(cooperative: bool) {
         (1, Some(json!({"max_attempts":-1}))),
         (1, Some(json!([{"max_attempts":3}]))),
         (u64::MAX, Some(json!({"max_attempts":u64::MAX}))),
+        (0, Some(json!({"max_attempts":3}))),
+        (4, Some(json!({"max_attempts":3}))),
     ];
     let server = Server::start(&cases).await;
     let client = Client::builder(&server.url)
@@ -173,12 +175,14 @@ async fn check_worker(cooperative: bool) {
         ActivityAttemptLimit::Bounded(u64::MAX)
     );
     assert_eq!(infos[11].is_last_configured_attempt(), Some(true));
+    assert_eq!(infos[12].is_last_configured_attempt(), None);
+    assert_eq!(infos[13].is_last_configured_attempt(), Some(true));
     let settlements = server.settlements.lock().unwrap();
     assert_eq!(settlements.len(), cases.len());
     for (i, receipt) in settlements.iter().enumerate() {
         assert_eq!(receipt["activity_attempt_id"], format!("attempt-{i}"));
-        assert_eq!(receipt["exception_type"], "Permanent");
-        assert_eq!(receipt["non_retryable"], true);
+        assert_eq!(receipt["failure"]["type"], "Permanent");
+        assert_eq!(receipt["failure"]["non_retryable"], true);
     }
 }
 #[tokio::test]
