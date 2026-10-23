@@ -335,36 +335,11 @@ impl Failure {
         })
     }
 
-    fn render(&self, budget: Budget) -> Result<(Value, Option<Value>)> {
-        let message = self
-            .fallback
-            .as_ref()
-            .map(|(_, message)| message.as_str())
-            .unwrap_or_else(|| {
-                self.original["message"]
-                    .as_str()
-                    .expect("validated failure message")
-            });
-        let stack = self.original.get("stack_trace").and_then(Value::as_str);
-        let mut truncated = message.len() > budget.message
-            || stack.is_some_and(|s| budget.stack == 0 || s.len() > budget.stack)
-            || self.metadata_bytes > budget.metadata;
-        // Preserve byte ordering too when serde_json's preserve_order feature is
-        // enabled by a downstream application.
-        if !truncated {
-            return Ok((
-                Value::Object(self.original.clone()),
-                self.fallback.as_ref().map(|_| json!(message)),
-            ));
-        }
+    fn bounded_fields(&self, budget: Budget) -> Result<(Map<String, Value>, Omitted)> {
         let mut omitted = Omitted::new(budget.names);
         let mut output = Map::new();
         let mut used = 2_usize;
-        // Reserve space for diagnostics only when a limit already requires a marker.
-        let metadata_limit =
-            budget
-                .metadata
-                .saturating_sub(if truncated { MARKER_RESERVE } else { 0 });
+        let metadata_limit = budget.metadata.saturating_sub(MARKER_RESERVE);
         for (index, (key, value)) in self.original.iter().enumerate() {
             if key == "stack_trace" || (key == "message" && self.fallback.is_none()) {
                 continue;
@@ -378,10 +353,35 @@ impl Failure {
                 used += size;
                 output.insert(key.clone(), value.clone());
             } else {
-                truncated = true;
                 omitted.add(key)?;
             }
         }
+        Ok((output, omitted))
+    }
+
+    fn render(&self, budget: Budget) -> Result<(Value, Option<Value>)> {
+        let message = self
+            .fallback
+            .as_ref()
+            .map(|(_, message)| message.as_str())
+            .unwrap_or_else(|| {
+                self.original["message"]
+                    .as_str()
+                    .expect("validated failure message")
+            });
+        let stack = self.original.get("stack_trace").and_then(Value::as_str);
+        let truncated = message.len() > budget.message
+            || stack.is_some_and(|s| budget.stack == 0 || s.len() > budget.stack)
+            || self.metadata_bytes > budget.metadata;
+        // Preserve byte ordering too when serde_json's preserve_order feature is
+        // enabled by a downstream application.
+        if !truncated {
+            return Ok((
+                Value::Object(self.original.clone()),
+                self.fallback.as_ref().map(|_| json!(message)),
+            ));
+        }
+        let (mut output, mut omitted) = self.bounded_fields(budget)?;
         if let Some(stack) = stack {
             let marker = format!(
                 "\n[truncated: original stack_trace {} UTF-8 bytes]",
@@ -480,6 +480,62 @@ struct MessageMirror {
     original_bytes: usize,
 }
 
+#[derive(Default)]
+struct ReportPositions {
+    pointers: Vec<(String, Option<String>)>,
+    texts: Vec<(String, LocalText)>,
+    mirrors: Vec<MessageMirror>,
+    guarded: bool,
+}
+impl ReportPositions {
+    fn complete(&mut self, body: &Value) {
+        for (index, command) in body["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if command["type"] == "fail_workflow" || command["type"] == "fail_update" {
+                self.guarded = true;
+                if command["exception"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !committed_message(message).is_empty())
+                {
+                    self.pointers
+                        .push((format!("/commands/{index}/exception"), None));
+                    if command.get("message").is_some() {
+                        self.mirrors.push(MessageMirror {
+                            target: format!("/commands/{index}/message"),
+                            source: format!("/commands/{index}/exception/message"),
+                            original_bytes: command["message"].as_str().map_or(0, str::len),
+                        });
+                    }
+                } else if let Some(message) = command["message"].as_str() {
+                    if command["exception"].is_object() {
+                        self.pointers.push((
+                            format!("/commands/{index}/exception"),
+                            Some(format!("/commands/{index}/message")),
+                        ));
+                    } else {
+                        self.texts.push((
+                            format!("/commands/{index}/message"),
+                            LocalText::new(message),
+                        ));
+                    }
+                }
+            }
+            if command["type"] == "record_local_activity" {
+                self.guarded |= command.get("message").is_some()
+                    || command["attempts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|v| v.get("message").is_some());
+            }
+        }
+    }
+}
+
 pub(super) struct Prepared {
     failures: Vec<Failure>,
     texts: Vec<(String, LocalText)>,
@@ -488,67 +544,28 @@ pub(super) struct Prepared {
 impl Prepared {
     pub(super) fn new(body: &mut Value, path: &str, limit: usize) -> Result<Option<Self>> {
         let parts: Vec<_> = path.trim_matches('/').split('/').collect();
-        let mut pointers = Vec::new();
-        let mut texts = Vec::new();
-        let mut mirrors = Vec::new();
-        let mut local_reports = false;
+        let mut positions = ReportPositions::default();
         match parts.as_slice() {
             ["worker", "activity-tasks" | "workflow-tasks" | "query-tasks", _, "fail"] => {
-                local_reports = true;
+                positions.guarded = true;
                 // Preserve Server validation and ordinary payload handling for
                 // malformed raw requests; their final body is still guarded.
                 if body["failure"]["message"].is_string() {
-                    pointers.push(("/failure".into(), None));
+                    positions.pointers.push(("/failure".into(), None));
                 }
             }
             ["worker", "workflow-tasks", _, "complete"] => {
-                for (index, command) in body["commands"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .enumerate()
-                {
-                    if command["type"] == "fail_workflow" || command["type"] == "fail_update" {
-                        local_reports = true;
-                        if command["exception"]["message"]
-                            .as_str()
-                            .is_some_and(|message| !committed_message(message).is_empty())
-                        {
-                            pointers.push((format!("/commands/{index}/exception"), None));
-                            if command.get("message").is_some() {
-                                mirrors.push(MessageMirror {
-                                    target: format!("/commands/{index}/message"),
-                                    source: format!("/commands/{index}/exception/message"),
-                                    original_bytes: command["message"].as_str().map_or(0, str::len),
-                                });
-                            }
-                        } else if let Some(message) = command["message"].as_str() {
-                            if command["exception"].is_object() {
-                                pointers.push((
-                                    format!("/commands/{index}/exception"),
-                                    Some(format!("/commands/{index}/message")),
-                                ));
-                            } else {
-                                texts.push((
-                                    format!("/commands/{index}/message"),
-                                    LocalText::new(message),
-                                ));
-                            }
-                        }
-                    }
-                    if command["type"] == "record_local_activity" {
-                        local_reports |= command.get("message").is_some()
-                            || command["attempts"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .any(|v| v.get("message").is_some());
-                    }
-                }
+                positions.complete(body);
             }
             _ => return Ok(None),
         }
-        if pointers.is_empty() && texts.is_empty() && !local_reports {
+        let ReportPositions {
+            pointers,
+            texts,
+            mirrors,
+            guarded,
+        } = positions;
+        if pointers.is_empty() && texts.is_empty() && !guarded {
             return Ok(None);
         }
         if path.len() > limit {
