@@ -505,6 +505,35 @@ fn health_check(enabled: bool) -> bool {
 
         self.assertTrue(self._guard_matches())
 
+    def test_new_history_read_api_exports_are_not_replay_changes(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(source.read_text() + "\npub use pagination::{\n    WorkflowHistoryPage, WorkflowHistoryOptions,\n};\n")
+        self.assertFalse(self._guard_matches(REPLAY_GUARD))
+
+    def test_new_history_exports_do_not_hide_a_replay_change(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(source.read_text().replace("history.len() < 10", "history.len() < 9") + "\npub use pagination::WorkflowHistoryPage;\n")
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_existing_history_binding_cannot_be_exempted_as_a_new_export(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(source.read_text() + "\npub use old_history::WorkflowHistoryPage;\n")
+        self._git("add", "src/lib.rs")
+        self._git("-c", "user.name=Corpus Guard Test", "-c", "user.email=corpus-guard@example.invalid", "commit", "--quiet", "-m", "existing history binding")
+        source.write_text(source.read_text().replace("old_history::", "new_history::"))
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_fresh_export_exemption_requires_verified_base_source(self) -> None:
+        diff = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1,2 @@\n+pub use pagination::WorkflowHistoryPage;\n"
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, "", VALIDATOR.CorpusError("cannot inspect base source")]):
+            with self.assertRaisesRegex(VALIDATOR.CorpusError, "cannot inspect base source"):
+                self._guard_matches(REPLAY_GUARD)
+
+    def test_non_ascii_reexport_is_not_in_the_narrow_exemption(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(source.read_text() + "\npub use pagination::WorkflowHistoryPageé;\n")
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
     def test_previous_codec_hunk_label_does_not_classify_client_changes(self) -> None:
         diff = """\
 diff --git a/src/lib.rs b/src/lib.rs

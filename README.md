@@ -356,6 +356,83 @@ Keep workflow command order deterministic:
 See the runnable [`workflow_testing`](examples/workflow_testing.rs) example and
 [`workflow_testing` tests](tests/workflow_testing.rs).
 
+## Workflow lists and complete run history
+
+`Client::list_workflows(WorkflowListOptions)` and
+`Client::get_workflow_history(workflow_id, run_id, WorkflowHistoryOptions)`
+each return **one page**. Inspect `next_page_token` to resume manually, or use
+the lazy iterators for complete reads. These methods wrap the published Server
+APIs and preserve their filters, validation and namespace scope; they add no
+Server query fields or grammar.
+
+For example, find an open run by a registered keyword search attribute:
+
+```rust,no_run
+use durable_workflow::WorkflowListOptions;
+# async fn find(client: durable_workflow::Client) -> durable_workflow::Result<()> {
+let mut matches = client.iter_workflows(
+    WorkflowListOptions::new()
+        .workflow_type("payments")
+        .status("running")
+        .query("OrderRef = 'order-42'")
+        .page_size(2),
+);
+match (matches.next().await?, matches.next().await?) {
+    (Some(run), None) => println!("open run: {} / {}", run.workflow_id, run.run_id),
+    (None, _) => println!("no open run"),
+    _ => println!("multiple open runs; refine the query"),
+}
+# Ok(())
+# }
+```
+
+The Server's `status=running` filter selects the active **status bucket**,
+including runs whose raw status is `pending` or `waiting`. `WorkflowSummary`
+preserves `status`, `status_bucket`, `is_terminal`, search attributes and unknown
+metadata in `raw`. Search attributes do not impose a uniqueness constraint.
+Create the client with the intended namespace before constructing the iterator;
+the same namespace and filters are retained across every opaque token.
+
+Read an entire selected run without loading every page at once:
+
+```rust,no_run
+use durable_workflow::WorkflowHistoryOptions;
+# async fn audit(client: durable_workflow::Client) -> durable_workflow::Result<()> {
+let mut events = client.iter_workflow_history(
+    "payment-42", "selected-run-id", WorkflowHistoryOptions::new().page_size(100),
+);
+while let Some(event) = events.next().await? {
+    println!("{}", event.event_type);
+}
+# Ok(())
+# }
+```
+
+Similarly, `iter_workflows(options)` yields each `WorkflowSummary` through
+`next().await`. Both iterators also provide `into_stream()` for standard
+`futures_util::TryStreamExt` consumers; pin the returned stream before polling.
+Constructing an iterator performs no I/O. It fetches only when
+the current page is exhausted, holds one page, and ends on a null or empty
+continuation token. Empty pages with a continuation are followed. Repeated or
+cyclic tokens produce `Error::Pagination` using bounded token state. A page
+failure is returned with its original typed error; that iterator then ends.
+Handle the error rather than treating a partial read as a complete result.
+
+Iterating history keeps the original workflow/run identity and does not follow
+continue-as-new into another run. It enumerates available history rather than
+subscribing indefinitely. History payloads retain their wire envelopes and
+lossless event metadata. For offline replay, use the existing
+`Client::export_workflow_history` and `testing::WorkflowHistory::from_export`
+instead of passing a partial page to the replay API.
+
+Published Server 2.11 defaults to 50 list rows (maximum 200) and 100 history
+events (maximum 1,000) per page. Page sizes are sent unchanged for Server
+validation. Stop the iterator when you have enough results, choose an appropriate
+page size, and bound work with your application's timeout. List pagination
+inherits the Server's ordering/consistency contract; it does not add snapshot
+isolation while runs change concurrently. See the read-only
+[`workflow_pagination` example](examples/workflow_pagination.rs).
+
 ## Examples
 
 ### Activity retry policies
