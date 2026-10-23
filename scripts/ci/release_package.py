@@ -21,6 +21,8 @@ from markdown_it.token import Token
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 MARKDOWN = MarkdownIt("commonmark")
 SCHEMA = "durable-workflow.rust-release-package/v1"
+SOURCE_MANIFEST = "Cargo.toml"
+SOURCE_CHANGELOG = "CHANGELOG.md"
 
 
 class ReleasePackageError(RuntimeError):
@@ -217,8 +219,8 @@ def render_release_notes(changelog: bytes, version: str) -> str:
 
 def source_release_notes(version: str) -> str:
     root = Path.cwd()
-    manifest = root / "Cargo.toml"
-    changelog = root / "CHANGELOG.md"
+    manifest = root / SOURCE_MANIFEST
+    changelog = root / SOURCE_CHANGELOG
     for path in (manifest, changelog):
         if path.is_symlink():
             raise ReleasePackageError(f"release notes require regular checkout files: {path.name}")
@@ -367,10 +369,21 @@ def restore_missing_lockfile(
     return identity
 
 
+def _validate_notes_arguments(
+    arguments: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> None:
+    if any((arguments.archive, arguments.expected_vcs_commit,
+            arguments.expected_archive_sha256, arguments.restore_missing_lockfile)):
+        parser.error("--release-notes cannot be combined with archive verification")
+    if (arguments.manifest != Path(SOURCE_MANIFEST)
+            or arguments.changelog != Path(SOURCE_CHANGELOG)):
+        parser.error("--release-notes uses the current checkout files; path overrides are refused")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, default=Path("Cargo.toml"))
-    parser.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
+    parser.add_argument("--manifest", type=Path, default=Path(SOURCE_MANIFEST))
+    parser.add_argument("--changelog", type=Path, default=Path(SOURCE_CHANGELOG))
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--expected-vcs-commit")
     parser.add_argument("--expected-archive-sha256")
@@ -385,12 +398,7 @@ def main() -> int:
 
     try:
         if arguments.release_notes is not None:
-            if any((arguments.archive, arguments.expected_vcs_commit,
-                    arguments.expected_archive_sha256, arguments.restore_missing_lockfile)):
-                parser.error("--release-notes cannot be combined with archive verification")
-            if (arguments.manifest != Path("Cargo.toml")
-                    or arguments.changelog != Path("CHANGELOG.md")):
-                parser.error("--release-notes uses the current checkout files; path overrides are refused")
+            _validate_notes_arguments(arguments, parser)
             sys.stdout.write(source_release_notes(arguments.release_notes))
             return 0
         elif arguments.restore_missing_lockfile:
