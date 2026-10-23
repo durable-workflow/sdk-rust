@@ -264,6 +264,98 @@ share that budget across all pages. Lease renewals do not restart it. Low-level
 cooperative polls retain their long-poll timeout plus five seconds, and explicit
 canonical cancellation refreshes retain their five-second budget.
 
+## Testing without a Server
+
+`testing::WorkflowEnvironment` runs registered workflows and activities in the
+current process. Use `from_worker(worker)` to reuse your application's complete
+registration set, or register test callbacks directly. `worker_mut()` exposes
+the existing typed and replayed-state registration APIs.
+
+```rust
+use durable_workflow::{json, testing::WorkflowEnvironment};
+# async fn test() -> durable_workflow::Result<()> {
+let mut env = WorkflowEnvironment::new()?;
+env.register_activity("greet", |_, args| async move {
+    Ok(json!(format!("Hello, {}!", args[0].as_str().unwrap())))
+});
+env.register_workflow("hello", |ctx, args| async move {
+    ctx.activity("greet", args).await
+});
+assert_eq!(env.run_activity("greet", "Ada").await?, json!("Hello, Ada!"));
+env.mock_activity("greet", |_, _| async { Ok(json!("mock greeting")) });
+assert_eq!(env.run_workflow("hello", "Ada").await?, json!("mock greeting"));
+# Ok(())
+# }
+```
+
+Workflow execution uses the worker's cold-replay engine, codec and activity
+adapters. Real or mocked remote/local activity failures become the same typed
+`Error::ActivityFailed` inside workflow code, including exception type, attempt
+number and non-retryable marker. Retry policies apply before workflow code
+receives a terminal failure. Timer and retry delays are skipped; activity
+callbacks still execute normally and must yield. An uncaught workflow error is
+returned with its original Rust error variant. Direct `run_activity` executes
+one attempt. Heartbeats are captured locally and closed when the attempt ends.
+The `*_avro_value` methods preserve fixed-Avro bytes, integers and other values
+that have no lossless JSON representation.
+
+The executor handles activities, local activities, timers, side effects,
+version markers, memo/search-attribute upserts and ordered parallel commands.
+Parallel callbacks run in command order. Activity timeout simulation, new select
+races, signals, child workflows, services, sessions, continue-as-new and cancellation require
+integration tests; unsupported commands return `Error::Testing` explicitly.
+This environment does not simulate queues, leases or deployment behavior.
+`max_steps(n)` bounds durable turns, commands and attempts (default 10,000);
+use `tokio::time::timeout` to bound asynchronous callbacks as well.
+
+### Replay before deploying changed workflow code
+
+Load a self-contained JSON bundle from `dw workflow:history-export` or
+`Client::export_workflow_history(workflow_id, run_id).await?`, register the
+candidate workflow code, then replay without a Server:
+
+```rust,no_run
+use durable_workflow::testing::{WorkflowEnvironment, WorkflowHistory};
+# fn replay(env: WorkflowEnvironment) -> std::result::Result<(), Box<dyn std::error::Error>> {
+let export = serde_json::from_slice(&std::fs::read("workflow-history.json")?)?;
+let history = WorkflowHistory::from_export(export)?;
+let report = env.replay(&history)?;
+assert!(report.completed); // A running snapshot can remain durably pending.
+# Ok(())
+# }
+```
+
+For the raw history API, combine **all** pages and call
+`WorkflowHistory::from_history("hello", original_input, response)?`.
+Set `.task_queue("original-queue")` if that context is absent. Exports must
+include original input and required recorded results. Redacted/pruned payloads,
+unresolved external references and remaining page tokens are refused. The SDK
+export helper resolves payload references while downloading; replay itself
+never contacts a Server. `env.last_history()` captures a new in-process run and
+can be exported for regression tests, including after an execution error.
+
+Replay uses the worker's decoding, side-effect, version-marker and persisted
+select-resolution paths. Activity callbacks do not run. Reordered or changed
+commands return `Error::NonDeterministicReplay(ReplayFailure)` with `sequence`,
+`expected` and `actual`. New commands beyond the snapshot also fail; use a
+fresh in-process run to test new logic. A report contains the reconstructed
+terminal commands or an empty decision for a recorded pending operation.
+
+Keep workflow command order deterministic:
+
+| Pattern | Durable replacement |
+| --- | --- |
+| Iterating a `HashMap` while scheduling | Sort keys first or use a `BTreeMap` |
+| Reading the system clock, randomness or a UUID | `ctx.side_effect(...)` for a recorded snapshot, or an activity |
+| `tokio::time::sleep`, `std::thread::sleep` | `ctx.sleep(...)` / `ctx.start_timer(...)` |
+| `tokio::select!`, racing ordinary futures | `ctx.select(...)` / `ctx.select_keyed(...)` |
+| Untracked concurrent durable calls | SDK `ctx.parallel(...)` with stable input ordering |
+| Network, filesystem or other external I/O | A registered activity |
+| Changing existing command order on deployment | A stable `ctx.get_version(...)` branch, checked against recorded history |
+
+See the runnable [`workflow_testing`](examples/workflow_testing.rs) example and
+[`workflow_testing` tests](tests/workflow_testing.rs).
+
 ## Examples
 
 ### Activity retry policies
