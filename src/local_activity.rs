@@ -654,27 +654,13 @@ impl Worker {
 }
 
 fn local_error(error: Error) -> (String, String, bool, Option<&'static str>) {
-    let (kind, non_retryable) = match &error {
-        Error::ActivityFailed(failure) => (
-            failure
-                .exception_type
-                .clone()
-                .unwrap_or_else(|| "RustActivityError".into()),
-            failure.non_retryable,
-        ),
-        Error::ActivityNotRegistered(_) => ("ActivityNotRegistered".into(), true),
-        Error::Codec(_) | Error::HandlerType { .. } => ("ActivityCodecError".into(), true),
-        _ => ("RustActivityError".into(), false),
-    };
-    if kind.len() > 255 {
-        return (
-            "local activity exception type exceeded 255 bytes".into(),
-            "LocalActivityFailureMetadataError".into(),
-            true,
-            None,
-        );
-    }
-    (error.to_string(), kind, non_retryable, None)
+    let failure = crate::ActivityError::from_error(&error, "RustActivityError");
+    (
+        failure.message,
+        failure.exception_type,
+        failure.non_retryable,
+        None,
+    )
 }
 
 fn heartbeat_extended(reports: &Arc<Mutex<Heartbeats>>, timeout: Option<u64>) -> Result<bool> {

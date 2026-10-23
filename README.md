@@ -234,6 +234,33 @@ compares the complete stored list and the other known policy fields exactly;
 changing an unused entry is also a policy change. The default remains one
 attempt with an empty backoff list.
 
+Activity handlers can return an application-defined failure type with
+`ActivityError`. The same type, message and retry marker are reported for remote
+and local activities, including cooperative workers:
+
+```rust
+use durable_workflow::{ActivityError, Worker};
+# fn register(worker: &mut Worker) {
+worker.register_activity("charge", |_, _| async {
+    Err(ActivityError::new("PaymentDeclined", "card declined")
+        .non_retryable(true)
+        .into())
+});
+# }
+```
+
+`ActivityError::new(...)` is retryable by default. An activity's
+`ActivityRetryPolicy::non_retryable_error_types(["PaymentDeclined"])` also stops
+retries when the returned type matches exactly. Setting `.non_retryable(true)`
+stops retries regardless of that list. Workflow code receives the terminal
+`Error::ActivityFailed` with its `exception_type`, `non_retryable` and attempt
+number. Application types must contain 1 to 255 bytes and cannot be blank;
+invalid types produce a non-retryable `ActivityFailureMetadataError`.
+
+Other errors retain the generic `RustActivityFailure` type for remote execution
+and `RustActivityError` for local execution. Use `ActivityError` when a retry
+policy must match the same application failure in both modes.
+
 ### Local activities
 
 Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.

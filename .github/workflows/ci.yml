@@ -447,6 +447,7 @@ jobs:
           printf '[package]\nname = "local-activity-consumer"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\ndurable-workflow = "=%s"\nreqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }\nserde_json = "1"\ntokio = { version = "1", features = ["full"] }\n' "$LOCAL_SDK_VERSION" > .local-consumer/Cargo.toml
           printf 'fn main() {}\n' > .local-consumer/src/main.rs
           cp tests/local_activity_server.rs .local-consumer/tests/
+          cp tests/activity_failure_server.rs .local-consumer/tests/
           cp tests/worker_session_server.rs .local-consumer/tests/
           cp tests/sticky_server.rs .local-consumer/tests/
           mkdir -p .local-consumer/examples
@@ -459,7 +460,7 @@ jobs:
           set -euo pipefail
           arguments=()
           if [ -n "$LOCAL_SDK_VERSION" ]; then arguments+=(--manifest-path .local-consumer/Cargo.toml); fi
-          cargo test "${arguments[@]}" --test local_activity_server -- --ignored --nocapture --test-threads=1 2>&1 | tee local-results.log
+          cargo test "${arguments[@]}" --test local_activity_server --test activity_failure_server -- --ignored --nocapture --test-threads=1 2>&1 | tee local-results.log
           jq --null-input --arg sdk "$GITHUB_SHA" --arg version "$LOCAL_SDK_VERSION" \
             '{runner_commit:$sdk,sdk_commit:(if $version == "" then $sdk else null end),published_sdk_version:($version | if length > 0 then . else null end)}' > local-qualification.json
           if [ -n "$LOCAL_SDK_VERSION" ]; then

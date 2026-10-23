@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 4.3.0
+
+- Add `ActivityError` for application-defined activity failure types and explicit
+  non-retryable outcomes. Ordinary, cooperative and local activity workers
+  preserve these fields so activity retry policies can match the authored type.
+  Low-level callers can use `Client::fail_activity_task_with_error`.
+
 ## 4.2.2
 
 - Require patched TLS certificate verification and root bundles that reject

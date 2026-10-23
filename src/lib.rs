@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod activity_error;
 mod activity_hydration;
 mod activity_lease;
 mod cancellation_context;
@@ -20,6 +21,7 @@ pub mod telemetry;
 mod worker_session;
 mod workflow_hydration;
 
+pub use activity_error::ActivityError;
 pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
 };
@@ -278,6 +280,8 @@ pub enum Error {
     ChildWorkflowFailed(ChildWorkflowFailure),
     #[error(transparent)]
     ActivityFailed(ActivityFailure),
+    #[error(transparent)]
+    ActivityError(#[from] ActivityError),
     #[error(transparent)]
     NexusOperationFailed(Box<NexusOperationFailure>),
     #[error(transparent)]
@@ -4783,13 +4787,31 @@ impl Client {
         message: impl Into<String>,
         non_retryable: bool,
     ) -> Result<Value> {
+        self.fail_activity_task_with_error(
+            task_id,
+            activity_attempt_id,
+            lease_owner,
+            &ActivityError::new("RustActivityFailure", message).non_retryable(non_retryable),
+        )
+        .await
+    }
+
+    /// Report an activity's application-defined failure type and retry marker.
+    pub async fn fail_activity_task_with_error(
+        &self,
+        task_id: &str,
+        activity_attempt_id: &str,
+        lease_owner: &str,
+        error: &ActivityError,
+    ) -> Result<Value> {
+        let error = error.validated();
         let body = json!({
             "activity_attempt_id": activity_attempt_id,
             "lease_owner": lease_owner,
             "failure": {
-                "message": message.into(),
-                "type": "RustActivityFailure",
-                "non_retryable": non_retryable
+                "message": error.message,
+                "type": error.exception_type,
+                "non_retryable": error.non_retryable
             }
         });
         let path = format!("/worker/activity-tasks/{task_id}/fail");
@@ -8974,12 +8996,11 @@ impl Worker {
             Err(error) => {
                 let failure = self
                     .client
-                    .fail_activity_task(
+                    .fail_activity_task_with_error(
                         &task_id,
                         &attempt_id,
                         &lease_owner,
-                        error.to_string(),
-                        false,
+                        &ActivityError::from_error(&error, "RustActivityFailure"),
                     )
                     .await;
                 if let Err(error) = failure {
@@ -32546,6 +32567,48 @@ mod tests {
 
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
+    }
+
+    fn typed_activity_failure_server(
+        path: &str,
+        _body: &str,
+        request_number: usize,
+    ) -> Option<(&'static str, String)> {
+        match path {
+            "/api/worker/activity-tasks/poll" if request_number == 1 => Some((
+                "200 OK",
+                r#"{"task":{"task_id":"typed-failure","activity_attempt_id":"typed-attempt","activity_type":"typed.failure","payload_codec":"avro","arguments":{"codec":"avro","blob":"wwHioz3/VYAiNwwA"},"attempt_number":1,"lease_owner":"typed-worker"}}"#.into(),
+            )),
+            "/api/worker/activity-tasks/typed-failure/fail" => Some(("200 OK", "{}".into())),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_activity_reports_application_type_and_non_retryable_marker() {
+        for non_retryable in [false, true] {
+            let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+                request_override: Some(typed_activity_failure_server),
+                ..MockWorkerBehavior::default()
+            });
+            let client = Client::builder(server.base_url()).build().unwrap();
+            let mut worker = Worker::new(client, "typed-queue").worker_id("typed-worker");
+            worker.register_activity("typed.failure", move |_, _| async move {
+                Err(ActivityError::new("PaymentDeclined", "card declined")
+                    .non_retryable(non_retryable)
+                    .into())
+            });
+            assert_eq!(worker.run_once().await.unwrap(), 1);
+            assert_eq!(
+                server.request_body("/api/worker/activity-tasks/typed-failure/fail"),
+                json!({
+                    "activity_attempt_id": "typed-attempt",
+                    "lease_owner": "typed-worker",
+                    "failure": {"type": "PaymentDeclined", "message": "card declined",
+                                "non_retryable": non_retryable}
+                })
+            );
+        }
     }
 
     fn activity_completion_backend_recovery(
