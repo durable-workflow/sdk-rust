@@ -10061,6 +10061,9 @@ impl Worker {
             activity_type: task.activity_type,
             attempt_number: task.attempt_number,
             retry_info,
+            activity_execution_id: task.activity_execution_id,
+            workflow_id: task.workflow_id,
+            run_id: task.run_id,
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
             claim_guard: None,
@@ -16164,6 +16167,9 @@ pub struct ActivityContext {
     pub activity_type: String,
     pub attempt_number: u64,
     retry_info: ActivityRetryInfo,
+    activity_execution_id: Option<String>,
+    workflow_id: Option<String>,
+    run_id: Option<String>,
     pub task_queue: String,
     pub worker_id: String,
     claim_guard: Option<cooperative_cancellation::ActivityClaimGuard>,
@@ -16172,6 +16178,29 @@ pub struct ActivityContext {
 }
 
 impl ActivityContext {
+    /// Logical Server activity execution ID, stable across that activity's retries.
+    ///
+    /// This is the received claim identity, including for worker-session activities.
+    /// It is unavailable when an older Server omits it, for inline local activities
+    /// before the Server records their command, and in Server-free tests. It is
+    /// never derived from a per-attempt task or attempt ID. Use an application
+    /// business key when this value is unavailable.
+    pub fn activity_execution_id(&self) -> Option<&str> {
+        self.activity_execution_id.as_deref()
+    }
+
+    /// Owning workflow instance ID from the claim (or parent local workflow task).
+    /// Older claims and Server-free activity tests can report `None`.
+    pub fn workflow_id(&self) -> Option<&str> {
+        self.workflow_id.as_deref()
+    }
+
+    /// Owning workflow run ID from the claim (or parent local workflow task).
+    /// Older claims and Server-free activity tests can report `None`.
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+
     /// Immutable original attempt identity and received retry policy.
     pub fn retry_info(&self) -> &ActivityRetryInfo {
         &self.retry_info
