@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.9.0
+
 - Expose optional immutable activity execution, workflow instance and run IDs
   from the original claim, including worker-session activities. Preserve absence
   on older claims without deriving stable identity from task or attempt IDs.
