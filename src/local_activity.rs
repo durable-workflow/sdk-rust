@@ -180,6 +180,20 @@ pub(super) struct Heartbeats {
 }
 
 impl Heartbeats {
+    pub(super) fn captured_attempt() -> (Arc<Mutex<Self>>, impl Drop) {
+        let now = Instant::now();
+        let reports = Arc::new(Mutex::new(Self {
+            active: true,
+            started: now,
+            last: now,
+            reports: Vec::new(),
+            capacity: MAX_HEARTBEATS,
+            overflowed: false,
+        }));
+        let close = CloseAttempt(reports.clone());
+        (reports, close)
+    }
+
     pub fn record<T: Serialize>(&mut self, details: T) -> Result<ActivityHeartbeatResponse> {
         if !self.active {
             return Ok(heartbeat_response(false));

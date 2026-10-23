@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 4.5.0
+
+- Add Server-free `testing::WorkflowEnvironment` and `WorkflowHistory` for
+  deployment replay and in-process workflow/activity tests. Reuse the worker's
+  codec, marker and persisted-selection replay paths; report typed divergence
+  sequences and recorded/produced identities. Import CLI exports or complete
+  history API responses, and export resolved payloads with the Client helper.
+- Execute real/mocked activities with authored retry policies and typed terminal
+  failures; skip durable timers and retry delays. Unsupported external runtime
+  operations and activity timeout simulation fail explicitly. Document the
+  supported execution model, determinism rules and runnable test examples.
+
 ## 4.4.0
 
 - Add `ClientBuilder::additional_root_certificates_pem` for self-hosted Servers

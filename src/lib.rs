@@ -18,6 +18,7 @@ mod sticky_worker;
 mod sticky_workflow_cache;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+pub mod testing;
 mod tls;
 mod worker_capacity;
 mod worker_session;
@@ -263,6 +264,8 @@ pub enum Error {
     InvalidBaseUrl,
     #[error("invalid additional root certificates: {0}")]
     InvalidRootCertificates(String),
+    #[error(transparent)]
+    Testing(#[from] testing::TestingError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("http {status}: {body}")]
