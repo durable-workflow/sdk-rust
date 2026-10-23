@@ -1891,12 +1891,11 @@ impl Worker {
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Err(error) => {
                 self.client
-                    .fail_activity_task(
+                    .fail_activity_task_with_error(
                         &guard.task_id,
                         &guard.attempt_id,
                         &guard.owner,
-                        error.to_string(),
-                        false,
+                        &crate::ActivityError::from_error(&error, "RustActivityFailure"),
                     )
                     .await
             }
