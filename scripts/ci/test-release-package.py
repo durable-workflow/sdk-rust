@@ -7,6 +7,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -15,6 +17,7 @@ from release_package import (
     ReleasePackageError,
     load_package,
     release_entry,
+    render_release_notes,
     restore_missing_lockfile,
     verify_archive,
     verify_source,
@@ -34,6 +37,70 @@ class ReleasePackageTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.package = load_package(MANIFEST)
+
+    def test_rendered_notes_preserve_only_the_exact_current_markdown(self) -> None:
+        changelog = b"""# Changelog
+
+## Unreleased
+
+- Future feature.
+
+## 2.0.1
+
+- Current **metrics** and [setup](README.md).
+
+```text
+## 9.9.9
+This is an example, not another release.
+```
+
+## 2.0.0
+
+- Previous pagination feature.
+"""
+        expected = """## 2.0.1
+
+- Current **metrics** and [setup](README.md).
+
+```text
+## 9.9.9
+This is an example, not another release.
+```
+"""
+        self.assertEqual(expected, render_release_notes(changelog, "2.0.1"))
+
+    def test_rendered_notes_reject_missing_empty_and_duplicate_version(self) -> None:
+        for changelog in (
+            b"## 2.0.0\n\n- Previous release.\n",
+            b"## 2.0.1\n\n<!-- empty -->\n\n## 2.0.0\n\n- Previous.\n",
+            b"## 2.0.1\n\n- One.\n\n## 2.0.1\n\n- Two.\n",
+        ):
+            with self.subTest(changelog=changelog), self.assertRaises(ReleasePackageError):
+                render_release_notes(changelog, "2.0.1")
+
+    def test_release_notes_cli_binds_output_to_manifest_version(self) -> None:
+        manifest = self.root / "Cargo.toml"
+        manifest.write_text('[package]\nname="example"\nversion="2.0.1"\n', encoding="utf-8")
+        changelog = self.root / "CHANGELOG.md"
+        changelog.write_text('## 2.0.1\n\n- Current metrics.\n\n## 2.0.0\n\n- Previous feature.\n', encoding="utf-8")
+        command = [sys.executable, str(ROOT / "scripts/ci/release_package.py"),
+                   "--manifest", str(manifest), "--changelog", str(changelog), "--release-notes"]
+        result = subprocess.run([*command, "2.0.1"], text=True, capture_output=True, check=True)
+        self.assertEqual("## 2.0.1\n\n- Current metrics.\n", result.stdout)
+        mismatch = subprocess.run([*command, "2.0.0"], text=True, capture_output=True)
+        self.assertNotEqual(0, mismatch.returncode)
+        self.assertEqual("", mismatch.stdout)
+        self.assertIn("differs from Cargo package version", mismatch.stderr)
+
+    def test_release_notes_cli_refuses_archive_mode(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/ci/release_package.py"),
+             "--release-notes", self.package["version"], "--archive", "example.crate"],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("cannot be combined", result.stderr)
 
     def archive(
         self,

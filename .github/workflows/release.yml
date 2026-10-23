@@ -97,6 +97,11 @@ jobs:
       - name: Install hash-locked release tooling
         run: ../release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
+      - name: Prepare exact source release notes
+        run: |
+          python3 ../release-tools/scripts/ci/release_package.py \
+            --release-notes "$RELEASE_TAG" > "${RUNNER_TEMP}/rust-sdk-release-notes.md"
+
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
 
@@ -121,7 +126,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            arguments=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+            arguments=(--verify-tag --notes-file "${RUNNER_TEMP}/rust-sdk-release-notes.md" --title "$RELEASE_TAG")
             if [[ "$RELEASE_TAG" == *-* ]]; then
               arguments+=(--prerelease)
             fi

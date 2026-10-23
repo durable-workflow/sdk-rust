@@ -149,7 +149,7 @@ def _line_starts(value: bytes) -> list[int]:
     return starts
 
 
-def release_entry(changelog: bytes, version: str) -> dict[str, Any]:
+def _release_entry_content(changelog: bytes, version: str) -> tuple[bytes, list[str]]:
     try:
         text = changelog.decode("utf-8")
     except UnicodeError as error:
@@ -197,11 +197,33 @@ def release_entry(changelog: bytes, version: str) -> dict[str, Any]:
     else:
         raise ReleasePackageError("CommonMark section source map is out of range")
     entry = changelog[start_offset:end_offset]
+    return entry, content_lines
+
+
+def release_entry(changelog: bytes, version: str) -> dict[str, Any]:
+    entry, content_lines = _release_entry_content(changelog, version)
     return {
         "version": version,
         "entry_sha256": sha256(entry),
         "content_lines": content_lines,
     }
+
+
+def render_release_notes(changelog: bytes, version: str) -> str:
+    """Render the exact validated source entry, rather than merged-PR ancestry."""
+    entry, _ = _release_entry_content(changelog, version)
+    return entry.decode("utf-8").rstrip("\r\n") + "\n"
+
+
+def source_release_notes(manifest: Path, changelog: Path, version: str) -> str:
+    package = load_package(manifest)
+    if package["version"] != version:
+        raise ReleasePackageError("release notes version differs from Cargo package version")
+    try:
+        changelog_bytes = changelog.read_bytes()
+    except OSError as error:
+        raise ReleasePackageError(f"could not read CHANGELOG.md: {error}") from error
+    return render_release_notes(changelog_bytes, version)
 
 
 def verify_source(manifest: Path, changelog: Path) -> dict[str, Any]:
@@ -347,12 +369,24 @@ def main() -> int:
     parser.add_argument("--expected-vcs-commit")
     parser.add_argument("--expected-archive-sha256")
     parser.add_argument("--restore-missing-lockfile", action="store_true")
+    parser.add_argument(
+        "--release-notes", metavar="VERSION",
+        help="print the exact current-version Markdown after manifest validation",
+    )
     arguments = parser.parse_args()
     if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
         parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
 
     try:
-        if arguments.restore_missing_lockfile:
+        if arguments.release_notes is not None:
+            if any((arguments.archive, arguments.expected_vcs_commit,
+                    arguments.expected_archive_sha256, arguments.restore_missing_lockfile)):
+                parser.error("--release-notes cannot be combined with archive verification")
+            sys.stdout.write(source_release_notes(
+                arguments.manifest, arguments.changelog, arguments.release_notes,
+            ))
+            return 0
+        elif arguments.restore_missing_lockfile:
             if not all((arguments.archive, arguments.expected_vcs_commit, arguments.expected_archive_sha256)):
                 parser.error("lockfile recovery requires archive, source commit and registry checksum")
             evidence = restore_missing_lockfile(
