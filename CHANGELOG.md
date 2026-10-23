@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 4.6.0
+
+- Add typed one-page workflow listing and selected-run history reads over the
+  published APIs, including search attributes and unchanged Server validation.
+  Add lazy async iterators that preserve namespace/run/filter identity and
+  hold one page at a time. Propagate page errors and detect repeated/cyclic
+  tokens with bounded state; retain the existing complete-history export helper.
+- Document single-page versus complete enumeration, active status-bucket
+  filtering, query identity, termination and consistency limits. Add a read-only
+  pagination example and real filtered multi-page list/history acceptance.
+
 ## 4.5.0
 
 - Add Server-free `testing::WorkflowEnvironment` and `WorkflowHistory` for

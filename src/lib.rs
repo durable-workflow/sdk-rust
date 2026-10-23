@@ -11,6 +11,7 @@ mod cancellation_scope_replay;
 mod cooperative_cancellation;
 mod local_activity;
 mod nexus;
+pub mod pagination;
 mod query_authority;
 mod runtime_payloads;
 mod runtime_uploads;
@@ -19,6 +20,10 @@ mod sticky_workflow_cache;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod testing;
+pub use pagination::{
+    PaginationError, WorkflowHistoryIterator, WorkflowHistoryOptions, WorkflowHistoryPage,
+    WorkflowIterator, WorkflowListOptions, WorkflowListPage, WorkflowSummary,
+};
 mod tls;
 mod worker_capacity;
 mod worker_session;
@@ -266,6 +271,8 @@ pub enum Error {
     InvalidRootCertificates(String),
     #[error(transparent)]
     Testing(#[from] testing::TestingError),
+    #[error(transparent)]
+    Pagination(#[from] pagination::PaginationError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("http {status}: {body}")]

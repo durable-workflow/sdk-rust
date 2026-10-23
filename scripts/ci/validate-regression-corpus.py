@@ -1792,6 +1792,58 @@ def _changed_paths(root: Path, base_ref: str) -> tuple[set[str], set[str]]:
     return changed | untracked, added | untracked
 
 
+def _added_reexport(lines: list[str], start: int) -> tuple[str, list[int]] | None:
+    declaration: list[str] = []
+    indices: list[int] = []
+    for index in range(start, len(lines)):
+        if not lines[index].startswith("+") or lines[index].startswith("+++"):
+            return None
+        declaration.append(lines[index][1:])
+        indices.append(index)
+        if declaration[-1].rstrip().endswith(";"):
+            return " ".join(declaration), indices
+    return None
+
+
+def _fresh_reexport_bindings(declaration: str, base_source: str) -> bool:
+    block = re.fullmatch(
+        r"pub use [A-Za-z_][A-Za-z0-9_:]*::\{([A-Za-z0-9_,\s]+)\};",
+        declaration,
+    )
+    single = re.fullmatch(
+        r"pub use [A-Za-z_][A-Za-z0-9_:]*::([A-Za-z_][A-Za-z0-9_]*);",
+        declaration,
+    )
+    match = block or single
+    if match is None:
+        return False
+    names = [name.strip() for name in match.group(1).split(",") if name.strip()]
+    return bool(names) and all(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+        and re.search(rf"\b{re.escape(name)}\b", base_source) is None
+        for name in names
+    )
+
+
+def _fresh_public_reexports(diff: str, base_source: str) -> set[int]:
+    """Only wholly added explicit bindings absent from the base are API additions.
+
+    Existing bindings, aliases, globs and mixed production edits stay guarded.
+    """
+    lines = diff.splitlines()
+    ignored: set[int] = set()
+    for start, line in enumerate(lines):
+        if not line.startswith("+pub use "):
+            continue
+        added = _added_reexport(lines, start)
+        if added is None:
+            continue
+        declaration, indices = added
+        if _fresh_reexport_bindings(declaration, base_source):
+            ignored.update(indices)
+    return ignored
+
+
 def _guard_matches(
     root: Path,
     base_ref: str,
@@ -1826,6 +1878,13 @@ def _guard_matches(
     untracked = set(
         _run(["git", "ls-files", "--others", "--exclude-standard"], root).splitlines()
     )
+    fresh_reexports: set[int] = set()
+    if re.search(r"^\+pub use ", diff, re.MULTILINE):
+        base_source = "\n".join(
+            _run(["git", "show", f"{base_ref}:{path}"], root)
+            for path in matching
+        )
+        fresh_reexports = _fresh_public_reexports(diff, base_source)
     relevant_lines: list[str] = []
     inside_hunk = False
     enclosing_items: list[tuple[int, str]] = []
@@ -1836,7 +1895,7 @@ def _guard_matches(
         r"(?:fn|impl|struct|enum|trait|mod|const|static)\b"
     )
     closing_scope = re.compile(r"^}\s*[,;]?$")
-    for line in diff.splitlines():
+    for index, line in enumerate(diff.splitlines()):
         if line.startswith("diff --git "):
             inside_hunk = False
             enclosing_items.clear()
@@ -1874,6 +1933,8 @@ def _guard_matches(
                 ]
                 enclosing_items.append((indentation, stripped))
         elif inside_hunk and line.startswith(("+", "-")):
+            if index in fresh_reexports:
+                continue
             # An unchanged cfg(test) module is absent from production builds.
             # A history literal in its fixtures is not a replay implementation
             # change. Other production hunks in the same diff remain guarded.
