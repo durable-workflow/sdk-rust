@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "durable-workflow"
-version = "4.3.1"
+version = "4.4.0"
 dependencies = [
  "apache-avro",
  "base64 0.22.1",
@@ -265,6 +265,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest",
+ "rustls",
  "rustls-webpki",
  "serde",
  "serde-value",
@@ -273,6 +274,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "uuid",
  "webpki-roots",

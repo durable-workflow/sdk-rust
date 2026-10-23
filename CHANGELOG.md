@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 4.4.0
+
+- Add `ClientBuilder::additional_root_certificates_pem` for self-hosted Servers
+  and proxies using private certificate authorities. Additional roots apply to
+  every request while preserving bundled public roots and hostname checks.
+
 ## 4.3.1
 
 - Enforce the configured workflow and activity concurrency limits in ordinary

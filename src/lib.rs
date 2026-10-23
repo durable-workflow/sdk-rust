@@ -18,6 +18,7 @@ mod sticky_worker;
 mod sticky_workflow_cache;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+mod tls;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
@@ -260,6 +261,8 @@ pub enum Error {
         "invalid Durable Workflow base URL: omit the SDK-owned /api suffix and pass the Server or Cloud runtime base URL; the SDK appends /api automatically"
     )]
     InvalidBaseUrl,
+    #[error("invalid additional root certificates: {0}")]
+    InvalidRootCertificates(String),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("http {status}: {body}")]
@@ -3039,6 +3042,7 @@ impl Client {
             timeout: Duration::from_secs(60),
             max_external_payload_bytes: 64 * 1024 * 1024,
             worker_protocol_version: WorkerProtocolVersion::default(),
+            additional_root_certificates: Vec::new(),
         }
     }
 
@@ -5849,6 +5853,7 @@ pub struct ClientBuilder {
     timeout: Duration,
     max_external_payload_bytes: usize,
     worker_protocol_version: WorkerProtocolVersion,
+    additional_root_certificates: Vec<reqwest::Certificate>,
 }
 
 impl ClientBuilder {
@@ -5900,11 +5905,14 @@ impl ClientBuilder {
             return Err(Error::InvalidBaseUrl);
         }
 
+        let mut http = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .redirect(reqwest::redirect::Policy::none());
+        for certificate in self.additional_root_certificates {
+            http = http.add_root_certificate(certificate);
+        }
         Ok(Client {
-            http: reqwest::Client::builder()
-                .timeout(self.timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            http: http.build()?,
             hydration_timeout: self.timeout,
             base_url,
             token: self.token,

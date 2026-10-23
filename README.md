@@ -100,6 +100,29 @@ ordinary worker registration does not enable it.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Private certificate authorities
+
+The SDK trusts bundled Mozilla public roots by default. It does not load the
+operating system trust store or `SSL_CERT_FILE`. For a self-hosted Server or a
+proxy using a private certificate authority, add its PEM root certificates:
+
+```rust,no_run
+use durable_workflow::Client;
+# fn client() -> Result<Client, Box<dyn std::error::Error>> {
+let client = Client::builder("https://workflow.internal")
+    .additional_root_certificates_pem(std::fs::read("company-ca.pem")?)?
+    .build()?;
+# Ok(client)
+# }
+```
+
+The bundle can contain multiple certificates, and repeated calls add more
+roots. Bundled public roots remain enabled. The same configured HTTP client
+handles control requests, worker polling and external payload transfers.
+Certificate-chain and hostname verification remain enabled. A private CA does
+not make a certificate for the wrong hostname valid. Client certificates
+(mTLS) are not configured by this option.
+
 ### Worker concurrency
 
 `Worker::max_concurrent_workflow_tasks(...)` and
