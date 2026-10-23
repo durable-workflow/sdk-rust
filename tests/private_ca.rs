@@ -191,3 +191,20 @@ fn invalid_or_empty_pem_bundles_are_rejected() {
         .build()
         .is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires the public Rust documentation HTTPS endpoint"]
+async fn adding_a_private_ca_keeps_bundled_public_roots_trusted() {
+    let client = Client::builder("https://rust.durable-workflow.com")
+        .additional_root_certificates_pem(CA)
+        .unwrap()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    // The documentation site is not a runtime. Reaching its HTTP response
+    // proves that adding a private root preserves the public TLS trust path.
+    assert!(matches!(
+        client.health().await,
+        Ok(_) | Err(Error::Http { .. }) | Err(Error::Json(_))
+    ));
+}
