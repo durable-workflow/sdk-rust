@@ -215,7 +215,13 @@ def render_release_notes(changelog: bytes, version: str) -> str:
     return entry.decode("utf-8").rstrip("\r\n") + "\n"
 
 
-def source_release_notes(manifest: Path, changelog: Path, version: str) -> str:
+def source_release_notes(version: str) -> str:
+    root = Path.cwd()
+    manifest = root / "Cargo.toml"
+    changelog = root / "CHANGELOG.md"
+    for path in (manifest, changelog):
+        if path.is_symlink():
+            raise ReleasePackageError(f"release notes require regular checkout files: {path.name}")
     package = load_package(manifest)
     if package["version"] != version:
         raise ReleasePackageError("release notes version differs from Cargo package version")
@@ -382,9 +388,10 @@ def main() -> int:
             if any((arguments.archive, arguments.expected_vcs_commit,
                     arguments.expected_archive_sha256, arguments.restore_missing_lockfile)):
                 parser.error("--release-notes cannot be combined with archive verification")
-            sys.stdout.write(source_release_notes(
-                arguments.manifest, arguments.changelog, arguments.release_notes,
-            ))
+            if (arguments.manifest != Path("Cargo.toml")
+                    or arguments.changelog != Path("CHANGELOG.md")):
+                parser.error("--release-notes uses the current checkout files; path overrides are refused")
+            sys.stdout.write(source_release_notes(arguments.release_notes))
             return 0
         elif arguments.restore_missing_lockfile:
             if not all((arguments.archive, arguments.expected_vcs_commit, arguments.expected_archive_sha256)):

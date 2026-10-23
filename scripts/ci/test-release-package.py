@@ -84,10 +84,12 @@ This is an example, not another release.
         changelog = self.root / "CHANGELOG.md"
         changelog.write_text('## 2.0.1\n\n- Current metrics.\n\n## 2.0.0\n\n- Previous feature.\n', encoding="utf-8")
         command = [sys.executable, str(ROOT / "scripts/ci/release_package.py"),
-                   "--manifest", str(manifest), "--changelog", str(changelog), "--release-notes"]
-        result = subprocess.run([*command, "2.0.1"], text=True, capture_output=True, check=True)
+                   "--release-notes"]
+        result = subprocess.run([*command, "2.0.1"], cwd=self.root,
+                                text=True, capture_output=True, check=True)
         self.assertEqual("## 2.0.1\n\n- Current metrics.\n", result.stdout)
-        mismatch = subprocess.run([*command, "2.0.0"], text=True, capture_output=True)
+        mismatch = subprocess.run([*command, "2.0.0"], cwd=self.root,
+                                  text=True, capture_output=True)
         self.assertNotEqual(0, mismatch.returncode)
         self.assertEqual("", mismatch.stdout)
         self.assertIn("differs from Cargo package version", mismatch.stderr)
@@ -101,6 +103,45 @@ This is an example, not another release.
         self.assertEqual(2, result.returncode)
         self.assertEqual("", result.stdout)
         self.assertIn("cannot be combined", result.stderr)
+
+    def test_release_notes_cli_refuses_paths_outside_checkout(self) -> None:
+        secret = self.root / "private.md"
+        secret.write_text("## 2.0.1\n\nPRIVATE-TEST-CONTENT\n", encoding="utf-8")
+        for option, value in (("--changelog", str(secret)),
+                              ("--manifest", str(secret)),
+                              ("--changelog", "../private.md")):
+            with self.subTest(option=option, value=value):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts/ci/release_package.py"),
+                     "--release-notes", "2.0.1", option, value], cwd=self.root,
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(2, result.returncode)
+                self.assertEqual("", result.stdout)
+                self.assertNotIn("PRIVATE-TEST-CONTENT", result.stderr)
+                self.assertIn("path overrides are refused", result.stderr)
+
+    def test_release_notes_cli_refuses_symlinks_in_checkout(self) -> None:
+        for filename in ("Cargo.toml", "CHANGELOG.md"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                checkout = Path(directory)
+                files = {"Cargo.toml": '[package]\nname="example"\nversion="2.0.1"\n',
+                         "CHANGELOG.md": '## 2.0.1\n\nPRIVATE-TEST-CONTENT\n'}
+                for name, content in files.items():
+                    (checkout / name).write_text(content, encoding="utf-8")
+                target = self.root / (filename + ".private")
+                target.write_text(files[filename], encoding="utf-8")
+                (checkout / filename).unlink()
+                (checkout / filename).symlink_to(target)
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts/ci/release_package.py"),
+                     "--release-notes", "2.0.1"], cwd=checkout,
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(1, result.returncode)
+                self.assertEqual("", result.stdout)
+                self.assertNotIn("PRIVATE-TEST-CONTENT", result.stderr)
+                self.assertIn("regular checkout files", result.stderr)
 
     def archive(
         self,
