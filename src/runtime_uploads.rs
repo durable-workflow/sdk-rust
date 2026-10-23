@@ -83,6 +83,55 @@ struct Upload {
 }
 
 impl Client {
+    pub(super) fn observe_failure_request_limit(&self, info: &Value) {
+        if let Some(limit) = info
+            .pointer("/limits/max_payload_bytes")
+            .and_then(Value::as_u64)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+        {
+            // Namespace/base URL are immutable on Client. Its clones share the
+            // conservative lower cap learned through normal discovery.
+            self.failure_request_limit
+                .fetch_min(limit, Ordering::Relaxed);
+        }
+    }
+    pub(super) async fn discover_failure_request_limit(
+        &self,
+        body: &Value,
+        path: &str,
+        protocol: RequestProtocol,
+    ) -> Result<usize> {
+        // Inline details already require this discovery for ordinary payload
+        // handling. Learn a lower request cap before its aggregate-size check.
+        let inline = payload_paths(body, path, protocol).iter().any(|pointer| {
+            body.pointer(pointer).is_some_and(|value| {
+                value.is_string() || (value["codec"] == DEFAULT_CODEC && value["blob"].is_string())
+            })
+        });
+        if inline {
+            self.runtime_upload_policy(protocol).await?;
+        }
+        self.known_failure_request_limit(protocol)
+    }
+
+    pub(super) fn known_failure_request_limit(&self, protocol: RequestProtocol) -> Result<usize> {
+        let role = usize::from(matches!(
+            protocol,
+            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+        ));
+        let cached = self
+            .runtime_upload_policy
+            .lock()
+            .map_err(|_| unsupported("discovery cache poisoned"))?;
+        Ok(cached[role]
+            .as_ref()
+            .map_or(crate::failure_reporting::REQUEST_BYTES, |(_, p)| {
+                p.request_bytes
+            })
+            .min(self.failure_request_limit.load(Ordering::Relaxed)))
+    }
+
     pub(super) async fn externalize_runtime_payloads(
         &self,
         body: &mut Value,
@@ -214,6 +263,7 @@ impl Client {
         let info = self
             .runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
             .await?;
+        self.observe_failure_request_limit(&info);
         let policy = Policy::from_info(&info)?;
         self.runtime_upload_policy
             .lock()

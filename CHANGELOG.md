@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 4.10.0
+
+- Bound outgoing activity, workflow-task and terminal workflow failure messages,
+  stacks and combined diagnostic data, with visible truncation and original-size
+  diagnostics. Enforce a 1 MiB complete encoded report cap or a lower known
+  transport limit after JSON escaping. Preserve claim identity, original type and
+  retry semantics; refuse unfit required data as a typed reporting error.
+- Expose structured activity and workflow-task reporting over existing Server
+  failure fields. Keep valid Avro details whole or omit them with a marker.
+  Bound local messages before workflow observation so committed replay matches.
+- Keep composed one-tick workers on the normal thread stack with optional
+  telemetry and cooperative polling. Reporting refusals discard provisional
+  sticky state and remain distinct from application failures.
+
 ## 4.9.0
 
 - Expose optional immutable activity execution, workflow instance and run IDs

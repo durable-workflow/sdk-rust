@@ -349,6 +349,7 @@ impl Worker {
         context: &WorkflowContext,
         index: usize,
         wire: &mut Value,
+        messages: &[(usize, crate::failure_reporting::LocalText)],
     ) -> Result<()> {
         let mut commands = context
             .state
@@ -360,11 +361,37 @@ impl Worker {
         let mut body = json!({"lease_owner": task.lease_owner, "workflow_task_attempt": task.workflow_task_attempt,
             "commands": commands});
         let path = format!("/worker/workflow-tasks/{}/complete", task.task_id);
+        let limit = self
+            .client
+            .known_failure_request_limit(RequestProtocol::DefaultWorker)?;
+        crate::failure_reporting::fit_local(&mut body, index, messages, limit)?;
         self.client
             .externalize_runtime_payloads(&mut body, &path, RequestProtocol::DefaultWorker)
             .await?;
+        let limit = self
+            .client
+            .known_failure_request_limit(RequestProtocol::DefaultWorker)?;
+        crate::failure_reporting::fit_local(&mut body, index, messages, limit)?;
         *wire = body["commands"][index].take();
         Ok(())
+    }
+
+    async fn admit_local_command(
+        &self,
+        task: &WorkflowTask,
+        context: &WorkflowContext,
+        index: usize,
+        wire: &mut Value,
+        messages: &[(usize, crate::failure_reporting::LocalText)],
+    ) -> Result<bool> {
+        match self
+            .externalize_local_command(task, context, index, wire, messages)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error @ Error::FailureReporting(_)) => Err(error),
+            Err(_) => Ok(false),
+        }
     }
 
     async fn execute_local_activity(
@@ -380,10 +407,9 @@ impl Worker {
             .commands[request.command_index]
             .clone();
         // Serialize and admit input before the callback can produce side effects.
-        if self
-            .externalize_local_command(task, context, request.command_index, &mut wire)
-            .await
-            .is_err()
+        if !self
+            .admit_local_command(task, context, request.command_index, &mut wire, &[])
+            .await?
         {
             return Ok(None);
         }
@@ -401,6 +427,7 @@ impl Worker {
             .schedule_to_close_timeout
             .map(|seconds| started + Duration::from_secs(seconds));
         let mut attempts = Vec::new();
+        let mut messages = Vec::new();
         let mut heartbeat_count = 0;
         for number in 1..=max_attempts {
             if !self.local_claim_is_active(task).await {
@@ -563,7 +590,9 @@ impl Worker {
                     "failed"
                 };
                 report["outcome"] = json!(status);
-                report["message"] = json!(message);
+                let original = crate::failure_reporting::LocalText::new(&message);
+                report["message"] = json!(original.render(crate::failure_reporting::MESSAGE_BYTES));
+                messages.push((attempts.len(), original));
                 report["exception_type"] = json!(exception_type);
                 report["non_retryable"] = json!(non_retryable);
                 if let Some(kind) = timeout_kind {
@@ -617,9 +646,20 @@ impl Worker {
                     }
                 }
                 wire["attempts"] = json!(attempts);
+                if !self
+                    .admit_local_command(task, context, request.command_index, &mut wire, &messages)
+                    .await?
+                    || !self.local_claim_is_active(task).await
+                {
+                    return Ok(None);
+                }
                 // Match the terminal fields Server persists. Database-generated
                 // execution/failure IDs are only available on committed replay.
                 let mut payload = wire.clone();
+                if let Some(message) = payload["message"].as_str() {
+                    payload["message"] =
+                        json!(crate::failure_reporting::committed_message(message));
+                }
                 payload["attempt_number"] = json!(number);
                 payload["failure_category"] = json!(if timeout_kind.is_some() {
                     "timeout"
@@ -643,24 +683,15 @@ impl Worker {
                 };
                 let result =
                     activity_outcome(&event, &task.payload_codec, Some(activity_type.clone()))?;
-                if self
-                    .externalize_local_command(task, context, request.command_index, &mut wire)
-                    .await
-                    .is_err()
-                    || !self.local_claim_is_active(task).await
-                {
-                    return Ok(None);
-                }
                 return Ok(Some((wire, result)));
             }
             report["outcome"] = json!("completed");
             attempts.push(report);
             wire["outcome"] = json!("completed");
             wire["attempts"] = json!(attempts);
-            if self
-                .externalize_local_command(task, context, request.command_index, &mut wire)
-                .await
-                .is_err()
+            if !self
+                .admit_local_command(task, context, request.command_index, &mut wire, &messages)
+                .await?
                 || !self.local_claim_is_active(task).await
             {
                 return Ok(None);

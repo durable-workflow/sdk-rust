@@ -10,6 +10,7 @@ mod cancellation_scope;
 mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
+mod failure_reporting;
 mod local_activity;
 pub mod metrics;
 mod nexus;
@@ -43,6 +44,7 @@ pub use cancellation_scope_history::{
 };
 #[doc(hidden)]
 pub use cancellation_scope_replay::CancellationScopeRequested;
+pub use failure_reporting::FailureReportError;
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
@@ -58,7 +60,7 @@ use std::{
     io::{self, Read},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     task::{Context as TaskContext, Poll},
@@ -272,6 +274,8 @@ pub enum Error {
     InvalidBaseUrl,
     #[error("invalid additional root certificates: {0}")]
     InvalidRootCertificates(String),
+    #[error(transparent)]
+    FailureReporting(#[from] FailureReportError),
     #[error(transparent)]
     Testing(#[from] testing::TestingError),
     #[error(transparent)]
@@ -3006,6 +3010,7 @@ pub struct Client {
     worker_build_id: Option<String>,
     sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
+    failure_request_limit: Arc<AtomicUsize>,
     activity_lease_renewal_supported: Arc<AtomicBool>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
@@ -3083,6 +3088,7 @@ impl Client {
         self.observe_activity_lease_capabilities(
             &discovery["worker_protocol"]["server_capabilities"],
         );
+        self.observe_failure_request_limit(&discovery);
         Ok(discovery)
     }
 
@@ -4655,7 +4661,11 @@ impl Client {
         .await
     }
 
-    async fn fail_workflow_task_with_failure(
+    /// Report a workflow-task failure using the existing Server failure schema.
+    /// The published schema supports `message`, `type`, `reason`, `sequence`
+    /// and `stack_trace`. Oversized data is bounded before transport; original
+    /// sizes and omissions are marked in the existing message field.
+    pub async fn fail_workflow_task_with_failure(
         &self,
         task_id: &str,
         lease_owner: &str,
@@ -4824,14 +4834,24 @@ impl Client {
         error: &ActivityError,
     ) -> Result<Value> {
         let error = error.validated();
+        self.fail_activity_task_with_failure(task_id,activity_attempt_id,lease_owner,json!({
+            "message":error.message,"type":error.exception_type,"non_retryable":error.non_retryable
+        })).await
+    }
+
+    /// Report a structured activity failure using existing Server fields such as
+    /// `message`, `type`, `stack_trace`, `non_retryable` and Avro `details`.
+    /// The final encoded report is bounded without changing claim identity or
+    /// retry flags. Invalid or unfit required data is a reporting error.
+    pub async fn fail_activity_task_with_failure(
+        &self,
+        task_id: &str,
+        activity_attempt_id: &str,
+        lease_owner: &str,
+        failure: Value,
+    ) -> Result<Value> {
         let body = json!({
-            "activity_attempt_id": activity_attempt_id,
-            "lease_owner": lease_owner,
-            "failure": {
-                "message": error.message,
-                "type": error.exception_type,
-                "non_retryable": error.non_retryable
-            }
+            "activity_attempt_id":activity_attempt_id,"lease_owner":lease_owner,"failure":failure
         });
         let path = format!("/worker/activity-tasks/{task_id}/fail");
         activity_task_response(
@@ -5019,6 +5039,18 @@ impl Client {
 
         if let Some(body) = body {
             let mut body = serde_json::to_value(body)?;
+            self.check_activity_lease_request(path, Some(&body))?;
+            let mut report = failure_reporting::Prepared::new(
+                &mut body,
+                path,
+                failure_reporting::REQUEST_BYTES,
+            )?;
+            if let Some(report) = report.as_mut().filter(|report| report.can_reduce()) {
+                let limit = self
+                    .discover_failure_request_limit(&body, path, protocol)
+                    .await?;
+                report.encode(&mut body, limit)?;
+            }
             if matches!(
                 method,
                 reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
@@ -5028,7 +5060,12 @@ impl Client {
                     .await?;
                 self.check_activity_lease_request(path, Some(&body))?;
             }
-            request = request.json(&body);
+            if let Some(mut report) = report {
+                let limit = self.known_failure_request_limit(protocol)?;
+                request = request.body(report.encode(&mut body, limit)?);
+            } else {
+                request = request.json(&body);
+            }
         }
 
         let request = request.build()?;
@@ -5922,6 +5959,7 @@ impl ClientBuilder {
             worker_build_id: None,
             sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
+            failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
@@ -8728,18 +8766,20 @@ impl Worker {
         }
         let worker = self.with_storage_admission(Arc::new(AtomicBool::new(false)));
         let mut handled = 0;
-        match worker.poll_workflow_once().await? {
+        // Keep optional telemetry/cooperative poller state off the caller's
+        // stack, including callers that await several run_once turns.
+        match Box::pin(worker.poll_workflow_once()).await? {
             ManagedPollOutcome::Handled => handled += 1,
             ManagedPollOutcome::Stop => return Ok(handled),
             ManagedPollOutcome::Idle => {}
         }
-        match worker.poll_activity_once().await? {
+        match Box::pin(worker.poll_activity_once()).await? {
             ManagedPollOutcome::Handled => handled += 1,
             ManagedPollOutcome::Stop => return Ok(handled),
             ManagedPollOutcome::Idle => {}
         }
         if !self.queries.is_empty() {
-            match worker.poll_query_once().await? {
+            match Box::pin(worker.poll_query_once()).await? {
                 ManagedPollOutcome::Handled => handled += 1,
                 ManagedPollOutcome::Stop => return Ok(handled),
                 ManagedPollOutcome::Idle => {}
@@ -8891,6 +8931,10 @@ impl Worker {
                 }
             }
             Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
+            Err(error @ Error::FailureReporting(_)) => {
+                self.discard_sticky_snapshot(snapshot.as_ref())?;
+                return Err(error);
+            }
             Err(error) => {
                 self.discard_sticky_snapshot(snapshot.as_ref())?;
                 if matches!(
