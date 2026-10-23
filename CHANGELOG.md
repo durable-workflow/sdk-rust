@@ -12,6 +12,9 @@
 - Expose structured activity and workflow-task reporting over existing Server
   failure fields. Keep valid Avro details whole or omit them with a marker.
   Bound local messages before workflow observation so committed replay matches.
+- Keep composed one-tick workers on the normal thread stack with optional
+  telemetry and cooperative polling. Reporting refusals discard provisional
+  sticky state and remain distinct from application failures.
 
 ## 4.9.0
 

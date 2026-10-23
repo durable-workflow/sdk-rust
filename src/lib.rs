@@ -8766,18 +8766,20 @@ impl Worker {
         }
         let worker = self.with_storage_admission(Arc::new(AtomicBool::new(false)));
         let mut handled = 0;
-        match worker.poll_workflow_once().await? {
+        // Keep optional telemetry/cooperative poller state off the caller's
+        // stack, including callers that await several run_once turns.
+        match Box::pin(worker.poll_workflow_once()).await? {
             ManagedPollOutcome::Handled => handled += 1,
             ManagedPollOutcome::Stop => return Ok(handled),
             ManagedPollOutcome::Idle => {}
         }
-        match worker.poll_activity_once().await? {
+        match Box::pin(worker.poll_activity_once()).await? {
             ManagedPollOutcome::Handled => handled += 1,
             ManagedPollOutcome::Stop => return Ok(handled),
             ManagedPollOutcome::Idle => {}
         }
         if !self.queries.is_empty() {
-            match worker.poll_query_once().await? {
+            match Box::pin(worker.poll_query_once()).await? {
                 ManagedPollOutcome::Handled => handled += 1,
                 ManagedPollOutcome::Stop => return Ok(handled),
                 ManagedPollOutcome::Idle => {}
@@ -8928,9 +8930,11 @@ impl Worker {
                     }
                 }
             }
-            Err(
-                error @ (Error::CancellationScopeExecutionUnavailable | Error::FailureReporting(_)),
-            ) => return Err(error),
+            Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
+            Err(error @ Error::FailureReporting(_)) => {
+                self.discard_sticky_snapshot(snapshot.as_ref())?;
+                return Err(error);
+            }
             Err(error) => {
                 self.discard_sticky_snapshot(snapshot.as_ref())?;
                 if matches!(
