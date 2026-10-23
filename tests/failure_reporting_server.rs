@@ -315,6 +315,10 @@ async fn workflow_task_failure_records_large_stack_and_omitted_valid_details() {
     })
     .await
     .unwrap();
+    assert_eq!(
+        task.workflow_id.as_deref(),
+        Some(handle.workflow_id.as_str())
+    );
     let details = serde_json::to_value(
         encode_avro_value(&AvroValue::String("valid detail".repeat(300_000))).unwrap(),
     )

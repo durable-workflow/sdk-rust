@@ -5039,6 +5039,7 @@ impl Client {
 
         if let Some(body) = body {
             let mut body = serde_json::to_value(body)?;
+            self.check_activity_lease_request(path, Some(&body))?;
             let mut report = failure_reporting::Prepared::new(
                 &mut body,
                 path,
