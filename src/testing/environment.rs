@@ -137,11 +137,10 @@ impl WorkflowEnvironment {
                             .state
                             .lock()
                             .map_err(|_| Error::WorkflowStatePoisoned)?;
-                        let sequence = state
+                        state
                             .recorded_commands
                             .last()
-                            .map_or(1, |command| command.sequence().saturating_add(1));
-                        sequence
+                            .map_or(1, |command| command.sequence().saturating_add(1))
                     };
                     let outcome = Worker::poll_workflow_future(&context, &mut future)?;
                     {

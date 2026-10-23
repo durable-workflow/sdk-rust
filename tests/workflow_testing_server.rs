@@ -30,8 +30,9 @@ async fn published_server_history_export_replays_offline_and_detects_changed_act
         Ok(json!({"number":number,"version":version,"result":second}))
     });
     worker.register().await.unwrap();
+    let input = "x".repeat(128 * 1024);
     let handle = client
-        .start_workflow("offline-replay", &queue, &queue, json!(["recorded"]))
+        .start_workflow("offline-replay", &queue, &queue, json!([input]))
         .await
         .unwrap();
     let watcher = handle.clone();
@@ -54,7 +55,7 @@ async fn published_server_history_export_replays_offline_and_detects_changed_act
             .result(WorkflowResultOptions::default())
             .await
             .unwrap(),
-        json!({"number":42,"version":1,"result":"recorded"})
+        json!({"number":42,"version":1,"result":input})
     );
     let export = client
         .export_workflow_history(&handle.workflow_id, handle.run_id.as_deref().unwrap())
@@ -73,5 +74,5 @@ async fn published_server_history_export_replays_offline_and_detects_changed_act
     assert!(
         matches!(changed.replay(&history),Err(Error::NonDeterministicReplay(f)) if f.sequence==Some(3) && f.expected.as_deref()==Some("activity:first") && f.actual.as_deref()==Some("activity:changed"))
     );
-    println!("published Server export: unchanged offline replay passed; changed activity diverged at sequence3");
+    println!("published Server export:128KiB original input replayed unchanged; changed activity diverged at sequence3");
 }
