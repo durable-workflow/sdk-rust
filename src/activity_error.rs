@@ -2,7 +2,7 @@ use crate::Error;
 
 /// An application failure returned by an activity handler.
 ///
-/// The exception type is matched by [`crate::ActivityRetryPolicy::non_retryable_error_types`].
+/// The exception type is matched by [`crate::ActivityRetryPolicy::non_retryable_error_types()`].
 /// Local and remote activities preserve the same type, message and retry marker.
 /// Convert this error into [`Error`] with `.into()` when returning it from a handler.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

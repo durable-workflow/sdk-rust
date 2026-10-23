@@ -239,7 +239,7 @@ Activity handlers can return an application-defined failure type with
 and local activities, including cooperative workers:
 
 ```rust
-use durable_workflow::{ActivityError, ActivityRetryPolicy, Worker};
+use durable_workflow::{ActivityError, Worker};
 # fn register(worker: &mut Worker) {
 worker.register_activity("charge", |_, _| async {
     Err(ActivityError::new("PaymentDeclined", "card declined")
