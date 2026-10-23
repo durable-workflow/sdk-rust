@@ -166,3 +166,19 @@ async fn query_and_update_failures_cannot_bypass_complete_report_cap() {
     assert_eq!(reports[1].2["commands"][0]["update_id"], "exact-update");
     assert_eq!(reports[1].2["commands"][0]["non_retryable"], true);
 }
+
+#[tokio::test]
+async fn plain_failures_respect_the_lower_limit_already_observed_by_cluster_info() {
+    let server = Server::start(4096, vec![]).await;
+    let client = Client::new(&server.url).unwrap();
+    client.cluster_info().await.unwrap();
+    client
+        .clone()
+        .fail_activity_task("task", "attempt", "owner", "\u{0000}".repeat(3 * MIB), true)
+        .await
+        .unwrap();
+    let reports = server.reports();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].1.len() <= 4096);
+    assert_eq!(reports[0].2["failure"]["non_retryable"], true);
+}

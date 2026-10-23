@@ -60,7 +60,7 @@ use std::{
     io::{self, Read},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     task::{Context as TaskContext, Poll},
@@ -3010,6 +3010,7 @@ pub struct Client {
     worker_build_id: Option<String>,
     sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
+    failure_request_limit: Arc<AtomicUsize>,
     activity_lease_renewal_supported: Arc<AtomicBool>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
@@ -3087,6 +3088,7 @@ impl Client {
         self.observe_activity_lease_capabilities(
             &discovery["worker_protocol"]["server_capabilities"],
         );
+        self.observe_failure_request_limit(&discovery);
         Ok(discovery)
     }
 
@@ -5042,7 +5044,7 @@ impl Client {
                 path,
                 failure_reporting::REQUEST_BYTES,
             )?;
-            if let Some(report) = report.as_mut() {
+            if let Some(report) = report.as_mut().filter(|report| report.can_reduce()) {
                 let limit = self
                     .discover_failure_request_limit(&body, path, protocol)
                     .await?;
@@ -5956,6 +5958,7 @@ impl ClientBuilder {
             worker_build_id: None,
             sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
+            failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]

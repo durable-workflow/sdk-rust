@@ -446,7 +446,12 @@ impl Prepared {
         let mut local_reports = false;
         match parts.as_slice() {
             ["worker", "activity-tasks" | "workflow-tasks" | "query-tasks", _, "fail"] => {
-                pointers.push("/failure".into())
+                local_reports = true;
+                // Preserve Server validation and ordinary payload handling for
+                // malformed raw requests; their final body is still guarded.
+                if body["failure"]["message"].is_string() {
+                    pointers.push("/failure".into());
+                }
             }
             ["worker", "workflow-tasks", _, "complete"] => {
                 for (index, command) in body["commands"]
@@ -456,7 +461,7 @@ impl Prepared {
                     .enumerate()
                 {
                     if command["type"] == "fail_workflow" || command["type"] == "fail_update" {
-                        if command["exception"].is_object() {
+                        if command["exception"]["message"].is_string() {
                             pointers.push(format!("/commands/{index}/exception"));
                             if command.get("message").is_some() {
                                 mirrors.push((
@@ -529,6 +534,10 @@ impl Prepared {
             *body.pointer_mut(target).expect("retained command message") = message;
         }
         Ok(())
+    }
+
+    pub(super) fn can_reduce(&self) -> bool {
+        !self.failures.is_empty() || !self.texts.is_empty()
     }
 
     pub(super) fn encode(&mut self, body: &mut Value, limit: usize) -> Result<Vec<u8>> {

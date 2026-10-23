@@ -83,6 +83,19 @@ struct Upload {
 }
 
 impl Client {
+    pub(super) fn observe_failure_request_limit(&self, info: &Value) {
+        if let Some(limit) = info
+            .pointer("/limits/max_payload_bytes")
+            .and_then(Value::as_u64)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+        {
+            // Namespace/base URL are immutable on Client. Its clones share the
+            // conservative lower cap learned through normal discovery.
+            self.failure_request_limit
+                .fetch_min(limit, Ordering::Relaxed);
+        }
+    }
     pub(super) async fn discover_failure_request_limit(
         &self,
         body: &Value,
@@ -116,7 +129,7 @@ impl Client {
             .map_or(crate::failure_reporting::REQUEST_BYTES, |(_, p)| {
                 p.request_bytes
             })
-            .min(crate::failure_reporting::REQUEST_BYTES))
+            .min(self.failure_request_limit.load(Ordering::Relaxed)))
     }
 
     pub(super) async fn externalize_runtime_payloads(
@@ -250,6 +263,7 @@ impl Client {
         let info = self
             .runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
             .await?;
+        self.observe_failure_request_limit(&info);
         let policy = Policy::from_info(&info)?;
         self.runtime_upload_policy
             .lock()
