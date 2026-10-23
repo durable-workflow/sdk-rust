@@ -1827,7 +1827,7 @@ impl Worker {
         task_metrics: &mut crate::metrics::WorkerObservation,
     ) -> Result<ManagedPollOutcome> {
         let session = self.track_session_task(task.worker_session.as_ref())?;
-        let hydration_claim = task.hydration_claim;
+        let metadata = task.invocation(session);
         let task = task.task;
         let guard = ActivityClaimGuard::new(&self.client, &task, &self.worker_id)?;
         let _abandon_on_drop = AbandonActivityOnDrop(guard.clone());
@@ -1840,8 +1840,7 @@ impl Worker {
                 &task,
                 &guard,
                 &mut callback_started,
-                session,
-                hydration_claim.as_ref(),
+                metadata,
             );
             tokio::pin!(invocation);
             loop {
@@ -1920,8 +1919,7 @@ impl Worker {
         task: &ActivityTask,
         guard: &ActivityClaimGuard,
         callback_started: &mut bool,
-        worker_session: Option<crate::WorkerSession>,
-        hydration_claim: Option<&crate::activity_hydration::HydrationClaim>,
+        invocation: worker_session::ActivityInvocation,
     ) -> Result<AvroValue> {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
@@ -1939,20 +1937,13 @@ impl Worker {
                         task,
                         guard,
                         callback_started,
-                        worker_session,
-                        hydration_claim,
+                        invocation,
                     ),
                 )
                 .await;
         }
-        self.execute_cooperative_activity_task_inner(
-            task,
-            guard,
-            callback_started,
-            worker_session,
-            hydration_claim,
-        )
-        .await
+        self.execute_cooperative_activity_task_inner(task, guard, callback_started, invocation)
+            .await
     }
 
     async fn execute_cooperative_activity_task_inner(
@@ -1960,9 +1951,13 @@ impl Worker {
         task: &ActivityTask,
         guard: &ActivityClaimGuard,
         callback_started: &mut bool,
-        worker_session: Option<crate::WorkerSession>,
-        hydration_claim: Option<&crate::activity_hydration::HydrationClaim>,
+        invocation: worker_session::ActivityInvocation,
     ) -> Result<AvroValue> {
+        let worker_session::ActivityInvocation {
+            worker_session,
+            hydration_claim,
+            retry_info,
+        } = invocation;
         validate_activity_task_payloads(task)?;
         let handler = self
             .activities
@@ -1976,13 +1971,14 @@ impl Worker {
             lease_owner: guard.owner.clone(),
             activity_type: task.activity_type.clone(),
             attempt_number: task.attempt_number,
+            retry_info,
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
             claim_guard: Some(guard.clone()),
             local_heartbeats: None,
             worker_session,
         };
-        if let Some(claim) = hydration_claim {
+        if let Some(claim) = &hydration_claim {
             claim.confirm(&self.client).await?;
         }
         guard.boundary()?;
