@@ -656,6 +656,10 @@ impl Worker {
                 // Match the terminal fields Server persists. Database-generated
                 // execution/failure IDs are only available on committed replay.
                 let mut payload = wire.clone();
+                if let Some(message) = payload["message"].as_str() {
+                    payload["message"] =
+                        json!(crate::failure_reporting::committed_message(message));
+                }
                 payload["attempt_number"] = json!(number);
                 payload["failure_category"] = json!(if timeout_kind.is_some() {
                     "timeout"

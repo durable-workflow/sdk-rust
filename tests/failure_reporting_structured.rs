@@ -13,7 +13,7 @@ async fn structured_reports_bound_stack_combined_details_and_final_escaping() {
         .unwrap(),
     )
     .unwrap();
-    let failure = json!({"type":"Original","message":"\u{0000}界🦀".repeat(400_000),"stack_trace":"\u{0001}".repeat(3*MIB),
+    let failure = json!({"type":"Original","message":"\u{0000}".repeat(3*MIB),"stack_trace":"\u{0001}".repeat(3*MIB),
         "retryable":false,"non_retryable":true,"details":details,"diagnostics":{"causes":[{"nested":"界".repeat(MIB)}]},
         "runtime_diagnostics":{"custom":"x".repeat(MIB)}});
     client
@@ -26,7 +26,7 @@ async fn structured_reports_bound_stack_combined_details_and_final_escaping() {
         .unwrap();
     let reports = server.reports();
     assert_eq!(reports.len(), 2);
-    for (_, bytes, body) in reports {
+    for (path, bytes, body) in reports {
         assert!(
             bytes.len() <= MIB,
             "actual body including markers/escaping {} bytes",
@@ -40,13 +40,25 @@ async fn structured_reports_bound_stack_combined_details_and_final_escaping() {
             failure.get("details").is_none(),
             "large Avro details omitted atomically"
         );
-        let marker = &failure["diagnostics"]["sdk_failure_truncation"];
-        assert_eq!(marker["original_stack_trace_bytes"], 3 * MIB);
-        assert!(marker["omitted_fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "details"));
+        if path.contains("/workflow-tasks/") {
+            assert!(failure["message"]
+                .as_str()
+                .unwrap()
+                .contains("original_stack_trace_bytes"));
+            assert!(failure["message"].as_str().unwrap().contains("details"));
+            assert!(
+                failure.get("diagnostics").is_none(),
+                "no unsupported diagnostic wire field added"
+            );
+        } else {
+            let marker = &failure["diagnostics"]["sdk_failure_truncation"];
+            assert_eq!(marker["original_stack_trace_bytes"], 3 * MIB);
+            assert!(marker["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "details"));
+        }
     }
 }
 
@@ -127,4 +139,30 @@ async fn small_structured_report_and_valid_details_are_unchanged() {
         .await
         .unwrap();
     assert_eq!(server.reports()[0].2["failure"], failure);
+}
+
+#[tokio::test]
+async fn query_and_update_failures_cannot_bypass_complete_report_cap() {
+    let server = Server::start(2 * MIB, vec![]).await;
+    let client = Client::new(&server.url).unwrap();
+    client
+        .fail_query_task(
+            "exact-query",
+            "owner",
+            7,
+            "\u{0000}".repeat(3 * MIB),
+            "original_reason",
+            "OriginalQueryType",
+        )
+        .await
+        .unwrap();
+    client.complete_workflow_task("task","owner",3,vec![json!({"type":"fail_update","update_id":"exact-update","message":"界\\\n".repeat(MIB),"exception_type":"OriginalUpdateType","non_retryable":true})]).await.unwrap();
+    let reports = server.reports();
+    assert_eq!(reports.len(), 2);
+    assert!(reports.iter().all(|(_, bytes, _)| bytes.len() <= MIB));
+    assert_eq!(reports[0].2["query_task_attempt"], 7);
+    assert_eq!(reports[0].2["failure"]["reason"], "original_reason");
+    assert_eq!(reports[0].2["failure"]["type"], "OriginalQueryType");
+    assert_eq!(reports[1].2["commands"][0]["update_id"], "exact-update");
+    assert_eq!(reports[1].2["commands"][0]["non_retryable"], true);
 }

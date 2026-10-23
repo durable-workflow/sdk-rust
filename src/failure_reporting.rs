@@ -5,7 +5,9 @@ use serde_json::Map;
 use std::io::{self, Write};
 use thiserror::Error as ThisError;
 
-pub const MESSAGE_BYTES: usize = 64 * 1024;
+// Published runtimes persist a TEXT timeline summary containing a prefix,
+// activity label and the message. Reserve room below its 65,535-byte boundary.
+pub const MESSAGE_BYTES: usize = 62 * 1024;
 pub const STACK_BYTES: usize = 128 * 1024;
 pub const DIAGNOSTIC_BYTES: usize = 64 * 1024;
 pub const REQUEST_BYTES: usize = 1024 * 1024;
@@ -92,6 +94,12 @@ impl LocalText {
     }
 }
 
+/// Match published failure/local-command normalization's PHP trim character set.
+/// Apply to the observed outcome, without rewriting the outgoing original.
+pub(super) fn committed_message(message: &str) -> &str {
+    message.trim_matches(|ch| matches!(ch, '\0' | '\t' | '\n' | '\r' | '\u{000b}' | ' '))
+}
+
 /// Fit only the current, not-yet-observed local command. Previously returned
 /// local outcomes and unrelated business payloads are fixed inputs.
 pub(super) fn fit_local(
@@ -110,6 +118,12 @@ pub(super) fn fit_local(
         let mut diagnostic_bytes = 2_usize;
         for (attempt, original) in messages {
             let message = original.render(target);
+            if committed_message(&message).is_empty() {
+                return Err(FailureReportError::InvalidReport(
+                    "local failure message is empty after Server normalization",
+                )
+                .into());
+            }
             diagnostic_bytes = diagnostic_bytes
                 .saturating_add(encoded_size(&message)?)
                 .saturating_add(1);
@@ -142,10 +156,11 @@ fn core(key: &str) -> bool {
             | "stack_trace"
             | "type"
             | "class"
-            | "code"
             | "non_retryable"
             | "retryable"
             | "kind"
+            | "reason"
+            | "sequence"
             | "timeout_type"
             | "cancelled"
             | "malformed_output"
@@ -221,9 +236,15 @@ struct Failure {
     original: Map<String, Value>,
     metadata_bytes: usize,
     field_sizes: Vec<usize>,
+    inline_diagnostics: bool,
 }
 impl Failure {
-    fn take(body: &mut Value, pointer: String, limit: usize) -> Result<Self> {
+    fn take(
+        body: &mut Value,
+        pointer: String,
+        limit: usize,
+        inline_diagnostics: bool,
+    ) -> Result<Self> {
         let value = body
             .pointer_mut(&pointer)
             .ok_or(FailureReportError::InvalidReport("missing failure object"))?
@@ -286,6 +307,7 @@ impl Failure {
             original,
             metadata_bytes,
             field_sizes,
+            inline_diagnostics,
         })
     }
 
@@ -343,7 +365,18 @@ impl Failure {
         } else if let Some(value) = self.original.get("stack_trace") {
             output.insert("stack_trace".into(), value.clone());
         }
-        if truncated {
+        let mut message_marker = MESSAGE_MARKER.to_owned();
+        if truncated && self.inline_diagnostics {
+            // Workflow/query-task failure schemas have no diagnostic field.
+            // Use their existing message, with exact sizing after JSON escaping.
+            message_marker = format!(
+                "\n[truncated: {}]",
+                serde_json::to_string(&json!({
+                    "original_message_bytes":message.len(),"original_stack_trace_bytes":stack.map_or(0,str::len),
+                    "original_metadata_json_bytes":self.metadata_bytes,"omitted_fields":omitted.names,"omitted_field_count":omitted.count,
+                }))?
+            );
+        } else if truncated {
             let diagnostic = output.remove("diagnostics");
             let mut diagnostics = match diagnostic {
                 Some(Value::Object(map)) => map,
@@ -367,7 +400,7 @@ impl Failure {
         }
         output.insert(
             "message".into(),
-            Value::String(clipped(message, budget.message, MESSAGE_MARKER, truncated)),
+            Value::String(clipped(message, budget.message, &message_marker, truncated)),
         );
         // Count the actual serialized metadata after inserting markers, including
         // escaped field names and any wrapper around existing diagnostics.
@@ -412,7 +445,7 @@ impl Prepared {
         let mut mirrors = Vec::new();
         let mut local_reports = false;
         match parts.as_slice() {
-            ["worker", "activity-tasks" | "workflow-tasks", _, "fail"] => {
+            ["worker", "activity-tasks" | "workflow-tasks" | "query-tasks", _, "fail"] => {
                 pointers.push("/failure".into())
             }
             ["worker", "workflow-tasks", _, "complete"] => {
@@ -422,7 +455,7 @@ impl Prepared {
                     .flatten()
                     .enumerate()
                 {
-                    if command["type"] == "fail_workflow" {
+                    if command["type"] == "fail_workflow" || command["type"] == "fail_update" {
                         if command["exception"].is_object() {
                             pointers.push(format!("/commands/{index}/exception"));
                             if command.get("message").is_some() {
@@ -461,8 +494,12 @@ impl Prepared {
             .into());
         }
         let mut failures = Vec::new();
+        let inline_diagnostics = matches!(
+            parts.as_slice(),
+            ["worker", "workflow-tasks" | "query-tasks", _, "fail"]
+        );
         for pointer in pointers {
-            failures.push(Failure::take(body, pointer, limit)?);
+            failures.push(Failure::take(body, pointer, limit, inline_diagnostics)?);
         }
         let prepared = Self {
             failures,
@@ -759,5 +796,20 @@ mod tests {
             Err(crate::Error::FailureReporting(_))
         ));
         assert_eq!(body["commands"][0], prior);
+    }
+
+    #[test]
+    fn local_observation_matches_php_trim_without_changing_small_wire_message() {
+        let message = "\0\t \r\n\u{000b} original \0\t\r\n";
+        assert_eq!(committed_message(message), "original");
+        assert_eq!(
+            committed_message("\u{00a0}original\u{00a0}"),
+            "\u{00a0}original\u{00a0}"
+        );
+        let mut body = json!({"commands":[{"type":"record_local_activity","message":message,"attempts":[{"message":message}]}]});
+        let before = body.clone();
+        fit_local(&mut body, 0, &[(0, LocalText::new(message))], REQUEST_BYTES).unwrap();
+        assert_eq!(body, before);
+        assert!(fit_local(&mut body, 0, &[(0, LocalText::new("\0 \t"))], REQUEST_BYTES).is_err());
     }
 }

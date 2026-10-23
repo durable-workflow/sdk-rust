@@ -45,7 +45,7 @@ impl Server {
                                     .then(|| value.trim().parse::<usize>().unwrap())
                             })
                             .unwrap_or(0);
-                        assert!(length < 16 * MIB, "test fixture bounds its raw intake");
+                        assert!(length < 64 * MIB, "test fixture bounds its raw intake");
                         break (index + 4, length);
                     }
                 };
@@ -71,6 +71,7 @@ impl Server {
                 } else if path.ends_with("/status") {
                     json!({"task_id":path.split('/').rev().nth(1).unwrap(),"activity_attempt_id":request["activity_attempt_id"],
                     "lease_owner":"failure-worker","can_continue":true,"cancel_requested":false,"heartbeat_recorded":false,
+                    "reason":null,"run_closed_reason":null,"run_closed_at":null,"last_heartbeat_at":null,
                     "task_status":"leased","attempt_status":"running","activity_status":"running","lease_expires_at":"2099-01-01T00:00:00Z"})
                 } else if path.ends_with("/fail") || path.ends_with("/complete") {
                     saved.lock().unwrap().push((path.to_owned(), raw));

@@ -4660,9 +4660,9 @@ impl Client {
     }
 
     /// Report a workflow-task failure using the existing Server failure schema.
-    /// Message, stack and diagnostic data are bounded before transport. Details
-    /// must be valid Avro envelopes/references; oversized details may be omitted
-    /// with an explicit diagnostic rather than sliced as encoded bytes.
+    /// The published schema supports `message`, `type`, `reason`, `sequence`
+    /// and `stack_trace`. Oversized data is bounded before transport; original
+    /// sizes and omissions are marked in the existing message field.
     pub async fn fail_workflow_task_with_failure(
         &self,
         task_id: &str,
@@ -5037,7 +5037,11 @@ impl Client {
 
         if let Some(body) = body {
             let mut body = serde_json::to_value(body)?;
-            let mut report = failure_reporting::Prepared::new(&mut body, path, failure_reporting::REQUEST_BYTES)?;
+            let mut report = failure_reporting::Prepared::new(
+                &mut body,
+                path,
+                failure_reporting::REQUEST_BYTES,
+            )?;
             if let Some(report) = report.as_mut() {
                 let limit = self
                     .discover_failure_request_limit(&body, path, protocol)

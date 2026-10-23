@@ -244,6 +244,8 @@ impl WorkflowEnvironment {
         let args = decode_task_avro_arguments(command.get("arguments"), DEFAULT_CODEC)?;
         let policy = &command["retry_policy"];
         let attempts = policy["max_attempts"].as_u64().unwrap_or(1);
+        let mut local_messages = Vec::new();
+        let mut local_attempts = Vec::new();
         for attempt in 1..=attempts {
             budget.spend()?;
             let result = activity_attempt(
@@ -271,6 +273,13 @@ impl WorkflowEnvironment {
             };
             let mut failure = ActivityError::from_error(&error, fallback);
             failure.non_retryable |= excluded_failure(policy, &failure.exception_type);
+            if local {
+                local_messages.push((
+                    local_attempts.len(),
+                    crate::failure_reporting::LocalText::new(&failure.message),
+                ));
+                local_attempts.push(json!({"message":failure.message}));
+            }
             if attempt < attempts && !failure.non_retryable {
                 append(
                     history,
@@ -282,7 +291,37 @@ impl WorkflowEnvironment {
                 )?;
                 continue;
             }
-            payload["message"] = json!(failure.message);
+            if local {
+                let mut body = json!({"commands":[{"type":"record_local_activity","message":failure.message,"attempts":local_attempts}]});
+                crate::failure_reporting::fit_local(
+                    &mut body,
+                    0,
+                    &local_messages,
+                    crate::failure_reporting::REQUEST_BYTES,
+                )?;
+                payload["message"] = json!(crate::failure_reporting::committed_message(
+                    body["commands"][0]["message"]
+                        .as_str()
+                        .expect("local failure message")
+                ));
+            } else {
+                let mut body = json!({"failure":{"message":failure.message,"type":failure.exception_type,"non_retryable":failure.non_retryable}});
+                let mut report = crate::failure_reporting::Prepared::new(
+                    &mut body,
+                    "/worker/activity-tasks/offline/fail",
+                    crate::failure_reporting::REQUEST_BYTES,
+                )?
+                .expect("activity report");
+                report.encode(&mut body, crate::failure_reporting::REQUEST_BYTES)?;
+                payload["message"] = json!(crate::failure_reporting::committed_message(
+                    body["failure"]["message"]
+                        .as_str()
+                        .expect("activity failure message")
+                ));
+                if let Some(diagnostics) = body["failure"].get("diagnostics") {
+                    payload["diagnostics"] = diagnostics.clone();
+                }
+            }
             payload["exception_type"] = json!(failure.exception_type);
             payload["non_retryable"] = json!(failure.non_retryable);
             payload["failure_category"] = json!("activity");

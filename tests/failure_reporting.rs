@@ -87,3 +87,59 @@ async fn workflow_task_and_terminal_workflow_report_large_failure() {
     assert_eq!(command["exception_type"], "Original");
     assert_eq!(command["non_retryable"], true);
 }
+
+#[tokio::test]
+async fn fresh_workflow_tests_record_bounded_failures_and_replay_without_callbacks() {
+    use durable_workflow::{
+        testing::WorkflowEnvironment, ActivityOptions, ActivityRetryPolicy, Error,
+        LocalActivityOptions,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    for local in [false, true] {
+        let mut env = WorkflowEnvironment::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saved = calls.clone();
+        env.register_activity("large", move |_, _| {
+            saved.fetch_add(1, Ordering::SeqCst);
+            async { Err(ActivityError::new("Original", "\u{0000}界".repeat(800_000)).into()) }
+        });
+        env.register_workflow("large-failure", move |ctx, _| async move {
+            let policy = ActivityRetryPolicy::new(2).backoff_intervals([Duration::ZERO]);
+            let result = if local {
+                ctx.local_activity_with_options(
+                    "large",
+                    LocalActivityOptions::new().retry_policy(policy),
+                    json!([]),
+                )
+                .await
+            } else {
+                ctx.activity_with_options(
+                    "large",
+                    ActivityOptions::new().retry_policy(policy),
+                    json!([]),
+                )
+                .await
+            };
+            let Err(Error::ActivityFailed(failure)) = result else {
+                panic!("expected original activity failure");
+            };
+            assert!(failure.message.len() <= 62 * 1024);
+            assert!(failure.message.contains("[truncated"));
+            assert_eq!(failure.exception_type.as_deref(), Some("Original"));
+            assert_eq!(failure.attempt_number, Some(2));
+            assert!(!failure.non_retryable);
+            Ok(json!(failure.message))
+        });
+        env.run_workflow("large-failure", ()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(env.replay(env.last_history().unwrap()).unwrap().completed);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "committed failures replay without activities"
+        );
+    }
+}
