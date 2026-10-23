@@ -529,6 +529,11 @@ fn health_check(enabled: bool) -> bool {
             with self.assertRaisesRegex(VALIDATOR.CorpusError, "cannot inspect base source"):
                 self._guard_matches(REPLAY_GUARD)
 
+    def test_non_ascii_reexport_is_not_in_the_narrow_exemption(self) -> None:
+        source = self.root / "src/lib.rs"
+        source.write_text(source.read_text() + "\npub use pagination::WorkflowHistoryPageé;\n")
+        self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
     def test_previous_codec_hunk_label_does_not_classify_client_changes(self) -> None:
         diff = """\
 diff --git a/src/lib.rs b/src/lib.rs

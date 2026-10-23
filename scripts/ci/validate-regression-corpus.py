@@ -1807,19 +1807,21 @@ def _added_reexport(lines: list[str], start: int) -> tuple[str, list[int]] | Non
 
 def _fresh_reexport_bindings(declaration: str, base_source: str) -> bool:
     block = re.fullmatch(
-        r"pub use [A-Za-z_][A-Za-z0-9_:]*::\{([A-Za-z0-9_,\s]+)\};",
+        r"pub use [A-Za-z_][\w:]*::\{([\w,\s]+)\};",
         declaration,
+        re.ASCII,
     )
     single = re.fullmatch(
-        r"pub use [A-Za-z_][A-Za-z0-9_:]*::([A-Za-z_][A-Za-z0-9_]*);",
+        r"pub use [A-Za-z_][\w:]*::([A-Za-z_]\w*);",
         declaration,
+        re.ASCII,
     )
     match = block or single
     if match is None:
         return False
     names = [name.strip() for name in match.group(1).split(",") if name.strip()]
     return bool(names) and all(
-        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+        re.fullmatch(r"[A-Za-z_]\w*", name, re.ASCII)
         and re.search(rf"\b{re.escape(name)}\b", base_source) is None
         for name in names
     )
