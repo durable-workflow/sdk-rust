@@ -100,6 +100,25 @@ ordinary worker registration does not enable it.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Worker concurrency
+
+`Worker::max_concurrent_workflow_tasks(...)` and
+`Worker::max_concurrent_activity_tasks(...)` each default to 10. `run` and
+`run_until` run up to those limits in independent workflow and activity lanes.
+Use a value of 1 for serial execution within a task family. Clones share their
+configured capacity, including concurrent `run_once` calls.
+
+Heartbeats report unused slots from actual claimed tasks, including input and
+history loading, callback execution and settlement. An empty long poll keeps
+its capacity available. Success, failure, refusal and cancellation release the
+local slot. Inline local activities occupy their workflow-task slot and bypass
+the remote activity pool. Queries retain their separate polling lane.
+
+Handlers run as async futures on Tokio and must yield. Use
+`tokio::task::spawn_blocking` or a separate process for blocking work, with its own
+cancellation boundary. A concurrency setting does not provide CPU isolation or
+make blocking code cancellable.
+
 ### Query execution authority
 
 On a runtime advertising `query_task_authority` with worker protocol 1.20,

@@ -18,6 +18,7 @@ mod sticky_worker;
 mod sticky_workflow_cache;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
 
@@ -2981,6 +2982,7 @@ pub struct Client {
     namespace: String,
     max_external_payload_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
+    worker_task_slot: Option<Arc<worker_capacity::TaskSlotMarker>>,
     cooperative_worker_protocol: bool,
     worker_protocol_version: WorkerProtocolVersion,
     local_activities_enabled: bool,
@@ -5245,7 +5247,7 @@ impl Client {
         let mut retries = 0;
 
         loop {
-            let response = if resolve {
+            let response: Result<Value> = if resolve {
                 self.request_json_with_timeout(
                     reqwest::Method::POST,
                     path,
@@ -5267,7 +5269,15 @@ impl Client {
 
             match response {
                 Err(Error::Transport(_)) if retries < max_retries => retries += 1,
-                response => return worker_poll_response(response),
+                response => {
+                    let value = worker_poll_response(response)?;
+                    if value.get("task").is_some_and(|task| !task.is_null()) {
+                        if let Some(slot) = &self.worker_task_slot {
+                            slot.claimed();
+                        }
+                    }
+                    return Ok(serde_json::from_value(value)?);
+                }
             }
         }
     }
@@ -5905,6 +5915,7 @@ impl ClientBuilder {
             namespace: self.namespace,
             max_external_payload_bytes: self.max_external_payload_bytes,
             worker_storage_admission: None,
+            worker_task_slot: None,
             cooperative_worker_protocol: false,
             worker_protocol_version: self.worker_protocol_version,
             local_activities_enabled: false,
@@ -7293,6 +7304,8 @@ pub struct Worker {
     registration_error: Option<DuplicateRegistrationError>,
     max_concurrent_workflow_tasks: usize,
     max_concurrent_activity_tasks: usize,
+    workflow_capacity: Arc<worker_capacity::TaskCapacity>,
+    activity_capacity: Arc<worker_capacity::TaskCapacity>,
     poll_timeout: Duration,
     heartbeat_interval: Duration,
     retry_policy: WorkerRetryPolicy,
@@ -7331,6 +7344,8 @@ impl Worker {
             registration_error: None,
             max_concurrent_workflow_tasks: 10,
             max_concurrent_activity_tasks: 10,
+            workflow_capacity: worker_capacity::TaskCapacity::new(10),
+            activity_capacity: worker_capacity::TaskCapacity::new(10),
             poll_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
             retry_policy: WorkerRetryPolicy::default(),
@@ -7486,12 +7501,16 @@ impl Worker {
     }
 
     pub fn max_concurrent_workflow_tasks(mut self, count: usize) -> Self {
-        self.max_concurrent_workflow_tasks = count.max(1);
+        self.max_concurrent_workflow_tasks = count.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        self.workflow_capacity =
+            worker_capacity::TaskCapacity::new(self.max_concurrent_workflow_tasks);
         self
     }
 
     pub fn max_concurrent_activity_tasks(mut self, count: usize) -> Self {
-        self.max_concurrent_activity_tasks = count.max(1);
+        self.max_concurrent_activity_tasks = count.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        self.activity_capacity =
+            worker_capacity::TaskCapacity::new(self.max_concurrent_activity_tasks);
         self
     }
 
@@ -8580,8 +8599,8 @@ impl Worker {
                     let result = self.retry_worker_operation(|| {
                         self.client.heartbeat_worker_with_sessions(
                             &self.worker_id,
-                            self.max_concurrent_workflow_tasks,
-                            self.max_concurrent_activity_tasks,
+                            self.workflow_capacity.available(),
+                            self.activity_capacity.available(),
                             self.client.worker_sessions_enabled.then(|| self.session_available()),
                         )
                     }).await;
@@ -8720,7 +8739,7 @@ impl Worker {
         Ok(handled)
     }
 
-    async fn poll_workflow_once(&self) -> Result<ManagedPollOutcome> {
+    async fn poll_workflow_once_reserved(&self) -> Result<ManagedPollOutcome> {
         if self.client.sticky_cache.is_some()
             && !self.sticky_registration_confirmed.load(Ordering::SeqCst)
         {
@@ -8882,25 +8901,7 @@ impl Worker {
         Ok(ManagedPollOutcome::Handled)
     }
 
-    async fn poll_workflows_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
-        while !stop.load(Ordering::SeqCst) {
-            match self.poll_workflow_once().await {
-                Ok(ManagedPollOutcome::Stop) => {
-                    stop.store(true, Ordering::SeqCst);
-                    break;
-                }
-                Err(error) => {
-                    stop.store(true, Ordering::SeqCst);
-                    return Err(error);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
+    async fn poll_activity_once_reserved(&self) -> Result<ManagedPollOutcome> {
         if self.client.worker_sessions_enabled {
             self.require_session_registration()?;
         }
@@ -9012,46 +9013,6 @@ impl Worker {
         }
 
         Ok(ManagedPollOutcome::Handled)
-    }
-
-    async fn poll_activities_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
-        // Each lane retains its leased response through callback settlement.
-        // A bounded independent activity must not occupy the cleanup lane too.
-        // Preserve the existing serial loop unless cooperation is enabled.
-        let lane_count = if self.cooperative_cancellation_enabled {
-            self.max_concurrent_activity_tasks
-        } else {
-            1
-        };
-        let mut lanes = FuturesUnordered::new();
-        for _ in 0..lane_count {
-            let worker = self.clone();
-            let stop = Arc::clone(&stop);
-            lanes.push(async move {
-                while !stop.load(Ordering::SeqCst) {
-                    match worker.poll_activity_once().await {
-                        Ok(ManagedPollOutcome::Stop) => {
-                            stop.store(true, Ordering::SeqCst);
-                            break;
-                        }
-                        Err(error) => {
-                            stop.store(true, Ordering::SeqCst);
-                            return Err(error);
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            });
-        }
-        // Join every lane before deregistration, including after one fails.
-        let mut first_error = None;
-        while let Some(result) = lanes.next().await {
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {
@@ -18780,6 +18741,7 @@ mod tests {
     mod runtime_payloads;
     mod runtime_uploads;
     mod version_marker_contract;
+    mod worker_capacity;
     mod worker_session;
     use std::{
         fs,
