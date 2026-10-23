@@ -43,7 +43,7 @@ impl WorkflowEnvironment {
             &self.worker,
             name,
             input,
-            1,
+            crate::ActivityRetryInfo::new(1, None),
             "offline-activity",
             &self.worker.task_queue,
             false,
@@ -250,7 +250,14 @@ impl WorkflowEnvironment {
                 &self.worker,
                 name,
                 args.clone(),
-                attempt,
+                crate::ActivityRetryInfo::new(
+                    attempt,
+                    if local {
+                        None
+                    } else {
+                        Some(payload["activity"]["retry_policy"].clone())
+                    },
+                ),
                 &identity,
                 command["queue"].as_str().unwrap_or(&self.worker.task_queue),
                 local,
@@ -359,7 +366,7 @@ async fn activity_attempt(
     worker: &Worker,
     name: &str,
     args: AvroValue,
-    attempt: u64,
+    retry_info: crate::ActivityRetryInfo,
     identity: &str,
     queue: &str,
     local: bool,
@@ -369,6 +376,7 @@ async fn activity_attempt(
         .get(name)
         .ok_or_else(|| Error::ActivityNotRegistered(name.into()))?;
     let (heartbeats, _close) = local_activity::Heartbeats::captured_attempt();
+    let attempt = retry_info.attempt_number();
     let context = ActivityContext {
         client: worker.client.clone(),
         task_id: identity.into(),
@@ -376,6 +384,7 @@ async fn activity_attempt(
         lease_owner: "offline".into(),
         activity_type: name.into(),
         attempt_number: attempt,
+        retry_info,
         task_queue: queue.into(),
         worker_id: worker.worker_id.clone(),
         claim_guard: None,

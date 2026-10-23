@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 4.8.0
+
+- Expose immutable `ActivityContext::retry_info()` with the original attempt
+  number and received retry policy, including unknown fields. Distinguish bounded,
+  explicit unlimited and unknown attempt budgets and check the final configured
+  attempt without promising retry admission. Preserve public task struct literals,
+  existing worker execution semantics and Rust 1.86 compatibility.
+
 ## 4.7.0
 
 - Add pluggable client/worker metrics recorders with a no-op default and the six

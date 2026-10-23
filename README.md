@@ -445,6 +445,33 @@ compares the complete stored list and the other known policy fields exactly;
 changing an unused entry is also a policy change. The default remains one
 attempt with an empty backoff list.
 
+In a service activity, `ctx.retry_info()` exposes the original attempt number
+and immutable Server retry snapshot. Use the configured budget for a final-attempt
+fallback:
+
+```rust
+# use durable_workflow::{json, Client, Worker};
+# let mut worker = Worker::new(Client::builder("http://localhost:8080").build()?, "orders");
+worker.register_activity("charge", |ctx, _| async move {
+    if ctx.retry_info().is_last_configured_attempt() == Some(true) {
+        // Select a final-attempt fallback or record an application alert.
+    }
+    Ok(json!({"attempt": ctx.retry_info().attempt_number()}))
+});
+# Ok::<(), durable_workflow::Error>(())
+```
+
+`ActivityAttemptLimit::Bounded(n)` includes the first attempt. `Unlimited` requires
+an explicit `max_attempts: null` in the received policy object. Omitted policies,
+root null and missing or invalid limits are `Unknown`; `policy()` retains their
+original JSON, including unknown fields. `is_last_configured_attempt()` returns
+`None` for unknown metadata, `Some(false)` for unlimited, and checks whether the
+original attempt has reached the bounded limit. A remaining budget does not
+promise a retry: non-retryable failures, cancellation, workflow closure and elapsed
+deadlines can end execution earlier. Local activities and direct `run_activity`
+tests have no received Server snapshot and report unknown policy; fresh
+`run_workflow` tests expose the modeled snapshot recorded in their history.
+
 Activity handlers can return an application-defined failure type with
 `ActivityError`. The same type, message and retry marker are reported for remote
 and local activities, including cooperative workers:

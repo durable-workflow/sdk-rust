@@ -258,12 +258,47 @@ fn lease_deadline(affinity: &Value) -> Result<Instant> {
 pub(super) struct SessionActivityTask {
     #[serde(flatten)]
     pub(super) task: crate::ActivityTask,
+    #[serde(
+        default,
+        deserialize_with = "crate::activity_retry::deserialize_policy"
+    )]
+    pub(super) retry_policy: Option<Value>,
     #[serde(default)]
     pub(super) worker_session: Option<Value>,
     #[serde(skip)]
     pub(super) hydration_claim: Option<crate::activity_hydration::HydrationClaim>,
     #[serde(skip)]
     pub(super) activity_lease: Option<Arc<crate::activity_lease::authority::Lease>>,
+}
+
+pub(super) struct ActivityInvocation {
+    pub(super) worker_session: Option<WorkerSession>,
+    pub(super) hydration_claim: Option<crate::activity_hydration::HydrationClaim>,
+    pub(super) retry_info: crate::ActivityRetryInfo,
+}
+
+#[cfg(test)]
+impl ActivityInvocation {
+    pub(super) fn unknown(attempt_number: u64) -> Self {
+        Self {
+            worker_session: None,
+            hydration_claim: None,
+            retry_info: crate::ActivityRetryInfo::new(attempt_number, None),
+        }
+    }
+}
+
+impl SessionActivityTask {
+    pub(super) fn invocation(&self, worker_session: Option<WorkerSession>) -> ActivityInvocation {
+        ActivityInvocation {
+            worker_session,
+            hydration_claim: self.hydration_claim.clone(),
+            retry_info: crate::ActivityRetryInfo::new(
+                self.task.attempt_number,
+                self.retry_policy.clone(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

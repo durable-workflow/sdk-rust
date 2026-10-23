@@ -497,9 +497,10 @@ mod tests {
             callback_entered.store(true, Ordering::SeqCst);
             async { Ok(json!(42)) }
         });
-        let result = worker
-            .execute_session_activity_task(task, None, Some(&claim))
-            .await;
+        let mut invocation =
+            crate::worker_session::ActivityInvocation::unknown(task.attempt_number);
+        invocation.hydration_claim = Some(claim.clone());
+        let result = worker.execute_session_activity_task(task, invocation).await;
         assert!(matches!(result, Err(Error::ActivityExecutionAbandoned(_))));
         assert!(!entered.load(Ordering::SeqCst));
         assert_eq!(requests.await.unwrap().len(), 1);

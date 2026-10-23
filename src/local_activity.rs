@@ -433,6 +433,7 @@ impl Worker {
                 lease_owner: task.lease_owner.clone().unwrap_or_default(),
                 activity_type: activity_type.clone(),
                 attempt_number: number,
+                retry_info: crate::ActivityRetryInfo::new(number, None),
                 task_queue: self.task_queue.clone(),
                 worker_id: self.worker_id.clone(),
                 claim_guard: None,

@@ -3,6 +3,7 @@
 mod activity_error;
 mod activity_hydration;
 mod activity_lease;
+mod activity_retry;
 mod cancellation_context;
 mod cancellation_replay_clock;
 mod cancellation_scope;
@@ -31,6 +32,7 @@ mod worker_session;
 mod workflow_hydration;
 
 pub use activity_error::ActivityError;
+pub use activity_retry::{ActivityAttemptLimit, ActivityRetryInfo};
 pub use cancellation_context::{
     CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
 };
@@ -8992,7 +8994,7 @@ impl Worker {
             return self.settle_cooperative_activity(task, task_metrics).await;
         }
         let session = self.track_session_task(task.worker_session.as_ref())?;
-        let hydration_claim = task.hydration_claim;
+        let invocation = task.invocation(session);
         let task = task.task;
 
         let task_id = task.task_id.clone();
@@ -9006,9 +9008,7 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
-        let result = self
-            .execute_session_activity_task(task, session, hydration_claim.as_ref())
-            .await;
+        let result = self.execute_session_activity_task(task, invocation).await;
         let task_outcome = if result.is_ok() {
             "completed"
         } else if matches!(result, Err(Error::ActivityExecutionAbandoned(_))) {
@@ -9976,14 +9976,14 @@ impl Worker {
 
     #[cfg(test)]
     async fn execute_activity_task(&self, task: ActivityTask) -> Result<AvroValue> {
-        self.execute_session_activity_task(task, None, None).await
+        let invocation = worker_session::ActivityInvocation::unknown(task.attempt_number);
+        self.execute_session_activity_task(task, invocation).await
     }
 
     async fn execute_session_activity_task(
         &self,
         task: ActivityTask,
-        worker_session: Option<WorkerSession>,
-        hydration_claim: Option<&activity_hydration::HydrationClaim>,
+        invocation: worker_session::ActivityInvocation,
     ) -> Result<AvroValue> {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = self.telemetry.as_ref().filter(|_| {
@@ -9997,20 +9997,24 @@ impl Worker {
                     "durable.activity.task",
                     self.activity_telemetry_fields(&task),
                     false,
-                    self.execute_session_activity_task_inner(task, worker_session, hydration_claim),
+                    self.execute_session_activity_task_inner(task, invocation),
                 )
                 .await;
         }
-        self.execute_session_activity_task_inner(task, worker_session, hydration_claim)
+        self.execute_session_activity_task_inner(task, invocation)
             .await
     }
 
     async fn execute_session_activity_task_inner(
         &self,
         task: ActivityTask,
-        worker_session: Option<WorkerSession>,
-        hydration_claim: Option<&activity_hydration::HydrationClaim>,
+        invocation: worker_session::ActivityInvocation,
     ) -> Result<AvroValue> {
+        let worker_session::ActivityInvocation {
+            worker_session,
+            hydration_claim,
+            retry_info,
+        } = invocation;
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
             if task.lease_owner.as_deref() != Some(self.worker_id.as_str())
@@ -10042,7 +10046,7 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
         let session = worker_session.clone();
-        if let Some(claim) = hydration_claim {
+        if let Some(claim) = &hydration_claim {
             claim.confirm(&self.client).await?;
         }
         #[cfg(feature = "telemetry")]
@@ -10056,6 +10060,7 @@ impl Worker {
             lease_owner,
             activity_type: task.activity_type,
             attempt_number: task.attempt_number,
+            retry_info,
             task_queue: self.task_queue.clone(),
             worker_id: self.worker_id.clone(),
             claim_guard: None,
@@ -16158,6 +16163,7 @@ pub struct ActivityContext {
     pub lease_owner: String,
     pub activity_type: String,
     pub attempt_number: u64,
+    retry_info: ActivityRetryInfo,
     pub task_queue: String,
     pub worker_id: String,
     claim_guard: Option<cooperative_cancellation::ActivityClaimGuard>,
@@ -16166,6 +16172,11 @@ pub struct ActivityContext {
 }
 
 impl ActivityContext {
+    /// Immutable original attempt identity and received retry policy.
+    pub fn retry_info(&self) -> &ActivityRetryInfo {
+        &self.retry_info
+    }
+
     pub async fn heartbeat<T: Serialize>(&self, details: T) -> Result<ActivityHeartbeatResponse> {
         if let Some(heartbeats) = &self.local_heartbeats {
             return heartbeats
