@@ -1,7 +1,11 @@
-use super::*;
+use super::{
+    MetricTags, MetricsRecorder, CLIENT_REQUESTS, CLIENT_REQUEST_DURATION_SECONDS, WORKER_POLLS,
+    WORKER_POLL_DURATION_SECONDS, WORKER_TASKS, WORKER_TASK_DURATION_SECONDS,
+};
 use ::prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
+use std::collections::BTreeMap;
 
 /// Prometheus adapter backed by the official `prometheus` crate.
 ///
