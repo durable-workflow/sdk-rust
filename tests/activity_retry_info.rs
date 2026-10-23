@@ -25,15 +25,19 @@ impl Drop for Server {
 }
 impl Server {
     async fn start(cases: &[(u64, Option<Value>)]) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let mut tasks: VecDeque<_> = cases.iter().enumerate().map(|(i, (attempt, policy))| {
+        let tasks: VecDeque<_> = cases.iter().enumerate().map(|(i, (attempt, policy))| {
             let mut task = json!({"task_id":format!("task-{i}"),"activity_attempt_id":format!("attempt-{i}"),
                 "activity_type":"inspect", "payload_codec":"avro", "attempt_number":attempt,
                 "lease_owner":"retry-worker"});
             if let Some(policy) = policy { task["retry_policy"] = policy.clone(); }
             task
         }).collect();
+        Self::start_tasks(tasks).await
+    }
+
+    async fn start_tasks(mut tasks: VecDeque<Value>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let settlements = Arc::new(Mutex::new(Vec::new()));
         let saved = settlements.clone();
         let task = tokio::spawn(async move {
@@ -69,7 +73,9 @@ impl Server {
                 let request: Value =
                     serde_json::from_slice(&bytes[header_end..header_end + length])
                         .unwrap_or(Value::Null);
-                let body = if path.ends_with("/register") {
+                let body = if path.ends_with("/cluster/info") {
+                    json!({})
+                } else if path.ends_with("/register") {
                     json!({"registered":true,"worker_id":"retry-worker", "namespace":"default", "task_queue":"retry-queue", "protocol_version":"1.20", "server_capabilities":{"cooperative_cancellation":true}, "capabilities":request["capabilities"]})
                 } else if path.ends_with("/workflow-tasks/poll") {
                     json!({"task":null})
@@ -237,4 +243,81 @@ async fn fresh_workflow_tests_share_the_recorded_snapshot_and_direct_attempts_re
     assert_eq!(result["attempt"], 1);
     assert_eq!(result["policy"]["max_attempts"], 1);
     assert_eq!(result["last"], true);
+}
+
+async fn check_execution_identity(cooperative: bool) {
+    let identities = vec![
+        json!({"activity_execution_id":"logical-activity", "workflow_id":"workflow-instance", "run_id":"workflow-run"}),
+        json!({}),
+        json!({"activity_execution_id":"other-logical-activity", "workflow_id":null, "run_id":"other-run"}),
+    ];
+    let tasks=identities.iter().enumerate().map(|(i,identity)| {
+        let mut task=json!({"task_id":format!("task-{i}"),"activity_attempt_id":format!("attempt-{i}"),
+            "activity_type":"identity", "payload_codec":"avro", "attempt_number":1, "lease_owner":"retry-worker"});
+        for (name,value) in identity.as_object().unwrap() { task[name]=value.clone(); }
+        task
+    }).collect();
+    let server = Server::start_tasks(tasks).await;
+    let client = Client::builder(&server.url).build().unwrap();
+    let mut worker = Worker::new(client, "retry-queue")
+        .worker_id("retry-worker")
+        .cooperative_cancellation(cooperative);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let saved = captured.clone();
+    worker.register_activity("identity",move |mut ctx,_| {
+        let saved=saved.clone();
+        async move {
+            let identity=json!({"activity_execution_id":ctx.activity_execution_id(),"workflow_id":ctx.workflow_id(),"run_id":ctx.run_id()});
+            let clone=ctx.clone();
+            ctx.task_id="mutated-task".into();
+            ctx.activity_attempt_id="mutated-attempt".into();
+            assert_eq!(ctx.activity_execution_id(),clone.activity_execution_id());
+            assert_eq!(ctx.workflow_id(),clone.workflow_id());
+            assert_eq!(ctx.run_id(),clone.run_id());
+            saved.lock().unwrap().push(identity);
+            Ok(json!(true))
+        }
+    });
+    worker.register().await.unwrap();
+    for _ in &identities {
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+    }
+    let captured = captured.lock().unwrap();
+    for (actual, expected) in captured.iter().zip(&identities) {
+        for name in ["activity_execution_id", "workflow_id", "run_id"] {
+            assert_eq!(&actual[name], expected.get(name).unwrap_or(&Value::Null));
+        }
+    }
+    assert_eq!(captured.len(), identities.len());
+    assert_eq!(server.settlements.lock().unwrap().len(), identities.len());
+}
+
+#[tokio::test]
+async fn normal_worker_preserves_optional_execution_identity_without_attempt_fallbacks() {
+    check_execution_identity(false).await;
+}
+
+#[tokio::test]
+async fn cooperative_worker_preserves_optional_execution_identity_without_attempt_fallbacks() {
+    check_execution_identity(true).await;
+}
+
+#[tokio::test]
+async fn server_free_tests_do_not_invent_server_execution_ids() {
+    let mut env = WorkflowEnvironment::new().unwrap();
+    env.register_activity("identity", |ctx, _| async move {
+        assert_eq!(ctx.activity_execution_id(), None);
+        assert_eq!(ctx.workflow_id(), None);
+        assert_eq!(ctx.run_id(), None);
+        Ok(json!(true))
+    });
+    assert_eq!(env.run_activity("identity", ()).await.unwrap(), true);
+    env.register_workflow("identity", |ctx, _| async move {
+        ctx.activity("identity", json!([])).await
+    });
+    assert_eq!(env.run_workflow("identity", ()).await.unwrap(), true);
+    env.register_workflow("local-identity", |ctx, _| async move {
+        ctx.local_activity("identity", json!([])).await
+    });
+    assert_eq!(env.run_workflow("local-identity", ()).await.unwrap(), true);
 }
