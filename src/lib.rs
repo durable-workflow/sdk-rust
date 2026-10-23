@@ -10,6 +10,7 @@ mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
 mod local_activity;
+pub mod metrics;
 mod nexus;
 pub mod pagination;
 mod query_authority;
@@ -2984,6 +2985,7 @@ fn avro_value_ordered_map_encoding_schema() -> Result<&'static Schema> {
 
 #[derive(Clone, Debug)]
 pub struct Client {
+    metrics: metrics::Metrics,
     http: reqwest::Client,
     hydration_timeout: Duration,
     base_url: String,
@@ -3053,6 +3055,7 @@ impl Client {
             max_external_payload_bytes: 64 * 1024 * 1024,
             worker_protocol_version: WorkerProtocolVersion::default(),
             additional_root_certificates: Vec::new(),
+            metrics: metrics::Metrics::default(),
         }
     }
 
@@ -4913,18 +4916,8 @@ impl Client {
         body: Option<&B>,
         timeout: Duration,
     ) -> Result<T> {
-        let mut value: Value = self
-            .request_json_unresolved_with_timeout(method, path, protocol, body, timeout)
-            .await?;
-        let protocol = match protocol {
-            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
-                RequestProtocol::Worker(self.worker_protocol_version.as_str())
-            }
-            RequestProtocol::ControlPlane => RequestProtocol::ControlPlane,
-        };
-        self.resolve_runtime_payloads(&mut value, path, protocol)
-            .await?;
-        Ok(serde_json::from_value(value)?)
+        self.metrics_request(method, path, protocol, body, timeout, true)
+            .await
     }
 
     fn worker_request_protocol(&self, protocol: RequestProtocol) -> Result<RequestProtocol> {
@@ -4974,6 +4967,19 @@ impl Client {
         protocol: RequestProtocol,
         body: Option<&B>,
         timeout: Duration,
+    ) -> Result<T> {
+        self.metrics_request(method, path, protocol, body, timeout, false)
+            .await
+    }
+
+    async fn send_json_with_timeout<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        protocol: RequestProtocol,
+        body: Option<&B>,
+        timeout: Duration,
+        observation: &metrics::ClientObservation,
     ) -> Result<T> {
         #[cfg(feature = "telemetry")]
         self.begin_observability_discovery(&method, path);
@@ -5048,6 +5054,7 @@ impl Client {
                     })?)
                     .await?;
                 let status = response.status();
+                observation.status(status);
                 Ok::<_, Error>((status, response.bytes().await?))
             };
             let retry_deadline = self
@@ -5256,42 +5263,8 @@ impl Client {
         max_retries: usize,
         resolve: bool,
     ) -> Result<T> {
-        let mut retries = 0;
-
-        loop {
-            let response: Result<Value> = if resolve {
-                self.request_json_with_timeout(
-                    reqwest::Method::POST,
-                    path,
-                    protocol,
-                    Some(body),
-                    timeout,
-                )
-                .await
-            } else {
-                self.request_json_unresolved_with_timeout(
-                    reqwest::Method::POST,
-                    path,
-                    protocol,
-                    Some(body),
-                    timeout,
-                )
-                .await
-            };
-
-            match response {
-                Err(Error::Transport(_)) if retries < max_retries => retries += 1,
-                response => {
-                    let value = worker_poll_response(response)?;
-                    if value.get("task").is_some_and(|task| !task.is_null()) {
-                        if let Some(slot) = &self.worker_task_slot {
-                            slot.claimed();
-                        }
-                    }
-                    return Ok(serde_json::from_value(value)?);
-                }
-            }
-        }
+        self.metrics_poll_request(path, protocol, body, timeout, max_retries, resolve)
+            .await
     }
 
     fn auth_token(&self, protocol: RequestProtocol) -> Result<Option<&str>> {
@@ -5855,6 +5828,7 @@ fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
 
 #[derive(Debug)]
 pub struct ClientBuilder {
+    metrics: metrics::Metrics,
     base_url: String,
     token: Option<String>,
     control_token: Option<String>,
@@ -5867,6 +5841,11 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Configure stable request metrics. Newly constructed workers inherit this recorder.
+    pub fn metrics_recorder(mut self, recorder: Arc<dyn metrics::MetricsRecorder>) -> Self {
+        self.metrics = metrics::Metrics::new(recorder);
+        self
+    }
     /// Explicitly select 1.19 for an older Server. Cooperation requires 1.20.
     pub fn worker_protocol_version(mut self, version: WorkerProtocolVersion) -> Self {
         self.worker_protocol_version = version;
@@ -5922,6 +5901,7 @@ impl ClientBuilder {
             http = http.add_root_certificate(certificate);
         }
         Ok(Client {
+            metrics: self.metrics,
             http: http.build()?,
             hydration_timeout: self.timeout,
             base_url,
@@ -7305,6 +7285,7 @@ enum ManagedPollOutcome {
 
 #[derive(Clone)]
 pub struct Worker {
+    metrics: metrics::Metrics,
     #[cfg(feature = "telemetry")]
     telemetry: Option<telemetry::ExecutionTelemetry>,
     client: Client,
@@ -7344,8 +7325,14 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Override worker poll/task metrics; client request metrics retain their client's recorder.
+    pub fn metrics_recorder(mut self, recorder: Arc<dyn metrics::MetricsRecorder>) -> Self {
+        self.metrics = metrics::Metrics::new(recorder);
+        self
+    }
     pub fn new(client: Client, task_queue: impl Into<String>) -> Self {
         Self {
+            metrics: client.metrics.clone(),
             #[cfg(feature = "telemetry")]
             telemetry: None,
             client,
@@ -8773,10 +8760,13 @@ impl Worker {
         if self.cooperative_cancellation_enabled {
             return self.poll_cooperative_workflow_once().await;
         }
+        let mut poll_metrics = self.metrics.worker(false, "workflow", &self.task_queue);
         let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
             .retry_worker_operation(|| self.poll_workflow_with_sticky_cache(&poll_request_id))
             .await;
+        poll_metrics.poll(&response, |value| value.0.outcome());
+        drop(poll_metrics);
         let Some((response, snapshot)) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -8789,6 +8779,8 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        let mut task_metrics = self.metrics.worker(true, "workflow", &self.task_queue);
+        task_metrics.outcome("failed");
         let task_id = task.task_id.clone();
         let attempt = task.workflow_task_attempt;
         let run_id = task.run_id.clone();
@@ -8799,19 +8791,28 @@ impl Worker {
 
         let decision = match self.execute_workflow_with_local_activities(task).await {
             Ok(Some(decision)) => Ok(decision),
-            Ok(None) => return Ok(ManagedPollOutcome::Handled),
+            Ok(None) => {
+                task_metrics.outcome("expired");
+                return Ok(ManagedPollOutcome::Handled);
+            }
             Err(error) => Err(error),
         };
-        self.settle_workflow_task_decision(
-            &task_id,
-            &lease_owner,
-            attempt,
-            run_id.as_deref(),
-            decision,
-            memo_updates_supported,
-            snapshot,
-        )
-        .await
+        let task_outcome = metrics::workflow_task_outcome(decision.as_ref().ok());
+        let settled = self
+            .settle_workflow_task_decision(
+                &task_id,
+                &lease_owner,
+                attempt,
+                run_id.as_deref(),
+                decision,
+                memo_updates_supported,
+                snapshot,
+            )
+            .await;
+        if settled.is_ok() {
+            task_metrics.outcome(task_outcome);
+        }
+        settled
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8925,6 +8926,7 @@ impl Worker {
         if self.client.worker_sessions_enabled {
             self.require_session_registration()?;
         }
+        let mut poll_metrics = self.metrics.worker(false, "activity", &self.task_queue);
         let poll_request_id = unique_request_id("rust-activity-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -8937,6 +8939,8 @@ impl Worker {
                 )
             })
             .await;
+        poll_metrics.poll(&response, |value| value.outcome());
+        drop(poll_metrics);
         let response = match response {
             Err(Error::ActivityExecutionAbandoned(_)) => return Ok(ManagedPollOutcome::Handled),
             response => response,
@@ -8958,18 +8962,23 @@ impl Worker {
         &self,
         task: worker_session::SessionActivityTask,
     ) -> Result<ManagedPollOutcome> {
+        let mut task_metrics = self.metrics.worker(true, "activity", &self.task_queue);
+        task_metrics.outcome("failed");
         let lease = task.activity_lease.clone();
         let mut worker = self.clone();
         worker.client = self.client.with_activity_lease_authority(
             lease.as_ref().map(|lease| Arc::clone(&lease.authority)),
         );
-        let operation = worker.execute_polled_activity(task);
+        let operation = worker.execute_polled_activity(task, &mut task_metrics);
         let result = match lease.as_ref() {
             Some(lease) => lease.authority.protect(operation).await,
             None => operation.await,
         };
         match result {
-            Err(Error::ActivityExecutionAbandoned(_)) => Ok(ManagedPollOutcome::Handled),
+            Err(Error::ActivityExecutionAbandoned(_)) => {
+                task_metrics.outcome("expired");
+                Ok(ManagedPollOutcome::Handled)
+            }
             result => result,
         }
     }
@@ -8977,9 +8986,10 @@ impl Worker {
     async fn execute_polled_activity(
         &self,
         task: worker_session::SessionActivityTask,
+        task_metrics: &mut metrics::WorkerObservation,
     ) -> Result<ManagedPollOutcome> {
         if self.cooperative_cancellation_enabled {
-            return self.settle_cooperative_activity(task).await;
+            return self.settle_cooperative_activity(task, task_metrics).await;
         }
         let session = self.track_session_task(task.worker_session.as_ref())?;
         let hydration_claim = task.hydration_claim;
@@ -8999,6 +9009,13 @@ impl Worker {
         let result = self
             .execute_session_activity_task(task, session, hydration_claim.as_ref())
             .await;
+        let task_outcome = if result.is_ok() {
+            "completed"
+        } else if matches!(result, Err(Error::ActivityExecutionAbandoned(_))) {
+            "expired"
+        } else {
+            "failed"
+        };
         match result {
             Err(Error::ActivityExecutionAbandoned(_)) => {}
             Err(error) if activity_hydration::stopped(&error) => {}
@@ -9032,10 +9049,12 @@ impl Worker {
             }
         }
 
+        task_metrics.outcome(task_outcome);
         Ok(ManagedPollOutcome::Handled)
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {
+        let mut poll_metrics = self.metrics.worker(false, "query", &self.task_queue);
         let poll_request_id = unique_request_id("rust-query-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -9055,6 +9074,14 @@ impl Worker {
                 }
             })
             .await;
+        poll_metrics.poll(&response, |value| {
+            worker_poll_outcome(
+                value.get("task").is_some_and(|task| !task.is_null()),
+                value.get("poll_status").and_then(Value::as_str),
+                value.get("reason").and_then(Value::as_str),
+            )
+        });
+        drop(poll_metrics);
         let Some(mut wire) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -9083,6 +9110,8 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        let mut task_metrics = self.metrics.worker(true, "query", &self.task_queue);
+        task_metrics.outcome("failed");
         let query_task_id = task.query_task_id.clone();
         let attempt = task.query_task_attempt;
         let lease_owner = task
@@ -9103,6 +9132,11 @@ impl Worker {
                 return Ok(ManagedPollOutcome::Handled)
             }
             Ok(result) => result,
+        };
+        let task_outcome = if execution.is_ok() {
+            "completed"
+        } else {
+            "failed"
         };
         match execution {
             Ok(value) => {
@@ -9180,6 +9214,7 @@ impl Worker {
             }
         }
 
+        task_metrics.outcome(task_outcome);
         Ok(ManagedPollOutcome::Handled)
     }
 

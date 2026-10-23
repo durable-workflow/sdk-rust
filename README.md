@@ -616,6 +616,85 @@ option. Keep a process supervisor for startup failures and process crashes.
 | [`continue_as_new.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/continue_as_new.rs) | Bounded histories and continue-as-new |
 | [`parallel_saga.rs`](https://github.com/durable-workflow/sdk-rust/blob/main/examples/parallel_saga.rs) | Deterministic parallel work and saga compensation |
 
+### Client and worker metrics
+
+Rust SDK 4.7.0 adds the [shared SDK recorder contract](https://github.com/durable-workflow/.github/blob/73e8fc323e4f46322945a007e54a546395904f79/sdk-metrics/README.md).
+The default is a no-op. Supply an `Arc<dyn metrics::MetricsRecorder>` with
+`increment(name, count, tags)` and `record(name, seconds, tags)` methods; the
+client, its clones and newly constructed workers inherit the recorder.
+`Worker::metrics_recorder` overrides worker poll/task observations while client
+request observations retain the client's recorder. Recorders must be fast and
+handle exporter failures locally. Unwinding recorder panics are isolated from
+SDK results; process aborts and blocking exporters cannot be repaired by a hook.
+
+Every observed client request, worker poll and claimed-task dispatch increments
+its counter by one and records one nonnegative monotonic duration in seconds.
+The six stable recorder names are:
+
+| Counter | Duration histogram |
+| --- | --- |
+| `durable_workflow_client_requests` | `durable_workflow_client_request_duration_seconds` |
+| `durable_workflow_worker_polls` | `durable_workflow_worker_poll_duration_seconds` |
+| `durable_workflow_worker_tasks` | `durable_workflow_worker_task_duration_seconds` |
+
+Client tags are exactly `method`, `route`, `plane`, `status_code`, `outcome`.
+Worker tags are exactly `task_kind`, `task_queue`, `outcome`. Reviewed route
+placeholders exclude IDs, query strings, payloads and credentials; unknown paths
+use `unknown`. Queue names are application-controlled: use bounded names rather
+than a queue per run. The SDK's tests consume the exact shared JSON at the pinned
+commit above (SHA256 `c456f4f434c601fa26f0caba07ef0fd29f548ca8f5fc29ba2f6430f01e32c0f0`).
+
+One client observation includes its internal transport/storage-admission retries
+and response/payload handling. Separate application/worker-managed calls remain
+separate client observations. A lazy iterator observes each requested page, not
+one operation for the whole iteration. Worker poll observations include managed
+retry/backoff and distinguish `task`, `empty`, `backpressure`, `error`. Task
+observations describe processing of workflow, activity and query dispatches:
+`completed`, `failed` and `expired` do not assert a workflow's terminal state.
+These are process observations, not durable counts, billing units or
+schedule-to-start latency. Abrupt process loss can prevent a final observation.
+
+Client outcomes include `ok`, `http_error`, `bridge_rejected`, `TransportError`,
+`TimeoutError`, `SdkError` and `pending` (a cancelled future). A decimal HTTP
+status is retained when observed, otherwise `status_code=none`. Language-specific
+exception outcomes need not match Python names. Renaming an adopted name, type,
+unit or tag key requires a major release; additions and new tag values are
+announced in the changelog.
+
+#### Prometheus export
+
+Enable the optional adapter in your application:
+
+```toml
+[dependencies]
+durable-workflow = { version = "=4.7.0", features = ["metrics-prometheus"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+`metrics::PrometheusMetrics::new()` owns a dedicated registry backed by the
+[official Prometheus Rust client](https://github.com/tikv/rust-prometheus/tree/v0.14.0).
+Pass an `Arc` of it to `ClientBuilder::metrics_recorder`, and serve its
+`encode()` bytes from your application's metrics route with content type
+`text/plain; version=0.0.4`. The adapter installs no listener or global registry;
+applications choose scrape authentication/network exposure, exporter resources
+and shutdown. Counter exports append `_total`; histograms expose standard
+bucket/sum/count series without changing the recorder contract. `registry()`
+allows application-owned collection and additional metrics.
+
+The [runnable example](examples/metrics_prometheus.rs) previews actual exported
+health-request observations:
+
+```bash
+DURABLE_WORKFLOW_SERVER_URL=http://localhost:8080 \
+DURABLE_WORKFLOW_AUTH_TOKEN=your-token \
+cargo run --features metrics-prometheus --example metrics_prometheus
+```
+
+For OpenTelemetry, implement `MetricsRecorder` with the application's existing
+meter: create count-unit (`1`) counters for `increment` and second-unit (`s`)
+histograms for `record`, using the exact names and tags above. Provider,
+aggregation, resource labels and exporter lifecycle stay with the application.
+
 ### Optional execution telemetry
 
 Enable the `telemetry` Cargo feature and configure your application's

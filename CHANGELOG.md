@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 4.7.0
+
+- Add pluggable client/worker metrics recorders with a no-op default and the six
+  stable shared SDK counter/histogram names, count/second units and exact labels.
+  Observe logical requests, polls and workflow/activity/query dispatches without
+  exposing IDs, payloads, credentials or query strings in core tags. Unknown
+  routes use a bounded fallback. Workers inherit or explicitly override recording;
+  recorder panics cannot change SDK results.
+- Add the optional `metrics-prometheus` adapter using a dedicated official
+  Prometheus registry, plus a runnable export recipe and pinned shared-contract
+  acceptance. New Rust client outcomes are ok/http_error/bridge_rejected,
+  TransportError/TimeoutError/SdkError/pending; poll outcomes are
+  task/empty/backpressure/error, and task outcomes completed/failed/expired.
+
 ## 4.6.0
 
 - Add typed one-page workflow listing and selected-run history reads over the
