@@ -57,6 +57,53 @@ fn server_and_worker() -> (MockWorkerServer, Worker) {
 }
 
 #[tokio::test]
+async fn concurrent_run_once_calls_share_the_configured_activity_limit() {
+    fn activity_only(path: &str, body: &str, request: usize) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/poll" {
+            return Some(("200 OK", json!({"task":null}).to_string()));
+        }
+        capacity_server(path, body, request)
+    }
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(activity_only),
+        concurrent_requests: true,
+        ..MockWorkerBehavior::default()
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let mut worker = Worker::new(Client::new(server.base_url()).unwrap(), "capacity-queue")
+        .worker_id("capacity-worker")
+        .max_concurrent_activity_tasks(2);
+    worker.register_activity("capacity.activity", {
+        let (active, maximum) = (active.clone(), maximum.clone());
+        move |_, _| {
+            let (active, maximum) = (active.clone(), maximum.clone());
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        }
+    });
+    let mut calls = FuturesUnordered::new();
+    for _ in 0..5 {
+        let worker = worker.clone();
+        calls.push(async move { worker.run_once().await });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(result) = calls.next().await {
+            assert_eq!(result.unwrap(), 1);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    assert_eq!(worker.activity_capacity.available(), 2);
+}
+
+#[tokio::test]
 async fn slow_activity_allows_other_work_and_heartbeats_report_occupied_slots() {
     let (server, mut worker) = server_and_worker();
     let slow = Arc::new(tokio::sync::Notify::new());

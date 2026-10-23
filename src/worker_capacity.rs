@@ -162,3 +162,34 @@ impl Worker {
         first_error.map_or(Ok(()), Err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_polls_do_not_consume_advertised_capacity_and_retained_clients_cannot_reopen_slots(
+    ) {
+        let capacity = TaskCapacity::new(1);
+        let reservation = capacity.reserve(None).await.unwrap();
+        assert_eq!(capacity.available(), 1, "a pending poll can receive work");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), capacity.reserve(None))
+                .await
+                .is_err()
+        );
+        let retained = reservation.marker.clone();
+        retained.claimed();
+        retained.claimed();
+        assert_eq!(capacity.available(), 0);
+        drop(reservation);
+        assert_eq!(capacity.available(), 1);
+        retained.claimed();
+        assert_eq!(
+            capacity.available(),
+            1,
+            "a retained callback client is no longer an active claim"
+        );
+        assert!(capacity.reserve(None).await.is_some());
+    }
+}

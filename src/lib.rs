@@ -7500,6 +7500,8 @@ impl Worker {
         self
     }
 
+    /// Bound simultaneous claimed workflow tasks, including loading and settlement.
+    /// Defaults to 10. Use 1 for serial workflow-task execution.
     pub fn max_concurrent_workflow_tasks(mut self, count: usize) -> Self {
         self.max_concurrent_workflow_tasks = count.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         self.workflow_capacity =
@@ -7507,6 +7509,8 @@ impl Worker {
         self
     }
 
+    /// Bound simultaneous remote activity tasks, including loading and settlement.
+    /// Defaults to 10. Use 1 for serial activity-task execution.
     pub fn max_concurrent_activity_tasks(mut self, count: usize) -> Self {
         self.max_concurrent_activity_tasks = count.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         self.activity_capacity =

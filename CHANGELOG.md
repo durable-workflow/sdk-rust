@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.3.1
+
 - Enforce the configured workflow and activity concurrency limits in ordinary
   workers and report heartbeat availability from in-flight tasks. Defaults stay
   at 10 for each task family; workers now use those slots instead of executing
