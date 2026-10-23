@@ -1660,11 +1660,18 @@ impl ActivityRetryPolicy {
 
     /// Preserve the complete explicit list independently of the attempt budget.
     /// Unused entries remain part of the policy compared during replay.
+    /// Set explicit durable retry intervals. Each positive fractional second
+    /// is rounded up when encoded: `Duration::from_millis(100)` becomes one
+    /// second. Zero stays zero. Queue latency can delay the next attempt further.
     pub fn backoff_intervals(mut self, intervals: impl IntoIterator<Item = Duration>) -> Self {
         self.backoff = Some(ActivityBackoff::Explicit(intervals.into_iter().collect()));
         self
     }
 
+    /// Generate durable retry intervals from `initial_interval` and `coefficient`.
+    /// Each interval is capped by `maximum_interval`, when present, then rounded
+    /// up to whole seconds. A 100 ms interval or cap therefore encodes one second.
+    /// Zero stays zero. This policy is separate from HTTP transport retries.
     pub fn exponential_backoff(
         mut self,
         initial_interval: Duration,
