@@ -29,11 +29,17 @@ async fn check_received_snapshot(cooperative: bool) {
         async move {
             let case=input[0].as_u64().unwrap();
             let info=ctx.retry_info().clone();
+            println!("received retry snapshot: case={case}, info={info:?}");
             saved.lock().unwrap().push((case,info.clone()));
             assert_eq!(info.attempt_number(),ctx.attempt_number);
-            assert_eq!(info.attempt_limit(),ActivityAttemptLimit::Bounded(if case==1 {1} else {3}));
+            if case==1 {
+                // This published PHP tuple omits policy for an unauthored retry policy.
+                // Preserve that absence instead of manufacturing a default snapshot.
+                assert_eq!(info.attempt_limit(),ActivityAttemptLimit::Unknown);
+                assert_eq!(info.policy(),None);
+            } else { assert_eq!(info.attempt_limit(),ActivityAttemptLimit::Bounded(3)); }
             if case==2 { return Err(ActivityError::new("Permanent","stop before budget").non_retryable(true).into()); }
-            if info.is_last_configured_attempt()!=Some(true) {
+            if case==0 && info.is_last_configured_attempt()!=Some(true) {
                 return Err(ActivityError::new("Transient","use next configured attempt").into());
             }
             Ok(json!({"case":case,"attempt":info.attempt_number(),"policy":info.policy(),"last":info.is_last_configured_attempt()}))
@@ -59,7 +65,7 @@ async fn check_received_snapshot(cooperative: bool) {
                 Ok(value) => results.push(value),
                 Err(Error::ActivityFailed(failure)) if case == 2 => {
                     assert!(failure.non_retryable);
-                    assert_eq!(failure.attempt_number, 1);
+                    assert_eq!(failure.attempt_number, Some(1));
                     results.push(json!({"case":case,"stopped_early":true}));
                 }
                 other => panic!("unexpected result: {other:?}"),
@@ -92,8 +98,8 @@ async fn check_received_snapshot(cooperative: bool) {
     assert_eq!(result[0]["last"], true);
     assert_eq!(result[0]["policy"]["max_attempts"], 3);
     assert_eq!(result[1]["attempt"], 1);
-    assert_eq!(result[1]["last"], true);
-    assert_eq!(result[1]["policy"]["max_attempts"], 1);
+    assert_eq!(result[1]["last"], Value::Null);
+    assert_eq!(result[1]["policy"], Value::Null);
     assert_eq!(result[2], json!({"case":2,"stopped_early":true}));
     let infos = infos.lock().unwrap();
     assert_eq!(
@@ -109,7 +115,7 @@ async fn check_received_snapshot(cooperative: bool) {
             (0, 1, Some(false)),
             (0, 2, Some(false)),
             (0, 3, Some(true)),
-            (1, 1, Some(true)),
+            (1, 1, None),
             (2, 1, Some(false))
         ]
     );
@@ -117,7 +123,7 @@ async fn check_received_snapshot(cooperative: bool) {
     assert!(policy["snapshot_version"].is_number());
     assert_eq!(infos[1].1.policy(), Some(policy));
     assert_eq!(infos[2].1.policy(), Some(policy));
-    println!("published Server retry snapshots passed: cooperative={cooperative}, attempts=[3,1,1], default=bounded(1), nonretryable stops before budget");
+    println!("published Server retry snapshots passed: cooperative={cooperative}, attempts=[3,1,1], default policy omitted/unknown, nonretryable stops before budget");
 }
 #[tokio::test]
 #[ignore = "requires isolated published Server"]
