@@ -11,6 +11,18 @@ The release workflow uses the crates.io publishing scripts after an immutable
 tag already exists. Ordinary pull requests run the product tests and package
 checks directly from `.github/workflows/ci.yml`.
 
+GitHub release notes come from the exact versioned CHANGELOG section selected by
+`release_package.py --release-notes VERSION`. The existing CommonMark validator
+ignores apparent headings inside code blocks/quotes and refuses missing, empty
+or ambiguous entries. It also requires the requested version to match Cargo.
+Notes mode reads only the current checkout's regular `Cargo.toml` and
+`CHANGELOG.md`, refusing custom paths and symlinks. The maintained workflow
+prepares these notes before obtaining publication
+credentials and passes the temporary file to `gh release create --notes-file`.
+Qualified tags select reviewed source before merge, so merged-PR auto-generated
+notes would describe the preceding release. Package source is never modified to
+produce release text.
+
 ## Local activity qualification
 
 Dispatch `ci.yml` with `local_qualification=true`. The nine ignored

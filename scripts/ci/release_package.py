@@ -21,6 +21,8 @@ from markdown_it.token import Token
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 MARKDOWN = MarkdownIt("commonmark")
 SCHEMA = "durable-workflow.rust-release-package/v1"
+SOURCE_MANIFEST = "Cargo.toml"
+SOURCE_CHANGELOG = "CHANGELOG.md"
 
 
 class ReleasePackageError(RuntimeError):
@@ -149,7 +151,7 @@ def _line_starts(value: bytes) -> list[int]:
     return starts
 
 
-def release_entry(changelog: bytes, version: str) -> dict[str, Any]:
+def _release_entry_content(changelog: bytes, version: str) -> tuple[bytes, list[str]]:
     try:
         text = changelog.decode("utf-8")
     except UnicodeError as error:
@@ -197,11 +199,39 @@ def release_entry(changelog: bytes, version: str) -> dict[str, Any]:
     else:
         raise ReleasePackageError("CommonMark section source map is out of range")
     entry = changelog[start_offset:end_offset]
+    return entry, content_lines
+
+
+def release_entry(changelog: bytes, version: str) -> dict[str, Any]:
+    entry, content_lines = _release_entry_content(changelog, version)
     return {
         "version": version,
         "entry_sha256": sha256(entry),
         "content_lines": content_lines,
     }
+
+
+def render_release_notes(changelog: bytes, version: str) -> str:
+    """Render the exact validated source entry, rather than merged-PR ancestry."""
+    entry, _ = _release_entry_content(changelog, version)
+    return entry.decode("utf-8").rstrip("\r\n") + "\n"
+
+
+def source_release_notes(version: str) -> str:
+    root = Path.cwd()
+    manifest = root / SOURCE_MANIFEST
+    changelog = root / SOURCE_CHANGELOG
+    for path in (manifest, changelog):
+        if path.is_symlink():
+            raise ReleasePackageError(f"release notes require regular checkout files: {path.name}")
+    package = load_package(manifest)
+    if package["version"] != version:
+        raise ReleasePackageError("release notes version differs from Cargo package version")
+    try:
+        changelog_bytes = changelog.read_bytes()
+    except OSError as error:
+        raise ReleasePackageError(f"could not read CHANGELOG.md: {error}") from error
+    return render_release_notes(changelog_bytes, version)
 
 
 def verify_source(manifest: Path, changelog: Path) -> dict[str, Any]:
@@ -339,20 +369,39 @@ def restore_missing_lockfile(
     return identity
 
 
+def _validate_notes_arguments(
+    arguments: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> None:
+    if any((arguments.archive, arguments.expected_vcs_commit,
+            arguments.expected_archive_sha256, arguments.restore_missing_lockfile)):
+        parser.error("--release-notes cannot be combined with archive verification")
+    if (arguments.manifest != Path(SOURCE_MANIFEST)
+            or arguments.changelog != Path(SOURCE_CHANGELOG)):
+        parser.error("--release-notes uses the current checkout files; path overrides are refused")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, default=Path("Cargo.toml"))
-    parser.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
+    parser.add_argument("--manifest", type=Path, default=Path(SOURCE_MANIFEST))
+    parser.add_argument("--changelog", type=Path, default=Path(SOURCE_CHANGELOG))
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--expected-vcs-commit")
     parser.add_argument("--expected-archive-sha256")
     parser.add_argument("--restore-missing-lockfile", action="store_true")
+    parser.add_argument(
+        "--release-notes", metavar="VERSION",
+        help="print the exact current-version Markdown after manifest validation",
+    )
     arguments = parser.parse_args()
     if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
         parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
 
     try:
-        if arguments.restore_missing_lockfile:
+        if arguments.release_notes is not None:
+            _validate_notes_arguments(arguments, parser)
+            sys.stdout.write(source_release_notes(arguments.release_notes))
+            return 0
+        elif arguments.restore_missing_lockfile:
             if not all((arguments.archive, arguments.expected_vcs_commit, arguments.expected_archive_sha256)):
                 parser.error("lockfile recovery requires archive, source commit and registry checksum")
             evidence = restore_missing_lockfile(

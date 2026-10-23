@@ -570,6 +570,16 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertIn("path: release-source/rust-sdk-release-evidence.json", workflow)
         self.assertEqual(2, workflow.count("persist-credentials: false"))
 
+    def test_github_notes_use_validated_source_before_publication(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('--release-notes "$RELEASE_TAG"', workflow)
+        self.assertIn('--notes-file "${RUNNER_TEMP}/rust-sdk-release-notes.md"', workflow)
+        self.assertNotIn('--generate-notes', workflow)
+        self.assertLess(workflow.index("Install hash-locked release tooling"),
+                        workflow.index("Prepare exact source release notes"))
+        self.assertLess(workflow.index("Prepare exact source release notes"),
+                        workflow.index("id: crates-auth"))
+
 
 class ReleaseToolingInstallerTrustTest(unittest.TestCase):
     def test_isolated_tools_use_the_bootstrapped_pip_client(self) -> None:
