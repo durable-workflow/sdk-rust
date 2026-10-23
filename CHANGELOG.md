@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 4.10.1
+
+- Preserve valid outer workflow-failure messages when a nested exception message
+  is absent or blank, matching published Server fallback semantics. Keep supplied
+  small report fields unchanged, while reducing redundant outer copies when a
+  lower encoded-body budget requires it. Preserve type, retry flags and claim IDs.
+
 ## 4.10.0
 
 - Bound outgoing activity, workflow-task and terminal workflow failure messages,

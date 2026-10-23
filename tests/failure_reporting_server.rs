@@ -335,3 +335,56 @@ async fn workflow_task_failure_records_large_stack_and_omitted_valid_details() {
         .is_some_and(|id| id != task.task_id));
     println!("published workflow-task failure passed:3MiB message/stack/valid details, recorded receipt, exact identity and retry task; originaltype=OriginalTaskFailure,task_id={}",task.task_id);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated published Server"]
+async fn terminal_failure_preserves_blank_fallback_and_nonblank_nested_authority() {
+    let client = client();
+    let queue = format!("rust-fallback-{}", durable_workflow::Uuid::new_v4());
+    let worker_id = format!("{queue}-worker");
+    let mut worker = Worker::new(client.clone(), &queue).worker_id(&worker_id);
+    worker.register_workflow("tests.failure-fallback", |_, _| async { Ok(json!(null)) });
+    worker.register().await.unwrap();
+    for (index, (nested, expected)) in [
+        ("", "outer fallback"),
+        (" \t\0", "outer fallback"),
+        ("nested authoritative", "nested authoritative"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workflow_id = format!("{queue}-{index}");
+        let handle = client
+            .start_workflow("tests.failure-fallback", &queue, &workflow_id, json!([]))
+            .await
+            .unwrap();
+        let task = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(task) = client
+                    .poll_workflow_task(&worker_id, &queue, Duration::from_millis(10))
+                    .await
+                    .unwrap()
+                {
+                    break task;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        client.complete_workflow_task(&task.task_id,task.lease_owner.as_deref().unwrap(),task.workflow_task_attempt,
+            vec![json!({"type":"fail_workflow","message":"outer fallback","exception_type":"OriginalFallbackType","non_retryable":true,
+                "exception":{"type":"OriginalFallbackType","message":nested}})]).await.unwrap();
+        let events = history(&client, &handle).await;
+        let failed = events
+            .iter()
+            .find(|event| event["event_type"] == "WorkflowFailed")
+            .expect("valid fallback failure recorded");
+        assert_eq!(failed["payload"]["message"], expected);
+        assert_eq!(failed["payload"]["exception_type"], "OriginalFallbackType");
+        assert_eq!(
+            handle.describe().await.unwrap().status.as_deref(),
+            Some("failed")
+        );
+    }
+    println!("published terminal fallback passed: empty/whitespace nested values preserve outer message; nonblank nested value is authoritative; original type and claim identity retained");
+}

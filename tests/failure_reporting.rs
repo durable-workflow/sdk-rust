@@ -83,7 +83,8 @@ async fn workflow_task_and_terminal_workflow_report_large_failure() {
     }
     assert_eq!(reports[0].2["failure"]["type"], "RustWorkflowTaskFailure");
     let command = &reports[1].2["commands"][0];
-    assert_eq!(command["message"], command["exception"]["message"]);
+    assert_eq!(command["exception"]["message"], "");
+    assert!(command["message"].as_str().unwrap().contains("[truncated"));
     assert_eq!(command["exception_type"], "Original");
     assert_eq!(command["non_retryable"], true);
 }
