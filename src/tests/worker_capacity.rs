@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 
 fn capacity_server(path: &str, _: &str, request: usize) -> Option<(&'static str, String)> {
     if path == "/api/worker/register" {

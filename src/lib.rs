@@ -58,9 +58,7 @@ use std::{
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
-use futures_util::{
-    future::OptionFuture, stream::FuturesUnordered, task::noop_waker_ref, StreamExt,
-};
+use futures_util::{future::OptionFuture, task::noop_waker_ref};
 pub use local_activity::LocalActivityOptions;
 use serde::{
     de::DeserializeOwned,
@@ -30145,7 +30143,10 @@ mod tests {
                 storage_path: Some(path),
                 ..MockWorkerBehavior::default()
             });
-            let mut worker = storage_worker(&server).retry_policy(WorkerRetryPolicy::default());
+            let mut worker = storage_worker(&server)
+                .max_concurrent_workflow_tasks(1)
+                .max_concurrent_activity_tasks(1)
+                .retry_policy(WorkerRetryPolicy::default());
             worker.register_activity("storage.activity", |ctx, _| async move {
                 ctx.heartbeat(json!({"step":2})).await?;
                 Ok(json!({"receipt":true}))
@@ -30277,7 +30278,10 @@ mod tests {
             storage_path: Some("/poll"),
             ..MockWorkerBehavior::default()
         });
-        let mut worker = storage_worker(&server).retry_policy(WorkerRetryPolicy::default());
+        let mut worker = storage_worker(&server)
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
+            .retry_policy(WorkerRetryPolicy::default());
         worker.register_activity("unused", |_, _| async { Ok(Value::Null) });
         let run = tokio::spawn(async move { worker.run().await });
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -30717,6 +30721,8 @@ mod tests {
         let observations = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&observations);
         let mut worker = Worker::new(client, "rust-snapshot-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .worker_id("rust-snapshot-worker")
             .poll_timeout(Duration::from_millis(10))
             .on_worker_heartbeat(move |observation| {
@@ -30989,6 +30995,8 @@ mod tests {
             .build()
             .expect("client");
         let mut worker = Worker::new(client, "rust-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .worker_id("retry-worker")
             .poll_timeout(Duration::from_millis(10))
             .retry_policy(WorkerRetryPolicy {
@@ -31101,6 +31109,8 @@ mod tests {
         let acknowledgements = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&acknowledgements);
         let mut worker = Worker::new(client, "rust-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .recover_transient_outages(true)
             .poll_timeout(Duration::from_millis(10))
             .retry_policy(WorkerRetryPolicy {
@@ -31157,6 +31167,8 @@ mod tests {
             });
             let client = Client::builder(server.base_url()).build().expect("client");
             let mut worker = Worker::new(client, "rust-workers")
+                .max_concurrent_workflow_tasks(1)
+                .max_concurrent_activity_tasks(1)
                 .recover_transient_outages(true)
                 .retry_policy(WorkerRetryPolicy {
                     max_retries: 1,
@@ -31204,6 +31216,8 @@ mod tests {
         let server = MockWorkerServer::unavailable_polls();
         let client = Client::builder(server.base_url()).build().expect("client");
         let mut worker = Worker::new(client, "rust-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .recover_transient_outages(true)
             .retry_policy(WorkerRetryPolicy {
                 max_retries: 0,
@@ -31223,6 +31237,8 @@ mod tests {
         });
         let client = Client::builder(server.base_url()).build().expect("client");
         let mut worker = Worker::new(client, "rust-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .recover_transient_outages(true)
             .retry_policy(WorkerRetryPolicy {
                 max_retries: 1,
@@ -31248,6 +31264,8 @@ mod tests {
             .build()
             .expect("client");
         let mut worker = Worker::new(client, "rust-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .worker_id("bounded-retry-worker")
             .poll_timeout(Duration::from_millis(10))
             .retry_policy(WorkerRetryPolicy {
@@ -31303,6 +31321,8 @@ mod tests {
             .build()
             .expect("client");
         let mut worker = Worker::new(client, "rust-workers")
+            .max_concurrent_workflow_tasks(1)
+            .max_concurrent_activity_tasks(1)
             .worker_id("unauthorized-worker")
             .recover_transient_outages(true)
             .poll_timeout(Duration::from_millis(10));

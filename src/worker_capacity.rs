@@ -2,7 +2,7 @@ use crate::{wait_for_worker_stop, ManagedPollOutcome, Result, Worker};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, PoisonError,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -66,7 +66,7 @@ pub(super) struct TaskSlotMarker {
 
 impl TaskSlotMarker {
     pub(super) fn claimed(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if *state == SlotState::Polling {
             self.active.fetch_add(1, Ordering::SeqCst);
             *state = SlotState::Active;
@@ -74,7 +74,7 @@ impl TaskSlotMarker {
     }
 
     fn close(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if *state == SlotState::Active {
             self.active.fetch_sub(1, Ordering::SeqCst);
         }
