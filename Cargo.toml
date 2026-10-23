@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "4.6.0"
+version = "4.7.0"
 edition = "2021"
 description = "Rust client and worker SDK for Durable Workflow Cloud and self-hosted Server"
 license = "MIT"
@@ -11,10 +11,10 @@ readme = "README.md"
 rust-version = "1.86"
 keywords = ["durable", "workflow", "temporal", "worker", "sdk"]
 categories = ["api-bindings", "asynchronous"]
-include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json"]
+include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json", "/tests/fixtures/sdk-metrics-contract.json"]
 
 [package.metadata.durable-workflow]
-product-train = "4.6.0"
+product-train = "4.7.0"
 compatibility-authority = "protocol-manifests"
 supported-server-versions = "2.0.0"
 qualified-server-version = "2.8.0"
@@ -108,8 +108,10 @@ path = "src/lib.rs"
 [features]
 default = []
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing"]
+metrics-prometheus = ["dep:prometheus"]
 
 [dependencies]
+prometheus = { version = "0.14", optional = true, default-features = false }
 opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace", "logs"] }
 opentelemetry_sdk = { version = "0.33", optional = true, default-features = false, features = ["trace"] }
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
@@ -146,3 +148,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde_bytes = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+[[example]]
+name = "metrics_prometheus"
+required-features = ["metrics-prometheus"]

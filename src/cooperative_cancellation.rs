@@ -1824,6 +1824,7 @@ impl Worker {
     pub(super) async fn settle_cooperative_activity(
         &self,
         task: worker_session::SessionActivityTask,
+        task_metrics: &mut crate::metrics::WorkerObservation,
     ) -> Result<ManagedPollOutcome> {
         let session = self.track_session_task(task.worker_session.as_ref())?;
         let hydration_claim = task.hydration_claim;
@@ -1876,6 +1877,11 @@ impl Worker {
             }
             return Ok(ManagedPollOutcome::Handled);
         }
+        let task_outcome = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
         let settlement = match result {
             Ok(value) => {
                 self.client
@@ -1905,6 +1911,7 @@ impl Worker {
                 return Err(error);
             }
         }
+        task_metrics.outcome(task_outcome);
         Ok(ManagedPollOutcome::Handled)
     }
 
@@ -2000,6 +2007,7 @@ impl Worker {
     }
 
     pub(super) async fn poll_cooperative_workflow_once(&self) -> Result<ManagedPollOutcome> {
+        let mut poll_metrics = self.metrics.worker(false, "workflow", &self.task_queue);
         let poll_request_id = unique_request_id("rust-workflow-poll");
         let response = self
             .retry_worker_operation(|| {
@@ -2013,6 +2021,8 @@ impl Worker {
                 )
             })
             .await;
+        poll_metrics.poll(&response, |value| value.outcome.clone());
+        drop(poll_metrics);
         let Some(response) = self.settle_worker_poll_response(response).await? else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -2024,6 +2034,8 @@ impl Worker {
         let Some(claim) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
+        let mut task_metrics = self.metrics.worker(true, "workflow", &self.task_queue);
+        task_metrics.outcome("failed");
         // Anchor the immutable cleanup deadline once, before replay. Deferring
         // completion must not grant another cleanup budget on each retry.
         let mut completion_worker = None;
@@ -2056,7 +2068,8 @@ impl Worker {
             return Ok(ManagedPollOutcome::Handled);
         };
         let (owner, _) = cancellation_claim(&claim.task)?;
-        completion_worker
+        let task_outcome = crate::metrics::workflow_task_outcome(Some(&decision));
+        let settled = completion_worker
             .as_ref()
             .unwrap_or(self)
             .settle_workflow_task_decision(
@@ -2068,7 +2081,11 @@ impl Worker {
                 memo_updates_supported,
                 claim.sticky_snapshot.clone(),
             )
-            .await
+            .await;
+        if settled.is_ok() {
+            task_metrics.outcome(task_outcome);
+        }
+        settled
     }
 
     async fn replay_cooperative_workflow_claim(
