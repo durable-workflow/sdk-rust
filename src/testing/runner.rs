@@ -60,6 +60,7 @@ impl WorkflowEnvironment {
     /// activity timeout simulation require a live integration test; unsupported
     /// commands fail explicitly. Parallel activity handlers run in command order.
     pub async fn run_workflow<T: Serialize>(&mut self, name: &str, input: T) -> Result<Value> {
+        self.last_history = None;
         self.run_workflow_avro_value(name, AvroValue::from_serialize(&input)?)
             .await?
             .into_json()
@@ -70,8 +71,8 @@ impl WorkflowEnvironment {
         name: &str,
         input: AvroValue,
     ) -> Result<AvroValue> {
-        self.worker.validate_registration()?;
         self.last_history = None;
+        self.worker.validate_registration()?;
         let input = encode_typed_envelope(&normalize_avro_arguments(input), DEFAULT_CODEC)?;
         let mut history = WorkflowHistory::from_history(name, (), json!([]))?
             .task_queue(self.worker.task_queue.clone());
@@ -205,7 +206,7 @@ impl WorkflowEnvironment {
             }
             "record_side_effect" => append(history, "SideEffectRecorded", payload),
             "record_version_marker" => append(history, "VersionMarkerRecorded", payload),
-            "upsert_memo" => append(history, "MemoUpserted", payload),
+            "upsert_memo" => record_memo(history, payload),
             "upsert_search_attributes" => append(history, "SearchAttributesUpserted", payload),
             _ => Err(TestingError::UnsupportedCommand(kind.into()).into()),
         }
@@ -282,6 +283,33 @@ impl WorkflowEnvironment {
         }
         Err(TestingError::InvalidHistory("activity retry policy has zero attempts".into()).into())
     }
+}
+
+fn record_memo(history: &mut WorkflowHistory, mut payload: Value) -> Result<()> {
+    let previous = history
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "MemoUpserted");
+    let mut merged = match previous {
+        Some(event) => crate::decode_memo_history_map(&event.payload["merged"], false)?,
+        None => AvroValue::Map(Default::default()),
+    };
+    let AvroValue::Map(values) = &mut merged else {
+        unreachable!("validated memo map");
+    };
+    let AvroValue::Map(entries) = crate::decode_memo_history_map(&payload["entries"], true)? else {
+        unreachable!("validated memo entries");
+    };
+    for (key, value) in entries {
+        if value == AvroValue::Null {
+            values.remove(&key);
+        } else {
+            values.insert(key, value);
+        }
+    }
+    payload["merged"] = encode_typed_envelope(&merged, DEFAULT_CODEC)?;
+    append(history, "MemoUpserted", payload)
 }
 
 fn excluded_failure(policy: &Value, exception_type: &str) -> bool {

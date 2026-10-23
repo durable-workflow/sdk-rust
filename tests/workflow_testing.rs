@@ -329,6 +329,14 @@ async fn typed_worker_registrations_and_lossless_avro_values_are_preserved() {
         json!(i64::MAX)
     );
     assert!(env.replay(env.last_history().unwrap()).unwrap().completed);
+    assert!(matches!(
+        env.run_workflow("typed", u64::MAX).await,
+        Err(Error::Codec(_))
+    ));
+    assert!(
+        env.last_history().is_none(),
+        "invalid new input must not expose the previous run as its history"
+    );
     env.register_activity_avro_value("bytes", |_, args| async move {
         let durable_workflow::AvroValue::Array(mut values) = args else {
             panic!("normalized args");
@@ -368,4 +376,38 @@ async fn callback_routing_and_heartbeat_lifetime_match_the_authored_attempt() {
     );
     let retained = retained.lock().unwrap().take().unwrap();
     assert!(!retained.heartbeat(()).await.unwrap().heartbeat_recorded);
+}
+
+#[tokio::test]
+async fn metadata_updates_and_ordered_parallel_commands_replay_canonically() {
+    let mut env = WorkflowEnvironment::new().unwrap();
+    env.register_activity("echo", |_, args| async move { Ok(args[0].clone()) });
+    env.register_workflow("parallel", |ctx, _| async move {
+        ctx.upsert_memo(json!({"stage":"before"}))?;
+        ctx.upsert_search_attributes(
+            durable_workflow::SearchAttributeUpdate::new()
+                .keyword("stage", "running")
+                .unwrap(),
+        )?;
+        let values = ctx
+            .parallel(vec![
+                ParallelOperation::activity("echo", json!(["a"])),
+                ParallelOperation::activity("echo", json!(["b"])),
+            ])
+            .await?;
+        assert_eq!(
+            values,
+            vec![
+                ParallelResult::Activity(json!("a")),
+                ParallelResult::Activity(json!("b"))
+            ]
+        );
+        ctx.upsert_memo(json!({"stage":null,"done":true}))?;
+        Ok(json!("done"))
+    });
+    assert_eq!(
+        env.run_workflow("parallel", ()).await.unwrap(),
+        json!("done")
+    );
+    assert!(env.replay(env.last_history().unwrap()).unwrap().completed);
 }
