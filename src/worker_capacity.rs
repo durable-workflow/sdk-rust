@@ -1,5 +1,9 @@
-use super::*;
-use std::sync::atomic::AtomicUsize;
+use crate::{wait_for_worker_stop, ManagedPollOutcome, Result, Worker};
+use futures_util::{stream::FuturesUnordered, StreamExt};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug)]
@@ -166,6 +170,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn empty_polls_do_not_consume_advertised_capacity_and_retained_clients_cannot_reopen_slots(
