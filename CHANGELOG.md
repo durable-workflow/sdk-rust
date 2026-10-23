@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.3.0
+
 - Add `ActivityError` for application-defined activity failure types and explicit
   non-retryable outcomes. Ordinary, cooperative and local activity workers
   preserve these fields so activity retry policies can match the authored type.

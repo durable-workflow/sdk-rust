@@ -4,7 +4,7 @@ use crate::Error;
 ///
 /// The exception type is matched by [`crate::ActivityRetryPolicy::non_retryable_error_types()`].
 /// Local and remote activities preserve the same type, message and retry marker.
-/// Convert this error into [`Error`] with `.into()` when returning it from a handler.
+/// Convert this error into [`enum@Error`] with `.into()` when returning it from a handler.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 #[error("{message}")]
 pub struct ActivityError {
