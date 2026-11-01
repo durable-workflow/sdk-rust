@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 4.10.2
+
+- Keep managed workers polling when a history-wait or workflow-task failure
+  report receives the original task, attempt and run's terminal timeout receipt.
+  Apply the same strict HTTP 409 identity check as command completions, discard
+  provisional sticky state, and preserve other refusals and direct client errors.
+
 ## 4.10.1
 
 - Preserve valid outer workflow-failure messages when a nested exception message
