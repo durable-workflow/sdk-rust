@@ -121,7 +121,8 @@ jobs:
         with:
           clients: pip,python,cargo,curl,git
       - name: Install the workflow parser for cache trust checks
-        run: python -m pip install PyYAML==6.0.2
+        run: >-
+          python -m pip install --only-binary :all: PyYAML==6.0.2
       - name: Check Rust cache event boundary
         run: python scripts/ci/test-rust-ci-cache.py
       - name: Install Rust 1.86
