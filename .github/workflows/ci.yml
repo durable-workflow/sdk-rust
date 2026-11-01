@@ -156,12 +156,52 @@ jobs:
         with:
           clients: pip,python,cargo,curl,git
       - name: Install Rust ${{ matrix.rust }}
+        id: toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt
+      - name: Resolve Rust dependency cache identity
+        id: dependencies
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib, json, pathlib, tomllib
+          lock = tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          # SDK version bumps rebuild the workspace, while dependencies can be reused.
+          for package in lock['package']:
+              if package['name'] == 'durable-workflow' and 'source' not in package:
+                  del package['version']
+          encoded = json.dumps(lock, sort_keys=True).encode()
+          print('key=' + hashlib.sha256(encoded).hexdigest())
+          PY
+      - name: Restore trusted Rust test dependencies
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/examples
+          key: ${{ runner.os }}-${{ runner.arch }}-sdk-tests-v1-${{ steps.toolchain.outputs.cachekey }}-${{ steps.dependencies.outputs.key }}
       - run: cargo fmt --all --check
       - run: cargo test --locked --all-targets --all-features
+      - name: Save trusted Rust test dependencies
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/examples
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
   protocol:
     name: Avro protocol
