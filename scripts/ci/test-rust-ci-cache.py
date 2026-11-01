@@ -69,13 +69,13 @@ class RustCacheTrustTest(unittest.TestCase):
             with self.subTest(event=name):
                 self.assertIs(actual, expected)
 
-    def test_qualification_reports_failures_and_releases_cancelled_runs(self):
+    def test_required_qualification_is_not_skipped_after_failure_or_cancellation(self):
         gate = self.workflow()['jobs']['target-branch-qualification']
         cases = [
             ('passed dependencies', {'failed': False, 'cancelled': False}, True),
             ('failed dependencies', {'failed': True, 'cancelled': False}, True),
-            ('cancelled after success', {'failed': False, 'cancelled': True}, False),
-            ('cancelled after failure', {'failed': True, 'cancelled': True}, False),
+            ('cancelled after success', {'failed': False, 'cancelled': True}, True),
+            ('cancelled after failure', {'failed': True, 'cancelled': True}, True),
         ]
         outcomes = self.evaluate_condition(gate['if'], [case[1] for case in cases])
         for (name, _, expected), actual in zip(cases, outcomes):

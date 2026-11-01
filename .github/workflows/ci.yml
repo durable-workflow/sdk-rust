@@ -575,7 +575,7 @@ jobs:
 
   target-branch-qualification:
     name: Target branch qualification
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() }}
     needs: [action-policy, completion-ack-fixture, regression-corpus, test, protocol, docs, package, cooperative-server, local-server]
     runs-on: ubuntu-latest
     timeout-minutes: 2
