@@ -116,8 +116,8 @@ async fn drive_reject() -> Outcome<Value> {
     // The typed variant is required. Whether the client error also carries the
     // failure's exception type is reported separately, since it depends on the
     // failure fields the runtime returns from describe.
-    let detail = json!({"exception": outcome.exception, "message": outcome.message}).to_string();
-    let detail_surfaced = outcome.exception_type.as_deref() == Some("ActivityFailed") && detail.contains("QualificationRejected");
+    let detail_surfaced = outcome.exception_type.as_deref() == Some("ActivityFailed")
+        && outcome.message.as_deref().is_some_and(|message| message.contains("rejected bob"));
     let current = handle.describe().await?;
     Ok(json!({"workflow_id": handle.workflow_id, "original_run_id": handle.run_id, "final_run_id": handle.run_id,
         "status": current.status, "exception_detail_surfaced": detail_surfaced,
