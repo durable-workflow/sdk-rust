@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 4.10.3
+
+- Declare minimum stable Server releases per major, including native Server 3.x,
+  without changing the existing 2.x fields, worker protocol or capabilities.
+  Validate the complete additive map before publication and retain it in release
+  evidence alongside the published crate.
+
 ## 4.10.2
 
 - Keep managed workers polling when a history-wait or workflow-task failure
