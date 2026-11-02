@@ -84,8 +84,13 @@ for name, case in report.get('cases', {}).items():
         next_history = history(nxt['workflow_id'], nxt['final_run_id'])
         expect(not timeouts(next_history), name + ': follow-up workflow timed out')
         types['next:' + nxt['final_run_id']] = [e.get('event_type') for e in next_history]
+    terminal_events = [e for e in final if e.get('event_type') in
+                       ('WorkflowFailed', 'WorkflowTimedOut', 'WorkflowCancelled', 'WorkflowCompleted')]
     observed[name] = {'event_types': types, 'timeout_events': timeouts(final),
-                      'failure_events': [e for e in final if e.get('event_type') == 'WorkflowFailed']}
+                      'failure_events': [e for e in final if e.get('event_type') == 'WorkflowFailed'],
+                      'terminal_events': terminal_events,
+                      'describe': get('/workflows/%s/runs/%s' % (urllib.parse.quote(case['workflow_id'], safe=''),
+                                                                urllib.parse.quote(case['final_run_id'], safe='')))}
 
 result = {'outcome': 'fail' if problems else 'pass', 'problems': problems, 'cases': observed}
 (state / 'history.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')

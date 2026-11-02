@@ -25,6 +25,9 @@ HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 EXPECTED_BASELINES = {'2': '2.0.0', '3': '3.0.0'}
 BINARY = 'installed-native-lifecycle'
+# Same pins as docker-compose.local-activities.yml, for the PHP Server baseline.
+MYSQL_IMAGE = 'mysql@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
+REDIS_IMAGE = 'redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499'
 
 
 def parse_args():
@@ -32,6 +35,10 @@ def parse_args():
     parser.add_argument('--crate-version', required=True, help='exact published durable-workflow version, e.g. 4.10.3')
     parser.add_argument('--server-index', required=True, help='exact image index digest, sha256:...')
     parser.add_argument('--server-image', default='ghcr.io/durable-workflow/server')
+    parser.add_argument('--runtime', choices=['native', 'php'], default='native',
+                        help='php starts the PHP Server process set (MySQL, Redis, queue worker, repair) as a parity baseline')
+    parser.add_argument('--fixture-from', type=pathlib.Path,
+                        help='reuse a fixture directory built by an earlier run (provenance is checked again)')
     parser.add_argument('--platform', default='linux/amd64')
     parser.add_argument('--expect-server-version', help='required /api/cluster/info version, e.g. 3.0.1')
     parser.add_argument('--expect-revision', help='required org.opencontainers.image.revision label')
@@ -190,6 +197,47 @@ class Cell:
         self.containers.append(name)
         return name
 
+    def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None):
+        """Start a PHP Server process-set container (writable root, as in its compose file)."""
+        name = '%s-%s' % (self.task, role)
+        line = ['docker', 'run', '-d', '--name', name, '--label', 'task=' + self.task, '--network', self.task,
+                '--memory', '1g', '--cpus', '1']
+        if user:
+            line += ['--user', user]
+        if alias:
+            line += ['--network-alias', alias]
+        if tmpfs:
+            line += ['--tmpfs', tmpfs]
+        for key, value in (env or {}).items():
+            line += ['-e', '%s=%s' % (key, value)]
+        call(line + [image] + command)
+        self.containers.append(name)
+        return name
+
+    def start_php(self, token):
+        image = self.server['executed_manifest']
+        env = {'APP_ENV': 'testing', 'APP_DEBUG': 'false', 'DW_SERVER_KEY': 'base64:' + __import__('base64').b64encode(secrets.token_bytes(32)).decode(),
+               'DB_CONNECTION': 'mysql', 'DB_HOST': 'mysql', 'DB_DATABASE': 'durable_workflow', 'DB_USERNAME': 'workflow',
+               'DB_PASSWORD': 'workflow', 'REDIS_HOST': 'redis', 'QUEUE_CONNECTION': 'redis', 'CACHE_STORE': 'redis',
+               'DW_AUTH_DRIVER': 'token', 'DW_AUTH_TOKEN': token, 'DW_WORKFLOW_TASK_TIMEOUT': '10',
+               'DW_WORKER_PROTOCOL_VERSION': '1.20'}
+        mysql = self.plain('mysql', MYSQL_IMAGE, [], alias='mysql', tmpfs='/var/lib/mysql',
+                           env={'MYSQL_DATABASE': 'durable_workflow', 'MYSQL_USER': 'workflow',
+                                'MYSQL_PASSWORD': 'workflow', 'MYSQL_ROOT_PASSWORD': 'root'})
+        self.plain('redis', REDIS_IMAGE, [], alias='redis', tmpfs='/data')
+        deadline = time.monotonic() + 120
+        while call(['docker', 'exec', mysql, 'mysqladmin', 'ping', '-h', 'localhost', '-uworkflow', '-pworkflow'], check=False).returncode:
+            if time.monotonic() > deadline:
+                raise RuntimeError('mysql never became ready')
+            time.sleep(1)
+        bootstrap = self.plain('bootstrap', image, ['server-bootstrap'], env=env)
+        if call(['docker', 'wait', bootstrap], timeout=600).stdout.strip() != '0':
+            raise RuntimeError('PHP Server bootstrap failed')
+        self.plain('runtime', image, [], env=env, alias='qualification-origin')
+        self.plain('queue', image, ['php', 'artisan', 'queue:work', '--sleep=1', '--tries=3', '--max-time=1800'], env=env, user='1000:1000')
+        self.plain('repair', image, ['sh', '-c', 'while true; do php artisan workflow:v2:repair-pass --json; sleep 2; done'],
+                   env=env, user='1000:1000')
+
     def http(self, container, path, token):
         code = ('import json,sys,urllib.request\n'
                 'r=urllib.request.Request("http://qualification-origin:8080/api%s",headers={"Authorization":"Bearer "+sys.argv[1],"X-Namespace":"default"})\n'
@@ -210,16 +258,20 @@ class Cell:
         binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
         call(['docker', 'network', 'create', '--internal', '--label', 'task=' + self.task, self.task])
         try:
-            self.start('runtime', self.server['executed_manifest'], [], user='1000:1000', alias='qualification-origin',
-                       env={'DB_CONNECTION': 'sqlite', 'DB_DATABASE': '/app/database/runtime.sqlite',
-                            'DW_AUTH_TOKEN': token, 'DW_SERVER_KEY': 'fixture-' + secrets.token_hex(16),
-                            'DW_RUST_MAINTENANCE_LOOP': '1'},
-                       mounts=['type=bind,src=%s,dst=/app/database' % (self.state / 'database'),
-                               'type=bind,src=%s,dst=/app/storage' % (self.state / 'storage')])
+            if self.args.runtime == 'php':
+                self.start_php(token)
+            else:
+                self.start('runtime', self.server['executed_manifest'], [], user='1000:1000', alias='qualification-origin',
+                           env={'DB_CONNECTION': 'sqlite', 'DB_DATABASE': '/app/database/runtime.sqlite',
+                                'DW_AUTH_TOKEN': token, 'DW_SERVER_KEY': 'fixture-' + secrets.token_hex(16),
+                                'DW_RUST_MAINTENANCE_LOOP': '1'},
+                           mounts=['type=bind,src=%s,dst=/app/database' % (self.state / 'database'),
+                                   'type=bind,src=%s,dst=/app/storage' % (self.state / 'storage')])
             proxy = self.start('proxy', self.args.python_image, ['python', '/harness/proxy.py'], alias='qualification-runtime')
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + 120
+            ready = '/health' if self.args.runtime == 'php' else '/ready'
             while time.monotonic() < deadline:
-                if self.http(proxy, '/ready', token).returncode == 0:
+                if self.http(proxy, ready, token).returncode == 0:
                     break
                 time.sleep(0.5)
             else:
@@ -274,8 +326,13 @@ def main():
             summary['baselines_control'] = dict(check_baselines(
                 control['package'].get('metadata', {}).get('durable-workflow', {}), 'required'), source=str(args.baselines_control))
         summary['server'] = server_identity(args)
-        fixture = args.work_dir / 'fixture'
-        summary['build'] = build_fixture(args, fixture)
+        if args.fixture_from:
+            fixture = args.fixture_from.resolve()
+            summary['build'] = {'reused_fixture': str(fixture), 'toolchain': (fixture / 'build.stdout').read_text().strip().splitlines()[:2],
+                                'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
+        else:
+            fixture = args.work_dir / 'fixture'
+            summary['build'] = build_fixture(args, fixture)
         summary['crate'] = crate_provenance(args, fixture)
         summary['python_image'] = image_identity(args.python_image)
         summary['cells'] = {name: Cell(args, name, args.work_dir, summary['server'], fixture, stamp).run()
