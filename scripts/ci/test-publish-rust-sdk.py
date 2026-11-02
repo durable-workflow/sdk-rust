@@ -301,7 +301,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual(PRODUCT_TRAIN, metadata["product-train"])
         self.assertEqual("protocol-manifests", metadata["compatibility-authority"])
         self.assertEqual(SERVER_VERSIONS, metadata["supported-server-versions"])
-        self.assertEqual({"2": SERVER_VERSIONS, "3": "3.0.0"}, metadata["supported-server-release-baselines"])
+        self.assertEqual({"2": SERVER_VERSIONS, "3": "3.0.2"}, metadata["supported-server-release-baselines"])
         self.assertEqual(QUALIFIED_SERVER_VERSION, metadata["qualified-server-version"])
         self.assertEqual(WORKER_PROTOCOL_VERSION, metadata["worker-protocol-version"])
         self.assertEqual(
@@ -363,7 +363,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual(PRODUCT_TRAIN, evidence["product_train"])
         self.assertEqual("protocol-manifests", evidence["compatibility_authority"])
         self.assertEqual(SERVER_VERSIONS, evidence["supported_server_versions"])
-        self.assertEqual({"2": SERVER_VERSIONS, "3": "3.0.0"}, evidence["supported_server_release_baselines"])
+        self.assertEqual({"2": SERVER_VERSIONS, "3": "3.0.2"}, evidence["supported_server_release_baselines"])
         self.assertEqual(QUALIFIED_SERVER_VERSION, evidence["qualified_server_version"])
         self.assertEqual(
             WORKER_PROTOCOL_VERSION,
@@ -518,18 +518,21 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
 
     def test_release_path_rejects_invalid_server_baselines(self) -> None:
-        declaration = 'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.0" }'
+        declaration = 'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.2" }'
         for replacement in (
             '',
             'supported-server-release-baselines = {}',
-            'supported-server-release-baselines = ["3.0.0"]',
-            'supported-server-release-baselines = { "02" = "2.0.0", "3" = "3.0.0" }',
-            'supported-server-release-baselines = { "2" = "2.1.0", "3" = "3.0.0" }',
-            'supported-server-release-baselines = { "3" = "3.0.0" }',
+            'supported-server-release-baselines = ["3.0.2"]',
+            'supported-server-release-baselines = { "02" = "2.0.0", "3" = "3.0.2" }',
+            'supported-server-release-baselines = { "2" = "2.1.0", "3" = "3.0.2" }',
+            'supported-server-release-baselines = { "3" = "3.0.2" }',
             'supported-server-release-baselines = { "2" = "2.0.0", "3" = 3 }',
-            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.0-rc.1" }',
-            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.00.0" }',
-            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.0", "4" = "3.0.0" }',
+            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.2-rc.1" }',
+            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.00.2" }',
+            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.2", "4" = "3.0.2" }',
+            # Native 3.0.0 and 3.0.1 omit terminal failure detail from describe (server#967).
+            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.0" }',
+            'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.1" }',
         ):
             with self.subTest(replacement=replacement):
                 result = self._publish(self._manifest_with(declaration, replacement))
