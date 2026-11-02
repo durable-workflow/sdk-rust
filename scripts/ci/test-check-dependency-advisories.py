@@ -119,7 +119,16 @@ class AdvisoryCheckTest(unittest.TestCase):
                     CHECKER.check({"Cargo.lock": CLEAN_LOCK}, respond(result))
 
     def test_fails_on_unclear_osv_batches(self) -> None:
-        for response in ({}, {"results": {}}, {"results": [{}, {}]}, {"results": []}, []):
+        for response in (
+            {},
+            {"results": {}},
+            {"results": [{}, {}]},
+            {"results": []},
+            {"results": [{}], "error": {"code": 500, "message": "unavailable"}},
+            {"results": [{}], "next_page_token": "next"},
+            [],
+            None,
+        ):
             with self.subTest(response=response):
                 with self.assertRaises(CHECKER.OsvError):
                     CHECKER.check({"Cargo.lock": CLEAN_LOCK}, lambda body: response)

@@ -71,7 +71,10 @@ def osv_lookup(packages: list[Package], post: Post) -> dict[Package, list[str]]:
                 ]
             }
         )
-        results = response.get("results") if isinstance(response, dict) else None
+        # A batch response has exactly one top-level field, "results".
+        if not isinstance(response, dict) or set(response) != {"results"}:
+            raise OsvError(f"unexpected batch response: {json.dumps(response)[:200]}")
+        results = response["results"]
         if not isinstance(results, list) or len(results) != len(chunk):
             raise OsvError("unexpected batch response shape")
         for (name, version), result in zip(chunk, results):
