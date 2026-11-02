@@ -23,7 +23,6 @@ import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[2]
-EXPECTED_BASELINES = {'2': '2.0.0', '3': '3.0.0'}
 BINARY = 'installed-native-lifecycle'
 # Same pins as docker-compose.local-activities.yml, for the PHP Server baseline.
 MYSQL_IMAGE = 'mysql@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
@@ -45,6 +44,8 @@ def parse_args():
     parser.add_argument('--expect-release-tag', help='required dev.durable-workflow.release.tag label')
     parser.add_argument('--baselines', choices=['required', 'absent'], default='required',
                         help='whether the published crate must carry the per-major Server baseline map')
+    parser.add_argument('--expected-baselines', type=json.loads, default={'2': '2.0.0', '3': '3.0.2'},
+                        help='JSON map the published crate must declare when --baselines required')
     parser.add_argument('--baselines-control', type=pathlib.Path,
                         help='a Cargo.toml that must pass the required-map check (positive control)')
     parser.add_argument('--source-tag', help='git tag the crate must match (default: the crate version)')
@@ -118,15 +119,16 @@ def build_fixture(args, fixture):
             'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
 
 
-def check_baselines(metadata, mode):
+def check_baselines(metadata, mode, expected):
     present = 'supported-server-release-baselines' in metadata
     baselines = metadata.get('supported-server-release-baselines')
     scalar = metadata.get('supported-server-versions')
     if mode == 'absent':
         ok = not present
     else:
-        ok = baselines == EXPECTED_BASELINES and scalar == EXPECTED_BASELINES['2']
-    return {'mode': mode, 'pass': ok, 'supported-server-release-baselines': baselines,
+        ok = baselines == expected and scalar == expected.get('2')
+    return {'mode': mode, 'pass': ok, 'expected': expected if mode == 'required' else None,
+            'supported-server-release-baselines': baselines,
             'supported-server-versions': scalar}
 
 
@@ -167,7 +169,7 @@ def crate_provenance(args, fixture):
     return {'version': version, 'sha256': digests['registry'], 'registry_published_at': registry.get('created_at'),
             'yanked': registry.get('yanked'), 'source_tag': tag, 'source_commit': commit,
             'verified_source_and_schema_files': len(tagged), 'product_train': metadata.get('product-train'),
-            'baselines': check_baselines(metadata, args.baselines)}
+            'baselines': check_baselines(metadata, args.baselines, args.expected_baselines)}
 
 
 class Cell:
@@ -324,7 +326,8 @@ def main():
         if args.baselines_control:
             control = tomllib.loads(args.baselines_control.read_text())
             summary['baselines_control'] = dict(check_baselines(
-                control['package'].get('metadata', {}).get('durable-workflow', {}), 'required'), source=str(args.baselines_control))
+                control['package'].get('metadata', {}).get('durable-workflow', {}), 'required', args.expected_baselines),
+                source=str(args.baselines_control))
         summary['server'] = server_identity(args)
         if args.fixture_from:
             fixture = args.fixture_from.resolve()

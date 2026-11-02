@@ -17,8 +17,9 @@ It does the following:
    - The crate's VCS commit must equal the clean source tag.
    - Every packaged `src/` and `schema/` file must match that tag.
    - The packaged per-major Server baseline map
-     (`supported-server-release-baselines`, `2 → 2.0.0` and `3 → 3.0.0`) is
-     checked as `required` or `absent`.
+     (`supported-server-release-baselines`) is checked as `required` (equal to
+     `--expected-baselines`, default `{"2": "2.0.0", "3": "3.0.2"}`, with the
+     legacy scalar equal to its `2` entry) or `absent`.
    - `--baselines-control` runs the required-map check on another `Cargo.toml`
      as a positive control.
 4. **Lifecycle cell.** One managed worker process, using the published crate,
