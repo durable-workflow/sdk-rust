@@ -187,10 +187,11 @@ async fn drive_deadline() -> Outcome<Value> {
     let mut cases = serde_json::Map::new();
     for kind in ["run", "execution"] {
         std::fs::write("/state/delay.json", json!({"seconds": 3.0}).to_string())?;
-        // The execution cell continues once after one second, so its second run
-        // reaches the two-second execution deadline before its own run deadline.
-        let (mode, step) = if kind == "run" { ("timeout", 0) } else { ("exec-timeout", 1) };
-        let handle = start(&format!("deadline-{kind}"), mode, if kind == "run" { 60 } else { 2 }, 2).await?;
+        // The execution cell continues once after two seconds. Its second run
+        // reaches the five-second execution deadline well before its own
+        // four-second run deadline.
+        let (mode, step, execution, run) = if kind == "run" { ("timeout", 0, 60, 2) } else { ("exec-timeout", 1, 5, 4) };
+        let handle = start(&format!("deadline-{kind}"), mode, execution, run).await?;
         let target = wait_for(&format!("worker to enter {kind} step {step}"), Duration::from_secs(10),
             || entered(&handle.workflow_id, step)).await?;
         wait_for(&format!("{kind}: worker to schedule its timer"), Duration::from_secs(10), || {
@@ -266,7 +267,7 @@ async fn run_worker() -> Outcome<()> {
             ("continue", 0) => ctx.continue_as_new(json!([mode, 1])),
             ("continue", _) => Ok(expected(step)),
             ("exec-timeout", 0) => {
-                ctx.sleep(Duration::from_secs(1)).await?;
+                ctx.sleep(Duration::from_secs(2)).await?;
                 ctx.continue_as_new(json!([mode, 1]))
             }
             _ => {
@@ -275,6 +276,7 @@ async fn run_worker() -> Outcome<()> {
             }
         }
     });
+    worker.declare_workflow_signals(WORKFLOW, &["approve"])?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     worker.run_until(async move { terminate.recv().await; }).await?;
     Ok(())

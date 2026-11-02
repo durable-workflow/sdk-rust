@@ -35,8 +35,9 @@ It does the following:
    the runtime must answer with a matching terminal 409 receipt (`recorded=false`,
    `reason=run_timed_out`). History must hold exactly one `WorkflowTimedOut` of
    the right kind, and the same worker process must then complete another
-   workflow. The execution case continues once before the deadline, so its
-   second run reaches the execution deadline before its own run deadline.
+   workflow. The execution case continues once after two seconds, so its
+   second run reaches the 5-second execution deadline before its own 4-second
+   run deadline.
 
 `check_history.py` verifies each cell's durable history through the runtime's
 public HTTP API, independently of the SDK under test.
