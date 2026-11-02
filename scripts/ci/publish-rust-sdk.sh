@@ -122,6 +122,20 @@ if [[ "$compatibility_authority" != "protocol-manifests" || "$server_compatibili
     printf 'unexpected Rust SDK supported Server contract: %s, %s, %s, %s\n' "$compatibility_authority" "$server_compatibility" "$qualified_server_version" "$server_worker_protocols" >&2
     exit 1
 fi
+server_release_baselines="$(jq -c '.packages[0].metadata["durable-workflow"]["supported-server-release-baselines"]' <<<"$metadata")"
+if ! jq -e --arg legacy "$server_compatibility" '
+    if type != "object" or length == 0 then false else
+        all(to_entries[];
+            (.key | test("^[1-9][0-9]*$")) and
+            (.value | type == "string") and
+            (.value | test("^[1-9][0-9]*\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
+            (.key == (.value | split(".")[0]))) and
+        .[($legacy | split(".")[0])] == $legacy and .["3"] == "3.0.0"
+    end
+' <<<"$server_release_baselines" >/dev/null; then
+    printf 'unexpected Rust SDK Server release baselines\n' >&2
+    exit 1
+fi
 if [[ "$worker_protocol" != "1.20" || "$control_plane" != "2" || "$message_streams" != "true" || "$message_streams_minimum_protocol" != "1.15" || "$query_tasks" != "true" || "$query_task_minimum_protocol" != "1.8" || "$replayed_instance_state_queries" != "true" || "$query_state_model" != "deterministic-workflow-replay" || "$snapshot_inspection_queries" != "true" || "$durable_condition_waits" != "true" || "$condition_wait_command" != "open_condition_wait" || "$condition_wait_minimum_protocol" != "1.9" || "$condition_wait_result" != '["satisfied","timed_out"]' || "$condition_wait_occurrence_capability" != "condition_wait_occurrence_identity" || "$condition_wait_occurrence_identity" != "explicit-deterministic-authored-ordinal" || "$condition_wait_occurrence_minimum_protocol" != "1.17" || "$condition_wait_replay_validation" != "command-order+authored-occurrence+sequence+key+predicate-fingerprint+timeout" || "$durable_selection" != "true" || "$durable_selection_authoring" != "select+select_keyed" || "$durable_selection_minimum_protocol" != "1.19" || "$durable_selection_winner_history_event" != "SelectionResolved" || "$durable_selection_non_winner_lifecycle" != '["continue","await","cancel"]' || "$workflow_search_attribute_updates" != "true" || "$search_attribute_update_command" != "upsert_search_attributes" || "$search_attribute_update_minimum_protocol" != "1.8" || "$search_attribute_types" != '["string","keyword","keyword_list","int","float","bool","datetime"]' || "$child_workflows" != "true" || "$child_workflow_command" != "start_child_workflow" || "$child_workflow_failure_reasons" != '["child_workflow","cancelled","terminated"]' || "$deterministic_side_effects" != "true" || "$side_effect_command" != "record_side_effect" || "$side_effect_history_event" != "SideEffectRecorded" || "$version_markers" != "true" || "$version_marker_command" != "record_version_marker" || "$version_marker_history_event" != "VersionMarkerRecorded" || "$version_marker_helpers" != '["patched","deprecate_patch"]' || "$typed_search_attributes" != "true" || "$typed_search_attributes_minimum_protocol" != "1.16" || "$search_attribute_replay_identity" != "json-value+canonical-declared-type" || "$legacy_search_attribute_history" != "value-only+unknown-type-identity" ]]; then
     printf 'unexpected Rust SDK compatibility metadata\n' >&2
     exit 1
@@ -196,6 +210,7 @@ write_evidence() {
         --arg compatibility_authority "$compatibility_authority" \
         --arg server_compatibility "$server_compatibility" \
         --arg qualified_server_version "$qualified_server_version" \
+        --argjson server_release_baselines "$server_release_baselines" \
         --arg worker_protocol "$worker_protocol" \
         --arg server_worker_protocols "$server_worker_protocols" \
         --arg control_plane "$control_plane" \
@@ -285,6 +300,7 @@ write_evidence() {
             product_train: $product_train,
             compatibility_authority: $compatibility_authority,
             supported_server_versions: $server_compatibility,
+            supported_server_release_baselines: $server_release_baselines,
             qualified_server_version: $qualified_server_version,
             protocol_compatibility: {
                 worker_protocol: $worker_protocol,
