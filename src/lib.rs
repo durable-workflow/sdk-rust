@@ -8978,6 +8978,14 @@ impl Worker {
             if !workflow_task_report_is_settled(&error, task_id, attempt, run_id) {
                 return Err(error);
             }
+            #[cfg(feature = "telemetry")]
+            tracing::debug!(
+                task_id,
+                workflow_task_attempt = attempt,
+                run_id,
+                error = %error,
+                "settled a non-recorded workflow-task receipt"
+            );
         }
 
         Ok(ManagedPollOutcome::Handled)
