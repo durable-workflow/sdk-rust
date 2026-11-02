@@ -4,6 +4,10 @@
 Obsolete pull request revisions are cancelled job by job, so the final gate of
 an obsolete run never holds a workflow-wide slot. The gate itself must still
 run after cancellation and fail unless every required dependency succeeded.
+
+Groups are evaluated in the scheduler's context. GitHub sets github.job only
+inside steps; it is null when jobs.<id>.concurrency is evaluated, so each group
+must name its job literally.
 """
 
 import json
@@ -20,10 +24,14 @@ OPTIONAL = {'cooperative-server', 'local-server'}
 EXPRESSION = re.compile(r'^\$\{\{\s*(needs\.([a-z-]+)\.result|inputs\.([a-z_]+)|github\.server_url == \'https://github\.com\')\s*\}\}$')
 
 
-def workflow():
-    return yaml.safe_load(
-        (Path(__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()
-    )
+ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW_NAME = 'CI'
+# The former key took job identity from github.job, which is null here.
+GITHUB_JOB_KEY = "ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}"
+
+
+def workflow(name='ci.yml'):
+    return yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
 
 
 def evaluate(expression, contexts):
@@ -47,13 +55,20 @@ def evaluate(expression, contexts):
 
 
 def group_template(group):
-    # GitHub's ${{ a }}-${{ b }} interpolation as a JavaScript template literal.
-    return '`' + re.sub(r'\$\{\{\s*(.*?)\s*\}\}', r'${\1}', group) + '`'
+    # GitHub's ${{ a }}-${{ b }} interpolation as a JavaScript template literal;
+    # GitHub renders null and missing values as empty strings.
+    return '`' + re.sub(r'\$\{\{\s*(.*?)\s*\}\}', r"${((\1) ?? '')}", group) + '`'
 
 
-def context(event, ref, sha, job, matrix=None):
-    return {'github': {'event_name': event, 'ref': ref, 'sha': sha, 'job': job},
-            'matrix': matrix or {}}
+def context(event, ref, sha, matrix=None, workflow_name=WORKFLOW_NAME):
+    """The scheduler's view: github.job is null, as outside any step."""
+    return {'github': {'event_name': event, 'ref': ref, 'sha': sha, 'job': None,
+                       'workflow': workflow_name},
+            'matrix': matrix or {}, 'inputs': {}}
+
+
+def literal_text(template):
+    return re.sub(r'\$\{\{.*?\}\}', '\0', template)
 
 
 class ConcurrencyTest(unittest.TestCase):
@@ -68,10 +83,10 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertNotIn('concurrency', gate)
         self.assertEqual('${{ always() }}', gate['if'])
 
-    def resolve(self, job, contexts):
+    def resolve(self, job, contexts, group=None):
         self.assertIn('concurrency', self.jobs[job], f'{job} has no concurrency group')
         concurrency = self.jobs[job]['concurrency']
-        groups = evaluate(group_template(concurrency['group']), contexts)
+        groups = evaluate(group_template(group or concurrency['group']), contexts)
         cancels = evaluate(concurrency['cancel-in-progress'], contexts)
         return list(zip(groups, cancels))
 
@@ -82,11 +97,11 @@ class ConcurrencyTest(unittest.TestCase):
             with self.subTest(job=job):
                 matrix = {'rust': '1.86.0'} if job == 'test' else None
                 (a, cancel_pr), (b, _), (main_a, cancel_main), (main_b, _), (dispatch, cancel_dispatch) = self.resolve(job, [
-                    context('pull_request', 'refs/pull/7/merge', 'a' * 40, job, matrix),
-                    context('pull_request', 'refs/pull/7/merge', 'b' * 40, job, matrix),
-                    context('push', 'refs/heads/main', 'c' * 40, job, matrix),
-                    context('push', 'refs/heads/main', 'd' * 40, job, matrix),
-                    context('workflow_dispatch', 'refs/heads/main', 'e' * 40, job, matrix),
+                    context('pull_request', 'refs/pull/7/merge', 'a' * 40, matrix),
+                    context('pull_request', 'refs/pull/7/merge', 'b' * 40, matrix),
+                    context('push', 'refs/heads/main', 'c' * 40, matrix),
+                    context('push', 'refs/heads/main', 'd' * 40, matrix),
+                    context('workflow_dispatch', 'refs/heads/main', 'e' * 40, matrix),
                 ])
                 # A new PR revision replaces the same job of the obsolete one.
                 self.assertEqual(a, b)
@@ -95,8 +110,36 @@ class ConcurrencyTest(unittest.TestCase):
                 self.assertNotEqual(main_a, main_b)
                 self.assertIs(False, cancel_main)
                 self.assertIs(False, cancel_dispatch)
-                self.assertIn(job, a)
                 self.assertIn('e' * 40, dispatch)
+                # Other pull requests keep their own groups.
+                ((other, _),) = self.resolve(job, [
+                    context('pull_request', 'refs/pull/8/merge', 'a' * 40, matrix)])
+                self.assertNotEqual(a, other)
+
+    def test_groups_name_the_job_literally_and_the_workflow(self):
+        for job in self.jobs:
+            if job == GATE:
+                continue
+            with self.subTest(job=job):
+                group = self.jobs[job]['concurrency']['group']
+                self.assertNotIn('github.job', group)
+                self.assertIn(f'-{job}-', literal_text(group))
+                self.assertTrue(group.startswith('${{ github.workflow }}-'), group)
+                matrix = {'rust': '1.86.0'} if job == 'test' else None
+                (ci, _), (renamed, _) = self.resolve(job, [
+                    context('pull_request', 'refs/pull/7/merge', 'a' * 40, matrix),
+                    context('pull_request', 'refs/pull/7/merge', 'a' * 40, matrix, 'Other'),
+                ])
+                self.assertTrue(ci.startswith(f'{WORKFLOW_NAME}-{job}-'), ci)
+                self.assertNotEqual(ci, renamed)
+
+    def test_scheduler_model_catches_a_github_job_key(self):
+        # Counterfactual: with github.job null, the former key gives every
+        # non-matrix job the same group, so they would cancel one another.
+        pr = context('pull_request', 'refs/pull/7/merge', 'a' * 40)
+        groups = {self.resolve(job, [pr], GITHUB_JOB_KEY)[0][0]
+                  for job in ('docs', 'package', 'protocol')}
+        self.assertEqual(1, len(groups), groups)
 
     def test_jobs_and_matrix_legs_never_share_a_group(self):
         groups = {}
@@ -106,9 +149,34 @@ class ConcurrencyTest(unittest.TestCase):
             legs = self.jobs[job].get('strategy', {}).get('matrix', {}).get('rust', [None])
             for rust in legs:
                 matrix = {'rust': rust} if rust else None
-                pr = context('pull_request', 'refs/pull/7/merge', 'a' * 40, job, matrix)
+                pr = context('pull_request', 'refs/pull/7/merge', 'a' * 40, matrix)
                 groups[(job, rust)] = self.resolve(job, [pr])[0][0]
         self.assertEqual(len(groups), len(set(groups.values())), groups)
+        self.assertIn(('test', '1.86.0'), groups)
+        self.assertIn(('test', 'stable'), groups)
+
+    def test_groups_do_not_collide_with_other_workflows(self):
+        ours = set()
+        for job in self.jobs:
+            if job == GATE:
+                continue
+            for rust in self.jobs[job].get('strategy', {}).get('matrix', {}).get('rust', [None]):
+                matrix = {'rust': rust} if rust else None
+                for event, ref in (('pull_request', 'refs/pull/7/merge'), ('push', 'refs/heads/main')):
+                    ours.add(self.resolve(job, [context(event, ref, 'a' * 40, matrix)])[0][0])
+        for path in sorted((ROOT / '.github/workflows').glob('*.yml')):
+            if path.name == 'ci.yml':
+                continue
+            other = workflow(path.name)
+            groups = [other.get('concurrency')] + [
+                spec.get('concurrency') for spec in other.get('jobs', {}).values()]
+            for spec in filter(None, groups):
+                group = spec['group'] if isinstance(spec, dict) else spec
+                for event, ref in (('pull_request', 'refs/pull/7/merge'), ('push', 'refs/heads/main')):
+                    with self.subTest(workflow=path.name, event=event):
+                        (theirs,) = evaluate(group_template(group), [
+                            context(event, ref, 'a' * 40, workflow_name=other.get('name', path.name))])
+                        self.assertNotIn(theirs, ours)
 
 
 class GateTest(unittest.TestCase):

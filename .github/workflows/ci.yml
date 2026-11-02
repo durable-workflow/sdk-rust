@@ -44,9 +44,10 @@ jobs:
     name: Central action policy preflight
     if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
-    # Per-job groups: an obsolete run's final gate must not hold a new revision (#149).
+    # Per-job groups keep an obsolete run's final gate from holding a new revision (#149).
+    # Job IDs are literal: github.job is null when the scheduler evaluates concurrency.
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-action-policy-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 5
     steps:
@@ -79,7 +80,7 @@ jobs:
     name: Completion acknowledgement fixture
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-completion-ack-fixture-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 5
     steps:
@@ -111,7 +112,7 @@ jobs:
     name: Regression corpus
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-regression-corpus-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 10
     steps:
@@ -157,7 +158,7 @@ jobs:
     name: Rust ${{ matrix.rust }}
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-test-${{ matrix.rust }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 20
     env:
@@ -233,7 +234,7 @@ jobs:
     name: Avro protocol
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-protocol-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
     steps:
@@ -280,7 +281,7 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-docs-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
     steps:
@@ -322,7 +323,7 @@ jobs:
     name: Package
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-package-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
     steps:
@@ -363,7 +364,7 @@ jobs:
     needs: [action-policy, test]
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-cooperative-server-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 25
     env:
@@ -485,7 +486,7 @@ jobs:
     needs: [action-policy, test]
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-${{ github.event_name }}-${{ github.job }}-${{ matrix.rust || 'single' }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ${{ github.workflow }}-local-server-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 20
     env:
