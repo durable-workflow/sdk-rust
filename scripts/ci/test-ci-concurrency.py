@@ -246,5 +246,13 @@ class GateTest(unittest.TestCase):
                 self.assertTrue(self.run_gate(self.ordinary_results() | {job: 'success'}, inputs))
 
 
+
+class TemporaryLiveFailureControl(unittest.TestCase):
+    # TEMPORARY (#149 live experiment): forces Regression corpus to fail so the
+    # required gate's refusal can be observed. Reverted by the next commit.
+    def test_forced_failure(self):
+        self.fail('#149 live control: deliberate Regression corpus failure')
+
+
 if __name__ == '__main__':
     unittest.main()
