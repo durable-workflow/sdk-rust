@@ -50,9 +50,10 @@ def parse_args():
 
 
 def call(command, timeout=120, check=True, **kwargs):
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, **kwargs)
+    kwargs.setdefault('text', True)
+    result = subprocess.run(command, capture_output=True, timeout=timeout, **kwargs)
     if check and result.returncode:
-        raise RuntimeError('%s failed (%s): %s' % (' '.join(command[:4]), result.returncode, result.stderr[-2000:]))
+        raise RuntimeError('%s failed (%s): %r' % (' '.join(command[:4]), result.returncode, result.stderr[-2000:]))
     return result
 
 
