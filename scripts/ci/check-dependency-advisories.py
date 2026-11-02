@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fail when a committed Cargo lock resolves a crate with a known advisory.
 
-Every registry package in the root lock and the fixture locks is checked
+Every crates.io package in the root lock and the fixture locks is checked
 against OSV, which includes GitHub-reviewed and RustSec advisories for crates.io.
+Any other package source, and any OSV response that is not a clear answer,
+fails the check instead of passing unchecked.
 """
 
 from __future__ import annotations
@@ -21,55 +23,96 @@ LOCKS = (
     "tests/fixtures/grouped-condition-worker-consumer/Cargo.lock",
     "tests/nexus/Cargo.lock",
 )
+# The only source OSV's "crates.io" ecosystem describes. Cargo records crates.io
+# with this source in lock files for both the git and sparse index protocols.
+CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 OSV = "https://api.osv.dev/v1/querybatch"
 BATCH = 500
 
 Package = tuple[str, str]
-Lookup = Callable[[list[Package]], dict[Package, list[str]]]
+Post = Callable[[dict], object]
 
 
-def registry_packages(text: str) -> list[Package]:
-    return [
-        (package["name"], package["version"])
-        for package in tomllib.loads(text).get("package", [])
-        if package.get("source", "").startswith("registry+")
-    ]
+class LockError(Exception):
+    pass
 
 
-def osv_lookup(packages: list[Package]) -> dict[Package, list[str]]:
-    """Return advisory IDs for each package that has one."""
+class OsvError(Exception):
+    pass
+
+
+def crates_io_packages(text: str) -> list[Package]:
+    """Return crates.io packages, refusing sources OSV cannot identify."""
+    packages = []
+    for package in tomllib.loads(text).get("package", []):
+        source = package.get("source")
+        if source is None:
+            continue  # Local path or workspace package: this repository's source.
+        if source != CRATES_IO:
+            raise LockError(
+                f"{package['name']} {package['version']} uses unsupported source {source}"
+            )
+        packages.append((package["name"], package["version"]))
+    if not packages:
+        raise LockError("no crates.io packages found")
+    return packages
+
+
+def osv_lookup(packages: list[Package], post: Post) -> dict[Package, list[str]]:
+    """Return advisory IDs per affected package, failing on any unclear answer."""
     found: dict[Package, list[str]] = {}
     for start in range(0, len(packages), BATCH):
         chunk = packages[start : start + BATCH]
-        body = json.dumps(
+        response = post(
             {
                 "queries": [
                     {"package": {"ecosystem": "crates.io", "name": name}, "version": version}
                     for name, version in chunk
                 ]
             }
-        ).encode()
-        request = urllib.request.Request(OSV, body, {"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=60) as response:
-            results = json.load(response).get("results")
+        )
+        results = response.get("results") if isinstance(response, dict) else None
         if not isinstance(results, list) or len(results) != len(chunk):
-            raise RuntimeError("OSV returned an unexpected batch response")
-        for package, result in zip(chunk, results):
-            ids = [vuln["id"] for vuln in result.get("vulns", [])]
-            if ids or result.get("next_page_token"):
-                found[package] = ids or ["(paginated OSV result)"]
+            raise OsvError("unexpected batch response shape")
+        for (name, version), result in zip(chunk, results):
+            ids = advisory_ids(result, f"{name} {version}")
+            if ids:
+                found[(name, version)] = ids
     return found
 
 
-def check(locks: dict[str, str], lookup: Lookup) -> list[str]:
-    """Return one failure line per affected package in each lock."""
+def advisory_ids(result: object, package: str) -> list[str]:
+    # A clean result is an empty object. Anything else must be a non-empty,
+    # unpaginated list of advisories with string IDs.
+    if not isinstance(result, dict) or set(result) - {"vulns"}:
+        raise OsvError(f"unexpected result for {package}: {json.dumps(result)[:200]}")
+    vulns = result.get("vulns", [])
+    if not isinstance(vulns, list) or ("vulns" in result and not vulns):
+        raise OsvError(f"malformed advisories for {package}")
+    ids = [vuln.get("id") if isinstance(vuln, dict) else None for vuln in vulns]
+    if not all(isinstance(vuln_id, str) and vuln_id for vuln_id in ids):
+        raise OsvError(f"malformed advisory ID for {package}")
+    return ids
+
+
+def post_osv(body: dict) -> object:
+    request = urllib.request.Request(
+        OSV, json.dumps(body).encode(), {"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)
+
+
+def check(locks: dict[str, str], post: Post) -> list[str]:
+    """Return one failure line per affected package or unusable lock."""
     failures = []
     for path, text in locks.items():
-        packages = registry_packages(text)
-        if not packages:
-            failures.append(f"{path}: no registry packages found")
+        try:
+            affected = osv_lookup(crates_io_packages(text), post)
+        except LockError as error:
+            failures.append(f"{path}: {error}")
             continue
-        for (name, version), ids in sorted(lookup(packages).items()):
+        for (name, version), ids in sorted(affected.items()):
             failures.append(f"{path}: {name} {version} is affected by {', '.join(ids)}")
     return failures
 
@@ -80,7 +123,8 @@ def main() -> int:
     arguments = parser.parse_args()
 
     locks = {path: (ROOT / path).read_text() for path in arguments.locks}
-    failures = check(locks, osv_lookup)
+    # HTTP and OSV response errors propagate and fail the job.
+    failures = check(locks, post_osv)
     for failure in failures:
         print(f"::error::{failure}")
     if failures:
