@@ -1,0 +1,16 @@
+[package]
+name = "installed-native-lifecycle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+durable-workflow = "=@CRATE_VERSION@"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[workspace]
