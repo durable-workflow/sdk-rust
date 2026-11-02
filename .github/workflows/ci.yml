@@ -140,6 +140,10 @@ jobs:
           python scripts/ci/validate-regression-corpus.py "${arguments[@]}"
       - name: Test the corpus policy
         run: python scripts/ci/test-validate-regression-corpus.py
+      - name: Test the dependency advisory check
+        run: python scripts/ci/test-check-dependency-advisories.py
+      - name: Check committed Cargo locks for known advisories
+        run: python scripts/ci/check-dependency-advisories.py
 
   test:
     name: Rust ${{ matrix.rust }}
