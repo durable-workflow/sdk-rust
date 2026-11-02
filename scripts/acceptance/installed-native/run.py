@@ -62,8 +62,12 @@ def sha256(path):
 
 def image_identity(image):
     data = json.loads(call(['docker', 'image', 'inspect', image]).stdout)[0]
+    # With the containerd image store, Id is the digest the image was pulled by
+    # (index or platform manifest), so compare the resolved content instead.
+    content = {'layers': data.get('RootFS', {}).get('Layers'), 'config': data.get('Config')}
     return {'id': data['Id'], 'repo_digests': data.get('RepoDigests', []),
-            'os': data.get('Os'), 'architecture': data.get('Architecture')}
+            'os': data.get('Os'), 'architecture': data.get('Architecture'),
+            'content_sha256': hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()}
 
 
 def server_identity(args):
@@ -78,7 +82,7 @@ def server_identity(args):
     call(['docker', 'pull', '--platform', args.platform, index_ref], timeout=900)
     call(['docker', 'pull', manifest_ref], timeout=900)
     by_index, by_manifest = image_identity(index_ref), image_identity(manifest_ref)
-    if by_index['id'] != by_manifest['id']:
+    if (by_index['content_sha256'], by_index['architecture']) != (by_manifest['content_sha256'], by_manifest['architecture']):
         raise RuntimeError('index and %s manifest resolve to different images' % args.platform)
     labels = json.loads(call(['docker', 'image', 'inspect', '--format', '{{json .Config.Labels}}', manifest_ref]).stdout) or {}
     for label, expected in [('org.opencontainers.image.revision', args.expect_revision),
@@ -87,7 +91,7 @@ def server_identity(args):
             raise RuntimeError('label %s is %r, expected %r' % (label, labels.get(label), expected))
     return {'index': index_ref, 'executed_manifest': manifest_ref, 'platform': args.platform,
             'other_manifests': [{'digest': m['digest'], 'platform': m.get('platform')} for m in index['manifests'] if m is not matches[0]],
-            'image': by_manifest, 'labels': labels}
+            'image': by_manifest, 'image_by_index': by_index, 'labels': labels}
 
 
 def build_fixture(args, fixture):
