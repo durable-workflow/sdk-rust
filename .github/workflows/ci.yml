@@ -39,15 +39,16 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   action-policy:
     name: Central action policy preflight
     if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
+    # Per-job groups keep an obsolete run's final gate from holding a new revision (#149).
+    # Job IDs are literal: github.job is null when the scheduler evaluates concurrency.
+    concurrency:
+      group: ${{ github.workflow }}-action-policy-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 5
     steps:
       - name: Check out candidate source
@@ -78,6 +79,9 @@ jobs:
   completion-ack-fixture:
     name: Completion acknowledgement fixture
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-completion-ack-fixture-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -107,6 +111,9 @@ jobs:
   regression-corpus:
     name: Regression corpus
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-regression-corpus-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -125,6 +132,8 @@ jobs:
           python -m pip install --only-binary :all: PyYAML==6.0.2
       - name: Check Rust cache event boundary
         run: python scripts/ci/test-rust-ci-cache.py
+      - name: Check CI concurrency and final gate
+        run: python scripts/ci/test-ci-concurrency.py
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
@@ -148,6 +157,9 @@ jobs:
   test:
     name: Rust ${{ matrix.rust }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-test-${{ matrix.rust }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 20
     env:
       # Keep source locations in test backtraces without full debugger data.
@@ -221,6 +233,9 @@ jobs:
   protocol:
     name: Avro protocol
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-protocol-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -265,6 +280,9 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-docs-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -304,6 +322,9 @@ jobs:
   package:
     name: Package
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-package-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -342,6 +363,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && (inputs.cooperative_qualification || (inputs.session_qualification && inputs.server_commit != '')) }}
     needs: [action-policy, test]
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-cooperative-server-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 25
     env:
       COMPOSE_PROJECT_NAME: rust-cooperative-${{ github.run_id }}-${{ github.run_attempt }}
@@ -461,6 +485,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && (inputs.local_qualification || inputs.sticky_qualification || (inputs.session_qualification && inputs.server_commit == '')) }}
     needs: [action-policy, test]
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-local-server-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 20
     env:
       COMPOSE_PROJECT_NAME: rust-local-${{ github.run_id }}-${{ github.run_attempt }}
