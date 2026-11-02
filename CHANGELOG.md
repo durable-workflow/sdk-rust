@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fill `WorkflowFailed` and `WorkflowTimedOut` results from the run's terminal
+  history event when a terminal description carries no failure detail or timeout
+  reason, as native Server 3.0.1 does. The error type, message, retry flag and
+  `run_timeout`/`execution_timeout` reason are restored. Complete descriptions
+  and cancelled or terminated runs never read history, and an unreadable history
+  keeps the description-only outcome.
+
 ## 4.10.3
 
 - Declare minimum stable Server releases per major, including native Server 3.x,
