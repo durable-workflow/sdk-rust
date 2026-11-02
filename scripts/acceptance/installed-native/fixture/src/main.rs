@@ -153,39 +153,50 @@ async fn expect_continued(handle: &WorkflowHandle) -> Outcome<Value> {
         "final_run_id": current.run_id, "status": current.status, "result": value}))
 }
 
+async fn lifecycle_case(mode: &str) -> Outcome<Value> {
+    let workflow_mode = if mode == "after-timeout" { "continue" } else { mode };
+    let run_timeout = if mode == "timeout" { 2 } else { 30 };
+    let handle = start(&format!("lifecycle-{mode}"), workflow_mode, 60, run_timeout).await?;
+    wait_for(&format!("worker to enter {mode}"), Duration::from_secs(15), || entered(&handle.workflow_id, 0)).await?;
+    if matches!(mode, "continue" | "after-timeout") {
+        return expect_continued(&handle).await;
+    }
+    if mode == "cancel" {
+        handle.cancel(WorkflowCommandOptions { reason: Some("qualification cancellation".into()), request_id: None }).await?;
+    }
+    let error = handle.result(result_options()).await.expect_err("workflow must not complete");
+    let observed = terminal(&error);
+    // The exact timeout kind is verified in durable history by check_history.py.
+    let kind = if mode == "timeout" { "timed_out" } else { "cancelled" };
+    check(observed["sdk_error"] == kind, format!("{mode}: unexpected terminal outcome {observed}"))?;
+    let current = handle.describe_selected_run().await?;
+    Ok(json!({"workflow_id": handle.workflow_id, "original_run_id": handle.run_id,
+        "final_run_id": handle.run_id, "status": current.status, "terminal": observed,
+        "described": {"closed_reason": current.closed_reason, "failure": current.failure}}))
+}
+
+/// Every scenario is attempted and reported, so one failure does not hide the rest.
 async fn drive_lifecycle() -> Outcome<Value> {
     let mut cases = serde_json::Map::new();
-    cases.insert("regular".to_owned(), drive_regular().await?);
-    cases.insert("reject".to_owned(), drive_reject().await?);
-    for mode in ["continue", "timeout", "cancel", "after-timeout"] {
-        let workflow_mode = if mode == "after-timeout" { "continue" } else { mode };
-        let run_timeout = if mode == "timeout" { 2 } else { 30 };
-        let handle = start(&format!("lifecycle-{mode}"), workflow_mode, 60, run_timeout).await?;
-        wait_for(&format!("worker to enter {mode}"), Duration::from_secs(15), || entered(&handle.workflow_id, 0)).await?;
-        let case = match mode {
-            "continue" | "after-timeout" => expect_continued(&handle).await?,
-            "timeout" | "cancel" => {
-                if mode == "cancel" {
-                    handle.cancel(WorkflowCommandOptions { reason: Some("qualification cancellation".into()), request_id: None }).await?;
-                }
-                let error = handle.result(result_options()).await.expect_err("workflow must not complete");
-                let observed = terminal(&error);
-                // The exact timeout kind is verified in durable history by check_history.py.
-                let kind = if mode == "timeout" { "timed_out" } else { "cancelled" };
-                check(observed["sdk_error"] == kind, format!("{mode}: unexpected terminal outcome {observed}"))?;
-                let current = handle.describe_selected_run().await?;
-                json!({"workflow_id": handle.workflow_id, "original_run_id": handle.run_id,
-                    "final_run_id": handle.run_id, "status": current.status, "terminal": observed,
-                    "described": {"closed_reason": current.closed_reason, "failure": current.failure}})
-            }
-            _ => unreachable!(),
-        };
-        cases.insert(mode.to_owned(), case);
-    }
-    // Report every scenario, then fail if the typed failure lost its detail.
     let mut problems = Vec::new();
-    if cases["reject"]["exception_detail_surfaced"] != true {
-        problems.push("reject: WorkflowFailed carries no exception type or message".to_owned());
+    for mode in ["regular", "reject", "continue", "timeout", "cancel", "after-timeout"] {
+        let case = match mode {
+            "regular" => drive_regular().await,
+            "reject" => drive_reject().await,
+            _ => lifecycle_case(mode).await,
+        };
+        match case {
+            Ok(case) => {
+                if mode == "reject" && case["exception_detail_surfaced"] != true {
+                    problems.push("reject: WorkflowFailed carries no exception type or message".to_owned());
+                }
+                cases.insert(mode.to_owned(), case);
+            }
+            Err(error) => {
+                problems.push(format!("{mode}: {error}"));
+                cases.insert(mode.to_owned(), json!({"error": error.to_string()}));
+            }
+        }
     }
     let outcome = if problems.is_empty() { "pass" } else { "fail" };
     Ok(json!({"outcome": outcome, "cell": "lifecycle", "problems": problems, "cases": cases}))

@@ -51,6 +51,9 @@ observed = {}
 if report.get('outcome') != 'pass':
     problems.append('driver did not pass: %s' % report.get('error'))
 for name, case in report.get('cases', {}).items():
+    if 'error' in case:
+        observed[name] = {'driver_error': case['error']}
+        continue
     runs = {case['original_run_id'], case['final_run_id']}
     case_history = {run: history(case['workflow_id'], run) for run in sorted(runs)}
     types = {run: [e.get('event_type') for e in events] for run, events in case_history.items()}
