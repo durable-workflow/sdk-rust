@@ -890,6 +890,14 @@ The crate publishes its supported Server and worker-protocol ranges in
 capability manifests, not matching package version strings, determine protocol
 compatibility. Stable releases follow semantic versioning.
 
+`supported-server-release-baselines` maps supported Server majors to minimum
+stable releases. A reader validates the whole map before selecting a major and
+refuses an unlisted major, a malformed entry or a contradiction with the legacy
+`supported-server-versions` 2.x baseline. Without the additive map, existing
+same-major baseline behavior remains. The legacy scalar and the separate 2.x
+qualification identity are preserved for older readers. Protocol and capability
+negotiation remain required for individual features.
+
 ## Development
 
 ```sh
