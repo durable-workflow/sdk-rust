@@ -113,12 +113,17 @@ async fn drive_reject() -> Outcome<Value> {
     let Error::WorkflowFailed(outcome) = &error else {
         return Err(format!("reject: expected WorkflowFailed, got {error}").into());
     };
-    let detail = json!({"exception": outcome.exception, "raw": outcome.raw}).to_string();
-    check(outcome.exception_type.as_deref() == Some("ActivityFailed") && detail.contains("QualificationRejected"),
-        format!("reject: untyped failure {:?} {detail}", outcome.exception_type))?;
+    // The typed variant is required. Whether the client error also carries the
+    // failure's exception type is reported separately, since it depends on the
+    // failure fields the runtime returns from describe.
+    let detail = json!({"exception": outcome.exception, "message": outcome.message}).to_string();
+    let detail_surfaced = outcome.exception_type.as_deref() == Some("ActivityFailed") && detail.contains("QualificationRejected");
     let current = handle.describe().await?;
     Ok(json!({"workflow_id": handle.workflow_id, "original_run_id": handle.run_id, "final_run_id": handle.run_id,
-        "status": current.status, "terminal": {"sdk_error": "failed", "reason": outcome.reason,
+        "status": current.status, "exception_detail_surfaced": detail_surfaced,
+        "described": {"closed_reason": current.closed_reason, "failure": current.failure,
+            "exception": current.exception, "failures": current.failures, "error": current.error},
+        "terminal": {"sdk_error": "failed", "reason": outcome.reason,
         "exception_type": outcome.exception_type, "non_retryable": outcome.non_retryable,
         "message": outcome.message, "exception": outcome.exception}}))
 }
@@ -177,7 +182,13 @@ async fn drive_lifecycle() -> Outcome<Value> {
         };
         cases.insert(mode.to_owned(), case);
     }
-    Ok(json!({"outcome": "pass", "cell": "lifecycle", "cases": cases}))
+    // Report every scenario, then fail if the typed failure lost its detail.
+    let mut problems = Vec::new();
+    if cases["reject"]["exception_detail_surfaced"] != true {
+        problems.push("reject: WorkflowFailed carries no exception type or message".to_owned());
+    }
+    let outcome = if problems.is_empty() { "pass" } else { "fail" };
+    Ok(json!({"outcome": outcome, "cell": "lifecycle", "problems": problems, "cases": cases}))
 }
 
 /// A run or execution deadline passes while the worker's history-wait report is
@@ -292,6 +303,11 @@ async fn main() -> Outcome<()> {
         other => return Err(format!("unknown role {other}").into()),
     };
     let report = report.unwrap_or_else(|error| json!({"outcome": "fail", "error": error.to_string()}));
+    let report = if report["outcome"] == "fail" && report.get("error").is_none() {
+        let mut report = report;
+        report["error"] = json!(report["problems"].to_string());
+        report
+    } else { report };
     std::fs::write("/state/driver.json", serde_json::to_string_pretty(&report)?)?;
     println!("{report}");
     check(report["outcome"] == "pass", "driver failed")

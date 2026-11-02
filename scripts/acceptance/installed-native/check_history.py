@@ -63,6 +63,9 @@ for name, case in report.get('cases', {}).items():
         elif name == 'reject':
             expect('Activity' in final_types and 'Failed' in final_types and not timeouts(final),
                    name + ': expected activity and failure events without a timeout')
+            failed = [e for e in final if e.get('event_type') == 'WorkflowFailed']
+            expect(len(failed) == 1 and 'QualificationRejected' in json.dumps(failed),
+                   name + ': WorkflowFailed history does not record the typed activity failure')
         elif name in ('continue', 'after-timeout'):
             expect(case['original_run_id'] != case['final_run_id'], name + ': run did not advance')
             expect(all(not timeouts(events) for events in case_history.values()), name + ': unexpected timeout')
@@ -81,7 +84,8 @@ for name, case in report.get('cases', {}).items():
         next_history = history(nxt['workflow_id'], nxt['final_run_id'])
         expect(not timeouts(next_history), name + ': follow-up workflow timed out')
         types['next:' + nxt['final_run_id']] = [e.get('event_type') for e in next_history]
-    observed[name] = {'event_types': types, 'timeout_events': timeouts(final)}
+    observed[name] = {'event_types': types, 'timeout_events': timeouts(final),
+                      'failure_events': [e for e in final if e.get('event_type') == 'WorkflowFailed']}
 
 result = {'outcome': 'fail' if problems else 'pass', 'problems': problems, 'cases': observed}
 (state / 'history.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
