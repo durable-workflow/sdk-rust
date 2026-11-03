@@ -5,10 +5,33 @@ It records every workflow-task /complete and /fail acknowledgement to
 is held for that many seconds before forwarding, unchanged, so a run or
 execution deadline passes while the worker waits for the receipt.
 """
-import http.client, http.server, json, pathlib, threading, time
+import http.client, http.server, json, pathlib, re, threading, time
 
 state = pathlib.Path('/state')
 lock = threading.Lock()
+
+HOP_BY_HOP = frozenset(('connection', 'keep-alive', 'proxy-connection', 'transfer-encoding',
+                        'content-length', 'te', 'trailer', 'upgrade'))
+HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+HEADER_VALUE = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
+
+
+def forwardable_headers(pairs):
+    """Upstream response headers that are safe to relay.
+
+    Hop-by-hop headers are dropped. A name that is not an RFC 9110 token, or a
+    value containing CR, LF or another control character, is refused rather than
+    relayed, so an upstream response cannot split or inject headers.
+    """
+    safe = []
+    for name, value in pairs:
+        if name.lower() in HOP_BY_HOP:
+            continue
+        if not HEADER_NAME.fullmatch(name) or not HEADER_VALUE.fullmatch(value):
+            raise ValueError('refusing to relay an unsafe upstream header')
+        safe.append((name, value))
+    return safe
+
 
 class Proxy(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -45,9 +68,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 with (state / 'acks.jsonl').open('a') as log:
                     log.write(json.dumps(event) + '\n')
         self.send_response(response.status)
-        for key, value in response.getheaders():
-            if key.lower() not in ('connection', 'transfer-encoding', 'content-length'):
-                self.send_header(key, value)
+        for key, value in forwardable_headers(response.getheaders()):
+            self.send_header(key, value)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Connection', 'close')
         self.end_headers()
@@ -60,4 +82,5 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     do_DELETE = handle_request
     do_PATCH = handle_request
 
-http.server.ThreadingHTTPServer(('0.0.0.0', 8080), Proxy).serve_forever()
+if __name__ == '__main__':
+    http.server.ThreadingHTTPServer(('0.0.0.0', 8080), Proxy).serve_forever()

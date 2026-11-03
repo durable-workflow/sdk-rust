@@ -151,6 +151,8 @@ jobs:
         run: python scripts/ci/test-validate-regression-corpus.py
       - name: Test the dependency advisory check
         run: python scripts/ci/test-check-dependency-advisories.py
+      - name: Test the acceptance proxy header relay
+        run: python scripts/acceptance/installed-native/test_proxy.py
       - name: Check committed Cargo locks for known advisories
         run: python scripts/ci/check-dependency-advisories.py
 
