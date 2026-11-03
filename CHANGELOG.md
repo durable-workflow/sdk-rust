@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Qualify replay of Workflow 2.19 redrive successors that reuse
+  `MemoUpserted`, `SearchAttributesUpserted` or an applied signal wait
+  (`SignalWaitOpened`, `SignalReceived`, `SignalApplied`). Values replay
+  unchanged and nothing is re-emitted. A reused prefix always precedes any
+  cancellation delivered on the successor, so these events never change
+  `remaining()`.
+
 ## 4.11.1
 
 - Advance the cooperative cancellation clock to a redrive-reused step's

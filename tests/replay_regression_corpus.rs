@@ -16,7 +16,8 @@ use durable_workflow::{
     decode_payload, encode_payload, json, ActivityOptions, ActivityRetryPolicy, AvroValue,
     ChildWorkflowOptions, Client, ConditionWaitOptions, ConditionWaitResult, Error,
     ParallelOperation, ParallelResult, PayloadEnvelope, SearchAttributeUpdate, SelectionKey,
-    StickyCacheOptions, Value, Worker, WorkerRetryPolicy, WorkflowInstance, DEFAULT_CODEC,
+    StickyCacheOptions, Value, Worker, WorkerRetryPolicy, WorkflowContext, WorkflowInstance,
+    DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -485,6 +486,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.redrive-reused-markers"
             | "corpus.redrive-reused-timer"
             | "corpus.redrive-reused-cancellation-clock"
+            | "corpus.redrive-reused-upserts"
+            | "corpus.redrive-reused-signal-wait"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
             | "corpus.nexus-result"
@@ -550,6 +553,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         task["workflow_command_id"] = workflow_command_id.clone();
     }
     for field in [
+        "workflow_id",
         "workflow_update_id",
         "update_name",
         "sticky_replay_mode",
@@ -906,6 +910,39 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 ctx.activity("corpus.redrive.cleanup", json!([])).await?;
                 ctx.sleep(Duration::from_secs(5)).await?;
                 Ok(json!(context.remaining()?.as_secs_f64()))
+            });
+        }
+        "corpus.redrive-reused-upserts" => {
+            // Core's TestRedriveVisibilityWorkflow up to its first activity,
+            // where the successor's own cancellation request is delivered.
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                ctx.upsert_memo(AvroValue::Map(BTreeMap::from([
+                    (
+                        "stage".to_string(),
+                        AvroValue::String("greeting".to_string()),
+                    ),
+                    (
+                        "customer".to_string(),
+                        AvroValue::String("Taylor".to_string()),
+                    ),
+                ])))?;
+                ctx.upsert_search_attributes(
+                    SearchAttributeUpdate::new().keyword("Stage", "greeting")?,
+                )?;
+                redrive_successor_cancellation_cleanup(&ctx, Vec::new()).await
+            });
+        }
+        "corpus.redrive-reused-signal-wait" => {
+            // Core's TestRedriveSignalWorkflow up to its first activity,
+            // where the successor's own cancellation request is delivered.
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let approved_by = ctx.wait_signal("approve").await?;
+                let received = ctx.signals("approve")?;
+                redrive_successor_cancellation_cleanup(
+                    &ctx,
+                    vec![json!(approved_by), json!(received)],
+                )
+                .await
             });
         }
         "corpus.memo-signed-zero" => {
@@ -1266,6 +1303,36 @@ async fn execute_expired_query_fixture(fixture: &Value) -> Result<Value, String>
         "failure_submissions":requests.iter().filter(|request| request.path == "/api/worker/query-tasks/expired-query/fail").count()});
     fixture_matches(&fixture["expected"], &actual, "expired query dispatch")?;
     Ok(actual)
+}
+
+/// Run the redrive successor's first activity, which receives the successor's
+/// cooperative cancellation, then schedule a shielded cleanup activity whose
+/// arguments carry `observed` and the remaining cleanup budget.
+// The SDK workflow handler signature returns the SDK error type.
+#[allow(clippy::result_large_err)]
+async fn redrive_successor_cancellation_cleanup(
+    ctx: &WorkflowContext,
+    mut observed: Vec<Value>,
+) -> durable_workflow::Result<Value> {
+    let first = ctx
+        .activity(
+            "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
+            json!(["Taylor"]),
+        )
+        .await;
+    let Err(Error::CooperativeCancellationRequested(_)) = first else {
+        return Err(Error::WorkerLoop(format!(
+            "expected the successor cancellation at the first activity, observed {first:?}"
+        )));
+    };
+    let context = ctx
+        .cancellation_context()?
+        .expect("committed rich cancellation");
+    let _shield = ctx.cancellation_shield()?;
+    observed.push(json!(context.remaining()?.as_secs_f64()));
+    ctx.activity("corpus.redrive.cleanup", Value::Array(observed))
+        .await?;
+    Ok(json!("unexpected completion"))
 }
 
 async fn execute_fixture(fixture: &Value) -> Result<Value, String> {
@@ -1663,4 +1730,221 @@ async fn redriven_reused_steps_advance_cancellation_clock_at_original_time() {
     )
     .await;
     assert_eq!(observed["result"], json!(18.0));
+}
+
+/// Run a checked-in redrive fixture with its history changed and return the
+/// commands it then emits.
+async fn redrive_reused_commands_with_history(
+    name: &str,
+    change: impl FnOnce(&mut Vec<Value>),
+) -> Result<Value, String> {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions")
+        .join(name);
+    let mut fixture: Value = serde_json::from_str(
+        &fs::read_to_string(&fixture_path).expect("read checked-in redrive reuse fixture"),
+    )
+    .expect("parse checked-in redrive reuse fixture");
+    change(fixture["history"].as_array_mut().expect("fixture history"));
+    fixture.as_object_mut().unwrap().remove("command_sequence");
+    fixture["expected"] = json!({"type": "schedule_activity"});
+    let observed = execute_fixture_delivery(&fixture, "changed-history").await?;
+    Ok(observed["command_sequence"].clone())
+}
+
+/// Retime each reused event, one at a time, to after the successor's
+/// cancellation delivery (00:05:02) and before its deadline (00:05:31). Had any
+/// of them reached the cancellation clock, remaining() would fall to 11s.
+async fn assert_reused_times_do_not_reach_remaining(name: &str, reused_event_types: &[&str]) {
+    let baseline = redrive_reused_commands_with_history(name, |_| {})
+        .await
+        .unwrap_or_else(|error| panic!("{name} baseline: {error}"));
+    for event_type in reused_event_types {
+        let commands = redrive_reused_commands_with_history(name, |history| {
+            let event = history
+                .iter_mut()
+                .find(|event| event["event_type"] == *event_type)
+                .unwrap_or_else(|| panic!("{name} must contain {event_type}"));
+            event["recorded_at"] = json!("2026-11-03T00:05:20+00:00");
+            event["payload"]["reused_recorded_at"] = json!("2026-11-03T00:05:20+00:00");
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{name} retimed {event_type}: {error}"));
+        assert_eq!(commands, baseline, "{name} retimed {event_type}");
+    }
+}
+
+fn redrive_successor_fixture(name: &str) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/replay-regressions")
+                .join(name),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn check_redrive_successor(history: &[Value]) -> Result<(), String> {
+    fn require(condition: bool, message: &str) -> Result<(), String> {
+        condition.then_some(()).ok_or_else(|| message.to_string())
+    }
+    let started = history.first().ok_or("empty history")?;
+    require(
+        started["event_type"] == "WorkflowStarted",
+        "history must open with WorkflowStarted",
+    )?;
+    let start = &started["payload"];
+    require(start["recovery_kind"] == "redrive", "recovery_kind")?;
+    require(
+        start["replayed_started_at"].is_string(),
+        "replayed_started_at",
+    )?;
+    require(start["workflow_link_id"].is_string(), "workflow_link_id")?;
+    let started_at = started["recorded_at"].as_str().ok_or("start time")?;
+    let source = start["continued_from_run_id"]
+        .as_str()
+        .ok_or("continued_from_run_id")?;
+    let mut prefix = true;
+    let mut last_reused_step = 0;
+    for (index, event) in history.iter().enumerate().skip(1) {
+        require(event["sequence"] == json!(index + 1), "history order")?;
+        if event["payload"].get("reused_from_run_id").is_some() {
+            require(prefix, "reused events must directly follow WorkflowStarted")?;
+            require(
+                event["payload"]["reused_from_run_id"] == source,
+                "reused_from_run_id must match continued_from_run_id",
+            )?;
+            require(
+                event["recorded_at"] == started["recorded_at"],
+                "reused events are recorded with the successor start",
+            )?;
+            // SignalReceived has no step of its own; it belongs to its wait.
+            if let Some(step) = event["payload"]["sequence"].as_u64() {
+                last_reused_step = last_reused_step.max(step);
+            }
+        } else {
+            prefix = false;
+            require(
+                event["recorded_at"].as_str().ok_or("event time")? >= started_at,
+                "successor event predates the successor start",
+            )?;
+        }
+    }
+    require(last_reused_step > 0, "no reused workflow step")?;
+    // Redrive resumes at the step after the last one it reused.
+    require(
+        start["resume_step_sequence"].as_u64() == Some(last_reused_step + 1),
+        "resume_step_sequence must follow the last reused step",
+    )
+}
+
+/// The successor history must be one Workflow 2.19 can write: a redrive
+/// WorkflowStarted bound to the source run, then the reused prefix, then the
+/// successor's own cancellation at or after its start.
+fn assert_valid_redrive_successor(name: &str, resume_step_sequence: u64) {
+    let fixture = redrive_successor_fixture(name);
+    let history = fixture["history"].as_array().unwrap();
+    assert_eq!(
+        history[0]["payload"]["resume_step_sequence"],
+        json!(resume_step_sequence),
+        "{name}"
+    );
+    check_redrive_successor(history).unwrap_or_else(|error| panic!("{name}: {error}"));
+}
+
+#[test]
+fn redrive_successor_check_rejects_a_wrong_resume_step() {
+    for name in [
+        "redrive-reused-upserts-clock.json",
+        "redrive-reused-signal-wait-clock.json",
+    ] {
+        let fixture = redrive_successor_fixture(name);
+        let resume = fixture["history"][0]["payload"]["resume_step_sequence"]
+            .as_u64()
+            .unwrap();
+        for wrong in [json!(resume - 1), json!(resume + 1), json!(null)] {
+            let mut history = fixture["history"].as_array().unwrap().clone();
+            history[0]["payload"]["resume_step_sequence"] = wrong.clone();
+            let error = check_redrive_successor(&history)
+                .expect_err(&format!("{name} resume_step_sequence {wrong} must fail"));
+            assert!(error.contains("resume_step_sequence"), "{error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn redriven_reused_upserts_keep_values_and_never_reach_remaining() {
+    assert_valid_redrive_successor("redrive-reused-upserts-clock.json", 3);
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-upserts-clock.json",
+        &["MemoUpserted", "SearchAttributesUpserted"],
+    )
+    .await;
+    // Neither upsert is re-emitted, and the first activity received the
+    // cancellation: the only new command is the shielded cleanup.
+    let commands = observed["command_sequence"].as_array().expect("commands");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["activity_type"], "corpus.redrive.cleanup");
+    // remaining() is the deadline (00:05:31) less the delivery (00:05:02).
+    assert_eq!(observed["arguments"], json!([29.0]));
+    assert_reused_times_do_not_reach_remaining(
+        "redrive-reused-upserts-clock.json",
+        &["MemoUpserted", "SearchAttributesUpserted"],
+    )
+    .await;
+
+    // A reused upsert is still checked against the workflow's own values.
+    let error =
+        redrive_reused_commands_with_history("redrive-reused-upserts-clock.json", |history| {
+            let event = history
+                .iter_mut()
+                .find(|event| event["event_type"] == "SearchAttributesUpserted")
+                .unwrap();
+            event["payload"]["attributes"]["Stage"] = json!("changed");
+            event["payload"]["merged"]["Stage"] = json!("changed");
+        })
+        .await
+        .expect_err("a changed reused search attribute must not replay");
+    assert!(error.contains("search_attribute_value_mismatch"), "{error}");
+    let error =
+        redrive_reused_commands_with_history("redrive-reused-upserts-clock.json", |history| {
+            let event = history
+                .iter_mut()
+                .find(|event| event["event_type"] == "MemoUpserted")
+                .unwrap();
+            // The same map with customer "Taylox".
+            let changed = json!({"codec": "avro", "blob": CHANGED_MEMO_BLOB});
+            event["payload"]["entries"] = changed.clone();
+            event["payload"]["merged"] = changed;
+        })
+        .await
+        .expect_err("a changed reused memo must not replay");
+    assert!(error.contains("memo_update_mismatch"), "{error}");
+}
+
+const CHANGED_MEMO_BLOB: &str = "wwHioz3/VYAiNw4EEGN1c3RvbWVyCgxUYXlsb3gKc3RhZ2UKEGdyZWV0aW5nAA==";
+
+#[tokio::test]
+async fn redriven_reused_signal_wait_keeps_its_value_and_never_reaches_remaining() {
+    assert_valid_redrive_successor("redrive-reused-signal-wait-clock.json", 2);
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-signal-wait-clock.json",
+        &["SignalWaitOpened", "SignalReceived", "SignalApplied"],
+    )
+    .await;
+    // The wait is not reopened, and the first activity received the
+    // cancellation: the only new command is the shielded cleanup.
+    let commands = observed["command_sequence"].as_array().expect("commands");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["activity_type"], "corpus.redrive.cleanup");
+    // The applied value and the received signal come from the source run;
+    // remaining() is the deadline (00:05:31) less the delivery (00:05:02).
+    assert_eq!(observed["arguments"], json!([["Grace"], [["Grace"]], 29.0]));
+    assert_reused_times_do_not_reach_remaining(
+        "redrive-reused-signal-wait-clock.json",
+        &["SignalWaitOpened", "SignalReceived", "SignalApplied"],
+    )
+    .await;
 }
