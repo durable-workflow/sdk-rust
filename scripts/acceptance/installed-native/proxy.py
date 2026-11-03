@@ -5,10 +5,40 @@ It records every workflow-task /complete and /fail acknowledgement to
 is held for that many seconds before forwarding, unchanged, so a run or
 execution deadline passes while the worker waits for the receipt.
 """
-import http.client, http.server, json, pathlib, threading, time
+import http.client, http.server, json, pathlib, re, threading, time
 
 state = pathlib.Path('/state')
 lock = threading.Lock()
+
+# Response headers the SDK reads from the native Server; anything else is dropped.
+FORWARDED_HEADERS = frozenset((
+    'content-type',
+    'retry-after',
+    'x-durable-workflow-control-plane-version',
+    'x-durable-workflow-payload-codec',
+    'x-durable-workflow-payload-sha256',
+    'x-durable-workflow-payload-size',
+    'x-durable-workflow-protocol-version',
+))
+HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# HTAB, SP and visible ASCII only: no CR, LF, other C0, DEL or C1/8-bit bytes.
+HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")
+
+
+def forwardable_headers(pairs):
+    """Upstream response headers that are safe to relay.
+
+    Every header is validated before any is relayed or dropped: a name that is
+    not an RFC 9110 token, or a value with anything other than HTAB, SP and
+    visible ASCII, refuses the whole response. Only the reviewed set in
+    FORWARDED_HEADERS is relayed; hop-by-hop and every other header is dropped.
+    """
+    pairs = list(pairs)
+    for name, value in pairs:
+        if not HEADER_NAME.fullmatch(name) or not HEADER_VALUE.fullmatch(value):
+            raise ValueError('refusing to relay an unsafe upstream header')
+    return [(name, value) for name, value in pairs if name.lower() in FORWARDED_HEADERS]
+
 
 class Proxy(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -45,9 +75,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 with (state / 'acks.jsonl').open('a') as log:
                     log.write(json.dumps(event) + '\n')
         self.send_response(response.status)
-        for key, value in response.getheaders():
-            if key.lower() not in ('connection', 'transfer-encoding', 'content-length'):
-                self.send_header(key, value)
+        for key, value in forwardable_headers(response.getheaders()):
+            self.send_header(key, value)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Connection', 'close')
         self.end_headers()
@@ -60,4 +89,5 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     do_DELETE = handle_request
     do_PATCH = handle_request
 
-http.server.ThreadingHTTPServer(('0.0.0.0', 8080), Proxy).serve_forever()
+if __name__ == '__main__':
+    http.server.ThreadingHTTPServer(('0.0.0.0', 8080), Proxy).serve_forever()
