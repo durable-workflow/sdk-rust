@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Advance the cooperative cancellation clock to a redrive-reused step's
+  original `reused_recorded_at` time instead of the time the successor run
+  copied it, matching Core, so `remaining()` after reused activity completions
+  or fired timers no longer loses the redrive delay from its cleanup budget.
+
 ## 4.11.0
 
 - Keep managed workers polling when a workflow-task completion or failure

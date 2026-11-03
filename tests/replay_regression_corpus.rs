@@ -484,6 +484,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.redrive-boundary"
             | "corpus.redrive-reused-markers"
             | "corpus.redrive-reused-timer"
+            | "corpus.redrive-reused-cancellation-clock"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
             | "corpus.nexus-result"
@@ -893,6 +894,18 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 )
                 .await?;
                 Ok(json!("unexpected completion"))
+            });
+        }
+        "corpus.redrive-reused-cancellation-clock" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let _ = ctx.sleep(Duration::from_secs(10)).await;
+                let context = ctx
+                    .cancellation_context()?
+                    .expect("committed rich cancellation");
+                let _shield = ctx.cancellation_shield()?;
+                ctx.activity("corpus.redrive.cleanup", json!([])).await?;
+                ctx.sleep(Duration::from_secs(5)).await?;
+                Ok(json!(context.remaining()?.as_secs_f64()))
             });
         }
         "corpus.memo-signed-zero" => {
@@ -1640,4 +1653,14 @@ async fn unconsumed_replay_fixture_cannot_satisfy_the_corpus() {
         .await
         .expect_err("structurally valid but unconsumed evidence must fail");
     assert!(error.contains("has no registered Rust workflow"));
+}
+
+#[tokio::test]
+async fn redriven_reused_steps_advance_cancellation_clock_at_original_time() {
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-cancellation-clock.json",
+        &["ActivityCompleted", "TimerFired"],
+    )
+    .await;
+    assert_eq!(observed["result"], json!(18.0));
 }
