@@ -62,7 +62,7 @@ For a crate published before the map existed (≤ 4.10.2), pass
 
 The run writes `<work-dir>/summary.json` with every identity, receipt and
 history result, plus per-container logs under `cells/*/logs`. The exit code is
-0 only when every check passes.
+0 only when every check passes and cleanup is complete (see below).
 
 ### Containers and cleanup
 
@@ -84,13 +84,25 @@ collision or a failed create never touches anyone else's object.
 
 Each Docker inspect, log and remove step is best-effort: a failure or timeout
 is recorded and the remaining steps still run. The credential file,
-`database/` and `storage/` are deleted in an outer `finally` whatever Docker
-did. A failed step never replaces the run's own error. The final JSON line and
-`summary.json` (`cleanup`) report `cleanup_errors`, each with only the step,
-object name and error type, plus `leftover_containers` and `leftover_networks`
-that still carry this run's token. A leftover list is `null` when its query
-failed. A container whose inspect failed is never removed, because its
-ownership could not be confirmed.
+`database/` and `storage/` are removed separately, in an outer `finally`,
+whatever Docker did. Afterwards each one is checked for absence, and any
+survivor is listed in `local_leftovers`. A failed step never replaces the
+run's own error.
+
+The final JSON line and `summary.json` (`cleanup`) report:
+- `cleanup_errors`, each with only the step, a bounded object label (a
+  container or network name, or `<cell>/<path>`) and the error type;
+- `local_leftovers`;
+- `leftover_containers` and `leftover_networks` that still carry this run's
+  token. A list is `null` when its query failed.
+
+A container whose inspect failed is never removed, because its ownership could
+not be confirmed.
+
+**Cleanup fails closed.** The run fails and exits nonzero on any cleanup error,
+a failed leftover query, a nonempty leftover list or a surviving local path,
+even when every check passed. `summary.json` keeps the checks' own result in
+`checks_outcome`, and any run error in `error`.
 
 The fixture build container uses `--rm`, `--init`, `--cpus` equal to `--jobs`,
 `--memory 3g`, `--pids-limit 1024`, `no-new-privileges` and `--cap-drop ALL`.

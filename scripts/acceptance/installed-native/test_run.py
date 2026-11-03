@@ -509,63 +509,198 @@ class CleanupStepsAreIndependent(HarnessRun):
         self.assertEqual(self.run.cleanup_errors, [])
 
 
-class FixtureFromSkipsBuilder(unittest.TestCase):
-    def test_fixture_from_never_starts_a_build_container_and_reports_leftovers(self):
+class LocalStateCleanup(HarnessRun):
+    """Credential, database/ and storage/ removal is independent, recorded and verified."""
+
+    def setUp(self):
+        super().setUp()
+        fixture = self.tmp / 'built'
+        write_binary(fixture)(None)
+        self.cell = run.Cell(args(), 'lifecycle', self.tmp / 'work', {'executed_manifest': 'img'}, fixture, self.run)
+        self.real_rmtree = shutil.rmtree
+
+    def run_cell(self, unlink=None, rmtree=None):
+        # The proxy fails client-side after creation, so the cell has its own error.
+        docker = FakeDocker(faults={self.cell.task + '-proxy': 'created-then-error'})
+        patches = [mock.patch.object(run, 'call', docker)]
+        if unlink:
+            patches.append(mock.patch.object(pathlib.Path, 'unlink', unlink))
+        if rmtree:
+            patches.append(mock.patch.object(run.shutil, 'rmtree', rmtree))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            with self.assertRaises(RuntimeError) as raised:
+                self.cell.run()
+        self.assertIn('docker run -d', str(raised.exception))  # the cell's own error, not a cleanup error
+        return {sub: os.path.lexists(self.cell.state / sub) for sub in ('credentials.json', 'database', 'storage')}
+
+    def failing_rmtree(self, failing):
+        def rmtree(path, *a, **k):
+            if pathlib.Path(path).name == failing:
+                raise PermissionError('denied')
+            return self.real_rmtree(path, *a, **k)
+        return rmtree
+
+    def errors(self):
+        return [(e['step'], e['object'], e['error']) for e in self.run.cleanup_errors]
+
+    def test_clean_local_cleanup_records_nothing(self):
+        present = self.run_cell()
+        self.assertEqual(present, {'credentials.json': False, 'database': False, 'storage': False})
+        self.assertEqual((self.run.cleanup_errors, self.run.local_leftovers), ([], []))
+
+    def test_credential_unlink_failure_does_not_skip_state_or_mask_the_error(self):
+        def unlink(path, missing_ok=False):
+            raise PermissionError('denied')
+        present = self.run_cell(unlink=unlink)
+        self.assertEqual(present, {'credentials.json': True, 'database': False, 'storage': False})
+        self.assertEqual(self.run.local_leftovers, ['lifecycle/credentials.json'])
+        self.assertEqual(self.errors(), [('local-remove', 'lifecycle/credentials.json', 'PermissionError'),
+                                         ('local-verify', 'lifecycle/credentials.json', 'StillPresent')])
+
+    def test_each_state_directory_failure_is_independent(self):
+        for failing in ('database', 'storage'):
+            with self.subTest(failing=failing):
+                self.setUp()
+                present = self.run_cell(rmtree=self.failing_rmtree(failing))
+                self.assertEqual(present, {'credentials.json': False, 'database': failing == 'database',
+                                           'storage': failing == 'storage'})
+                self.assertEqual(self.run.local_leftovers, ['lifecycle/' + failing])
+                self.assertEqual(self.errors(), [('local-remove', 'lifecycle/' + failing, 'PermissionError'),
+                                                 ('local-verify', 'lifecycle/' + failing, 'StillPresent')])
+
+    def test_silent_partial_removal_is_caught_by_the_absence_check(self):
+        present = self.run_cell(rmtree=lambda path, *a, **k: None)  # "succeeds" but removes nothing
+        self.assertEqual(present, {'credentials.json': False, 'database': True, 'storage': True})
+        self.assertEqual(self.run.local_leftovers, ['lifecycle/database', 'lifecycle/storage'])
+        self.assertEqual(self.errors(), [('local-verify', 'lifecycle/database', 'StillPresent'),
+                                         ('local-verify', 'lifecycle/storage', 'StillPresent')])
+
+    def test_records_carry_no_paths_or_values(self):
+        def unlink(path, missing_ok=False):
+            raise PermissionError(str(path))
+        self.run_cell(unlink=unlink, rmtree=self.failing_rmtree('storage'))
+        text = json.dumps([self.run.cleanup_errors, self.run.local_leftovers])
+        self.assertNotIn(str(self.tmp), text)
+        self.assertNotIn('fixture-', text)
+
+
+class MainOutcome(unittest.TestCase):
+    """--fixture-from skips the builder, and the final result fails closed on cleanup uncertainty."""
+
+    def main(self, docker=None, cell_run=None):
         tmp = temporary_directory(self)
         fixture = tmp / 'prebuilt'
         write_binary(fixture)(None)
         (fixture / 'build.stdout').write_text(BUILD_STDOUT)
-        argv = ['run.py', '--crate-version', '4.11.1', '--server-index', 'sha256:x', '--cells', '',
+        argv = ['run.py', '--crate-version', '4.11.1', '--server-index', 'sha256:x', '--cells', 'lifecycle',
                 '--fixture-from', str(fixture), '--work-dir', str(tmp / 'work'), '--container-prefix', 'general']
-        docker = FakeDocker()
-        cell = mock.Mock()
-        cell.return_value.run.return_value = {'outcome': 'pass'}
+        self.docker = docker or FakeDocker()
+        self.work = tmp / 'work'
+        harness_runs = []
+
+        def cell(args_, name, root, server, fixture_, harness):
+            harness_runs.append(harness)
+            instance = mock.Mock()
+            instance.run.side_effect = lambda: (cell_run or (lambda h: None))(harness) or {'outcome': 'pass'}
+            return instance
+
         out = io.StringIO()
-        with mock.patch.object(sys, 'argv', argv), mock.patch.object(run, 'call', docker), \
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(run, 'call', self.docker), \
                 mock.patch.object(run, 'server_identity', return_value={'executed_manifest': 'img'}), \
                 mock.patch.object(run, 'crate_provenance', return_value={'baselines': {'pass': True}}), \
-                mock.patch.object(run, 'build_fixture') as build, mock.patch.object(run, 'Cell', cell), \
-                contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                mock.patch.object(run, 'build_fixture') as self.build, mock.patch.object(run, 'Cell', cell), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exited:
             run.main()
-        build.assert_not_called()
-        self.assertEqual(docker.runs(), [])
-        self.assertNotIn(['docker', 'pull', RUST], [c for c, _ in docker.commands])
-        summary = json.loads((tmp / 'work' / 'summary.json').read_text())
-        self.assertEqual(summary['build']['reused_fixture'], str(fixture.resolve()))
-        # Leftover reporting covers containers and networks, scoped to this run's token.
+        self.assertEqual(len(harness_runs), 1)
+        self.fixture = fixture
+        return exited.exception.code, json.loads(out.getvalue()), json.loads((tmp / 'work' / 'summary.json').read_text())
+
+    def assert_fails_closed(self, code, receipt, summary):
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['outcome'], 'fail')
+        self.assertEqual(summary['outcome'], 'fail')
+        self.assertEqual(summary['checks_outcome'], 'pass')  # the checks passed; cleanup failed
+        self.assertIs(summary['cleanup']['pass'], False)
+        self.assertNotIn('error', summary)
+
+    def test_clean_run_passes_and_never_builds(self):
+        code, receipt, summary = self.main()
+        self.assertEqual((code, receipt['outcome'], summary['outcome'], summary['checks_outcome']), (0, 'pass', 'pass', 'pass'))
+        self.build.assert_not_called()
+        self.assertEqual(self.docker.runs(), [])
+        self.assertNotIn(['docker', 'pull', RUST], [c for c, _ in self.docker.commands])
+        self.assertEqual(summary['build']['reused_fixture'], str(self.fixture.resolve()))
+        self.assertEqual(summary['cleanup'], {'pass': True, 'errors': [], 'local_leftovers': [],
+                                              'leftover_containers': [], 'leftover_networks': []})
+        self.assertEqual((receipt['leftover_containers'], receipt['leftover_networks'], receipt['local_leftovers'],
+                          receipt['cleanup_errors']), ([], [], [], []))
         run_filter = re.compile(r'label=dev\.durable-workflow\.acceptance\.run=[0-9a-f]{16}')
-        [containers] = [c for c, _ in docker.commands if c[:3] == ['docker', 'ps', '-aq']]
-        [networks] = [c for c, _ in docker.commands if c[:4] == ['docker', 'network', 'ls', '-q']]
+        [containers] = [c for c, _ in self.docker.commands if c[:3] == ['docker', 'ps', '-aq']]
+        [networks] = [c for c, _ in self.docker.commands if c[:4] == ['docker', 'network', 'ls', '-q']]
         self.assertTrue(run_filter.fullmatch(containers[-1]))
         self.assertTrue(run_filter.fullmatch(networks[-1]))
-        receipt = json.loads(out.getvalue())
-        self.assertEqual((receipt['leftover_containers'], receipt['leftover_networks'], receipt['cleanup_errors']),
-                         ([], [], []))
-        self.assertEqual(summary['cleanup'], {'errors': [], 'leftover_containers': [], 'leftover_networks': []})
 
-    def test_failed_leftover_query_is_reported_not_raised(self):
-        tmp = temporary_directory(self)
-        fixture = tmp / 'prebuilt'
-        write_binary(fixture)(None)
-        (fixture / 'build.stdout').write_text(BUILD_STDOUT)
-        argv = ['run.py', '--crate-version', '4.11.1', '--server-index', 'sha256:x', '--cells', '',
-                '--fixture-from', str(fixture), '--work-dir', str(tmp / 'work')]
-        docker = FakeDocker(raise_on={(('docker', 'ps'), None): TIMEOUT})
-        cell = mock.Mock()
-        cell.return_value.run.return_value = {'outcome': 'pass'}
-        out = io.StringIO()
-        with mock.patch.object(sys, 'argv', argv), mock.patch.object(run, 'call', docker), \
-                mock.patch.object(run, 'server_identity', return_value={'executed_manifest': 'img'}), \
-                mock.patch.object(run, 'crate_provenance', return_value={'baselines': {'pass': True}}), \
-                mock.patch.object(run, 'Cell', cell), contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
-            run.main()
-        receipt = json.loads(out.getvalue())
+    def test_recorded_cleanup_error_fails(self):
+        error = {'step': 'container-remove', 'object': 'x', 'error': 'TimeoutExpired'}
+        code, receipt, summary = self.main(cell_run=lambda h: h.cleanup_errors.append(error))
+        self.assert_fails_closed(code, receipt, summary)
+        self.assertEqual(receipt['cleanup_errors'], [error])
+
+    def test_local_leftover_fails(self):
+        def cell_run(h):
+            h.local_leftovers.append('lifecycle/credentials.json')
+            h.cleanup_errors.append({'step': 'local-verify', 'object': 'lifecycle/credentials.json', 'error': 'StillPresent'})
+        code, receipt, summary = self.main(cell_run=cell_run)
+        self.assert_fails_closed(code, receipt, summary)
+        self.assertEqual(receipt['local_leftovers'], ['lifecycle/credentials.json'])
+
+    def test_failed_container_query_fails(self):
+        code, receipt, summary = self.main(FakeDocker(raise_on={(('docker', 'ps'), None): TIMEOUT}))
+        self.assert_fails_closed(code, receipt, summary)
         self.assertIsNone(receipt['leftover_containers'])
-        self.assertEqual(receipt['leftover_networks'], [])
         self.assertEqual(receipt['cleanup_errors'],
                          [{'step': 'leftover-query', 'object': 'containers', 'error': 'TimeoutExpired'}])
-        summary = json.loads((tmp / 'work' / 'summary.json').read_text())
-        self.assertEqual(summary['cleanup']['errors'], receipt['cleanup_errors'])
+
+    def test_failed_network_query_fails(self):
+        code, receipt, summary = self.main(FakeDocker(raise_on={(('docker', 'network', 'ls'), None): TIMEOUT}))
+        self.assert_fails_closed(code, receipt, summary)
+        self.assertIsNone(receipt['leftover_networks'])
+
+    def test_leftover_container_fails(self):
+        class Leftovers(FakeDocker):
+            def __call__(self, command, timeout=120, check=True, **kwargs):
+                if list(command[:3]) == ['docker', 'ps', '-aq']:
+                    self.commands.append((list(command), timeout))
+                    return done(command, stdout='abc123\n')
+                return super().__call__(command, timeout, check, **kwargs)
+        code, receipt, summary = self.main(Leftovers())
+        self.assert_fails_closed(code, receipt, summary)
+        self.assertEqual(receipt['leftover_containers'], ['abc123'])
+
+    def test_leftover_network_fails(self):
+        class Leftovers(FakeDocker):
+            def __call__(self, command, timeout=120, check=True, **kwargs):
+                if list(command[:4]) == ['docker', 'network', 'ls', '-q']:
+                    self.commands.append((list(command), timeout))
+                    return done(command, stdout='net123\n')
+                return super().__call__(command, timeout, check, **kwargs)
+        code, receipt, summary = self.main(Leftovers())
+        self.assert_fails_closed(code, receipt, summary)
+        self.assertEqual(receipt['leftover_networks'], ['net123'])
+
+    def test_run_error_is_preserved_separately_from_cleanup(self):
+        def cell_run(h):
+            h.cleanup_errors.append({'step': 'network-cleanup', 'object': 'n', 'error': 'TimeoutExpired'})
+            raise RuntimeError('cell failed')
+        with self.assertRaises(RuntimeError):
+            self.main(cell_run=cell_run)
+        summary = json.loads((self.work / 'summary.json').read_text())
+        self.assertEqual((summary['outcome'], summary['checks_outcome']), ('fail', 'fail'))
+        self.assertEqual(summary['error'], 'RuntimeError: cell failed')
+        self.assertEqual(summary['cleanup']['errors'],
+                         [{'step': 'network-cleanup', 'object': 'n', 'error': 'TimeoutExpired'}])
 
 
 if __name__ == '__main__':

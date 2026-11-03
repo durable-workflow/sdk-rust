@@ -58,6 +58,7 @@ class Run:
         self.token = token or secrets.token_hex(8)
         self.base = '%s-accept-%s-%s' % (self.prefix, self.stamp, self.token)
         self.cleanup_errors = []
+        self.local_leftovers = []
 
     def best_effort(self, step, name, function, *args, **kwargs):
         """Run one cleanup step; record a failure (step, object, error type only) and continue."""
@@ -90,6 +91,11 @@ def remove_owned_container(name, run):
     if container_id:
         call(['docker', 'rm', '-f', container_id])
     return container_id
+
+
+def remove_tree(path):
+    if os.path.lexists(path):
+        shutil.rmtree(path)
 
 
 def remove_owned_network(name, run):
@@ -418,11 +424,22 @@ class Cell:
                 self.remove_docker_objects()
             finally:
                 # Local credential and state cleanup always runs, whatever Docker did.
-                try:
-                    credentials.unlink(missing_ok=True)
-                finally:
-                    for sub in ['database', 'storage']:
-                        shutil.rmtree(self.state / sub, ignore_errors=True)
+                self.remove_local_state(credentials)
+
+    def remove_local_state(self, credentials):
+        """Remove the credential file, database/ and storage/ independently, then
+        prove each is gone. Failures and survivors are recorded with bounded
+        labels (cell/path) and error types only, and fail the run."""
+        run = self.harness_run
+        paths = [('credentials.json', credentials, lambda path: path.unlink(missing_ok=True))]
+        paths += [(sub, self.state / sub, remove_tree) for sub in ('database', 'storage')]
+        for label, path, remove in paths:
+            run.best_effort('local-remove', '%s/%s' % (self.name, label), remove, path)
+        for label, path, _ in paths:
+            label = '%s/%s' % (self.name, label)
+            if os.path.lexists(path):
+                run.local_leftovers.append(label)
+                run.cleanup_errors.append({'step': 'local-verify', 'object': label, 'error': 'StillPresent'})
 
     def remove_docker_objects(self):
         """Best-effort, per-object cleanup: one failing inspect, log or remove never
@@ -490,13 +507,23 @@ def main():
             ['docker', 'ps', '-aq', '--filter', run_filter], check=False).stdout.split())
         leftover_networks = run.best_effort('leftover-query', 'networks', lambda: call(
             ['docker', 'network', 'ls', '-q', '--filter', run_filter], check=False).stdout.split())
-        summary['cleanup'] = {'errors': run.cleanup_errors, 'leftover_containers': leftovers,
+        # Fail closed: any cleanup error, unavailable leftover query or leftover
+        # object makes the run non-passing. The checks' own outcome and any run
+        # error are kept separately.
+        cleanup_clean = (not run.cleanup_errors and not run.local_leftovers
+                         and leftovers == [] and leftover_networks == [])
+        summary['checks_outcome'] = summary['outcome']
+        if not cleanup_clean:
+            summary['outcome'] = 'fail'
+        summary['cleanup'] = {'pass': cleanup_clean, 'errors': run.cleanup_errors,
+                              'local_leftovers': run.local_leftovers, 'leftover_containers': leftovers,
                               'leftover_networks': leftover_networks}
         summary['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         (args.work_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps({'outcome': summary['outcome'], 'error': summary.get('error'),
                           'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers,
-                          'leftover_networks': leftover_networks, 'cleanup_errors': run.cleanup_errors}))
+                          'leftover_networks': leftover_networks, 'local_leftovers': run.local_leftovers,
+                          'cleanup_errors': run.cleanup_errors}))
     sys.exit(0 if summary['outcome'] == 'pass' else 1)
 
 
