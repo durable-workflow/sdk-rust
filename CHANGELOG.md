@@ -8,6 +8,15 @@
   unchanged and nothing is re-emitted. A reused prefix always precedes any
   cancellation delivered on the successor, so these events never change
   `remaining()`.
+- Keep managed workers polling when a workflow-task completion or failure
+  report receives a non-recorded `run_closed` receipt for the same task,
+  attempt and run, for example after the run was cancelled while the report
+  was in flight. The receipt must carry `recorded=false`, the exact task,
+  attempt and `run_id`, a terminal `run_status`, the `stop_reason` it implies
+  and `can_continue=false`, as native Server sends once server#994 ships.
+  Native 3.0.4's `run_closed` body lacks `recorded` and `run_id` and still
+  surfaces, as do recorded, mismatched and other conflicts. Direct client
+  calls keep the original HTTP error.
 - Correction to 4.11.1: its cancellation-clock fixture was not a valid redrive
   successor history. It had no redrive `WorkflowStarted` and placed the
   cancellation before the reused prefix. Reused times are not observable through

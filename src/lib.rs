@@ -5539,10 +5539,11 @@ fn activity_task_rejection_is_final(error: &Error) -> bool {
 
 /// A workflow-task report the server answered with a non-recorded receipt
 /// for exactly this task, attempt and run, which settles the managed tick:
-/// the run's terminal timeout (`run_timed_out` with `run_status=failed`), or a
+/// the run's terminal timeout (`run_timed_out` with `run_status=failed`), a
 /// task this worker no longer holds (`task_not_leased`, for example after the
-/// run was cancelled or the task was reclaimed). Nothing was recorded, and the
-/// server owns any redelivery.
+/// run was cancelled or the task was reclaimed), or a run already closed by
+/// another path (`run_closed` with the terminal state it implies). Nothing was
+/// recorded, and the server owns any redelivery.
 fn workflow_task_report_is_settled(
     error: &Error,
     task_id: &str,
@@ -5566,6 +5567,7 @@ fn workflow_task_report_is_settled(
     let settled = match body.get("reason").and_then(Value::as_str) {
         Some("run_timed_out") => body.get("run_status").and_then(Value::as_str) == Some("failed"),
         Some("task_not_leased") => true,
+        Some("run_closed") => run_closed_receipt_is_terminal(&body),
         _ => false,
     };
     settled
@@ -5573,6 +5575,21 @@ fn workflow_task_report_is_settled(
         && body.get("run_id").and_then(Value::as_str) == Some(run_id)
         && body.get("task_id").and_then(Value::as_str) == Some(task_id)
         && body.get("workflow_task_attempt").and_then(Value::as_u64) == Some(workflow_task_attempt)
+}
+
+/// A `run_closed` refusal settles only with the closed run's own state: a
+/// terminal `run_status`, the `stop_reason` that status implies, and
+/// `can_continue=false`. Absent or inconsistent state is never inferred.
+fn run_closed_receipt_is_terminal(body: &Value) -> bool {
+    let stop_reason = match body.get("run_status").and_then(Value::as_str) {
+        Some("completed") => "run_completed",
+        Some("failed") => "run_failed",
+        Some("cancelled") => "run_cancelled",
+        Some("terminated") => "run_terminated",
+        _ => return false,
+    };
+    body.get("stop_reason").and_then(Value::as_str) == Some(stop_reason)
+        && body.get("can_continue").and_then(Value::as_bool) == Some(false)
 }
 
 fn protocol_failure(status: reqwest::StatusCode, raw_body: &str) -> Option<ProtocolFailure> {
@@ -8766,6 +8783,11 @@ impl Worker {
     /// A `recorded=false`, `reason=task_not_leased` receipt for the same task,
     /// attempt and run settles the tick the same way: this worker no longer
     /// holds the task, and the server owns any redelivery.
+    /// A `recorded=false`, `reason=run_closed` receipt for the same task,
+    /// attempt and run also settles the tick when it carries the closed run's
+    /// terminal `run_status`, the matching `stop_reason` and
+    /// `can_continue=false`, for example after the run was cancelled while the
+    /// report was in flight.
     /// Every other rejection remains an error. This worker-level
     /// race handling is distinct from [`WorkflowResultOptions::timeout`], which
     /// only bounds how long a client waits for a result.
@@ -8979,9 +9001,9 @@ impl Worker {
             }
         };
 
-        // A run may expire, or the task may be reclaimed, while a completion
-        // or failure report is in flight. Settle only the matching task's
-        // non-recorded receipt.
+        // A run may expire or close, or the task may be reclaimed, while a
+        // completion or failure report is in flight. Settle only the matching
+        // task's non-recorded receipt.
         if let Err(error) = reported {
             self.discard_sticky_snapshot(snapshot.as_ref())?;
             if !workflow_task_report_is_settled(&error, task_id, attempt, run_id) {
@@ -29599,6 +29621,411 @@ mod tests {
                 "{name}: unexpected error {error}"
             );
         }
+    }
+
+    /// Native Server's full not-recorded `run_closed` receipt (server#994) for
+    /// the mock's selected task, after the run closed by another path. The
+    /// guard's body and the receipt fields follow Server PR #999; the
+    /// capability manifest is elided.
+    fn run_closed_receipt(close: &str) -> Value {
+        let (run_status, stop_reason, closed_reason, task_status, cancel_requested) = match close {
+            "completed" => (
+                "completed",
+                "run_completed",
+                "completed",
+                "completed",
+                false,
+            ),
+            "failed" => ("failed", "run_failed", "failed", "failed", false),
+            "timed_out" => ("failed", "run_failed", "timed_out", "completed", false),
+            "cancelled" => ("cancelled", "run_cancelled", "cancelled", "cancelled", true),
+            "terminated" => (
+                "terminated",
+                "run_terminated",
+                "terminated",
+                "cancelled",
+                true,
+            ),
+            other => panic!("unknown close {other}"),
+        };
+        json!({"task_id":"workflow-timeout-task","workflow_task_attempt":3,
+            "error":"Workflow run is already closed.","reason":"run_closed","protocol_version":"1.20",
+            "server_capabilities":{},"stop_reason":stop_reason,"cancel_requested":cancel_requested,
+            "can_continue":false,"run_status":run_status,"run_closed_reason":closed_reason,
+            "run_closed_at":"2026-11-03T12:00:00.000000Z","task_status":task_status,
+            "lease_owner":"timeout-worker","lease_expires_at":null,
+            "recorded":false,"run_id":"run-selected-timeout"})
+    }
+
+    /// Every request except task polls and the read-only capability probe:
+    /// the reports and any retry, lease or other state-changing call.
+    fn state_requests(server: &MockWorkerServer) -> Vec<String> {
+        server
+            .captured_paths()
+            .into_iter()
+            .filter(|path| !path.ends_with("/poll") && path != "/api/cluster/info")
+            .collect()
+    }
+
+    const RUN_CLOSED_CLOSES: [&str; 5] = [
+        "completed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "terminated",
+    ];
+
+    fn assert_original_http_error(
+        error: Error,
+        status: reqwest::StatusCode,
+        response: &str,
+        context: &str,
+    ) {
+        let Error::Http {
+            status: actual,
+            body,
+        } = error
+        else {
+            panic!("{context}: expected the original HTTP error, got {error}");
+        };
+        assert_eq!(actual, status, "{context}");
+        assert_eq!(body, response, "{context}: the response body is unchanged");
+    }
+
+    #[tokio::test]
+    async fn managed_worker_settles_exact_run_closed_receipts_without_advancing_state() {
+        let complete = "/api/worker/workflow-tasks/workflow-timeout-task/complete";
+        let fail = "/api/worker/workflow-tasks/workflow-timeout-task/fail";
+        for close in RUN_CLOSED_CLOSES {
+            let response: &'static str =
+                Box::leak(run_closed_receipt(close).to_string().into_boxed_str());
+
+            // Direct client calls keep the original HTTP error.
+            let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+            let client = Client::builder(server.base_url())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client");
+            let error = client
+                .complete_workflow_task(
+                    "workflow-timeout-task",
+                    "timeout-worker",
+                    3,
+                    vec![json!({"type": "complete_workflow", "result": fixture_envelope(Value::Null)})],
+                )
+                .await
+                .expect_err("the low-level client preserves the completion refusal");
+            assert_original_http_error(error, reqwest::StatusCode::CONFLICT, response, close);
+            let error = client
+                .fail_workflow_task(
+                    "workflow-timeout-task",
+                    "timeout-worker",
+                    3,
+                    "fixture failure",
+                )
+                .await
+                .expect_err("the low-level client preserves the failure refusal");
+            assert_original_http_error(error, reqwest::StatusCode::CONFLICT, response, close);
+
+            // The managed completion settles with exactly one report and no
+            // further request for the task: no retry, failure report, lease
+            // renewal or other state change.
+            let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+            let client = Client::builder(server.base_url())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client");
+            let mut worker = Worker::new(client, "rust-workers")
+                .worker_id("timeout-worker")
+                .poll_timeout(Duration::from_millis(10));
+            worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+                Ok(json!({"late": "result"}))
+            });
+            assert_eq!(
+                worker.run_once().await.unwrap_or_else(|error| panic!(
+                    "{close}: an exact run_closed receipt settles the tick: {error}"
+                )),
+                1
+            );
+            assert_eq!(
+                state_requests(&server),
+                vec![complete.to_owned()],
+                "{close}"
+            );
+
+            // Every managed failure report settles the same way.
+            for (surface, decision) in workflow_timeout_failure_decisions() {
+                let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+                let client = Client::builder(server.base_url())
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .expect("client");
+                let worker = Worker::new(client, "rust-workers");
+                assert_eq!(
+                    worker
+                        .settle_workflow_task_decision(
+                            "workflow-timeout-task",
+                            "timeout-worker",
+                            3,
+                            Some("run-selected-timeout"),
+                            decision,
+                            false,
+                            None,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{close} {surface}: {error}")),
+                    ManagedPollOutcome::Handled,
+                );
+                assert_eq!(
+                    server.captured_paths(),
+                    vec![fail.to_owned()],
+                    "{close} {surface}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_worker_keeps_polling_after_a_cancel_during_report_race() {
+        // Native 3.0.4 answered a completion that raced a cancellation with
+        // 409 run_closed, and the managed 4.11.1 worker exited (#170). With
+        // server#994's full receipt the same worker settles and keeps going.
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(cancelled_during_report_then_unrelated_work),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let executed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&executed);
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("timeout-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+            Ok(json!({"late": "result"}))
+        });
+        worker.register_workflow("unrelated.workflow", move |_ctx, _input| {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        });
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("the cancelled run's exact receipt settles the tick"),
+            1
+        );
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("the same worker processes a later workflow task"),
+            1
+        );
+        assert!(executed.load(Ordering::SeqCst));
+        assert_eq!(
+            state_requests(&server),
+            vec![
+                "/api/worker/workflow-tasks/workflow-timeout-task/complete".to_owned(),
+                "/api/worker/workflow-tasks/unrelated-task/complete".to_owned(),
+            ],
+            "one report for the closed run, then the later task's completion"
+        );
+    }
+
+    fn cancelled_during_report_then_unrelated_work(
+        path: &str,
+        _body: &str,
+        request: usize,
+    ) -> Option<(&'static str, String)> {
+        if path == "/api/worker/workflow-tasks/poll" && request <= 2 {
+            let raced = request == 1;
+            let task = json!({"task_id":if raced {"workflow-timeout-task"} else {"unrelated-task"},
+                "workflow_id":if raced {"reused-workflow-id"} else {"unrelated-workflow"},
+                "run_id":if raced {"run-selected-timeout"} else {"unrelated-run"},
+                "workflow_type":if raced {"timeout.workflow"} else {"unrelated.workflow"},
+                "payload_codec":"avro","arguments":fixture_envelope(json!([])),
+                "history_events":[],"workflow_task_attempt":3,"lease_owner":"timeout-worker"});
+            return Some(("200 OK", json!({"task":task}).to_string()));
+        }
+        match path {
+            // The run was cancelled while the completion was in flight.
+            "/api/worker/workflow-tasks/workflow-timeout-task/complete" => {
+                Some(("409 Conflict", run_closed_receipt("cancelled").to_string()))
+            }
+            "/api/worker/workflow-tasks/unrelated-task/complete" => Some((
+                "200 OK",
+                json!({"outcome":"completed","recorded":true}).to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_worker_keeps_inexact_run_closed_refusals_fatal() {
+        let valid = run_closed_receipt("cancelled");
+        let mut cases: Vec<(String, &'static str, String)> = Vec::new();
+        for (field, value) in [
+            ("recorded", None),
+            ("recorded", Some(json!(true))),
+            ("recorded", Some(json!("false"))),
+            ("recorded", Some(Value::Null)),
+            ("task_id", None),
+            ("task_id", Some(json!("other-task"))),
+            ("workflow_task_attempt", None),
+            ("workflow_task_attempt", Some(json!(4))),
+            ("workflow_task_attempt", Some(json!("3"))),
+            ("run_id", None),
+            ("run_id", Some(json!("run-other"))),
+            ("run_id", Some(Value::Null)),
+            ("run_status", None),
+            ("run_status", Some(json!("running"))),
+            ("run_status", Some(json!("waiting"))),
+            ("run_status", Some(json!("completed"))),
+            ("stop_reason", None),
+            ("stop_reason", Some(json!("run_terminated"))),
+            ("can_continue", None),
+            ("can_continue", Some(json!(true))),
+            ("reason", None),
+            ("reason", Some(json!("lease_owner_mismatch"))),
+            ("reason", Some(json!("lease_expired"))),
+            ("reason", Some(json!("workflow_task_attempt_mismatch"))),
+            ("reason", Some(json!("conflicting_completion"))),
+        ] {
+            let mut body = valid.clone();
+            let name = match value {
+                Some(value) => {
+                    let name = format!("{field}={value}");
+                    body[field] = value;
+                    name
+                }
+                None => {
+                    body.as_object_mut().expect("receipt object").remove(field);
+                    format!("{field} absent")
+                }
+            };
+            cases.push((name, "409 Conflict", body.to_string()));
+        }
+        for status in [
+            "403 Forbidden",
+            "410 Gone",
+            "422 Unprocessable Entity",
+            "503 Service Unavailable",
+        ] {
+            cases.push((format!("HTTP {status}"), status, valid.to_string()));
+        }
+        cases.push(("malformed JSON".into(), "409 Conflict", "{broken".into()));
+        // Native 3.0.4's guard body (#170) for the same task and attempt: it
+        // lacks `recorded` and `run_id`, so it stays fatal.
+        cases.push((
+            "native 3.0.4 body".into(),
+            "409 Conflict",
+            json!({"task_id":"workflow-timeout-task","workflow_task_attempt":3,
+                "error":"Workflow run is already closed.","reason":"run_closed","protocol_version":"1.20",
+                "server_capabilities":{},"stop_reason":"run_cancelled","cancel_requested":true,
+                "can_continue":false,"run_status":"cancelled","run_closed_reason":"cancelled",
+                "task_status":"cancelled","lease_owner":"timeout-worker"})
+            .to_string(),
+        ));
+        // A receipt that carries no closed-run state is not inferred terminal.
+        cases.push((
+            "receipt without run state".into(),
+            "409 Conflict",
+            json!({"reason":"run_closed","message":"run_closed","protocol_version":"1.20",
+                "server_capabilities":{},"task_id":"workflow-timeout-task","workflow_task_attempt":3,
+                "recorded":false,"run_id":"run-selected-timeout","task_status":"leased"})
+            .to_string(),
+        ));
+
+        for (name, status, response) in cases {
+            let response: &'static str = Box::leak(response.into_boxed_str());
+            let expected_status =
+                reqwest::StatusCode::from_u16(status[..3].parse().expect("status code"))
+                    .expect("status");
+
+            let server = MockWorkerServer::workflow_completion(status, response);
+            let client = Client::builder(server.base_url())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client");
+            let mut worker = Worker::new(client, "rust-workers")
+                .worker_id("timeout-worker")
+                .poll_timeout(Duration::from_millis(10));
+            worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+                Ok(json!({"late": "result"}))
+            });
+            let error = worker
+                .run_once()
+                .await
+                .expect_err(&format!("{name} must remain an error"));
+            assert_original_http_error(error, expected_status, response, &name);
+            if expected_status == reqwest::StatusCode::CONFLICT {
+                assert_eq!(
+                    server
+                        .request_count("/api/worker/workflow-tasks/workflow-timeout-task/complete"),
+                    1,
+                    "{name}: a refused report is not retried"
+                );
+            }
+
+            for (surface, decision) in workflow_timeout_failure_decisions() {
+                let server = MockWorkerServer::workflow_completion(status, response);
+                let client = Client::builder(server.base_url())
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .expect("client");
+                let worker = Worker::new(client, "rust-workers");
+                let error = worker
+                    .settle_workflow_task_decision(
+                        "workflow-timeout-task",
+                        "timeout-worker",
+                        3,
+                        Some("run-selected-timeout"),
+                        decision,
+                        false,
+                        None,
+                    )
+                    .await
+                    .expect_err(&format!("{surface}: {name} must remain an error"));
+                assert_original_http_error(
+                    error,
+                    expected_status,
+                    response,
+                    &format!("{surface}: {name}"),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_worker_requires_the_selected_run_for_run_closed_receipts() {
+        // Without the task's own run there is nothing to match.
+        let response: &'static str =
+            Box::leak(run_closed_receipt("cancelled").to_string().into_boxed_str());
+        let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let worker = Worker::new(client, "rust-workers");
+        let error = worker
+            .settle_workflow_task_decision(
+                "workflow-timeout-task",
+                "timeout-worker",
+                3,
+                None,
+                Err(Error::WorkerLoop("fixture failure".into())),
+                false,
+                None,
+            )
+            .await
+            .expect_err("a task without a run never settles");
+        assert_original_http_error(error, reqwest::StatusCode::CONFLICT, response, "no run");
     }
 
     #[tokio::test]
