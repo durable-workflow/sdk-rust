@@ -18,7 +18,9 @@
   activity completions, fired timers, side effects and version markers are now
   qualified with valid Workflow 2.19 successor histories. The 4.11.1 markers and
   timer fixtures also lacked the redrive envelope. Each redrive fixture must
-  either pass the successor check or be one of the named 4.11.1 exceptions.
+  either pass the successor check or be one of the named 4.11.1 exceptions. The
+  check binds the full redrive `WorkflowStarted` envelope, each event's run and
+  instance, and the successor's cancellation request and delivery.
 
 ## 4.11.1
 

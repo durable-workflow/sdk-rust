@@ -82,7 +82,9 @@
       "recorded_at": "2026-11-03T00:05:01+00:00",
       "payload": {
         "workflow_command_id": "successor-request",
+        "workflow_instance_id": "regression-corpus-redrive-successor-cancellation",
         "workflow_run_id": "regression-corpus-run",
+        "command_type": "request_cancellation",
         "cleanup_deadline_at": "2026-11-03T00:05:31.000000Z",
         "cancellation": {
           "schema": "durable-workflow.cancellation-context/v1",
@@ -117,7 +119,30 @@
         "workflow_command_id": "successor-request",
         "workflow_run_id": "regression-corpus-run",
         "sequence": 3,
-        "call_kind": "activity"
+        "call_kind": "activity",
+        "cancellation": {
+          "schema": "durable-workflow.cancellation-context/v1",
+          "request_id": "successor-request",
+          "root_request_id": "successor-request",
+          "root_workflow_instance_id": "regression-corpus-redrive-successor-cancellation",
+          "root_workflow_run_id": "regression-corpus-run",
+          "parent_request_id": null,
+          "reason": null,
+          "requester": {
+            "type": "operator",
+            "id": "fixture-operator"
+          },
+          "source": "control_plane",
+          "requested_at": "2026-11-03T00:05:01.000000Z",
+          "cleanup_deadline_at": "2026-11-03T00:05:31.000000Z",
+          "lineage": [
+            {
+              "request_id": "successor-request",
+              "workflow_instance_id": "regression-corpus-redrive-successor-cancellation",
+              "workflow_run_id": "regression-corpus-run"
+            }
+          ]
+        }
       }
     }
   ],
