@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.11.0
+
 - Keep managed workers polling when a workflow-task completion or failure
   report receives a non-recorded `task_not_leased` receipt for the same task,
   attempt and run, for example after the run was cancelled. Recorded,
