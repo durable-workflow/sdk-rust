@@ -74,20 +74,28 @@ token is fresh per invocation. Each carries the labels `task`,
 `dev.durable-workflow.acceptance.owner=<prefix>`.
 
 While the client is alive, it removes its containers, its network and the
-fixture credentials, even when the run fails. It first inspects each object
-and removes it by ID only when the run label equals this invocation's token, so
-a name collision or a failed create never removes anyone else's container.
-`leftover_containers` lists containers that still carry this run's token.
+fixture credentials, even when the run fails. Each cell writes its credential
+file and creates its network and containers inside the cleanup-protected
+region. It records each container name before running `docker run`, because
+the daemon can create a container (or network) even when the client then times
+out or errors. Cleanup inspects each recorded name, then logs and removes the
+object by ID only when its run label equals this invocation's token. A name
+collision or a failed create never touches anyone else's object.
+`leftover_containers` and `leftover_networks` in the final JSON list objects
+that still carry this run's token.
 
 The fixture build container uses `--rm`, `--init`, `--cpus` equal to `--jobs`,
 `--memory 3g`, `--pids-limit 1024`, `no-new-privileges` and `--cap-drop ALL`.
 It uses the default network for the crates.io fetch and mounts only the fixture
 directory. Its build runs under `timeout --kill-after=60s 3300s` inside the
 container, so the container exits and the daemon removes it even if the client
-is killed. The client's own timeout is 3600 seconds. Cell containers are
-detached and have no in-container wall bound, so if the client is killed
-mid-cell, remove them with
-`docker rm -f $(docker ps -aq --filter label=dev.durable-workflow.acceptance.run=<token>)`.
+is killed. The client's own timeout is 3600 seconds.
+
+Cell containers are detached and have no client-independent lifetime bound. If
+the client is killed mid-cell, its containers, its network and the cell's
+`state/` (credential file, database and storage) stay behind until removed by
+hand. Removing the containers labelled with the run token alone is not a
+complete cleanup. Issue #171 tracks an independent cell lifetime and reaper.
 
 The cell runtime uses SQLite, normal native maintenance, and one shared
 fixture token for all roles. It does not cover role-only authentication, other

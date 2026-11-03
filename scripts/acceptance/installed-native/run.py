@@ -272,8 +272,11 @@ class Cell:
             line += ['--network-alias', alias]
         for key, value in (env or {}).items():
             line += ['-e', '%s=%s' % (key, value)]
-        call(line + [image] + command)
+        # Track before creating: the daemon can create the container even when the
+        # client then times out or errors. Cleanup is ownership-checked, so a
+        # failed create or a foreign name collision is never removed.
         self.containers.append(name)
+        call(line + [image] + command)
         return name
 
     def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None):
@@ -289,8 +292,11 @@ class Cell:
             line += ['--tmpfs', tmpfs]
         for key, value in (env or {}).items():
             line += ['-e', '%s=%s' % (key, value)]
-        call(line + [image] + command)
+        # Track before creating: the daemon can create the container even when the
+        # client then times out or errors. Cleanup is ownership-checked, so a
+        # failed create or a foreign name collision is never removed.
         self.containers.append(name)
+        call(line + [image] + command)
         return name
 
     def start_php(self, token):
@@ -332,11 +338,13 @@ class Cell:
             (self.state / sub).chmod(0o777)
         token = 'fixture-' + secrets.token_hex(24)
         credentials = self.state / 'credentials.json'
-        credentials.write_text(json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
-        credentials.chmod(0o644)
-        binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
-        call(['docker', 'network', 'create', '--internal'] + self.harness_run.labels(self.task) + [self.task])
         try:
+            credentials.write_text(json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
+            credentials.chmod(0o644)
+            binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
+            # Inside the protected region: the daemon can create the network even
+            # when the client then times out. Removal is ownership-checked.
+            call(['docker', 'network', 'create', '--internal'] + self.harness_run.labels(self.task) + [self.task])
             if self.args.runtime == 'php':
                 self.start_php(token)
             else:
@@ -379,12 +387,16 @@ class Cell:
         finally:
             logs = self.dir / 'logs'
             logs.mkdir(exist_ok=True)
-            for name in self.containers:
-                out = call(['docker', 'logs', '--tail', '300', name], check=False)
-                (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_text(out.stdout)
-                (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
-            for name in reversed(self.containers):
-                remove_owned_container(name, self.harness_run)
+            # Only containers carrying this run's token are logged and removed (by ID).
+            owned = [(name, owned_id('container', name, self.harness_run)) for name in self.containers]
+            for name, container_id in owned:
+                if container_id:
+                    out = call(['docker', 'logs', '--tail', '300', container_id], check=False)
+                    (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_text(out.stdout)
+                    (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
+            for name, container_id in reversed(owned):
+                if container_id:
+                    call(['docker', 'rm', '-f', container_id], check=False)
             remove_owned_network(self.task, self.harness_run)
             credentials.unlink(missing_ok=True)
             for sub in ['database', 'storage']:
@@ -429,9 +441,12 @@ def main():
     finally:
         summary['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         (args.work_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
-        leftovers = call(['docker', 'ps', '-aq', '--filter', 'label=%s=%s' % (RUN_LABEL, run.token)], check=False).stdout.split()
+        run_filter = 'label=%s=%s' % (RUN_LABEL, run.token)
+        leftovers = call(['docker', 'ps', '-aq', '--filter', run_filter], check=False).stdout.split()
+        leftover_networks = call(['docker', 'network', 'ls', '-q', '--filter', run_filter], check=False).stdout.split()
         print(json.dumps({'outcome': summary['outcome'], 'error': summary.get('error'),
-                          'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers}))
+                          'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers,
+                          'leftover_networks': leftover_networks}))
     sys.exit(0 if summary['outcome'] == 'pass' else 1)
 
 
