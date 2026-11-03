@@ -30,7 +30,7 @@ class ForwardableHeadersTest(unittest.TestCase):
         # Response headers the native Server emits and the SDK reads. Expanding
         # this set needs review; request-only names such as
         # x-durable-workflow-payload-completion must not be relayed.
-        self.assertEqual(FORWARDED_HEADERS, frozenset((
+        self.assertEqual(frozenset(FORWARDED_HEADERS), frozenset((
             'content-type',
             'retry-after',
             'x-durable-workflow-control-plane-version',
@@ -62,6 +62,14 @@ class ForwardableHeadersTest(unittest.TestCase):
         for name in ('Bad Name', 'Bad:Name', 'Bad\r\nName', '', 'Bad\x00', 'Caf\xe9'):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 forwardable_headers([(name, 'v')])
+
+    def test_relays_canonical_constant_names(self):
+        self.assertEqual(forwardable_headers([('content-TYPE', 'application/json'),
+                                              ('x-durable-workflow-protocol-version', '1.20')]),
+                         [('Content-Type', 'application/json'),
+                          ('X-Durable-Workflow-Protocol-Version', '1.20')])
+        for key, name in FORWARDED_HEADERS.items():
+            self.assertEqual(key, name.lower())
 
     def test_allows_htab_and_space_in_values(self):
         self.assertEqual(forwardable_headers([('Content-Type', 'application/json;\tcharset=utf-8 ')]),
