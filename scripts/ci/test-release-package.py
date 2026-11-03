@@ -569,9 +569,9 @@ This is an example, not another release.
         candidate = harness.approval_candidate(summary, b"{}")
         approval, _ = parse_approval(json.dumps(candidate).encode())
         self.assertEqual("3.0.5", approval["acceptance"]["expected_server_version"])
-        failed = {**summary, "outcome": "fail"}
+        failed = json.dumps(harness.approval_candidate({**summary, "outcome": "fail"}, b"{}")).encode()
         with self.assertRaisesRegex(ReleasePackageError, "outcome"):
-            parse_approval(json.dumps(harness.approval_candidate(failed, b"{}")).encode())
+            parse_approval(failed)
 
     def test_acceptance_receipt_deletions_are_refused(self) -> None:
         for field in sorted(ACCEPTANCE):
@@ -706,8 +706,9 @@ This is an example, not another release.
                 shutil.rmtree(secret.parent / "approved-packages", ignore_errors=True)
                 repository = self.tooling(record)
                 mutate(repository)
+                root = confined_root(repository)
                 with self.assertRaisesRegex(ReleasePackageError, message):
-                    read_approval_record(confined_root(repository), version)
+                    read_approval_record(root, version)
 
     def test_approval_version_is_strict_semver_before_naming_a_path(self) -> None:
         secret = self.outside_file()

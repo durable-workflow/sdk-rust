@@ -477,12 +477,14 @@ release_entry_checksum="$(jq -er '.changelog.entry_sha256' "$local_identity")"
 # link-free file that equals the blob tracked at that exact path.
 approved_package_path="release/approved-packages/${package_version}.json"
 approval_present="false"
+approval_tracked=""
 if [[ -n "$approved_package_repository" ]]; then
-    if [[ -e "$approved_package_repository/$approved_package_path" || \
-          -L "$approved_package_repository/$approved_package_path" ]] || \
-       [[ -n "$(git -C "$approved_package_repository" ls-tree --full-tree HEAD -- "$approved_package_path" 2>/dev/null || true)" ]]; then
-        approval_present="true"
-    fi
+    approval_tracked="$(git -C "$approved_package_repository" ls-tree --full-tree HEAD -- "$approved_package_path" 2>/dev/null || true)"
+fi
+if [[ -n "$approved_package_repository" && \
+      ( -e "$approved_package_repository/$approved_package_path" || \
+        -L "$approved_package_repository/$approved_package_path" || -n "$approval_tracked" ) ]]; then
+    approval_present="true"
 fi
 if [[ "$approval_present" == "true" ]]; then
     packaging_cargo="$(cargo -V | awk '{print $2}')"

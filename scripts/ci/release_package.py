@@ -568,9 +568,18 @@ def load_approval(path: Path) -> tuple[dict[str, Any], str]:
     return parse_approval(_read_regular_no_follow(path))
 
 
+GIT_OBJECT_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
 def _git(repository: str, *arguments: str) -> bytes:
+    """Run a fixed git query in the confined repository.
+
+    The repository is the working directory, never an argument, and every
+    argument is a constant, the SemVer-derived record path after "--", or a
+    validated object id, so no caller value can become a git option.
+    """
     result = subprocess.run(
-        ["git", "-C", repository, *arguments], capture_output=True, check=False, timeout=60,
+        ["git", *arguments], cwd=repository, capture_output=True, check=False, timeout=60,
     )
     if result.returncode:
         raise ReleasePackageError(f"git {arguments[0]} failed in the approvals repository")
@@ -598,7 +607,10 @@ def read_approval_record(repository: str, version: str) -> tuple[bytes, str]:
     if (tracked_path != relative.encode() or len(fields) != 3
             or fields[0] != b"100644" or fields[1] != b"blob"):
         raise ReleasePackageError("approved package record is not a tracked regular file at its exact path")
-    if _git(repository, "cat-file", "blob", fields[2].decode("ascii")) != content:
+    object_id = fields[2].decode("ascii")
+    if not GIT_OBJECT_PATTERN.fullmatch(object_id):
+        raise ReleasePackageError("approved package record has an invalid tracked object id")
+    if _git(repository, "cat-file", "blob", object_id) != content:
         raise ReleasePackageError("approved package record differs from its tracked content")
     return content, relative
 

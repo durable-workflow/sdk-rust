@@ -175,6 +175,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
 
             command = sys.argv[1]
             approvals = os.environ.get("MOCK_APPROVAL_REPOSITORY")
+            in_approvals = approvals and os.path.realpath(os.getcwd()) == os.path.realpath(approvals)
+            if command in {"ls-tree", "cat-file"} and in_approvals:
+                os.execv(os.environ["MOCK_REAL_GIT"], ["git", *sys.argv[1:]])
             if command == "-C" and approvals and os.path.realpath(sys.argv[2]) == os.path.realpath(approvals):
                 # The approvals checkout is a real repository.
                 os.execv(os.environ["MOCK_REAL_GIT"], ["git", *sys.argv[1:]])
