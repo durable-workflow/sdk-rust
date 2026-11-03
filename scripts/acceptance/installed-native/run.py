@@ -93,6 +93,13 @@ def remove_owned_container(name, run):
     return container_id
 
 
+def write_owner_only(path, text):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+
+
 def remove_tree(path):
     if os.path.lexists(path):
         shutil.rmtree(path)
@@ -365,17 +372,20 @@ class Cell:
         return call(['docker', 'exec', container, 'python', '-c', code, token], check=False)
 
     def run(self):
-        self.state.mkdir(parents=True)
-        for path in [self.dir, self.state]:
-            path.chmod(0o777)
-        for sub in ['database', 'storage']:
-            (self.state / sub).mkdir()
-            (self.state / sub).chmod(0o777)
         token = 'fixture-' + secrets.token_hex(24)
         credentials = self.state / 'credentials.json'
+        # All state setup is inside the protected region: a partial setup (say,
+        # database/ created and storage/ failing) is still removed and verified.
         try:
-            credentials.write_text(json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
-            credentials.chmod(0o644)
+            self.state.mkdir(parents=True)
+            for path in [self.dir, self.state]:
+                path.chmod(0o777)
+            for sub in ['database', 'storage']:
+                (self.state / sub).mkdir()
+                (self.state / sub).chmod(0o777)
+            # Owner-only from creation: the readers (worker, driver, history check)
+            # run as the host UID, and the server roles get the token by env.
+            write_owner_only(credentials, json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
             binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
             # Inside the protected region: the daemon can create the network even
             # when the client then times out. Removal is ownership-checked.

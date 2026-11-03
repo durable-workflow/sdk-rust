@@ -577,6 +577,71 @@ class LocalStateCleanup(HarnessRun):
         self.assertEqual(self.errors(), [('local-verify', 'lifecycle/database', 'StillPresent'),
                                          ('local-verify', 'lifecycle/storage', 'StillPresent')])
 
+    def test_credential_file_is_owner_only_before_any_container_starts(self):
+        modes = []
+
+        class Recording(FakeDocker):
+            def __call__(inner, command, timeout=120, check=True, **kwargs):
+                if list(command[:3]) == ['docker', 'network', 'create']:
+                    modes.append(os.stat(self.cell.state / 'credentials.json').st_mode & 0o777)
+                return FakeDocker.__call__(inner, command, timeout, check, **kwargs)
+        docker = Recording(faults={self.cell.task + '-proxy': 'created-then-error'})
+        previous = os.umask(0)  # even a permissive umask must not widen the mode
+        try:
+            with mock.patch.object(run, 'call', docker), self.assertRaises(RuntimeError):
+                self.cell.run()
+        finally:
+            os.umask(previous)
+        self.assertEqual(modes, [0o600])
+
+    def test_credential_file_is_created_owner_only(self):
+        opened = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, *a, **k):
+            opened.append((pathlib.Path(path).name, flags & os.O_EXCL, mode))
+            return real_open(path, flags, mode, *a, **k)
+        with mock.patch.object(run.os, 'open', recording_open):
+            self.run_cell()
+        self.assertIn(('credentials.json', os.O_EXCL, 0o600), opened)
+
+    def test_partial_setup_failure_is_cleaned_and_preserves_the_error(self):
+        real_chmod = pathlib.Path.chmod
+
+        def chmod(path, mode, *a, **k):
+            if path.name == 'storage':
+                raise PermissionError('chmod denied')  # storage/ exists, database/ already set up
+            return real_chmod(path, mode, *a, **k)
+        docker = FakeDocker()
+        with mock.patch.object(run, 'call', docker), mock.patch.object(pathlib.Path, 'chmod', chmod):
+            with self.assertRaises(PermissionError) as raised:
+                self.cell.run()
+        self.assertEqual(str(raised.exception), 'chmod denied')
+        for sub in ('credentials.json', 'database', 'storage'):
+            self.assertFalse(os.path.lexists(self.cell.state / sub), sub)
+        self.assertEqual((self.run.cleanup_errors, self.run.local_leftovers), ([], []))
+        self.assertEqual(docker.runs(), [])
+
+    def test_partial_setup_failure_that_also_fails_cleanup_is_reported(self):
+        real_chmod, real_rmtree = pathlib.Path.chmod, shutil.rmtree
+
+        def chmod(path, mode, *a, **k):
+            if path.name == 'storage':
+                raise PermissionError('chmod denied')
+            return real_chmod(path, mode, *a, **k)
+
+        def rmtree(path, *a, **k):
+            if pathlib.Path(path).name == 'database':
+                raise PermissionError('denied')
+            return real_rmtree(path, *a, **k)
+        with mock.patch.object(run, 'call', FakeDocker()), mock.patch.object(pathlib.Path, 'chmod', chmod), \
+                mock.patch.object(run.shutil, 'rmtree', rmtree), self.assertRaises(PermissionError):
+            self.cell.run()
+        self.assertFalse(os.path.lexists(self.cell.state / 'storage'))
+        self.assertEqual(self.run.local_leftovers, ['lifecycle/database'])
+        self.assertEqual(self.errors(), [('local-remove', 'lifecycle/database', 'PermissionError'),
+                                         ('local-verify', 'lifecycle/database', 'StillPresent')])
+
     def test_records_carry_no_paths_or_values(self):
         def unlink(path, missing_ok=False):
             raise PermissionError(str(path))

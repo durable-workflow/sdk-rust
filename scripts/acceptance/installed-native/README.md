@@ -82,6 +82,12 @@ out or errors. Cleanup inspects each recorded name, then logs and removes the
 object by ID only when its run label equals this invocation's token. A name
 collision or a failed create never touches anyone else's object.
 
+Each cell creates `state/`, `database/`, `storage/` and its credential file
+inside the cleanup-protected region, so a partial setup failure is cleaned up
+too. The credential file is created owner-only (`0600`). Its readers (the
+fixture worker, driver and history check) run as the host UID, and the server
+roles get the token from their environment.
+
 Each Docker inspect, log and remove step is best-effort: a failure or timeout
 is recorded and the remaining steps still run. The credential file,
 `database/` and `storage/` are removed separately, in an outer `finally`,
