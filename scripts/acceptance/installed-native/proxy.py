@@ -10,27 +10,35 @@ import http.client, http.server, json, pathlib, re, threading, time
 state = pathlib.Path('/state')
 lock = threading.Lock()
 
-HOP_BY_HOP = frozenset(('connection', 'keep-alive', 'proxy-connection', 'transfer-encoding',
-                        'content-length', 'te', 'trailer', 'upgrade'))
+# Response headers the SDK reads from the native Server; anything else is dropped.
+FORWARDED_HEADERS = frozenset((
+    'content-type',
+    'retry-after',
+    'x-durable-workflow-control-plane-version',
+    'x-durable-workflow-payload-codec',
+    'x-durable-workflow-payload-completion',
+    'x-durable-workflow-payload-sha256',
+    'x-durable-workflow-payload-size',
+    'x-durable-workflow-protocol-version',
+))
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-HEADER_VALUE = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
+# HTAB, SP and visible ASCII only: no CR, LF, other C0, DEL or C1/8-bit bytes.
+HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")
 
 
 def forwardable_headers(pairs):
     """Upstream response headers that are safe to relay.
 
-    Hop-by-hop headers are dropped. A name that is not an RFC 9110 token, or a
-    value containing CR, LF or another control character, is refused rather than
-    relayed, so an upstream response cannot split or inject headers.
+    Every header is validated before any is relayed or dropped: a name that is
+    not an RFC 9110 token, or a value with anything other than HTAB, SP and
+    visible ASCII, refuses the whole response. Only the reviewed set in
+    FORWARDED_HEADERS is relayed; hop-by-hop and every other header is dropped.
     """
-    safe = []
+    pairs = list(pairs)
     for name, value in pairs:
-        if name.lower() in HOP_BY_HOP:
-            continue
         if not HEADER_NAME.fullmatch(name) or not HEADER_VALUE.fullmatch(value):
             raise ValueError('refusing to relay an unsafe upstream header')
-        safe.append((name, value))
-    return safe
+    return [(name, value) for name, value in pairs if name.lower() in FORWARDED_HEADERS]
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
