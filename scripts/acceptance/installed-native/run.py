@@ -12,6 +12,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
@@ -27,6 +28,88 @@ BINARY = 'installed-native-lifecycle'
 # Same pins as docker-compose.local-activities.yml, for the PHP Server baseline.
 MYSQL_IMAGE = 'mysql@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
 REDIS_IMAGE = 'redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499'
+# Every container and network this harness creates carries these labels. The run
+# label holds a per-invocation random token; forced cleanup removes only objects
+# that carry this invocation's token.
+RUN_LABEL = 'dev.durable-workflow.acceptance.run'
+OWNER_LABEL = 'dev.durable-workflow.acceptance.owner'
+PREFIX_PATTERN = re.compile(r'[a-z][a-z0-9-]{0,30}')
+# The fixture build is bounded inside its container, independent of this client:
+# timeout sends TERM at BUILD_WALL_SECONDS and KILL BUILD_KILL_AFTER_SECONDS
+# later, the container exits, and the daemon's --rm removes it. The client
+# timeout is longer, so the in-container bound always fires first.
+BUILD_WALL_SECONDS = 3300
+BUILD_KILL_AFTER_SECONDS = 60
+BUILD_CLIENT_TIMEOUT = 3600
+
+
+def container_prefix(value):
+    if not PREFIX_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError('%r must match ^%s$' % (value, PREFIX_PATTERN.pattern))
+    return value
+
+
+class Run:
+    """One harness invocation: owner prefix plus a high-entropy token."""
+
+    def __init__(self, prefix, stamp=None, token=None):
+        self.prefix = container_prefix(prefix)
+        self.stamp = stamp or datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dt%H%M%S')
+        self.token = token or secrets.token_hex(8)
+        self.base = '%s-accept-%s-%s' % (self.prefix, self.stamp, self.token)
+        self.cleanup_errors = []
+        self.local_leftovers = []
+
+    def best_effort(self, step, name, function, *args, **kwargs):
+        """Run one cleanup step; record a failure (step, object, error type only) and continue."""
+        try:
+            return function(*args, **kwargs)
+        except Exception as error:
+            self.cleanup_errors.append({'step': step, 'object': name, 'error': type(error).__name__})
+            return None
+
+    def labels(self, task):
+        return ['--label', 'task=' + task, '--label', '%s=%s' % (RUN_LABEL, self.token),
+                '--label', '%s=%s' % (OWNER_LABEL, self.prefix)]
+
+
+def owned_id(kind, name, run):
+    """The ID of container/network `name` if it carries this run's token, else None."""
+    result = call(['docker', kind, 'inspect', '--format',
+                   '{{.Id}} {{index .%s "%s"}}' % ('Config.Labels' if kind == 'container' else 'Labels', RUN_LABEL),
+                   name], check=False)
+    fields = result.stdout.split() if result.returncode == 0 else []
+    if len(fields) == 2 and fields[1] == run.token:
+        return fields[0]
+    return None
+
+
+def remove_owned_container(name, run):
+    # Remove by ID, never by name, and only after the run token matched: a name
+    # collision or a failed create must not touch another owner's container.
+    container_id = owned_id('container', name, run)
+    if container_id:
+        call(['docker', 'rm', '-f', container_id])
+    return container_id
+
+
+def write_owner_only(path, text):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+
+
+def remove_tree(path):
+    if os.path.lexists(path):
+        shutil.rmtree(path)
+
+
+def remove_owned_network(name, run):
+    network_id = owned_id('network', name, run)
+    if network_id:
+        call(['docker', 'network', 'rm', network_id])
+    return network_id
 
 
 def parse_args():
@@ -54,6 +137,9 @@ def parse_args():
     parser.add_argument('--cells', default='lifecycle,deadline')
     parser.add_argument('--jobs', type=int, default=2, help='cargo build jobs (lab machines: keep at 2)')
     parser.add_argument('--work-dir', type=pathlib.Path, required=True, help='new directory for build output and evidence')
+    parser.add_argument('--container-prefix', type=container_prefix, default='sdkrust',
+                        help='owner prefix for container, network and task names, e.g. general or security '
+                             '(^%s$)' % PREFIX_PATTERN.pattern)
     return parser.parse_args()
 
 
@@ -103,16 +189,30 @@ def server_identity(args):
             'image': by_manifest, 'image_by_index': by_index, 'labels': labels}
 
 
-def build_fixture(args, fixture):
+def build_fixture(args, fixture, run):
     shutil.copytree(HERE / 'fixture' / 'src', fixture / 'src')
     template = (HERE / 'fixture' / 'Cargo.toml.in').read_text()
     (fixture / 'Cargo.toml').write_text(template.replace('@CRATE_VERSION@', args.crate_version))
     call(['docker', 'pull', args.rust_image], timeout=1800)
-    command = ['docker', 'run', '--rm', '--user', '%d:%d' % (os.getuid(), os.getgid()),
-               '-v', '%s:/work' % fixture, '-w', '/work', '-e', 'CARGO_HOME=/work/.cargo',
-               '-e', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback', args.rust_image, 'sh', '-c',
-               'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs]
-    build = call(command, timeout=3600)
+    # Bounded like every other harness container: --init, CPU/RAM/PID caps and an
+    # in-container wall bound. It keeps the default network only for the
+    # crates.io fetch and mounts only the fixture directory.
+    name = run.base + '-build'
+    command = (['docker', 'run', '--rm', '--init', '--name', name] + run.labels(name) +
+               ['--cpus', str(max(1, args.jobs)), '--memory', '3g', '--pids-limit', '1024',
+                '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+                '--user', '%d:%d' % (os.getuid(), os.getgid()),
+                '-v', '%s:/work' % fixture, '-w', '/work', '-e', 'CARGO_HOME=/work/.cargo',
+                '-e', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback', args.rust_image,
+                'timeout', '--kill-after=%ds' % BUILD_KILL_AFTER_SECONDS, '%ds' % BUILD_WALL_SECONDS, 'sh', '-c',
+                'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs])
+    try:
+        build = call(command, timeout=BUILD_CLIENT_TIMEOUT)
+    finally:
+        # Covers a client-side timeout or error while this process is alive. If
+        # the client dies, the in-container timeout ends the build and --rm fires.
+        # A cleanup failure is recorded and never replaces the build's own error.
+        run.best_effort('build-cleanup', name, remove_owned_container, name, run)
     (fixture / 'build.stdout').write_text(build.stdout)
     (fixture / 'build.stderr').write_text(build.stderr)
     return {'rust_image': image_identity(args.rust_image), 'toolchain': build.stdout.strip().splitlines()[:2],
@@ -173,16 +273,16 @@ def crate_provenance(args, fixture):
 
 
 class Cell:
-    def __init__(self, args, name, root, server, fixture, stamp):
-        self.args, self.name, self.server, self.fixture = args, name, server, fixture
+    def __init__(self, args, name, root, server, fixture, run):
+        self.args, self.name, self.server, self.fixture, self.harness_run = args, name, server, fixture, run
         self.dir = root / 'cells' / name
         self.state = self.dir / 'state'
-        self.task = 'sdkrust-accept-%s-%s' % (stamp, name)
+        self.task = '%s-%s' % (run.base, name)
         self.containers = []
 
     def start(self, role, image, command, user=None, env=None, alias=None, mounts=()):
         name = '%s-%s' % (self.task, role)
-        line = ['docker', 'run', '-d', '--init', '--read-only', '--name', name, '--label', 'task=' + self.task,
+        line = ['docker', 'run', '-d', '--init', '--read-only', '--name', name] + self.harness_run.labels(self.task) + [
                 '--user', user or '%d:%d' % (os.getuid(), os.getgid()), '--cpus', '1', '--memory', '1g',
                 '--pids-limit', '256', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
                 '--network', self.task, '--tmpfs', '/tmp:mode=1777,size=64m',
@@ -195,15 +295,25 @@ class Cell:
             line += ['--network-alias', alias]
         for key, value in (env or {}).items():
             line += ['-e', '%s=%s' % (key, value)]
-        call(line + [image] + command)
+        # Track before creating: the daemon can create the container even when the
+        # client then times out or errors. Cleanup is ownership-checked, so a
+        # failed create or a foreign name collision is never removed.
         self.containers.append(name)
+        call(line + [image] + command)
         return name
 
-    def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None):
-        """Start a PHP Server process-set container (writable root, as in its compose file)."""
+    def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None, caps=(), pids=256):
+        """Start a PHP Server process-set container (writable root, as in its compose file).
+
+        Bounded like `start`: --init, CPU/RAM/PID caps, no-new-privileges and
+        --cap-drop ALL, adding back only the capabilities `caps` names.
+        """
         name = '%s-%s' % (self.task, role)
-        line = ['docker', 'run', '-d', '--name', name, '--label', 'task=' + self.task, '--network', self.task,
-                '--memory', '1g', '--cpus', '1']
+        line = ['docker', 'run', '-d', '--init', '--name', name] + self.harness_run.labels(self.task) + [
+                '--network', self.task, '--memory', '1g', '--cpus', '1', '--pids-limit', str(pids),
+                '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL']
+        for cap in caps:
+            line += ['--cap-add', cap]
         if user:
             line += ['--user', user]
         if alias:
@@ -212,8 +322,11 @@ class Cell:
             line += ['--tmpfs', tmpfs]
         for key, value in (env or {}).items():
             line += ['-e', '%s=%s' % (key, value)]
-        call(line + [image] + command)
+        # Track before creating: the daemon can create the container even when the
+        # client then times out or errors. Cleanup is ownership-checked, so a
+        # failed create or a foreign name collision is never removed.
         self.containers.append(name)
+        call(line + [image] + command)
         return name
 
     def start_php(self, token):
@@ -223,19 +336,31 @@ class Cell:
                'DB_PASSWORD': 'workflow', 'REDIS_HOST': 'redis', 'QUEUE_CONNECTION': 'redis', 'CACHE_STORE': 'redis',
                'DW_AUTH_DRIVER': 'token', 'DW_AUTH_TOKEN': token, 'DW_WORKFLOW_TASK_TIMEOUT': '10',
                'DW_WORKER_PROTOCOL_VERSION': '1.20'}
+        # Capabilities kept after --cap-drop ALL, from each image's entrypoint. The
+        # MySQL 8.4 and Redis 7.4 entrypoints start as root, chown their data and
+        # socket directories (MySQL also walks mysql-owned directories such as
+        # secure-file-priv), then drop to their service user with gosu. MySQL runs
+        # one thread per connection and background task, so it gets 512 PIDs.
         mysql = self.plain('mysql', MYSQL_IMAGE, [], alias='mysql', tmpfs='/var/lib/mysql',
+                           caps=('CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'), pids=512,
                            env={'MYSQL_DATABASE': 'durable_workflow', 'MYSQL_USER': 'workflow',
                                 'MYSQL_PASSWORD': 'workflow', 'MYSQL_ROOT_PASSWORD': 'root'})
-        self.plain('redis', REDIS_IMAGE, [], alias='redis', tmpfs='/data')
+        self.plain('redis', REDIS_IMAGE, [], alias='redis', tmpfs='/data', caps=('CHOWN', 'SETGID', 'SETUID'))
         deadline = time.monotonic() + 120
         while call(['docker', 'exec', mysql, 'mysqladmin', 'ping', '-h', 'localhost', '-uworkflow', '-pworkflow'], check=False).returncode:
             if time.monotonic() > deadline:
                 raise RuntimeError('mysql never became ready')
             time.sleep(1)
-        bootstrap = self.plain('bootstrap', image, ['server-bootstrap'], env=env)
+        # The PHP Server image starts as root and writes caches under directories
+        # owned by www-data (uid 1000).
+        bootstrap = self.plain('bootstrap', image, ['server-bootstrap'], env=env, caps=('DAC_OVERRIDE',))
         if call(['docker', 'wait', bootstrap], timeout=600).stdout.strip() != '0':
             raise RuntimeError('PHP Server bootstrap failed')
-        self.plain('runtime', image, [], env=env, alias='qualification-origin')
+        # Apache's root master also chowns its mutex to www-data, switches its
+        # children to www-data and signals them.
+        self.plain('runtime', image, [], env=env, alias='qualification-origin',
+                   caps=('CHOWN', 'DAC_OVERRIDE', 'KILL', 'SETGID', 'SETUID'))
+        # queue and repair run as uid 1000 and keep no capabilities.
         self.plain('queue', image, ['php', 'artisan', 'queue:work', '--sleep=1', '--tries=3', '--max-time=1800'], env=env, user='1000:1000')
         self.plain('repair', image, ['sh', '-c', 'while true; do php artisan workflow:v2:repair-pass --json; sleep 2; done'],
                    env=env, user='1000:1000')
@@ -247,19 +372,24 @@ class Cell:
         return call(['docker', 'exec', container, 'python', '-c', code, token], check=False)
 
     def run(self):
-        self.state.mkdir(parents=True)
-        for path in [self.dir, self.state]:
-            path.chmod(0o777)
-        for sub in ['database', 'storage']:
-            (self.state / sub).mkdir()
-            (self.state / sub).chmod(0o777)
         token = 'fixture-' + secrets.token_hex(24)
         credentials = self.state / 'credentials.json'
-        credentials.write_text(json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
-        credentials.chmod(0o644)
-        binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
-        call(['docker', 'network', 'create', '--internal', '--label', 'task=' + self.task, self.task])
+        # All state setup is inside the protected region: a partial setup (say,
+        # database/ created and storage/ failing) is still removed and verified.
         try:
+            self.state.mkdir(parents=True)
+            for path in [self.dir, self.state]:
+                path.chmod(0o777)
+            for sub in ['database', 'storage']:
+                (self.state / sub).mkdir()
+                (self.state / sub).chmod(0o777)
+            # Owner-only from creation: the readers (worker, driver, history check)
+            # run as the host UID, and the server roles get the token by env.
+            write_owner_only(credentials, json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
+            binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
+            # Inside the protected region: the daemon can create the network even
+            # when the client then times out. Removal is ownership-checked.
+            call(['docker', 'network', 'create', '--internal'] + self.harness_run.labels(self.task) + [self.task])
             if self.args.runtime == 'php':
                 self.start_php(token)
             else:
@@ -300,18 +430,47 @@ class Cell:
                                            and result['binary_unchanged']) else 'fail'
             return result
         finally:
-            logs = self.dir / 'logs'
-            logs.mkdir(exist_ok=True)
-            for name in self.containers:
-                out = call(['docker', 'logs', '--tail', '300', name], check=False)
-                (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_text(out.stdout)
-                (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
-            for name in reversed(self.containers):
-                call(['docker', 'rm', '-f', name], check=False)
-            call(['docker', 'network', 'rm', self.task], check=False)
-            credentials.unlink(missing_ok=True)
-            for sub in ['database', 'storage']:
-                shutil.rmtree(self.state / sub, ignore_errors=True)
+            try:
+                self.remove_docker_objects()
+            finally:
+                # Local credential and state cleanup always runs, whatever Docker did.
+                self.remove_local_state(credentials)
+
+    def remove_local_state(self, credentials):
+        """Remove the credential file, database/ and storage/ independently, then
+        prove each is gone. Failures and survivors are recorded with bounded
+        labels (cell/path) and error types only, and fail the run."""
+        run = self.harness_run
+        paths = [('credentials.json', credentials, lambda path: path.unlink(missing_ok=True))]
+        paths += [(sub, self.state / sub, remove_tree) for sub in ('database', 'storage')]
+        for label, path, remove in paths:
+            run.best_effort('local-remove', '%s/%s' % (self.name, label), remove, path)
+        for label, path, _ in paths:
+            label = '%s/%s' % (self.name, label)
+            if os.path.lexists(path):
+                run.local_leftovers.append(label)
+                run.cleanup_errors.append({'step': 'local-verify', 'object': label, 'error': 'StillPresent'})
+
+    def remove_docker_objects(self):
+        """Best-effort, per-object cleanup: one failing inspect, log or remove never
+        skips the others. Only objects carrying this run's token are logged and
+        removed, by ID; failures are recorded on the run."""
+        run, logs = self.harness_run, self.dir / 'logs'
+        run.best_effort('logs-dir', self.task, logs.mkdir, exist_ok=True)
+        owned = [(name, run.best_effort('container-inspect', name, owned_id, 'container', name, run))
+                 for name in self.containers]
+        for name, container_id in owned:
+            if container_id:
+                run.best_effort('container-logs', name, self.save_logs, logs, name, container_id)
+        for name, container_id in reversed(owned):
+            if container_id:
+                run.best_effort('container-remove', name, call, ['docker', 'rm', '-f', container_id])
+        run.best_effort('network-cleanup', self.task, remove_owned_network, self.task, run)
+
+    def save_logs(self, logs, name, container_id):
+        out = call(['docker', 'logs', '--tail', '300', container_id], check=False)
+        (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_text(out.stdout)
+        (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
 
 
 def main():
@@ -319,7 +478,7 @@ def main():
     if args.work_dir.exists():
         raise SystemExit('work dir %s already exists; use a new one' % args.work_dir)
     args.work_dir.mkdir(parents=True)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dt%H%M%S')
+    run = Run(args.container_prefix)
     summary = {'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'outcome': 'fail',
                'harness_commit': call(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], check=False).stdout.strip()}
     try:
@@ -335,13 +494,15 @@ def main():
                                 'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
         else:
             fixture = args.work_dir / 'fixture'
-            summary['build'] = build_fixture(args, fixture)
+            summary['build'] = build_fixture(args, fixture, run)
         summary['crate'] = crate_provenance(args, fixture)
         # Pull first: inspect alone fails on a clean host that never fetched the helper image.
         call(['docker', 'pull', '--quiet', args.python_image], timeout=600)
         summary['python_image'] = image_identity(args.python_image)
-        summary['cells'] = {name: Cell(args, name, args.work_dir, summary['server'], fixture, stamp).run()
-                            for name in args.cells.split(',')}
+        cells = {}
+        for name in args.cells.split(','):
+            cells[name] = Cell(args, name, args.work_dir, summary['server'], fixture, run).run()
+        summary['cells'] = cells
         passed = (summary['crate']['baselines']['pass']
                   and summary.get('baselines_control', {'pass': True})['pass']
                   and all(c['outcome'] == 'pass' for c in summary['cells'].values()))
@@ -350,12 +511,29 @@ def main():
         summary['error'] = '%s: %s' % (type(error).__name__, error)
         raise
     finally:
+        run_filter = 'label=%s=%s' % (RUN_LABEL, run.token)
+        # None means the query itself failed (recorded in cleanup_errors).
+        leftovers = run.best_effort('leftover-query', 'containers', lambda: call(
+            ['docker', 'ps', '-aq', '--filter', run_filter], check=False).stdout.split())
+        leftover_networks = run.best_effort('leftover-query', 'networks', lambda: call(
+            ['docker', 'network', 'ls', '-q', '--filter', run_filter], check=False).stdout.split())
+        # Fail closed: any cleanup error, unavailable leftover query or leftover
+        # object makes the run non-passing. The checks' own outcome and any run
+        # error are kept separately.
+        cleanup_clean = (not run.cleanup_errors and not run.local_leftovers
+                         and leftovers == [] and leftover_networks == [])
+        summary['checks_outcome'] = summary['outcome']
+        if not cleanup_clean:
+            summary['outcome'] = 'fail'
+        summary['cleanup'] = {'pass': cleanup_clean, 'errors': run.cleanup_errors,
+                              'local_leftovers': run.local_leftovers, 'leftover_containers': leftovers,
+                              'leftover_networks': leftover_networks}
         summary['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         (args.work_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
-        leftovers = call(['docker', 'ps', '-aq', '--filter', 'label=task'], check=False).stdout.split()
-        leftovers = [c for c in leftovers if 'sdkrust-accept' in call(['docker', 'inspect', '--format', '{{.Name}}', c], check=False).stdout]
         print(json.dumps({'outcome': summary['outcome'], 'error': summary.get('error'),
-                          'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers}))
+                          'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers,
+                          'leftover_networks': leftover_networks, 'local_leftovers': run.local_leftovers,
+                          'cleanup_errors': run.cleanup_errors}))
     sys.exit(0 if summary['outcome'] == 'pass' else 1)
 
 
