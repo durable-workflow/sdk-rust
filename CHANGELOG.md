@@ -8,6 +8,17 @@
   unchanged and nothing is re-emitted. A reused prefix always precedes any
   cancellation delivered on the successor, so these events never change
   `remaining()`.
+- Correction to 4.11.1: its cancellation-clock fixture was not a valid redrive
+  successor history. It had no redrive `WorkflowStarted` and placed the
+  cancellation before the reused prefix. Reused times are not observable through
+  `remaining()` in valid redrive histories: the reused prefix always precedes
+  the successor's cancellation delivery, so `remaining()` is the cleanup
+  deadline less that delivery. Preferring `reused_recorded_at` changes no
+  observable result, and 4.11.1 does not restore any cleanup budget. Reused
+  activity completions, fired timers, side effects and version markers are now
+  qualified with valid Workflow 2.19 successor histories. The 4.11.1 markers and
+  timer fixtures also lacked the redrive envelope. Each redrive fixture must
+  either pass the successor check or be one of the named 4.11.1 exceptions.
 
 ## 4.11.1
 
