@@ -61,9 +61,33 @@ For a crate published before the map existed (≤ 4.10.2), pass
 `--baselines absent --baselines-control Cargo.toml`.
 
 The run writes `<work-dir>/summary.json` with every identity, receipt and
-history result, plus per-container logs under `cells/*/logs`. It removes its
-containers and network and the fixture credentials, even when it fails. The
-exit code is 0 only when every check passes.
+history result, plus per-container logs under `cells/*/logs`. The exit code is
+0 only when every check passes.
+
+### Containers and cleanup
+
+`--container-prefix` (default `sdkrust`, must match `^[a-z][a-z0-9-]{0,30}$`)
+names the owner, for example `general` or `security`. Every container and
+network is named `<prefix>-accept-<utc stamp>-<16 hex token>-…`, where the
+token is fresh per invocation. Each carries the labels `task`,
+`dev.durable-workflow.acceptance.run=<token>` and
+`dev.durable-workflow.acceptance.owner=<prefix>`.
+
+While the client is alive, it removes its containers, its network and the
+fixture credentials, even when the run fails. It first inspects each object
+and removes it by ID only when the run label equals this invocation's token, so
+a name collision or a failed create never removes anyone else's container.
+`leftover_containers` lists containers that still carry this run's token.
+
+The fixture build container uses `--rm`, `--init`, `--cpus` equal to `--jobs`,
+`--memory 3g`, `--pids-limit 1024`, `no-new-privileges` and `--cap-drop ALL`.
+It uses the default network for the crates.io fetch and mounts only the fixture
+directory. Its build runs under `timeout --kill-after=60s 3300s` inside the
+container, so the container exits and the daemon removes it even if the client
+is killed. The client's own timeout is 3600 seconds. Cell containers are
+detached and have no in-container wall bound, so if the client is killed
+mid-cell, remove them with
+`docker rm -f $(docker ps -aq --filter label=dev.durable-workflow.acceptance.run=<token>)`.
 
 The cell runtime uses SQLite, normal native maintenance, and one shared
 fixture token for all roles. It does not cover role-only authentication, other

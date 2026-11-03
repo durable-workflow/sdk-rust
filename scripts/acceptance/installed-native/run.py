@@ -12,6 +12,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
@@ -27,6 +28,66 @@ BINARY = 'installed-native-lifecycle'
 # Same pins as docker-compose.local-activities.yml, for the PHP Server baseline.
 MYSQL_IMAGE = 'mysql@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
 REDIS_IMAGE = 'redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499'
+# Every container and network this harness creates carries these labels. The run
+# label holds a per-invocation random token; forced cleanup removes only objects
+# that carry this invocation's token.
+RUN_LABEL = 'dev.durable-workflow.acceptance.run'
+OWNER_LABEL = 'dev.durable-workflow.acceptance.owner'
+PREFIX_PATTERN = re.compile(r'[a-z][a-z0-9-]{0,30}')
+# The fixture build is bounded inside its container, independent of this client:
+# timeout sends TERM at BUILD_WALL_SECONDS and KILL BUILD_KILL_AFTER_SECONDS
+# later, the container exits, and the daemon's --rm removes it. The client
+# timeout is longer, so the in-container bound always fires first.
+BUILD_WALL_SECONDS = 3300
+BUILD_KILL_AFTER_SECONDS = 60
+BUILD_CLIENT_TIMEOUT = 3600
+
+
+def container_prefix(value):
+    if not PREFIX_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError('%r must match ^%s$' % (value, PREFIX_PATTERN.pattern))
+    return value
+
+
+class Run:
+    """One harness invocation: owner prefix plus a high-entropy token."""
+
+    def __init__(self, prefix, stamp=None, token=None):
+        self.prefix = container_prefix(prefix)
+        self.stamp = stamp or datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dt%H%M%S')
+        self.token = token or secrets.token_hex(8)
+        self.base = '%s-accept-%s-%s' % (self.prefix, self.stamp, self.token)
+
+    def labels(self, task):
+        return ['--label', 'task=' + task, '--label', '%s=%s' % (RUN_LABEL, self.token),
+                '--label', '%s=%s' % (OWNER_LABEL, self.prefix)]
+
+
+def owned_id(kind, name, run):
+    """The ID of container/network `name` if it carries this run's token, else None."""
+    result = call(['docker', kind, 'inspect', '--format',
+                   '{{.Id}} {{index .%s "%s"}}' % ('Config.Labels' if kind == 'container' else 'Labels', RUN_LABEL),
+                   name], check=False)
+    fields = result.stdout.split() if result.returncode == 0 else []
+    if len(fields) == 2 and fields[1] == run.token:
+        return fields[0]
+    return None
+
+
+def remove_owned_container(name, run):
+    # Remove by ID, never by name, and only after the run token matched: a name
+    # collision or a failed create must not touch another owner's container.
+    container_id = owned_id('container', name, run)
+    if container_id:
+        call(['docker', 'rm', '-f', container_id], check=False)
+    return container_id
+
+
+def remove_owned_network(name, run):
+    network_id = owned_id('network', name, run)
+    if network_id:
+        call(['docker', 'network', 'rm', network_id], check=False)
+    return network_id
 
 
 def parse_args():
@@ -54,6 +115,9 @@ def parse_args():
     parser.add_argument('--cells', default='lifecycle,deadline')
     parser.add_argument('--jobs', type=int, default=2, help='cargo build jobs (lab machines: keep at 2)')
     parser.add_argument('--work-dir', type=pathlib.Path, required=True, help='new directory for build output and evidence')
+    parser.add_argument('--container-prefix', type=container_prefix, default='sdkrust',
+                        help='owner prefix for container, network and task names, e.g. general or security '
+                             '(^%s$)' % PREFIX_PATTERN.pattern)
     return parser.parse_args()
 
 
@@ -103,26 +167,29 @@ def server_identity(args):
             'image': by_manifest, 'image_by_index': by_index, 'labels': labels}
 
 
-def build_fixture(args, fixture):
+def build_fixture(args, fixture, run):
     shutil.copytree(HERE / 'fixture' / 'src', fixture / 'src')
     template = (HERE / 'fixture' / 'Cargo.toml.in').read_text()
     (fixture / 'Cargo.toml').write_text(template.replace('@CRATE_VERSION@', args.crate_version))
     call(['docker', 'pull', args.rust_image], timeout=1800)
-    # Bounded like every other harness container: named, --init, CPU/RAM/PID
-    # caps. It keeps the default network only for the crates.io fetch.
-    name = 'sdkrust-accept-build-%s' % datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dt%H%M%S')
-    command = ['docker', 'run', '--rm', '--init', '--name', name, '--label', 'task=' + name,
-               '--cpus', str(max(1, args.jobs)), '--memory', '3g', '--pids-limit', '1024',
-               '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
-               '--user', '%d:%d' % (os.getuid(), os.getgid()),
-               '-v', '%s:/work' % fixture, '-w', '/work', '-e', 'CARGO_HOME=/work/.cargo',
-               '-e', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback', args.rust_image, 'sh', '-c',
-               'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs]
+    # Bounded like every other harness container: --init, CPU/RAM/PID caps and an
+    # in-container wall bound. It keeps the default network only for the
+    # crates.io fetch and mounts only the fixture directory.
+    name = run.base + '-build'
+    command = (['docker', 'run', '--rm', '--init', '--name', name] + run.labels(name) +
+               ['--cpus', str(max(1, args.jobs)), '--memory', '3g', '--pids-limit', '1024',
+                '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+                '--user', '%d:%d' % (os.getuid(), os.getgid()),
+                '-v', '%s:/work' % fixture, '-w', '/work', '-e', 'CARGO_HOME=/work/.cargo',
+                '-e', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback', args.rust_image,
+                'timeout', '--kill-after=%ds' % BUILD_KILL_AFTER_SECONDS, '%ds' % BUILD_WALL_SECONDS, 'sh', '-c',
+                'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs])
     try:
-        build = call(command, timeout=3600)
+        build = call(command, timeout=BUILD_CLIENT_TIMEOUT)
     finally:
-        # --rm cannot fire if the client is killed or times out mid-build.
-        call(['docker', 'rm', '-f', name], check=False)
+        # Covers a client-side timeout or error while this process is alive. If
+        # the client dies, the in-container timeout ends the build and --rm fires.
+        remove_owned_container(name, run)
     (fixture / 'build.stdout').write_text(build.stdout)
     (fixture / 'build.stderr').write_text(build.stderr)
     return {'rust_image': image_identity(args.rust_image), 'toolchain': build.stdout.strip().splitlines()[:2],
@@ -183,16 +250,16 @@ def crate_provenance(args, fixture):
 
 
 class Cell:
-    def __init__(self, args, name, root, server, fixture, stamp):
-        self.args, self.name, self.server, self.fixture = args, name, server, fixture
+    def __init__(self, args, name, root, server, fixture, run):
+        self.args, self.name, self.server, self.fixture, self.harness_run = args, name, server, fixture, run
         self.dir = root / 'cells' / name
         self.state = self.dir / 'state'
-        self.task = 'sdkrust-accept-%s-%s' % (stamp, name)
+        self.task = '%s-%s' % (run.base, name)
         self.containers = []
 
     def start(self, role, image, command, user=None, env=None, alias=None, mounts=()):
         name = '%s-%s' % (self.task, role)
-        line = ['docker', 'run', '-d', '--init', '--read-only', '--name', name, '--label', 'task=' + self.task,
+        line = ['docker', 'run', '-d', '--init', '--read-only', '--name', name] + self.harness_run.labels(self.task) + [
                 '--user', user or '%d:%d' % (os.getuid(), os.getgid()), '--cpus', '1', '--memory', '1g',
                 '--pids-limit', '256', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
                 '--network', self.task, '--tmpfs', '/tmp:mode=1777,size=64m',
@@ -212,8 +279,8 @@ class Cell:
     def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None):
         """Start a PHP Server process-set container (writable root, as in its compose file)."""
         name = '%s-%s' % (self.task, role)
-        line = ['docker', 'run', '-d', '--name', name, '--label', 'task=' + self.task, '--network', self.task,
-                '--memory', '1g', '--cpus', '1']
+        line = ['docker', 'run', '-d', '--name', name] + self.harness_run.labels(self.task) + [
+                '--network', self.task, '--memory', '1g', '--cpus', '1']
         if user:
             line += ['--user', user]
         if alias:
@@ -268,7 +335,7 @@ class Cell:
         credentials.write_text(json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
         credentials.chmod(0o644)
         binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
-        call(['docker', 'network', 'create', '--internal', '--label', 'task=' + self.task, self.task])
+        call(['docker', 'network', 'create', '--internal'] + self.harness_run.labels(self.task) + [self.task])
         try:
             if self.args.runtime == 'php':
                 self.start_php(token)
@@ -317,8 +384,8 @@ class Cell:
                 (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_text(out.stdout)
                 (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
             for name in reversed(self.containers):
-                call(['docker', 'rm', '-f', name], check=False)
-            call(['docker', 'network', 'rm', self.task], check=False)
+                remove_owned_container(name, self.harness_run)
+            remove_owned_network(self.task, self.harness_run)
             credentials.unlink(missing_ok=True)
             for sub in ['database', 'storage']:
                 shutil.rmtree(self.state / sub, ignore_errors=True)
@@ -329,7 +396,7 @@ def main():
     if args.work_dir.exists():
         raise SystemExit('work dir %s already exists; use a new one' % args.work_dir)
     args.work_dir.mkdir(parents=True)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dt%H%M%S')
+    run = Run(args.container_prefix)
     summary = {'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'outcome': 'fail',
                'harness_commit': call(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], check=False).stdout.strip()}
     try:
@@ -345,12 +412,12 @@ def main():
                                 'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
         else:
             fixture = args.work_dir / 'fixture'
-            summary['build'] = build_fixture(args, fixture)
+            summary['build'] = build_fixture(args, fixture, run)
         summary['crate'] = crate_provenance(args, fixture)
         # Pull first: inspect alone fails on a clean host that never fetched the helper image.
         call(['docker', 'pull', '--quiet', args.python_image], timeout=600)
         summary['python_image'] = image_identity(args.python_image)
-        summary['cells'] = {name: Cell(args, name, args.work_dir, summary['server'], fixture, stamp).run()
+        summary['cells'] = {name: Cell(args, name, args.work_dir, summary['server'], fixture, run).run()
                             for name in args.cells.split(',')}
         passed = (summary['crate']['baselines']['pass']
                   and summary.get('baselines_control', {'pass': True})['pass']
@@ -362,8 +429,7 @@ def main():
     finally:
         summary['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         (args.work_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
-        leftovers = call(['docker', 'ps', '-aq', '--filter', 'label=task'], check=False).stdout.split()
-        leftovers = [c for c in leftovers if 'sdkrust-accept' in call(['docker', 'inspect', '--format', '{{.Name}}', c], check=False).stdout]
+        leftovers = call(['docker', 'ps', '-aq', '--filter', 'label=%s=%s' % (RUN_LABEL, run.token)], check=False).stdout.split()
         print(json.dumps({'outcome': summary['outcome'], 'error': summary.get('error'),
                           'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers}))
     sys.exit(0 if summary['outcome'] == 'pass' else 1)
