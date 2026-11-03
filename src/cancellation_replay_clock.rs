@@ -153,10 +153,13 @@ impl ReplayClock {
 
     fn observe(&mut self, event: Option<&HistoryEvent>) {
         let time = event.and_then(|event| {
+            // A step that redrive reused from an earlier run keeps the time it
+            // was first recorded, as Core's RedriveReplayClock does.
             event
-                .raw
-                .get("timestamp")
-                .filter(|value| !value.is_null())
+                .payload
+                .get("reused_recorded_at")
+                .filter(|value| value.is_string())
+                .or_else(|| event.raw.get("timestamp").filter(|value| !value.is_null()))
                 .or_else(|| event.raw.get("recorded_at"))
                 .and_then(Value::as_str)
                 .and_then(|time| DateTime::parse_from_rfc3339(time).ok())

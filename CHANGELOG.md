@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Advance the cooperative cancellation clock to a redrive-reused step's
+  original `reused_recorded_at` time instead of the time the successor run
+  copied it, matching Core, so `remaining()` after reused activity completions
+  or fired timers no longer loses the redrive delay from its cleanup budget.
+  Cover cold replay of redriven histories with reused side effects, version
+  markers and fired timers in the replay regression corpus.
+
 - Keep managed workers polling when a workflow-task completion or failure
   report receives a non-recorded `task_not_leased` receipt for the same task,
   attempt and run, for example after the run was cancelled. Recorded,
