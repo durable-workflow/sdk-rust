@@ -1367,7 +1367,10 @@ async fn recorded_activity_failure_boundary_is_stable_across_cold_workers() {
     assert_eq!(first, restarted);
 }
 
-async fn redrive_reused_fixture_replays_identically_on_cold_workers(name: &str) -> Value {
+async fn redrive_reused_fixture_replays_identically_on_cold_workers(
+    name: &str,
+    reused_event_types: &[&str],
+) -> Value {
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/replay-regressions")
         .join(name);
@@ -1375,15 +1378,23 @@ async fn redrive_reused_fixture_replays_identically_on_cold_workers(name: &str) 
         &fs::read_to_string(&fixture_path).expect("read checked-in redrive reuse fixture"),
     )
     .expect("parse checked-in redrive reuse fixture");
-    assert!(
-        fixture["history"]
-            .as_array()
-            .expect("redrive reuse fixture history")
+    let history = fixture["history"]
+        .as_array()
+        .expect("redrive reuse fixture history");
+    for event_type in reused_event_types {
+        let events: Vec<&Value> = history
             .iter()
-            .any(|event| event["payload"]["reused_from_run_id"].is_string()
-                && event["payload"]["reused_recorded_at"].is_string()),
-        "{name} must carry the redrive reuse keys"
-    );
+            .filter(|event| event["event_type"] == *event_type)
+            .collect();
+        assert!(!events.is_empty(), "{name} must contain {event_type}");
+        for event in events {
+            assert!(
+                event["payload"]["reused_from_run_id"].is_string()
+                    && event["payload"]["reused_recorded_at"].is_string(),
+                "{name} {event_type} must carry both redrive reuse keys"
+            );
+        }
+    }
 
     let first = execute_fixture_delivery(&fixture, "delivery-a")
         .await
@@ -1399,6 +1410,7 @@ async fn redrive_reused_fixture_replays_identically_on_cold_workers(name: &str) 
 async fn redriven_reused_side_effect_and_version_marker_replay_without_reexecution() {
     let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
         "redrive-reused-markers-clock.json",
+        &["SideEffectRecorded", "VersionMarkerRecorded"],
     )
     .await;
     assert_eq!(observed["side_effect_callback_calls"], json!(0));
@@ -1409,6 +1421,7 @@ async fn redriven_reused_side_effect_and_version_marker_replay_without_reexecuti
 async fn redriven_reused_fired_timer_does_not_wait_again() {
     let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
         "redrive-reused-timer-clock.json",
+        &["ActivityCompleted", "TimerFired"],
     )
     .await;
     let commands = observed["command_sequence"].as_array().expect("commands");
