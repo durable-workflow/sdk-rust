@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
+import subprocess
 import sys
 import tarfile
 import tomllib
@@ -279,6 +282,7 @@ def verify_archive(
     ):
         raise ReleasePackageError("expected VCS commit must be a full lowercase SHA-1")
 
+    _archive_files(archive_path, f"{source['package']}-{source['package_version']}")
     try:
         archive_bytes = archive_path.read_bytes()
         with tarfile.open(archive_path, "r:*") as archive:
@@ -430,11 +434,11 @@ def confined_file(
     return Path(resolved)
 
 
-def approval_record_path(root: str, version: str) -> Path:
-    """The reviewed record for `version`: <root>/<version>.json, strictly confined."""
+def approval_record_relative(version: str) -> str:
+    """release/approved-packages/<version>.json, only for a strict SemVer version."""
     if not isinstance(version, str) or not STRICT_SEMVER.fullmatch(version):
         raise ReleasePackageError("approval version is not a strict SemVer version")
-    return confined_file(root, f"{version}.json")
+    return f"{APPROVAL_DIRECTORY}/{version}.json"
 
 
 def _safe_member_name(name: object) -> bool:
@@ -455,41 +459,148 @@ def file_list_sha256(files: list[str]) -> str:
     return sha256("".join(f"{name}\n" for name in sorted(files)).encode())
 
 
-def load_approval(path: Path) -> tuple[dict[str, Any], str]:
-    """Read one reviewed approved-package record and check its shape."""
+ACCEPTANCE_FIELDS = {
+    "summary_sha256", "harness_commit", "server_index", "executed_manifest", "platform",
+    "expected_server_version", "expected_revision", "expected_release_tag",
+    "cluster_versions", "cells", "finished_at", "outcome",
+}
+ACCEPTANCE_CELLS = ["deadline", "lifecycle"]
+ACCEPTANCE_PLATFORMS = {"linux/amd64", "linux/arm64"}
+# <registry>/<repository>@sha256:<digest>, lowercase, as `docker manifest` names it.
+IMAGE_DIGEST_PATTERN = re.compile(
+    r"^((?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]+)?/)?"
+    r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*)"
+    r"@sha256:[0-9a-f]{64}$",
+    re.ASCII,
+)
+APPROVAL_DIRECTORY = "release/approved-packages"
+
+
+def _is_text(value: object, pattern: re.Pattern[str] | None = None) -> bool:
+    return isinstance(value, str) and (pattern is None or pattern.fullmatch(value) is not None)
+
+
+def _valid_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
     try:
-        raw = path.read_bytes()
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def validate_acceptance(acceptance: object) -> None:
+    """The receipt of one passing exact-Server lifecycle and deadline run.
+
+    The inner schema is exact (no missing or extra keys, strict types) and its
+    relationships are bound: one image repository for index and executed
+    manifest, tag equal to the expected Server version, every cell reporting
+    that version, both cells, a supported platform and a valid completion time.
+    """
+    if not isinstance(acceptance, dict) or set(acceptance) != ACCEPTANCE_FIELDS:
+        raise ReleasePackageError("approval acceptance receipt has missing or unexpected fields")
+    index = IMAGE_DIGEST_PATTERN.fullmatch(acceptance["server_index"]) if _is_text(acceptance["server_index"]) else None
+    executed = (IMAGE_DIGEST_PATTERN.fullmatch(acceptance["executed_manifest"])
+                if _is_text(acceptance["executed_manifest"]) else None)
+    version = acceptance["expected_server_version"]
+    checks = {
+        "summary_sha256": _is_text(acceptance["summary_sha256"], SHA256_PATTERN),
+        "harness_commit": _is_text(acceptance["harness_commit"], COMMIT_PATTERN),
+        "expected_revision": _is_text(acceptance["expected_revision"], COMMIT_PATTERN),
+        "server_index": index is not None,
+        "executed_manifest": executed is not None and index is not None and executed.group(1) == index.group(1),
+        "platform": _is_text(acceptance["platform"]) and acceptance["platform"] in ACCEPTANCE_PLATFORMS,
+        "expected_server_version": _is_text(version, STRICT_SEMVER),
+        "expected_release_tag": _is_text(acceptance["expected_release_tag"]) and acceptance["expected_release_tag"] == version,
+        "cluster_versions": isinstance(acceptance["cluster_versions"], list) and acceptance["cluster_versions"] == [version],
+        "cells": isinstance(acceptance["cells"], list) and acceptance["cells"] == ACCEPTANCE_CELLS,
+        "finished_at": _valid_timestamp(acceptance["finished_at"]),
+        "outcome": _is_text(acceptance["outcome"]) and acceptance["outcome"] == "pass",
+    }
+    failed = sorted(field for field, ok in checks.items() if not ok)
+    if failed:
+        raise ReleasePackageError(f"approval acceptance receipt is invalid: {', '.join(failed)}")
+
+
+def parse_approval(raw: bytes) -> tuple[dict[str, Any], str]:
+    """Parse one reviewed approved-package record and check its exact shape."""
+    try:
         approval = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise ReleasePackageError(f"could not read approved package record: {error}") from error
     if not isinstance(approval, dict) or set(approval) != APPROVAL_FIELDS:
         raise ReleasePackageError("approved package record has unexpected fields")
     files = approval["files"]
-    acceptance = approval["acceptance"]
     if (
         approval["schema"] != APPROVAL_SCHEMA
-        or not isinstance(approval["package"], str)
-        or not isinstance(approval["version"], str)
-        or not STRICT_SEMVER.fullmatch(approval["version"])
-        or not isinstance(approval["commit"], str)
-        or not COMMIT_PATTERN.fullmatch(approval["commit"])
-        or not isinstance(approval["crate_sha256"], str)
-        or not SHA256_PATTERN.fullmatch(approval["crate_sha256"])
-        or not isinstance(approval["cargo_version"], str)
-        or not CARGO_VERSION_PATTERN.fullmatch(approval["cargo_version"])
+        or not _is_text(approval["package"])
+        or not _is_text(approval["version"], STRICT_SEMVER)
+        or not _is_text(approval["commit"], COMMIT_PATTERN)
+        or not _is_text(approval["crate_sha256"], SHA256_PATTERN)
+        or not _is_text(approval["cargo_version"], CARGO_VERSION_PATTERN)
         or not isinstance(files, list)
         or not files
         or not all(_safe_member_name(name) for name in files)
         or files != sorted(set(files))
         or approval["file_list_sha256"] != file_list_sha256(files)
-        or not isinstance(acceptance, dict)
-        or not isinstance(acceptance.get("summary_sha256"), str)
-        or not SHA256_PATTERN.fullmatch(acceptance["summary_sha256"])
-        or not isinstance(acceptance.get("server_index"), str)
-        or not acceptance["server_index"]
     ):
         raise ReleasePackageError("approved package record is malformed")
+    validate_acceptance(approval["acceptance"])
     return approval, sha256(raw)
+
+
+def _read_regular_no_follow(path: Path) -> bytes:
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ReleasePackageError("approved package record is not a regular file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise ReleasePackageError(f"could not open approved package record: {error.strerror}") from error
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ReleasePackageError("approved package record is not a regular file")
+        return handle.read()
+
+
+def load_approval(path: Path) -> tuple[dict[str, Any], str]:
+    """Read (without following links) and parse one approved-package record."""
+    return parse_approval(_read_regular_no_follow(path))
+
+
+def _git(repository: str, *arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", repository, *arguments], capture_output=True, check=False, timeout=60,
+    )
+    if result.returncode:
+        raise ReleasePackageError(f"git {arguments[0]} failed in the approvals repository")
+    return result.stdout
+
+
+def read_approval_record(repository: str, version: str) -> tuple[bytes, str]:
+    """The reviewed record for `version` from the maintained-tooling checkout.
+
+    Its path is always release/approved-packages/<version>.json, built only
+    after `version` passes strict SemVer. The worktree file must be a regular
+    file reached without any symbolic link (lstat + O_NOFOLLOW), confined to
+    the repository, and byte-identical to a regular (mode 100644) blob tracked
+    at exactly that path in the checked-out commit.
+    """
+    relative = approval_record_relative(version)
+    path = confined_file(repository, relative)
+    content = _read_regular_no_follow(path)
+    listing = _git(repository, "ls-tree", "-z", "--full-tree", "HEAD", "--", relative)
+    entries = [entry for entry in listing.split(b"\0") if entry]
+    if len(entries) != 1:
+        raise ReleasePackageError("approved package record is not tracked at its exact path")
+    meta, _, tracked_path = entries[0].partition(b"\t")
+    fields = meta.split()
+    if (tracked_path != relative.encode() or len(fields) != 3
+            or fields[0] != b"100644" or fields[1] != b"blob"):
+        raise ReleasePackageError("approved package record is not a tracked regular file at its exact path")
+    if _git(repository, "cat-file", "blob", fields[2].decode("ascii")) != content:
+        raise ReleasePackageError("approved package record differs from its tracked content")
+    return content, relative
 
 
 def _archive_files(archive_path: Path, root: str) -> list[str]:
@@ -501,9 +612,13 @@ def _archive_files(archive_path: Path, root: str) -> list[str]:
         raise ReleasePackageError(f"could not inspect crate archive: {error}") from error
     names = []
     for member in members:
-        if not member.isfile() or not member.name.startswith(prefix):
+        # Each member independently: a regular file (no symlink or hardlink)
+        # under the exact <name>-<version>/ prefix, with a canonical relative
+        # POSIX path (no absolute form, empty, '.', '..', backslash or NUL).
+        relative = member.name[len(prefix):] if member.name.startswith(prefix) else None
+        if not member.isfile() or relative is None or not _safe_member_name(relative):
             raise ReleasePackageError(f"crate member {member.name!r} is not a regular package file")
-        names.append(member.name[len(prefix):])
+        names.append(relative)
     if len(names) != len(set(names)):
         raise ReleasePackageError("crate archive repeats a member")
     return sorted(names)
@@ -514,12 +629,12 @@ def verify_approved_archive(
     manifest: Path,
     changelog: Path,
     expected_vcs_commit: str,
-    approval_path: Path,
+    approval_record: bytes,
     cargo_version: str | None = None,
 ) -> dict[str, Any]:
     """Require an archive to be exactly the approved pre-publication package."""
     identity = verify_archive(archive_path, manifest, changelog, expected_vcs_commit)
-    approval, approval_sha256 = load_approval(approval_path)
+    approval, approval_sha256 = parse_approval(approval_record)
     if approval["package"] != identity["package"]:
         raise ReleasePackageError("approved package name differs from the release manifest")
     if approval["version"] != identity["package_version"]:
@@ -551,6 +666,7 @@ def verify_approved_archive(
         "file_list_sha256": approval["file_list_sha256"],
         "acceptance_summary_sha256": approval["acceptance"]["summary_sha256"],
         "server_index": approval["acceptance"]["server_index"],
+        "server_version": approval["acceptance"]["expected_server_version"],
     }
     return identity
 
@@ -560,7 +676,7 @@ def _validate_notes_arguments(
 ) -> None:
     if any((arguments.archive, arguments.expected_vcs_commit,
             arguments.expected_archive_sha256, arguments.restore_missing_lockfile,
-            arguments.approval_root, arguments.archive_root, arguments.cargo_version,
+            arguments.approval_repository, arguments.archive_root, arguments.cargo_version,
             arguments.check_paths)):
         parser.error("--release-notes cannot be combined with archive verification")
     if (arguments.manifest != Path(SOURCE_MANIFEST)
@@ -575,25 +691,25 @@ def _validate_mode_arguments(
     if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
         parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
     if arguments.check_paths and any((
-        arguments.archive, arguments.archive_root, arguments.approval_root,
+        arguments.archive, arguments.archive_root, arguments.approval_repository,
         arguments.expected_vcs_commit, arguments.restore_missing_lockfile, arguments.cargo_version,
     )):
         parser.error("--check-paths takes only --source-root, --manifest and --changelog")
     if (arguments.archive is None) != (arguments.archive_root is None):
         parser.error("--archive and --archive-root must be given together")
-    if arguments.cargo_version is not None and arguments.approval_root is None:
-        parser.error("--cargo-version requires --approval-root")
-    if arguments.approval_root is not None and (
+    if arguments.cargo_version is not None and arguments.approval_repository is None:
+        parser.error("--cargo-version requires --approval-repository")
+    if arguments.approval_repository is not None and (
         arguments.archive is None or arguments.expected_vcs_commit is None
         or arguments.restore_missing_lockfile
     ):
-        parser.error("--approval-root requires --archive and --expected-vcs-commit only")
+        parser.error("--approval-repository requires --archive and --expected-vcs-commit only")
 
 
 def _run(arguments: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[str, Any]:
     # Every file named on the command line is confined to an explicit root
     # before it is opened: the checkout (--source-root), the package directory
-    # (--archive-root) or the reviewed approvals directory (--approval-root).
+    # (--archive-root) or the reviewed approvals directory (--approval-repository).
     source_root = confined_root(arguments.source_root)
     manifest = confined_file(source_root, arguments.manifest)
     changelog = confined_file(source_root, arguments.changelog)
@@ -615,14 +731,16 @@ def _run(arguments: argparse.Namespace, parser: argparse.ArgumentParser) -> dict
         if arguments.expected_vcs_commit is not None:
             parser.error("--expected-vcs-commit requires --archive")
         return {"schema": SCHEMA, "version": 1, **verify_source(manifest, changelog)}
-    if arguments.approval_root is not None:
-        approval = approval_record_path(
-            confined_root(arguments.approval_root), str(load_package(manifest)["version"])
+    if arguments.approval_repository is not None:
+        record, relative = read_approval_record(
+            confined_root(arguments.approval_repository), str(load_package(manifest)["version"])
         )
-        return verify_approved_archive(
+        identity = verify_approved_archive(
             archive, manifest, changelog, arguments.expected_vcs_commit,
-            approval, arguments.cargo_version,
+            record, arguments.cargo_version,
         )
+        identity["approval"]["record_path"] = relative
+        return identity
     return verify_archive(archive, manifest, changelog, arguments.expected_vcs_commit)
 
 
@@ -640,11 +758,12 @@ def main() -> int:
     parser.add_argument("--check-paths", action="store_true",
                         help="only confine --manifest and --changelog to --source-root")
     parser.add_argument(
-        "--approval-root",
-        help="reviewed approvals directory; requires --archive to equal <version>.json in it",
+        "--approval-repository",
+        help="maintained-tooling checkout; requires --archive to equal its tracked "
+             "release/approved-packages/<version>.json",
     )
     parser.add_argument(
-        "--cargo-version", help="with --approval-root: the packaging Cargo release (X.Y.Z)",
+        "--cargo-version", help="with --approval-repository: the packaging Cargo release (X.Y.Z)",
     )
     parser.add_argument(
         "--release-notes", metavar="VERSION",

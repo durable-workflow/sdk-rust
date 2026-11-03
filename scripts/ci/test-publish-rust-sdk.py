@@ -35,6 +35,23 @@ SERVER_WORKER_PROTOCOLS = ">=1.19,<2.0"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 TOOLING_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
 CHECKSUM = "a" * 64
+REAL_GIT = shutil.which("git")
+APPROVAL_RELATIVE = f"release/approved-packages/{PACKAGE_VERSION}.json"
+# The exact receipt approval_candidate() emits for a passing 3.0.5 run.
+ACCEPTANCE = {
+    "summary_sha256": "c" * 64,
+    "harness_commit": "e" * 40,
+    "server_index": "ghcr.io/durable-workflow/server@sha256:" + "d" * 64,
+    "executed_manifest": "ghcr.io/durable-workflow/server@sha256:" + "f" * 64,
+    "platform": "linux/arm64",
+    "expected_server_version": "3.0.5",
+    "expected_revision": "b" * 40,
+    "expected_release_tag": "3.0.5",
+    "cluster_versions": ["3.0.5"],
+    "cells": ["deadline", "lifecycle"],
+    "finished_at": "2026-11-03T23:00:00+00:00",
+    "outcome": "pass",
+}
 
 
 class PublishRustSdkContractTest(unittest.TestCase):
@@ -45,6 +62,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.bin_dir = self.temp / "bin"
         self.bin_dir.mkdir()
         self.evidence = self.temp / "evidence.json"
+        self.tooling = self.temp / "tooling"
+        self.tooling.mkdir()
+        self._tooling_git("init", "--quiet")
         self._write_mock_commands()
 
     def _write_executable(self, name: str, source: str) -> None:
@@ -154,7 +174,11 @@ class PublishRustSdkContractTest(unittest.TestCase):
             import sys
 
             command = sys.argv[1]
-            if command == "-C":
+            approvals = os.environ.get("MOCK_APPROVAL_REPOSITORY")
+            if command == "-C" and approvals and os.path.realpath(sys.argv[2]) == os.path.realpath(approvals):
+                # The approvals checkout is a real repository.
+                os.execv(os.environ["MOCK_REAL_GIT"], ["git", *sys.argv[1:]])
+            elif command == "-C":
                 print(os.environ["MOCK_TOOLING_COMMIT"])
             elif command == "check-ignore":
                 raise SystemExit(0 if os.environ.get("MOCK_IGNORED_LOCKFILE") else 1)
@@ -235,7 +259,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 "RELEASE_TAG": PACKAGE_VERSION,
                 "RUST_SDK_MANIFEST_PATH": os.path.relpath(manifest, cwd),
                 "RUST_SDK_RELEASE_EVIDENCE_PATH": str(self.evidence),
-                "RUST_SDK_APPROVED_PACKAGE_DIR": str(self.temp / "approved"),
+                "RUST_SDK_APPROVED_PACKAGE_REPOSITORY": str(self.tooling),
+                "MOCK_APPROVAL_REPOSITORY": str(self.tooling),
+                "MOCK_REAL_GIT": REAL_GIT,
                 "MOCK_PUBLISH_MARKER": str(self.temp / "published-marker"),
             }
         )
@@ -254,9 +280,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         if approval is not None:
             record = self._approval(registry_archive)
             record.update(approval)
-            path = Path(env["RUST_SDK_APPROVED_PACKAGE_DIR"]) / f"{PACKAGE_VERSION}.json"
-            path.parent.mkdir(exist_ok=True)
-            path.write_text(json.dumps(record), encoding="utf-8")
+            self._commit_approval(json.dumps(record).encode())
         if registry_changelog is not None:
             # crates.io serves different (self-consistent) bytes than were approved.
             changed = self.temp / "changed-registry"
@@ -278,6 +302,24 @@ class PublishRustSdkContractTest(unittest.TestCase):
             check=False,
         )
 
+    def _tooling_git(self, *arguments: str) -> None:
+        subprocess.run(
+            [REAL_GIT, "-C", str(self.tooling), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", *arguments],
+            check=True, capture_output=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+
+    def _commit_approval(self, content: bytes, relative: str = APPROVAL_RELATIVE) -> Path:
+        path = self.tooling / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            path.unlink()
+        path.write_bytes(content)
+        self._tooling_git("add", "--", relative)
+        self._tooling_git("commit", "--quiet", "--allow-empty", "-m", "approve")
+        return path
+
     @staticmethod
     def _approval(archive: Path) -> dict[str, object]:
         root = f"durable-workflow-{PACKAGE_VERSION}/"
@@ -292,7 +334,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
             "cargo_version": "1.86.0",
             "files": files,
             "file_list_sha256": hashlib.sha256("".join(f"{name}\n" for name in files).encode()).hexdigest(),
-            "acceptance": {"summary_sha256": "c" * 64, "server_index": "ghcr.io/durable-workflow/server@sha256:" + "d" * 64},
+            "acceptance": dict(ACCEPTANCE),
         }
 
     def _evidence(self) -> dict[str, object]:
@@ -323,7 +365,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertFalse(self._published())
         self.assertEqual("approved_package_required", self._evidence()["reason"])
         result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token",
-                                            "RUST_SDK_APPROVED_PACKAGE_DIR": ""})
+                                            "RUST_SDK_APPROVED_PACKAGE_REPOSITORY": ""})
         self.assertNotEqual(0, result.returncode)
         self.assertFalse(self._published())
 
@@ -443,21 +485,91 @@ class PublishRustSdkContractTest(unittest.TestCase):
                                cwd=source, approval={})
         self.assertEqual(0, result.returncode, result.stderr)
 
-    def test_symlinked_approval_record_is_refused(self) -> None:
-        outside = self.temp / "forged.json"
+    def _approved_record(self) -> bytes:
+        """Publish once with a valid record, then reset the registry state."""
         result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
                                approval={})
         self.assertEqual(0, result.returncode, result.stderr)
-        record = self.temp / "approved" / f"{PACKAGE_VERSION}.json"
-        outside.write_bytes(record.read_bytes())
-        record.unlink()
-        record.symlink_to(outside)
         (self.temp / "published-marker").unlink()
-        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"})
+        return (self.tooling / APPROVAL_RELATIVE).read_bytes()
+
+    def _publish_new(self) -> subprocess.CompletedProcess[str]:
+        return self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"})
+
+    def test_approval_record_must_be_the_tracked_regular_file(self) -> None:
+        record = self._approved_record()
+        path = self.tooling / APPROVAL_RELATIVE
+        outside = self.temp / "forged.json"
+        outside.write_bytes(record)
+
+        def external_symlink() -> None:
+            path.unlink()
+            path.symlink_to(outside)
+
+        def tracked_symlink() -> None:
+            path.unlink()
+            path.symlink_to(outside)
+            self._tooling_git("add", "--", APPROVAL_RELATIVE)
+            self._tooling_git("commit", "--quiet", "-m", "symlink")
+
+        def symlinked_directory() -> None:
+            directory = self.tooling / "release" / "approved-packages"
+            shutil.move(directory, self.temp / "elsewhere")
+            directory.symlink_to(self.temp / "elsewhere", target_is_directory=True)
+
+        def untracked_copy() -> None:
+            self._tooling_git("rm", "--quiet", "--cached", "--", APPROVAL_RELATIVE)
+            self._tooling_git("commit", "--quiet", "-m", "untrack")
+
+        def edited_worktree() -> None:
+            path.write_bytes(record.replace(b'"outcome": "pass"', b'"outcome": "pass" '))
+
+        for label, mutate, message in (
+            ("external symlink", external_symlink, "symbolic link"),
+            ("tracked symlink", tracked_symlink, "symbolic link"),
+            ("symlinked directory", symlinked_directory, "symbolic link"),
+            ("untracked record", untracked_copy, "not tracked at its exact path"),
+            ("worktree differs from tracked blob", edited_worktree, "differs from its tracked content"),
+        ):
+            with self.subTest(label=label):
+                mutate()
+                result = self._publish_new()
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(self._published())
+                self.assertEqual("approved_package_mismatch", self._evidence()["reason"])
+                self.assertIn(message, result.stderr)
+                # Restore the tracked regular record for the next case.
+                if (self.tooling / "release" / "approved-packages").is_symlink():
+                    (self.tooling / "release" / "approved-packages").unlink()
+                    shutil.move(self.temp / "elsewhere", self.tooling / "release" / "approved-packages")
+                self._commit_approval(record)
+
+    def test_record_tracked_at_a_wrong_path_is_not_an_approval(self) -> None:
+        record = self._approved_record()
+        self._tooling_git("rm", "--quiet", "--", APPROVAL_RELATIVE)
+        for relative in ("release/approved-packages/4.11.0.json", f"release/{PACKAGE_VERSION}.json",
+                         f"release/approved-packages/nested/{PACKAGE_VERSION}.json",
+                         f"approved-packages/{PACKAGE_VERSION}.json"):
+            self._commit_approval(record, relative)
+        result = self._publish_new()
         self.assertNotEqual(0, result.returncode)
         self.assertFalse(self._published())
-        self.assertEqual("approved_package_mismatch", self._evidence()["reason"])
-        self.assertIn("symbolic link", result.stderr)
+        self.assertEqual("approved_package_required", self._evidence()["reason"])
+
+    def test_truncated_or_fabricated_acceptance_receipt_refuses_to_publish(self) -> None:
+        cases = {"empty receipt": {}, "receipt without outcome": {k: v for k, v in ACCEPTANCE.items() if k != "outcome"},
+                 "failed receipt": {**ACCEPTANCE, "outcome": "fail"},
+                 "other Server": {**ACCEPTANCE, "cluster_versions": ["3.0.4"]}}
+        for label, acceptance in cases.items():
+            with self.subTest(label=label):
+                result = self._publish(
+                    environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                    approval={"acceptance": acceptance},
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(self._published())
+                self.assertEqual("approved_package_mismatch", self._evidence()["reason"])
+                self.assertIn("acceptance receipt", result.stderr)
 
     def test_symlinked_evidence_path_is_refused(self) -> None:
         target = self.temp / "elsewhere.json"
@@ -475,12 +587,12 @@ class PublishRustSdkContractTest(unittest.TestCase):
     def test_release_workflow_supplies_the_reviewed_approval_record(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
-            "RUST_SDK_APPROVED_PACKAGE_DIR: ${{ github.workspace }}/release-tools/release/approved-packages",
+            "RUST_SDK_APPROVED_PACKAGE_REPOSITORY: ${{ github.workspace }}/release-tools",
             workflow,
         )
         # The record comes from maintained tooling (main), never the tagged source.
         self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
-        self.assertLess(workflow.index("Resolve exact release identity"), workflow.index("RUST_SDK_APPROVED_PACKAGE_DIR"))
+        self.assertLess(workflow.index("Resolve exact release identity"), workflow.index("RUST_SDK_APPROVED_PACKAGE_REPOSITORY"))
         self.assertNotIn("/release/", MANIFEST.read_text(encoding="utf-8").split("include = ", 1)[1].split("\n", 1)[0])
 
     def _manifest_with(self, old: str, new: str) -> Path:

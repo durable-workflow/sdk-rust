@@ -121,7 +121,7 @@ jobs:
           RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
           # Reviewed record of the pre-publication package that passed installed-native
           # acceptance, committed to main (the maintained tooling), never the tagged source.
-          RUST_SDK_APPROVED_PACKAGE_DIR: ${{ github.workspace }}/release-tools/release/approved-packages
+          RUST_SDK_APPROVED_PACKAGE_REPOSITORY: ${{ github.workspace }}/release-tools
         run: ../release-tools/scripts/ci/publish-rust-sdk.sh
 
       - name: Create the source GitHub Release

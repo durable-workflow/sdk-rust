@@ -52,6 +52,8 @@ CRATES_IO_SOURCE = 'registry+https://github.com/rust-lang/crates.io-index'
 GENERATED_PACKAGE_FILES = ('.cargo_vcs_info.json', 'Cargo.toml')
 REQUIRED_PACKAGE_FILES = ('.cargo_vcs_info.json', 'Cargo.toml', 'Cargo.toml.orig', 'Cargo.lock')
 APPROVAL_SCHEMA = 'durable-workflow.rust-sdk.approved-package/v1'
+APPROVAL_CELLS = ['deadline', 'lifecycle']
+APPROVAL_PLATFORMS = ('linux/amd64', 'linux/arm64')
 COMMIT_PATTERN = re.compile(r'[0-9a-f]{40}')
 SHA256_PATTERN = re.compile(r'[0-9a-f]{64}')
 # Semantic Versioning 2.0.0, ASCII only. The version names files and directories
@@ -242,6 +244,18 @@ def parse_args(argv=None):
         absent = [option for option, value in required if not value]
         if absent:
             parser.error('--package-from requires %s' % ', '.join(absent))
+        # The approval receipt the release workflow accepts is exactly this shape.
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', args.server_index):
+            parser.error('--package-from requires --server-index sha256:<64 hex>')
+        if args.platform not in APPROVAL_PLATFORMS:
+            parser.error('--package-from requires --platform in %s' % sorted(APPROVAL_PLATFORMS))
+        if sorted(args.cells.split(',')) != APPROVAL_CELLS:
+            parser.error('--package-from requires --cells lifecycle,deadline')
+        if not COMMIT_PATTERN.fullmatch(args.expect_revision):
+            parser.error('--package-from requires a 40-hex --expect-revision')
+        if not VERSION_PATTERN.fullmatch(args.expect_server_version) or \
+                args.expect_release_tag != args.expect_server_version:
+            parser.error('--package-from requires --expect-release-tag equal to a SemVer --expect-server-version')
         for option, value in (('--fixture-from', args.fixture_from), ('--source-tag', args.source_tag)):
             if value:
                 parser.error('%s cannot be combined with --package-from' % option)
@@ -609,7 +623,8 @@ def approval_candidate(summary, summary_bytes):
                            'expected_release_tag': summary.get('expected_server', {}).get('release_tag'),
                            'cluster_versions': sorted({c.get('cluster_info', {}).get('version') or ''
                                                        for c in summary['cells'].values()}),
-                           'cells': sorted(summary['cells']), 'finished_at': summary['finished_at']}}
+                           'cells': sorted(summary['cells']), 'finished_at': summary['finished_at'],
+                           'outcome': summary['outcome']}}
 
 
 def check_baselines(metadata, mode, expected):

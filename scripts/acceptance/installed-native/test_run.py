@@ -1135,8 +1135,11 @@ class PrePublication(HarnessRun):
         self.assertEqual(sorted(checksum['files']), identity['files'])
 
 
+INDEX = 'sha256:' + '3' * 64
+
+
 class PrePublicationArguments(unittest.TestCase):
-    BASE = ['--server-index', 'sha256:x', '--work-dir', '/tmp/x']
+    BASE = ['--server-index', INDEX, '--work-dir', '/tmp/x']
     PACKAGE = ['--package-from', '/tmp/src', '--package-commit', 'a' * 40, '--expect-version', VERSION,
                '--expect-server-version', '3.0.5', '--expect-revision', 'b' * 40, '--expect-release-tag', '3.0.5']
 
@@ -1147,6 +1150,11 @@ class PrePublicationArguments(unittest.TestCase):
     def test_package_mode_parses(self):
         args = self.parse(self.PACKAGE)
         self.assertEqual((args.package_commit, args.expect_version, args.crate_version), ('a' * 40, VERSION, None))
+
+    def test_server_index_must_be_a_digest_in_package_mode(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            run.parse_args(['--server-index', 'sha256:x', '--work-dir', '/tmp/x'] + self.PACKAGE)
+        self.assertEqual(self.parse(self.PACKAGE + ['--cells', 'deadline,lifecycle']).cells, 'deadline,lifecycle')
 
     def test_invalid_combinations_are_refused(self):
         def without(option):
@@ -1160,7 +1168,13 @@ class PrePublicationArguments(unittest.TestCase):
                       ['--crate-version', '4.11.1', '--expect-package-sha256', 'a' * 64],
                       self.PACKAGE[:3] + ['abc'] + self.PACKAGE[4:],
                       self.PACKAGE + ['--expect-package-sha256', 'A' * 64],
-                      without('--expect-version') + ['--expect-version', 'v4.11.2']):
+                      without('--expect-version') + ['--expect-version', 'v4.11.2'],
+                      # The approval receipt shape the release workflow accepts.
+                      self.PACKAGE + ['--cells', 'lifecycle'], self.PACKAGE + ['--cells', 'lifecycle,deadline,extra'],
+                      self.PACKAGE + ['--platform', 'linux/riscv64'],
+                      without('--expect-release-tag') + ['--expect-release-tag', 'native-3.0.5'],
+                      without('--expect-revision') + ['--expect-revision', 'main'],
+                      without('--expect-server-version') + ['--expect-server-version', 'v3.0.5']):
             with self.subTest(extra=extra), self.assertRaises(SystemExit):
                 self.parse(extra)
 
@@ -1191,7 +1205,7 @@ class PrePublicationOutcome(unittest.TestCase):
             instance.run.side_effect = run_cell
             return instance
         argv = ['run.py'] + PrePublicationArguments.PACKAGE + [
-            '--server-index', 'sha256:x', '--cells', 'lifecycle', '--work-dir', str(work), '--container-prefix', 'general']
+            '--server-index', INDEX, '--cells', 'lifecycle,deadline', '--work-dir', str(work), '--container-prefix', 'general']
         out = io.StringIO()
         server = {'index': 'img@sha256:x', 'executed_manifest': 'img@sha256:y', 'platform': 'linux/arm64'}
         with mock.patch.object(sys, 'argv', argv), mock.patch.object(run, 'call', FakeDocker()), \
@@ -1215,6 +1229,12 @@ class PrePublicationOutcome(unittest.TestCase):
         for key in ('package', 'version', 'commit', 'crate_sha256', 'files', 'file_list_sha256'):
             self.assertEqual(approval[key], self.identity[key])
         self.assertEqual(approval['cargo_version'], '1.86.0')
+        self.assertEqual(sorted(approval['acceptance']), sorted([
+            'summary_sha256', 'harness_commit', 'server_index', 'executed_manifest', 'platform',
+            'expected_server_version', 'expected_revision', 'expected_release_tag', 'cluster_versions',
+            'cells', 'finished_at', 'outcome']))
+        self.assertEqual((approval['acceptance']['outcome'], approval['acceptance']['cells']),
+                         ('pass', ['deadline', 'lifecycle']))
         self.assertEqual(approval['acceptance']['summary_sha256'],
                          hashlib.sha256((work / 'summary.json').read_bytes()).hexdigest())
         self.assertEqual((approval['acceptance']['expected_server_version'], approval['acceptance']['expected_release_tag'],
@@ -1319,6 +1339,11 @@ class PathConfinement(unittest.TestCase):
         tmp = temporary_directory(self)
         commit = make_repo(tmp / 'repo')
         members = packaged_members(commit)
+        hardlink = tarfile.TarInfo('durable-workflow-%s/src/hard.rs' % VERSION)
+        hardlink.type, hardlink.linkname = tarfile.LNKTYPE, 'durable-workflow-%s/Cargo.lock' % VERSION
+        crate = make_crate(members, raw=[(hardlink, None)])
+        with self.assertRaisesRegex(run.PackageError, 'not a regular file'):
+            run.verify_package_archive(crate, VERSION, commit, sorted(members) + ['src/hard.rs'], lambda path: None)
         for name in ('src/a\\..\\b.rs',):
             crate = make_crate(dict(members, **{name: b'x'}))
             with self.subTest(name=name), self.assertRaisesRegex(run.PackageError, 'not a regular file'):

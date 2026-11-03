@@ -10,7 +10,9 @@ These scripts support four public repository checks:
 The release workflow uses the crates.io publishing scripts after an immutable
 tag already exists. A version that is not yet on crates.io is published only
 when `cargo package` of the tag reproduces the reviewed pre-publication record
-`release/approved-packages/<version>.json` exactly. The record must match the
+`release/approved-packages/<version>.json` exactly. That record must be the
+regular file tracked at that path in the maintained-tooling checkout, and its
+acceptance receipt must be complete and passing. The record must match the
 SHA-256, file set, version, VCS commit and Cargo release. After publication, the
 crates.io checksum, the downloaded archive and the tag read back from `origin`
 must still match it. See `scripts/acceptance/installed-native/README.md`

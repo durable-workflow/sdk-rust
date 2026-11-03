@@ -17,7 +17,9 @@ lockfile_source="source_checkout"
 # A reviewed record of the pre-publication package that passed installed-native
 # acceptance (scripts/acceptance/installed-native, --package-from). New versions
 # publish only when the reproduced package is exactly that artifact.
-approved_package_dir="${RUST_SDK_APPROVED_PACKAGE_DIR:-}"
+# The maintained-tooling checkout (main) that tracks the reviewed records at
+# release/approved-packages/<version>.json.
+approved_package_repository="${RUST_SDK_APPROVED_PACKAGE_REPOSITORY:-}"
 approved_package_path=""
 
 for command in cargo curl git jq python3 rustc sha256sum; do
@@ -470,10 +472,19 @@ archive_vcs_dirty="$(jq -r '.archive.vcs_dirty' "$local_identity")"
 changelog_checksum="$(jq -er '.changelog.sha256' "$local_identity")"
 release_entry_checksum="$(jq -er '.changelog.entry_sha256' "$local_identity")"
 
-if [[ -n "$approved_package_dir" ]]; then
-    approved_package_path="${approved_package_dir}/${package_version}.json"
+# package_version is already an exact SemVer here; release_package.py validates
+# it strictly again before naming the record, and reads only a regular,
+# link-free file that equals the blob tracked at that exact path.
+approved_package_path="release/approved-packages/${package_version}.json"
+approval_present="false"
+if [[ -n "$approved_package_repository" ]]; then
+    if [[ -e "$approved_package_repository/$approved_package_path" || \
+          -L "$approved_package_repository/$approved_package_path" ]] || \
+       [[ -n "$(git -C "$approved_package_repository" ls-tree --full-tree HEAD -- "$approved_package_path" 2>/dev/null || true)" ]]; then
+        approval_present="true"
+    fi
 fi
-if [[ -n "$approved_package_path" && ( -e "$approved_package_path" || -L "$approved_package_path" ) ]]; then
+if [[ "$approval_present" == "true" ]]; then
     packaging_cargo="$(cargo -V | awk '{print $2}')"
     local_approval="$tmp_dir/local-approval.json"
     if ! python3 "$script_dir/release_package.py" \
@@ -483,7 +494,7 @@ if [[ -n "$approved_package_path" && ( -e "$approved_package_path" || -L "$appro
         --archive-root "$local_archive_root" \
         --archive "$(basename "$local_archive")" \
         --expected-vcs-commit "$release_commit" \
-        --approval-root "$approved_package_dir" \
+        --approval-repository "$approved_package_repository" \
         --cargo-version "$packaging_cargo" > "$local_approval"; then
         approval_status="reproduction_mismatch"
         write_evidence "failed" "approved_package_mismatch"
@@ -505,7 +516,7 @@ fi
 
 if [[ "$http_status" == "404" && "$approval_status" != "reproduced" ]]; then
     write_evidence "failed" "approved_package_required"
-    printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_DIR)\n' \
+    printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_REPOSITORY)\n' \
         "$package_name" "$package_version" >&2
     exit 1
 fi
@@ -628,7 +639,7 @@ if [[ "$approval_status" == "reproduced" ]]; then
         --archive-root "$tmp_dir" \
         --archive "$(basename "$published_archive")" \
         --expected-vcs-commit "$release_commit" \
-        --approval-root "$approved_package_dir" > "$tmp_dir/published-approval.json"; then
+        --approval-repository "$approved_package_repository" > "$tmp_dir/published-approval.json"; then
         write_evidence "failed" "published_package_differs_from_approved_package"
         printf 'downloaded crate is not the approved pre-publication package\n' >&2
         exit 1

@@ -134,9 +134,31 @@ whose checks and cleanup both pass writes `<work-dir>/approved-package.json`:
   "package": "durable-workflow", "version": "4.11.2", "commit": "<40 hex>",
   "crate_sha256": "<64 hex>", "cargo_version": "1.86.0",
   "files": ["..."], "file_list_sha256": "<64 hex>",
-  "acceptance": {"summary_sha256": "<64 hex>", "server_index": "...", "...": "..."}
+  "acceptance": {
+    "summary_sha256": "<64 hex>", "harness_commit": "<40 hex>",
+    "server_index": "ghcr.io/durable-workflow/server@sha256:<64 hex>",
+    "executed_manifest": "ghcr.io/durable-workflow/server@sha256:<64 hex>",
+    "platform": "linux/arm64", "expected_server_version": "3.0.5",
+    "expected_revision": "<40 hex>", "expected_release_tag": "3.0.5",
+    "cluster_versions": ["3.0.5"], "cells": ["deadline", "lifecycle"],
+    "finished_at": "<ISO 8601 with offset>", "outcome": "pass"
+  }
 }
 ```
+
+Publication accepts only this exact shape: no missing or extra keys at
+either level, and strict types. It also checks how the receipt's fields relate:
+- the index and executed manifest are canonical digests in one repository;
+- the tag equals the expected Server version, and so does every cell's cluster
+  version;
+- the cells are exactly lifecycle and deadline;
+- the platform is `linux/amd64` or `linux/arm64`;
+- the completion time is a valid timestamp with an offset;
+- the outcome is `pass`.
+
+To match, pre-publication mode requires `--server-index sha256:<64 hex>`, a
+supported `--platform`, both cells, a 40-hex `--expect-revision`, and
+`--expect-release-tag` equal to `--expect-server-version`.
 
 A reviewer commits that record unchanged to `main` as
 `release/approved-packages/<version>.json`. `release/` is outside the crate's
@@ -172,13 +194,19 @@ written.
 | Paths the harness writes or reads below the work dir, such as unpacked and vendored members | `--work-dir` | Each is a `/`-separated relative path with no empty, `.`, `..`, NUL or backslash parts and no link at any component. Its canonical result must stay inside the root (`os.path.commonpath`). Files are created with `O_EXCL`/`O_NOFOLLOW`. |
 | `release_package.py --manifest`, `--changelog` | `--source-root` (the release checkout) | Relative, confined |
 | `release_package.py --archive` | `--archive-root` (Cargo's `target/package`, or the publisher's temporary directory) | Relative, confined |
-| Approval record | `--approval-root`, set by the Release workflow as `RUST_SDK_APPROVED_PACKAGE_DIR=$GITHUB_WORKSPACE/release-tools/release/approved-packages` | Always `<version>.json`. The version must match strict Semantic Versioning 2.0.0 before it names a file. The record's own version must match it too, and its file names must be safe relative paths. |
+| Approval record | `--approval-repository`, set by the Release workflow as `RUST_SDK_APPROVED_PACKAGE_REPOSITORY=$GITHUB_WORKSPACE/release-tools` (the maintained-tooling checkout of `main`) | Always `release/approved-packages/<version>.json`. The version must match strict Semantic Versioning 2.0.0 before it names the path. The record is read with `lstat` and `O_NOFOLLOW` and must be a regular file with no link at any component. It must also be byte-identical to a regular (`100644`) blob tracked at exactly that path in the checked-out commit. Its own version must match, and its file names must be canonical relative paths. |
 
 Versions used in harness paths (`--expect-version`) also follow strict
 Semantic Versioning, so a value such as `4.11.2/../../x` is refused.
 
 The publisher also refuses a manifest or changelog outside its working
 directory, and an evidence path that is a link or contains a `..` component.
+
+Every `.crate` member is checked independently, in acceptance and again at
+publication. Each must be a regular file, never a symlink, hardlink or
+directory. Its name must sit under the exact `<name>-<version>/` prefix, as a
+canonical relative POSIX path with no absolute form, empty, `.` or `..`
+component, backslash or NUL. No name may appear twice.
 
 The run writes `<work-dir>/summary.json` with every identity, receipt and
 history result, plus per-container logs under `cells/*/logs`. The exit code is
