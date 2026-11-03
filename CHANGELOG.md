@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Qualify replay of Workflow 2.19 redrive successors that reuse
+  `MemoUpserted`, `SearchAttributesUpserted` or an applied signal wait
+  (`SignalWaitOpened`, `SignalReceived`, `SignalApplied`). Values replay
+  unchanged and nothing is re-emitted. A reused prefix always precedes any
+  cancellation delivered on the successor, so these events never change
+  `remaining()`.
 - Keep managed workers polling when a workflow-task completion or failure
   report receives a non-recorded `run_closed` receipt for the same task,
   attempt and run, for example after the run was cancelled while the report

@@ -7,3 +7,4 @@
 /.rustup/
 /rustup-init
 /rust-sdk-release-evidence.json
+__pycache__/
