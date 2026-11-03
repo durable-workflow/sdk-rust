@@ -354,6 +354,19 @@ jobs:
           archive="target/package/durable-workflow-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])').crate"
           python3 scripts/ci/release_package.py --archive "$archive"
           python3 scripts/ci/verify-fresh-consumer.py package
+      - name: Check that the package is byte-reproducible
+        # Pre-publication approval binds a .crate SHA-256 that the release
+        # workflow must reproduce, so packaging twice must give identical bytes.
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          first="$(sha256sum "target/package/durable-workflow-${version}.crate" | awk '{print $1}')"
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/repackage" cargo package --locked --no-verify
+          second="$(sha256sum "${RUNNER_TEMP}/repackage/package/durable-workflow-${version}.crate" | awk '{print $1}')"
+          printf 'commit %s cargo %s crate %s\n' "$(git rev-parse HEAD)" "$(cargo -V)" "$first"
+          if [[ "$first" != "$second" ]]; then
+            printf 'cargo package is not reproducible: %s != %s\n' "$first" "$second" >&2
+            exit 1
+          fi
       - name: Validate release tooling
         run: |
           bash -n scripts/ci/crates-io-publish-lib.sh scripts/ci/install-release-tooling.sh scripts/ci/publish-rust-sdk.sh scripts/ci/test-crates-io-publish.sh

@@ -14,6 +14,10 @@ release_run_id="${RELEASE_RUN_ID:-}"
 release_run_attempt="${RELEASE_RUN_ATTEMPT:-}"
 release_tooling_commit="$(git -C "$script_dir" rev-parse HEAD)"
 lockfile_source="source_checkout"
+# A reviewed record of the pre-publication package that passed installed-native
+# acceptance (scripts/acceptance/installed-native, --package-from). New versions
+# publish only when the reproduced package is exactly that artifact.
+approved_package_path="${RUST_SDK_APPROVED_PACKAGE_PATH:-}"
 
 for command in cargo curl git jq python3 rustc sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -185,6 +189,11 @@ release_entry_checksum=""
 published_changelog_checksum=""
 published_release_entry_checksum=""
 fresh_consumer_verified="false"
+approval_status="absent"
+approved_checksum=""
+approved_record_sha256=""
+approved_matches_registry="false"
+source_tag_readback_commit=""
 
 write_evidence() {
     local outcome="$1"
@@ -265,6 +274,12 @@ write_evidence() {
         --arg published_changelog_checksum "$published_changelog_checksum" \
         --arg published_release_entry_checksum "$published_release_entry_checksum" \
         --arg fresh_consumer_verified "$fresh_consumer_verified" \
+        --arg approval_status "$approval_status" \
+        --arg approved_package_path "$approved_package_path" \
+        --arg approved_checksum "$approved_checksum" \
+        --arg approved_record_sha256 "$approved_record_sha256" \
+        --arg approved_matches_registry "$approved_matches_registry" \
+        --arg source_tag_readback_commit "$source_tag_readback_commit" \
         --arg outcome "$outcome" \
         --arg reason "$reason" \
         --arg registry_verified "$registry_verified" \
@@ -353,6 +368,17 @@ write_evidence() {
                 commit: $release_tooling_commit,
                 lockfile_source: $lockfile_source
             },
+            approved_package: {
+                status: $approval_status,
+                record_path: $approved_package_path,
+                record_sha256: $approved_record_sha256,
+                crate_sha256: $approved_checksum,
+                registry_matches_approved_package: ($approved_matches_registry == "true")
+            },
+            source_tag_readback: {
+                tag: $release_tag,
+                commit: $source_tag_readback_commit
+            },
             fresh_consumer: {
                 rust_version: $rust_version,
                 exact_dependency: ($package + " = \"=" + $version + "\""),
@@ -424,11 +450,38 @@ archive_vcs_dirty="$(jq -r '.archive.vcs_dirty' "$local_identity")"
 changelog_checksum="$(jq -er '.changelog.sha256' "$local_identity")"
 release_entry_checksum="$(jq -er '.changelog.entry_sha256' "$local_identity")"
 
+if [[ -n "$approved_package_path" && -e "$approved_package_path" ]]; then
+    packaging_cargo="$(cargo -V | awk '{print $2}')"
+    local_approval="$tmp_dir/local-approval.json"
+    if ! python3 "$script_dir/release_package.py" \
+        --manifest "$manifest_path" \
+        --changelog "$changelog_path" \
+        --archive "$local_archive" \
+        --expected-vcs-commit "$release_commit" \
+        --approved-package "$approved_package_path" \
+        --cargo-version "$packaging_cargo" > "$local_approval"; then
+        approval_status="reproduction_mismatch"
+        write_evidence "failed" "approved_package_mismatch"
+        printf 'reproduced package is not the approved pre-publication package; refusing to publish\n' >&2
+        exit 1
+    fi
+    approved_checksum="$(jq -er '.approval.crate_sha256' "$local_approval")"
+    approved_record_sha256="$(jq -er '.approval.record_sha256' "$local_approval")"
+    approval_status="reproduced"
+fi
+
 write_evidence "pending" "checking_public_registry"
 
 if ! http_status="$(crates_io_version_lookup "$version_api" "$version_response" "$user_agent")"; then
     write_evidence "failed" "registry_version_lookup_transient_failure_exhausted"
     printf 'could not reach a conclusive crates.io version API response\n' >&2
+    exit 1
+fi
+
+if [[ "$http_status" == "404" && "$approval_status" != "reproduced" ]]; then
+    write_evidence "failed" "approved_package_required"
+    printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_PATH)\n' \
+        "$package_name" "$package_version" >&2
     exit 1
 fi
 
@@ -505,6 +558,12 @@ if [[ "$download_checksum" != "$published_checksum" ]]; then
     printf 'downloaded crate checksum does not match the crates.io registry checksum\n' >&2
     exit 1
 fi
+if [[ "$approval_status" == "reproduced" && \
+      ( "$published_checksum" != "$approved_checksum" || "$download_checksum" != "$approved_checksum" ) ]]; then
+    write_evidence "failed" "published_checksum_differs_from_approved_package"
+    printf 'crates.io checksum %s differs from the approved package %s\n' "$published_checksum" "$approved_checksum" >&2
+    exit 1
+fi
 if [[ "$local_checksum" != "$published_checksum" ]]; then
     write_evidence "failed" "published_source_archive_mismatch"
     printf 'published crate archive differs from the exact release checkout package\n' >&2
@@ -531,6 +590,38 @@ if [[ "$published_archive_vcs_commit" != "$archive_vcs_commit" || \
       "$published_release_entry_checksum" != "$release_entry_checksum" ]]; then
     write_evidence "failed" "published_package_release_identity_mismatch"
     printf 'downloaded crate release identity differs from the authorized local package\n' >&2
+    exit 1
+fi
+
+if [[ "$approval_status" == "reproduced" ]]; then
+    if ! python3 "$script_dir/release_package.py" \
+        --manifest "$manifest_path" \
+        --changelog "$changelog_path" \
+        --archive "$published_archive" \
+        --expected-vcs-commit "$release_commit" \
+        --approved-package "$approved_package_path" > "$tmp_dir/published-approval.json"; then
+        write_evidence "failed" "published_package_differs_from_approved_package"
+        printf 'downloaded crate is not the approved pre-publication package\n' >&2
+        exit 1
+    fi
+    approved_matches_registry="true"
+fi
+
+# Read the source tag back from the repository: it must still name the release
+# (and approved) commit after publication.
+if ! remote_tag_refs="$(git ls-remote origin "refs/tags/${release_tag}" "refs/tags/${release_tag}^{}")"; then
+    write_evidence "failed" "source_tag_readback_failed"
+    printf 'could not read source tag %s back from origin\n' "$release_tag" >&2
+    exit 1
+fi
+source_tag_readback_commit="$(awk -v ref="refs/tags/${release_tag}^{}" '$2 == ref {print $1}' <<<"$remote_tag_refs")"
+if [[ -z "$source_tag_readback_commit" ]]; then
+    source_tag_readback_commit="$(awk -v ref="refs/tags/${release_tag}" '$2 == ref {print $1}' <<<"$remote_tag_refs")"
+fi
+if [[ "$source_tag_readback_commit" != "$release_commit" ]]; then
+    write_evidence "failed" "source_tag_readback_mismatch"
+    printf 'source tag %s reads back as %s, not release commit %s\n' \
+        "$release_tag" "${source_tag_readback_commit:-<missing>}" "$release_commit" >&2
     exit 1
 fi
 

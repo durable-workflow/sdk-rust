@@ -4,6 +4,8 @@ Every Docker call is stubbed; nothing here starts a container.
 """
 import argparse
 import contextlib
+import gzip
+import hashlib
 import io
 import json
 import os
@@ -12,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -47,7 +50,8 @@ class FakeDocker:
         self.containers = dict(containers or {})
         self.networks = dict(networks or {})
         self.faults = dict(faults or {})
-        self.created = created  # side effect of a successful build, e.g. writing the binary
+        # Side effect of a foreground run, e.g. writing the binary; a returned string is its stdout.
+        self.created = created
         self.raise_on = dict(raise_on or {})
 
     def __call__(self, command, timeout=120, check=True, **kwargs):
@@ -73,9 +77,10 @@ class FakeDocker:
             result = self._create(self.containers, name, command, timeout, check)
             if '--rm' in command and '-d' not in command:
                 self.containers.pop(name)  # a foreground --rm container exits and is removed
-            if self.created:
-                self.created(command)
-            return done(command, stdout=BUILD_STDOUT if '-d' not in command else 'cid\n') if result is None else result
+            stdout = self.created(command) if self.created else None
+            if stdout is None:
+                stdout = BUILD_STDOUT if '-d' not in command else 'cid\n'
+            return done(command, stdout=stdout) if result is None else result
         if command[:3] == ['docker', 'network', 'create']:
             result = self._create(self.networks, command[-1], command, timeout, check)
             return done(command) if result is None else result
@@ -766,6 +771,466 @@ class MainOutcome(unittest.TestCase):
         self.assertEqual(summary['error'], 'RuntimeError: cell failed')
         self.assertEqual(summary['cleanup']['errors'],
                          [{'step': 'network-cleanup', 'object': 'n', 'error': 'TimeoutExpired'}])
+
+
+# ---------------------------------------------------------------------------
+# Pre-publication mode: exact packaging, byte binding and offline installation.
+# ---------------------------------------------------------------------------
+
+VERSION = '4.11.2'
+CARGO_V = 'cargo 1.86.0 (adf9b6ad1 2025-02-28)'
+SOURCE_MANIFEST = ('[package]\nname = "durable-workflow"\nversion = "%s"\nedition = "2021"\n\n'
+                   '[package.metadata.durable-workflow]\nproduct-train = "%s"\n'
+                   'supported-server-versions = "2.0.0"\n'
+                   'supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.2" }\n') % (VERSION, VERSION)
+SOURCE_FILES = {'Cargo.toml': SOURCE_MANIFEST.encode(), 'Cargo.lock': b'version = 4\n',
+                'CHANGELOG.md': b'# Changelog\n\n## 4.11.2\n\n- Fix.\n', 'src/lib.rs': b'pub fn settle() {}\n',
+                'schema/contract.json': b'{"v": 1}\n'}
+REAL_CALL = run.call
+
+
+def git_env():
+    return dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t',
+                GIT_COMMITTER_EMAIL='t@example.invalid', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+
+
+def make_repo(path, files=None):
+    path.mkdir(parents=True)
+    for name, content in (files or SOURCE_FILES).items():
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_bytes(content)
+    for command in (['init', '--quiet'], ['add', '-A'], ['-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'release']):
+        subprocess.run(['git', '-C', str(path)] + command, check=True, env=git_env(), capture_output=True)
+    return subprocess.run(['git', '-C', str(path), 'rev-parse', 'HEAD'], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+def packaged_members(commit, files=None):
+    files = dict(files or SOURCE_FILES)
+    members = {name: content for name, content in files.items() if name != 'Cargo.toml'}
+    members['Cargo.toml.orig'] = files['Cargo.toml']
+    members['Cargo.toml'] = b'# normalized by cargo\n' + files['Cargo.toml']
+    members['.cargo_vcs_info.json'] = json.dumps({'git': {'sha1': commit}, 'path_in_vcs': ''}).encode()
+    return members
+
+
+def make_crate(members, version=VERSION, raw=()):
+    """A gzip tar like Cargo's; `raw` adds (TarInfo, bytes-or-None) members verbatim."""
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0) as compressed, \
+            tarfile.open(fileobj=compressed, mode='w') as archive:
+        for name, content in members.items():
+            info = tarfile.TarInfo('durable-workflow-%s/%s' % (version, name))
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+        for info, content in raw:
+            archive.addfile(info, io.BytesIO(content) if content is not None else None)
+    return buffer.getvalue()
+
+
+def hybrid(docker):
+    """git runs for real (temporary repositories); Docker is the stateful fake."""
+    def dispatch(command, timeout=120, check=True, **kwargs):
+        if command[0] == 'git':
+            return REAL_CALL(command, timeout=timeout, check=check, **kwargs)
+        return docker(command, timeout, check, **kwargs)
+    return dispatch
+
+
+def volume(command, destination):
+    """Host side of the `-v host:destination[:ro]` mount."""
+    for index, value in enumerate(command):
+        if command[index - 1] == '-v' and value.split(':')[1] == destination:
+            return pathlib.Path(value.split(':')[0])
+    raise AssertionError('no %s mount in %r' % (destination, command))
+
+
+class FakeCargo:
+    """What the three Cargo containers write, with knobs for each counterfactual."""
+
+    def __init__(self, commit, members=None, crate_name=None, cargo=CARGO_V, listing=None, lock=None,
+                 vendor_foreign=False, tamper_install=None, crate=None):
+        self.commit, self.cargo = commit, cargo
+        self.members = members if members is not None else packaged_members(commit)
+        self.crate = crate
+        self.crate_name = crate_name or 'durable-workflow-%s.crate' % VERSION
+        self.listing = listing
+        self.lock, self.vendor_foreign, self.tamper_install = lock, vendor_foreign, tamper_install
+
+    def crate_bytes(self):
+        return self.crate if self.crate is not None else make_crate(self.members)
+
+    def __call__(self, command):
+        name = command[command.index('--name') + 1]
+        if name.endswith('-package'):
+            out = volume(command, '/out')
+            (out / 'target' / 'package').mkdir(parents=True)
+            (out / 'target' / 'package' / self.crate_name).write_bytes(self.crate_bytes())
+            listing = self.listing if self.listing is not None else sorted(self.members)
+            (out / 'package.list').write_text(''.join(line + '\n' for line in listing))
+            return self.cargo + '\n'
+        work = volume(command, '/work')
+        if name.endswith('-resolve'):
+            (work / 'Cargo.lock').write_text('version = 4\n')
+            (work / 'vendor' / 'serde_json-1.0.0').mkdir(parents=True)
+            if self.vendor_foreign:
+                (work / 'vendor' / ('durable-workflow-%s' % VERSION)).mkdir()
+            return self.cargo + '\n'
+        # The offline build: lock what the directory source declares.
+        entry = work / 'vendor' / ('durable-workflow-%s' % VERSION)
+        declared = json.loads((entry / '.cargo-checksum.json').read_text())['package']
+        lock = self.lock or {'name': 'durable-workflow', 'version': VERSION, 'source': run.CRATES_IO_SOURCE,
+                             'checksum': declared}
+        (work / 'Cargo.lock').write_text('version = 4\n\n[[package]]\n' + ''.join(
+            '%s = "%s"\n' % item for item in lock.items()))
+        if self.tamper_install:
+            self.tamper_install(entry)
+        write_binary(work)(command)
+        return 'rustc 1.86.0\n' + self.cargo + '\n'
+
+
+def package_args(checkout, commit, **overrides):
+    values = dict(package_from=checkout, package_commit=commit, expect_version=VERSION, expect_package_sha256=None,
+                  package_cargo_version='1.86.0', rust_image=RUST, jobs=2, baselines='required',
+                  expected_baselines={'2': '2.0.0', '3': '3.0.2'})
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class PrePublication(HarnessRun):
+    def setUp(self):
+        super().setUp()
+        self.checkout = self.tmp / 'release'
+        self.commit = make_repo(self.checkout)
+        self.work = self.tmp / 'work'
+        self.work.mkdir()
+
+    def package(self, cargo=None, **overrides):
+        self.docker = FakeDocker(created=cargo or FakeCargo(self.commit))
+        with mock.patch.object(run, 'call', hybrid(self.docker)):
+            return run.package_release(package_args(self.checkout, self.commit, **overrides), self.work, self.run)
+
+    def install(self, cargo=None):
+        cargo = cargo or FakeCargo(self.commit)
+        identity, members = self.package(cargo)
+        fixture = self.work / 'fixture'
+        with mock.patch.object(run, 'call', hybrid(self.docker)):
+            build = run.build_packaged_fixture(package_args(self.checkout, self.commit), fixture, identity, members, self.run)
+            crate = run.packaged_provenance(package_args(self.checkout, self.commit), fixture, identity, members)
+        return identity, build, crate
+
+    def refused(self, pattern, cargo=None, **overrides):
+        with self.assertRaisesRegex(run.PackageError, pattern):
+            self.package(cargo, **overrides)
+
+    def test_exact_clean_commit_is_packaged_bound_and_installed_offline(self):
+        identity, build, crate = self.install()
+        crate_bytes = make_crate(packaged_members(self.commit))
+        digest = hashlib.sha256(crate_bytes).hexdigest()
+        self.assertEqual((identity['commit'], identity['version'], identity['crate_sha256']), (self.commit, VERSION, digest))
+        self.assertEqual(identity['files'], sorted(packaged_members(self.commit)))
+        self.assertEqual(identity['file_list_sha256'], run.file_list_sha256(packaged_members(self.commit)))
+        self.assertEqual(identity['vcs_info'], {'git': {'sha1': self.commit}, 'path_in_vcs': ''})
+        self.assertEqual(identity['cargo_version'], CARGO_V)
+        self.assertEqual((self.work / 'package' / identity['crate_file']).read_bytes(), crate_bytes)
+        self.assertEqual((crate['sha256'], crate['lock_checksum'], crate['lock_source']),
+                         (digest, digest, run.CRATES_IO_SOURCE))
+        self.assertIs(crate['registry_published'], False)
+        self.assertTrue(crate['baselines']['pass'])
+        self.assertEqual(build['network'], 'none')
+        json.dumps(identity)  # evidence is serializable and carries no raw bytes
+        self.assertEqual(self.run.cleanup_errors, [])
+
+    def test_package_container_is_bounded_read_only_and_labelled(self):
+        self.package()
+        [(command, timeout)] = self.docker.runs()
+        name = self.run.base + '-package'
+        image = command.index(RUST)
+        self.assertEqual(command[:image], [
+            'docker', 'run', '--rm', '--init', '--name', name,
+            '--label', 'task=' + name, '--label', 'dev.durable-workflow.acceptance.run=' + TOKEN,
+            '--label', 'dev.durable-workflow.acceptance.owner=general',
+            '--cpus', '2', '--memory', '3g', '--pids-limit', '1024',
+            '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '--user', '%d:%d' % (os.getuid(), os.getgid()),
+            '-v', '%s:/source:ro' % (self.work / 'package-source'), '-v', '%s:/out' % (self.work / 'package-out'),
+            '-w', '/source', '-e', 'CARGO_HOME=/out/.cargo', '-e', 'CARGO_TARGET_DIR=/out/target'])
+        self.assertEqual(command[image + 1:image + 6], ['timeout', '--kill-after=60s', '3300s', 'sh', '-c'])
+        self.assertIn('cargo package --locked --no-verify --list', command[-1])
+        self.assertEqual(timeout, run.BUILD_CLIENT_TIMEOUT)
+
+    def test_resolve_and_offline_build_containers(self):
+        self.install()
+        [package, resolve, build] = [c for c, _ in self.docker.runs()]
+        self.assertNotIn('--network', resolve)
+        self.assertIn('%s:/package:ro' % (self.work / 'package' / ('durable-workflow-' + VERSION)), resolve)
+        self.assertIn('cargo vendor --locked --versioned-dirs vendor', resolve[-1])
+        self.assertEqual(build[build.index('--network') + 1], 'none')
+        self.assertEqual([build[i + 1] for i, a in enumerate(build) if a in ('-v', '--mount')],
+                         ['%s:/work' % (self.work / 'fixture')])
+        self.assertIn('cargo build --locked --offline -j 2', build[-1])
+        fixture = self.work / 'fixture'
+        self.assertNotIn('[patch', (fixture / 'Cargo.toml').read_text())
+        self.assertIn('replace-with = "acceptance-package"', (fixture / '.cargo' / 'config.toml').read_text())
+        for container in (package, resolve, build):
+            self.assertIn('--rm', container)
+            self.assertIn('--init', container)
+
+    # Counterfactuals: each refuses before any lifecycle cell can run.
+
+    def test_dirty_tree_is_refused_before_packaging(self):
+        for change in ('modify', 'untracked'):
+            with self.subTest(change=change):
+                target = self.checkout / ('src/lib.rs' if change == 'modify' else 'notes.txt')
+                original = target.read_bytes() if target.exists() else None
+                target.write_bytes(b'drift\n')
+                try:
+                    self.refused('is not clean')
+                    self.assertEqual(self.docker.runs(), [])
+                finally:
+                    target.write_bytes(original) if original is not None else target.unlink()
+                shutil.rmtree(self.work / 'package-source', ignore_errors=True)
+
+    def test_head_commit_mismatch_is_refused(self):
+        with self.assertRaisesRegex(run.PackageError, 'not requested commit'):
+            self.docker = FakeDocker(created=FakeCargo(self.commit))
+            with mock.patch.object(run, 'call', hybrid(self.docker)):
+                run.package_release(package_args(self.checkout, 'f' * 40), self.work, self.run)
+        self.assertEqual(self.docker.runs(), [])
+
+    def test_source_version_mismatch_is_refused_before_packaging(self):
+        self.refused('declares durable-workflow 4.11.2, expected durable-workflow 4.11.3', expect_version='4.11.3')
+        self.assertEqual(self.docker.runs(), [])
+
+    def test_packaged_manifest_version_mismatch_is_refused(self):
+        members = packaged_members(self.commit)
+        members['Cargo.toml'] = members['Cargo.toml'].replace(b'version = "4.11.2"', b'version = "4.11.1"')
+        self.refused('packaged manifest is durable-workflow 4.11.1', FakeCargo(self.commit, members=members))
+
+    def test_crate_file_name_or_count_mismatch_is_refused(self):
+        self.refused('expected exactly durable-workflow-4.11.2.crate',
+                     FakeCargo(self.commit, crate_name='durable-workflow-4.11.1.crate'))
+
+    def test_vcs_info_mismatch_is_refused(self):
+        for record in ({'git': {'sha1': 'e' * 40}, 'path_in_vcs': ''},
+                       {'git': {'sha1': None}, 'path_in_vcs': ''},
+                       {'git': {'dirty': True}, 'path_in_vcs': ''},
+                       {'path_in_vcs': ''},
+                       {'git': {'sha1': 'COMMIT', 'dirty': True}, 'path_in_vcs': ''},
+                       {'git': {'sha1': 'COMMIT'}, 'path_in_vcs': 'sdk'}):
+            with self.subTest(record=record):
+                members = packaged_members(self.commit)
+                members['.cargo_vcs_info.json'] = json.dumps(record).replace('COMMIT', self.commit).encode()
+                self.refused('does not name clean commit', FakeCargo(self.commit, members=members))
+                shutil.rmtree(self.work)
+                self.work.mkdir()
+
+    def test_one_byte_package_drift_from_the_commit_is_refused(self):
+        for name in ('src/lib.rs', 'schema/contract.json', 'Cargo.lock', 'Cargo.toml.orig', 'CHANGELOG.md'):
+            with self.subTest(name=name):
+                members = packaged_members(self.commit)
+                members[name] = members[name][:-1] + bytes([members[name][-1] ^ 1])
+                self.refused('differ from commit', FakeCargo(self.commit, members=members))
+                shutil.rmtree(self.work)
+                self.work.mkdir()
+
+    def test_extra_or_missing_file_against_cargo_listing_is_refused(self):
+        members = packaged_members(self.commit)
+        extra = dict(members, **{'src/extra.rs': b'// not listed\n'})
+        missing = {k: v for k, v in members.items() if k != 'schema/contract.json'}
+        cases = (('extra', FakeCargo(self.commit, members=extra, listing=sorted(members))),
+                 ('missing', FakeCargo(self.commit, members=missing, listing=sorted(members))),
+                 ('listed-twice', FakeCargo(self.commit, listing=sorted(members) + ['src/lib.rs'])))
+        for label, cargo in cases:
+            with self.subTest(label=label):
+                self.refused('differs from cargo package --list|repeats a path', cargo)
+                shutil.rmtree(self.work)
+                self.work.mkdir()
+
+    def test_extra_file_absent_from_the_commit_is_refused_even_when_listed(self):
+        members = dict(packaged_members(self.commit), **{'src/injected.rs': b'// not in git\n'})
+        self.refused('differ from commit', FakeCargo(self.commit, members=members))
+
+    def test_missing_required_generated_file_is_refused(self):
+        members = {k: v for k, v in packaged_members(self.commit).items() if k != 'Cargo.lock'}
+        self.refused('lacks required files', FakeCargo(self.commit, members=members))
+
+    def test_unsafe_or_duplicate_members_are_refused(self):
+        members = packaged_members(self.commit)
+        link = tarfile.TarInfo('durable-workflow-%s/src/link.rs' % VERSION)
+        link.type, link.linkname = tarfile.SYMTYPE, '/etc/passwd'
+        outside = tarfile.TarInfo('durable-workflow-%s/../escape.rs' % VERSION)
+        outside.size = 1
+        foreign = tarfile.TarInfo('other-1.0.0/src/lib.rs')
+        foreign.size = 1
+        duplicate = tarfile.TarInfo('durable-workflow-%s/src/lib.rs' % VERSION)
+        duplicate.size = len(members['src/lib.rs'])
+        for label, raw in (('symlink', [(link, None)]), ('traversal', [(outside, b'x')]),
+                           ('foreign-root', [(foreign, b'x')]), ('duplicate', [(duplicate, members['src/lib.rs'])])):
+            with self.subTest(label=label):
+                self.refused('not a regular file|more than once',
+                             FakeCargo(self.commit, crate=make_crate(members, raw=raw)))
+                shutil.rmtree(self.work)
+                self.work.mkdir()
+
+    def test_corrupt_archive_is_refused(self):
+        self.refused('could not read the packaged crate', FakeCargo(self.commit, crate=b'not a gzip tar'))
+
+    def test_expected_package_sha256_mismatch_is_refused(self):
+        self.refused('differs from expected', expect_package_sha256='0' * 64)
+        shutil.rmtree(self.work)
+        self.work.mkdir()
+        identity, _ = self.package(expect_package_sha256=hashlib.sha256(
+            make_crate(packaged_members(self.commit))).hexdigest())
+        self.assertEqual(identity['crate_sha256'], hashlib.sha256(make_crate(packaged_members(self.commit))).hexdigest())
+
+    def test_wrong_packaging_cargo_is_refused(self):
+        self.refused('packaging Cargo is', FakeCargo(self.commit, cargo='cargo 1.99.0 (5f94df478 2026-08-27)'))
+
+    def test_package_container_failure_is_cleaned_by_ownership(self):
+        name = self.run.base + '-package'
+        self.docker = FakeDocker(faults={name: 'created-then-timeout'})
+        with mock.patch.object(run, 'call', hybrid(self.docker)), self.assertRaises(subprocess.TimeoutExpired):
+            run.package_release(package_args(self.checkout, self.commit), self.work, self.run)
+        self.assertEqual(self.docker.removals(), [['docker', 'rm', '-f', 'id-' + name]])
+
+    def test_foreign_vendored_package_is_refused(self):
+        with self.assertRaisesRegex(run.PackageError, 'only the packaged bytes'):
+            self.install(FakeCargo(self.commit, vendor_foreign=True))
+
+    def test_lock_that_is_not_the_packaged_crate_is_refused(self):
+        for lock in ({'name': 'durable-workflow', 'version': VERSION, 'source': run.CRATES_IO_SOURCE, 'checksum': '0' * 64},
+                     {'name': 'durable-workflow', 'version': VERSION, 'source': 'path+file:///package'},
+                     {'name': 'durable-workflow', 'version': '4.11.1', 'source': run.CRATES_IO_SOURCE, 'checksum': '0' * 64}):
+            with self.subTest(lock=lock):
+                with self.assertRaises(run.PackageError):
+                    self.install(FakeCargo(self.commit, lock=lock))
+                shutil.rmtree(self.work)
+                self.work.mkdir()
+
+    def test_installed_bytes_that_drift_from_the_package_are_refused(self):
+        def drift(entry):
+            (entry / 'src' / 'lib.rs').write_bytes(b'pub fn other() {}\n')
+
+        def extra(entry):
+            (entry / 'src' / 'extra.rs').write_bytes(b'\n')
+
+        def link(entry):
+            (entry / 'src' / 'lib.rs').unlink()
+            os.symlink(self.checkout / 'src' / 'lib.rs', entry / 'src' / 'lib.rs')
+        for tamper in (drift, extra, link):
+            with self.subTest(tamper=tamper.__name__):
+                with self.assertRaisesRegex(run.PackageError, 'installed package'):
+                    self.install(FakeCargo(self.commit, tamper_install=tamper))
+                shutil.rmtree(self.work)
+                self.work.mkdir()
+
+    def test_directory_source_checksum_is_the_crate_sha256(self):
+        identity, _, _ = self.install()
+        entry = self.work / 'fixture' / 'vendor' / ('durable-workflow-' + VERSION)
+        checksum = json.loads((entry / '.cargo-checksum.json').read_text())
+        self.assertEqual(checksum['package'], identity['crate_sha256'])
+        self.assertEqual(sorted(checksum['files']), identity['files'])
+
+
+class PrePublicationArguments(unittest.TestCase):
+    BASE = ['--server-index', 'sha256:x', '--work-dir', '/tmp/x']
+    PACKAGE = ['--package-from', '/tmp/src', '--package-commit', 'a' * 40, '--expect-version', VERSION,
+               '--expect-server-version', '3.0.5', '--expect-revision', 'b' * 40, '--expect-release-tag', '3.0.5']
+
+    def parse(self, extra):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return run.parse_args(self.BASE + extra)
+
+    def test_package_mode_parses(self):
+        args = self.parse(self.PACKAGE)
+        self.assertEqual((args.package_commit, args.expect_version, args.crate_version), ('a' * 40, VERSION, None))
+
+    def test_invalid_combinations_are_refused(self):
+        def without(option):
+            index = self.PACKAGE.index(option)
+            return self.PACKAGE[:index] + self.PACKAGE[index + 2:]
+        for extra in ([], self.PACKAGE + ['--crate-version', '4.11.1'],
+                      without('--package-commit'), without('--expect-version'), without('--expect-server-version'),
+                      without('--expect-revision'), without('--expect-release-tag'),
+                      self.PACKAGE + ['--fixture-from', '/tmp/f'], self.PACKAGE + ['--source-tag', '4.11.2'],
+                      ['--crate-version', '4.11.1', '--package-commit', 'a' * 40],
+                      ['--crate-version', '4.11.1', '--expect-package-sha256', 'a' * 64],
+                      self.PACKAGE[:3] + ['abc'] + self.PACKAGE[4:],
+                      self.PACKAGE + ['--expect-package-sha256', 'A' * 64],
+                      without('--expect-version') + ['--expect-version', 'v4.11.2']):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                self.parse(extra)
+
+
+class PrePublicationOutcome(unittest.TestCase):
+    """The approval candidate exists only for a fully passing run, and binds the package."""
+
+    def main(self, cell_run=None, tamper_after_cells=False):
+        tmp = temporary_directory(self)
+        work = tmp / 'work'
+        identity = {'mode': 'pre-publication', 'package': 'durable-workflow', 'version': VERSION, 'commit': 'a' * 40,
+                    'crate_file': 'durable-workflow-%s.crate' % VERSION, 'crate_sha256': hashlib.sha256(b'crate').hexdigest(),
+                    'files': ['Cargo.toml'], 'file_list_sha256': run.file_list_sha256(['Cargo.toml']), 'cargo_version': CARGO_V}
+
+        def package_release(args_, work_dir, harness):
+            (work_dir / 'package').mkdir()
+            (work_dir / 'package' / identity['crate_file']).write_bytes(b'crate')
+            return dict(identity), {}
+
+        def cell(args_, name, root, server, fixture_, harness):
+            instance = mock.Mock()
+
+            def run_cell():
+                if tamper_after_cells:
+                    (work / 'package' / identity['crate_file']).write_bytes(b'other')
+                (cell_run or (lambda h: None))(harness)
+                return {'outcome': 'pass', 'cluster_info': {'version': '3.0.5'}}
+            instance.run.side_effect = run_cell
+            return instance
+        argv = ['run.py'] + PrePublicationArguments.PACKAGE + [
+            '--server-index', 'sha256:x', '--cells', 'lifecycle', '--work-dir', str(work), '--container-prefix', 'general']
+        out = io.StringIO()
+        server = {'index': 'img@sha256:x', 'executed_manifest': 'img@sha256:y', 'platform': 'linux/arm64'}
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(run, 'call', FakeDocker()), \
+                mock.patch.object(run, 'server_identity', return_value=server), \
+                mock.patch.object(run, 'package_release', package_release), \
+                mock.patch.object(run, 'build_packaged_fixture', return_value={'network': 'none'}), \
+                mock.patch.object(run, 'packaged_provenance', return_value={'baselines': {'pass': True}}), \
+                mock.patch.object(run, 'crate_provenance') as published, mock.patch.object(run, 'Cell', cell), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exited:
+            run.main()
+        published.assert_not_called()
+        self.identity = identity
+        return exited.exception.code, json.loads(out.getvalue()), work
+
+    def test_passing_run_writes_a_bound_approval_candidate(self):
+        code, receipt, work = self.main()
+        self.assertEqual(code, 0)
+        approval = json.loads((work / 'approved-package.json').read_text())
+        self.assertEqual(receipt['approval_candidate'], str(work / 'approved-package.json'))
+        self.assertEqual(approval['schema'], run.APPROVAL_SCHEMA)
+        for key in ('package', 'version', 'commit', 'crate_sha256', 'files', 'file_list_sha256'):
+            self.assertEqual(approval[key], self.identity[key])
+        self.assertEqual(approval['cargo_version'], '1.86.0')
+        self.assertEqual(approval['acceptance']['summary_sha256'],
+                         hashlib.sha256((work / 'summary.json').read_bytes()).hexdigest())
+        self.assertEqual((approval['acceptance']['expected_server_version'], approval['acceptance']['expected_release_tag'],
+                          approval['acceptance']['platform'], approval['acceptance']['cluster_versions']),
+                         ('3.0.5', '3.0.5', 'linux/arm64', ['3.0.5']))
+        summary = json.loads((work / 'summary.json').read_text())
+        self.assertEqual((summary['mode'], summary['package']['crate_sha256_after_cells']),
+                         ('pre-publication', self.identity['crate_sha256']))
+
+    def test_cleanup_failure_writes_no_approval(self):
+        error = {'step': 'container-remove', 'object': 'x', 'error': 'TimeoutExpired'}
+        code, receipt, work = self.main(cell_run=lambda h: h.cleanup_errors.append(error))
+        self.assertEqual((code, receipt['approval_candidate']), (1, None))
+        self.assertFalse((work / 'approved-package.json').exists())
+
+    def test_package_changed_during_cells_writes_no_approval(self):
+        code, receipt, work = self.main(tamper_after_cells=True)
+        self.assertEqual((code, receipt['outcome'], receipt['approval_candidate']), (1, 'fail', None))
+        self.assertFalse((work / 'approved-package.json').exists())
 
 
 if __name__ == '__main__':

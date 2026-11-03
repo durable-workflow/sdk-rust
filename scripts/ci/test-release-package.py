@@ -14,11 +14,14 @@ import tempfile
 import unittest
 
 from release_package import (
+    APPROVAL_SCHEMA,
     ReleasePackageError,
+    file_list_sha256,
     load_package,
     release_entry,
     render_release_notes,
     restore_missing_lockfile,
+    verify_approved_archive,
     verify_archive,
     verify_source,
 )
@@ -446,6 +449,86 @@ This is an example, not another release.
                     verify_archive(
                         archive, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT
                     )
+
+
+    def approval(self, archive: Path, **changes: object) -> Path:
+        root = f"{self.package['name']}-{self.package['version']}/"
+        with tarfile.open(archive) as crate:
+            files = sorted(member.name.removeprefix(root) for member in crate.getmembers())
+        record = {
+            "schema": APPROVAL_SCHEMA,
+            "package": self.package["name"],
+            "version": self.package["version"],
+            "commit": COMMIT,
+            "crate_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "cargo_version": "1.86.0",
+            "files": files,
+            "file_list_sha256": file_list_sha256(files),
+            "acceptance": {"summary_sha256": "c" * 64, "server_index": "ghcr.io/durable-workflow/server@sha256:" + "d" * 64},
+        }
+        record.update(changes)
+        path = self.root / "approved.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path
+
+    def test_approved_archive_binds_checksum_files_commit_version_and_cargo(self) -> None:
+        archive = self.archive()
+        identity = verify_approved_archive(
+            archive, MANIFEST, CHANGELOG, COMMIT, self.approval(archive), "1.86.0"
+        )
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), identity["approval"]["crate_sha256"])
+        self.assertEqual(COMMIT, identity["approval"]["commit"])
+        self.assertEqual(3, identity["approval"]["file_count"])
+
+    def test_approved_archive_counterfactuals_are_refused(self) -> None:
+        archive = self.archive()
+        files = sorted([".cargo_vcs_info.json", "CHANGELOG.md", "Cargo.lock"])
+        extra = files + ["src/extra.rs"]
+        cases = {
+            "one-byte checksum drift": ({"crate_sha256": "0" * 64}, "SHA-256 differs"),
+            "wrong commit": ({"commit": "f" * 40}, "commit differs"),
+            "wrong version": ({"version": "9.9.9"}, "version differs"),
+            "wrong package": ({"package": "other"}, "name differs"),
+            "extra file": ({"files": sorted(extra), "file_list_sha256": file_list_sha256(extra)}, "file set differs"),
+            "missing file": ({"files": files[1:], "file_list_sha256": file_list_sha256(files[1:])}, "file set differs"),
+            "unsorted files": ({"files": list(reversed(files))}, "malformed"),
+            "list digest drift": ({"file_list_sha256": "0" * 64}, "malformed"),
+            "wrong schema": ({"schema": "other"}, "malformed"),
+            "no acceptance": ({"acceptance": {}}, "malformed"),
+            "extra field": ({"note": "x"}, "unexpected fields"),
+        }
+        for label, (change, message) in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, message):
+                verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, self.approval(archive, **change))
+        with self.assertRaisesRegex(ReleasePackageError, "differs from approved Cargo"):
+            verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, self.approval(archive), "1.99.0")
+        # A one-byte drift in the archive itself, with the approval recorded before it.
+        approval = self.approval(archive)
+        drifted = self.archive(changelog=CHANGELOG.read_bytes(), name="drifted.crate", lockfile=(ROOT / "Cargo.lock").read_bytes() + b"#")
+        with self.assertRaisesRegex(ReleasePackageError, "SHA-256 differs"):
+            verify_approved_archive(drifted, MANIFEST, CHANGELOG, COMMIT, approval)
+        with self.assertRaises(ReleasePackageError):
+            verify_approved_archive(archive, MANIFEST, CHANGELOG, "e" * 40, approval)
+
+    def test_approved_package_cli_requires_archive_and_commit(self) -> None:
+        archive = self.archive()
+        approval = self.approval(archive)
+        script = Path(__file__).with_name("release_package.py")
+        for arguments in (
+            ["--approved-package", str(approval)],
+            ["--approved-package", str(approval), "--archive", str(archive)],
+            ["--archive", str(archive), "--expected-vcs-commit", COMMIT, "--cargo-version", "1.86.0"],
+        ):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True)
+                self.assertEqual(2, result.returncode, result.stderr)
+        result = subprocess.run(
+            [sys.executable, str(script), "--archive", str(archive), "--expected-vcs-commit", COMMIT,
+             "--approved-package", str(approval), "--cargo-version", "1.86.0"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(COMMIT, json.loads(result.stdout)["approval"]["commit"])
 
 
 if __name__ == "__main__":

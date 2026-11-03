@@ -2,8 +2,9 @@
 """Installed-package lifecycle acceptance of the Rust SDK against a native Server image.
 
 Everything runs in disposable local containers on an internal Docker network,
-against one exact Server image index digest and one exact published crate
-version. Nothing here contacts Cloud. See README.md for usage.
+against one exact Server image index digest and either one exact published
+crate version or (pre-publication mode) the exact `cargo package` bytes of one
+clean source commit. Nothing here contacts Cloud. See README.md for usage.
 """
 import argparse
 import datetime
@@ -41,6 +42,23 @@ PREFIX_PATTERN = re.compile(r'[a-z][a-z0-9-]{0,30}')
 BUILD_WALL_SECONDS = 3300
 BUILD_KILL_AFTER_SECONDS = 60
 BUILD_CLIENT_TIMEOUT = 3600
+# Pre-publication mode. The release workflow packages with Rust 1.86.0, and a
+# different Cargo writes different archive bytes, so packaging here must use the
+# same Cargo release.
+PACKAGE_NAME = 'durable-workflow'
+PACKAGE_CARGO_VERSION = '1.86.0'
+CRATES_IO_SOURCE = 'registry+https://github.com/rust-lang/crates.io-index'
+# Files Cargo writes into the archive instead of copying them from the commit.
+GENERATED_PACKAGE_FILES = ('.cargo_vcs_info.json', 'Cargo.toml')
+REQUIRED_PACKAGE_FILES = ('.cargo_vcs_info.json', 'Cargo.toml', 'Cargo.toml.orig', 'Cargo.lock')
+APPROVAL_SCHEMA = 'durable-workflow.rust-sdk.approved-package/v1'
+COMMIT_PATTERN = re.compile(r'[0-9a-f]{40}')
+SHA256_PATTERN = re.compile(r'[0-9a-f]{64}')
+VERSION_PATTERN = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?')
+
+
+class PackageError(RuntimeError):
+    """The locally packaged crate is not exactly the requested clean commit."""
 
 
 def container_prefix(value):
@@ -112,9 +130,39 @@ def remove_owned_network(name, run):
     return network_id
 
 
-def parse_args():
+def full_commit(value):
+    if not COMMIT_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError('%r must be a full lowercase 40-hex commit' % value)
+    return value
+
+
+def exact_sha256(value):
+    if not SHA256_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError('%r must be a lowercase 64-hex SHA-256' % value)
+    return value
+
+
+def exact_version(value):
+    if not VERSION_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError('%r must be an exact SemVer version' % value)
+    return value
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--crate-version', required=True, help='exact published durable-workflow version, e.g. 4.10.3')
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--crate-version', help='exact published durable-workflow version, e.g. 4.10.3')
+    source.add_argument('--package-from', type=pathlib.Path,
+                        help='pre-publication mode: a clean git checkout whose HEAD is --package-commit; '
+                             'the harness packages that commit and installs only the packaged bytes')
+    parser.add_argument('--package-commit', type=full_commit,
+                        help='pre-publication mode: the exact release commit to package (40 hex)')
+    parser.add_argument('--expect-version', type=exact_version,
+                        help='pre-publication mode: required Cargo.toml version of the packaged crate')
+    parser.add_argument('--expect-package-sha256', type=exact_sha256,
+                        help='pre-publication mode: require the packaged .crate to have this SHA-256')
+    parser.add_argument('--package-cargo-version', default=PACKAGE_CARGO_VERSION,
+                        help='pre-publication mode: required `cargo -V` release in --rust-image (the release workflow\'s)')
     parser.add_argument('--server-index', required=True, help='exact image index digest, sha256:...')
     parser.add_argument('--server-image', default='ghcr.io/durable-workflow/server')
     parser.add_argument('--runtime', choices=['native', 'php'], default='native',
@@ -140,7 +188,24 @@ def parse_args():
     parser.add_argument('--container-prefix', type=container_prefix, default='sdkrust',
                         help='owner prefix for container, network and task names, e.g. general or security '
                              '(^%s$)' % PREFIX_PATTERN.pattern)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.package_from:
+        # An approval candidate is only meaningful against one exact Server release.
+        required = (('--package-commit', args.package_commit), ('--expect-version', args.expect_version),
+                    ('--expect-server-version', args.expect_server_version),
+                    ('--expect-revision', args.expect_revision), ('--expect-release-tag', args.expect_release_tag))
+        absent = [option for option, value in required if not value]
+        if absent:
+            parser.error('--package-from requires %s' % ', '.join(absent))
+        for option, value in (('--fixture-from', args.fixture_from), ('--source-tag', args.source_tag)):
+            if value:
+                parser.error('%s cannot be combined with --package-from' % option)
+    else:
+        for option, value in (('--package-commit', args.package_commit), ('--expect-version', args.expect_version),
+                              ('--expect-package-sha256', args.expect_package_sha256)):
+            if value:
+                parser.error('%s requires --package-from' % option)
+    return args
 
 
 def call(command, timeout=120, check=True, **kwargs):
@@ -189,34 +254,309 @@ def server_identity(args):
             'image': by_manifest, 'image_by_index': by_index, 'labels': labels}
 
 
-def build_fixture(args, fixture, run):
-    shutil.copytree(HERE / 'fixture' / 'src', fixture / 'src')
-    template = (HERE / 'fixture' / 'Cargo.toml.in').read_text()
-    (fixture / 'Cargo.toml').write_text(template.replace('@CRATE_VERSION@', args.crate_version))
-    call(['docker', 'pull', args.rust_image], timeout=1800)
-    # Bounded like every other harness container: --init, CPU/RAM/PID caps and an
-    # in-container wall bound. It keeps the default network only for the
-    # crates.io fetch and mounts only the fixture directory.
-    name = run.base + '-build'
+FIXTURE_ENV = ['CARGO_HOME=/work/.cargo', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback']
+
+
+def bounded_cargo(args, run, role, volumes, env, script, workdir='/work', network=None):
+    """Run one foreground Cargo step in a bounded, labelled, self-removing container.
+
+    Bounded like every other harness container: --init, CPU/RAM/PID caps, no
+    capabilities and an in-container wall bound. `network` None keeps the
+    default network (registry fetches); 'none' runs fully offline.
+    """
+    name = '%s-%s' % (run.base, role)
     command = (['docker', 'run', '--rm', '--init', '--name', name] + run.labels(name) +
                ['--cpus', str(max(1, args.jobs)), '--memory', '3g', '--pids-limit', '1024',
                 '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
-                '--user', '%d:%d' % (os.getuid(), os.getgid()),
-                '-v', '%s:/work' % fixture, '-w', '/work', '-e', 'CARGO_HOME=/work/.cargo',
-                '-e', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback', args.rust_image,
-                'timeout', '--kill-after=%ds' % BUILD_KILL_AFTER_SECONDS, '%ds' % BUILD_WALL_SECONDS, 'sh', '-c',
-                'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs])
+                '--user', '%d:%d' % (os.getuid(), os.getgid())])
+    if network:
+        command += ['--network', network]
+    for volume in volumes:
+        command += ['-v', volume]
+    command += ['-w', workdir]
+    for value in env:
+        command += ['-e', value]
+    command += [args.rust_image, 'timeout', '--kill-after=%ds' % BUILD_KILL_AFTER_SECONDS,
+                '%ds' % BUILD_WALL_SECONDS, 'sh', '-c', script]
     try:
-        build = call(command, timeout=BUILD_CLIENT_TIMEOUT)
+        return call(command, timeout=BUILD_CLIENT_TIMEOUT)
     finally:
         # Covers a client-side timeout or error while this process is alive. If
-        # the client dies, the in-container timeout ends the build and --rm fires.
-        # A cleanup failure is recorded and never replaces the build's own error.
-        run.best_effort('build-cleanup', name, remove_owned_container, name, run)
+        # the client dies, the in-container timeout ends the step and --rm fires.
+        # A cleanup failure is recorded and never replaces the step's own error.
+        run.best_effort('%s-cleanup' % role, name, remove_owned_container, name, run)
+
+
+def fixture_manifest(version):
+    return (HERE / 'fixture' / 'Cargo.toml.in').read_text().replace('@CRATE_VERSION@', version)
+
+
+def build_fixture(args, fixture, run):
+    shutil.copytree(HERE / 'fixture' / 'src', fixture / 'src')
+    (fixture / 'Cargo.toml').write_text(fixture_manifest(args.crate_version))
+    call(['docker', 'pull', args.rust_image], timeout=1800)
+    # The default network is kept only for the crates.io fetch; only the fixture
+    # directory is mounted.
+    build = bounded_cargo(args, run, 'build', ['%s:/work' % fixture], FIXTURE_ENV,
+                          'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs)
     (fixture / 'build.stdout').write_text(build.stdout)
     (fixture / 'build.stderr').write_text(build.stderr)
     return {'rust_image': image_identity(args.rust_image), 'toolchain': build.stdout.strip().splitlines()[:2],
             'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
+
+
+# ---------------------------------------------------------------------------
+# Pre-publication mode: package one clean commit, bind its bytes, and install
+# only those bytes into the fixture as a checksummed crates.io replacement.
+# ---------------------------------------------------------------------------
+
+def git(path, *arguments, **kwargs):
+    return call(['git', '-C', str(path)] + list(arguments), **kwargs)
+
+
+def require_clean_checkout(path, commit):
+    """The checkout's HEAD must be exactly `commit` and its tree fully clean."""
+    head = git(path, 'rev-parse', '--verify', 'HEAD^{commit}', check=False)
+    if head.returncode or head.stdout.strip() != commit:
+        raise PackageError('checkout %s HEAD is %r, not requested commit %s' % (path, head.stdout.strip(), commit))
+    status = git(path, 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none', check=False)
+    if status.returncode or status.stdout.strip():
+        raise PackageError('checkout %s is not clean (%d changed or untracked paths)'
+                           % (path, len(status.stdout.splitlines())))
+
+
+def clone_exact_commit(checkout, commit, destination):
+    """Copy exactly `commit` into a fresh, self-contained repository.
+
+    A linked worktree's .git points outside itself, so the packaging container
+    could not read it, and Cargo would silently omit .cargo_vcs_info.json.
+    """
+    require_clean_checkout(checkout, commit)
+    git(destination.parent, 'init', '--quiet', str(destination))
+    git(destination, 'fetch', '--quiet', '--no-tags', '--no-recurse-submodules', str(checkout),
+        '+HEAD:refs/heads/acceptance-package', timeout=600)
+    git(destination, 'checkout', '--quiet', '--detach', commit)
+    require_clean_checkout(destination, commit)
+
+
+def file_list_sha256(files):
+    return hashlib.sha256(''.join(name + '\n' for name in sorted(files)).encode()).hexdigest()
+
+
+def verify_package_archive(crate_bytes, version, commit, listed, git_blob):
+    """Check a .crate against its source commit and `cargo package --list`.
+
+    Returns {relative path: bytes}. Every member must be a regular file under
+    `<name>-<version>/`; the member set must equal the listing exactly; the VCS
+    record must name the clean commit; the generated manifest must carry the
+    version; every other file must be byte-identical to the commit's blob.
+    """
+    prefix = '%s-%s/' % (PACKAGE_NAME, version)
+    members = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(crate_bytes), mode='r:gz') as archive:
+            for member in archive.getmembers():
+                relative = member.name.removeprefix(prefix)
+                parts = relative.split('/')
+                if (not member.name.startswith(prefix) or not member.isfile() or not relative
+                        or any(part in ('', '.', '..') for part in parts)):
+                    raise PackageError('crate member %r is not a regular file under %s' % (member.name, prefix))
+                if relative in members:
+                    raise PackageError('crate member %r appears more than once' % relative)
+                members[relative] = archive.extractfile(member).read()
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise PackageError('could not read the packaged crate: %s' % type(error).__name__) from error
+    listed = list(listed)
+    if len(set(listed)) != len(listed):
+        raise PackageError('cargo package --list repeats a path')
+    missing, extra = sorted(set(listed) - set(members)), sorted(set(members) - set(listed))
+    if missing or extra:
+        raise PackageError('crate file set differs from cargo package --list: missing %s, extra %s'
+                           % (missing[:10], extra[:10]))
+    absent = [name for name in REQUIRED_PACKAGE_FILES if name not in members]
+    if absent:
+        raise PackageError('crate lacks required files %s' % absent)
+    try:
+        vcs = json.loads(members['.cargo_vcs_info.json'])
+        manifest = tomllib.loads(members['Cargo.toml'].decode())
+    except (ValueError, UnicodeError) as error:
+        raise PackageError('crate VCS record or manifest is unreadable: %s' % type(error).__name__) from error
+    git_record = vcs.get('git') if isinstance(vcs, dict) else None
+    if (not isinstance(git_record, dict) or git_record.get('sha1') != commit
+            or git_record.get('dirty', False) is not False or vcs.get('path_in_vcs') != ''):
+        raise PackageError('crate VCS record %r does not name clean commit %s' % (vcs, commit))
+    package = manifest.get('package', {})
+    if package.get('name') != PACKAGE_NAME or package.get('version') != version:
+        raise PackageError('packaged manifest is %s %s, expected %s %s'
+                           % (package.get('name'), package.get('version'), PACKAGE_NAME, version))
+    drift = []
+    for relative, content in members.items():
+        if relative in GENERATED_PACKAGE_FILES:
+            continue
+        if git_blob('Cargo.toml' if relative == 'Cargo.toml.orig' else relative) != content:
+            drift.append(relative)
+    if drift:
+        raise PackageError('packaged files differ from commit %s: %s' % (commit, sorted(drift)[:10]))
+    return members
+
+
+def write_members(members, destination):
+    """Write verified archive members (never tar extraction) under `destination`."""
+    destination.mkdir(parents=True)
+    for relative, content in sorted(members.items()):
+        path = destination / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
+def package_release(args, work_dir, run):
+    """`cargo package` exactly args.package_commit and bind the resulting bytes."""
+    commit, version = args.package_commit, args.expect_version
+    checkout = args.package_from.resolve()
+    source, out = work_dir / 'package-source', work_dir / 'package-out'
+    clone_exact_commit(checkout, commit, source)
+    source_manifest = tomllib.loads(git(source, 'show', '%s:Cargo.toml' % commit).stdout)['package']
+    if source_manifest.get('name') != PACKAGE_NAME or source_manifest.get('version') != version:
+        raise PackageError('commit %s declares %s %s, expected %s %s'
+                           % (commit, source_manifest.get('name'), source_manifest.get('version'), PACKAGE_NAME, version))
+    out.mkdir()
+    call(['docker', 'pull', args.rust_image], timeout=1800)
+    # The source is mounted read-only; Cargo writes only under /out. The default
+    # network is kept for the registry index Cargo needs to package --locked.
+    # --no-verify skips Cargo's own test build only: archive bytes are written
+    # first and are identical, and the offline fixture build below compiles them.
+    packaged = bounded_cargo(args, run, 'package', ['%s:/source:ro' % source, '%s:/out' % out],
+                             ['CARGO_HOME=/out/.cargo', 'CARGO_TARGET_DIR=/out/target'],
+                             'cargo -V && cargo package --locked --no-verify --list > /out/package.list '
+                             '&& cargo package --locked --no-verify', workdir='/source')
+    (out / 'package.stdout').write_text(packaged.stdout)
+    (out / 'package.stderr').write_text(packaged.stderr)
+    cargo_version = (packaged.stdout.strip().splitlines() or [''])[0]
+    if not cargo_version.startswith('cargo %s ' % args.package_cargo_version):
+        raise PackageError('packaging Cargo is %r, expected cargo %s' % (cargo_version, args.package_cargo_version))
+    # The worktree must still be exactly the commit after Cargo ran.
+    require_clean_checkout(source, commit)
+    crates = sorted((out / 'target' / 'package').glob('*.crate'))
+    expected = out / 'target' / 'package' / ('%s-%s.crate' % (PACKAGE_NAME, version))
+    if crates != [expected]:
+        raise PackageError('expected exactly %s, found %s' % (expected.name, [c.name for c in crates]))
+    crate_bytes = expected.read_bytes()
+    crate_sha256 = hashlib.sha256(crate_bytes).hexdigest()
+    if args.expect_package_sha256 and crate_sha256 != args.expect_package_sha256:
+        raise PackageError('packaged crate SHA-256 %s differs from expected %s' % (crate_sha256, args.expect_package_sha256))
+    listed = [line for line in (out / 'package.list').read_text().splitlines() if line]
+
+    def blob(path):
+        result = git(source, 'cat-file', 'blob', '%s:%s' % (commit, path), check=False, text=False)
+        return result.stdout if result.returncode == 0 else None
+    members = verify_package_archive(crate_bytes, version, commit, listed, blob)
+    unpacked = work_dir / 'package' / ('%s-%s' % (PACKAGE_NAME, version))
+    write_members(members, unpacked)
+    (work_dir / 'package' / expected.name).write_bytes(crate_bytes)
+    metadata = tomllib.loads(members['Cargo.toml'].decode())['package'].get('metadata', {}).get('durable-workflow', {})
+    return {'mode': 'pre-publication', 'package': PACKAGE_NAME, 'version': version, 'commit': commit,
+            'source_checkout': str(checkout), 'crate_file': expected.name, 'crate_sha256': crate_sha256,
+            'crate_size': len(crate_bytes), 'files': sorted(members), 'file_count': len(members),
+            'file_list_sha256': file_list_sha256(members),
+            'vcs_info': json.loads(members['.cargo_vcs_info.json']), 'cargo_version': cargo_version,
+            'rust_image': image_identity(args.rust_image), 'product_train': metadata.get('product-train'),
+            'verified_source_files': len(members) - len(GENERATED_PACKAGE_FILES),
+            'unpacked': str(unpacked)}, members
+
+
+def cargo_checksum(members, crate_sha256):
+    return json.dumps({'files': {name: hashlib.sha256(content).hexdigest() for name, content in sorted(members.items())},
+                       'package': crate_sha256}, sort_keys=True)
+
+
+def build_packaged_fixture(args, fixture, package, members, run):
+    """Build the fixture against only the packaged bytes, offline.
+
+    1. Resolve: with the default network, `[patch]` the dependency to the
+       unpacked package only to resolve and `cargo vendor` third-party crates.
+       Cargo never vendors that path package.
+    2. Install: add the verified members as a directory-source entry whose
+       package checksum is the .crate SHA-256, replace crates.io with the vendor
+       directory, drop the patch and the lockfile, and build with --network none.
+       Cargo then locks durable-workflow as a crates.io package whose checksum is
+       the packaged SHA-256 and verifies every vendored file against it.
+    """
+    version = package['version']
+    shutil.copytree(HERE / 'fixture' / 'src', fixture / 'src')
+    final_manifest = fixture_manifest(version)
+    (fixture / 'Cargo.toml').write_text(final_manifest + '\n[patch.crates-io]\n%s = { path = "/package" }\n' % PACKAGE_NAME)
+    resolve = bounded_cargo(args, run, 'resolve', ['%s:/work' % fixture, '%s:/package:ro' % package['unpacked']],
+                            FIXTURE_ENV, 'cargo -V && cargo generate-lockfile && cargo vendor --locked --versioned-dirs vendor')
+    (fixture / 'resolve.stdout').write_text(resolve.stdout)
+    (fixture / 'resolve.stderr').write_text(resolve.stderr)
+    vendor = fixture / 'vendor'
+    foreign = sorted(p.name for p in vendor.glob(PACKAGE_NAME + '-*'))
+    if foreign:
+        raise PackageError('third-party vendoring produced %s; only the packaged bytes may be installed' % foreign)
+    entry = vendor / ('%s-%s' % (PACKAGE_NAME, version))
+    write_members(members, entry)
+    (entry / '.cargo-checksum.json').write_text(cargo_checksum(members, package['crate_sha256']))
+    (fixture / 'Cargo.toml').write_text(final_manifest)
+    (fixture / 'Cargo.lock').unlink()
+    (fixture / '.cargo').mkdir(exist_ok=True)
+    (fixture / '.cargo' / 'config.toml').write_text(
+        '[source.crates-io]\nreplace-with = "acceptance-package"\n\n'
+        '[source.acceptance-package]\ndirectory = "vendor"\n')
+    build = bounded_cargo(args, run, 'build', ['%s:/work' % fixture], FIXTURE_ENV,
+                          'rustc -V && cargo -V && cargo generate-lockfile --offline '
+                          '&& cargo build --locked --offline -j %d' % args.jobs, network='none')
+    (fixture / 'build.stdout').write_text(build.stdout)
+    (fixture / 'build.stderr').write_text(build.stderr)
+    return {'rust_image': image_identity(args.rust_image), 'toolchain': build.stdout.strip().splitlines()[:2],
+            'network': 'none', 'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
+
+
+def packaged_provenance(args, fixture, package, members):
+    """The built fixture locked and installed exactly the packaged bytes."""
+    version, crate_sha256 = package['version'], package['crate_sha256']
+    lock = tomllib.loads((fixture / 'Cargo.lock').read_text())
+    locked = [p for p in lock['package'] if p['name'] == PACKAGE_NAME]
+    if len(locked) != 1 or locked[0].get('version') != version:
+        raise PackageError('fixture did not lock exactly %s %s: %r' % (PACKAGE_NAME, version, locked))
+    if locked[0].get('source') != CRATES_IO_SOURCE or locked[0].get('checksum') != crate_sha256:
+        raise PackageError('fixture lock %r is not the packaged crate %s' % (locked[0], crate_sha256))
+    entries = sorted(p.name for p in (fixture / 'vendor').glob(PACKAGE_NAME + '-*'))
+    entry = fixture / 'vendor' / ('%s-%s' % (PACKAGE_NAME, version))
+    if entries != [entry.name]:
+        raise PackageError('vendored %s entries are %s' % (PACKAGE_NAME, entries))
+    paths = list(entry.rglob('*'))
+    if any(p.is_symlink() or not (p.is_file() or p.is_dir()) for p in paths):
+        raise PackageError('installed package contains a link or special file')
+    installed = {str(p.relative_to(entry)): p.read_bytes() for p in paths if p.is_file()}
+    checksum = json.loads(installed.pop('.cargo-checksum.json', b'null'))
+    if installed != members or not isinstance(checksum, dict) or checksum.get('package') != crate_sha256:
+        raise PackageError('installed package bytes differ from the packaged crate')
+    metadata = tomllib.loads(members['Cargo.toml'].decode())['package'].get('metadata', {}).get('durable-workflow', {})
+    return {'mode': 'pre-publication', 'version': version, 'sha256': crate_sha256, 'lock_checksum': locked[0]['checksum'],
+            'lock_source': locked[0]['source'], 'registry_published': False, 'source_commit': package['commit'],
+            'installed_files': len(installed), 'verified_source_files': package['verified_source_files'],
+            'product_train': metadata.get('product-train'),
+            'baselines': check_baselines(metadata, args.baselines, args.expected_baselines)}
+
+
+def approval_candidate(summary, summary_bytes):
+    """The approved-package record a reviewer commits after a passing run."""
+    package = summary['package']
+    return {'schema': APPROVAL_SCHEMA, 'package': package['package'], 'version': package['version'],
+            'commit': package['commit'], 'crate_sha256': package['crate_sha256'],
+            'cargo_version': package['cargo_version'].split()[1], 'files': package['files'],
+            'file_list_sha256': package['file_list_sha256'],
+            'acceptance': {'summary_sha256': hashlib.sha256(summary_bytes).hexdigest(),
+                           'harness_commit': summary.get('harness_commit'),
+                           'server_index': summary['server']['index'],
+                           'executed_manifest': summary['server']['executed_manifest'],
+                           'platform': summary['server']['platform'],
+                           'expected_server_version': summary.get('expected_server', {}).get('version'),
+                           'expected_revision': summary.get('expected_server', {}).get('revision'),
+                           'expected_release_tag': summary.get('expected_server', {}).get('release_tag'),
+                           'cluster_versions': sorted({c.get('cluster_info', {}).get('version') or ''
+                                                       for c in summary['cells'].values()}),
+                           'cells': sorted(summary['cells']), 'finished_at': summary['finished_at']}}
 
 
 def check_baselines(metadata, mode, expected):
@@ -480,7 +820,11 @@ def main():
     args.work_dir.mkdir(parents=True)
     run = Run(args.container_prefix)
     summary = {'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'outcome': 'fail',
+               'mode': 'pre-publication' if args.package_from else 'published',
+               'expected_server': {'version': args.expect_server_version, 'revision': args.expect_revision,
+                                   'release_tag': args.expect_release_tag},
                'harness_commit': call(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], check=False).stdout.strip()}
+    approval = None
     try:
         if args.baselines_control:
             control = tomllib.loads(args.baselines_control.read_text())
@@ -488,14 +832,20 @@ def main():
                 control['package'].get('metadata', {}).get('durable-workflow', {}), 'required', args.expected_baselines),
                 source=str(args.baselines_control))
         summary['server'] = server_identity(args)
-        if args.fixture_from:
+        if args.package_from:
+            fixture = args.work_dir / 'fixture'
+            summary['package'], members = package_release(args, args.work_dir, run)
+            summary['build'] = build_packaged_fixture(args, fixture, summary['package'], members, run)
+            summary['crate'] = packaged_provenance(args, fixture, summary['package'], members)
+        elif args.fixture_from:
             fixture = args.fixture_from.resolve()
             summary['build'] = {'reused_fixture': str(fixture), 'toolchain': (fixture / 'build.stdout').read_text().strip().splitlines()[:2],
                                 'binary_sha256': sha256(fixture / 'target' / 'debug' / BINARY)}
         else:
             fixture = args.work_dir / 'fixture'
             summary['build'] = build_fixture(args, fixture, run)
-        summary['crate'] = crate_provenance(args, fixture)
+        if not args.package_from:
+            summary['crate'] = crate_provenance(args, fixture)
         # Pull first: inspect alone fails on a clean host that never fetched the helper image.
         call(['docker', 'pull', '--quiet', args.python_image], timeout=600)
         summary['python_image'] = image_identity(args.python_image)
@@ -503,7 +853,13 @@ def main():
         for name in args.cells.split(','):
             cells[name] = Cell(args, name, args.work_dir, summary['server'], fixture, run).run()
         summary['cells'] = cells
-        passed = (summary['crate']['baselines']['pass']
+        package_intact = True
+        if args.package_from:
+            # The approved bytes are the ones that were packaged, not a later copy.
+            after = sha256(args.work_dir / 'package' / summary['package']['crate_file'])
+            summary['package']['crate_sha256_after_cells'] = after
+            package_intact = after == summary['package']['crate_sha256']
+        passed = (package_intact and summary['crate']['baselines']['pass']
                   and summary.get('baselines_control', {'pass': True})['pass']
                   and all(c['outcome'] == 'pass' for c in summary['cells'].values()))
         summary['outcome'] = 'pass' if passed else 'fail'
@@ -529,8 +885,15 @@ def main():
                               'local_leftovers': run.local_leftovers, 'leftover_containers': leftovers,
                               'leftover_networks': leftover_networks}
         summary['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        (args.work_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
+        summary_bytes = (json.dumps(summary, ensure_ascii=False, indent=2) + '\n').encode()
+        (args.work_dir / 'summary.json').write_bytes(summary_bytes)
+        if args.package_from and summary['outcome'] == 'pass':
+            # Only a fully passing pre-publication run (checks and cleanup) yields
+            # an approval candidate; a reviewer commits it for the release workflow.
+            approval = args.work_dir / 'approved-package.json'
+            approval.write_text(json.dumps(approval_candidate(summary, summary_bytes), indent=2) + '\n')
         print(json.dumps({'outcome': summary['outcome'], 'error': summary.get('error'),
+                          'approval_candidate': str(approval) if approval else None,
                           'summary': str(args.work_dir / 'summary.json'), 'leftover_containers': leftovers,
                           'leftover_networks': leftover_networks, 'local_leftovers': run.local_leftovers,
                           'cleanup_errors': run.cleanup_errors}))

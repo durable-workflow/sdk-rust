@@ -369,11 +369,124 @@ def restore_missing_lockfile(
     return identity
 
 
+APPROVAL_SCHEMA = "durable-workflow.rust-sdk.approved-package/v1"
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+CARGO_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+APPROVAL_FIELDS = {
+    "schema", "package", "version", "commit", "crate_sha256", "cargo_version",
+    "files", "file_list_sha256", "acceptance",
+}
+
+
+def file_list_sha256(files: list[str]) -> str:
+    return sha256("".join(f"{name}\n" for name in sorted(files)).encode())
+
+
+def load_approval(path: Path) -> tuple[dict[str, Any], str]:
+    """Read one reviewed approved-package record and check its shape."""
+    try:
+        raw = path.read_bytes()
+        approval = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReleasePackageError(f"could not read approved package record: {error}") from error
+    if not isinstance(approval, dict) or set(approval) != APPROVAL_FIELDS:
+        raise ReleasePackageError("approved package record has unexpected fields")
+    files = approval["files"]
+    acceptance = approval["acceptance"]
+    if (
+        approval["schema"] != APPROVAL_SCHEMA
+        or not isinstance(approval["package"], str)
+        or not isinstance(approval["version"], str)
+        or not isinstance(approval["commit"], str)
+        or not COMMIT_PATTERN.fullmatch(approval["commit"])
+        or not isinstance(approval["crate_sha256"], str)
+        or not SHA256_PATTERN.fullmatch(approval["crate_sha256"])
+        or not isinstance(approval["cargo_version"], str)
+        or not CARGO_VERSION_PATTERN.fullmatch(approval["cargo_version"])
+        or not isinstance(files, list)
+        or not files
+        or not all(isinstance(name, str) and name for name in files)
+        or files != sorted(set(files))
+        or approval["file_list_sha256"] != file_list_sha256(files)
+        or not isinstance(acceptance, dict)
+        or not isinstance(acceptance.get("summary_sha256"), str)
+        or not SHA256_PATTERN.fullmatch(acceptance["summary_sha256"])
+        or not isinstance(acceptance.get("server_index"), str)
+        or not acceptance["server_index"]
+    ):
+        raise ReleasePackageError("approved package record is malformed")
+    return approval, sha256(raw)
+
+
+def _archive_files(archive_path: Path, root: str) -> list[str]:
+    prefix = f"{root}/"
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError, EOFError) as error:
+        raise ReleasePackageError(f"could not inspect crate archive: {error}") from error
+    names = []
+    for member in members:
+        if not member.isfile() or not member.name.startswith(prefix):
+            raise ReleasePackageError(f"crate member {member.name!r} is not a regular package file")
+        names.append(member.name[len(prefix):])
+    if len(names) != len(set(names)):
+        raise ReleasePackageError("crate archive repeats a member")
+    return sorted(names)
+
+
+def verify_approved_archive(
+    archive_path: Path,
+    manifest: Path,
+    changelog: Path,
+    expected_vcs_commit: str,
+    approval_path: Path,
+    cargo_version: str | None = None,
+) -> dict[str, Any]:
+    """Require an archive to be exactly the approved pre-publication package."""
+    identity = verify_archive(archive_path, manifest, changelog, expected_vcs_commit)
+    approval, approval_sha256 = load_approval(approval_path)
+    if approval["package"] != identity["package"]:
+        raise ReleasePackageError("approved package name differs from the release manifest")
+    if approval["version"] != identity["package_version"]:
+        raise ReleasePackageError("approved package version differs from the release manifest")
+    if approval["commit"] != expected_vcs_commit or approval["commit"] != identity["archive"]["vcs_commit"]:
+        raise ReleasePackageError("approved package commit differs from the release commit")
+    if cargo_version is not None and approval["cargo_version"] != cargo_version:
+        raise ReleasePackageError(
+            f"release Cargo {cargo_version} differs from approved Cargo {approval['cargo_version']}"
+        )
+    files = _archive_files(archive_path, f"{identity['package']}-{identity['package_version']}")
+    if files != approval["files"]:
+        missing = sorted(set(approval["files"]) - set(files))
+        extra = sorted(set(files) - set(approval["files"]))
+        raise ReleasePackageError(
+            f"archive file set differs from approved package: missing {missing[:10]}, extra {extra[:10]}"
+        )
+    if identity["archive"]["sha256"] != approval["crate_sha256"]:
+        raise ReleasePackageError(
+            "archive SHA-256 differs from the approved pre-publication package"
+        )
+    identity["approval"] = {
+        "record_sha256": approval_sha256,
+        "crate_sha256": approval["crate_sha256"],
+        "commit": approval["commit"],
+        "version": approval["version"],
+        "cargo_version": approval["cargo_version"],
+        "file_count": len(approval["files"]),
+        "file_list_sha256": approval["file_list_sha256"],
+        "acceptance_summary_sha256": approval["acceptance"]["summary_sha256"],
+        "server_index": approval["acceptance"]["server_index"],
+    }
+    return identity
+
+
 def _validate_notes_arguments(
     arguments: argparse.Namespace, parser: argparse.ArgumentParser,
 ) -> None:
     if any((arguments.archive, arguments.expected_vcs_commit,
-            arguments.expected_archive_sha256, arguments.restore_missing_lockfile)):
+            arguments.expected_archive_sha256, arguments.restore_missing_lockfile,
+            arguments.approved_package, arguments.cargo_version)):
         parser.error("--release-notes cannot be combined with archive verification")
     if (arguments.manifest != Path(SOURCE_MANIFEST)
             or arguments.changelog != Path(SOURCE_CHANGELOG)):
@@ -389,12 +502,26 @@ def main() -> int:
     parser.add_argument("--expected-archive-sha256")
     parser.add_argument("--restore-missing-lockfile", action="store_true")
     parser.add_argument(
+        "--approved-package", type=Path,
+        help="require --archive to be exactly this reviewed approved-package record",
+    )
+    parser.add_argument(
+        "--cargo-version", help="with --approved-package: the packaging Cargo release (X.Y.Z)",
+    )
+    parser.add_argument(
         "--release-notes", metavar="VERSION",
         help="print the exact current-version Markdown after manifest validation",
     )
     arguments = parser.parse_args()
     if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
         parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
+    if arguments.cargo_version is not None and arguments.approved_package is None:
+        parser.error("--cargo-version requires --approved-package")
+    if arguments.approved_package is not None and (
+        arguments.archive is None or arguments.expected_vcs_commit is None
+        or arguments.restore_missing_lockfile or arguments.release_notes is not None
+    ):
+        parser.error("--approved-package requires --archive and --expected-vcs-commit only")
 
     try:
         if arguments.release_notes is not None:
@@ -416,6 +543,15 @@ def main() -> int:
                 "version": 1,
                 **verify_source(arguments.manifest, arguments.changelog),
             }
+        elif arguments.approved_package is not None:
+            evidence = verify_approved_archive(
+                arguments.archive,
+                arguments.manifest,
+                arguments.changelog,
+                arguments.expected_vcs_commit,
+                arguments.approved_package,
+                arguments.cargo_version,
+            )
         else:
             evidence = verify_archive(
                 arguments.archive,

@@ -119,6 +119,9 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
           RELEASE_RUN_ID: ${{ github.run_id }}
           RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          # Reviewed record of the pre-publication package that passed installed-native
+          # acceptance, committed to main (the maintained tooling), never the tagged source.
+          RUST_SDK_APPROVED_PACKAGE_PATH: ../release-tools/release/approved-packages/${{ env.RELEASE_TAG }}.json
         run: ../release-tools/scripts/ci/publish-rust-sdk.sh
 
       - name: Create the source GitHub Release

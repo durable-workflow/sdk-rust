@@ -1,7 +1,8 @@
 # Installed-package acceptance against native Server
 
-This harness checks one exact published `durable-workflow` crate against one
-exact native Server image. It runs in disposable local containers on an
+This harness checks one exact published `durable-workflow` crate, or (in
+pre-publication mode, below) the exact `cargo package` bytes of one clean
+release commit, against one exact native Server image. It runs in disposable local containers on an
 internal Docker network and never contacts Cloud.
 
 It does the following:
@@ -59,6 +60,105 @@ python3 scripts/acceptance/installed-native/run.py \
 
 For a crate published before the map existed (≤ 4.10.2), pass
 `--baselines absent --baselines-control Cargo.toml`.
+
+### Pre-publication mode
+
+A new version must pass this acceptance **before** it is tagged or published,
+so crates.io never holds an unqualified immutable version. `--package-from`
+replaces `--crate-version`: the harness packages one exact clean commit and
+installs only those packaged bytes.
+
+```sh
+python3 scripts/acceptance/installed-native/run.py \
+  --package-from <clean checkout whose HEAD is the release commit> \
+  --package-commit <40-hex release commit> \
+  --expect-version 4.11.2 \
+  --server-index sha256:3cb6e5bf8ec766ac2abd933369b40a77af62794b6d7b921ce21d3fb263e88b72 \
+  --platform linux/arm64 \
+  --expect-server-version 3.0.5 \
+  --expect-release-tag 3.0.5 --expect-revision bc24589db02161a21febbb30211309537fd1e24e \
+  --baselines required --container-prefix general \
+  --work-dir <new empty directory>
+```
+
+Use the commit that will be tagged. Cargo records the commit in
+`.cargo_vcs_info.json`, so a different commit (for example a later merge
+commit with the same tree) produces a different package and will not match.
+
+1. **Exact source.** The checkout's HEAD must equal `--package-commit` and
+   its tree must be fully clean (no changed or untracked paths). The harness
+   copies that commit into `<work-dir>/package-source`, a self-contained
+   repository, and checks it the same way.
+2. **Package.** A bounded `--rm` container (same limits as the fixture build)
+   runs `cargo package --locked --no-verify --list` and
+   `cargo package --locked --no-verify`, with the source mounted read-only. The
+   container must report Cargo `--package-cargo-version` (default `1.86.0`,
+   the release workflow's), because a different Cargo writes different bytes.
+   `--no-verify` skips only Cargo's own test build. The archive is already
+   written by then, and the offline fixture build compiles it.
+3. **Bind.** The harness refuses the package unless all of these hold:
+   - exactly `durable-workflow-<version>.crate` was produced, and the source and
+     packaged manifests both declare `--expect-version`;
+   - every member is a regular file under `durable-workflow-<version>/`, with
+     no links, traversal or duplicates;
+   - the member set equals the `--list` output exactly;
+   - `.cargo_vcs_info.json` names the clean commit, with `path_in_vcs` empty;
+   - every member except the generated `Cargo.toml` and `.cargo_vcs_info.json`
+     is byte-identical to the commit's blob (`Cargo.toml.orig` against
+     `Cargo.toml`).
+
+   `--expect-package-sha256` also pins the archive SHA-256, for example when
+   re-running an earlier result.
+4. **Install only those bytes.** One container (default network) patches the
+   dependency to the unpacked package, only to resolve and `cargo vendor`
+   third-party crates. The harness then adds the verified members as a
+   directory-source entry whose package checksum is the `.crate` SHA-256 and
+   replaces crates.io with that directory. A second container, with
+   `--network none`, regenerates the lockfile and builds offline. Cargo checks
+   every vendored file against the checksums. The fixture lock must name
+   `durable-workflow <version>` from the crates.io source with checksum equal
+   to the `.crate` SHA-256. The installed files must equal the archive
+   members exactly. There is no path dependency on checkout bytes.
+5. **Same cells.** The lifecycle and deadline cells, Server identity and
+   same-worker assertions are unchanged. After the cells, the saved `.crate`
+   must still hash to the bound SHA-256.
+
+`summary.json` records `package` (commit, version, SHA-256, size, sorted file
+list and its digest, VCS record, Cargo version, Rust image identity) and
+`crate` (lock checksum and source, installed file count, baselines). Only a run
+whose checks and cleanup both pass writes `<work-dir>/approved-package.json`:
+
+```json
+{
+  "schema": "durable-workflow.rust-sdk.approved-package/v1",
+  "package": "durable-workflow", "version": "4.11.2", "commit": "<40 hex>",
+  "crate_sha256": "<64 hex>", "cargo_version": "1.86.0",
+  "files": ["..."], "file_list_sha256": "<64 hex>",
+  "acceptance": {"summary_sha256": "<64 hex>", "server_index": "...", "...": "..."}
+}
+```
+
+A reviewer commits that record unchanged to `main` as
+`release/approved-packages/<version>.json`. `release/` is outside the crate's
+`include` list, so it never changes package bytes. The Release workflow reads
+the record from its maintained tooling checkout (`main`), never from the
+tagged source. Then:
+
+- **Before publishing,** it reproduces `cargo package --locked` from the tag and
+  refuses (`approved_package_mismatch`) unless the archive's SHA-256, file set,
+  version, VCS commit and Cargo release all equal the record. A version that is
+  not yet on crates.io is never published without a record
+  (`approved_package_required`).
+- **After publishing,** the crates.io checksum and the downloaded archive must
+  equal the approved SHA-256. The downloaded archive must match the record
+  again. The tag must read back from `origin` as the release commit. Any
+  difference fails the release (`published_checksum_differs_from_approved_package`,
+  `published_package_differs_from_approved_package`,
+  `source_tag_readback_mismatch`), and nothing may claim the version is qualified.
+
+Cargo cannot upload a prebuilt `.crate`, so `cargo publish` packages again from
+the same clean tag with the same Cargo. The readback above is what proves that
+the published bytes are the accepted ones.
 
 The run writes `<work-dir>/summary.json` with every identity, receipt and
 history result, plus per-container logs under `cells/*/logs`. The exit code is

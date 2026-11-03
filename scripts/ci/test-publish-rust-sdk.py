@@ -7,10 +7,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import hashlib
 import ssl
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -65,6 +67,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
             import tomllib
 
             command = sys.argv[1]
+            if command == "-V":
+                print(f'cargo {os.environ.get("MOCK_CARGO_VERSION", "1.86.0")} (adf9b6ad1 2025-02-28)')
+                raise SystemExit(0)
             manifest = Path(sys.argv[sys.argv.index("--manifest-path") + 1])
             package = tomllib.loads(manifest.read_text(encoding="utf-8"))["package"]
             target = Path(os.environ["CARGO_TARGET_DIR"])
@@ -106,6 +111,10 @@ class PublishRustSdkContractTest(unittest.TestCase):
                                 member = tarfile.TarInfo(name)
                                 member.size = len(content)
                                 crate.addfile(member, io.BytesIO(content))
+            elif command == "publish":
+                if "--locked" not in sys.argv:
+                    raise SystemExit("publication must use --locked")
+                Path(os.environ["MOCK_PUBLISH_MARKER"]).write_text("published\n")
             elif command == "build":
                 if os.environ.get("MOCK_CONSUMER_BUILD_OUTCOME") == "fail":
                     raise SystemExit("mock fresh consumer build failed")
@@ -153,6 +162,14 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 pass
             elif command in {"rev-parse", "rev-list"}:
                 print(os.environ["MOCK_RELEASE_COMMIT"])
+            elif command == "ls-remote":
+                if sys.argv[2] != "origin":
+                    raise SystemExit("tag readback must use origin")
+                tag = sys.argv[3]
+                peeled = os.environ.get("MOCK_REMOTE_TAG_COMMIT", os.environ["MOCK_RELEASE_COMMIT"])
+                print("1111111111111111111111111111111111111111\t" + tag)
+                if peeled:
+                    print(peeled + "\t" + tag + "^{}")
             else:
                 raise SystemExit(f"unexpected git command: {command}")
             """,
@@ -187,7 +204,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
             else:
                 raise SystemExit(f"unexpected curl URL: {{url}}")
             if "--write-out" in args:
-                print(os.environ.get("MOCK_LOOKUP_STATUS", "200"), end="")
+                published = Path(os.environ["MOCK_PUBLISH_MARKER"]).exists()
+                print("200" if published else os.environ.get("MOCK_LOOKUP_STATUS", "200"), end="")
             ''',
         )
     def _publish(
@@ -195,6 +213,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
         manifest: Path = MANIFEST,
         environment: dict[str, str] | None = None,
         cwd: Path = ROOT,
+        approval: dict[str, object] | None = None,
+        registry_changelog: bytes | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
@@ -208,6 +228,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 "RELEASE_TAG": PACKAGE_VERSION,
                 "RUST_SDK_MANIFEST_PATH": str(manifest),
                 "RUST_SDK_RELEASE_EVIDENCE_PATH": str(self.evidence),
+                "RUST_SDK_APPROVED_PACKAGE_PATH": str(self.temp / "approved" / f"{PACKAGE_VERSION}.json"),
+                "MOCK_PUBLISH_MARKER": str(self.temp / "published-marker"),
             }
         )
         env.update(environment or {})
@@ -221,6 +243,24 @@ class PublishRustSdkContractTest(unittest.TestCase):
             [str(self.bin_dir / "cargo"), "package", "--manifest-path", str(MANIFEST)],
             env=fixture_env, check=True,
         )
+        registry_archive = Path(env["MOCK_REGISTRY_ARCHIVE"])
+        if approval is not None:
+            record = self._approval(registry_archive)
+            record.update(approval)
+            path = Path(env["RUST_SDK_APPROVED_PACKAGE_PATH"])
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(record), encoding="utf-8")
+        if registry_changelog is not None:
+            # crates.io serves different (self-consistent) bytes than were approved.
+            changed = self.temp / "changed-registry"
+            changelog = self.temp / "registry-CHANGELOG.md"
+            changelog.write_bytes(registry_changelog)
+            subprocess.run(
+                [str(self.bin_dir / "cargo"), "package", "--manifest-path", str(MANIFEST)],
+                env={**fixture_env, "CARGO_TARGET_DIR": str(changed),
+                     "RUST_SDK_CHANGELOG_PATH": str(changelog)}, check=True,
+            )
+            env["MOCK_REGISTRY_ARCHIVE"] = str(changed / "package" / registry_archive.name)
         return subprocess.run(
             ["bash", str(PUBLISH)],
             cwd=cwd,
@@ -230,6 +270,153 @@ class PublishRustSdkContractTest(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    @staticmethod
+    def _approval(archive: Path) -> dict[str, object]:
+        root = f"durable-workflow-{PACKAGE_VERSION}/"
+        with tarfile.open(archive) as crate:
+            files = sorted(member.name.removeprefix(root) for member in crate.getmembers())
+        return {
+            "schema": "durable-workflow.rust-sdk.approved-package/v1",
+            "package": "durable-workflow",
+            "version": PACKAGE_VERSION,
+            "commit": RELEASE_COMMIT,
+            "crate_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "cargo_version": "1.86.0",
+            "files": files,
+            "file_list_sha256": hashlib.sha256("".join(f"{name}\n" for name in files).encode()).hexdigest(),
+            "acceptance": {"summary_sha256": "c" * 64, "server_index": "ghcr.io/durable-workflow/server@sha256:" + "d" * 64},
+        }
+
+    def _evidence(self) -> dict[str, object]:
+        return json.loads(self.evidence.read_text(encoding="utf-8"))
+
+    def _published(self) -> bool:
+        return (self.temp / "published-marker").exists()
+
+    # Pre-publication approval binding (sdk-rust#170 Security ruling).
+
+    def test_new_version_publishes_only_the_approved_reproduced_package(self) -> None:
+        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                               approval={})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(self._published())
+        evidence = self._evidence()
+        self.assertEqual("published", evidence["outcome"])
+        self.assertEqual("reproduced", evidence["approved_package"]["status"])
+        self.assertTrue(evidence["approved_package"]["registry_matches_approved_package"])
+        self.assertEqual(evidence["registry_checksum_sha256"], evidence["approved_package"]["crate_sha256"])
+        self.assertEqual(evidence["local_package_checksum_sha256"], evidence["approved_package"]["crate_sha256"])
+        self.assertEqual(RELEASE_COMMIT, evidence["source_tag_readback"]["commit"])
+        self.assertNotIn("test-token", self.evidence.read_text(encoding="utf-8"))
+
+    def test_new_version_without_an_approval_record_is_never_published(self) -> None:
+        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"})
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self._published())
+        self.assertEqual("approved_package_required", self._evidence()["reason"])
+        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token",
+                                            "RUST_SDK_APPROVED_PACKAGE_PATH": ""})
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self._published())
+
+    def test_publish_time_repackage_mismatch_refuses_to_publish(self) -> None:
+        cases = {
+            "one-byte checksum drift": {"crate_sha256": "0" * 64},
+            "wrong commit": {"commit": "f" * 40},
+            "wrong version": {"version": "4.11.9"},
+            "wrong cargo": {"cargo_version": "1.99.0"},
+            "malformed": {"crate_sha256": "not-a-digest"},
+            "unexpected field": {"approved_by": "nobody"},
+        }
+        for label, change in cases.items():
+            with self.subTest(label=label):
+                result = self._publish(
+                    environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                    approval=change,
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(self._published())
+                evidence = self._evidence()
+                self.assertEqual("approved_package_mismatch", evidence["reason"])
+                self.assertEqual("reproduction_mismatch", evidence["approved_package"]["status"])
+                self.assertIn("refusing to publish", result.stderr)
+
+    def test_extra_or_missing_approved_file_refuses_to_publish(self) -> None:
+        for label, mutate in (
+            ("extra", lambda files: sorted(files + ["src/extra.rs"])),
+            ("missing", lambda files: files[1:]),
+        ):
+            with self.subTest(label=label):
+                record = self._approval_files_override(mutate)
+                result = self._publish(
+                    environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                    approval=record,
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(self._published())
+                self.assertEqual("approved_package_mismatch", self._evidence()["reason"])
+                self.assertIn("file set differs", result.stderr)
+
+    @staticmethod
+    def _approval_files_override(mutate) -> dict[str, object]:
+        # The mock package holds exactly these members.
+        files = mutate([".cargo_vcs_info.json", "CHANGELOG.md", "Cargo.lock"])
+        return {"files": files,
+                "file_list_sha256": hashlib.sha256("".join(f"{n}\n" for n in files).encode()).hexdigest()}
+
+    def test_post_publish_registry_readback_mismatch_fails(self) -> None:
+        result = self._publish(
+            environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+            approval={},
+            registry_changelog=(ROOT / "CHANGELOG.md").read_bytes() + b"\n",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertTrue(self._published())
+        evidence = self._evidence()
+        self.assertEqual("failed", evidence["outcome"])
+        self.assertEqual("published_checksum_differs_from_approved_package", evidence["reason"])
+        self.assertFalse(evidence["approved_package"]["registry_matches_approved_package"])
+
+    def test_registry_checksum_claim_differing_from_approval_fails(self) -> None:
+        result = self._publish(
+            environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token",
+                         "MOCK_REGISTRY_CHECKSUM": "0" * 64},
+            approval={},
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotEqual("published", self._evidence()["outcome"])
+        self.assertFalse(self._evidence()["approved_package"]["registry_matches_approved_package"])
+
+    def test_already_published_version_must_still_equal_its_approval(self) -> None:
+        result = self._publish(approval={}, registry_changelog=(ROOT / "CHANGELOG.md").read_bytes() + b"\n")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("published_checksum_differs_from_approved_package", self._evidence()["reason"])
+
+    def test_post_publish_source_tag_readback_mismatch_fails(self) -> None:
+        for label, commit in (("moved", "e" * 40), ("missing", "")):
+            with self.subTest(label=label):
+                result = self._publish(
+                    environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token",
+                                 "MOCK_REMOTE_TAG_COMMIT": commit},
+                    approval={},
+                )
+                self.assertNotEqual(0, result.returncode)
+                evidence = self._evidence()
+                self.assertEqual("source_tag_readback_mismatch", evidence["reason"])
+                self.assertEqual("failed", evidence["outcome"])
+                (self.temp / "published-marker").unlink(missing_ok=True)
+
+    def test_release_workflow_supplies_the_reviewed_approval_record(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "RUST_SDK_APPROVED_PACKAGE_PATH: ../release-tools/release/approved-packages/${{ env.RELEASE_TAG }}.json",
+            workflow,
+        )
+        # The record comes from maintained tooling (main), never the tagged source.
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
+        self.assertLess(workflow.index("Resolve exact release identity"), workflow.index("RUST_SDK_APPROVED_PACKAGE_PATH"))
+        self.assertNotIn("/release/", MANIFEST.read_text(encoding="utf-8").split("include = ", 1)[1].split("\n", 1)[0])
 
     def _manifest_with(self, old: str, new: str) -> Path:
         manifest = self.temp / "Cargo.toml"
