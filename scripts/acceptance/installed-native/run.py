@@ -108,11 +108,21 @@ def build_fixture(args, fixture):
     template = (HERE / 'fixture' / 'Cargo.toml.in').read_text()
     (fixture / 'Cargo.toml').write_text(template.replace('@CRATE_VERSION@', args.crate_version))
     call(['docker', 'pull', args.rust_image], timeout=1800)
-    command = ['docker', 'run', '--rm', '--user', '%d:%d' % (os.getuid(), os.getgid()),
+    # Bounded like every other harness container: named, --init, CPU/RAM/PID
+    # caps. It keeps the default network only for the crates.io fetch.
+    name = 'sdkrust-accept-build-%s' % datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dt%H%M%S')
+    command = ['docker', 'run', '--rm', '--init', '--name', name, '--label', 'task=' + name,
+               '--cpus', str(max(1, args.jobs)), '--memory', '3g', '--pids-limit', '1024',
+               '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+               '--user', '%d:%d' % (os.getuid(), os.getgid()),
                '-v', '%s:/work' % fixture, '-w', '/work', '-e', 'CARGO_HOME=/work/.cargo',
                '-e', 'CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback', args.rust_image, 'sh', '-c',
                'rustc -V && cargo -V && cargo generate-lockfile && cargo build --locked -j %d' % args.jobs]
-    build = call(command, timeout=3600)
+    try:
+        build = call(command, timeout=3600)
+    finally:
+        # --rm cannot fire if the client is killed or times out mid-build.
+        call(['docker', 'rm', '-f', name], check=False)
     (fixture / 'build.stdout').write_text(build.stdout)
     (fixture / 'build.stderr').write_text(build.stderr)
     return {'rust_image': image_identity(args.rust_image), 'toolchain': build.stdout.strip().splitlines()[:2],
