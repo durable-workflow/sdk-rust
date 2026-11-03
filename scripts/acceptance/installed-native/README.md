@@ -81,8 +81,16 @@ the daemon can create a container (or network) even when the client then times
 out or errors. Cleanup inspects each recorded name, then logs and removes the
 object by ID only when its run label equals this invocation's token. A name
 collision or a failed create never touches anyone else's object.
-`leftover_containers` and `leftover_networks` in the final JSON list objects
-that still carry this run's token.
+
+Each Docker inspect, log and remove step is best-effort: a failure or timeout
+is recorded and the remaining steps still run. The credential file,
+`database/` and `storage/` are deleted in an outer `finally` whatever Docker
+did. A failed step never replaces the run's own error. The final JSON line and
+`summary.json` (`cleanup`) report `cleanup_errors`, each with only the step,
+object name and error type, plus `leftover_containers` and `leftover_networks`
+that still carry this run's token. A leftover list is `null` when its query
+failed. A container whose inspect failed is never removed, because its
+ownership could not be confirmed.
 
 The fixture build container uses `--rm`, `--init`, `--cpus` equal to `--jobs`,
 `--memory 3g`, `--pids-limit 1024`, `no-new-privileges` and `--cap-drop ALL`.
@@ -90,6 +98,21 @@ It uses the default network for the crates.io fetch and mounts only the fixture
 directory. Its build runs under `timeout --kill-after=60s 3300s` inside the
 container, so the container exits and the daemon removes it even if the client
 is killed. The client's own timeout is 3600 seconds.
+
+Cell containers all get `--init`, `--cpus 1`, `--memory 1g`,
+`no-new-privileges` and `--cap-drop ALL`. Their `--pids-limit` is 256, except
+MySQL, which gets 512. The native cell containers also run with a read-only
+root filesystem. The PHP baseline (`--runtime php`) keeps writable roots, as in
+its compose file. It adds back only the capabilities each image's entrypoint
+uses:
+
+| Role | Added capabilities | Why |
+| --- | --- | --- |
+| `mysql` (8.4) | `CHOWN`, `DAC_OVERRIDE`, `SETGID`, `SETUID` | The root entrypoint walks and chowns its data, socket and mysql-owned secure-file directories, then drops to `mysql` with gosu. |
+| `redis` (7.4) | `CHOWN`, `SETGID`, `SETUID` | The root entrypoint chowns `/data`, then drops to `redis` with gosu. |
+| `bootstrap` | `DAC_OVERRIDE` | Root writes Laravel caches under directories owned by www-data. |
+| `runtime` | `CHOWN`, `DAC_OVERRIDE`, `KILL`, `SETGID`, `SETUID` | The Apache root master chowns its mutex, switches its children to www-data and signals them. |
+| `queue`, `repair` | none | They run as uid 1000. |
 
 Cell containers are detached and have no client-independent lifetime bound. If
 the client is killed mid-cell, its containers, its network and the cell's

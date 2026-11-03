@@ -38,18 +38,26 @@ class FakeDocker:
     'fail' (nothing created, nonzero exit), 'timeout' (nothing created, client
     timeout), 'created-then-timeout' (the daemon created it, then the client
     timed out) or 'created-then-error' (created, then a nonzero exit).
+    `raise_on` maps (command prefix, last argument or None) to an exception that
+    the call raises, e.g. an inspect or remove that times out.
     """
 
-    def __init__(self, containers=None, networks=None, faults=None, created=None):
+    def __init__(self, containers=None, networks=None, faults=None, created=None, raise_on=None):
         self.commands = []
         self.containers = dict(containers or {})
         self.networks = dict(networks or {})
         self.faults = dict(faults or {})
         self.created = created  # side effect of a successful build, e.g. writing the binary
+        self.raise_on = dict(raise_on or {})
 
     def __call__(self, command, timeout=120, check=True, **kwargs):
         command = list(command)
         self.commands.append((command, timeout))
+        for (prefix, target), error in self.raise_on.items():
+            if tuple(command[:len(prefix)]) == prefix and target in (None, command[-1]):
+                raise error
+        if command[:2] == ['docker', 'wait']:
+            return done(command, stdout='0\n')
         if command[:2] == ['docker', 'pull']:
             return done(command)
         if command[:3] == ['docker', 'image', 'inspect']:
@@ -111,6 +119,14 @@ class FakeDocker:
 
     def runs(self):
         return [(c, t) for c, t in self.commands if c[:2] == ['docker', 'run']]
+
+
+INSPECT = ('docker', 'container', 'inspect')
+LOGS = ('docker', 'logs')
+REMOVE = ('docker', 'rm', '-f')
+NETWORK_INSPECT = ('docker', 'network', 'inspect')
+NETWORK_REMOVE = ('docker', 'network', 'rm')
+TIMEOUT = subprocess.TimeoutExpired(['docker'], 120)
 
 
 def args(**overrides):
@@ -284,6 +300,13 @@ class BuildCleanup(HarnessRun):
         self.assertEqual(docker.removals(), [['docker', 'rm', '-f', 'id-' + self.name()]])
         self.assertEqual(docker.containers, {})
 
+    def test_cleanup_failure_is_recorded_and_never_masks_the_build_error(self):
+        docker = FakeDocker(faults={self.name(): 'created-then-error'}, raise_on={(INSPECT, None): TIMEOUT})
+        with self.assertRaises(RuntimeError):
+            self.build(docker)
+        self.assertEqual(self.run.cleanup_errors,
+                         [{'step': 'build-cleanup', 'object': self.name(), 'error': 'TimeoutExpired'}])
+
     def test_build_error_removes_only_the_owned_container_by_id(self):
         docker = FakeDocker(faults={self.name(): 'created-then-error'})
         with self.assertRaises(RuntimeError):
@@ -375,6 +398,117 @@ class CellCleanup(HarnessRun):
         self.assert_state_cleaned(cell)
 
 
+class PlainContainerBounds(HarnessRun):
+    """The PHP-baseline process set gets the same envelope as Cell.start."""
+
+    def test_every_php_baseline_role_is_bounded(self):
+        cell = run.Cell(args(runtime='php'), 'lifecycle', self.tmp / 'work', {'executed_manifest': 'server-img'},
+                        self.tmp, self.run)
+        docker = FakeDocker()
+        with mock.patch.object(run, 'call', docker):
+            cell.start_php('fixture-token')
+        labels = ['--label', 'task=' + cell.task, '--label', 'dev.durable-workflow.acceptance.run=' + TOKEN,
+                  '--label', 'dev.durable-workflow.acceptance.owner=general']
+
+        def bounds(role, pids, caps, *extra):
+            line = ['docker', 'run', '-d', '--init', '--name', '%s-%s' % (cell.task, role)] + labels + [
+                    '--network', cell.task, '--memory', '1g', '--cpus', '1', '--pids-limit', pids,
+                    '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL']
+            for cap in caps:
+                line += ['--cap-add', cap]
+            return line + list(extra)
+
+        expected = {
+            'mysql': bounds('mysql', '512', ('CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'),
+                            '--network-alias', 'mysql', '--tmpfs', '/var/lib/mysql'),
+            'redis': bounds('redis', '256', ('CHOWN', 'SETGID', 'SETUID'), '--network-alias', 'redis', '--tmpfs', '/data'),
+            'bootstrap': bounds('bootstrap', '256', ('DAC_OVERRIDE',)),
+            'runtime': bounds('runtime', '256', ('CHOWN', 'DAC_OVERRIDE', 'KILL', 'SETGID', 'SETUID'),
+                              '--network-alias', 'qualification-origin'),
+            'queue': bounds('queue', '256', (), '--user', '1000:1000'),
+            'repair': bounds('repair', '256', (), '--user', '1000:1000'),
+        }
+        runs = {c[c.index('--name') + 1].rsplit('-', 1)[1]: c for c, _ in docker.runs()}
+        self.assertEqual(list(runs), list(expected))
+        for role, command in runs.items():
+            with self.subTest(role=role):
+                end = command.index('-e') if '-e' in command else len(command) - 1
+                self.assertEqual(command[:end], expected[role])
+                self.assertNotIn('--privileged', command)
+                self.assertFalse({'SYS_ADMIN', 'NET_ADMIN', 'NET_RAW', 'ALL'} & {
+                    command[i + 1] for i, a in enumerate(command) if a == '--cap-add'})
+        self.assertEqual(runs['mysql'][-1], run.MYSQL_IMAGE)
+        self.assertEqual(runs['redis'][-1], run.REDIS_IMAGE)
+        self.assertEqual(runs['bootstrap'][-2:], ['server-img', 'server-bootstrap'])
+        self.assertEqual(runs['runtime'][-1], 'server-img')
+
+
+class CleanupStepsAreIndependent(HarnessRun):
+    """A failing Docker cleanup step never skips later steps or local credential/state cleanup."""
+
+    def setUp(self):
+        super().setUp()
+        fixture = self.tmp / 'built'
+        write_binary(fixture)(None)
+        self.cell = run.Cell(args(), 'lifecycle', self.tmp / 'work', {'executed_manifest': 'img'}, fixture, self.run)
+        self.runtime, self.proxy = self.cell.task + '-runtime', self.cell.task + '-proxy'
+
+    def run_with(self, raise_on):
+        # runtime starts; proxy is created, then its docker run fails client-side.
+        docker = FakeDocker(faults={self.proxy: 'created-then-error'}, raise_on=raise_on)
+        with mock.patch.object(run, 'call', docker), self.assertRaises(RuntimeError):
+            self.cell.run()  # the original error propagates, not a cleanup error
+        self.assertFalse((self.cell.state / 'credentials.json').exists())
+        self.assertFalse((self.cell.state / 'database').exists())
+        self.assertFalse((self.cell.state / 'storage').exists())
+        for error in self.run.cleanup_errors:
+            self.assertEqual(set(error), {'step', 'object', 'error'})
+        return docker
+
+    def errors(self):
+        return [(e['step'], e['object'], e['error']) for e in self.run.cleanup_errors]
+
+    def test_inspect_timeout(self):
+        docker = self.run_with({(INSPECT, self.runtime): TIMEOUT})
+        self.assertEqual(docker.removals(), [['docker', 'rm', '-f', 'id-' + self.proxy],
+                                             ['docker', 'network', 'rm', 'id-' + self.cell.task]])
+        self.assertEqual(self.errors(), [('container-inspect', self.runtime, 'TimeoutExpired')])
+
+    def test_logs_failure(self):
+        docker = self.run_with({(LOGS, 'id-' + self.runtime): TIMEOUT})
+        self.assertEqual(docker.removals(), [['docker', 'rm', '-f', 'id-' + self.proxy],
+                                             ['docker', 'rm', '-f', 'id-' + self.runtime],
+                                             ['docker', 'network', 'rm', 'id-' + self.cell.task]])
+        self.assertEqual(self.errors(), [('container-logs', self.runtime, 'TimeoutExpired')])
+
+    def test_remove_failure(self):
+        docker = self.run_with({(REMOVE, 'id-' + self.proxy): RuntimeError('daemon')})
+        self.assertEqual(docker.removals(), [['docker', 'rm', '-f', 'id-' + self.proxy],
+                                             ['docker', 'rm', '-f', 'id-' + self.runtime],
+                                             ['docker', 'network', 'rm', 'id-' + self.cell.task]])
+        self.assertEqual(docker.containers, {self.proxy: ('id-' + self.proxy, TOKEN)})
+        self.assertEqual(self.errors(), [('container-remove', self.proxy, 'RuntimeError')])
+
+    def test_network_remove_failure(self):
+        self.run_with({(NETWORK_REMOVE, None): TIMEOUT})
+        self.assertEqual(self.errors(), [('network-cleanup', self.cell.task, 'TimeoutExpired')])
+
+    def test_network_inspect_timeout(self):
+        self.run_with({(NETWORK_INSPECT, None): TIMEOUT})
+        self.assertEqual(self.errors(), [('network-cleanup', self.cell.task, 'TimeoutExpired')])
+
+    def test_every_docker_cleanup_call_fails(self):
+        docker = self.run_with({(INSPECT, None): TIMEOUT, (NETWORK_INSPECT, None): TIMEOUT})
+        self.assertEqual(docker.removals(), [])
+        self.assertEqual(self.errors(), [('container-inspect', self.runtime, 'TimeoutExpired'),
+                                         ('container-inspect', self.proxy, 'TimeoutExpired'),
+                                         ('network-cleanup', self.cell.task, 'TimeoutExpired')])
+
+    def test_clean_run_records_no_errors(self):
+        self.run_with({})
+        self.assertEqual(self.run.cleanup_errors, [])
+
+
 class FixtureFromSkipsBuilder(unittest.TestCase):
     def test_fixture_from_never_starts_a_build_container_and_reports_leftovers(self):
         tmp = temporary_directory(self)
@@ -405,7 +539,33 @@ class FixtureFromSkipsBuilder(unittest.TestCase):
         self.assertTrue(run_filter.fullmatch(containers[-1]))
         self.assertTrue(run_filter.fullmatch(networks[-1]))
         receipt = json.loads(out.getvalue())
-        self.assertEqual((receipt['leftover_containers'], receipt['leftover_networks']), ([], []))
+        self.assertEqual((receipt['leftover_containers'], receipt['leftover_networks'], receipt['cleanup_errors']),
+                         ([], [], []))
+        self.assertEqual(summary['cleanup'], {'errors': [], 'leftover_containers': [], 'leftover_networks': []})
+
+    def test_failed_leftover_query_is_reported_not_raised(self):
+        tmp = temporary_directory(self)
+        fixture = tmp / 'prebuilt'
+        write_binary(fixture)(None)
+        (fixture / 'build.stdout').write_text(BUILD_STDOUT)
+        argv = ['run.py', '--crate-version', '4.11.1', '--server-index', 'sha256:x', '--cells', '',
+                '--fixture-from', str(fixture), '--work-dir', str(tmp / 'work')]
+        docker = FakeDocker(raise_on={(('docker', 'ps'), None): TIMEOUT})
+        cell = mock.Mock()
+        cell.return_value.run.return_value = {'outcome': 'pass'}
+        out = io.StringIO()
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(run, 'call', docker), \
+                mock.patch.object(run, 'server_identity', return_value={'executed_manifest': 'img'}), \
+                mock.patch.object(run, 'crate_provenance', return_value={'baselines': {'pass': True}}), \
+                mock.patch.object(run, 'Cell', cell), contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            run.main()
+        receipt = json.loads(out.getvalue())
+        self.assertIsNone(receipt['leftover_containers'])
+        self.assertEqual(receipt['leftover_networks'], [])
+        self.assertEqual(receipt['cleanup_errors'],
+                         [{'step': 'leftover-query', 'object': 'containers', 'error': 'TimeoutExpired'}])
+        summary = json.loads((tmp / 'work' / 'summary.json').read_text())
+        self.assertEqual(summary['cleanup']['errors'], receipt['cleanup_errors'])
 
 
 if __name__ == '__main__':
