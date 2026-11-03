@@ -5,77 +5,116 @@
   "protocol_version": "1.20",
   "bindings": ["rust"],
   "workflow": {"type": "corpus.redrive-reused-signal-wait", "input": [], "payload_codec": "avro"},
+  "worker_task": {"workflow_id": "regression-corpus-redrive-signal", "payload_codec": "avro"},
   "history": [
-    {"sequence": 1, "event_type": "WorkflowStarted", "recorded_at": "2026-11-03T00:05:00+00:00", "payload": {}},
     {
-      "sequence": 2, "event_type": "CooperativeCancellationRequested", "recorded_at": "2026-11-03T00:00:00.000000Z",
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "recorded_at": "2026-11-03T00:05:00+00:00",
       "payload": {
-        "workflow_command_id": "original-request", "workflow_run_id": "regression-corpus-run",
-        "cleanup_deadline_at": "2026-11-03T00:00:30.000000Z",
-        "cancellation": {
-          "schema": "durable-workflow.cancellation-context/v1",
-          "request_id": "original-request", "root_request_id": "original-request",
-          "root_workflow_instance_id": "regression-corpus-rust-redrive-reused-signal-wait-clock",
-          "root_workflow_run_id": "regression-corpus-run", "parent_request_id": null,
-          "reason": null, "requester": {"type": "operator", "id": "fixture-operator"}, "source": "control_plane",
-          "requested_at": "2026-11-03T00:00:00.000000Z", "cleanup_deadline_at": "2026-11-03T00:00:30.000000Z",
-          "lineage": [{"request_id": "original-request", "workflow_instance_id": "regression-corpus-rust-redrive-reused-signal-wait-clock", "workflow_run_id": "regression-corpus-run"}]
-        }
+        "workflow_class": "Tests\\Fixtures\\V2\\TestRedriveSignalWorkflow",
+        "workflow_type": "corpus.redrive-reused-signal-wait",
+        "workflow_instance_id": "regression-corpus-redrive-signal",
+        "workflow_run_id": "regression-corpus-run",
+        "workflow_command_id": "01JBREDRIVECOMMAND00000000",
+        "continued_from_run_id": "01JBREDRIVESOURCERUN000000",
+        "resume_step_sequence": 2,
+        "recovery_kind": "redrive",
+        "execution_deadline_at": null,
+        "run_deadline_at": null,
+        "replayed_started_at": "2026-11-03T00:00:00+00:00",
+        "workflow_link_id": "01JBREDRIVELINK00000000000"
       }
     },
     {
-      "sequence": 3, "event_type": "CooperativeCancellationDelivered", "recorded_at": "2026-11-03T00:00:01+00:00",
-      "payload": {"workflow_command_id": "original-request", "workflow_run_id": "regression-corpus-run", "sequence": 1, "call_kind": "timer"}
-    },
-    {
-      "sequence": 4, "event_type": "SignalWaitOpened", "recorded_at": "2026-11-03T00:05:00+00:00",
+      "sequence": 2,
+      "event_type": "SignalWaitOpened",
+      "recorded_at": "2026-11-03T00:05:00+00:00",
       "payload": {
         "signal_name": "approve",
         "signal_wait_id": "01M6H8VWAMNSM12WCT4KJ4EQN3",
-        "sequence": 2,
+        "sequence": 1,
         "reused_from_run_id": "01JBREDRIVESOURCERUN000000",
-        "reused_recorded_at": "2026-11-03T00:00:06+00:00"
+        "reused_recorded_at": "2026-11-03T00:00:00+00:00"
       }
     },
     {
-      "sequence": 5, "event_type": "SignalReceived", "recorded_at": "2026-11-03T00:05:00+00:00",
+      "sequence": 3,
+      "event_type": "SignalReceived",
+      "recorded_at": "2026-11-03T00:05:00+00:00",
       "payload": {
         "workflow_command_id": "01m6h8vwbfwstfzz0nn2gy924h",
         "signal_id": "01m6h8vwbfwstfzz0nn2gy924j",
-        "workflow_instance_id": "regression-corpus-rust-redrive-reused-signal-wait-clock",
+        "workflow_instance_id": "regression-corpus-redrive-signal",
         "workflow_run_id": "01JBREDRIVESOURCERUN000000",
         "signal_name": "approve",
         "signal_wait_id": "01M6H8VWAMNSM12WCT4KJ4EQN3",
         "arguments": "wwHioz3/VYAiNwwCCgpHcmFjZQA=",
         "payload_codec": "avro",
         "reused_from_run_id": "01JBREDRIVESOURCERUN000000",
-        "reused_recorded_at": "2026-11-03T00:00:06+00:00"
+        "reused_recorded_at": "2026-11-03T00:00:00+00:00"
       }
     },
     {
-      "sequence": 6, "event_type": "SignalApplied", "recorded_at": "2026-11-03T00:05:00+00:00",
+      "sequence": 4,
+      "event_type": "SignalApplied",
+      "recorded_at": "2026-11-03T00:05:00+00:00",
       "payload": {
         "workflow_command_id": "01m6h8vwbfwstfzz0nn2gy924h",
         "signal_id": "01m6h8vwbfwstfzz0nn2gy924j",
         "signal_name": "approve",
         "signal_wait_id": "01M6H8VWAMNSM12WCT4KJ4EQN3",
-        "sequence": 2,
+        "sequence": 1,
         "value": "wwHioz3/VYAiNwoKR3JhY2U=",
         "reused_from_run_id": "01JBREDRIVESOURCERUN000000",
-        "reused_recorded_at": "2026-11-03T00:00:06+00:00"
+        "reused_recorded_at": "2026-11-03T00:00:00+00:00"
+      }
+    },
+    {
+      "sequence": 5,
+      "event_type": "CooperativeCancellationRequested",
+      "recorded_at": "2026-11-03T00:05:01+00:00",
+      "payload": {
+        "workflow_command_id": "successor-request",
+        "workflow_run_id": "regression-corpus-run",
+        "cleanup_deadline_at": "2026-11-03T00:05:31.000000Z",
+        "cancellation": {
+          "schema": "durable-workflow.cancellation-context/v1",
+          "request_id": "successor-request",
+          "root_request_id": "successor-request",
+          "root_workflow_instance_id": "regression-corpus-redrive-signal",
+          "root_workflow_run_id": "regression-corpus-run",
+          "parent_request_id": null,
+          "reason": null,
+          "requester": {
+            "type": "operator",
+            "id": "fixture-operator"
+          },
+          "source": "control_plane",
+          "requested_at": "2026-11-03T00:05:01.000000Z",
+          "cleanup_deadline_at": "2026-11-03T00:05:31.000000Z",
+          "lineage": [
+            {
+              "request_id": "successor-request",
+              "workflow_instance_id": "regression-corpus-redrive-signal",
+              "workflow_run_id": "regression-corpus-run"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "sequence": 6,
+      "event_type": "CooperativeCancellationDelivered",
+      "recorded_at": "2026-11-03T00:05:02+00:00",
+      "payload": {
+        "workflow_command_id": "successor-request",
+        "workflow_run_id": "regression-corpus-run",
+        "sequence": 2,
+        "call_kind": "activity"
       }
     }
   ],
-  "command_sequence": [
-    {
-      "type": "schedule_activity",
-      "activity_type": "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
-      "arguments": [["Grace"], [["Grace"]], 24.0]
-    }
-  ],
-  "expected": {
-    "type": "schedule_activity",
-    "activity_type": "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
-    "arguments": [["Grace"], [["Grace"]], 24.0]
-  }
+  "command_sequence": [{"type": "schedule_activity", "activity_type": "corpus.redrive.cleanup", "arguments": [["Grace"], [["Grace"]], 29.0]}],
+  "expected": {"type": "schedule_activity", "activity_type": "corpus.redrive.cleanup", "arguments": [["Grace"], [["Grace"]], 29.0]}
 }

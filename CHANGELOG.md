@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-- Qualify replay of Workflow 2.19 redrive-reused `MemoUpserted`,
-  `SearchAttributesUpserted` and applied signal waits (`SignalWaitOpened`,
-  `SignalReceived`, `SignalApplied`). Of these, only `SignalApplied` sets the
-  cooperative cancellation clock, and it already uses `reused_recorded_at`.
-  Upserts, wait-open and receipt events never move `remaining()`.
+- Qualify replay of Workflow 2.19 redrive successors that reuse
+  `MemoUpserted`, `SearchAttributesUpserted` or an applied signal wait
+  (`SignalWaitOpened`, `SignalReceived`, `SignalApplied`). Values replay
+  unchanged and nothing is re-emitted. A reused prefix always precedes any
+  cancellation delivered on the successor, so these events never change
+  `remaining()`.
 
 ## 4.11.1
 
