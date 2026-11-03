@@ -482,6 +482,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.durable-selection-portable-affinity"
             | "corpus.selection-cancel-request"
             | "corpus.redrive-boundary"
+            | "corpus.redrive-reused-markers"
+            | "corpus.redrive-reused-timer"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
             | "corpus.nexus-result"
@@ -855,6 +857,41 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         "corpus.redrive-boundary" => {
             worker.register_workflow(workflow_type, |ctx, _input| async move {
                 ctx.activity("corpus.redrive.activity", json!([])).await?;
+                Ok(json!("unexpected completion"))
+            });
+        }
+        "corpus.redrive-reused-markers" => {
+            worker.register_workflow(workflow_type, move |ctx, _input| {
+                let observed_calls = Arc::clone(&observed_calls);
+                async move {
+                    let captured = ctx.side_effect(|| {
+                        observed_calls.fetch_add(1, Ordering::SeqCst);
+                        "re-executed".to_string()
+                    })?;
+                    let version = ctx.get_version("redrive-markers", -1, 1)?;
+                    ctx.activity(
+                        "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
+                        json!([captured, version]),
+                    )
+                    .await?;
+                    Ok(json!("unexpected completion"))
+                }
+            });
+        }
+        "corpus.redrive-reused-timer" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let greeting = ctx
+                    .activity(
+                        "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
+                        json!(["Taylor"]),
+                    )
+                    .await?;
+                ctx.sleep(Duration::from_secs(5)).await?;
+                ctx.activity(
+                    "Tests\\Fixtures\\V2\\TestRedriveSecondActivity",
+                    json!([greeting]),
+                )
+                .await?;
                 Ok(json!("unexpected completion"))
             });
         }
@@ -1328,6 +1365,68 @@ async fn recorded_activity_failure_boundary_is_stable_across_cold_workers() {
         .expect("cold failed-activity replay must execute");
 
     assert_eq!(first, restarted);
+}
+
+async fn redrive_reused_fixture_replays_identically_on_cold_workers(
+    name: &str,
+    reused_event_types: &[&str],
+) -> Value {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions")
+        .join(name);
+    let fixture: Value = serde_json::from_str(
+        &fs::read_to_string(&fixture_path).expect("read checked-in redrive reuse fixture"),
+    )
+    .expect("parse checked-in redrive reuse fixture");
+    let history = fixture["history"]
+        .as_array()
+        .expect("redrive reuse fixture history");
+    for event_type in reused_event_types {
+        let events: Vec<&Value> = history
+            .iter()
+            .filter(|event| event["event_type"] == *event_type)
+            .collect();
+        assert!(!events.is_empty(), "{name} must contain {event_type}");
+        for event in events {
+            assert!(
+                event["payload"]["reused_from_run_id"].is_string()
+                    && event["payload"]["reused_recorded_at"].is_string(),
+                "{name} {event_type} must carry both redrive reuse keys"
+            );
+        }
+    }
+
+    let first = execute_fixture_delivery(&fixture, "delivery-a")
+        .await
+        .unwrap_or_else(|error| panic!("{name} first replay: {error}"));
+    let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+        .await
+        .unwrap_or_else(|error| panic!("{name} cold replay: {error}"));
+    assert_eq!(first, restarted);
+    first
+}
+
+#[tokio::test]
+async fn redriven_reused_side_effect_and_version_marker_replay_without_reexecution() {
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-markers-clock.json",
+        &["SideEffectRecorded", "VersionMarkerRecorded"],
+    )
+    .await;
+    assert_eq!(observed["side_effect_callback_calls"], json!(0));
+    assert_eq!(observed["arguments"], json!(["0123456789abcdef", 1]));
+}
+
+#[tokio::test]
+async fn redriven_reused_fired_timer_does_not_wait_again() {
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-timer-clock.json",
+        &["ActivityCompleted", "TimerFired"],
+    )
+    .await;
+    let commands = observed["command_sequence"].as_array().expect("commands");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["type"], "schedule_activity");
 }
 
 #[tokio::test]
