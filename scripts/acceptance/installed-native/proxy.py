@@ -11,15 +11,15 @@ state = pathlib.Path('/state')
 lock = threading.Lock()
 
 # Response headers the SDK reads from the native Server; anything else is dropped.
-FORWARDED_HEADERS = frozenset((
-    'content-type',
-    'retry-after',
-    'x-durable-workflow-control-plane-version',
-    'x-durable-workflow-payload-codec',
-    'x-durable-workflow-payload-sha256',
-    'x-durable-workflow-payload-size',
-    'x-durable-workflow-protocol-version',
-))
+FORWARDED_HEADERS = {
+    'content-type': 'Content-Type',
+    'retry-after': 'Retry-After',
+    'x-durable-workflow-control-plane-version': 'X-Durable-Workflow-Control-Plane-Version',
+    'x-durable-workflow-payload-codec': 'X-Durable-Workflow-Payload-Codec',
+    'x-durable-workflow-payload-sha256': 'X-Durable-Workflow-Payload-Sha256',
+    'x-durable-workflow-payload-size': 'X-Durable-Workflow-Payload-Size',
+    'x-durable-workflow-protocol-version': 'X-Durable-Workflow-Protocol-Version',
+}
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 # HTAB, SP and visible ASCII only: no CR, LF, other C0, DEL or C1/8-bit bytes.
 HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")
@@ -31,13 +31,16 @@ def forwardable_headers(pairs):
     Every header is validated before any is relayed or dropped: a name that is
     not an RFC 9110 token, or a value with anything other than HTAB, SP and
     visible ASCII, refuses the whole response. Only the reviewed set in
-    FORWARDED_HEADERS is relayed; hop-by-hop and every other header is dropped.
+    FORWARDED_HEADERS is relayed, under its canonical name; hop-by-hop and every other header is dropped.
     """
     pairs = list(pairs)
     for name, value in pairs:
         if not HEADER_NAME.fullmatch(name) or not HEADER_VALUE.fullmatch(value):
             raise ValueError('refusing to relay an unsafe upstream header')
-    return [(name, value) for name, value in pairs if name.lower() in FORWARDED_HEADERS]
+    # Names come from the constant table and values are CR/LF-stripped after the
+    # refusal above, so the relayed header can never carry a line break.
+    return [(FORWARDED_HEADERS[name.lower()], value.replace('\r', '').replace('\n', ''))
+            for name, value in pairs if name.lower() in FORWARDED_HEADERS]
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
