@@ -107,12 +107,12 @@ impl WorkerProtocolVersion {
     }
 }
 const WORKFLOW_HISTORY_PAGE_SIZE: usize = 500;
+/// History pages read to find a terminal event when a description lacks detail.
+const TERMINAL_HISTORY_PAGE_LIMIT: usize = 20;
 /// First additive worker protocol that defines portable worker-affinity features.
 pub const PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION: &str = "1.18";
 pub const CONTROL_PLANE_VERSION: &str = "2";
 pub const DEFAULT_CODEC: &str = "avro";
-/// History pages read to find a terminal event when a description lacks detail.
-const TERMINAL_HISTORY_PAGE_LIMIT: usize = 20;
 pub const SDK_VERSION: &str = concat!("durable-workflow-rust/", env!("CARGO_PKG_VERSION"));
 /// Worker-registration capability for authored condition-wait occurrence identity.
 pub const CONDITION_WAIT_OCCURRENCE_IDENTITY_CAPABILITY: &str =
