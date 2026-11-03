@@ -5537,7 +5537,13 @@ fn activity_task_rejection_is_final(error: &Error) -> bool {
     )
 }
 
-fn workflow_task_report_is_terminal_timeout(
+/// A workflow-task report the server answered with a non-recorded receipt
+/// for exactly this task, attempt and run, which settles the managed tick:
+/// the run's terminal timeout (`run_timed_out` with `run_status=failed`), or a
+/// task this worker no longer holds (`task_not_leased`, for example after the
+/// run was cancelled or the task was reclaimed). Nothing was recorded, and the
+/// server owns any redelivery.
+fn workflow_task_report_is_settled(
     error: &Error,
     task_id: &str,
     workflow_task_attempt: u64,
@@ -5557,9 +5563,13 @@ fn workflow_task_report_is_terminal_timeout(
         return false;
     };
 
-    body.get("recorded").and_then(Value::as_bool) == Some(false)
-        && body.get("reason").and_then(Value::as_str) == Some("run_timed_out")
-        && body.get("run_status").and_then(Value::as_str) == Some("failed")
+    let settled = match body.get("reason").and_then(Value::as_str) {
+        Some("run_timed_out") => body.get("run_status").and_then(Value::as_str) == Some("failed"),
+        Some("task_not_leased") => true,
+        _ => false,
+    };
+    settled
+        && body.get("recorded").and_then(Value::as_bool) == Some(false)
         && body.get("run_id").and_then(Value::as_str) == Some(run_id)
         && body.get("task_id").and_then(Value::as_str) == Some(task_id)
         && body.get("workflow_task_attempt").and_then(Value::as_u64) == Some(workflow_task_attempt)
@@ -8753,6 +8763,9 @@ impl Worker {
     /// selected task and run with `recorded=false`, `reason=run_timed_out`, and
     /// terminal `run_status=failed`, the workflow tick is considered settled:
     /// the late command was not recorded and cannot replace the terminal run.
+    /// A `recorded=false`, `reason=task_not_leased` receipt for the same task,
+    /// attempt and run settles the tick the same way: this worker no longer
+    /// holds the task, and the server owns any redelivery.
     /// Every other rejection remains an error. This worker-level
     /// race handling is distinct from [`WorkflowResultOptions::timeout`], which
     /// only bounds how long a client waits for a result.
@@ -8966,13 +8979,22 @@ impl Worker {
             }
         };
 
-        // A run may expire while either a completion or a failure report is
-        // in flight. Settle only the matching task's authoritative timeout.
+        // A run may expire, or the task may be reclaimed, while a completion
+        // or failure report is in flight. Settle only the matching task's
+        // non-recorded receipt.
         if let Err(error) = reported {
             self.discard_sticky_snapshot(snapshot.as_ref())?;
-            if !workflow_task_report_is_terminal_timeout(&error, task_id, attempt, run_id) {
+            if !workflow_task_report_is_settled(&error, task_id, attempt, run_id) {
                 return Err(error);
             }
+            #[cfg(feature = "telemetry")]
+            tracing::debug!(
+                task_id,
+                workflow_task_attempt = attempt,
+                run_id,
+                error = %error,
+                "settled a non-recorded workflow-task receipt"
+            );
         }
 
         Ok(ManagedPollOutcome::Handled)
@@ -29480,6 +29502,102 @@ mod tests {
                     "created_task_ids":[],"reason":"run_timed_out"}).to_string())),
             "/api/worker/workflow-tasks/unrelated-task/complete" => Some(("200 OK", json!({"outcome":"completed","recorded":true}).to_string())),
             _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_worker_settles_matching_task_not_leased_receipt_and_keeps_polling() {
+        // Published PHP Server 2.11.8 answered a completion after cancellation
+        // with this receipt; the 4.10.2 managed worker exited on it (#157).
+        let response = r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"outcome":"completed","recorded":false,"run_id":"run-selected-timeout","run_status":null,"created_task_ids":[],"reason":"task_not_leased"}"#;
+        let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let direct_error = client
+            .complete_workflow_task(
+                "workflow-timeout-task",
+                "timeout-worker",
+                3,
+                vec![json!({"type": "complete_workflow", "result": fixture_envelope(Value::Null)})],
+            )
+            .await
+            .expect_err("the low-level client preserves the completion rejection");
+        assert!(
+            matches!(direct_error, Error::Http { status, .. } if status == reqwest::StatusCode::CONFLICT)
+        );
+
+        let mut worker = Worker::new(client, "rust-workers")
+            .worker_id("timeout-worker")
+            .poll_timeout(Duration::from_millis(10));
+        worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+            Ok(json!({"late": "result"}))
+        });
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("a matching task_not_leased receipt settles the tick"),
+            1
+        );
+        assert_eq!(
+            worker
+                .run_once()
+                .await
+                .expect("the managed worker keeps polling"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worker_keeps_nearby_task_not_leased_conflicts_as_errors() {
+        for (name, response) in [
+            (
+                "recorded",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":true,"run_id":"run-selected-timeout","reason":"task_not_leased"}"#,
+            ),
+            (
+                "recorded missing",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"run_id":"run-selected-timeout","reason":"task_not_leased"}"#,
+            ),
+            (
+                "different task",
+                r#"{"task_id":"other-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","reason":"task_not_leased"}"#,
+            ),
+            (
+                "different attempt",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":4,"recorded":false,"run_id":"run-selected-timeout","reason":"task_not_leased"}"#,
+            ),
+            (
+                "different run",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-other","reason":"task_not_leased"}"#,
+            ),
+            (
+                "other reason",
+                r#"{"task_id":"workflow-timeout-task","workflow_task_attempt":3,"recorded":false,"run_id":"run-selected-timeout","reason":"lease_owner_mismatch"}"#,
+            ),
+        ] {
+            let server = MockWorkerServer::workflow_completion("409 Conflict", response);
+            let client = Client::builder(server.base_url())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("client");
+            let mut worker = Worker::new(client, "rust-workers")
+                .worker_id("timeout-worker")
+                .poll_timeout(Duration::from_millis(10));
+            worker.register_workflow("timeout.workflow", |_ctx, _input| async move {
+                Ok(json!({"late": "result"}))
+            });
+            let error = worker
+                .run_once()
+                .await
+                .expect_err(&format!("{name} must remain an error"));
+            assert!(
+                matches!(error, Error::Http { .. }),
+                "{name}: unexpected error {error}"
+            );
         }
     }
 
