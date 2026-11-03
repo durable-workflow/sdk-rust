@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.11.1
+
 - Advance the cooperative cancellation clock to a redrive-reused step's
   original `reused_recorded_at` time instead of the time the successor run
   copied it, matching Core, so `remaining()` after reused activity completions
