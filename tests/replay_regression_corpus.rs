@@ -485,6 +485,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.redrive-reused-markers"
             | "corpus.redrive-reused-timer"
             | "corpus.redrive-reused-cancellation-clock"
+            | "corpus.redrive-reused-upserts"
+            | "corpus.redrive-reused-signal-wait"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
             | "corpus.nexus-result"
@@ -906,6 +908,57 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 ctx.activity("corpus.redrive.cleanup", json!([])).await?;
                 ctx.sleep(Duration::from_secs(5)).await?;
                 Ok(json!(context.remaining()?.as_secs_f64()))
+            });
+        }
+        "corpus.redrive-reused-upserts" => {
+            // Mirrors Core's TestRedriveVisibilityWorkflow: replay time is read
+            // straight after each reused upsert.
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let _ = ctx.sleep(Duration::from_secs(10)).await;
+                let context = ctx
+                    .cancellation_context()?
+                    .expect("committed rich cancellation");
+                let _shield = ctx.cancellation_shield()?;
+                ctx.upsert_memo(AvroValue::Map(BTreeMap::from([
+                    (
+                        "stage".to_string(),
+                        AvroValue::String("greeting".to_string()),
+                    ),
+                    (
+                        "customer".to_string(),
+                        AvroValue::String("Taylor".to_string()),
+                    ),
+                ])))?;
+                let after_memo = context.remaining()?.as_secs_f64();
+                ctx.upsert_search_attributes(
+                    SearchAttributeUpdate::new().keyword("Stage", "greeting")?,
+                )?;
+                let after_search_attributes = context.remaining()?.as_secs_f64();
+                ctx.activity(
+                    "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
+                    json!([after_memo, after_search_attributes]),
+                )
+                .await?;
+                Ok(json!("unexpected completion"))
+            });
+        }
+        "corpus.redrive-reused-signal-wait" => {
+            // Mirrors Core's TestRedriveSignalWorkflow: replay time is read
+            // straight after the reused applied signal wait.
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let _ = ctx.sleep(Duration::from_secs(10)).await;
+                let context = ctx
+                    .cancellation_context()?
+                    .expect("committed rich cancellation");
+                let _shield = ctx.cancellation_shield()?;
+                let approved_by = ctx.wait_signal("approve").await?;
+                let after_signal = context.remaining()?.as_secs_f64();
+                ctx.activity(
+                    "Tests\\Fixtures\\V2\\TestRedriveFirstActivity",
+                    json!([approved_by, ctx.signals("approve")?, after_signal]),
+                )
+                .await?;
+                Ok(json!("unexpected completion"))
             });
         }
         "corpus.memo-signed-zero" => {
@@ -1663,4 +1716,150 @@ async fn redriven_reused_steps_advance_cancellation_clock_at_original_time() {
     )
     .await;
     assert_eq!(observed["result"], json!(18.0));
+}
+
+/// Run a checked-in redrive fixture with its history changed and return the
+/// arguments of the single command it then emits.
+async fn redrive_reused_arguments_with_history(
+    name: &str,
+    change: impl FnOnce(&mut Vec<Value>),
+) -> Result<Value, String> {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/replay-regressions")
+        .join(name);
+    let mut fixture: Value = serde_json::from_str(
+        &fs::read_to_string(&fixture_path).expect("read checked-in redrive reuse fixture"),
+    )
+    .expect("parse checked-in redrive reuse fixture");
+    change(fixture["history"].as_array_mut().expect("fixture history"));
+    fixture.as_object_mut().unwrap().remove("command_sequence");
+    fixture["expected"] = json!({"type": "schedule_activity"});
+    let observed = execute_fixture_delivery(&fixture, "changed-history").await?;
+    Ok(observed["arguments"].clone())
+}
+
+fn set_event_times(history: &mut [Value], event_type: &str, recorded_at: &str, reused_at: &str) {
+    let mut found = false;
+    for event in history
+        .iter_mut()
+        .filter(|event| event["event_type"] == event_type)
+    {
+        event["recorded_at"] = json!(recorded_at);
+        event["payload"]["reused_recorded_at"] = json!(reused_at);
+        found = true;
+    }
+    assert!(found, "history must contain {event_type}");
+}
+
+#[tokio::test]
+async fn redriven_reused_upserts_keep_values_and_do_not_move_replay_time() {
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-upserts-clock.json",
+        &["MemoUpserted", "SearchAttributesUpserted"],
+    )
+    .await;
+    // The upserts are replayed, not re-emitted: only the next activity is new.
+    let commands = observed["command_sequence"].as_array().expect("commands");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["type"], "schedule_activity");
+    // remaining() reads the last consumed blocking result (the delivery at
+    // 00:00:01); synchronous upserts never enter the cancellation clock.
+    assert_eq!(observed["arguments"], json!([29.0, 29.0]));
+
+    // Moving the upserts' own and reused times leaves replay time unchanged.
+    for event_type in ["MemoUpserted", "SearchAttributesUpserted"] {
+        let arguments =
+            redrive_reused_arguments_with_history("redrive-reused-upserts-clock.json", |history| {
+                set_event_times(
+                    history,
+                    event_type,
+                    "2026-11-03T00:00:02+00:00",
+                    "2026-11-03T00:00:20+00:00",
+                );
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{event_type} time change: {error}"));
+        assert_eq!(arguments, json!([29.0, 29.0]), "{event_type}");
+    }
+
+    // A reused upsert is still checked against the workflow's own values.
+    let error =
+        redrive_reused_arguments_with_history("redrive-reused-upserts-clock.json", |history| {
+            let event = history
+                .iter_mut()
+                .find(|event| event["event_type"] == "SearchAttributesUpserted")
+                .unwrap();
+            event["payload"]["attributes"]["Stage"] = json!("changed");
+            event["payload"]["merged"]["Stage"] = json!("changed");
+        })
+        .await
+        .expect_err("a changed reused search attribute must not replay");
+    assert!(error.contains("search_attribute_value_mismatch"), "{error}");
+    let error =
+        redrive_reused_arguments_with_history("redrive-reused-upserts-clock.json", |history| {
+            let event = history
+                .iter_mut()
+                .find(|event| event["event_type"] == "MemoUpserted")
+                .unwrap();
+            // The same map with customer "Taylox".
+            let changed = json!({"codec": "avro", "blob": CHANGED_MEMO_BLOB});
+            event["payload"]["entries"] = changed.clone();
+            event["payload"]["merged"] = changed;
+        })
+        .await
+        .expect_err("a changed reused memo must not replay");
+    assert!(error.contains("memo_update_mismatch"), "{error}");
+}
+
+const CHANGED_MEMO_BLOB: &str = "wwHioz3/VYAiNw4EEGN1c3RvbWVyCgxUYXlsb3gKc3RhZ2UKEGdyZWV0aW5nAA==";
+
+#[tokio::test]
+async fn redriven_reused_signal_wait_replays_at_its_original_applied_time() {
+    let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
+        "redrive-reused-signal-wait-clock.json",
+        &["SignalWaitOpened", "SignalReceived", "SignalApplied"],
+    )
+    .await;
+    // The wait is not reopened: only the next activity is new.
+    let commands = observed["command_sequence"].as_array().expect("commands");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["type"], "schedule_activity");
+    // The applied value, the received signal and the time all come from the
+    // source run: SignalApplied's reused_recorded_at (00:00:06), not its
+    // successor recorded_at (00:05:00).
+    assert_eq!(observed["arguments"], json!([["Grace"], [["Grace"]], 24.0]));
+
+    // SignalApplied is the only one of the three events that sets the time.
+    let arguments =
+        redrive_reused_arguments_with_history("redrive-reused-signal-wait-clock.json", |history| {
+            set_event_times(
+                history,
+                "SignalApplied",
+                "2026-11-03T00:05:00+00:00",
+                "2026-11-03T00:00:16+00:00",
+            );
+        })
+        .await
+        .expect("moved SignalApplied replay");
+    assert_eq!(arguments[2], json!(14.0));
+    for event_type in ["SignalWaitOpened", "SignalReceived"] {
+        let arguments = redrive_reused_arguments_with_history(
+            "redrive-reused-signal-wait-clock.json",
+            |history| {
+                set_event_times(
+                    history,
+                    event_type,
+                    "2026-11-03T00:00:02+00:00",
+                    "2026-11-03T00:00:20+00:00",
+                );
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{event_type} time change: {error}"));
+        assert_eq!(
+            arguments,
+            json!([["Grace"], [["Grace"]], 24.0]),
+            "{event_type}"
+        );
+    }
 }
