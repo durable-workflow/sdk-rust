@@ -1,0 +1,63 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-typed-activity-failure-terminal-detail",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {
+    "type": "corpus.redrive-boundary",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.redrive.activity"
+      }
+    },
+    {
+      "event_type": "ActivityFailed",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.redrive.activity",
+        "activity_execution_id": "activity-typed-1",
+        "failure_category": "activity",
+        "exception_type": "QualificationRejected",
+        "exception_class": "RuntimeException",
+        "non_retryable": true,
+        "message": "rejected bob",
+        "exception": {
+          "type": "QualificationRejected",
+          "class": "RuntimeException",
+          "message": "rejected bob"
+        }
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "fail_workflow",
+      "exception_type": "ActivityFailed",
+      "exception_class": "durable_workflow::ActivityFailure",
+      "non_retryable": true,
+      "failed_step_sequence": 1,
+      "failed_activity_execution_id": "activity-typed-1",
+      "exception": {
+        "type": "ActivityFailed",
+        "class": "durable_workflow::ActivityFailure",
+        "properties": {
+          "activity_exception_type": "QualificationRejected",
+          "activity_exception_class": "RuntimeException",
+          "activity_non_retryable": true
+        }
+      }
+    }
+  ],
+  "expected": {
+    "type": "fail_workflow",
+    "exception_type": "ActivityFailed",
+    "non_retryable": true
+  }
+}
