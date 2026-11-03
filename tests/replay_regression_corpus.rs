@@ -1774,11 +1774,8 @@ async fn assert_reused_times_do_not_reach_remaining(name: &str, reused_event_typ
     }
 }
 
-/// The successor history must be one Workflow 2.19 can write: a redrive
-/// WorkflowStarted bound to the source run, then the reused prefix, then the
-/// successor's own cancellation at or after its start.
-fn assert_valid_redrive_successor(name: &str) {
-    let fixture: Value = serde_json::from_str(
+fn redrive_successor_fixture(name: &str) -> Value {
+    serde_json::from_str(
         &fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/replay-regressions")
@@ -1786,42 +1783,100 @@ fn assert_valid_redrive_successor(name: &str) {
         )
         .unwrap(),
     )
-    .unwrap();
-    let history = fixture["history"].as_array().unwrap();
-    let started = &history[0];
-    assert_eq!(started["event_type"], "WorkflowStarted", "{name}");
+    .unwrap()
+}
+
+fn check_redrive_successor(history: &[Value]) -> Result<(), String> {
+    fn require(condition: bool, message: &str) -> Result<(), String> {
+        condition.then_some(()).ok_or_else(|| message.to_string())
+    }
+    let started = history.first().ok_or("empty history")?;
+    require(
+        started["event_type"] == "WorkflowStarted",
+        "history must open with WorkflowStarted",
+    )?;
     let start = &started["payload"];
-    assert_eq!(start["recovery_kind"], "redrive", "{name}");
-    assert!(start["replayed_started_at"].is_string(), "{name}");
-    assert!(start["resume_step_sequence"].is_u64(), "{name}");
-    assert!(start["workflow_link_id"].is_string(), "{name}");
-    let started_at = started["recorded_at"].as_str().unwrap();
-    let source = start["continued_from_run_id"].as_str().unwrap();
+    require(start["recovery_kind"] == "redrive", "recovery_kind")?;
+    require(
+        start["replayed_started_at"].is_string(),
+        "replayed_started_at",
+    )?;
+    require(start["workflow_link_id"].is_string(), "workflow_link_id")?;
+    let started_at = started["recorded_at"].as_str().ok_or("start time")?;
+    let source = start["continued_from_run_id"]
+        .as_str()
+        .ok_or("continued_from_run_id")?;
     let mut prefix = true;
+    let mut last_reused_step = 0;
     for (index, event) in history.iter().enumerate().skip(1) {
-        assert_eq!(event["sequence"], json!(index + 1), "{name} history order");
-        let reused = event["payload"].get("reused_from_run_id").is_some();
-        if reused {
-            assert!(
-                prefix,
-                "{name} reused events must directly follow WorkflowStarted"
-            );
-            assert_eq!(event["payload"]["reused_from_run_id"], source, "{name}");
-            assert_eq!(event["recorded_at"], started["recorded_at"], "{name}");
+        require(event["sequence"] == json!(index + 1), "history order")?;
+        if event["payload"].get("reused_from_run_id").is_some() {
+            require(prefix, "reused events must directly follow WorkflowStarted")?;
+            require(
+                event["payload"]["reused_from_run_id"] == source,
+                "reused_from_run_id must match continued_from_run_id",
+            )?;
+            require(
+                event["recorded_at"] == started["recorded_at"],
+                "reused events are recorded with the successor start",
+            )?;
+            // SignalReceived has no step of its own; it belongs to its wait.
+            if let Some(step) = event["payload"]["sequence"].as_u64() {
+                last_reused_step = last_reused_step.max(step);
+            }
         } else {
             prefix = false;
-            assert!(
-                event["recorded_at"].as_str().unwrap() >= started_at,
-                "{name} {} predates the successor start",
-                event["event_type"]
-            );
+            require(
+                event["recorded_at"].as_str().ok_or("event time")? >= started_at,
+                "successor event predates the successor start",
+            )?;
+        }
+    }
+    require(last_reused_step > 0, "no reused workflow step")?;
+    // Redrive resumes at the step after the last one it reused.
+    require(
+        start["resume_step_sequence"].as_u64() == Some(last_reused_step + 1),
+        "resume_step_sequence must follow the last reused step",
+    )
+}
+
+/// The successor history must be one Workflow 2.19 can write: a redrive
+/// WorkflowStarted bound to the source run, then the reused prefix, then the
+/// successor's own cancellation at or after its start.
+fn assert_valid_redrive_successor(name: &str, resume_step_sequence: u64) {
+    let fixture = redrive_successor_fixture(name);
+    let history = fixture["history"].as_array().unwrap();
+    assert_eq!(
+        history[0]["payload"]["resume_step_sequence"],
+        json!(resume_step_sequence),
+        "{name}"
+    );
+    check_redrive_successor(history).unwrap_or_else(|error| panic!("{name}: {error}"));
+}
+
+#[test]
+fn redrive_successor_check_rejects_a_wrong_resume_step() {
+    for name in [
+        "redrive-reused-upserts-clock.json",
+        "redrive-reused-signal-wait-clock.json",
+    ] {
+        let fixture = redrive_successor_fixture(name);
+        let resume = fixture["history"][0]["payload"]["resume_step_sequence"]
+            .as_u64()
+            .unwrap();
+        for wrong in [json!(resume - 1), json!(resume + 1), json!(null)] {
+            let mut history = fixture["history"].as_array().unwrap().clone();
+            history[0]["payload"]["resume_step_sequence"] = wrong.clone();
+            let error = check_redrive_successor(&history)
+                .expect_err(&format!("{name} resume_step_sequence {wrong} must fail"));
+            assert!(error.contains("resume_step_sequence"), "{error}");
         }
     }
 }
 
 #[tokio::test]
 async fn redriven_reused_upserts_keep_values_and_never_reach_remaining() {
-    assert_valid_redrive_successor("redrive-reused-upserts-clock.json");
+    assert_valid_redrive_successor("redrive-reused-upserts-clock.json", 3);
     let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
         "redrive-reused-upserts-clock.json",
         &["MemoUpserted", "SearchAttributesUpserted"],
@@ -1873,7 +1928,7 @@ const CHANGED_MEMO_BLOB: &str = "wwHioz3/VYAiNw4EEGN1c3RvbWVyCgxUYXlsb3gKc3RhZ2U
 
 #[tokio::test]
 async fn redriven_reused_signal_wait_keeps_its_value_and_never_reaches_remaining() {
-    assert_valid_redrive_successor("redrive-reused-signal-wait-clock.json");
+    assert_valid_redrive_successor("redrive-reused-signal-wait-clock.json", 2);
     let observed = redrive_reused_fixture_replays_identically_on_cold_workers(
         "redrive-reused-signal-wait-clock.json",
         &["SignalWaitOpened", "SignalReceived", "SignalApplied"],
