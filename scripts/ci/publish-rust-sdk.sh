@@ -130,7 +130,7 @@ if ! jq -e --arg legacy "$server_compatibility" '
             (.value | type == "string") and
             (.value | test("^[1-9][0-9]*\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
             (.key == (.value | split(".")[0]))) and
-        .[($legacy | split(".")[0])] == $legacy and .["3"] == "3.0.0"
+        .[($legacy | split(".")[0])] == $legacy and .["3"] == "3.0.2"
     end
 ' <<<"$server_release_baselines" >/dev/null; then
     printf 'unexpected Rust SDK Server release baselines\n' >&2
