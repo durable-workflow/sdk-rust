@@ -337,6 +337,8 @@ def main():
             fixture = args.work_dir / 'fixture'
             summary['build'] = build_fixture(args, fixture)
         summary['crate'] = crate_provenance(args, fixture)
+        # Pull first: inspect alone fails on a clean host that never fetched the helper image.
+        call(['docker', 'pull', '--quiet', args.python_image], timeout=600)
         summary['python_image'] = image_identity(args.python_image)
         summary['cells'] = {name: Cell(args, name, args.work_dir, summary['server'], fixture, stamp).run()
                             for name in args.cells.split(',')}
