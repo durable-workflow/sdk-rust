@@ -26,6 +26,21 @@ class ForwardableHeadersTest(unittest.TestCase):
             ('Retry-After', '1'),
         ])
 
+    def test_reviewed_set_is_exact(self):
+        # Response headers the native Server emits and the SDK reads. Expanding
+        # this set needs review; request-only names such as
+        # x-durable-workflow-payload-completion must not be relayed.
+        self.assertEqual(FORWARDED_HEADERS, frozenset((
+            'content-type',
+            'retry-after',
+            'x-durable-workflow-control-plane-version',
+            'x-durable-workflow-payload-codec',
+            'x-durable-workflow-payload-sha256',
+            'x-durable-workflow-payload-size',
+            'x-durable-workflow-protocol-version',
+        )))
+        self.assertEqual(forwardable_headers([('X-Durable-Workflow-Payload-Completion', 'ctx')]), [])
+
     def test_reviewed_set_has_no_hop_by_hop_or_cookie_headers(self):
         for name in ('connection', 'keep-alive', 'transfer-encoding', 'content-length',
                      'te', 'trailer', 'upgrade', 'proxy-connection', 'set-cookie'):

@@ -16,7 +16,6 @@ FORWARDED_HEADERS = frozenset((
     'retry-after',
     'x-durable-workflow-control-plane-version',
     'x-durable-workflow-payload-codec',
-    'x-durable-workflow-payload-completion',
     'x-durable-workflow-payload-sha256',
     'x-durable-workflow-payload-size',
     'x-durable-workflow-protocol-version',
