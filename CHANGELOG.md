@@ -4,8 +4,10 @@
 
 ## 4.10.3
 
-- Declare minimum stable Server releases per major, including native Server 3.x,
-  without changing the existing 2.x fields, worker protocol or capabilities.
+- Declare minimum stable Server releases per major, including native Server 3.x
+  from 3.0.2, without changing the existing 2.x fields, worker protocol or
+  capabilities. Native 3.0.0 and 3.0.1 are not declared because their run
+  descriptions omit terminal failure detail (server#967).
   Validate the complete additive map before publication and retain it in release
   evidence alongside the published crate.
 
