@@ -2,11 +2,19 @@
 
 ## Unreleased
 
+## 4.11.0
+
 - Keep managed workers polling when a workflow-task completion or failure
   report receives a non-recorded `task_not_leased` receipt for the same task,
   attempt and run, for example after the run was cancelled. Recorded,
   mismatched and other conflicts still surface, and direct client calls keep
   the original HTTP error.
+- Fill `WorkflowFailed` and `WorkflowTimedOut` results from the run's terminal
+  history event when a terminal description carries no failure detail or timeout
+  reason, as native Server 3.0.1 does. The error type, message, retry flag and
+  `run_timeout`/`execution_timeout` reason are restored. Complete descriptions
+  and cancelled or terminated runs never read history, and an unreadable history
+  keeps the description-only outcome.
 
 ## 4.10.3
 

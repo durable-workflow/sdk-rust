@@ -27,6 +27,7 @@ pub use pagination::{
     PaginationError, WorkflowHistoryIterator, WorkflowHistoryOptions, WorkflowHistoryPage,
     WorkflowIterator, WorkflowListOptions, WorkflowListPage, WorkflowSummary,
 };
+mod terminal_failure_detail;
 mod tls;
 mod worker_capacity;
 mod worker_session;
@@ -6251,6 +6252,10 @@ impl WorkflowHandle {
                 });
             }
             if description.is_terminal() {
+                let description = self
+                    .client
+                    .with_terminal_failure_detail(description, &self.workflow_id, selected_run_id)
+                    .await;
                 let outcome =
                     workflow_terminal_outcome(&description, &self.workflow_id, selected_run_id);
                 return Err(match outcome.kind {
@@ -6288,6 +6293,10 @@ impl WorkflowHandle {
             }
 
             if description.is_terminal() {
+                let description = self
+                    .client
+                    .with_terminal_failure_detail(description, &self.workflow_id, selected_run_id)
+                    .await;
                 let outcome =
                     workflow_terminal_outcome(&description, &self.workflow_id, selected_run_id);
                 return Err(match outcome.kind {
@@ -28801,6 +28810,121 @@ mod tests {
             .contains("run_timeout_seconds cannot exceed execution_timeout_seconds"));
     }
 
+    async fn terminal_error(client: &Client, workflow_id: &str, run_id: Option<&str>) -> Error {
+        WorkflowHandle {
+            client: client.clone(),
+            workflow_id: workflow_id.to_string(),
+            run_id: run_id.map(str::to_string),
+            workflow_type: "terminal".to_string(),
+        }
+        .result(WorkflowResultOptions {
+            poll_interval: Duration::ZERO,
+            timeout: Duration::from_secs(1),
+        })
+        .await
+        .expect_err("terminal outcome")
+    }
+
+    #[tokio::test]
+    async fn workflow_result_fills_missing_terminal_detail_from_history() {
+        let server = MockWorkerServer::start();
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+
+        let Error::WorkflowFailed(failed) = terminal_error(&client, "wf-native-failed", None).await
+        else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(failed.run_id.as_deref(), Some("run-native-failed"));
+        assert_eq!(failed.reason, "failed");
+        assert_eq!(failed.exception_type.as_deref(), Some("ActivityFailed"));
+        assert_eq!(
+            failed.exception_class.as_deref(),
+            Some("durable_workflow::ActivityFailure")
+        );
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("activity failed (activity): rejected bob")
+        );
+        assert_eq!(failed.non_retryable, Some(true));
+        assert_eq!(failed.failure_category.as_deref(), Some("application"));
+        assert_eq!(failed.failure_id.as_deref(), Some("failure-native"));
+        assert_eq!(
+            failed.exception.as_ref().and_then(|e| e.get("type")),
+            Some(&json!("ActivityFailed"))
+        );
+
+        // The same detail is filled for an explicitly selected run.
+        let Error::WorkflowFailed(selected) =
+            terminal_error(&client, "wf-native-failed", Some("run-native-failed")).await
+        else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(selected.exception_type.as_deref(), Some("ActivityFailed"));
+
+        let Error::WorkflowTimedOut(timed_out) =
+            terminal_error(&client, "wf-native-timed-out", None).await
+        else {
+            panic!("expected WorkflowTimedOut");
+        };
+        assert_eq!(timed_out.reason, "execution_timeout");
+        assert_eq!(timed_out.failure_category.as_deref(), Some("timeout"));
+        assert_eq!(
+            timed_out.message.as_deref(),
+            Some("Workflow execution deadline expired.")
+        );
+
+        let Error::WorkflowFailed(paged) = terminal_error(&client, "wf-native-paged", None).await
+        else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(paged.exception_type.as_deref(), Some("PagedFailure"));
+        assert_eq!(paged.message.as_deref(), Some("found on page two"));
+
+        // An unavailable history keeps the describe-only outcome.
+        let Error::WorkflowFailed(bare) =
+            terminal_error(&client, "wf-native-no-history", None).await
+        else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(bare.reason, "failed");
+        assert_eq!(bare.exception_type, None);
+        assert_eq!(bare.message, None);
+        assert_eq!(
+            server
+                .method_for(
+                    "/api/workflows/wf-native-no-history/runs/run-native-no-history/history"
+                )
+                .as_deref(),
+            Some("GET")
+        );
+
+        // A complete description, and a non-failure terminal state, never read history.
+        let Error::WorkflowFailed(complete) =
+            terminal_error(&client, "wf-failed", Some("run-failed")).await
+        else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(complete.exception_type.as_deref(), Some("PaymentError"));
+        assert!(matches!(
+            terminal_error(&client, "wf-cancelled", None).await,
+            Error::WorkflowCancelled(_)
+        ));
+        assert!(matches!(
+            terminal_error(&client, "wf-timed-out", None).await,
+            Error::WorkflowTimedOut(_)
+        ));
+        for path in [
+            "/api/workflows/wf-failed/runs/run-failed/history",
+            "/api/workflows/wf-cancelled/runs/run-cancelled/history",
+            "/api/workflows/wf-timed-out/runs/run-timed-out/history",
+        ] {
+            assert_eq!(server.method_for(path), None, "{path} must not be read");
+        }
+    }
+
     #[tokio::test]
     async fn workflow_result_returns_each_typed_terminal_outcome() {
         let server = MockWorkerServer::start();
@@ -32987,6 +33111,40 @@ mod tests {
             "/api/workflows/wf-timed-out" => (
                 "200 OK",
                 r#"{"workflow_id":"wf-timed-out","run_id":"run-timed-out","status":"failed","closed_reason":"timed_out","reason":"run_timeout"}"#,
+            ),
+            // Native-style terminal descriptions without failure detail (#156).
+            "/api/workflows/wf-native-failed"
+            | "/api/workflows/wf-native-failed/runs/run-native-failed" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-native-failed","run_id":"run-native-failed","status":"failed","closed_reason":"failed","output":null}"#,
+            ),
+            "/api/workflows/wf-native-failed/runs/run-native-failed/history" => (
+                "200 OK",
+                r#"{"events":[{"sequence":1,"event_type":"WorkflowStarted","payload":{}},{"sequence":6,"event_type":"WorkflowFailed","payload":{"failure_id":"failure-native","failure_category":"application","non_retryable":true,"exception_type":"ActivityFailed","exception_class":"durable_workflow::ActivityFailure","message":"activity failed (activity): rejected bob","exception":{"type":"ActivityFailed","class":"durable_workflow::ActivityFailure","message":"activity failed (activity): rejected bob"}}}]}"#,
+            ),
+            "/api/workflows/wf-native-timed-out" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-native-timed-out","run_id":"run-native-timed-out","status":"failed","closed_reason":"timed_out"}"#,
+            ),
+            "/api/workflows/wf-native-timed-out/runs/run-native-timed-out/history" => (
+                "200 OK",
+                r#"{"events":[{"sequence":5,"event_type":"WorkflowTimedOut","payload":{"failure_id":"failure-deadline","timeout_kind":"execution_timeout","failure_category":"timeout","message":"Workflow execution deadline expired."}}]}"#,
+            ),
+            "/api/workflows/wf-native-paged" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-native-paged","run_id":"run-native-paged","status":"failed","closed_reason":"failed"}"#,
+            ),
+            "/api/workflows/wf-native-paged/runs/run-native-paged/history" => (
+                "200 OK",
+                r#"{"events":[{"sequence":1,"event_type":"WorkflowStarted","payload":{}}],"next_page_token":"page-2"}"#,
+            ),
+            "/api/workflows/wf-native-paged/runs/run-native-paged/history?next_page_token=page-2" => (
+                "200 OK",
+                r#"{"events":[{"sequence":2,"event_type":"WorkflowFailed","payload":{"exception_type":"PagedFailure","message":"found on page two"}}]}"#,
+            ),
+            "/api/workflows/wf-native-no-history" => (
+                "200 OK",
+                r#"{"workflow_id":"wf-native-no-history","run_id":"run-native-no-history","status":"failed","closed_reason":"failed"}"#,
             ),
             "/api/workflows/wf-waiting" | "/api/workflows/wf-waiting/runs/run-waiting" => (
                 "200 OK",
