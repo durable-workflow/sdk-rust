@@ -64,6 +64,9 @@
         {
           "glob": "src/sticky_*.rs",
           "content_patterns": ["History", "history", "Replay", "replay"]
+        },
+        {
+          "glob": "src/cancellation_replay_clock.rs"
         }
       ]
     }
