@@ -371,7 +371,7 @@ def restore_missing_lockfile(
 
 APPROVAL_SCHEMA = "durable-workflow.rust-sdk.approved-package/v1"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-CARGO_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+CARGO_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$", re.ASCII)
 APPROVAL_FIELDS = {
     "schema", "package", "version", "commit", "crate_sha256", "cargo_version",
     "files", "file_list_sha256", "acceptance",
@@ -493,6 +493,18 @@ def _validate_notes_arguments(
         parser.error("--release-notes uses the current checkout files; path overrides are refused")
 
 
+def _validate_approval_arguments(
+    arguments: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> None:
+    if arguments.cargo_version is not None and arguments.approved_package is None:
+        parser.error("--cargo-version requires --approved-package")
+    if arguments.approved_package is not None and (
+        arguments.archive is None or arguments.expected_vcs_commit is None
+        or arguments.restore_missing_lockfile or arguments.release_notes is not None
+    ):
+        parser.error("--approved-package requires --archive and --expected-vcs-commit only")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=Path(SOURCE_MANIFEST))
@@ -515,13 +527,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
         parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
-    if arguments.cargo_version is not None and arguments.approved_package is None:
-        parser.error("--cargo-version requires --approved-package")
-    if arguments.approved_package is not None and (
-        arguments.archive is None or arguments.expected_vcs_commit is None
-        or arguments.restore_missing_lockfile or arguments.release_notes is not None
-    ):
-        parser.error("--approved-package requires --archive and --expected-vcs-commit only")
+    _validate_approval_arguments(arguments, parser)
 
     try:
         if arguments.release_notes is not None:

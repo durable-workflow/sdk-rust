@@ -991,10 +991,11 @@ class PrePublication(HarnessRun):
                 shutil.rmtree(self.work / 'package-source', ignore_errors=True)
 
     def test_head_commit_mismatch_is_refused(self):
-        with self.assertRaisesRegex(run.PackageError, 'not requested commit'):
-            self.docker = FakeDocker(created=FakeCargo(self.commit))
-            with mock.patch.object(run, 'call', hybrid(self.docker)):
-                run.package_release(package_args(self.checkout, 'f' * 40), self.work, self.run)
+        self.docker = FakeDocker(created=FakeCargo(self.commit))
+        wrong = package_args(self.checkout, 'f' * 40)
+        with mock.patch.object(run, 'call', hybrid(self.docker)), \
+                self.assertRaisesRegex(run.PackageError, 'not requested commit'):
+            run.package_release(wrong, self.work, self.run)
         self.assertEqual(self.docker.runs(), [])
 
     def test_source_version_mismatch_is_refused_before_packaging(self):
@@ -1089,23 +1090,25 @@ class PrePublication(HarnessRun):
     def test_package_container_failure_is_cleaned_by_ownership(self):
         name = self.run.base + '-package'
         self.docker = FakeDocker(faults={name: 'created-then-timeout'})
+        arguments = package_args(self.checkout, self.commit)
         with mock.patch.object(run, 'call', hybrid(self.docker)), self.assertRaises(subprocess.TimeoutExpired):
-            run.package_release(package_args(self.checkout, self.commit), self.work, self.run)
+            run.package_release(arguments, self.work, self.run)
         self.assertEqual(self.docker.removals(), [['docker', 'rm', '-f', 'id-' + name]])
 
     def test_foreign_vendored_package_is_refused(self):
+        cargo = FakeCargo(self.commit, vendor_foreign=True)
         with self.assertRaisesRegex(run.PackageError, 'only the packaged bytes'):
-            self.install(FakeCargo(self.commit, vendor_foreign=True))
+            self.install(cargo)
 
     def test_lock_that_is_not_the_packaged_crate_is_refused(self):
         for lock in ({'name': 'durable-workflow', 'version': VERSION, 'source': run.CRATES_IO_SOURCE, 'checksum': '0' * 64},
                      {'name': 'durable-workflow', 'version': VERSION, 'source': 'path+file:///package'},
                      {'name': 'durable-workflow', 'version': '4.11.1', 'source': run.CRATES_IO_SOURCE, 'checksum': '0' * 64}):
-            with self.subTest(lock=lock):
-                with self.assertRaises(run.PackageError):
-                    self.install(FakeCargo(self.commit, lock=lock))
-                shutil.rmtree(self.work)
-                self.work.mkdir()
+            cargo = FakeCargo(self.commit, lock=lock)
+            with self.subTest(lock=lock), self.assertRaises(run.PackageError):
+                self.install(cargo)
+            shutil.rmtree(self.work)
+            self.work.mkdir()
 
     def test_installed_bytes_that_drift_from_the_package_are_refused(self):
         def drift(entry):
@@ -1118,11 +1121,11 @@ class PrePublication(HarnessRun):
             (entry / 'src' / 'lib.rs').unlink()
             os.symlink(self.checkout / 'src' / 'lib.rs', entry / 'src' / 'lib.rs')
         for tamper in (drift, extra, link):
-            with self.subTest(tamper=tamper.__name__):
-                with self.assertRaisesRegex(run.PackageError, 'installed package'):
-                    self.install(FakeCargo(self.commit, tamper_install=tamper))
-                shutil.rmtree(self.work)
-                self.work.mkdir()
+            cargo = FakeCargo(self.commit, tamper_install=tamper)
+            with self.subTest(tamper=tamper.__name__), self.assertRaisesRegex(run.PackageError, 'installed package'):
+                self.install(cargo)
+            shutil.rmtree(self.work)
+            self.work.mkdir()
 
     def test_directory_source_checksum_is_the_crate_sha256(self):
         identity, _, _ = self.install()

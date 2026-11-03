@@ -498,10 +498,12 @@ This is an example, not another release.
             "extra field": ({"note": "x"}, "unexpected fields"),
         }
         for label, (change, message) in cases.items():
+            approval = self.approval(archive, **change)
             with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, message):
-                verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, self.approval(archive, **change))
+                verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, approval)
+        approval = self.approval(archive)
         with self.assertRaisesRegex(ReleasePackageError, "differs from approved Cargo"):
-            verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, self.approval(archive), "1.99.0")
+            verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, approval, "1.99.0")
         # A one-byte drift in the archive itself, with the approval recorded before it.
         approval = self.approval(archive)
         drifted = self.archive(changelog=CHANGELOG.read_bytes(), name="drifted.crate", lockfile=(ROOT / "Cargo.lock").read_bytes() + b"#")
