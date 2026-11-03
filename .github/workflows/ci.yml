@@ -352,7 +352,7 @@ jobs:
         run: |
           cargo package --locked
           archive="target/package/durable-workflow-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])').crate"
-          python3 scripts/ci/release_package.py --archive "$archive"
+          python3 scripts/ci/release_package.py --archive-root "$(dirname "$archive")" --archive "$(basename "$archive")"
           python3 scripts/ci/verify-fresh-consumer.py package
       - name: Check that the package is byte-reproducible
         # Pre-publication approval binds a .crate SHA-256 that the release

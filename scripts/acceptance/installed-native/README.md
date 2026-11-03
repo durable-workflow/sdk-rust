@@ -160,6 +160,26 @@ Cargo cannot upload a prebuilt `.crate`, so `cargo publish` packages again from
 the same clean tag with the same Cargo. The readback above is what proves that
 the published bytes are the accepted ones.
 
+#### Path confinement
+
+Every file named by a command-line argument, an environment variable or an
+approval record is resolved inside an explicit root before it is opened or
+written.
+
+| Input | Root | Rule |
+| --- | --- | --- |
+| `--package-from`, `--work-dir`, `--fixture-from`, `--baselines-control` | Operator-supplied root | The path is canonicalized. The harness refuses a NUL byte, a `..` component, or a path that is itself a symbolic link. |
+| Paths the harness writes or reads below the work dir, such as unpacked and vendored members | `--work-dir` | Each is a `/`-separated relative path with no empty, `.`, `..`, NUL or backslash parts and no link at any component. Its canonical result must stay inside the root (`os.path.commonpath`). Files are created with `O_EXCL`/`O_NOFOLLOW`. |
+| `release_package.py --manifest`, `--changelog` | `--source-root` (the release checkout) | Relative, confined |
+| `release_package.py --archive` | `--archive-root` (Cargo's `target/package`, or the publisher's temporary directory) | Relative, confined |
+| Approval record | `--approval-root`, set by the Release workflow as `RUST_SDK_APPROVED_PACKAGE_DIR=$GITHUB_WORKSPACE/release-tools/release/approved-packages` | Always `<version>.json`. The version must match strict Semantic Versioning 2.0.0 before it names a file. The record's own version must match it too, and its file names must be safe relative paths. |
+
+Versions used in harness paths (`--expect-version`) also follow strict
+Semantic Versioning, so a value such as `4.11.2/../../x` is refused.
+
+The publisher also refuses a manifest or changelog outside its working
+directory, and an evidence path that is a link or contains a `..` component.
+
 The run writes `<work-dir>/summary.json` with every identity, receipt and
 history result, plus per-container logs under `cells/*/logs`. The exit code is
 0 only when every check passes and cleanup is complete (see below).

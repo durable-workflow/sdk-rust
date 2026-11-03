@@ -1210,7 +1210,7 @@ class PrePublicationOutcome(unittest.TestCase):
         code, receipt, work = self.main()
         self.assertEqual(code, 0)
         approval = json.loads((work / 'approved-package.json').read_text())
-        self.assertEqual(receipt['approval_candidate'], str(work / 'approved-package.json'))
+        self.assertEqual(receipt['approval_candidate'], str(work.resolve() / 'approved-package.json'))
         self.assertEqual(approval['schema'], run.APPROVAL_SCHEMA)
         for key in ('package', 'version', 'commit', 'crate_sha256', 'files', 'file_list_sha256'):
             self.assertEqual(approval[key], self.identity[key])
@@ -1234,6 +1234,95 @@ class PrePublicationOutcome(unittest.TestCase):
         code, receipt, work = self.main(tamper_after_cells=True)
         self.assertEqual((code, receipt['outcome'], receipt['approval_candidate']), (1, 'fail', None))
         self.assertFalse((work / 'approved-package.json').exists())
+
+
+class PathConfinement(unittest.TestCase):
+    """Security review of #178: CLI paths and every path written below them."""
+
+    def setUp(self):
+        self.tmp = temporary_directory(self)
+        self.outside = temporary_directory(self)
+        (self.outside / 'secret').write_bytes(b'PRIVATE')
+
+    def test_cli_paths_refuse_nul_dot_dot_and_symlinks(self):
+        (self.tmp / 'real').mkdir()
+        (self.tmp / 'link').symlink_to(self.outside, target_is_directory=True)
+        for value in ('', 'work\0dir', str(self.tmp / 'real' / '..' / 'escape'), '../work', 'a/../../b',
+                      str(self.tmp / 'link')):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                run.cli_path(value)
+        # Positive controls: absolute, relative and not-yet-existing paths canonicalize.
+        self.assertEqual(run.cli_path(str(self.tmp / 'real')), pathlib.Path(os.path.realpath(self.tmp / 'real')))
+        self.assertEqual(run.cli_path(str(self.tmp / 'new')), pathlib.Path(os.path.realpath(self.tmp)) / 'new')
+        self.assertTrue(run.cli_path('work').is_absolute())
+
+    def test_every_path_option_is_confined(self):
+        (self.tmp / 'link').symlink_to(self.outside, target_is_directory=True)
+        package = PrePublicationArguments.PACKAGE
+        for option in ('--package-from', '--work-dir'):
+            for value in (str(self.tmp / 'link'), '../x', 'x\0y'):
+                argv = ['--server-index', 'sha256:x', '--work-dir', str(self.tmp / 'w')] + package
+                argv[argv.index(option) + 1] = value
+                with self.subTest(option=option, value=value), self.assertRaises(SystemExit), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    run.parse_args(argv)
+        base = ['--server-index', 'sha256:x', '--work-dir', str(self.tmp / 'w'), '--crate-version', '4.11.1']
+        for option in ('--fixture-from', '--baselines-control'):
+            with self.subTest(option=option), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                run.parse_args(base + [option, str(self.tmp / 'link')])
+
+    def test_crafted_versions_are_refused_before_naming_paths(self):
+        for version in ('4.11.2/../../x', '../4.11.2', '4.11.2\0', '4.11.2-..', '4.11.2-rc..1', 'v4.11.2',
+                        '04.11.2', '4.11.2/', '４.11.2', '4.11.2-a/b'):
+            with self.subTest(version=version), self.assertRaises(argparse.ArgumentTypeError):
+                run.exact_version(version)
+        for version in ('4.11.2', '4.11.2-rc.1+build.5', '10.0.0-alpha-1'):
+            with self.subTest(positive=version):
+                self.assertEqual(run.exact_version(version), version)
+
+    def test_confined_child_refusals_and_positive_controls(self):
+        root = self.tmp / 'root'
+        (root / 'src').mkdir(parents=True)
+        (root / 'linkdir').symlink_to(self.outside, target_is_directory=True)
+        (root / 'link.rs').symlink_to(self.outside / 'secret')
+        for relative in ('../secret', 'src/../../secret', str(self.outside / 'secret'), '/etc/passwd',
+                         'linkdir/secret', 'link.rs', 'src/a\0b', 'src\\..\\x', '', 'src//a', './a'):
+            with self.subTest(relative=relative), self.assertRaises(run.PackageError):
+                run.confined_child(root, relative)
+        self.assertEqual(run.confined_child(root, 'src/lib.rs'),
+                         pathlib.Path(os.path.realpath(root)) / 'src' / 'lib.rs')
+
+    def test_write_members_never_escapes_or_follows_links(self):
+        for name in ('../escape.rs', 'src/../../escape.rs', '/abs.rs', 'a\0b'):
+            destination = self.tmp / ('dest-%d' % len(os.listdir(self.tmp)))
+            with self.subTest(name=name), self.assertRaises(run.PackageError):
+                run.write_members({name: b'x'}, destination)
+        self.assertEqual(sorted(os.listdir(self.outside)), ['secret'])
+        self.assertFalse((self.tmp / 'escape.rs').exists())
+        # A member whose directory is a link planted beside it is refused too.
+        destination = self.tmp / 'planted'
+        original_mkdir = pathlib.Path.mkdir
+
+        def mkdir(path, *a, **k):
+            if path.name == 'src' and path.parent == pathlib.Path(os.path.realpath(destination)):
+                path.symlink_to(self.outside, target_is_directory=True)
+                return None
+            return original_mkdir(path, *a, **k)
+        with mock.patch.object(pathlib.Path, 'mkdir', mkdir), self.assertRaises(run.PackageError):
+            run.write_members({'src/lib.rs': b'x'}, destination)
+        self.assertEqual(sorted(os.listdir(self.outside)), ['secret'])
+        # Positive control.
+        run.write_members({'src/lib.rs': b'pub fn a() {}\n', 'Cargo.toml': b'[package]\n'}, self.tmp / 'ok')
+        self.assertEqual((self.tmp / 'ok' / 'src' / 'lib.rs').read_bytes(), b'pub fn a() {}\n')
+
+    def test_archive_member_with_nul_or_backslash_is_refused(self):
+        tmp = temporary_directory(self)
+        commit = make_repo(tmp / 'repo')
+        members = packaged_members(commit)
+        for name in ('src/a\\..\\b.rs',):
+            crate = make_crate(dict(members, **{name: b'x'}))
+            with self.subTest(name=name), self.assertRaisesRegex(run.PackageError, 'not a regular file'):
+                run.verify_package_archive(crate, VERSION, commit, sorted(members) + [name], lambda path: None)
 
 
 if __name__ == '__main__':

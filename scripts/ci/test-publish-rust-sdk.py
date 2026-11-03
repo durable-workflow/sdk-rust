@@ -216,6 +216,13 @@ class PublishRustSdkContractTest(unittest.TestCase):
         approval: dict[str, object] | None = None,
         registry_changelog: bytes | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        if cwd == ROOT and not manifest.resolve().is_relative_to(ROOT):
+            # A modified manifest is its own release checkout: the publisher only
+            # reads a manifest and changelog confined to its working directory.
+            cwd = manifest.parent
+            for name in ("CHANGELOG.md", "Cargo.lock"):
+                if not (cwd / name).exists():
+                    shutil.copyfile(ROOT / name, cwd / name)
         env = os.environ.copy()
         env.update(
             {
@@ -226,9 +233,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 "MOCK_PACKAGE_VERSION": PACKAGE_VERSION,
                 "MOCK_REGISTRY_ARCHIVE": str(self.temp / "registry" / "package" / f"durable-workflow-{PACKAGE_VERSION}.crate"),
                 "RELEASE_TAG": PACKAGE_VERSION,
-                "RUST_SDK_MANIFEST_PATH": str(manifest),
+                "RUST_SDK_MANIFEST_PATH": os.path.relpath(manifest, cwd),
                 "RUST_SDK_RELEASE_EVIDENCE_PATH": str(self.evidence),
-                "RUST_SDK_APPROVED_PACKAGE_PATH": str(self.temp / "approved" / f"{PACKAGE_VERSION}.json"),
+                "RUST_SDK_APPROVED_PACKAGE_DIR": str(self.temp / "approved"),
                 "MOCK_PUBLISH_MARKER": str(self.temp / "published-marker"),
             }
         )
@@ -247,7 +254,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         if approval is not None:
             record = self._approval(registry_archive)
             record.update(approval)
-            path = Path(env["RUST_SDK_APPROVED_PACKAGE_PATH"])
+            path = Path(env["RUST_SDK_APPROVED_PACKAGE_DIR"]) / f"{PACKAGE_VERSION}.json"
             path.parent.mkdir(exist_ok=True)
             path.write_text(json.dumps(record), encoding="utf-8")
         if registry_changelog is not None:
@@ -316,7 +323,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertFalse(self._published())
         self.assertEqual("approved_package_required", self._evidence()["reason"])
         result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token",
-                                            "RUST_SDK_APPROVED_PACKAGE_PATH": ""})
+                                            "RUST_SDK_APPROVED_PACKAGE_DIR": ""})
         self.assertNotEqual(0, result.returncode)
         self.assertFalse(self._published())
 
@@ -407,15 +414,73 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 self.assertEqual("failed", evidence["outcome"])
                 (self.temp / "published-marker").unlink(missing_ok=True)
 
+    # Path confinement of every file the publisher reads or writes.
+
+    def test_source_paths_outside_the_release_checkout_are_refused(self) -> None:
+        source = self._source_checkout()
+        outside = self.temp / "outside"
+        outside.mkdir()
+        shutil.copyfile(ROOT / "CHANGELOG.md", outside / "CHANGELOG.md")
+        linked = source / "linked"
+        linked.mkdir()
+        (linked / "CHANGELOG.md").symlink_to(outside / "CHANGELOG.md")
+        cases = {
+            "absolute manifest": {"RUST_SDK_MANIFEST_PATH": str(source / "Cargo.toml")},
+            "dot-dot manifest": {"RUST_SDK_MANIFEST_PATH": "../source/Cargo.toml"},
+            "dot-dot changelog": {"RUST_SDK_CHANGELOG_PATH": "../outside/CHANGELOG.md"},
+            "absolute changelog": {"RUST_SDK_CHANGELOG_PATH": str(outside / "CHANGELOG.md")},
+            "symlinked changelog": {"RUST_SDK_CHANGELOG_PATH": "linked/CHANGELOG.md"},
+        }
+        for label, environment in cases.items():
+            with self.subTest(label=label):
+                result = self._publish(source / "Cargo.toml", environment, cwd=source)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("inside the release checkout", result.stderr)
+                self.assertFalse(self._published())
+        # Positive control: the same checkout with plain relative paths publishes.
+        result = self._publish(source / "Cargo.toml", {"MOCK_LOOKUP_STATUS": "404",
+                                                       "CARGO_REGISTRY_TOKEN": "test-token"},
+                               cwd=source, approval={})
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_symlinked_approval_record_is_refused(self) -> None:
+        outside = self.temp / "forged.json"
+        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                               approval={})
+        self.assertEqual(0, result.returncode, result.stderr)
+        record = self.temp / "approved" / f"{PACKAGE_VERSION}.json"
+        outside.write_bytes(record.read_bytes())
+        record.unlink()
+        record.symlink_to(outside)
+        (self.temp / "published-marker").unlink()
+        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"})
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self._published())
+        self.assertEqual("approved_package_mismatch", self._evidence()["reason"])
+        self.assertIn("symbolic link", result.stderr)
+
+    def test_symlinked_evidence_path_is_refused(self) -> None:
+        target = self.temp / "elsewhere.json"
+        target.write_text("untouched", encoding="utf-8")
+        link = self.temp / "linked-evidence.json"
+        link.symlink_to(target)
+        for value in (str(link), str(self.temp / "sub" / ".." / "evidence.json")):
+            with self.subTest(value=value):
+                (self.temp / "sub").mkdir(exist_ok=True)
+                result = self._publish(environment={"RUST_SDK_RELEASE_EVIDENCE_PATH": value})
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("release evidence path", result.stderr)
+        self.assertEqual("untouched", target.read_text(encoding="utf-8"))
+
     def test_release_workflow_supplies_the_reviewed_approval_record(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
-            "RUST_SDK_APPROVED_PACKAGE_PATH: ../release-tools/release/approved-packages/${{ env.RELEASE_TAG }}.json",
+            "RUST_SDK_APPROVED_PACKAGE_DIR: ${{ github.workspace }}/release-tools/release/approved-packages",
             workflow,
         )
         # The record comes from maintained tooling (main), never the tagged source.
         self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
-        self.assertLess(workflow.index("Resolve exact release identity"), workflow.index("RUST_SDK_APPROVED_PACKAGE_PATH"))
+        self.assertLess(workflow.index("Resolve exact release identity"), workflow.index("RUST_SDK_APPROVED_PACKAGE_DIR"))
         self.assertNotIn("/release/", MANIFEST.read_text(encoding="utf-8").split("include = ", 1)[1].split("\n", 1)[0])
 
     def _manifest_with(self, old: str, new: str) -> Path:
@@ -738,14 +803,12 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 self.assertIn("supported Server contract", result.stderr)
 
     def test_release_path_rejects_package_without_current_release_notes(self) -> None:
-        changelog = self.temp / "CHANGELOG.md"
-        changelog.write_text(
+        source = self._source_checkout()
+        (source / "CHANGELOG.md").write_text(
             "# Changelog\n\n## 2.0.0-rc.31\n\n- Previous release.\n",
             encoding="utf-8",
         )
-        result = self._publish(
-            environment={"RUST_SDK_CHANGELOG_PATH": str(changelog)}
-        )
+        result = self._publish(source / "Cargo.toml", cwd=source)
         self.assertNotEqual(0, result.returncode)
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
         self.assertEqual("local_package_release_identity_mismatch", evidence["reason"])

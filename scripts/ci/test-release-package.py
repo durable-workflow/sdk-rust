@@ -6,7 +6,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -16,7 +18,11 @@ import unittest
 from release_package import (
     APPROVAL_SCHEMA,
     ReleasePackageError,
+    approval_record_path,
+    confined_file,
+    confined_root,
     file_list_sha256,
+    load_approval,
     load_package,
     release_entry,
     render_release_notes,
@@ -512,26 +518,166 @@ This is an example, not another release.
         with self.assertRaises(ReleasePackageError):
             verify_approved_archive(archive, MANIFEST, CHANGELOG, "e" * 40, approval)
 
+    def approvals(self, archive: Path, **changes: object) -> Path:
+        """An approvals directory holding <version>.json for `archive`."""
+        directory = self.root / "approvals"
+        directory.mkdir(exist_ok=True)
+        record = self.approval(archive, **changes)
+        record.replace(directory / f"{self.package['version']}.json")
+        return directory
+
+    def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts/ci/release_package.py"), *arguments],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+
     def test_approved_package_cli_requires_archive_and_commit(self) -> None:
         archive = self.archive()
-        approval = self.approval(archive)
-        script = Path(__file__).with_name("release_package.py")
+        approvals = self.approvals(archive)
+        base = ["--archive-root", str(self.root), "--archive", archive.name]
         for arguments in (
-            ["--approved-package", str(approval)],
-            ["--approved-package", str(approval), "--archive", str(archive)],
-            ["--archive", str(archive), "--expected-vcs-commit", COMMIT, "--cargo-version", "1.86.0"],
+            ["--approval-root", str(approvals)],
+            ["--approval-root", str(approvals), *base],
+            [*base, "--expected-vcs-commit", COMMIT, "--cargo-version", "1.86.0"],
+            ["--archive", archive.name, "--expected-vcs-commit", COMMIT],
+            ["--check-paths", *base],
         ):
             with self.subTest(arguments=arguments):
-                result = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True)
-                self.assertEqual(2, result.returncode, result.stderr)
-        result = subprocess.run(
-            [sys.executable, str(script), "--archive", str(archive), "--expected-vcs-commit", COMMIT,
-             "--approved-package", str(approval), "--cargo-version", "1.86.0"],
-            capture_output=True, text=True,
-        )
+                self.assertEqual(2, self.cli(*arguments).returncode)
+        result = self.cli(*base, "--expected-vcs-commit", COMMIT,
+                          "--approval-root", str(approvals), "--cargo-version", "1.86.0")
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(COMMIT, json.loads(result.stdout)["approval"]["commit"])
 
+    # Path confinement (Security review of #178): every CLI path is confined to
+    # an explicit root before it is opened.
+
+    def outside_file(self) -> Path:
+        outside = Path(tempfile.mkdtemp(prefix="release-package-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        secret = outside / "secret.crate"
+        secret.write_bytes(b"PRIVATE-TEST-CONTENT")
+        return secret
+
+    def test_confined_file_refusals_and_positive_controls(self) -> None:
+        root = confined_root(self.root)
+        (self.root / "nested").mkdir()
+        (self.root / "nested" / "ok.crate").write_bytes(b"x")
+        (self.root / "ok.crate").write_bytes(b"x")
+        secret = self.outside_file()
+        (self.root / "link.crate").symlink_to(secret)
+        (self.root / "linkdir").symlink_to(secret.parent, target_is_directory=True)
+        refusals = {
+            "dot-dot escape": "../" + secret.parent.name + "/secret.crate",
+            "inner dot-dot": "nested/../ok.crate",
+            "symlink to outside": "link.crate",
+            "symlinked directory": "linkdir/secret.crate",
+            "absolute": str(secret),
+            "absolute inside root": str(self.root / "ok.crate"),
+            "NUL byte": "ok.crate\0.json",
+            "empty": "",
+            "directory": "nested",
+            "missing": "absent.crate",
+        }
+        for label, value in refusals.items():
+            with self.subTest(label=label), self.assertRaises(ReleasePackageError):
+                confined_file(root, value)
+        for value in ("ok.crate", "nested/ok.crate", "./ok.crate"):
+            with self.subTest(positive=value):
+                self.assertEqual(Path(root, value).resolve(), confined_file(root, value))
+        with self.assertRaisesRegex(ReleasePackageError, "already exists"):
+            confined_file(root, "ok.crate", must_exist=False)
+        self.assertEqual(Path(root, "new.lock"), confined_file(root, "new.lock", must_exist=False))
+
+    def test_confined_root_refusals(self) -> None:
+        (self.root / "real").mkdir()
+        (self.root / "rootlink").symlink_to(self.root / "real", target_is_directory=True)
+        (self.root / "file").write_bytes(b"x")
+        for label, value in (("symlink", str(self.root / "rootlink")), ("dot-dot", str(self.root / "real" / "..")),
+                             ("NUL", str(self.root) + "\0"), ("file", str(self.root / "file")),
+                             ("missing", str(self.root / "absent")), ("empty", "")):
+            with self.subTest(label=label), self.assertRaises(ReleasePackageError):
+                confined_root(value)
+        self.assertEqual(os.path.realpath(self.root / "real"), confined_root(self.root / "real"))
+
+    def test_approval_path_requires_strict_semver_before_naming_a_file(self) -> None:
+        root = confined_root(self.root)
+        (self.root / "4.11.2.json").write_text("{}")
+        (self.root / "4.11.2-rc.1+build.5.json").write_text("{}")
+        secret = self.outside_file()
+        (secret.parent / "x.json").write_text("{}")
+        for version in ("4.11.2/../../x", "../4.11.2", "4.11.2\0", "v4.11.2", "4.11", "04.11.2",
+                        "4.11.2-..", "4.11.2-rc..1", "4.11.2/", "/4.11.2", "４.11.2", "",
+                        os.path.relpath(secret.parent / "x", self.root)):
+            with self.subTest(version=version), self.assertRaisesRegex(ReleasePackageError, "strict SemVer"):
+                approval_record_path(root, version)
+        for version in ("4.11.2", "4.11.2-rc.1+build.5"):
+            with self.subTest(positive=version):
+                self.assertEqual(Path(root, f"{version}.json"), approval_record_path(root, version))
+        (self.root / "4.11.2.json").unlink()
+        (self.root / "4.11.2.json").symlink_to(secret)
+        with self.assertRaisesRegex(ReleasePackageError, "symbolic link"):
+            approval_record_path(root, "4.11.2")
+
+    def test_approval_record_rejects_unsafe_file_names_and_versions(self) -> None:
+        archive = self.archive()
+        for label, change in {
+            "dot-dot file": {"files": ["../escape"]},
+            "absolute file": {"files": ["/etc/passwd"]},
+            "NUL file": {"files": ["a\0b"]},
+            "backslash file": {"files": ["a\\..\\b"]},
+            "crafted version": {"version": "4.11.2/../../x"},
+        }.items():
+            files = change.get("files")
+            if files is not None:
+                change = {**change, "file_list_sha256": file_list_sha256(files)}
+            approval = self.approval(archive, **change)
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, "malformed"):
+                load_approval(approval)
+
+    def test_cli_refuses_paths_outside_their_roots(self) -> None:
+        archive = self.archive()
+        approvals = self.approvals(archive)
+        secret = self.outside_file()
+        (self.root / "escape.crate").symlink_to(secret)
+        verify = ["--expected-vcs-commit", COMMIT]
+        # A NUL byte cannot cross argv (exec refuses it); confined_file's own
+        # NUL refusal is covered in test_confined_file_refusals_and_positive_controls.
+        cases = {
+            "archive dot-dot": ["--archive-root", str(self.root), "--archive", "../" + secret.parent.name + "/secret.crate", *verify],
+            "archive absolute": ["--archive-root", str(self.root), "--archive", str(secret), *verify],
+            "archive symlink": ["--archive-root", str(self.root), "--archive", "escape.crate", *verify],
+            "manifest absolute": ["--manifest", str(MANIFEST), "--archive-root", str(self.root), "--archive", archive.name, *verify],
+            "manifest dot-dot": ["--manifest", "../" + ROOT.name + "/Cargo.toml", "--archive-root", str(self.root), "--archive", archive.name, *verify],
+            "changelog absolute": ["--check-paths", "--changelog", str(CHANGELOG)],
+            "root symlink": ["--archive-root", str(self.root / "rootlink"), "--archive", archive.name, *verify],
+        }
+        (self.root / "rootlink").symlink_to(secret.parent, target_is_directory=True)
+        for label, arguments in cases.items():
+            with self.subTest(label=label):
+                result = self.cli(*arguments)
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual("", result.stdout)
+                self.assertNotIn("PRIVATE-TEST-CONTENT", result.stderr)
+        record = approvals / f"{self.package['version']}.json"
+        moved = secret.parent / "approved.json"
+        record.replace(moved)
+        record.symlink_to(moved)
+        result = self.cli("--archive-root", str(self.root), "--archive", archive.name, *verify,
+                          "--approval-root", str(approvals))
+        self.assertEqual(1, result.returncode)
+        self.assertIn("symbolic link", result.stderr)
+        # Positive controls: the same inputs, confined, are accepted.
+        record.unlink()
+        moved.replace(record)
+        for arguments in (["--check-paths"],
+                          ["--archive-root", str(self.root), "--archive", archive.name, *verify],
+                          ["--archive-root", str(self.root), "--archive", archive.name, *verify,
+                           "--approval-root", str(approvals)]):
+            with self.subTest(positive=arguments):
+                result = self.cli(*arguments)
+                self.assertEqual(0, result.returncode, result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

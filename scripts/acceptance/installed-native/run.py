@@ -54,7 +54,13 @@ REQUIRED_PACKAGE_FILES = ('.cargo_vcs_info.json', 'Cargo.toml', 'Cargo.toml.orig
 APPROVAL_SCHEMA = 'durable-workflow.rust-sdk.approved-package/v1'
 COMMIT_PATTERN = re.compile(r'[0-9a-f]{40}')
 SHA256_PATTERN = re.compile(r'[0-9a-f]{64}')
-VERSION_PATTERN = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?')
+# Semantic Versioning 2.0.0, ASCII only. The version names files and directories
+# (durable-workflow-<version>.crate, vendor/durable-workflow-<version>/); no
+# identifier can be empty, so it can never hold '/' or a '..' component.
+VERSION_PATTERN = re.compile(
+    r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)'
+    r'(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?'
+    r'(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?', re.ASCII)
 
 
 class PackageError(RuntimeError):
@@ -142,6 +148,45 @@ def exact_sha256(value):
     return value
 
 
+def cli_path(value):
+    """An operator-supplied root (checkout, work dir, fixture, control manifest).
+
+    Refuses NUL bytes, '..' components and a symbolic link at the path itself,
+    then canonicalizes it. Everything the harness reads or writes below a root
+    is confined to it separately (confined_child).
+    """
+    if not value or '\0' in value:
+        raise argparse.ArgumentTypeError('path is empty or contains a NUL byte')
+    if '..' in pathlib.PurePath(value).parts:
+        raise argparse.ArgumentTypeError('%r contains a ".." component' % value)
+    if os.path.islink(value):
+        raise argparse.ArgumentTypeError('%r is a symbolic link' % value)
+    return pathlib.Path(os.path.realpath(value))
+
+
+def safe_relative(relative):
+    """A '/'-separated relative path with no empty, '.', '..', NUL or backslash parts."""
+    return (isinstance(relative, str) and relative and '\0' not in relative and '\\' not in relative
+            and not os.path.isabs(relative)
+            and all(part not in ('', '.', '..') for part in relative.split('/')))
+
+
+def confined_child(root, relative):
+    """`root`/`relative`, refusing escapes and symbolic links below canonical `root`."""
+    if not safe_relative(relative):
+        raise PackageError('unsafe relative path %r' % relative)
+    base = os.path.realpath(root)
+    current = base
+    for part in relative.split('/'):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise PackageError('path %r passes through a symbolic link' % relative)
+    target = os.path.realpath(os.path.join(base, relative))
+    if os.path.commonpath([base, target]) != base:
+        raise PackageError('path %r escapes its root' % relative)
+    return pathlib.Path(target)
+
+
 def exact_version(value):
     if not VERSION_PATTERN.fullmatch(value):
         raise argparse.ArgumentTypeError('%r must be an exact SemVer version' % value)
@@ -152,7 +197,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--crate-version', help='exact published durable-workflow version, e.g. 4.10.3')
-    source.add_argument('--package-from', type=pathlib.Path,
+    source.add_argument('--package-from', type=cli_path,
                         help='pre-publication mode: a clean git checkout whose HEAD is --package-commit; '
                              'the harness packages that commit and installs only the packaged bytes')
     parser.add_argument('--package-commit', type=full_commit,
@@ -167,7 +212,7 @@ def parse_args(argv=None):
     parser.add_argument('--server-image', default='ghcr.io/durable-workflow/server')
     parser.add_argument('--runtime', choices=['native', 'php'], default='native',
                         help='php starts the PHP Server process set (MySQL, Redis, queue worker, repair) as a parity baseline')
-    parser.add_argument('--fixture-from', type=pathlib.Path,
+    parser.add_argument('--fixture-from', type=cli_path,
                         help='reuse a fixture directory built by an earlier run (provenance is checked again)')
     parser.add_argument('--platform', default='linux/amd64')
     parser.add_argument('--expect-server-version', help='required /api/cluster/info version, e.g. 3.0.1')
@@ -177,14 +222,14 @@ def parse_args(argv=None):
                         help='whether the published crate must carry the per-major Server baseline map')
     parser.add_argument('--expected-baselines', type=json.loads, default={'2': '2.0.0', '3': '3.0.2'},
                         help='JSON map the published crate must declare when --baselines required')
-    parser.add_argument('--baselines-control', type=pathlib.Path,
+    parser.add_argument('--baselines-control', type=cli_path,
                         help='a Cargo.toml that must pass the required-map check (positive control)')
     parser.add_argument('--source-tag', help='git tag the crate must match (default: the crate version)')
     parser.add_argument('--rust-image', default='rust:1.86-bookworm')
     parser.add_argument('--python-image', default='python:3.12-bookworm')
     parser.add_argument('--cells', default='lifecycle,deadline')
     parser.add_argument('--jobs', type=int, default=2, help='cargo build jobs (lab machines: keep at 2)')
-    parser.add_argument('--work-dir', type=pathlib.Path, required=True, help='new directory for build output and evidence')
+    parser.add_argument('--work-dir', type=cli_path, required=True, help='new directory for build output and evidence')
     parser.add_argument('--container-prefix', type=container_prefix, default='sdkrust',
                         help='owner prefix for container, network and task names, e.g. general or security '
                              '(^%s$)' % PREFIX_PATTERN.pattern)
@@ -357,9 +402,7 @@ def verify_package_archive(crate_bytes, version, commit, listed, git_blob):
         with tarfile.open(fileobj=io.BytesIO(crate_bytes), mode='r:gz') as archive:
             for member in archive.getmembers():
                 relative = member.name.removeprefix(prefix)
-                parts = relative.split('/')
-                if (not member.name.startswith(prefix) or not member.isfile() or not relative
-                        or any(part in ('', '.', '..') for part in parts)):
+                if not member.name.startswith(prefix) or not member.isfile() or not safe_relative(relative):
                     raise PackageError('crate member %r is not a regular file under %s' % (member.name, prefix))
                 if relative in members:
                     raise PackageError('crate member %r appears more than once' % relative)
@@ -401,18 +444,28 @@ def verify_package_archive(crate_bytes, version, commit, listed, git_blob):
 
 
 def write_members(members, destination):
-    """Write verified archive members (never tar extraction) under `destination`."""
+    """Write verified archive members (never tar extraction) under `destination`.
+
+    `destination` must be new. Each member path is confined below it (no
+    escape, no link), and each file is created exclusively, never through an
+    existing path.
+    """
     destination.mkdir(parents=True)
     for relative, content in sorted(members.items()):
-        path = destination / relative
+        path = confined_child(destination, relative)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        confined_child(destination, relative)  # parents just created: still no link or escape
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o644)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(content)
 
 
 def package_release(args, work_dir, run):
     """`cargo package` exactly args.package_commit and bind the resulting bytes."""
     commit, version = args.package_commit, args.expect_version
-    checkout = args.package_from.resolve()
+    checkout = args.package_from
+    if not checkout.is_dir():
+        raise PackageError('--package-from %s is not a directory' % checkout)
     source, out = work_dir / 'package-source', work_dir / 'package-out'
     clone_exact_commit(checkout, commit, source)
     source_manifest = tomllib.loads(git(source, 'show', '%s:Cargo.toml' % commit).stdout)['package']

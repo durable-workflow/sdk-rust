@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -370,6 +371,78 @@ def restore_missing_lockfile(
 
 
 APPROVAL_SCHEMA = "durable-workflow.rust-sdk.approved-package/v1"
+# Semantic Versioning 2.0.0, ASCII only. A version is validated with this before
+# it names a file (release/approved-packages/<version>.json); no identifier can
+# be empty, so it can never contain "/" or a ".." component.
+STRICT_SEMVER = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$",
+    re.ASCII,
+)
+
+
+def _refuse_unsafe_text(value: str, label: str) -> None:
+    if not value or "\0" in value:
+        raise ReleasePackageError(f"{label} is empty or contains a NUL byte")
+    if ".." in Path(value).parts:
+        raise ReleasePackageError(f"{label} contains a '..' component")
+
+
+def confined_root(value: str | os.PathLike[str]) -> str:
+    """Canonicalize an explicit trust root: an existing directory, not a link."""
+    text = os.fspath(value)
+    _refuse_unsafe_text(text, "path root")
+    if os.path.islink(text):
+        raise ReleasePackageError("path root must not be a symbolic link")
+    root = os.path.realpath(text)
+    if not os.path.isdir(root):
+        raise ReleasePackageError("path root is not an existing directory")
+    return root
+
+
+def confined_file(
+    root: str, relative: str | os.PathLike[str], *, must_exist: bool = True,
+) -> Path:
+    """Resolve `relative` strictly inside canonical `root`.
+
+    Refuses NUL bytes, absolute paths, '..' components and a symbolic link at
+    any component below the root, then requires the canonical result to stay
+    inside the root (os.path.commonpath) and, if `must_exist`, to be a regular
+    file.
+    """
+    text = os.fspath(relative)
+    _refuse_unsafe_text(text, "path")
+    if os.path.isabs(text):
+        raise ReleasePackageError("path must be relative to its root, not absolute")
+    current = root
+    for part in Path(text).parts:
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise ReleasePackageError("path must not pass through a symbolic link")
+    resolved = os.path.realpath(os.path.join(root, text))
+    if os.path.commonpath([root, resolved]) != root:
+        raise ReleasePackageError("path escapes its root")
+    if must_exist and not os.path.isfile(resolved):
+        raise ReleasePackageError("path is not an existing regular file")
+    if not must_exist and os.path.lexists(resolved):
+        raise ReleasePackageError("path already exists")
+    return Path(resolved)
+
+
+def approval_record_path(root: str, version: str) -> Path:
+    """The reviewed record for `version`: <root>/<version>.json, strictly confined."""
+    if not isinstance(version, str) or not STRICT_SEMVER.fullmatch(version):
+        raise ReleasePackageError("approval version is not a strict SemVer version")
+    return confined_file(root, f"{version}.json")
+
+
+def _safe_member_name(name: object) -> bool:
+    if not isinstance(name, str) or not name or "\0" in name or "\\" in name:
+        return False
+    if name.startswith("/") or os.path.isabs(name):
+        return False
+    return all(part not in ("", ".", "..") for part in name.split("/"))
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CARGO_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$", re.ASCII)
 APPROVAL_FIELDS = {
@@ -397,6 +470,7 @@ def load_approval(path: Path) -> tuple[dict[str, Any], str]:
         approval["schema"] != APPROVAL_SCHEMA
         or not isinstance(approval["package"], str)
         or not isinstance(approval["version"], str)
+        or not STRICT_SEMVER.fullmatch(approval["version"])
         or not isinstance(approval["commit"], str)
         or not COMMIT_PATTERN.fullmatch(approval["commit"])
         or not isinstance(approval["crate_sha256"], str)
@@ -405,7 +479,7 @@ def load_approval(path: Path) -> tuple[dict[str, Any], str]:
         or not CARGO_VERSION_PATTERN.fullmatch(approval["cargo_version"])
         or not isinstance(files, list)
         or not files
-        or not all(isinstance(name, str) and name for name in files)
+        or not all(_safe_member_name(name) for name in files)
         or files != sorted(set(files))
         or approval["file_list_sha256"] != file_list_sha256(files)
         or not isinstance(acceptance, dict)
@@ -486,85 +560,106 @@ def _validate_notes_arguments(
 ) -> None:
     if any((arguments.archive, arguments.expected_vcs_commit,
             arguments.expected_archive_sha256, arguments.restore_missing_lockfile,
-            arguments.approved_package, arguments.cargo_version)):
+            arguments.approval_root, arguments.archive_root, arguments.cargo_version,
+            arguments.check_paths)):
         parser.error("--release-notes cannot be combined with archive verification")
     if (arguments.manifest != Path(SOURCE_MANIFEST)
-            or arguments.changelog != Path(SOURCE_CHANGELOG)):
+            or arguments.changelog != Path(SOURCE_CHANGELOG)
+            or arguments.source_root != "."):
         parser.error("--release-notes uses the current checkout files; path overrides are refused")
 
 
-def _validate_approval_arguments(
+def _validate_mode_arguments(
     arguments: argparse.Namespace, parser: argparse.ArgumentParser,
 ) -> None:
-    if arguments.cargo_version is not None and arguments.approved_package is None:
-        parser.error("--cargo-version requires --approved-package")
-    if arguments.approved_package is not None and (
+    if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
+        parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
+    if arguments.check_paths and any((
+        arguments.archive, arguments.archive_root, arguments.approval_root,
+        arguments.expected_vcs_commit, arguments.restore_missing_lockfile, arguments.cargo_version,
+    )):
+        parser.error("--check-paths takes only --source-root, --manifest and --changelog")
+    if (arguments.archive is None) != (arguments.archive_root is None):
+        parser.error("--archive and --archive-root must be given together")
+    if arguments.cargo_version is not None and arguments.approval_root is None:
+        parser.error("--cargo-version requires --approval-root")
+    if arguments.approval_root is not None and (
         arguments.archive is None or arguments.expected_vcs_commit is None
-        or arguments.restore_missing_lockfile or arguments.release_notes is not None
+        or arguments.restore_missing_lockfile
     ):
-        parser.error("--approved-package requires --archive and --expected-vcs-commit only")
+        parser.error("--approval-root requires --archive and --expected-vcs-commit only")
+
+
+def _run(arguments: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[str, Any]:
+    # Every file named on the command line is confined to an explicit root
+    # before it is opened: the checkout (--source-root), the package directory
+    # (--archive-root) or the reviewed approvals directory (--approval-root).
+    source_root = confined_root(arguments.source_root)
+    manifest = confined_file(source_root, arguments.manifest)
+    changelog = confined_file(source_root, arguments.changelog)
+    if arguments.check_paths:
+        return {"manifest": str(manifest), "changelog": str(changelog)}
+    archive = None
+    if arguments.archive is not None:
+        archive = confined_file(confined_root(arguments.archive_root), arguments.archive)
+    if arguments.restore_missing_lockfile:
+        if not all((archive, arguments.expected_vcs_commit, arguments.expected_archive_sha256)):
+            parser.error("lockfile recovery requires archive, source commit and registry checksum")
+        # The lockfile is written beside the confined manifest, never through a link.
+        confined_file(source_root, manifest.parent.relative_to(source_root) / "Cargo.lock", must_exist=False)
+        return restore_missing_lockfile(
+            archive, manifest, changelog,
+            arguments.expected_vcs_commit, arguments.expected_archive_sha256,
+        )
+    if archive is None:
+        if arguments.expected_vcs_commit is not None:
+            parser.error("--expected-vcs-commit requires --archive")
+        return {"schema": SCHEMA, "version": 1, **verify_source(manifest, changelog)}
+    if arguments.approval_root is not None:
+        approval = approval_record_path(
+            confined_root(arguments.approval_root), str(load_package(manifest)["version"])
+        )
+        return verify_approved_archive(
+            archive, manifest, changelog, arguments.expected_vcs_commit,
+            approval, arguments.cargo_version,
+        )
+    return verify_archive(archive, manifest, changelog, arguments.expected_vcs_commit)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-root", default=".",
+                        help="release checkout; --manifest and --changelog are relative to it")
     parser.add_argument("--manifest", type=Path, default=Path(SOURCE_MANIFEST))
     parser.add_argument("--changelog", type=Path, default=Path(SOURCE_CHANGELOG))
-    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--archive-root", help="directory holding --archive")
+    parser.add_argument("--archive", type=Path, help="crate file name relative to --archive-root")
     parser.add_argument("--expected-vcs-commit")
     parser.add_argument("--expected-archive-sha256")
     parser.add_argument("--restore-missing-lockfile", action="store_true")
+    parser.add_argument("--check-paths", action="store_true",
+                        help="only confine --manifest and --changelog to --source-root")
     parser.add_argument(
-        "--approved-package", type=Path,
-        help="require --archive to be exactly this reviewed approved-package record",
+        "--approval-root",
+        help="reviewed approvals directory; requires --archive to equal <version>.json in it",
     )
     parser.add_argument(
-        "--cargo-version", help="with --approved-package: the packaging Cargo release (X.Y.Z)",
+        "--cargo-version", help="with --approval-root: the packaging Cargo release (X.Y.Z)",
     )
     parser.add_argument(
         "--release-notes", metavar="VERSION",
         help="print the exact current-version Markdown after manifest validation",
     )
     arguments = parser.parse_args()
-    if arguments.expected_archive_sha256 is not None and not arguments.restore_missing_lockfile:
-        parser.error("--expected-archive-sha256 requires --restore-missing-lockfile")
-    _validate_approval_arguments(arguments, parser)
+    if arguments.release_notes is not None:
+        _validate_notes_arguments(arguments, parser)
+    _validate_mode_arguments(arguments, parser)
 
     try:
         if arguments.release_notes is not None:
-            _validate_notes_arguments(arguments, parser)
             sys.stdout.write(source_release_notes(arguments.release_notes))
             return 0
-        elif arguments.restore_missing_lockfile:
-            if not all((arguments.archive, arguments.expected_vcs_commit, arguments.expected_archive_sha256)):
-                parser.error("lockfile recovery requires archive, source commit and registry checksum")
-            evidence = restore_missing_lockfile(
-                arguments.archive, arguments.manifest, arguments.changelog,
-                arguments.expected_vcs_commit, arguments.expected_archive_sha256,
-            )
-        elif arguments.archive is None:
-            if arguments.expected_vcs_commit is not None:
-                parser.error("--expected-vcs-commit requires --archive")
-            evidence = {
-                "schema": SCHEMA,
-                "version": 1,
-                **verify_source(arguments.manifest, arguments.changelog),
-            }
-        elif arguments.approved_package is not None:
-            evidence = verify_approved_archive(
-                arguments.archive,
-                arguments.manifest,
-                arguments.changelog,
-                arguments.expected_vcs_commit,
-                arguments.approved_package,
-                arguments.cargo_version,
-            )
-        else:
-            evidence = verify_archive(
-                arguments.archive,
-                arguments.manifest,
-                arguments.changelog,
-                arguments.expected_vcs_commit,
-            )
+        evidence = _run(arguments, parser)
     except ReleasePackageError as error:
         print(f"release package verification failed: {error}", file=sys.stderr)
         return 1

@@ -17,7 +17,8 @@ lockfile_source="source_checkout"
 # A reviewed record of the pre-publication package that passed installed-native
 # acceptance (scripts/acceptance/installed-native, --package-from). New versions
 # publish only when the reproduced package is exactly that artifact.
-approved_package_path="${RUST_SDK_APPROVED_PACKAGE_PATH:-}"
+approved_package_dir="${RUST_SDK_APPROVED_PACKAGE_DIR:-}"
+approved_package_path=""
 
 for command in cargo curl git jq python3 rustc sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -32,6 +33,21 @@ if [[ ! -f "$manifest_path" ]]; then
 fi
 if [[ ! -f "$changelog_path" ]]; then
     printf 'Rust SDK changelog not found: %s\n' "$changelog_path" >&2
+    exit 1
+fi
+
+# The manifest and changelog must be regular files inside the release checkout
+# (the working directory): relative, no '..', no symbolic links, no escape.
+source_root="$(pwd -P)"
+if ! python3 "$script_dir/release_package.py" --check-paths --source-root "$source_root" \
+    --manifest "$manifest_path" --changelog "$changelog_path" >/dev/null; then
+    printf 'Rust SDK manifest and changelog must be regular files inside the release checkout\n' >&2
+    exit 1
+fi
+evidence_parent="$(dirname "$evidence_path")"
+if [[ -L "$evidence_path" || -L "$evidence_parent" || ! -d "$evidence_parent" || \
+      "/$evidence_path/" == *"/../"* ]]; then
+    printf 'release evidence path must be a plain path without links or ".." components\n' >&2
     exit 1
 fi
 
@@ -413,8 +429,9 @@ if [[ ! -f "$lockfile_path" || -L "$lockfile_path" ]]; then
        ! crates_io_request --fail --silent --show-error --location \
         --header "User-Agent: ${user_agent}" --output "$published_archive" "$download_url" || \
        ! python3 "$script_dir/release_package.py" \
-        --manifest "$manifest_path" --changelog "$changelog_path" \
-        --archive "$published_archive" --expected-vcs-commit "$release_commit" \
+        --source-root "$source_root" --manifest "$manifest_path" --changelog "$changelog_path" \
+        --archive-root "$tmp_dir" --archive "$(basename "$published_archive")" \
+        --expected-vcs-commit "$release_commit" \
         --expected-archive-sha256 "$published_checksum" \
         --restore-missing-lockfile > "$tmp_dir/restored-lockfile.json"; then
         write_evidence "failed" "legacy_release_lockfile_verification_failed"
@@ -428,7 +445,8 @@ if ! cargo package --locked --manifest-path "$manifest_path"; then
     exit 1
 fi
 
-local_archive="${target_directory}/package/${package_name}-${package_version}.crate"
+local_archive_root="${target_directory}/package"
+local_archive="${local_archive_root}/${package_name}-${package_version}.crate"
 if [[ ! -f "$local_archive" ]]; then
     write_evidence "failed" "local_package_archive_missing"
     printf 'local Cargo package archive was not created: %s\n' "$local_archive" >&2
@@ -437,9 +455,11 @@ fi
 local_checksum="$(sha256sum "$local_archive" | awk '{print $1}')"
 local_identity="$tmp_dir/local-package-identity.json"
 if ! python3 "$script_dir/release_package.py" \
+    --source-root "$source_root" \
     --manifest "$manifest_path" \
     --changelog "$changelog_path" \
-    --archive "$local_archive" \
+    --archive-root "$local_archive_root" \
+    --archive "$(basename "$local_archive")" \
     --expected-vcs-commit "$release_commit" > "$local_identity"; then
     write_evidence "failed" "local_package_release_identity_mismatch"
     printf 'local Cargo package does not contain the authorized release notes and VCS identity\n' >&2
@@ -450,15 +470,20 @@ archive_vcs_dirty="$(jq -r '.archive.vcs_dirty' "$local_identity")"
 changelog_checksum="$(jq -er '.changelog.sha256' "$local_identity")"
 release_entry_checksum="$(jq -er '.changelog.entry_sha256' "$local_identity")"
 
-if [[ -n "$approved_package_path" && -e "$approved_package_path" ]]; then
+if [[ -n "$approved_package_dir" ]]; then
+    approved_package_path="${approved_package_dir}/${package_version}.json"
+fi
+if [[ -n "$approved_package_path" && ( -e "$approved_package_path" || -L "$approved_package_path" ) ]]; then
     packaging_cargo="$(cargo -V | awk '{print $2}')"
     local_approval="$tmp_dir/local-approval.json"
     if ! python3 "$script_dir/release_package.py" \
+        --source-root "$source_root" \
         --manifest "$manifest_path" \
         --changelog "$changelog_path" \
-        --archive "$local_archive" \
+        --archive-root "$local_archive_root" \
+        --archive "$(basename "$local_archive")" \
         --expected-vcs-commit "$release_commit" \
-        --approved-package "$approved_package_path" \
+        --approval-root "$approved_package_dir" \
         --cargo-version "$packaging_cargo" > "$local_approval"; then
         approval_status="reproduction_mismatch"
         write_evidence "failed" "approved_package_mismatch"
@@ -480,7 +505,7 @@ fi
 
 if [[ "$http_status" == "404" && "$approval_status" != "reproduced" ]]; then
     write_evidence "failed" "approved_package_required"
-    printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_PATH)\n' \
+    printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_DIR)\n' \
         "$package_name" "$package_version" >&2
     exit 1
 fi
@@ -572,9 +597,11 @@ fi
 
 published_identity="$tmp_dir/published-package-identity.json"
 if ! python3 "$script_dir/release_package.py" \
+    --source-root "$source_root" \
     --manifest "$manifest_path" \
     --changelog "$changelog_path" \
-    --archive "$published_archive" \
+    --archive-root "$tmp_dir" \
+    --archive "$(basename "$published_archive")" \
     --expected-vcs-commit "$release_commit" > "$published_identity"; then
     write_evidence "failed" "published_package_release_identity_mismatch"
     printf 'downloaded crate does not contain the authorized release notes and VCS identity\n' >&2
@@ -595,11 +622,13 @@ fi
 
 if [[ "$approval_status" == "reproduced" ]]; then
     if ! python3 "$script_dir/release_package.py" \
+        --source-root "$source_root" \
         --manifest "$manifest_path" \
         --changelog "$changelog_path" \
-        --archive "$published_archive" \
+        --archive-root "$tmp_dir" \
+        --archive "$(basename "$published_archive")" \
         --expected-vcs-commit "$release_commit" \
-        --approved-package "$approved_package_path" > "$tmp_dir/published-approval.json"; then
+        --approval-root "$approved_package_dir" > "$tmp_dir/published-approval.json"; then
         write_evidence "failed" "published_package_differs_from_approved_package"
         printf 'downloaded crate is not the approved pre-publication package\n' >&2
         exit 1
