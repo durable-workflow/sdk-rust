@@ -24494,26 +24494,46 @@ mod tests {
                 },
             )
         };
-        assert!(
-            decode(&original).is_ok(),
-            "full-timeout reopen still replays"
-        );
-        for (reopen, accepted) in [
-            (json!(18), true),
-            (json!(0), true),
-            (json!(31), false),
-            (Value::Null, false),
-        ] {
-            let mut changed = original.clone();
-            changed[3]["payload"]["timeout_seconds"] = reopen.clone();
-            let result = decode(&changed);
-            assert_eq!(
-                result.is_ok(),
-                accepted,
-                "reopen timeout {reopen}: {result:?}"
+        // The same history as select members, as reopened_selection_condition_history builds it.
+        let selection = original
+            .iter()
+            .map(|event| {
+                let mut event = event.clone();
+                let payload = &mut event["payload"];
+                let index = payload["parallel_group_index"].as_u64().unwrap();
+                payload["parallel_group_id"] = json!("select-calls:1:2");
+                payload["parallel_group_mode"] = json!("select");
+                payload["selection_member_key"] = json!(if index == 0 { "timer" } else { "votes" });
+                payload["selection_member_index"] = json!(index);
+                payload["selection_member_base_sequence"] = json!(index + 1);
+                payload["selection_member_size"] = json!(1);
+                payload["selection_member_kind"] =
+                    json!(if index == 0 { "timer" } else { "condition" });
+                event
+            })
+            .collect::<Vec<_>>();
+        for (mode, history) in [("parallel", &original), ("select", &selection)] {
+            assert!(
+                decode(history).is_ok(),
+                "{mode}: full-timeout reopen still replays"
             );
-            if let Err(Error::NonDeterministicReplay(failure)) = result {
-                assert_eq!(failure.reason, "condition_wait_group_reopen_mismatch");
+            for (reopen, accepted) in [
+                (json!(18), true),
+                (json!(0), true),
+                (json!(31), false),
+                (Value::Null, false),
+            ] {
+                let mut changed = history.clone();
+                changed[3]["payload"]["timeout_seconds"] = reopen.clone();
+                let result = decode(&changed);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{mode} reopen timeout {reopen}: {result:?}"
+                );
+                if let Err(Error::NonDeterministicReplay(failure)) = result {
+                    assert_eq!(failure.reason, "condition_wait_group_reopen_mismatch");
+                }
             }
         }
     }
