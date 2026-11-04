@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Parse JSON floats with correct rounding by enabling serde_json's
+  `float_roundtrip` feature (#181). Without it, some 16 to 17
+  significant-digit doubles in Server JSON decoded one ULP off, for example
+  `1.4820142857142857` became `1.4820142857142855`. Replay compared those
+  values with the workflow's own floats, so a recorded float search attribute
+  could fail as `search_attribute_value_mismatch`. Other JSON numbers read
+  from Server responses and history had the same drift. Avro payloads
+  (arguments, results, memos, query and update values) carry binary doubles
+  and were not affected. Cargo unifies features, so this applies to every
+  serde_json user in a worker binary; float parsing is slightly slower.
 - Qualify replay of Workflow 2.19 redrive successors that reuse
   `MemoUpserted`, `SearchAttributesUpserted` or an applied signal wait
   (`SignalWaitOpened`, `SignalReceived`, `SignalApplied`). Values replay
