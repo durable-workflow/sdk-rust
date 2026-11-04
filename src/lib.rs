@@ -3019,6 +3019,7 @@ pub struct Client {
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
     failure_request_limit: Arc<AtomicUsize>,
     activity_lease_renewal_supported: Arc<AtomicBool>,
+    activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
     execution_telemetry: Option<telemetry::ExecutionTelemetry>,
@@ -4108,7 +4109,7 @@ impl Client {
             )
             .await?;
         if response["registered"] == true && response["worker_id"].as_str() == Some(worker_id) {
-            self.observe_activity_lease_capabilities(&response["server_capabilities"]);
+            self.observe_worker_activity_lease_capabilities(&response["server_capabilities"]);
         }
         if self.sticky_cache.is_some() {
             self.confirm_sticky_registration(&response, worker_id, task_queue)
@@ -6005,6 +6006,7 @@ impl ClientBuilder {
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
             failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
+            activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
             execution_telemetry: None,
@@ -8882,6 +8884,8 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        self.client.release_worker_poll();
+
         let mut task_metrics = self.metrics.worker(true, "workflow", &self.task_queue);
         task_metrics.outcome("failed");
         let task_id = task.task_id.clone();
@@ -9071,6 +9075,7 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        self.client.release_worker_poll();
         self.settle_polled_activity(task).await
     }
 
@@ -9415,7 +9420,16 @@ impl Worker {
                     .initial_backoff
                     .max(Duration::from_millis(1));
                 let maximum_delay = self.retry_policy.max_backoff.max(minimum_delay);
-                tokio::time::sleep(advertised_delay.max(minimum_delay).min(maximum_delay)).await;
+                let delay = advertised_delay.max(minimum_delay).min(maximum_delay);
+                if let Some(stop) = &self.run_stop {
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_worker_stop(stop) => {},
+                        _ = tokio::time::sleep(delay) => {},
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
                 Ok(None)
             }
         }

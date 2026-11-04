@@ -162,9 +162,11 @@ equal-or-newer-minor worker protocol version.
 
 `Worker::max_concurrent_workflow_tasks(...)` and
 `Worker::max_concurrent_activity_tasks(...)` each default to 10. `run` and
-`run_until` run up to those limits in independent workflow and activity lanes.
-Use a value of 1 for serial execution within a task family. Clones share their
-configured capacity, including concurrent `run_once` calls.
+`run_until` keep up to those limits active independently for workflows and
+activities. Each family has one long poll. After a claim is validated and
+hydrated, the poller can fill another free slot while earlier tasks execute or
+report completion. Use a value of 1 for serial execution within a task family.
+Clones share their configured capacity, including concurrent `run_once` calls.
 
 Heartbeats report unused slots from actual claimed tasks, including input and
 history loading, callback execution and settlement. An empty long poll keeps
