@@ -123,6 +123,41 @@ Certificate-chain and hostname verification remain enabled. A private CA does
 not make a certificate for the wrong hostname valid. Client certificates
 (mTLS) are not configured by this option.
 
+If a certificate cannot be verified at all, `.danger_accept_invalid_certs(true)`
+turns off certificate and hostname verification for every request the client
+makes. It defaults to `false`. With it on, anyone on the network path can read
+and change traffic, including bearer tokens, so prefer a private CA root.
+
+### Raw Server requests
+
+Typed `Client` methods are the API for applications. Tools that must reach
+every Server route and report the Server's response unchanged, such as the
+`dw` CLI, can send raw requests over the same configured transport:
+
+```rust,no_run
+use durable_workflow::{Client, RawRequest};
+# async fn list(client: &Client) -> Result<(), durable_workflow::Error> {
+let response = client
+    .control_plane_request(
+        RawRequest::get(["workflows", "order/42", "runs"]).query("page_size", "50"),
+    )
+    .await?;
+if let Some(refusal) = response.refusal() {
+    eprintln!("refused: {:?}", refusal.reason);
+}
+let body = response.error_for_status()?.json()?;
+# let _ = body;
+# Ok(())
+# }
+```
+
+The SDK percent-encodes each path segment, keeps any path prefix in the base
+URL, and sends the namespace, the plane's token and both version headers.
+Every HTTP status comes back as a `RawResponse` with its exact body bytes and
+headers. A raw request makes one attempt and never rewrites its body.
+`worker_plane_request` also requires 2xx responses to echo a same-major,
+equal-or-newer-minor worker protocol version.
+
 ### Worker concurrency
 
 `Worker::max_concurrent_workflow_tasks(...)` and
