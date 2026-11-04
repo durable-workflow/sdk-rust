@@ -100,6 +100,24 @@ ordinary worker registration does not enable it.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Condition predicate identities
+
+`wait_condition!` derives the recorded predicate identity from the call site's
+module path and the predicate's Rust tokens. Moving or renaming the workflow
+module changes the identity even when the predicate behaves the same. Rust also
+allows [`stringify!` output to change between compiler versions](https://doc.rust-lang.org/std/macro.stringify.html).
+The SDK's minimum-supported and stable Rust CI jobs pin representative macro
+fingerprints to detect that change before a toolchain upgrade is accepted.
+
+Keep the module path and predicate identity stable while affected waits are
+open, or drain those runs before moving the workflow. For workflows that need
+identities independent of module moves, use
+`ConditionWaitOptions::new("approval", "approval-rule-v1")` from the start.
+An explicit identity must still change when predicate behavior changes.
+Switching an existing macro fingerprint to a new label does not migrate its
+recorded history; preserve the original fingerprint for those runs or drain
+them first.
+
 ### Private certificate authorities
 
 The SDK trusts bundled Mozilla public roots by default. It does not load the
