@@ -1,6 +1,6 @@
 //! Read-only activity visibility for one explicit workflow run.
 
-use crate::{percent_encode_path_segment, Client, RequestProtocol, Result, Value};
+use crate::{percent_encode_path_segment, Client, RequestProtocol, Result, Value, WorkflowHandle};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -160,5 +160,23 @@ impl Client {
             ));
         }
         Ok(view)
+    }
+}
+
+impl WorkflowHandle {
+    /// Inspect the run originally selected by this handle.
+    ///
+    /// A handle without a run ID refuses before sending a request. Use
+    /// [`Client::get_run_activities`] to select a historical run explicitly.
+    pub async fn get_activities(&self) -> Result<WorkflowActivityList> {
+        let run_id = self.run_id.as_deref().ok_or_else(|| {
+            invalid(
+                "missing_run_id",
+                "a selected run ID is required for activity inspection",
+            )
+        })?;
+        self.client
+            .get_run_activities(&self.workflow_id, run_id)
+            .await
     }
 }

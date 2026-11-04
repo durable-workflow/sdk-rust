@@ -54,6 +54,19 @@ impl Server {
                         .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().into()))
                         .collect(),
                 };
+                let content_length = request
+                    .headers
+                    .get("content-length")
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                let header_end = header.find("\r\n\r\n").unwrap() + 4;
+                let mut received = header.len() - header_end;
+                while received < content_length {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    received += count;
+                }
                 captured.lock().unwrap().push(request);
                 let body = document.to_string();
                 let reply = format!("HTTP/1.1 {status} fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
@@ -156,7 +169,7 @@ async fn exact_run_route_returns_typed_activity_attempt_and_authority() {
     );
     assert!(!request
         .headers
-        .contains_key("x-durable-workflow-worker-protocol-version"));
+        .contains_key("x-durable-workflow-protocol-version"));
 }
 
 #[tokio::test]
@@ -317,4 +330,50 @@ async fn worker_credentials_cannot_authorize_a_control_plane_read() {
         })
     ));
     assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn handle_reads_its_selected_run_without_resolving_the_current_run() {
+    let server = Server::start(200, full_document()).await;
+    let handle = server
+        .client()
+        .start_workflow("fixture", "queue", "fixture-id", json!([]))
+        .await
+        .unwrap();
+    let before = server.requests.lock().unwrap().len();
+    let view = handle.get_activities().await.unwrap();
+    assert_eq!(view.run_id, "run?one");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        before + 1,
+        "the selected-run read makes exactly one additional request"
+    );
+    let request = requests.last().unwrap();
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/proxy/api/workflows/workflow%2Fone/runs/run%3Fone/activities"
+    );
+}
+
+#[tokio::test]
+async fn handle_without_run_identity_refuses_before_activity_request() {
+    let server = Server::start(200, full_document()).await;
+    let mut handle = server
+        .client()
+        .start_workflow("fixture", "queue", "fixture-id", json!([]))
+        .await
+        .unwrap();
+    handle.run_id = None;
+    let before = server.requests.lock().unwrap().len();
+    match handle.get_activities().await.unwrap_err() {
+        Error::WorkflowActivityMetadata(error) => assert_eq!(error.reason, "missing_run_id"),
+        other => panic!("expected selected-run refusal, got {other:?}"),
+    }
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        before,
+        "no implicit current-run lookup"
+    );
 }

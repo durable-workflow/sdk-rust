@@ -423,6 +423,8 @@ Unsupported, diagnostic and future status strings are preserved, and unknown
 response fields remain in each model's `raw` map. Heartbeat progress retains its
 structured JSON types. Attempt flags describe the received snapshot and do not
 grant worker authority. This read does not fetch or decode workflow payloads.
+A handle with a selected run also offers `WorkflowHandle::get_activities()`;
+it refuses a missing run ID instead of following the instance's current run.
 
 ## Workflow lists and complete run history
 
