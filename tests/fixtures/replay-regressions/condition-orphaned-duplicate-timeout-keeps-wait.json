@@ -1,0 +1,137 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-condition-orphaned-duplicate-timeout-keeps-wait",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.condition-search",
+    "payload_codec": "avro",
+    "input": []
+  },
+  "history": [
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T04:07:36.000000+00:00",
+      "payload": {
+        "sequence": 4,
+        "condition_wait_id": "condition:4",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "event_type": "TimerScheduled",
+      "timestamp": "2026-11-04T04:07:36.001000+00:00",
+      "payload": {
+        "sequence": 4,
+        "timer_id": "condition-timer:4",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:4",
+        "delay_seconds": 30
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T04:07:36.020000+00:00",
+      "payload": {
+        "sequence": 5,
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "event_type": "TimerScheduled",
+      "timestamp": "2026-11-04T04:07:36.021000+00:00",
+      "payload": {
+        "sequence": 5,
+        "timer_id": "condition-timer:5",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:5",
+        "delay_seconds": 30
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "timestamp": "2026-11-04T04:07:46.000000+00:00",
+      "payload": {
+        "signal_id": "r1",
+        "workflow_command_id": "command-r1",
+        "signal_name": "reject",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCgZBZGEA"
+        }
+      }
+    },
+    {
+      "event_type": "ConditionWaitSatisfied",
+      "timestamp": "2026-11-04T04:07:46.010000+00:00",
+      "payload": {
+        "sequence": 5,
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1"
+      }
+    },
+    {
+      "event_type": "TimerCancelled",
+      "timestamp": "2026-11-04T04:07:46.011000+00:00",
+      "payload": {
+        "sequence": 5,
+        "timer_id": "condition-timer:5",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:5",
+        "delay_seconds": 30
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T04:07:46.012000+00:00",
+      "payload": {
+        "sequence": 6,
+        "condition_wait_id": "condition:6",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 20
+      }
+    },
+    {
+      "event_type": "TimerScheduled",
+      "timestamp": "2026-11-04T04:07:46.013000+00:00",
+      "payload": {
+        "sequence": 6,
+        "timer_id": "condition-timer:6",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:6",
+        "delay_seconds": 20
+      }
+    },
+    {
+      "event_type": "TimerFired",
+      "timestamp": "2026-11-04T04:08:06.100000+00:00",
+      "payload": {
+        "sequence": 4,
+        "timer_id": "condition-timer:4",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "condition:4",
+        "delay_seconds": 30
+      }
+    }
+  ],
+  "expected": {
+    "type": "open_condition_wait",
+    "condition_wait_occurrence_id": "rust:condition-wait:0",
+    "condition_key": "approval",
+    "timeout_seconds": 0
+  }
+}

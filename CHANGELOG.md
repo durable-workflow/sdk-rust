@@ -18,6 +18,40 @@
 - Add `ClientBuilder::danger_accept_invalid_certs` for self-hosted Servers
   whose certificates cannot be verified. It defaults to `false`; prefer
   `additional_root_certificates_pem` for a private CA.
+- Replay condition-wait histories in which the Server recorded a second open
+  of a wait that was still open (#191, #192). A wait is now linked to the
+  same logical wait by its state when the next open was recorded: if it was
+  still open, the next open is a repeated open. So an orphaned duplicate whose
+  timer fires later no longer fails replay with
+  `condition_wait_reopened_after_timeout` (the sdk-php#283 shape). On PHP
+  Server 2.x, condition members of one `parallel` or `select` group whose waits
+  are recorded next to each other, woken by one signal, no longer fail the next
+  task with `condition_wait_group_reopen_mismatch`, and each member consumes
+  its own reopen. A group whose condition waits are separated by another of its
+  members (for example a timer) is not covered yet. A wait that timed out
+  before the next open still ends it. Both histories were refused by 4.11.1 as
+  well.
+
+## 4.11.2
+
+- A `wait_condition` timeout now runs from the first time the wait opens
+  (#187, parity with sdk-php#269). The Server wakes an open condition wait on
+  any signal and records it satisfied. When the predicate was still false, the
+  worker reopened the wait with the full `timeout_seconds`, so each
+  non-matching signal pushed the deadline back. The worker now reopens with
+  the time remaining since the first `ConditionWaitOpened`, rounded up to whole
+  seconds and never below zero; a reopen after the deadline opens with a zero
+  timeout so the Server resolves it as timed out. A condition wait inside a
+  `parallel` or `select` group reopens with its authored timeout, as sdk-php
+  does, because the PHP Server accepts a grouped reopen only when its timeout
+  equals the original open's (#189). Histories whose reopens
+  carry the full timeout still replay, and a reopen longer than the authored
+  timeout is still refused. A reopen links only to the same logical wait
+  (`condition_wait_occurrence_id`), so a separate wait that follows a timed-out
+  one measures from its own open. This needs no Server change. Rolling deploys
+  and rollback: workers on 4.11.1 or earlier refuse a history whose reopen
+  records less than the authored timeout (`condition_wait_timeout_mismatch`),
+  so keep those runs on fixed workers.
 - Parse JSON floats with correct rounding by enabling serde_json's
   `float_roundtrip` feature (#181). Without it, some 16 to 17
   significant-digit doubles in Server JSON decoded one ULP off, for example
@@ -39,7 +73,7 @@
   attempt and run, for example after the run was cancelled while the report
   was in flight. The receipt must carry `recorded=false`, the exact task,
   attempt and `run_id`, a terminal `run_status`, the `stop_reason` it implies
-  and `can_continue=false`, as native Server sends once server#994 ships.
+  and `can_continue=false`, as native Server 3.0.5 sends (server#994).
   Native 3.0.4's `run_closed` body lacks `recorded` and `run_id` and still
   surfaces, as do recorded, mismatched and other conflicts. Direct client
   calls keep the original HTTP error.

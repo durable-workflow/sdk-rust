@@ -1,0 +1,47 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-condition-wait-false-wake-keeps-deadline",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.condition-search",
+    "payload_codec": "avro",
+    "input": []
+  },
+  "history": [
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T02:36:05.000000+00:00",
+      "payload": {
+        "sequence": 4,
+        "condition_wait_id": "condition:4",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "approval",
+        "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "timestamp": "2026-11-04T02:36:17.000000+00:00",
+      "payload": {
+        "workflow_sequence": 4,
+        "signal_name": "reject",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCgZBZGEA"
+        }
+      }
+    }
+  ],
+  "expected": {
+    "type": "open_condition_wait",
+    "condition_wait_occurrence_id": "rust:condition-wait:0",
+    "condition_key": "approval",
+    "condition_definition_fingerprint": "sha256:corpus-approval-v1",
+    "timeout_seconds": 18
+  }
+}

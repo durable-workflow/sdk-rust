@@ -186,6 +186,11 @@ impl HistoryProxy {
                     }
                     Err(error) => panic!("proxy accept: {error}"),
                 };
+                // macOS/BSD accepted sockets inherit the listener's O_NONBLOCK.
+                incoming.set_nonblocking(false).unwrap();
+                incoming
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
                 incoming
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
