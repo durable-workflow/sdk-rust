@@ -24619,6 +24619,90 @@ mod tests {
             .collect()
     }
 
+    fn grouped_wait(sequence: u64, base: u64, size: usize, index: usize) -> RecordedCommand {
+        RecordedCommand::ConditionWait {
+            sequence,
+            occurrence_id: format!("rust:condition-wait:{base}-{index}"),
+            condition_key: Some(format!("member-{index}")),
+            predicate_identity: format!("sha256:member-{index}"),
+            timeout_seconds: Some(300),
+            result: None,
+            parallel_group_path: Some(vec![parallel_group_entry(base, size, index, "condition")]),
+        }
+    }
+
+    fn order(commands: Vec<RecordedCommand>) -> Vec<u64> {
+        group_condition_reopens_by_member(commands)
+            .iter()
+            .map(RecordedCommand::sequence)
+            .collect()
+    }
+
+    // #191: reorder only within a contiguous run of one group's condition
+    // waits, member by member, keeping each member's own order.
+    #[test]
+    fn grouped_reopens_are_ordered_by_member_only_within_one_contiguous_group_run() {
+        // Three members with unequal reopen counts: a1 b1 c1 a2 c2 a3.
+        assert_eq!(
+            order(vec![
+                grouped_wait(1, 1, 3, 0),
+                grouped_wait(2, 1, 3, 1),
+                grouped_wait(3, 1, 3, 2),
+                grouped_wait(4, 1, 3, 0),
+                grouped_wait(5, 1, 3, 2),
+                grouped_wait(6, 1, 3, 0),
+            ]),
+            vec![1, 4, 6, 2, 3, 5]
+        );
+
+        // Another command between members ends the run: nothing moves across it.
+        assert_eq!(
+            order(vec![
+                grouped_wait(1, 1, 2, 0),
+                RecordedCommand::Timer {
+                    sequence: 2,
+                    delay_seconds: 5,
+                    fired: false,
+                    parallel_group_path: None,
+                },
+                grouped_wait(3, 1, 2, 1),
+                grouped_wait(4, 1, 2, 0),
+            ]),
+            vec![1, 2, 3, 4]
+        );
+
+        // Two different groups interleaved never merge into one run.
+        assert_eq!(
+            order(vec![
+                grouped_wait(1, 1, 2, 0),
+                grouped_wait(10, 10, 2, 0),
+                grouped_wait(2, 1, 2, 1),
+                grouped_wait(11, 10, 2, 1),
+            ]),
+            vec![1, 10, 2, 11]
+        );
+
+        // Ungrouped waits and an already member-ordered run are unchanged.
+        let ungrouped = |sequence| RecordedCommand::ConditionWait {
+            sequence,
+            occurrence_id: "rust:condition-wait:0".into(),
+            condition_key: Some("approval".into()),
+            predicate_identity: "sha256:approval".into(),
+            timeout_seconds: Some(30),
+            result: None,
+            parallel_group_path: None,
+        };
+        assert_eq!(order(vec![ungrouped(1), ungrouped(2)]), vec![1, 2]);
+        assert_eq!(
+            order(vec![
+                grouped_wait(1, 1, 2, 0),
+                grouped_wait(3, 1, 2, 0),
+                grouped_wait(2, 1, 2, 1),
+            ]),
+            vec![1, 3, 2]
+        );
+    }
+
     // #191: the PHP Server 2.11.8 history for two condition members woken by
     // one signal. It satisfies only the resume task's member (seq 2) but
     // records a reopen of the other, still-open member (seq 3 after seq 1).
