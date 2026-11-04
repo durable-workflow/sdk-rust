@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.12.0
+
 - Keep one in-flight poll per task family while filling the configured workflow
   and activity execution slots (#199). A received task finishes hydration and
   initial lease confirmation before polling refills a spare slot. Its execution
