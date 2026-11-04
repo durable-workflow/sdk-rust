@@ -2031,6 +2031,7 @@ impl Worker {
         let Some(claim) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
+        self.client.release_worker_poll();
         let mut task_metrics = self.metrics.worker(true, "workflow", &self.task_queue);
         task_metrics.outcome("failed");
         // Anchor the immutable cleanup deadline once, before replay. Deferring

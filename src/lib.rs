@@ -8884,6 +8884,8 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        self.client.release_worker_poll();
+
         let mut task_metrics = self.metrics.worker(true, "workflow", &self.task_queue);
         task_metrics.outcome("failed");
         let task_id = task.task_id.clone();
@@ -9073,6 +9075,7 @@ impl Worker {
             return Ok(ManagedPollOutcome::Idle);
         };
 
+        self.client.release_worker_poll();
         self.settle_polled_activity(task).await
     }
 
@@ -9417,7 +9420,16 @@ impl Worker {
                     .initial_backoff
                     .max(Duration::from_millis(1));
                 let maximum_delay = self.retry_policy.max_backoff.max(minimum_delay);
-                tokio::time::sleep(advertised_delay.max(minimum_delay).min(maximum_delay)).await;
+                let delay = advertised_delay.max(minimum_delay).min(maximum_delay);
+                if let Some(stop) = &self.run_stop {
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_worker_stop(stop) => {},
+                        _ = tokio::time::sleep(delay) => {},
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
                 Ok(None)
             }
         }

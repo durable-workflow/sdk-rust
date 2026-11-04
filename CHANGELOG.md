@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep one in-flight poll per task family while filling the configured workflow
+  and activity execution slots (#199). A received task finishes hydration and
+  initial lease confirmation before polling refills a spare slot. Its execution
+  slot stays occupied through completion reporting, so slow callbacks can run
+  concurrently without multiplying idle long polls.
+
 - Reuse worker-authenticated activity lease capability observations instead of
   fetching `/cluster/info` for every activity (#199). Client clones share one
   discovery when needed and refresh only after an explicit capability refusal. Original claim,

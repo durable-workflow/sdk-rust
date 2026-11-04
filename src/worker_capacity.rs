@@ -1,4 +1,4 @@
-use crate::{wait_for_worker_stop, ManagedPollOutcome, Result, Worker};
+use crate::{wait_for_worker_stop, Client, ManagedPollOutcome, Result, Worker};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,6 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Debug)]
 pub(super) struct TaskCapacity {
     permits: Arc<Semaphore>,
+    polls: Arc<Semaphore>,
     active: Arc<AtomicUsize>,
     limit: usize,
 }
@@ -17,6 +18,7 @@ impl TaskCapacity {
     pub(super) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             permits: Arc::new(Semaphore::new(limit)),
+            polls: Arc::new(Semaphore::new(1)),
             active: Arc::new(AtomicUsize::new(0)),
             limit,
         })
@@ -34,16 +36,29 @@ impl TaskCapacity {
                 None => std::future::pending().await,
             }
         };
+        tokio::pin!(stopped);
         let permit = tokio::select! {
             biased;
-            _ = stopped => return None,
+            _ = &mut stopped => return None,
             permit = self.permits.clone().acquire_owned() => permit.ok()?,
         };
+        // Execution capacity is independent of long-poll concurrency. One
+        // poller refills spare slots without waking every idle lane for a task.
+        let poll = tokio::select! {
+            biased;
+            _ = &mut stopped => return None,
+            poll = self.polls.clone().acquire_owned() => poll.ok()?,
+        };
+        // Acquiring the semaphore can wake us before the stop waiter's timer.
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            return None;
+        }
         Some(Reservation {
             _permit: permit,
             marker: Arc::new(TaskSlotMarker {
                 active: self.active.clone(),
                 state: Mutex::new(SlotState::Polling),
+                poll: Mutex::new(Some(poll)),
             }),
         })
     }
@@ -62,9 +77,19 @@ enum SlotState {
 pub(super) struct TaskSlotMarker {
     active: Arc<AtomicUsize>,
     state: Mutex<SlotState>,
+    poll: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl TaskSlotMarker {
+    fn poll_completed(&self) {
+        let poll = self
+            .poll
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(poll);
+    }
+
     pub(super) fn claimed(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if *state == SlotState::Polling {
@@ -79,6 +104,15 @@ impl TaskSlotMarker {
             self.active.fetch_sub(1, Ordering::SeqCst);
         }
         *state = SlotState::Closed;
+        self.poll_completed();
+    }
+}
+
+impl Client {
+    pub(super) fn release_worker_poll(&self) {
+        if let Some(slot) = &self.worker_task_slot {
+            slot.poll_completed();
+        }
     }
 }
 
@@ -106,7 +140,9 @@ impl Worker {
         };
         let mut worker = self.clone();
         worker.client.worker_task_slot = Some(slot.marker.clone());
-        worker.poll_workflow_once_reserved().await
+        let result = worker.poll_workflow_once_reserved().await;
+        self.stop_on_terminal_poll(&result);
+        result
     }
 
     pub(super) async fn poll_activity_once(&self) -> Result<ManagedPollOutcome> {
@@ -115,7 +151,18 @@ impl Worker {
         };
         let mut worker = self.clone();
         worker.client.worker_task_slot = Some(slot.marker.clone());
-        worker.poll_activity_once_reserved().await
+        let result = worker.poll_activity_once_reserved().await;
+        self.stop_on_terminal_poll(&result);
+        result
+    }
+
+    fn stop_on_terminal_poll(&self, result: &Result<ManagedPollOutcome>) {
+        if matches!(result, Err(_) | Ok(ManagedPollOutcome::Stop)) {
+            if let Some(stop) = &self.run_stop {
+                // Stop queued pollers before this reservation's drop wakes one.
+                stop.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     pub(super) async fn poll_workflows_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
