@@ -238,6 +238,7 @@ class ConditionCell(native.Cell):
 
 
 def recover(root, token):
+    require(isinstance(token, str) and re.fullmatch('[0-9a-f]{16}', token), 'invalid recovery token')
     record = json.loads(native.confined_child(root, 'run.json').read_text())
     require(record.get('owner') == PREFIX and record.get('token') == token
             and record.get('cells') == [CELL], 'wrong recovery ownership')
