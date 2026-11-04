@@ -9,10 +9,10 @@
   non-matching signal pushed the deadline back. The worker now reopens with
   the time remaining since the first `ConditionWaitOpened`, rounded up to whole
   seconds and never below zero; a reopen after the deadline opens with a zero
-  timeout so the Server resolves it as timed out. This applies to condition
-  waits inside `parallel` and `select` groups too; sdk-php 3.9.x re-sends a
-  grouped wait with its authored timeout (aligning under sdk-php#278), and each
-  SDK replays only its own histories. Histories whose reopens
+  timeout so the Server resolves it as timed out. A condition wait inside a
+  `parallel` or `select` group reopens with its authored timeout, as sdk-php
+  does, because the PHP Server accepts a grouped reopen only when its timeout
+  equals the original open's (#189). Histories whose reopens
   carry the full timeout still replay, and a reopen longer than the authored
   timeout is still refused. A reopen links only to the same logical wait
   (`condition_wait_occurrence_id`), so a separate wait that follows a timed-out
