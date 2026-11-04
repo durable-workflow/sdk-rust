@@ -1,0 +1,47 @@
+name: Stable API documentation check
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'scripts/check-docs-*.py'
+      - 'scripts/ci/test-docs-*.mjs'
+      - 'scripts/ci/validate-example-base-urls.py'
+      - 'scripts/ci/*docs-release.py'
+      - 'scripts/ci/build-stable-docs.sh'
+      - 'scripts/ci/release_package.py'
+      - 'scripts/ci/install-release-tooling.sh'
+      - 'scripts/ci/release-tooling-requirements.txt'
+      - 'release/approved-packages/*.json'
+      - '.github/workflows/docs.yml'
+      - '.github/workflows/docs-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-stable-docs-check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Check the published stable API build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
+      - name: Install isolated approval verification tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+      - name: Build and check the published documentation
+        run: bash scripts/ci/build-stable-docs.sh
