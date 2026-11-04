@@ -670,6 +670,18 @@ pub fn __condition_definition_fingerprint(source: &str) -> String {
 ///
 /// The returned [`ConditionWaitCall`] must be awaited. The timeout form is
 /// `wait_condition!(ctx, "approval", timeout: duration, || predicate)`.
+///
+/// The identity includes the call site's [`module_path!`] and the predicate's
+/// [`stringify!`] output. Moving or renaming the workflow module changes it,
+/// even when the predicate behaves the same. Compiler upgrades can also change
+/// token stringification. Keep those identities stable while waits are open,
+/// or drain the affected runs before changing them.
+///
+/// Use [`ConditionWaitOptions::new`] with an explicit stable predicate identity
+/// when module moves or compiler changes must not affect it. Choose that
+/// identity before starting runs; replacing an existing macro fingerprint with
+/// a new label does not migrate histories. Change an explicit identity whenever
+/// the predicate's behavior changes.
 #[macro_export]
 macro_rules! wait_condition {
     ($ctx:expr, $key:expr, timeout: $timeout:expr, $predicate:expr $(,)?) => {{
@@ -19275,6 +19287,7 @@ mod tests {
     mod cancellation_scope_opening;
     mod cancellation_scope_replay;
     mod child_workflow_policies;
+    mod condition_fingerprint;
     mod cooperative_cancellation;
     mod local_activity;
     mod nexus;
