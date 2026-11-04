@@ -24866,6 +24866,125 @@ mod tests {
         (poll, ctx.take_commands().expect("commands"))
     }
 
+    fn approval_wait_open_at(
+        sequence: u64,
+        occurrence: u64,
+        at: &str,
+        timeout_seconds: u64,
+    ) -> HistoryEvent {
+        let mut event = approval_wait_open(sequence, at, timeout_seconds);
+        event.payload["condition_wait_occurrence_id"] =
+            json!(format!("rust:condition-wait:{occurrence}"));
+        event
+    }
+
+    fn approval_wait_timed_out(sequence: u64, at: &str) -> HistoryEvent {
+        timed_event(
+            "ConditionWaitTimedOut",
+            at,
+            json!({
+                "sequence": sequence,
+                "condition_wait_id": format!("condition:{sequence}"),
+                "condition_wait_occurrence_id": "rust:condition-wait:0",
+                "condition_key": "approval",
+                "condition_definition_fingerprint": "sha256:approval-v1",
+            }),
+        )
+    }
+
+    /// `if wait(300) { approved } else if wait(grace) { late } else { expired }`,
+    /// both waits on the same key and predicate. Returns the outcome so far and
+    /// any new commands.
+    fn poll_grace_wait(
+        history: Vec<HistoryEvent>,
+        grace_seconds: u64,
+    ) -> (Poll<Result<&'static str>>, Vec<Value>) {
+        let ctx = workflow_context(history);
+        let wait = |seconds| {
+            let predicate_ctx = ctx.clone();
+            ctx.wait_condition(
+                ConditionWaitOptions::new("approval", "sha256:approval-v1")
+                    .timeout(Duration::from_secs(seconds)),
+                move || Ok(!predicate_ctx.signals("approve")?.is_empty()),
+            )
+        };
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let mut first = Box::pin(wait(300));
+        let poll = match first.as_mut().poll(&mut task_context) {
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied)) => Poll::Ready(Ok("approved")),
+            Poll::Ready(Ok(ConditionWaitResult::TimedOut)) => {
+                let mut grace = Box::pin(wait(grace_seconds));
+                match grace.as_mut().poll(&mut task_context) {
+                    Poll::Ready(Ok(ConditionWaitResult::Satisfied)) => Poll::Ready(Ok("late")),
+                    Poll::Ready(Ok(ConditionWaitResult::TimedOut)) => Poll::Ready(Ok("expired")),
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        };
+        (poll, ctx.take_commands().expect("commands"))
+    }
+
+    // A separate wait after a timed-out one is its own logical wait: it
+    // measures from its own open and never inherits the earlier deadline
+    // (General's sdk-php#271 review vectors).
+    #[test]
+    fn a_wait_after_a_timed_out_wait_measures_from_its_own_open() {
+        let timed_out_first = || {
+            vec![
+                approval_wait_open_at(1, 0, "2026-11-04T02:36:05.000000+00:00", 300),
+                approval_wait_timed_out(1, "2026-11-04T02:41:05.000000+00:00"),
+            ]
+        };
+        for (label, grace, signal, expected) in [
+            ("grace wait, wrong signal", 60, "reject", 31),
+            ("equal-timeout wait, wrong signal", 300, "reject", 271),
+        ] {
+            let mut history = timed_out_first();
+            history.push(approval_wait_open_at(
+                2,
+                1,
+                "2026-11-04T02:41:05.500000+00:00",
+                grace,
+            ));
+            history.push(approval_signal(
+                signal,
+                "s1",
+                "2026-11-04T02:41:35.000000+00:00",
+            ));
+            let (poll, commands) = poll_grace_wait(history, grace);
+            assert!(matches!(poll, Poll::Pending), "{label}: {poll:?}");
+            assert_eq!(commands.len(), 1, "{label}: {commands:?}");
+            assert_eq!(
+                commands[0]["condition_wait_occurrence_id"],
+                json!("rust:condition-wait:1"),
+                "{label}"
+            );
+            assert_eq!(commands[0]["timeout_seconds"], json!(expected), "{label}");
+        }
+
+        let mut history = timed_out_first();
+        history.push(approval_wait_open_at(
+            2,
+            1,
+            "2026-11-04T02:41:05.500000+00:00",
+            60,
+        ));
+        history.push(approval_signal(
+            "approve",
+            "a1",
+            "2026-11-04T02:41:35.000000+00:00",
+        ));
+        let (poll, commands) = poll_grace_wait(history, 60);
+        assert!(
+            matches!(poll, Poll::Ready(Ok("late"))),
+            "grace wait, approve: {poll:?}"
+        );
+        assert!(commands.is_empty());
+    }
+
     // The same vectors as sdk-php#271 (#187): a false wake satisfies the Server's
     // wait, and the reopen keeps the deadline of the first open.
     #[test]
