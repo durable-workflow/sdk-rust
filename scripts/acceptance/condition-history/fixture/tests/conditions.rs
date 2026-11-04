@@ -327,19 +327,31 @@ mod installed_conditions {
         worker.register_workflow("installed.two-member", |ctx, _| async move {
             let votes = ctx.clone();
             let approvals = ctx.clone();
-            ctx.parallel(vec![
-                ParallelOperation::condition(
-                    ConditionWaitOptions::new("votes", "sha256:votes-v1")
-                        .timeout(Duration::from_secs(300)),
-                    move || Ok(votes.signals("vote")?.len() >= 2),
-                ),
-                ParallelOperation::condition(
-                    ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
-                        .timeout(Duration::from_secs(300)),
-                    move || Ok(!approvals.signals("approve")?.is_empty()),
-                ),
-            ])
-            .await?;
+            let outcomes = ctx
+                .parallel(vec![
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("votes", "sha256:votes-v1")
+                            .timeout(Duration::from_secs(300)),
+                        move || Ok(votes.signals("vote")?.len() >= 2),
+                    ),
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
+                            .timeout(Duration::from_secs(300)),
+                        move || Ok(!approvals.signals("approve")?.is_empty()),
+                    ),
+                ])
+                .await?;
+            if !matches!(
+                outcomes.as_slice(),
+                [
+                    ParallelResult::Condition(ConditionWaitResult::Satisfied),
+                    ParallelResult::Condition(ConditionWaitResult::Satisfied),
+                ]
+            ) {
+                return Err(Error::WorkerLoop(
+                    "both live conditions must be satisfied".into(),
+                ));
+            }
             Ok(json!("both"))
         });
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

@@ -153,6 +153,84 @@ class Packet(unittest.TestCase):
             packet.recover(self.args.work_dir, self.args.run_token)
         recover.assert_not_called()
 
+    def test_malformed_recovery_token_refuses_before_reading_a_record(self):
+        with mock.patch.object(packet.native, 'confined_child') as read, self.assertRaises(SystemExit):
+            packet.recover(self.root / 'absent', 'malformed')
+        read.assert_not_called()
+
+    def test_server_review_countercontrols(self):
+        cases = []
+        report = self.report()
+        report['history'].insert(-1, {'event_type': 'TimerFired', 'payload': {
+            'sequence': 3, 'condition_wait_id': 'foreign', 'timer_id': 'foreign',
+            'timer_kind': 'condition_timeout', 'delay_seconds': 300}})
+        cases.append(('foreign-timer', report))
+        report = self.report()
+        report['history'].insert(-1, {'event_type': 'ConditionWaitTimedOut', 'payload': {
+            'sequence': 999, 'condition_wait_id': 'foreign'}})
+        cases.append(('foreign-timeout', report))
+        report = self.report()
+        extra = copy.deepcopy(report['history'][4])
+        extra['payload'].update(sequence=999, condition_wait_id='foreign', condition_key='foreign')
+        report['history'].insert(-1, extra)
+        cases.append(('foreign-fifth-open', report))
+        report = self.report()
+        for row in report['history']:
+            if row['event_type'].startswith('ConditionWait'):
+                row['payload']['condition_definition_fingerprint'] = 'sha256:foreign'
+        cases.append(('consistently-wrong-fingerprint', report))
+        report = self.report()
+        report['history'][0]['payload']['timeout_seconds'] = 300.0
+        cases.append(('float-original-timeout', report))
+        for label, report in cases:
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                packet.comparator.check(report)
+
+    def snapshots(self, events):
+        signals = [i for i, event in enumerate(events) if event['event_type'] == 'SignalReceived']
+        return {'outcome': 'pass', 'result': 'both', 'initial': events[:signals[0]],
+                'reopened': events[:signals[1]], 'history': events}
+
+    def test_additional_reopens_keep_the_same_declared_members(self):
+        events = self.report()['history']
+        extra = copy.deepcopy(events[4:6])
+        for sequence, event in zip((5, 6), extra):
+            event['payload'].update(sequence=sequence, condition_wait_id='condition:' + str(sequence))
+        events[6:6] = extra
+        report = self.snapshots(events)
+        self.assertEqual(packet.comparator.check(report)['all_open_sequences'], [1, 2, 3, 4, 5, 6])
+
+    def timer(self, kind, sequence):
+        return {'event_type': kind, 'payload': {'sequence': sequence,
+            'condition_wait_id': 'condition:' + str(sequence), 'timer_id': 'timer:' + str(sequence),
+            'timer_kind': 'condition_timeout', 'delay_seconds': 300}}
+
+    def test_correlated_superseded_orphan_timer_is_distinct_from_the_current_tail(self):
+        events = self.report()['history']
+        orphan = copy.deepcopy(events[0])
+        orphan['event_type'] = 'ConditionWaitTimedOut'
+        events.insert(1, self.timer('TimerScheduled', 1))
+        events[-3:-3] = [self.timer('TimerFired', 1), orphan]
+        self.assertEqual(packet.comparator.check(self.snapshots(events))['outcome'], 'pass')
+
+    def test_timer_terminals_require_prior_schedule_and_row_ordered_supersession(self):
+        for label in ('missing-schedule', 'current-tail', 'before-reopen', 'duplicate-fire', 'wrong-delay'):
+            events = self.report()['history']
+            if label == 'current-tail':
+                events.insert(5, self.timer('TimerScheduled', 3))
+                events.insert(-1, self.timer('TimerFired', 3))
+            else:
+                if label != 'missing-schedule':
+                    events.insert(1, self.timer('TimerScheduled', 1))
+                fired = self.timer('TimerFired', 1)
+                if label == 'wrong-delay':
+                    fired['payload']['delay_seconds'] = 299
+                events.insert(2 if label == 'before-reopen' else -1, fired)
+                if label == 'duplicate-fire':
+                    events.insert(-1, copy.deepcopy(fired))
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                packet.comparator.check(self.snapshots(events))
+
 
 if __name__ == '__main__':
     unittest.main()

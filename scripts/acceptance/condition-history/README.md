@@ -97,6 +97,16 @@ not an independent second HTTP client. After execution, a separate read-only own
 audit must confirm all matching containers, networks, volumes and processes absent.
 Publish a sanitized immutable result before acceptance or closure.
 
+The comparator scans every opened wait, condition outcome and timer row, binding
+the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.
+Additional reopens must keep that member lineage and cannot extend its recorded
+timeout. Present timer terminals require a matching earlier schedule; a superseded
+orphan's timer is distinct from the current tail. Current-tail timeouts contradict
+this case's required satisfied result. H's minimal two-member fixture has no timer
+rows, and its direct condition outcomes do not imply an invented timer schedule.
+The live consumer also checks both public parallel results are `Satisfied` before
+returning `both`. These are source assertions for review, not observed live results.
+
 Inert source checks, which do not invoke Docker or Cargo:
 
 ```sh
