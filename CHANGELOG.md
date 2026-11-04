@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- A `wait_condition` timeout now runs from the first time the wait opens
+  (#187, parity with sdk-php#269). The Server wakes an open condition wait on
+  any signal and records it satisfied. When the predicate was still false, the
+  worker reopened the wait with the full `timeout_seconds`, so each
+  non-matching signal pushed the deadline back. The worker now reopens with
+  the time remaining since the first `ConditionWaitOpened`, rounded up to whole
+  seconds and never below zero; a reopen after the deadline opens with a zero
+  timeout so the Server resolves it as timed out. This applies to condition
+  waits inside `parallel` and `select` groups too; sdk-php 3.9.x re-sends a
+  grouped wait with its authored timeout (aligning under sdk-php#278), and each
+  SDK replays only its own histories. Histories whose reopens
+  carry the full timeout still replay, and a reopen longer than the authored
+  timeout is still refused. A reopen links only to the same logical wait
+  (`condition_wait_occurrence_id`), so a separate wait that follows a timed-out
+  one measures from its own open. This needs no Server change. Rolling deploys
+  and rollback: workers on 4.11.1 or earlier refuse a history whose reopen
+  records less than the authored timeout (`condition_wait_timeout_mismatch`),
+  so keep those runs on fixed workers.
 - Parse JSON floats with correct rounding by enabling serde_json's
   `float_roundtrip` feature (#181). Without it, some 16 to 17
   significant-digit doubles in Server JSON decoded one ULP off, for example

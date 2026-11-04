@@ -481,6 +481,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.condition-search"
             | "corpus.condition-search-adjacent"
             | "corpus.grouped-condition-reopen"
+            | "corpus.grouped-condition-timed-reopen"
             | "corpus.cancellation-remaining-condition"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
@@ -777,6 +778,20 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 ])
                 .await?;
                 Ok(json!(context.remaining()?.as_secs_f64()))
+            });
+        }
+        "corpus.grouped-condition-timed-reopen" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                ctx.parallel(vec![
+                    ParallelOperation::timer(Duration::from_secs(300)),
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                            .timeout(Duration::from_secs(30)),
+                        || Ok(false),
+                    ),
+                ])
+                .await?;
+                Ok(Value::Null)
             });
         }
         "corpus.grouped-condition-reopen" => {
