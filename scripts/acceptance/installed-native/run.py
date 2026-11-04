@@ -7,6 +7,7 @@ crate version or (pre-publication mode) the exact `cargo package` bytes of one
 clean source commit. Nothing here contacts Cloud. See README.md for usage.
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import io
@@ -42,6 +43,10 @@ PREFIX_PATTERN = re.compile(r'[a-z][a-z0-9-]{0,30}')
 BUILD_WALL_SECONDS = 3300
 BUILD_KILL_AFTER_SECONDS = 60
 BUILD_CLIENT_TIMEOUT = 3600
+# All roles in one Cell share this absolute wall bound, including setup and
+# late-starting history checks. It remains effective if this client dies.
+CELL_WALL_SECONDS = 600
+CELL_KILL_AFTER_SECONDS = 10
 # Pre-publication mode. The release workflow packages with Rust 1.86.0, and a
 # different Cargo writes different archive bytes, so packaging here must use the
 # same Cargo release.
@@ -85,6 +90,7 @@ class Run:
         self.base = '%s-accept-%s-%s' % (self.prefix, self.stamp, self.token)
         self.cleanup_errors = []
         self.local_leftovers = []
+        self.secret_values = []  # In-memory only, never part of the ownership record.
 
     def best_effort(self, step, name, function, *args, **kwargs):
         """Run one cleanup step; record a failure (step, object, error type only) and continue."""
@@ -131,11 +137,87 @@ def remove_tree(path):
         shutil.rmtree(path)
 
 
+def redact_credentials(data, values):
+    """Exact-value fence for retained diagnostics, including structured output."""
+    leaked = False
+    for value in values:
+        needle = value.encode()
+        if needle in data:
+            leaked = True
+            data = data.replace(needle, b'[REDACTED]')
+    return data, leaked
+
+
+def credential_output(run, label):
+    error = {'step': 'credential-output', 'object': label, 'error': 'CredentialOutput'}
+    if error not in run.cleanup_errors:
+        run.cleanup_errors.append(error)
+
+
 def remove_owned_network(name, run):
     network_id = owned_id('network', name, run)
     if network_id:
         call(['docker', 'network', 'rm', network_id])
     return network_id
+
+
+def run_objects(kind, run):
+    filters = ['--filter', 'label=%s=%s' % (RUN_LABEL, run.token),
+               '--filter', 'label=%s=%s' % (OWNER_LABEL, run.prefix)]
+    command = ['docker', 'ps', '-aq'] if kind == 'container' else ['docker', 'network', 'ls', '-q']
+    # A failed query is uncertainty, never an empty inventory.
+    return call(command + filters).stdout.split()
+
+
+def recover_run(root, run, cells):
+    """Recovery after client death. Recheck both labels before every removal."""
+    for kind in ('container', 'network'):
+        objects = run.best_effort('recovery-query', kind, run_objects, kind, run)
+        for object_id in objects or []:
+            def remove():
+                labels = 'Config.Labels' if kind == 'container' else 'Labels'
+                result = call(['docker', kind, 'inspect', '--format',
+                               '{{index .%s "%s"}} {{index .%s "%s"}}' %
+                               (labels, RUN_LABEL, labels, OWNER_LABEL), object_id])
+                if result.stdout.split() != [run.token, run.prefix]:
+                    raise RuntimeError('refusing foreign recovery object')
+                command = ['docker', 'rm', '-f', object_id] if kind == 'container' else ['docker', 'network', 'rm', object_id]
+                call(command)
+            run.best_effort('recovery-remove', kind, remove)
+    # With a dead client the secret values are intentionally unavailable. Purge
+    # the complete unqualified Cell tree instead of retaining unscannable logs
+    # or partially written driver/history/acknowledgement files.
+    for cell in cells:
+        run.best_effort('recovery-state', cell, lambda: remove_tree(confined_child(root, 'cells/' + cell)))
+    containers = run.best_effort('recovery-verify', 'container', run_objects, 'container', run)
+    networks = run.best_effort('recovery-verify', 'network', run_objects, 'network', run)
+    for cell in cells:
+        def verify():
+            if os.path.lexists(confined_child(root, 'cells/' + cell)):
+                raise RuntimeError('Cell survived recovery')
+        run.best_effort('recovery-state-verify', cell, verify)
+    return {'pass': not run.cleanup_errors and containers == [] and networks == [],
+            'errors': run.cleanup_errors, 'leftover_containers': containers, 'leftover_networks': networks}
+
+
+def cleanup_main(argv=None):
+    parser = argparse.ArgumentParser(description='Recover one acceptance run after client death.')
+    parser.add_argument('--work-dir', required=True, type=cli_path)
+    parser.add_argument('--container-prefix', required=True, type=container_prefix)
+    parser.add_argument('--run-token', required=True)
+    args = parser.parse_args(argv)
+    if not re.fullmatch('[0-9a-f]{16}', args.run_token):
+        parser.error('--run-token must be the exact 16-hex run label')
+    record = json.loads(confined_child(args.work_dir, 'run.json').read_text())
+    expected = {'schema': 'durable-workflow.acceptance-run/v1', 'owner': args.container_prefix,
+                'token': args.run_token, 'cells': record.get('cells')}
+    if (record != expected or not isinstance(record['cells'], list) or not record['cells']
+            or any(c not in ('lifecycle', 'deadline') for c in record['cells'])):
+        raise SystemExit('work directory does not belong to the requested run')
+    run = Run(args.container_prefix, token=args.run_token)
+    result = recover_run(args.work_dir, run, record['cells'])
+    print(json.dumps(result))
+    raise SystemExit(0 if result['pass'] else 1)
 
 
 def full_commit(value):
@@ -236,6 +318,8 @@ def parse_args(argv=None):
                         help='owner prefix for container, network and task names, e.g. general or security '
                              '(^%s$)' % PREFIX_PATTERN.pattern)
     args = parser.parse_args(argv)
+    if not args.cells or any(c not in ('lifecycle', 'deadline') for c in args.cells.split(',')):
+        parser.error('--cells must select lifecycle and/or deadline')
     if args.package_from:
         # An approval candidate is only meaningful against one exact Server release.
         required = (('--package-commit', args.package_commit), ('--expect-version', args.expect_version),
@@ -687,8 +771,93 @@ class Cell:
         self.state = self.dir / 'state'
         self.task = '%s-%s' % (run.base, name)
         self.containers = []
+        self.deadline = int(time.time()) + CELL_WALL_SECONDS
+        self.token = 'fixture-' + secrets.token_hex(24)
+        self.server_key = 'base64:' + base64.b64encode(secrets.token_bytes(32)).decode()
+        self.harness_run.secret_values.extend((self.token, self.server_key))
+        self.image_commands = {}
 
-    def start(self, role, image, command, user=None, env=None, alias=None, mounts=()):
+    def evidence(self, data, label):
+        clean, leaked = redact_credentials(data, (self.token, self.server_key))
+        if leaked:
+            credential_output(self.harness_run, self.name + '/' + label)
+        return clean
+
+    def fence_artifacts(self):
+        """After writers stop, sanitize every retained Cell artifact or fail closed.
+
+        JSON is normalized before scanning, so escaped credential characters
+        cannot survive as a reusable structured value. Never follow a symlink.
+        """
+        if not self.dir.exists():
+            return
+        for path in self.dir.rglob('*'):
+            _, named_secret = redact_credentials(path.relative_to(self.dir).as_posix().encode(),
+                                                 (self.token, self.server_key))
+            if named_secret:
+                credential_output(self.harness_run, self.name + '/artifact-name')
+                raise RuntimeError('credential-bearing artifact name')
+            if path.is_symlink():
+                raise RuntimeError('refusing symlinked Cell evidence')
+            if not path.is_file():
+                continue
+            path = confined_child(self.dir, path.relative_to(self.dir).as_posix())
+            if path.stat().st_size > 8 * 1024 * 1024:
+                raise RuntimeError('Cell evidence exceeds the bounded artifact size')
+            raw = path.read_bytes()
+            normalized = raw
+            try:
+                if path.suffix == '.json':
+                    normalized = json.dumps(json.loads(raw), ensure_ascii=False).encode()
+                elif path.suffix == '.jsonl':
+                    normalized = ('\n'.join(json.dumps(json.loads(line), ensure_ascii=False)
+                                            for line in raw.splitlines() if line) + '\n').encode()
+            except (ValueError, UnicodeError):
+                raise RuntimeError('malformed structured Cell evidence') from None
+            clean = self.evidence(normalized, 'artifact')
+            if clean != normalized:
+                path.write_bytes(clean)
+
+    def launch(self, line, name, image, command, user, credentials):
+        """Preserve the image entrypoint under a client-independent supervisor.
+
+        The token travels only on stdin into this container's private tmpfs.
+        Neither Docker's create metadata nor bind-mounted evidence stores it.
+        A client death before token delivery leaves a bounded, unarmed waiter.
+        """
+        if time.time() >= self.deadline:
+            raise RuntimeError('Cell deadline has expired')
+        if image not in self.image_commands:
+            config = json.loads(call(['docker', 'image', 'inspect', image]).stdout)[0]['Config']
+            entry, default = config.get('Entrypoint') or [], config.get('Cmd') or []
+            if not all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in (entry, default)):
+                raise RuntimeError('image entrypoint and command must be argument arrays')
+            self.image_commands[image] = entry, default
+        entry, default = self.image_commands[image]
+        child = entry + (command or default)
+        if not child:
+            raise RuntimeError('image has no command to supervise')
+        uid, gid = user.split(':')
+        if not uid.isdecimal() or not gid.isdecimal():
+            raise RuntimeError('Cell user must be a numeric uid:gid')
+        line += ['--entrypoint', '/bin/sh', '--tmpfs',
+                 '/credentials:mode=0700,uid=%s,gid=%s,size=64k,noexec,nosuid,nodev' % (uid, gid),
+                 '--mount', 'type=bind,src=%s,dst=/acceptance-supervisor.sh,readonly' % (HERE / 'cell-supervisor.sh')]
+        self.containers.append(name)
+        call(line + [image, '/acceptance-supervisor.sh', str(self.deadline),
+                     str(CELL_KILL_AFTER_SECONDS), credentials] + child)
+        if credentials != 'none':
+            token = self.token if credentials in ('auth', 'both') else ''
+            key = self.server_key if credentials in ('server', 'both') else ''
+            call(['docker', 'exec', '-i', name, '/bin/sh', '-c',
+                  'umask 077; IFS= read -r token && IFS= read -r key && '
+                  '{ [ -z "$token" ] || printf %s "$token" > /credentials/token; } && '
+                  '{ [ -z "$key" ] || printf %s "$key" > /credentials/server-key; } && '
+                  ': > /credentials/ready.tmp && mv /credentials/ready.tmp /credentials/ready'],
+                 input=token + '\n' + key + '\n', timeout=30)
+        return name
+
+    def start(self, role, image, command, user=None, env=None, alias=None, mounts=(), credentials='none'):
         name = '%s-%s' % (self.task, role)
         line = ['docker', 'run', '-d', '--init', '--read-only', '--name', name] + self.harness_run.labels(self.task) + [
                 '--user', user or '%d:%d' % (os.getuid(), os.getgid()), '--cpus', '1', '--memory', '1g',
@@ -706,11 +875,10 @@ class Cell:
         # Track before creating: the daemon can create the container even when the
         # client then times out or errors. Cleanup is ownership-checked, so a
         # failed create or a foreign name collision is never removed.
-        self.containers.append(name)
-        call(line + [image] + command)
-        return name
+        return self.launch(line, name, image, command, user or '%d:%d' % (os.getuid(), os.getgid()), credentials)
 
-    def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None, caps=(), pids=256):
+    def plain(self, role, image, command, env=None, alias=None, user=None, tmpfs=None, caps=(), pids=256,
+              credentials='none'):
         """Start a PHP Server process-set container (writable root, as in its compose file).
 
         Bounded like `start`: --init, CPU/RAM/PID caps, no-new-privileges and
@@ -733,16 +901,18 @@ class Cell:
         # Track before creating: the daemon can create the container even when the
         # client then times out or errors. Cleanup is ownership-checked, so a
         # failed create or a foreign name collision is never removed.
-        self.containers.append(name)
-        call(line + [image] + command)
-        return name
+        if image == self.server['executed_manifest']:
+            # The PHP entrypoint caches environment, including the Server key.
+            # That derived copy must die with the container too.
+            line += ['--tmpfs', '/app/bootstrap/cache:mode=0777,size=8m,noexec,nosuid,nodev']
+        return self.launch(line, name, image, command, user or '0:0', credentials)
 
     def start_php(self, token):
         image = self.server['executed_manifest']
-        env = {'APP_ENV': 'testing', 'APP_DEBUG': 'false', 'DW_SERVER_KEY': 'base64:' + __import__('base64').b64encode(secrets.token_bytes(32)).decode(),
+        env = {'APP_ENV': 'testing', 'APP_DEBUG': 'false',
                'DB_CONNECTION': 'mysql', 'DB_HOST': 'mysql', 'DB_DATABASE': 'durable_workflow', 'DB_USERNAME': 'workflow',
                'DB_PASSWORD': 'workflow', 'REDIS_HOST': 'redis', 'QUEUE_CONNECTION': 'redis', 'CACHE_STORE': 'redis',
-               'DW_AUTH_DRIVER': 'token', 'DW_AUTH_TOKEN': token, 'DW_WORKFLOW_TASK_TIMEOUT': '10',
+               'DW_AUTH_DRIVER': 'token', 'DW_WORKFLOW_TASK_TIMEOUT': '10',
                'DW_WORKER_PROTOCOL_VERSION': '1.20'}
         # Capabilities kept after --cap-drop ALL, from each image's entrypoint. The
         # MySQL 8.4 and Redis 7.4 entrypoints start as root, chown their data and
@@ -761,26 +931,32 @@ class Cell:
             time.sleep(1)
         # The PHP Server image starts as root and writes caches under directories
         # owned by www-data (uid 1000).
-        bootstrap = self.plain('bootstrap', image, ['server-bootstrap'], env=env, caps=('DAC_OVERRIDE',))
+        # Bootstrap migrates/seeds; queue and repair are CLI processes. None
+        # handles HTTP authentication, so only the HTTP runtime gets the token.
+        bootstrap = self.plain('bootstrap', image, ['server-bootstrap'], env=env, caps=('DAC_OVERRIDE',),
+                               credentials='server')
         if call(['docker', 'wait', bootstrap], timeout=600).stdout.strip() != '0':
             raise RuntimeError('PHP Server bootstrap failed')
         # Apache's root master also chowns its mutex to www-data, switches its
         # children to www-data and signals them.
         self.plain('runtime', image, [], env=env, alias='qualification-origin',
-                   caps=('CHOWN', 'DAC_OVERRIDE', 'KILL', 'SETGID', 'SETUID'))
+                   caps=('CHOWN', 'DAC_OVERRIDE', 'KILL', 'SETGID', 'SETUID'), credentials='both')
         # queue and repair run as uid 1000 and keep no capabilities.
-        self.plain('queue', image, ['php', 'artisan', 'queue:work', '--sleep=1', '--tries=3', '--max-time=1800'], env=env, user='1000:1000')
+        self.plain('queue', image, ['php', 'artisan', 'queue:work', '--sleep=1', '--tries=3', '--max-time=1800'],
+                   env=env, user='1000:1000', credentials='server')
         self.plain('repair', image, ['sh', '-c', 'while true; do php artisan workflow:v2:repair-pass --json; sleep 2; done'],
-                   env=env, user='1000:1000')
+                   env=env, user='1000:1000', credentials='server')
 
     def http(self, container, path, token):
-        code = ('import json,sys,urllib.request\n'
-                'r=urllib.request.Request("http://qualification-origin:8080/api%s",headers={"Authorization":"Bearer "+sys.argv[1],"X-Namespace":"default"})\n'
+        code = ('import json,pathlib,urllib.request\n'
+                'token=pathlib.Path("/credentials/token").read_text()\n'
+                'r=urllib.request.Request("http://qualification-origin:8080/api%s",headers={"Authorization":"Bearer "+token,"X-Namespace":"default"})\n'
                 'print(urllib.request.urlopen(r,timeout=3).read().decode())' % path)
-        return call(['docker', 'exec', container, 'python', '-c', code, token], check=False)
+        return call(['docker', 'exec', container, 'python', '-c', code], check=False)
 
     def run(self):
-        token = 'fixture-' + secrets.token_hex(24)
+        token = self.token
+        result = None
         credentials = self.state / 'credentials.json'
         # All state setup is inside the protected region: a partial setup (say,
         # database/ created and storage/ failing) is still removed and verified.
@@ -791,9 +967,6 @@ class Cell:
             for sub in ['database', 'storage']:
                 (self.state / sub).mkdir()
                 (self.state / sub).chmod(0o777)
-            # Owner-only from creation: the readers (worker, driver, history check)
-            # run as the host UID, and the server roles get the token by env.
-            write_owner_only(credentials, json.dumps(dict.fromkeys(['operator', 'worker', 'admin'], token)))
             binary_before = sha256(self.fixture / 'target' / 'debug' / BINARY)
             # Inside the protected region: the daemon can create the network even
             # when the client then times out. Removal is ownership-checked.
@@ -802,12 +975,13 @@ class Cell:
                 self.start_php(token)
             else:
                 self.start('runtime', self.server['executed_manifest'], [], user='1000:1000', alias='qualification-origin',
+                           credentials='both',
                            env={'DB_CONNECTION': 'sqlite', 'DB_DATABASE': '/app/database/runtime.sqlite',
-                                'DW_AUTH_TOKEN': token, 'DW_SERVER_KEY': 'fixture-' + secrets.token_hex(16),
                                 'DW_RUST_MAINTENANCE_LOOP': '1'},
                            mounts=['type=bind,src=%s,dst=/app/database' % (self.state / 'database'),
                                    'type=bind,src=%s,dst=/app/storage' % (self.state / 'storage')])
-            proxy = self.start('proxy', self.args.python_image, ['python', '/harness/proxy.py'], alias='qualification-runtime')
+            proxy = self.start('proxy', self.args.python_image, ['python', '/harness/proxy.py'],
+                               alias='qualification-runtime', credentials='auth')
             deadline = time.monotonic() + 120
             ready = '/health' if self.args.runtime == 'php' else '/ready'
             while time.monotonic() < deadline:
@@ -820,15 +994,19 @@ class Cell:
             cluster = json.loads(info.stdout) if info.returncode == 0 else {'error': info.stderr[-500:]}
             if self.args.expect_server_version and cluster.get('version') != self.args.expect_server_version:
                 raise RuntimeError('cluster/info version %r, expected %r' % (cluster.get('version'), self.args.expect_server_version))
-            worker = self.start('worker', self.args.rust_image, ['/fixture/' + BINARY, 'worker'])
-            driver = self.start('driver', self.args.rust_image, ['/fixture/' + BINARY, 'drive-' + self.name])
+            worker = self.start('worker', self.args.rust_image, ['/fixture/' + BINARY, 'worker'], credentials='auth')
+            driver = self.start('driver', self.args.rust_image, ['/fixture/' + BINARY, 'drive-' + self.name], credentials='auth')
             driver_exit = int(call(['docker', 'wait', driver], timeout=300).stdout.strip())
-            checker = self.start('history', self.args.python_image, ['python', '/harness/check_history.py'])
+            checker = self.start('history', self.args.python_image, ['python', '/harness/check_history.py'], credentials='auth')
             history_exit = int(call(['docker', 'wait', checker], timeout=120).stdout.strip())
             worker_running = call(['docker', 'inspect', '--format', '{{.State.Running}}', worker]).stdout.strip() == 'true'
-            read = lambda name: json.loads((self.state / name).read_text()) if (self.state / name).exists() else None
-            acks = [json.loads(l) for l in (self.state / 'acks.jsonl').read_text().splitlines()] if (self.state / 'acks.jsonl').exists() else []
-            result = {'cell': self.name, 'cluster_info': {k: cluster.get(k) for k in
+            read = lambda name: json.loads(self.evidence(
+                json.dumps(json.loads((self.state / name).read_text())).encode(), 'structured')) if (self.state / name).exists() else None
+            acks = [json.loads(self.evidence(json.dumps(json.loads(l)).encode(), 'structured'))
+                    for l in (self.state / 'acks.jsonl').read_text().splitlines()] if (self.state / 'acks.jsonl').exists() else []
+            result = {'cell': self.name, 'deadline_unix': self.deadline,
+                      'kill_after_seconds': CELL_KILL_AFTER_SECONDS,
+                      'cluster_info': {k: cluster.get(k) for k in
                       ('version', 'implementation', 'development', 'qualified_for_php_takeover', 'error') if k in cluster},
                       'driver_exit': driver_exit, 'history_exit': history_exit,
                       'same_worker_running_after_cases': worker_running,
@@ -837,12 +1015,28 @@ class Cell:
             result['outcome'] = 'pass' if (driver_exit == 0 and history_exit == 0 and worker_running
                                            and result['binary_unchanged']) else 'fail'
             return result
+        except Exception as error:
+            message = self.evidence(str(error).encode(), 'error').decode()
+            if message != str(error):
+                raise RuntimeError('Cell failed with credential-bearing diagnostics') from None
+            raise
         finally:
             try:
                 self.remove_docker_objects()
             finally:
                 # Local credential and state cleanup always runs, whatever Docker did.
                 self.remove_local_state(credentials)
+                try:
+                    self.fence_artifacts()
+                except Exception as error:
+                    self.harness_run.cleanup_errors.append({
+                        'step': 'evidence-fence', 'object': self.name, 'error': type(error).__name__})
+                    # Unreadable/unsafe artifacts cannot be certified clean.
+                    self.harness_run.best_effort('evidence-purge', self.name, remove_tree, self.dir)
+                    if os.path.lexists(self.dir):
+                        self.harness_run.local_leftovers.append(self.name + '/evidence')
+                if result is not None and self.harness_run.cleanup_errors:
+                    result['outcome'] = 'fail'
 
     def remove_local_state(self, credentials):
         """Remove the credential file, database/ and storage/ independently, then
@@ -877,8 +1071,8 @@ class Cell:
 
     def save_logs(self, logs, name, container_id):
         out = call(['docker', 'logs', '--tail', '300', container_id], check=False)
-        (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_text(out.stdout)
-        (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
+        (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_bytes(self.evidence(out.stdout.encode(), 'logs'))
+        (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_bytes(self.evidence(out.stderr.encode(), 'logs'))
 
 
 def harness_identity(args):
@@ -903,6 +1097,9 @@ def main():
         raise SystemExit('work dir %s already exists; use a new one' % args.work_dir)
     args.work_dir.mkdir(parents=True)
     run = Run(args.container_prefix)
+    write_owner_only(args.work_dir / 'run.json', json.dumps({
+        'schema': 'durable-workflow.acceptance-run/v1', 'owner': run.prefix,
+        'token': run.token, 'cells': args.cells.split(',')}))
     summary = {'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'outcome': 'fail',
                'mode': 'pre-publication' if args.package_from else 'published',
                'expected_server': {'version': args.expect_server_version, 'revision': args.expect_revision,
@@ -951,12 +1148,9 @@ def main():
         summary['error'] = '%s: %s' % (type(error).__name__, error)
         raise
     finally:
-        run_filter = 'label=%s=%s' % (RUN_LABEL, run.token)
         # None means the query itself failed (recorded in cleanup_errors).
-        leftovers = run.best_effort('leftover-query', 'containers', lambda: call(
-            ['docker', 'ps', '-aq', '--filter', run_filter], check=False).stdout.split())
-        leftover_networks = run.best_effort('leftover-query', 'networks', lambda: call(
-            ['docker', 'network', 'ls', '-q', '--filter', run_filter], check=False).stdout.split())
+        leftovers = run.best_effort('leftover-query', 'containers', run_objects, 'container', run)
+        leftover_networks = run.best_effort('leftover-query', 'networks', run_objects, 'network', run)
         # Fail closed: any cleanup error, unavailable leftover query or leftover
         # object makes the run non-passing. The checks' own outcome and any run
         # error are kept separately.
@@ -969,7 +1163,15 @@ def main():
                               'local_leftovers': run.local_leftovers, 'leftover_containers': leftovers,
                               'leftover_networks': leftover_networks}
         summary['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        summary_bytes = (json.dumps(summary, ensure_ascii=False, indent=2) + '\n').encode()
+        _, leaked = redact_credentials(json.dumps(summary, ensure_ascii=False).encode(), run.secret_values)
+        if leaked:
+            credential_output(run, 'summary')
+            summary['outcome'] = summary['checks_outcome'] = 'fail'
+            summary['cleanup']['pass'] = False
+            summary['cleanup']['errors'] = run.cleanup_errors
+        summary_bytes, _ = redact_credentials(
+            (json.dumps(summary, ensure_ascii=False, indent=2) + '\n').encode(), run.secret_values)
+        summary = json.loads(summary_bytes)
         (args.work_dir / 'summary.json').write_bytes(summary_bytes)
         if args.package_from and summary['outcome'] == 'pass':
             # Only a fully passing pre-publication run (checks and cleanup) yields
@@ -985,4 +1187,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:2] == ['cleanup']:
+        cleanup_main(sys.argv[2:])
+    else:
+        main()

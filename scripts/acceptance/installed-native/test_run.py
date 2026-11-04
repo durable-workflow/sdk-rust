@@ -65,7 +65,8 @@ class FakeDocker:
         if command[:2] == ['docker', 'pull']:
             return done(command)
         if command[:3] == ['docker', 'image', 'inspect']:
-            return done(command, stdout=json.dumps([{'Id': 'sha256:img', 'RootFS': {'Layers': []}, 'Config': {}}]))
+            return done(command, stdout=json.dumps([{'Id': 'sha256:img', 'RootFS': {'Layers': []},
+                                                    'Config': {'Cmd': ['image-default']}}]))
         if command[:3] in (['docker', 'container', 'inspect'], ['docker', 'network', 'inspect']):
             table = self.containers if command[1] == 'container' else self.networks
             if command[-1] not in table:
@@ -437,15 +438,15 @@ class PlainContainerBounds(HarnessRun):
         self.assertEqual(list(runs), list(expected))
         for role, command in runs.items():
             with self.subTest(role=role):
-                end = command.index('-e') if '-e' in command else len(command) - 1
+                end = command.index('-e') if '-e' in command else command.index('--entrypoint')
                 self.assertEqual(command[:end], expected[role])
                 self.assertNotIn('--privileged', command)
                 self.assertFalse({'SYS_ADMIN', 'NET_ADMIN', 'NET_RAW', 'ALL'} & {
                     command[i + 1] for i, a in enumerate(command) if a == '--cap-add'})
-        self.assertEqual(runs['mysql'][-1], run.MYSQL_IMAGE)
-        self.assertEqual(runs['redis'][-1], run.REDIS_IMAGE)
-        self.assertEqual(runs['bootstrap'][-2:], ['server-img', 'server-bootstrap'])
-        self.assertEqual(runs['runtime'][-1], 'server-img')
+        self.assertIn(run.MYSQL_IMAGE, runs['mysql'])
+        self.assertIn(run.REDIS_IMAGE, runs['redis'])
+        self.assertEqual(runs['bootstrap'][-1], 'server-bootstrap')
+        self.assertEqual(runs['runtime'][-1], 'image-default')
 
 
 class CleanupStepsAreIndependent(HarnessRun):
@@ -559,10 +560,9 @@ class LocalStateCleanup(HarnessRun):
         def unlink(path, missing_ok=False):
             raise PermissionError('denied')
         present = self.run_cell(unlink=unlink)
-        self.assertEqual(present, {'credentials.json': True, 'database': False, 'storage': False})
-        self.assertEqual(self.run.local_leftovers, ['lifecycle/credentials.json'])
-        self.assertEqual(self.errors(), [('local-remove', 'lifecycle/credentials.json', 'PermissionError'),
-                                         ('local-verify', 'lifecycle/credentials.json', 'StillPresent')])
+        self.assertEqual(present, {'credentials.json': False, 'database': False, 'storage': False})
+        self.assertEqual(self.run.local_leftovers, [])
+        self.assertEqual(self.errors(), [('local-remove', 'lifecycle/credentials.json', 'PermissionError')])
 
     def test_each_state_directory_failure_is_independent(self):
         for failing in ('database', 'storage'):
@@ -582,13 +582,13 @@ class LocalStateCleanup(HarnessRun):
         self.assertEqual(self.errors(), [('local-verify', 'lifecycle/database', 'StillPresent'),
                                          ('local-verify', 'lifecycle/storage', 'StillPresent')])
 
-    def test_credential_file_is_owner_only_before_any_container_starts(self):
+    def test_no_host_credential_exists_before_any_container_starts(self):
         modes = []
 
         class Recording(FakeDocker):
             def __call__(inner, command, timeout=120, check=True, **kwargs):
                 if list(command[:3]) == ['docker', 'network', 'create']:
-                    modes.append(os.stat(self.cell.state / 'credentials.json').st_mode & 0o777)
+                    modes.append(os.path.lexists(self.cell.state / 'credentials.json'))
                 return FakeDocker.__call__(inner, command, timeout, check, **kwargs)
         docker = Recording(faults={self.cell.task + '-proxy': 'created-then-error'})
         previous = os.umask(0)  # even a permissive umask must not widen the mode
@@ -597,9 +597,9 @@ class LocalStateCleanup(HarnessRun):
                 self.cell.run()
         finally:
             os.umask(previous)
-        self.assertEqual(modes, [0o600])
+        self.assertEqual(modes, [False])
 
-    def test_credential_file_is_created_owner_only(self):
+    def test_no_host_credential_is_opened_for_writing(self):
         opened = []
         real_open = os.open
 
@@ -608,7 +608,7 @@ class LocalStateCleanup(HarnessRun):
             return real_open(path, flags, mode, *a, **k)
         with mock.patch.object(run.os, 'open', recording_open):
             self.run_cell()
-        self.assertIn(('credentials.json', os.O_EXCL, 0o600), opened)
+        self.assertFalse(any(name == 'credentials.json' for name, _, _ in opened))
 
     def test_partial_setup_failure_is_cleaned_and_preserves_the_error(self):
         real_chmod = pathlib.Path.chmod
@@ -709,8 +709,10 @@ class MainOutcome(unittest.TestCase):
         run_filter = re.compile(r'label=dev\.durable-workflow\.acceptance\.run=[0-9a-f]{16}')
         [containers] = [c for c, _ in self.docker.commands if c[:3] == ['docker', 'ps', '-aq']]
         [networks] = [c for c, _ in self.docker.commands if c[:4] == ['docker', 'network', 'ls', '-q']]
-        self.assertTrue(run_filter.fullmatch(containers[-1]))
-        self.assertTrue(run_filter.fullmatch(networks[-1]))
+        self.assertTrue(run_filter.fullmatch(containers[-3]))
+        self.assertTrue(run_filter.fullmatch(networks[-3]))
+        self.assertEqual(containers[-1], 'label=%s=general' % run.OWNER_LABEL)
+        self.assertEqual(networks[-1], 'label=%s=general' % run.OWNER_LABEL)
 
     def test_recorded_cleanup_error_fails(self):
         error = {'step': 'container-remove', 'object': 'x', 'error': 'TimeoutExpired'}
@@ -1200,8 +1202,8 @@ class PrePublicationOutcome(unittest.TestCase):
             def run_cell():
                 if tamper_after_cells:
                     (work / 'package' / identity['crate_file']).write_bytes(b'other')
-                (cell_run or (lambda h: None))(harness)
-                return {'outcome': 'pass', 'cluster_info': {'version': '3.0.5'}}
+                return (cell_run or (lambda h: None))(harness) or {
+                    'outcome': 'pass', 'cluster_info': {'version': '3.0.5'}}
             instance.run.side_effect = run_cell
             return instance
         argv = ['run.py'] + PrePublicationArguments.PACKAGE + [
@@ -1249,6 +1251,22 @@ class PrePublicationOutcome(unittest.TestCase):
         code, receipt, work = self.main(cell_run=lambda h: h.cleanup_errors.append(error))
         self.assertEqual((code, receipt['approval_candidate']), (1, None))
         self.assertFalse((work / 'approved-package.json').exists())
+
+    def test_credential_output_cannot_create_package_approval(self):
+        token, key = 'fixture-' + '0' * 48, 'base64:' + 'A' * 43 + '='
+
+        def cell(harness):
+            harness.secret_values.extend((token, key))
+            return {'outcome': 'pass', 'cluster_info': {'version': '3.0.5'}, 'child_output': token + key}
+
+        code, receipt, work = self.main(cell_run=cell)
+        self.assertEqual((code, receipt['approval_candidate']), (1, None))
+        self.assertFalse((work / 'approved-package.json').exists())
+        data = (work / 'summary.json').read_bytes()
+        self.assertFalse(any(s.encode() in data for s in (token, key)))
+        summary = json.loads(data)
+        self.assertEqual(summary['checks_outcome'], 'fail')
+        self.assertTrue(any(e['step'] == 'credential-output' for e in summary['cleanup']['errors']))
 
     def test_package_changed_during_cells_writes_no_approval(self):
         code, receipt, work = self.main(tamper_after_cells=True)
