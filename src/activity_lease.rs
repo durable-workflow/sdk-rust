@@ -135,9 +135,10 @@ impl Client {
                 "the shared request window must be positive and at most five seconds",
             ));
         }
-        let result = tokio::time::timeout(request_window, async {
+        let deadline = tokio::time::Instant::now() + request_window;
+        let result = tokio::time::timeout_at(deadline, async {
             self.discover_activity_lease_renewal(request_window).await?;
-            let response = activity_task_response(
+            activity_task_response(
                 self.request_json_unresolved_with_timeout(
                     reqwest::Method::POST,
                     &format!(
@@ -155,29 +156,35 @@ impl Client {
                 "renew_lease",
                 task_id,
                 activity_attempt_id,
-            );
-            if matches!(&response, Err(Error::ActivityTaskRejected(refusal))
+            )
+        })
+        .await;
+        let response = match result {
+            Err(_) => Err(Error::Timeout),
+            Ok(Err(Error::Transport(error))) if error.is_timeout() => Err(Error::Timeout),
+            Ok(result) => result,
+        };
+        if matches!(&response, Err(Error::ActivityTaskRejected(refusal))
                 if refusal.status == 422
                     && refusal.reason == "activity_lease_renewal_unavailable"
                     && refusal.body["lease_renewed"] == false
                     && refusal.can_continue == Some(false))
-            {
-                self.activity_lease_discovery
-                    .state
-                    .store(UNKNOWN, Ordering::SeqCst);
-                // Refresh only an explicit capability refusal, once inside the
-                // original budget. Never replay this renewal or turn its refusal
-                // into permission to execute; the original error still surfaces.
-                let _ = self.discover_activity_lease_renewal(request_window).await;
+        {
+            self.activity_lease_discovery
+                .state
+                .store(UNKNOWN, Ordering::SeqCst);
+            // Best-effort refresh cannot overwrite the original typed refusal.
+            // Its lock and HTTP wait use only the original budget's remainder.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    self.discover_activity_lease_renewal(remaining),
+                )
+                .await;
             }
-            response
-        })
-        .await;
-        match result {
-            Err(_) => Err(Error::Timeout),
-            Ok(Err(Error::Transport(error))) if error.is_timeout() => Err(Error::Timeout),
-            Ok(result) => result,
         }
+        response
     }
 }
 
@@ -715,5 +722,23 @@ mod tests {
                 .collect();
             assert_eq!(methods, ["get", "post", "post"]);
         }
+    }
+
+    #[tokio::test]
+    async fn slow_capability_refresh_preserves_the_original_typed_refusal() {
+        let (client, requests) = server(vec![
+            (200, discovery(json!(true)), Duration::ZERO),
+            (422, json!({"reason":"activity_lease_renewal_unavailable","lease_renewed":false,"can_continue":false}), Duration::ZERO),
+            (200, discovery(json!(false)), Duration::from_millis(250)),
+        ]).await;
+        let result = client
+            .renew_activity_task_lease("task", "attempt", "owner", Duration::from_millis(100))
+            .await;
+        let Err(Error::ActivityTaskRejected(refusal)) = result else {
+            panic!("original refusal must survive slow discovery: {result:?}");
+        };
+        assert_eq!(refusal.status, 422);
+        assert_eq!(refusal.reason, "activity_lease_renewal_unavailable");
+        assert_eq!(requests.await.unwrap().len(), 3);
     }
 }

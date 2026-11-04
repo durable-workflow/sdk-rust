@@ -23,6 +23,11 @@ candidate's source commit. Interleave samples and record the exact Server image,
 database settings, resource limits and cleanup with the results. Source builds
 do not replace packaged or published release acceptance.
 
+`tests/worker_latency/python_worker.py` supplies the same workflow and activity
+through an independently installed, exact published Python SDK. It uses the same
+environment variables and Rust driver. Record that wheel's checksum and verify
+installed package files before using it as a reference.
+
 Route metrics include startup and idle long polls. Distinguish those from
 measured workflow durations, and separate the initial payload-policy discovery
 from activity lease capability discovery. A lower request count alone does not
