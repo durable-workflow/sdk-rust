@@ -18,4 +18,16 @@ impl ClientBuilder {
         self.additional_root_certificates.extend(certificates);
         Ok(self)
     }
+
+    /// Disable TLS certificate and hostname verification for every request
+    /// this client makes, including worker polling and external payload
+    /// transfers. The default is `false` (verified).
+    ///
+    /// Any party on the network path can then read and change traffic,
+    /// including bearer tokens. Prefer
+    /// [`ClientBuilder::additional_root_certificates_pem`] for a private CA.
+    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.danger_accept_invalid_certs = accept;
+        self
+    }
 }

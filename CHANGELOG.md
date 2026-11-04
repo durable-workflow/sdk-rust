@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Add a public raw request API for tools that must reach every Server route
+  and report its response unchanged (#180). `Client::control_plane_request`
+  and `Client::worker_plane_request` take a `RawRequest` (path segments the
+  SDK percent-encodes, query pairs, a verbatim JSON body, a timeout and
+  optional version-header overrides) and return a `RawResponse` for every
+  HTTP status, with the exact body bytes and all headers.
+  `RawResponse::error_for_status` gives the same `Error::Http` or
+  `Error::Protocol` a typed call would, and `refusal()` decodes `reason`,
+  `rejection_reason`, `message`, `error` and `validation_errors`. Raw
+  requests make one attempt and never rewrite bodies. Worker-plane 2xx
+  responses must echo a same-major, equal-or-newer-minor protocol version in
+  both the header and the body. Typed methods remain the API for
+  applications.
+- Add `ClientBuilder::danger_accept_invalid_certs` for self-hosted Servers
+  whose certificates cannot be verified. It defaults to `false`; prefer
+  `additional_root_certificates_pem` for a private CA.
 - Replay condition-wait histories in which the Server recorded a second open
   of a wait that was still open (#191, #192). A wait is now linked to the
   same logical wait by its state when the next open was recorded: if it was
