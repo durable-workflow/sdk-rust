@@ -12,7 +12,7 @@ import urllib.request
 
 ORIGIN = 'http://qualification-origin:8080/api'
 state = pathlib.Path('/state')
-token = json.loads((state / 'credentials.json').read_text())['operator']
+token = pathlib.Path('/credentials/token').read_text()
 report = json.loads((state / 'driver.json').read_text())
 problems = []
 
