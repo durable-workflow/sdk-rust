@@ -4,12 +4,21 @@ use crate::{
     activity_task_response, percent_encode_path_segment, Client, Error, RequestProtocol, Result,
 };
 use serde_json::{json, Value};
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 pub(crate) mod authority;
 
 const MAX_REQUEST_WINDOW: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+pub(crate) struct Discovery {
+    confirmed: AtomicBool,
+    lock: tokio::sync::Mutex<()>,
+}
 
 fn unavailable(message: &str) -> Error {
     Error::ActivityLeaseRenewalUnavailable(message.to_owned())
@@ -23,6 +32,53 @@ impl Client {
         }
     }
 
+    pub(crate) fn observe_worker_activity_lease_capabilities(&self, capabilities: &Value) {
+        self.observe_activity_lease_capabilities(capabilities);
+        if let Some(advertised) = capabilities.get("activity_lease_renewal") {
+            self.activity_lease_discovery
+                .confirmed
+                .store(advertised.as_bool() == Some(true), Ordering::SeqCst);
+        }
+    }
+
+    async fn discover_activity_lease_renewal(&self, request_window: Duration) -> Result<()> {
+        if self
+            .activity_lease_discovery
+            .confirmed
+            .load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        // Clones share discovery, but independent clients and control-plane
+        // observations cannot authorize a worker request. Lock waiting remains
+        // inside the caller's total renewal window.
+        let _discovery = self.activity_lease_discovery.lock.lock().await;
+        if self
+            .activity_lease_discovery
+            .confirmed
+            .load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let discovery: Value = self
+            .request_json_unresolved_with_timeout::<Value, Value>(
+                reqwest::Method::GET,
+                "/cluster/info",
+                RequestProtocol::DefaultWorker,
+                None,
+                request_window,
+            )
+            .await?;
+        let capabilities = &discovery["worker_protocol"]["server_capabilities"];
+        self.observe_worker_activity_lease_capabilities(capabilities);
+        if capabilities["activity_lease_renewal"].as_bool() != Some(true) {
+            return Err(unavailable(
+                "runtime must explicitly advertise activity_lease_renewal=true",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_activity_lease_authority(
         &self,
         authority: Option<Arc<authority::Authority>>,
@@ -34,8 +90,9 @@ impl Client {
 
     /// Renew one original activity claim without recording application progress.
     ///
-    /// Actual worker-authenticated discovery must advertise the boolean
-    /// `activity_lease_renewal=true`. Discovery, retries and renewal share
+    /// A worker-authenticated registration, poll or discovery must advertise
+    /// the boolean `activity_lease_renewal=true`. Clones share this observation
+    /// until a renewal fails. Discovery, lock waiting and renewal share
     /// `request_window`, which must be positive and at most five seconds. Use
     /// any earlier claim or execution deadline as an additional caller ceiling.
     ///
@@ -66,26 +123,7 @@ impl Client {
             ));
         }
         let result = tokio::time::timeout(request_window, async {
-            let discovery: Value = self
-                .request_json_unresolved_with_timeout::<Value, Value>(
-                    reqwest::Method::GET,
-                    "/cluster/info",
-                    RequestProtocol::DefaultWorker,
-                    None,
-                    request_window,
-                )
-                .await?;
-            self.observe_activity_lease_capabilities(
-                &discovery["worker_protocol"]["server_capabilities"],
-            );
-            if discovery["worker_protocol"]["server_capabilities"]["activity_lease_renewal"]
-                .as_bool()
-                != Some(true)
-            {
-                return Err(unavailable(
-                    "runtime must explicitly advertise activity_lease_renewal=true",
-                ));
-            }
+            self.discover_activity_lease_renewal(request_window).await?;
             activity_task_response(
                 self.request_json_unresolved_with_timeout(
                     reqwest::Method::POST,
@@ -107,6 +145,13 @@ impl Client {
             )
         })
         .await;
+        if !matches!(&result, Ok(Ok(_))) {
+            // Do not replay a refused renewal. A later attempt must recheck
+            // capability, while the caller handles this original claim's error.
+            self.activity_lease_discovery
+                .confirmed
+                .store(false, Ordering::SeqCst);
+        }
         match result {
             Err(_) => Err(Error::Timeout),
             Ok(Err(Error::Transport(error))) if error.is_timeout() => Err(Error::Timeout),
@@ -354,5 +399,161 @@ mod tests {
                 .headers
                 .contains("x-durable-workflow-protocol-version: 1.19\r\n"));
         }
+    }
+
+    async fn renew(client: &Client) -> Result<Value> {
+        client
+            .renew_activity_task_lease("task", "attempt", "owner", Duration::from_secs(1))
+            .await
+    }
+
+    #[tokio::test]
+    async fn registered_worker_capability_avoids_discovery_across_clones() {
+        let (client, requests) = server(vec![
+            (200, json!({"registered":true,"worker_id":"worker", "server_capabilities":{"activity_lease_renewal":true}}), Duration::ZERO),
+            (200, json!({"lease_renewed":true}), Duration::ZERO),
+            (200, json!({"lease_renewed":true}), Duration::ZERO),
+        ]).await;
+        client
+            .register_worker("worker", "queue", vec![], vec![], 16, 16)
+            .await
+            .unwrap();
+        renew(&client).await.unwrap();
+        renew(&client.clone()).await.unwrap();
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0]
+            .headers
+            .starts_with("post /api/worker/register "));
+        for request in &requests[1..] {
+            assert!(request
+                .headers
+                .starts_with("post /api/worker/activity-tasks/task/renew-lease "));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_renewals_share_one_worker_discovery() {
+        let mut replies = vec![(200, discovery(json!(true)), Duration::from_millis(20))];
+        replies.extend((0..4).map(|_| (200, json!({"lease_renewed":true}), Duration::ZERO)));
+        let (client, requests) = server(replies).await;
+        let other = client.clone();
+        let results = tokio::join!(renew(&client), renew(&other), renew(&client), renew(&other));
+        for result in [results.0, results.1, results.2, results.3] {
+            result.unwrap();
+        }
+        let requests = requests.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.headers.starts_with("get /api/cluster/info "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r
+                    .headers
+                    .starts_with("post /api/worker/activity-tasks/task/renew-lease "))
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn control_discovery_does_not_authorize_cached_worker_renewal() {
+        let (client, requests) = server(vec![
+            (200, discovery(json!(true)), Duration::ZERO),
+            (200, discovery(json!(false)), Duration::ZERO),
+        ])
+        .await;
+        client.cluster_info().await.unwrap();
+        assert!(matches!(
+            renew(&client).await,
+            Err(Error::ActivityLeaseRenewalUnavailable(_))
+        ));
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0]
+            .headers
+            .contains("authorization: bearer control-test-token\r\n"));
+        assert!(requests[1]
+            .headers
+            .contains("authorization: bearer worker-test-token\r\n"));
+        assert!(requests
+            .iter()
+            .all(|r| r.headers.starts_with("get /api/cluster/info ")));
+    }
+
+    #[tokio::test]
+    async fn refused_renewal_invalidates_discovery_without_replaying_the_request() {
+        let (client, requests) = server(vec![
+            (200, discovery(json!(true)), Duration::ZERO),
+            (200, json!({"lease_renewed":true}), Duration::ZERO),
+            (409, json!({"reason":"lease_expired","task_id":"task","activity_attempt_id":"attempt","can_continue":false}), Duration::ZERO),
+            (200, discovery(json!(false)), Duration::ZERO),
+        ]).await;
+        renew(&client).await.unwrap();
+        assert!(matches!(
+            renew(&client).await,
+            Err(Error::ActivityTaskRejected(_))
+        ));
+        assert!(matches!(
+            renew(&client).await,
+            Err(Error::ActivityLeaseRenewalUnavailable(_))
+        ));
+        let requests = requests.await.unwrap();
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|r| r.headers.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(methods, ["get", "post", "post", "get"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_cache_is_not_shared_by_independent_clients() {
+        let (client, requests) = server(vec![
+            (200, discovery(json!(true)), Duration::ZERO),
+            (200, json!({"lease_renewed":true}), Duration::ZERO),
+            (200, discovery(json!(false)), Duration::ZERO),
+        ])
+        .await;
+        renew(&client).await.unwrap();
+        let independent = Client::builder(&client.base_url)
+            .worker_token(Some("worker-test-token".into()))
+            .namespace("named-test")
+            .build()
+            .unwrap();
+        assert!(matches!(
+            renew(&independent).await,
+            Err(Error::ActivityLeaseRenewalUnavailable(_))
+        ));
+        assert_eq!(requests.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_shared_discovery_stays_within_the_request_window() {
+        let (client, requests) = server(vec![
+            (200, discovery(json!(true)), Duration::from_millis(150)),
+            (200, json!({"lease_renewed":true}), Duration::ZERO),
+        ])
+        .await;
+        let (first, waiting) = tokio::join!(
+            renew(&client),
+            client.renew_activity_task_lease(
+                "other",
+                "attempt",
+                "owner",
+                Duration::from_millis(20)
+            )
+        );
+        first.unwrap();
+        assert!(matches!(waiting, Err(Error::Timeout)));
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .headers
+            .starts_with("post /api/worker/activity-tasks/task/renew-lease "));
     }
 }

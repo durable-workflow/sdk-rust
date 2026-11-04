@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Reuse worker-authenticated activity lease capability observations instead of
+  fetching `/cluster/info` for every activity (#199). Client clones share one
+  discovery when needed and refresh after a failed renewal. Original claim,
+  ownership and deadline validation still apply to every renewal.
+
 - Add a public raw request API for tools that must reach every Server route
   and report its response unchanged (#180). `Client::control_plane_request`
   and `Client::worker_plane_request` take a `RawRequest` (path segments the

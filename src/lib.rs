@@ -3019,6 +3019,7 @@ pub struct Client {
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
     failure_request_limit: Arc<AtomicUsize>,
     activity_lease_renewal_supported: Arc<AtomicBool>,
+    activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
     execution_telemetry: Option<telemetry::ExecutionTelemetry>,
@@ -4108,7 +4109,7 @@ impl Client {
             )
             .await?;
         if response["registered"] == true && response["worker_id"].as_str() == Some(worker_id) {
-            self.observe_activity_lease_capabilities(&response["server_capabilities"]);
+            self.observe_worker_activity_lease_capabilities(&response["server_capabilities"]);
         }
         if self.sticky_cache.is_some() {
             self.confirm_sticky_registration(&response, worker_id, task_queue)
@@ -6005,6 +6006,7 @@ impl ClientBuilder {
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
             failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
+            activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
             execution_telemetry: None,
