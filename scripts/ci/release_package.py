@@ -441,6 +441,11 @@ def approval_record_relative(version: str) -> str:
     return f"{APPROVAL_DIRECTORY}/{version}.json"
 
 
+def approval_summary_relative(version: str) -> str:
+    """release/approved-packages/<version>.summary.json, the run's exact summary.json."""
+    return approval_record_relative(version).removesuffix(".json") + ".summary.json"
+
+
 def _safe_member_name(name: object) -> bool:
     if not isinstance(name, str) or not name or "\0" in name or "\\" in name:
         return False
@@ -586,33 +591,108 @@ def _git(repository: str, *arguments: str) -> bytes:
     return result.stdout
 
 
-def read_approval_record(repository: str, version: str) -> tuple[bytes, str]:
-    """The reviewed record for `version` from the maintained-tooling checkout.
+def read_tracked_record(repository: str, relative: str) -> bytes:
+    """One reviewed file from the maintained-tooling checkout.
 
-    Its path is always release/approved-packages/<version>.json, built only
-    after `version` passes strict SemVer. The worktree file must be a regular
-    file reached without any symbolic link (lstat + O_NOFOLLOW), confined to
-    the repository, and byte-identical to a regular (mode 100644) blob tracked
-    at exactly that path in the checked-out commit.
+    The worktree file must be a regular file reached without any symbolic link
+    (lstat + O_NOFOLLOW + fstat), confined to the repository, and
+    byte-identical to a regular (mode 100644) blob tracked at exactly
+    `relative` in the checked-out commit.
     """
-    relative = approval_record_relative(version)
     path = confined_file(repository, relative)
     content = _read_regular_no_follow(path)
     listing = _git(repository, "ls-tree", "-z", "--full-tree", "HEAD", "--", relative)
     entries = [entry for entry in listing.split(b"\0") if entry]
     if len(entries) != 1:
-        raise ReleasePackageError("approved package record is not tracked at its exact path")
+        raise ReleasePackageError(f"approved package file {relative} is not tracked at its exact path")
     meta, _, tracked_path = entries[0].partition(b"\t")
     fields = meta.split()
     if (tracked_path != relative.encode() or len(fields) != 3
             or fields[0] != b"100644" or fields[1] != b"blob"):
-        raise ReleasePackageError("approved package record is not a tracked regular file at its exact path")
+        raise ReleasePackageError(f"approved package file {relative} is not a tracked regular file at its exact path")
     object_id = fields[2].decode("ascii")
     if not GIT_OBJECT_PATTERN.fullmatch(object_id):
-        raise ReleasePackageError("approved package record has an invalid tracked object id")
+        raise ReleasePackageError(f"approved package file {relative} has an invalid tracked object id")
     if _git(repository, "cat-file", "blob", object_id) != content:
-        raise ReleasePackageError("approved package record differs from its tracked content")
-    return content, relative
+        raise ReleasePackageError(f"approved package file {relative} differs from its tracked content")
+    return content
+
+
+def read_approval_record(repository: str, version: str) -> tuple[bytes, bytes, str]:
+    """The reviewed record and its acceptance summary for `version`.
+
+    Both live under release/approved-packages/, named only after `version`
+    passes strict SemVer: <version>.json and <version>.summary.json (the
+    harness's exact summary.json bytes). Each is read with read_tracked_record.
+    """
+    relative = approval_record_relative(version)
+    record = read_tracked_record(repository, relative)
+    summary = read_tracked_record(repository, approval_summary_relative(version))
+    return record, summary, relative
+
+
+def _summary_mismatches(approval: dict[str, Any], summary: Any) -> list[str]:
+    acceptance = approval["acceptance"]
+    if not isinstance(summary, dict):
+        return ["summary"]
+    package = summary.get("package") if isinstance(summary.get("package"), dict) else {}
+    crate = summary.get("crate") if isinstance(summary.get("crate"), dict) else {}
+    server = summary.get("server") if isinstance(summary.get("server"), dict) else {}
+    cells = summary.get("cells") if isinstance(summary.get("cells"), dict) else {}
+    cargo = package.get("cargo_version")
+    version = acceptance["expected_server_version"]
+    checks = {
+        "mode": summary.get("mode") == "pre-publication",
+        "outcome": summary.get("outcome") == "pass" and summary.get("checks_outcome") == "pass",
+        "error": "error" not in summary,
+        "cleanup": summary.get("cleanup") == {
+            "pass": True, "errors": [], "local_leftovers": [],
+            "leftover_containers": [], "leftover_networks": [],
+        },
+        "harness_commit": summary.get("harness_commit") == acceptance["harness_commit"],
+        "finished_at": summary.get("finished_at") == acceptance["finished_at"],
+        "expected_server": summary.get("expected_server") == {
+            "version": version, "revision": acceptance["expected_revision"],
+            "release_tag": acceptance["expected_release_tag"],
+        },
+        "server": (server.get("index") == acceptance["server_index"]
+                   and server.get("executed_manifest") == acceptance["executed_manifest"]
+                   and server.get("platform") == acceptance["platform"]),
+        "package.identity": (package.get("package") == approval["package"]
+                             and package.get("version") == approval["version"]
+                             and package.get("commit") == approval["commit"]
+                             and package.get("vcs_info") == {"git": {"sha1": approval["commit"]}, "path_in_vcs": ""}),
+        "package.crate_sha256": (package.get("crate_sha256") == approval["crate_sha256"]
+                                 and package.get("crate_sha256_after_cells") == approval["crate_sha256"]),
+        "package.files": (package.get("files") == approval["files"]
+                          and package.get("file_list_sha256") == approval["file_list_sha256"]),
+        "package.cargo_version": (isinstance(cargo, str) and len(cargo.split()) >= 2
+                                  and cargo.split()[0] == "cargo" and cargo.split()[1] == approval["cargo_version"]),
+        "crate": (crate.get("sha256") == approval["crate_sha256"]
+                  and crate.get("lock_checksum") == approval["crate_sha256"]
+                  and crate.get("source_commit") == approval["commit"]
+                  and crate.get("registry_published") is False
+                  and isinstance(crate.get("baselines"), dict) and crate["baselines"].get("pass") is True),
+        "cells": (sorted(cells) == acceptance["cells"]
+                  and all(isinstance(cell, dict) and cell.get("outcome") == "pass"
+                          and isinstance(cell.get("cluster_info"), dict)
+                          and cell["cluster_info"].get("version") == version
+                          for cell in cells.values())),
+    }
+    return sorted(field for field, ok in checks.items() if not ok)
+
+
+def verify_acceptance_summary(approval: dict[str, Any], summary_record: bytes) -> None:
+    """The committed summary.json is the run the approval names, and it passed."""
+    if sha256(summary_record) != approval["acceptance"]["summary_sha256"]:
+        raise ReleasePackageError("acceptance summary SHA-256 differs from the approval's summary_sha256")
+    try:
+        summary = json.loads(summary_record)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ReleasePackageError("acceptance summary is not valid JSON") from error
+    mismatches = _summary_mismatches(approval, summary)
+    if mismatches:
+        raise ReleasePackageError(f"acceptance summary does not match the approval: {', '.join(mismatches)}")
 
 
 def _archive_files(archive_path: Path, root: str) -> list[str]:
@@ -642,6 +722,7 @@ def verify_approved_archive(
     changelog: Path,
     expected_vcs_commit: str,
     approval_record: bytes,
+    summary_record: bytes,
     cargo_version: str | None = None,
 ) -> dict[str, Any]:
     """Require an archive to be exactly the approved pre-publication package."""
@@ -668,6 +749,8 @@ def verify_approved_archive(
         raise ReleasePackageError(
             "archive SHA-256 differs from the approved pre-publication package"
         )
+    # The record matches the archive; now its committed acceptance run must too.
+    verify_acceptance_summary(approval, summary_record)
     identity["approval"] = {
         "record_sha256": approval_sha256,
         "crate_sha256": approval["crate_sha256"],
@@ -679,6 +762,7 @@ def verify_approved_archive(
         "acceptance_summary_sha256": approval["acceptance"]["summary_sha256"],
         "server_index": approval["acceptance"]["server_index"],
         "server_version": approval["acceptance"]["expected_server_version"],
+        "summary_verified": True,
     }
     return identity
 
@@ -744,12 +828,12 @@ def _run(arguments: argparse.Namespace, parser: argparse.ArgumentParser) -> dict
             parser.error("--expected-vcs-commit requires --archive")
         return {"schema": SCHEMA, "version": 1, **verify_source(manifest, changelog)}
     if arguments.approval_repository is not None:
-        record, relative = read_approval_record(
+        record, summary, relative = read_approval_record(
             confined_root(arguments.approval_repository), str(load_package(manifest)["version"])
         )
         identity = verify_approved_archive(
             archive, manifest, changelog, arguments.expected_vcs_commit,
-            record, arguments.cargo_version,
+            record, summary, arguments.cargo_version,
         )
         identity["approval"]["record_path"] = relative
         return identity

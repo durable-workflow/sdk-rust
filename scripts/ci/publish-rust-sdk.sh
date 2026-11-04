@@ -2,6 +2,36 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The release runs as separate jobs so the publication credential never shares
+# a runner with crate code:
+#   gate      (job 1, no credential): reproduce the tag's package with Cargo's
+#             full verify build, require the approved record, require that the
+#             version is absent, and hand the exact .crate to job 2.
+#   preflight (job 2, before minting): reproduce the package with --no-verify,
+#             require it to equal job 1's .crate, its output digest and the
+#             approval, and require the version to still be absent.
+#   publish   (job 2, the only phase with the credential): cargo publish
+#             --locked --no-verify. No build, test or other crate code runs.
+#   verify    (job 3, no credential): registry and tag readback against the
+#             approval, then the fresh-consumer build.
+phase="${1:-}"
+case "$phase" in
+    gate | preflight | publish | verify) ;;
+    *)
+        printf 'usage: %s gate|preflight|publish|verify\n' "$0" >&2
+        exit 2
+        ;;
+esac
+if [[ "$phase" == "publish" ]]; then
+    if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+        printf 'the publish phase requires CARGO_REGISTRY_TOKEN\n' >&2
+        exit 1
+    fi
+elif [[ -n "${CARGO_REGISTRY_TOKEN:-}${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
+    printf 'the %s phase must not see a crates.io publication credential\n' "$phase" >&2
+    exit 1
+fi
 # shellcheck source=crates-io-publish-lib.sh
 source "$script_dir/crates-io-publish-lib.sh"
 
@@ -57,6 +87,14 @@ if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
     printf 'Rust SDK publication requires a clean release checkout\n' >&2
     exit 1
 fi
+# The tagged source is package data, never configuration for the tools that
+# package or upload it: no Cargo configuration or toolchain override.
+for override in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
+    if [[ -e "$override" || -L "$override" ]]; then
+        printf 'release source must not contain %s\n' "$override" >&2
+        exit 1
+    fi
+done
 
 metadata="$(cargo metadata --manifest-path "$manifest_path" --no-deps --format-version 1)"
 package_name="$(jq -er '.packages[0].name' <<<"$metadata")"
@@ -410,6 +448,21 @@ write_evidence() {
         }' > "$evidence_path"
 }
 
+if [[ "$phase" == "publish" ]]; then
+    # Token-only step. --no-verify packages and uploads without building, so no
+    # build script, proc-macro or test of the crate or its dependencies runs
+    # here. The preflight phase in this job already required this clean tag's
+    # --no-verify package to equal job 1's gated .crate and the approval; the
+    # verify job reads the published bytes back against the approval.
+    if ! cargo publish --locked --no-verify --manifest-path "$manifest_path" --registry crates-io; then
+        write_evidence "failed" "cargo_publish_failed"
+        exit 1
+    fi
+    write_evidence "published" "exact_public_version_published"
+    printf 'Rust SDK %s %s was uploaded to crates.io.\n' "$package_name" "$package_version"
+    exit 0
+fi
+
 # Older immutable tags ignored Cargo.lock. Recover only that missing input from
 # their verified registry archive; complete local/archive equality still follows.
 lockfile_path="$(dirname "$manifest_path")/Cargo.lock"
@@ -442,7 +495,13 @@ if [[ ! -f "$lockfile_path" || -L "$lockfile_path" ]]; then
     lockfile_source="verified_registry_archive"
 fi
 
-if ! cargo package --locked --manifest-path "$manifest_path"; then
+# Only the gate phase (job 1, no credential) runs Cargo's verify build of the
+# package; the other phases reproduce the same bytes without building.
+package_arguments=(package --locked --manifest-path "$manifest_path")
+if [[ "$phase" != "gate" ]]; then
+    package_arguments+=(--no-verify)
+fi
+if ! cargo "${package_arguments[@]}"; then
     write_evidence "failed" "local_package_archive_build_failed"
     exit 1
 fi
@@ -516,24 +575,101 @@ if ! http_status="$(crates_io_version_lookup "$version_api" "$version_response" 
     exit 1
 fi
 
-if [[ "$http_status" == "404" && "$approval_status" != "reproduced" ]]; then
+if [[ "$http_status" != "200" && "$http_status" != "404" ]]; then
+    write_evidence "failed" "registry_version_lookup_http_${http_status}"
+    printf 'crates.io version lookup failed with HTTP %s\n' "$http_status" >&2
+    exit 1
+fi
+if [[ "$http_status" == "404" && "$phase" != "verify" && "$approval_status" != "reproduced" ]]; then
     write_evidence "failed" "approved_package_required"
     printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_REPOSITORY)\n' \
         "$package_name" "$package_version" >&2
     exit 1
 fi
 
-if ! publish_exact_crate_if_absent "$http_status" "$manifest_path"; then
-    write_evidence "failed" "$publish_error"
-    case "$publish_error" in
-        registry_token_missing)
-            printf 'CARGO_REGISTRY_TOKEN is required to publish %s %s\n' "$package_name" "$package_version" >&2
-            ;;
-        registry_version_lookup_http_*)
-            printf 'crates.io version lookup failed with HTTP %s\n' "$http_status" >&2
-            ;;
-    esac
-    exit 1
+write_output() {
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+    fi
+}
+
+if [[ "$phase" == "gate" ]]; then
+    # Hand the exact reproduced bytes to the publish job (uploaded unarchived,
+    # digest-bound by the central artifact handoff contract). Job 2 trusts
+    # neither this file nor these outputs alone: it requires both to equal its
+    # own reproduction and the reviewed approval.
+    gated_file="${RUST_SDK_GATED_PACKAGE_FILE:-}"
+    if [[ -z "$gated_file" || -e "$gated_file" || -L "$gated_file" ]]; then
+        write_evidence "failed" "gated_package_path_invalid"
+        printf 'RUST_SDK_GATED_PACKAGE_FILE must name a new file\n' >&2
+        exit 1
+    fi
+    cp "$local_archive" "$gated_file"
+    gated_file_sha256="$(sha256sum "$gated_file" | awk '{print $1}')"
+    if [[ "$gated_file_sha256" != "$local_checksum" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        exit 1
+    fi
+    write_output crate_sha256 "$gated_file_sha256"
+    if [[ "$http_status" == "200" ]]; then
+        write_output publish_required false
+        write_evidence "gated" "exact_public_version_already_exists"
+        exit 0
+    fi
+    if [[ "$gated_file_sha256" != "$approved_checksum" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        exit 1
+    fi
+    write_output publish_required true
+    write_evidence "gated" "approved_package_reproduced_and_built"
+    printf 'Rust SDK %s %s is approved, reproduced, built and absent from crates.io.\n' "$package_name" "$package_version"
+    exit 0
+fi
+
+if [[ "$phase" == "preflight" ]]; then
+    if [[ "$http_status" != "404" ]]; then
+        write_evidence "failed" "registry_version_already_exists"
+        printf '%s %s already exists on crates.io; nothing to publish\n' "$package_name" "$package_version" >&2
+        exit 1
+    fi
+    gated_file="${RUST_SDK_GATED_PACKAGE_FILE:-}"
+    gated_digest="${RUST_SDK_GATED_SHA256:-}"
+    gated_output="${RUST_SDK_GATED_CRATE_SHA256:-}"
+    gated_entries=""
+    if [[ -n "$gated_file" ]]; then
+        gated_entries="$(find "$(dirname "$gated_file")" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)"
+    fi
+    if [[ ! "$gated_digest" =~ ^[0-9a-f]{64}$ || ! "$gated_output" =~ ^[0-9a-f]{64}$ || \
+          -z "$gated_file" || "$gated_entries" != "$gated_file" || -L "$gated_file" || ! -f "$gated_file" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        printf 'the gated package handoff must be exactly one regular file with exact digests\n' >&2
+        exit 1
+    fi
+    gated_file_sha256="$(sha256sum "$gated_file" | awk '{print $1}')"
+    if [[ "$gated_file_sha256" != "$gated_digest" || "$gated_file_sha256" != "$gated_output" || \
+          "$gated_file_sha256" != "$local_checksum" || "$gated_file_sha256" != "$approved_checksum" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        printf 'gated package %s, artifact digest %s, gate output %s, reproduction %s and approval %s must be equal\n' \
+            "$gated_file_sha256" "$gated_digest" "$gated_output" "$local_checksum" "$approved_checksum" >&2
+        exit 1
+    fi
+    write_evidence "preflight_passed" "approved_package_reproduced_without_build"
+    printf 'Rust SDK %s %s matches the gated package and the approval.\n' "$package_name" "$package_version"
+    exit 0
+fi
+
+# verify phase
+if [[ "${RUST_SDK_PUBLISHED_IN_RUN:-false}" == "true" ]]; then
+    publish_outcome="published"
+    publish_reason="exact_public_version_published"
+else
+    if [[ "$http_status" != "200" ]]; then
+        write_evidence "failed" "registry_version_absent"
+        printf '%s %s is not on crates.io\n' "$package_name" "$package_version" >&2
+        exit 1
+    fi
+    publish_outcome="already_published"
+    publish_reason="exact_public_version_already_exists"
 fi
 
 if [[ "$publish_outcome" == "published" ]]; then

@@ -522,13 +522,13 @@ def package_release(args, work_dir, run):
     (work_dir / 'package' / expected.name).write_bytes(crate_bytes)
     metadata = tomllib.loads(members['Cargo.toml'].decode())['package'].get('metadata', {}).get('durable-workflow', {})
     return {'mode': 'pre-publication', 'package': PACKAGE_NAME, 'version': version, 'commit': commit,
-            'source_checkout': str(checkout), 'crate_file': expected.name, 'crate_sha256': crate_sha256,
+            'crate_file': expected.name, 'crate_sha256': crate_sha256,
             'crate_size': len(crate_bytes), 'files': sorted(members), 'file_count': len(members),
             'file_list_sha256': file_list_sha256(members),
             'vcs_info': json.loads(members['.cargo_vcs_info.json']), 'cargo_version': cargo_version,
             'rust_image': image_identity(args.rust_image), 'product_train': metadata.get('product-train'),
             'verified_source_files': len(members) - len(GENERATED_PACKAGE_FILES),
-            'unpacked': str(unpacked)}, members
+            'unpacked': str(unpacked.relative_to(work_dir))}, members
 
 
 def cargo_checksum(members, crate_sha256):
@@ -552,7 +552,7 @@ def build_packaged_fixture(args, fixture, package, members, run):
     shutil.copytree(HERE / 'fixture' / 'src', fixture / 'src')
     final_manifest = fixture_manifest(version)
     (fixture / 'Cargo.toml').write_text(final_manifest + '\n[patch.crates-io]\n%s = { path = "/package" }\n' % PACKAGE_NAME)
-    resolve = bounded_cargo(args, run, 'resolve', ['%s:/work' % fixture, '%s:/package:ro' % package['unpacked']],
+    resolve = bounded_cargo(args, run, 'resolve', ['%s:/work' % fixture, '%s:/package:ro' % (fixture.parent / package['unpacked'])],
                             FIXTURE_ENV, 'cargo -V && cargo generate-lockfile && cargo vendor --locked --versioned-dirs vendor')
     (fixture / 'resolve.stdout').write_text(resolve.stdout)
     (fixture / 'resolve.stderr').write_text(resolve.stderr)
@@ -881,8 +881,24 @@ class Cell:
         (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_text(out.stderr)
 
 
+def harness_identity(args):
+    """The harness commit, and in pre-publication mode proof that it is clean.
+
+    An approval names the harness commit that produced it, so a locally edited
+    harness must not be able to produce an approval that names a clean commit.
+    """
+    head = call(['git', '-C', str(REPO), 'rev-parse', '--verify', 'HEAD^{commit}'], check=False).stdout.strip()
+    if args.package_from:
+        try:
+            require_clean_checkout(REPO, head)
+        except PackageError as error:
+            raise SystemExit('pre-publication mode requires a clean harness checkout: %s' % error) from error
+    return head
+
+
 def main():
     args = parse_args()
+    harness_commit = harness_identity(args)
     if args.work_dir.exists():
         raise SystemExit('work dir %s already exists; use a new one' % args.work_dir)
     args.work_dir.mkdir(parents=True)
@@ -891,7 +907,7 @@ def main():
                'mode': 'pre-publication' if args.package_from else 'published',
                'expected_server': {'version': args.expect_server_version, 'revision': args.expect_revision,
                                    'release_tag': args.expect_release_tag},
-               'harness_commit': call(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], check=False).stdout.strip()}
+               'harness_commit': harness_commit}
     approval = None
     try:
         if args.baselines_control:

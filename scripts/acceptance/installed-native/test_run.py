@@ -1350,5 +1350,53 @@ class PathConfinement(unittest.TestCase):
                 run.verify_package_archive(crate, VERSION, commit, sorted(members) + [name], lambda path: None)
 
 
+class HarnessCleanliness(unittest.TestCase):
+    """F2: an approval names the harness commit, so package mode needs a clean harness."""
+
+    def setUp(self):
+        self.tmp = temporary_directory(self)
+        self.harness = self.tmp / 'harness'
+        self.commit = make_repo(self.harness)
+        self.argv = ['run.py'] + PrePublicationArguments.PACKAGE + [
+            '--server-index', INDEX, '--cells', 'lifecycle,deadline', '--work-dir', str(self.tmp / 'work')]
+
+    def main(self, docker):
+        with mock.patch.object(run, 'REPO', self.harness), mock.patch.object(run, 'call', hybrid(docker)), \
+                mock.patch.object(sys, 'argv', self.argv), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit) as exited:
+            run.main()
+        return exited.exception
+
+    def test_dirty_harness_checkout_is_refused_before_any_work(self):
+        for change in ('modified', 'untracked', 'staged'):
+            with self.subTest(change=change):
+                target = self.harness / ('src/lib.rs' if change != 'untracked' else 'scratch.py')
+                original = target.read_bytes() if target.exists() else None
+                target.write_bytes(b'# local edit\n')
+                if change == 'staged':
+                    subprocess.run(['git', '-C', str(self.harness), 'add', '-A'], check=True, env=git_env())
+                docker = FakeDocker()
+                error = self.main(docker)
+                self.assertIn('clean harness checkout', str(error))
+                self.assertEqual(docker.commands, [])
+                self.assertFalse((self.tmp / 'work').exists())
+                if original is None:
+                    target.unlink()
+                else:
+                    target.write_bytes(original)
+                subprocess.run(['git', '-C', str(self.harness), 'reset', '--quiet', '--hard'], check=True, env=git_env())
+
+    def test_clean_harness_commit_is_recorded(self):
+        args = run.parse_args(self.argv[1:])
+        with mock.patch.object(run, 'REPO', self.harness), mock.patch.object(run, 'call', hybrid(FakeDocker())):
+            self.assertEqual(run.harness_identity(args), self.commit)
+
+    def test_published_mode_still_only_records_head(self):
+        (self.harness / 'scratch.py').write_bytes(b'x')
+        args = run.parse_args(['--crate-version', '4.11.1', '--server-index', 'sha256:x', '--work-dir', str(self.tmp / 'w')])
+        with mock.patch.object(run, 'REPO', self.harness), mock.patch.object(run, 'call', hybrid(FakeDocker())):
+            self.assertEqual(run.harness_identity(args), self.commit)
+
+
 if __name__ == '__main__':
     unittest.main()

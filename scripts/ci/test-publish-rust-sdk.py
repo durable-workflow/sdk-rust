@@ -6,6 +6,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 from pathlib import Path
 import hashlib
 import ssl
@@ -37,6 +38,7 @@ TOOLING_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
 CHECKSUM = "a" * 64
 REAL_GIT = shutil.which("git")
 APPROVAL_RELATIVE = f"release/approved-packages/{PACKAGE_VERSION}.json"
+SUMMARY_RELATIVE = f"release/approved-packages/{PACKAGE_VERSION}.summary.json"
 # The exact receipt approval_candidate() emits for a passing 3.0.5 run.
 ACCEPTANCE = {
     "summary_sha256": "c" * 64,
@@ -62,6 +64,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.bin_dir = self.temp / "bin"
         self.bin_dir.mkdir()
         self.evidence = self.temp / "evidence.json"
+        self.cargo_log = self.temp / "cargo-calls.jsonl"
         self.tooling = self.temp / "tooling"
         self.tooling.mkdir()
         self._tooling_git("init", "--quiet")
@@ -87,6 +90,13 @@ class PublishRustSdkContractTest(unittest.TestCase):
             import tomllib
 
             command = sys.argv[1]
+            if os.environ.get("MOCK_CARGO_LOG"):
+                with open(os.environ["MOCK_CARGO_LOG"], "a", encoding="utf-8") as log:
+                    log.write(json.dumps({
+                        "argv": sys.argv[1:],
+                        "phase": os.environ.get("MOCK_PHASE", ""),
+                        "credential": bool(os.environ.get("CARGO_REGISTRY_TOKEN")),
+                    }) + "\n")
             if command == "-V":
                 print(f'cargo {os.environ.get("MOCK_CARGO_VERSION", "1.86.0")} (adf9b6ad1 2025-02-28)')
                 raise SystemExit(0)
@@ -132,8 +142,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
                                 member.size = len(content)
                                 crate.addfile(member, io.BytesIO(content))
             elif command == "publish":
-                if "--locked" not in sys.argv:
-                    raise SystemExit("publication must use --locked")
+                if "--locked" not in sys.argv or "--no-verify" not in sys.argv:
+                    raise SystemExit("publication must use --locked --no-verify")
                 Path(os.environ["MOCK_PUBLISH_MARKER"]).write_text("published\n")
             elif command == "build":
                 if os.environ.get("MOCK_CONSUMER_BUILD_OUTCOME") == "fail":
@@ -242,6 +252,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
         cwd: Path = ROOT,
         approval: dict[str, object] | None = None,
         registry_changelog: bytes | None = None,
+        between_jobs=None,
+        preflight_environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if cwd == ROOT and not manifest.resolve().is_relative_to(ROOT):
             # A modified manifest is its own release checkout: the publisher only
@@ -266,11 +278,13 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 "MOCK_APPROVAL_REPOSITORY": str(self.tooling),
                 "MOCK_REAL_GIT": REAL_GIT,
                 "MOCK_PUBLISH_MARKER": str(self.temp / "published-marker"),
+                "MOCK_CARGO_LOG": str(self.cargo_log),
             }
         )
         env.update(environment or {})
+        # The simulated registry's own packaging is not part of the release run.
         fixture_env = {
-            **env,
+            **{key: value for key, value in env.items() if key not in {"CARGO_REGISTRY_TOKEN", "MOCK_CARGO_LOG"}},
             "CARGO_TARGET_DIR": str(self.temp / "registry"),
             "RUST_SDK_CHANGELOG_PATH": str(ROOT / "CHANGELOG.md"),
             "MOCK_FIXTURE_CREATION": "1",
@@ -281,9 +295,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
         )
         registry_archive = Path(env["MOCK_REGISTRY_ARCHIVE"])
         if approval is not None:
-            record = self._approval(registry_archive)
+            record, summary = self._approval(registry_archive)
             record.update(approval)
-            self._commit_approval(json.dumps(record).encode())
+            self._commit_approval(json.dumps(record).encode(), summary=summary)
         if registry_changelog is not None:
             # crates.io serves different (self-consistent) bytes than were approved.
             changed = self.temp / "changed-registry"
@@ -295,15 +309,69 @@ class PublishRustSdkContractTest(unittest.TestCase):
                      "RUST_SDK_CHANGELOG_PATH": str(changelog)}, check=True,
             )
             env["MOCK_REGISTRY_ARCHIVE"] = str(changed / "package" / registry_archive.name)
-        return subprocess.run(
-            ["bash", str(PUBLISH)],
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        return self._run_release(env, cwd, between_jobs, preflight_environment or {})
+
+    def _phase(self, phase: str, env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        if getattr(self, "_fresh_lockfile", False):
+            (cwd / "Cargo.lock").unlink(missing_ok=True)
+        result = subprocess.run(
+            ["bash", str(PUBLISH), phase], cwd=cwd, env={**env, "MOCK_PHASE": phase},
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
+        self.phases.append(phase)
+        return result
+
+    def _run_release(self, env, cwd, between_jobs, preflight_environment) -> subprocess.CompletedProcess[str]:
+        """Run the four release jobs as release.yml does, stopping at the first failure.
+
+        Only the publish phase receives CARGO_REGISTRY_TOKEN; every other phase
+        runs without it, as their jobs have no credential.
+        """
+        self.phases = []
+        token = env.pop("CARGO_REGISTRY_TOKEN", None)
+        # Each job starts from a fresh checkout: a lockfile a legacy phase
+        # restored is not visible to the next job.
+        self._fresh_lockfile = not (cwd / "Cargo.lock").exists()
+        jobs = self.temp / "jobs"
+        shutil.rmtree(jobs, ignore_errors=True)
+        jobs.mkdir()
+        outputs = jobs / "gate-output"
+        gated = jobs / "gated-package.crate"
+        result = self._phase("gate", {**env, "GITHUB_OUTPUT": str(outputs), "RUST_SDK_GATED_PACKAGE_FILE": str(gated)}, cwd)
+        if result.returncode:
+            return result
+        gate = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
+        published_in_run = "false"
+        if gate.get("publish_required") == "true":
+            # actions/upload-artifact + download-artifact + the central validator:
+            # job 2 receives the same single file in an isolated directory.
+            isolated = jobs / "isolated-gated-package"
+            isolated.mkdir()
+            shutil.copyfile(gated, isolated / gated.name)
+            if between_jobs is not None:
+                between_jobs(isolated / gated.name)
+            handoff = {
+                "RUST_SDK_GATED_PACKAGE_FILE": str(isolated / gated.name),
+                "RUST_SDK_GATED_SHA256": hashlib.sha256(gated.read_bytes()).hexdigest(),
+                "RUST_SDK_GATED_CRATE_SHA256": gate.get("crate_sha256", ""),
+                **preflight_environment,
+            }
+            result = self._phase("preflight", {**env, **handoff}, cwd)
+            if result.returncode:
+                return result
+            publish_env = dict(env)
+            if token is not None:
+                publish_env["CARGO_REGISTRY_TOKEN"] = token
+            result = self._phase("publish", publish_env, cwd)
+            if result.returncode:
+                return result
+            published_in_run = "true"
+        return self._phase("verify", {**env, "RUST_SDK_PUBLISHED_IN_RUN": published_in_run}, cwd)
+
+    def _cargo_calls(self) -> list[dict[str, object]]:
+        if not self.cargo_log.exists():
+            return []
+        return [json.loads(line) for line in self.cargo_log.read_text(encoding="utf-8").splitlines()]
 
     def _tooling_git(self, *arguments: str) -> None:
         subprocess.run(
@@ -313,21 +381,45 @@ class PublishRustSdkContractTest(unittest.TestCase):
             env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
         )
 
-    def _commit_approval(self, content: bytes, relative: str = APPROVAL_RELATIVE) -> Path:
-        path = self.tooling / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_symlink():
-            path.unlink()
-        path.write_bytes(content)
-        self._tooling_git("add", "--", relative)
+    def _commit_approval(self, content: bytes, relative: str = APPROVAL_RELATIVE,
+                         summary: bytes | None = None) -> Path:
+        files = {relative: content}
+        if summary is not None:
+            files[SUMMARY_RELATIVE] = summary
+        for name, data in files.items():
+            path = self.tooling / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                path.unlink()
+            path.write_bytes(data)
+            self._tooling_git("add", "--", name)
         self._tooling_git("commit", "--quiet", "--allow-empty", "-m", "approve")
-        return path
+        return self.tooling / relative
 
     @staticmethod
-    def _approval(archive: Path) -> dict[str, object]:
+    def _approval(archive: Path) -> tuple[dict[str, object], bytes]:
+        """A record and the exact harness summary.json it binds."""
         root = f"durable-workflow-{PACKAGE_VERSION}/"
         with tarfile.open(archive) as crate:
             files = sorted(member.name.removeprefix(root) for member in crate.getmembers())
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        file_list = hashlib.sha256("".join(f"{name}\n" for name in files).encode()).hexdigest()
+        summary = (json.dumps({
+            "outcome": "pass", "checks_outcome": "pass", "mode": "pre-publication",
+            "expected_server": {"version": "3.0.5", "revision": ACCEPTANCE["expected_revision"], "release_tag": "3.0.5"},
+            "harness_commit": ACCEPTANCE["harness_commit"],
+            "server": {"index": ACCEPTANCE["server_index"], "executed_manifest": ACCEPTANCE["executed_manifest"],
+                       "platform": ACCEPTANCE["platform"]},
+            "package": {"package": "durable-workflow", "version": PACKAGE_VERSION, "commit": RELEASE_COMMIT,
+                        "crate_sha256": digest, "crate_sha256_after_cells": digest, "files": files,
+                        "file_list_sha256": file_list, "vcs_info": {"git": {"sha1": RELEASE_COMMIT}, "path_in_vcs": ""},
+                        "cargo_version": "cargo 1.86.0 (adf9b6ad1 2025-02-28)"},
+            "crate": {"sha256": digest, "lock_checksum": digest, "source_commit": RELEASE_COMMIT,
+                      "registry_published": False, "baselines": {"pass": True}},
+            "cells": {name: {"outcome": "pass", "cluster_info": {"version": "3.0.5"}} for name in ("lifecycle", "deadline")},
+            "cleanup": {"pass": True, "errors": [], "local_leftovers": [], "leftover_containers": [], "leftover_networks": []},
+            "finished_at": ACCEPTANCE["finished_at"],
+        }, indent=2) + "\n").encode()
         return {
             "schema": "durable-workflow.rust-sdk.approved-package/v1",
             "package": "durable-workflow",
@@ -336,9 +428,9 @@ class PublishRustSdkContractTest(unittest.TestCase):
             "crate_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
             "cargo_version": "1.86.0",
             "files": files,
-            "file_list_sha256": hashlib.sha256("".join(f"{name}\n" for name in files).encode()).hexdigest(),
-            "acceptance": dict(ACCEPTANCE),
-        }
+            "file_list_sha256": file_list,
+            "acceptance": {**ACCEPTANCE, "summary_sha256": hashlib.sha256(summary).hexdigest()},
+        }, summary
 
     def _evidence(self) -> dict[str, object]:
         return json.loads(self.evidence.read_text(encoding="utf-8"))
@@ -586,6 +678,126 @@ class PublishRustSdkContractTest(unittest.TestCase):
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn("release evidence path", result.stderr)
         self.assertEqual("untouched", target.read_text(encoding="utf-8"))
+
+    # F1: the publication credential never shares a job with crate code.
+
+    def test_credential_reaches_only_the_no_verify_upload(self) -> None:
+        result = self._publish(environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                               approval={})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["gate", "preflight", "publish", "verify"], self.phases)
+        calls = self._cargo_calls()
+        with_credential = [call for call in calls if call["credential"]]
+        self.assertEqual({"publish"}, {call["phase"] for call in with_credential})
+        self.assertEqual({"metadata", "publish"}, {call["argv"][0] for call in with_credential})
+        [upload] = [call for call in calls if call["argv"][0] == "publish"]
+        self.assertTrue({"--locked", "--no-verify"} <= set(upload["argv"]))
+        packages = {call["phase"]: call["argv"] for call in calls if call["argv"][0] == "package"}
+        self.assertNotIn("--no-verify", packages["gate"])  # the verify build runs credential-free
+        self.assertIn("--no-verify", packages["preflight"])
+        self.assertIn("--no-verify", packages["verify"])
+        for call in calls:
+            if call["argv"][0] in {"build", "test", "run", "check"}:
+                self.assertFalse(call["credential"], call)
+                self.assertNotEqual("publish", call["phase"])
+        self.assertEqual(set(), {call["argv"][0] for call in calls if call["phase"] == "publish"} - {"metadata", "publish"})
+
+    def test_phases_refuse_a_misplaced_credential(self) -> None:
+        def run(phase: str, **environment: str) -> subprocess.CompletedProcess[str]:
+            env = {key: value for key, value in os.environ.items()
+                   if key not in {"CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_CRATES_IO_TOKEN"}}
+            return subprocess.run(["bash", str(PUBLISH), *([phase] if phase else [])], cwd=ROOT,
+                                  env={**env, **environment}, text=True, capture_output=True, check=False)
+        for phase in ("gate", "preflight", "verify"):
+            for variable in ("CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_CRATES_IO_TOKEN"):
+                with self.subTest(phase=phase, variable=variable):
+                    result = run(phase, **{variable: "test-token"})
+                    self.assertEqual(1, result.returncode)
+                    self.assertIn("must not see a crates.io publication credential", result.stderr)
+                    self.assertNotIn("test-token", result.stderr + result.stdout)
+        result = run("publish")
+        self.assertEqual(1, result.returncode)
+        self.assertIn("requires CARGO_REGISTRY_TOKEN", result.stderr)
+        for phase in ("", "all", "--help"):
+            with self.subTest(phase=phase):
+                self.assertEqual(2, run(phase).returncode)
+
+    def test_gated_handoff_must_equal_the_reproduction_and_approval(self) -> None:
+        def flip_byte(path: Path) -> None:
+            data = bytearray(path.read_bytes())
+            data[-1] ^= 1
+            path.write_bytes(bytes(data))
+
+        def extra_file(path: Path) -> None:
+            (path.parent / "extra.crate").write_bytes(b"x")
+
+        def symlink(path: Path) -> None:
+            copy = path.parent.parent / "elsewhere.crate"
+            path.replace(copy)
+            path.symlink_to(copy)
+
+        def missing(path: Path) -> None:
+            path.unlink()
+        cases = {
+            "one-byte artifact drift": (flip_byte, {}),
+            "extra file in the handoff": (extra_file, {}),
+            "symlinked artifact": (symlink, {}),
+            "missing artifact": (missing, {}),
+            "artifact digest output differs": (None, {"RUST_SDK_GATED_SHA256": "0" * 64}),
+            "gate output differs": (None, {"RUST_SDK_GATED_CRATE_SHA256": "0" * 64}),
+            "malformed digest": (None, {"RUST_SDK_GATED_SHA256": "sha256:" + "0" * 64}),
+        }
+        for label, (tamper, override) in cases.items():
+            with self.subTest(label=label):
+                self.cargo_log.unlink(missing_ok=True)
+                result = self._publish(
+                    environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"},
+                    approval={}, between_jobs=tamper, preflight_environment=override,
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(["gate", "preflight"], self.phases)
+                self.assertEqual("gated_package_mismatch", self._evidence()["reason"])
+                self.assertFalse(self._published())
+                self.assertNotIn("publish", [call["argv"][0] for call in self._cargo_calls()])
+
+    def test_version_published_between_jobs_is_not_uploaded_again(self) -> None:
+        result = self._publish(
+            environment={"MOCK_LOOKUP_STATUS": "404", "CARGO_REGISTRY_TOKEN": "test-token"}, approval={},
+            between_jobs=lambda _path: (self.temp / "published-marker").write_text("elsewhere\n"),
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("registry_version_already_exists", self._evidence()["reason"])
+        self.assertNotIn("publish", [call["argv"][0] for call in self._cargo_calls()])
+
+    def test_tagged_source_cannot_configure_cargo_or_the_toolchain(self) -> None:
+        for override in (".cargo/config.toml", ".cargo/config", "rust-toolchain.toml", "rust-toolchain"):
+            with self.subTest(override=override):
+                source = self.temp / "source"
+                shutil.rmtree(source, ignore_errors=True)
+                source = self._source_checkout()
+                (source / override).parent.mkdir(parents=True, exist_ok=True)
+                (source / override).write_text("[toolchain]\npath = \"/tmp/x\"\n", encoding="utf-8")
+                result = self._publish(source / "Cargo.toml", {"MOCK_LOOKUP_STATUS": "404",
+                                                               "CARGO_REGISTRY_TOKEN": "test-token"},
+                                       cwd=source, approval={})
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("must not contain " + override, result.stderr)
+                self.assertFalse(self._published())
+
+    # F4: a record tracked at HEAD but absent from the worktree is still an
+    # approval, so it can never silently fall back to legacy verification.
+
+    def test_tracked_record_missing_from_the_worktree_still_binds(self) -> None:
+        self._approved_record()
+        (self.tooling / APPROVAL_RELATIVE).unlink()
+        for status in ("200", "404"):
+            with self.subTest(registry=status):
+                result = self._publish(environment={"MOCK_LOOKUP_STATUS": status, "CARGO_REGISTRY_TOKEN": "test-token"})
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual("approved_package_mismatch", self._evidence()["reason"])
+                self.assertEqual("reproduction_mismatch", self._evidence()["approved_package"]["status"])
+                self.assertIn("not an existing regular file", result.stderr)
+                self.assertFalse(self._published())
 
     def test_release_workflow_supplies_the_reviewed_approval_record(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -929,45 +1141,102 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual("local_package_release_identity_mismatch", evidence["reason"])
         self.assertIn("current-version entry", result.stderr)
 
+    @staticmethod
+    def _workflow_jobs() -> dict[str, str]:
+        """release.yml job name -> that job's source text."""
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        body = workflow.split("\njobs:\n", maxsplit=1)[1]
+        parts = re.split(r"^  ([a-z][a-z0-9-]*):\n", body, flags=re.MULTILINE)
+        return {parts[index]: parts[index + 1] for index in range(1, len(parts), 2)}
+
+    @staticmethod
+    def _steps(job: str) -> list[str]:
+        return ["      - " + step for step in job.split("\n      - ")[1:]]
+
     def test_release_workflow_only_publishes_planned_dispatches(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         triggers = workflow.split("\njobs:\n", maxsplit=1)[0]
         self.assertIn("workflow_dispatch:", triggers)
         self.assertNotIn("push:", triggers)
-        self.assertIn("scripts/ci/publish-rust-sdk.sh", workflow)
-        self.assertIn(
-            'scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"',
-            workflow,
-        )
-        self.assertLess(
-            workflow.index("Install hash-locked release tooling"),
-            workflow.index("CARGO_REGISTRY_TOKEN"),
-        )
-        self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", workflow)
-        self.assertIn("environment: crates-io", workflow)
-        self.assertEqual(1, workflow.count("id-token: write"))
-        self.assertIn(
-            "uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18",
-            workflow,
-        )
-        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}", workflow)
-        self.assertLess(workflow.index("id: crates-auth"), workflow.index("CARGO_REGISTRY_TOKEN"))
-        self.assertLess(workflow.index("Bootstrap patched pip trust"), workflow.index("Install hash-locked release tooling"))
-        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
-        self.assertIn("working-directory: release-source", workflow)
-        self.assertIn("run: ../release-tools/scripts/ci/publish-rust-sdk.sh", workflow)
-        self.assertIn("path: release-source/rust-sdk-release-evidence.json", workflow)
-        self.assertEqual(2, workflow.count("persist-credentials: false"))
+        self.assertNotIn("secrets.", workflow)
+        self.assertEqual(["gate", "publish", "verify", "release"], list(self._workflow_jobs()))
+        for name, job in self._workflow_jobs().items():
+            with self.subTest(job=name):
+                self.assertIn("github.ref == 'refs/heads/main'", job)
+                self.assertIn('scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"', job)
+                self.assertLess(job.index("Bootstrap patched pip trust"), job.index("Install hash-locked release tooling"))
+                self.assertIn("persist-credentials: false", job.replace("'false'", "false"))
 
-    def test_github_notes_use_validated_source_before_publication(self) -> None:
-        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn('--release-notes "$RELEASE_TAG"', workflow)
-        self.assertIn('--notes-file "${RUNNER_TEMP}/rust-sdk-release-notes.md"', workflow)
-        self.assertNotIn('--generate-notes', workflow)
-        self.assertLess(workflow.index("Install hash-locked release tooling"),
-                        workflow.index("Prepare exact source release notes"))
-        self.assertLess(workflow.index("Prepare exact source release notes"),
-                        workflow.index("id: crates-auth"))
+    def test_publication_credential_exists_only_in_the_publish_job(self) -> None:
+        jobs = self._workflow_jobs()
+        for marker in ("CARGO_REGISTRY_TOKEN", "id-token", "crates-io-auth-action", "crates-auth",
+                       "environment: crates-io"):
+            holders = [name for name, job in jobs.items() if marker in job]
+            with self.subTest(marker=marker):
+                self.assertEqual(["publish"], holders)
+        publish = jobs["publish"]
+        self.assertEqual(1, publish.count("id-token: write"))
+        self.assertEqual(1, publish.count("CARGO_REGISTRY_TOKEN"))
+        # The credential is minted after the credential-free preflight, and only
+        # the single upload step receives it.
+        steps = self._steps(publish)
+        [token_step] = [step for step in steps if "CARGO_REGISTRY_TOKEN" in step]
+        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}", token_step)
+        self.assertTrue(token_step.rstrip().endswith("run: ../scripts/ci/publish-rust-sdk.sh publish"))
+        names = [step.split("\n", 1)[0] for step in steps]
+        self.assertLess(names.index("      - name: Preflight the gated package without the publication credential"),
+                        names.index("      - name: Obtain a short-lived crates.io publication token"))
+        self.assertLess(names.index("      - name: Obtain a short-lived crates.io publication token"),
+                        names.index("      - name: Publish the gated package"))
+        for name in ("gate", "verify", "release"):
+            with self.subTest(job=name):
+                self.assertNotIn("id-token", jobs[name])
+                self.assertNotIn("environment:", jobs[name])
+
+    def test_publish_job_runs_no_crate_build_or_test(self) -> None:
+        publish = self._workflow_jobs()["publish"]
+        for forbidden in ("cargo build", "cargo test", "cargo run", "cargo check", "verify-fresh-consumer",
+                          "publish-rust-sdk.sh gate", "publish-rust-sdk.sh verify", "cargo package",
+                          "cargo publish"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, publish)
+        phases = re.findall(r"publish-rust-sdk\.sh (\w+)", publish)
+        self.assertEqual(["preflight", "publish"], phases)
+        # The tagged source is data for --no-verify packaging: Cargo cannot be
+        # redirected by an in-repo toolchain file.
+        for step in self._steps(publish):
+            if "publish-rust-sdk.sh" in step:
+                self.assertIn("RUSTUP_TOOLCHAIN: 1.86.0", step)
+        # The handed-off .crate is digest-bound before any other use.
+        steps = self._steps(publish)
+        self.assertIn("uses: actions/download-artifact@", steps[1])
+        self.assertIn("artifact-ids: ${{ needs.gate.outputs.gated_artifact_id }}", steps[1])
+        self.assertIn("digest-mismatch: error", steps[1])
+        self.assertIn("EXPECTED_ARTIFACT_DIGEST: ${{ needs.gate.outputs.gated_artifact_digest }}", steps[2])
+        self.assertIn("RUST_SDK_GATED_SHA256: ${{ needs.gate.outputs.gated_artifact_digest }}", publish)
+        self.assertIn("RUST_SDK_GATED_CRATE_SHA256: ${{ needs.gate.outputs.crate_sha256 }}", publish)
+
+    def test_gate_and_verify_jobs_build_without_the_credential(self) -> None:
+        jobs = self._workflow_jobs()
+        self.assertIn("run: ../release-tools/scripts/ci/publish-rust-sdk.sh gate", jobs["gate"])
+        self.assertIn("path: gated-package.crate", jobs["gate"])
+        self.assertIn("run: ../release-tools/scripts/ci/publish-rust-sdk.sh verify", jobs["verify"])
+        self.assertIn("RUST_SDK_PUBLISHED_IN_RUN: ${{ needs.publish.result == 'success' }}", jobs["verify"])
+        self.assertIn("needs: [gate, publish]", jobs["verify"])
+        self.assertIn("needs.publish.result == 'success' || needs.publish.result == 'skipped'", jobs["verify"])
+        self.assertIn("needs: verify", jobs["release"])
+        self.assertIn("contents: write", jobs["release"])
+        for name in ("gate", "publish", "verify"):
+            self.assertNotIn("contents: write", jobs[name])
+
+    def test_github_notes_use_validated_source_after_verification(self) -> None:
+        release = self._workflow_jobs()["release"]
+        self.assertIn('--release-notes "$RELEASE_TAG"', release)
+        self.assertIn('--notes-file "${RUNNER_TEMP}/rust-sdk-release-notes.md"', release)
+        self.assertNotIn('--generate-notes', release)
+        self.assertLess(release.index("- name: Prepare exact source release notes"),
+                        release.index("- name: Create the source GitHub Release"))
+        self.assertIsNone(re.search(r"\bcargo (build|test|run|check|package|publish)\b", release))
 
 
 class ReleaseToolingInstallerTrustTest(unittest.TestCase):

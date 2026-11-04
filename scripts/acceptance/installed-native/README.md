@@ -81,6 +81,10 @@ python3 scripts/acceptance/installed-native/run.py \
   --work-dir <new empty directory>
 ```
 
+Run the harness from a clean checkout. Pre-publication mode refuses a
+harness tree with changed, staged or untracked files, because the approval
+records the harness commit.
+
 Use the commit that will be tagged. Cargo records the commit in
 `.cargo_vcs_info.json`, so a different commit (for example a later merge
 commit with the same tree) produces a different package and will not match.
@@ -161,26 +165,64 @@ supported `--platform`, both cells, a 40-hex `--expect-revision`, and
 `--expect-release-tag` equal to `--expect-server-version`.
 
 A reviewer commits that record unchanged to `main` as
-`release/approved-packages/<version>.json`. `release/` is outside the crate's
-`include` list, so it never changes package bytes. The Release workflow reads
-the record from its maintained tooling checkout (`main`), never from the
-tagged source. Then:
+`release/approved-packages/<version>.json`. The same change commits the run's
+exact `summary.json` bytes as `release/approved-packages/<version>.summary.json`.
+`release/` is outside the crate's `include` list, so neither file changes
+package bytes. Both files are read from the maintained tooling checkout
+(`main`), never from the tagged source, with the tracked-blob and no-follow
+rules below. Publication requires all of the following:
+- the summary's SHA-256 equals `acceptance.summary_sha256`;
+- the summary is a passing pre-publication run, with checks, outcome and
+  cleanup all passing and no error;
+- its harness commit, Server tuple, finish time and cells match the receipt;
+- its package commit, `.crate` SHA-256 (before and after the cells), file list
+  and digest, VCS record and Cargo version, and its locked crate checksum, all
+  equal the record.
 
-- **Before publishing,** it reproduces `cargo package --locked` from the tag and
-  refuses (`approved_package_mismatch`) unless the archive's SHA-256, file set,
-  version, VCS commit and Cargo release all equal the record. A version that is
-  not yet on crates.io is never published without a record
-  (`approved_package_required`).
-- **After publishing,** the crates.io checksum and the downloaded archive must
-  equal the approved SHA-256. The downloaded archive must match the record
-  again. The tag must read back from `origin` as the release commit. Any
-  difference fails the release (`published_checksum_differs_from_approved_package`,
-  `published_package_differs_from_approved_package`,
-  `source_tag_readback_mismatch`), and nothing may claim the version is qualified.
+The Release workflow (`release.yml`) runs as four jobs. Hosted runners keep
+every secret a job references in memory, grant passwordless sudo, and let any
+step of an `id-token` job mint OIDC tokens. The credential is therefore
+isolated by job, not by step:
 
-Cargo cannot upload a prebuilt `.crate`, so `cargo publish` packages again from
-the same clean tag with the same Cargo. The readback above is what proves that
-the published bytes are the accepted ones.
+1. **`gate`** has no credential (`contents: read`).
+   - It reproduces `cargo package --locked` from the tag with Cargo's full
+     verify build. Every build script and proc-macro runs here, without the
+     credential.
+   - It refuses (`approved_package_mismatch`) unless the archive's SHA-256,
+     file set, version, VCS commit, Cargo release and committed summary all
+     equal the record.
+   - It never publishes a missing version without a record
+     (`approved_package_required`).
+   - It uploads the `.crate` unarchived as a digest-bound artifact.
+2. **`publish`** is the only job with `id-token: write`, the `crates-io`
+   environment and the minted `CARGO_REGISTRY_TOKEN`.
+   - It runs no build, test or other crate code.
+   - The central handoff validator checks the artifact's ID, run and SHA-256.
+   - Before minting, it reproduces the package with `--no-verify`, which
+     neither builds nor runs build scripts. It requires that package to equal
+     the handed-off file, the artifact digest, the gate output and the approval
+     (`gated_package_mismatch`), and requires the version to still be absent.
+   - Only then is the token minted, and only `cargo publish --locked
+     --no-verify` sees it.
+   - The tagged source is package data only. Cargo is pinned with
+     `RUSTUP_TOOLCHAIN=1.86.0`, and the publisher refuses an in-repo
+     `.cargo/config*` or `rust-toolchain*`.
+3. **`verify`** has no credential. The crates.io checksum and the downloaded
+   archive must equal the approved SHA-256, and the downloaded archive must
+   match the record again. The tag must read back from `origin` as the release
+   commit. Then the fresh-consumer build runs. Any difference fails the release
+   (`published_checksum_differs_from_approved_package`,
+   `published_package_differs_from_approved_package`,
+   `source_tag_readback_mismatch`), and nothing may claim the version is
+   qualified.
+4. **`release`** creates the GitHub Release from the validated changelog
+   entry.
+
+Cargo cannot upload a prebuilt `.crate`, so `cargo publish --no-verify`
+packages again from the same clean tag with the same Cargo. The preflight
+equality before upload and the readback afterwards are what prove that the
+published bytes are the accepted ones. CI's package job also checks every
+change: the `--no-verify` repackage must equal the verify-built package.
 
 #### Path confinement
 
