@@ -50,3 +50,30 @@ crates.io version for a fresh installed consumer, with no source SDK override.
 The run retains scenario results, package provenance, image identities, consumer
 metadata and the downloaded crate's SHA-256 for 90 days. The runtime and payload
 volume are removed when the job finishes. These checks do not qualify Cloud.
+
+## Stable API documentation
+
+Normal CI documents the current source. The separate `API Documentation`
+workflow builds the latest stable public crate for the stable Pages site.
+`resolve-docs-release.py` checks crates.io's version and checksum against the
+maintained approved-package record, the public source tag, the archive's clean
+VCS identity, manifest and exact file inventory. It extracts that verified
+archive into a fresh build directory. Missing or mismatched publication evidence
+refuses the build; current SDK source is never a fallback.
+
+The maintained site navigation, assets and analytics are applied to that API
+build. `__build.json` records the package version, checksum, source revision and
+documentation tooling revision. Example links bind to the published source.
+Pull requests exercise the published build without Pages write permissions.
+
+After publishing a new stable crate and accepting its public identity, dispatch
+the existing `API Documentation` workflow on `main` once. Verify the protected
+Pages deployment, live `__build.json`, API version and representative changed
+pages before recording documentation follow-through. A source or version commit
+alone does not publish the crate or change the stable API selection.
+
+Run the focused refusal controls with:
+
+```bash
+python3 scripts/ci/test-resolve-docs-release.py
+```
