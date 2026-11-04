@@ -42,6 +42,8 @@ html = landing.read_text().replace('Stable release</strong>', f"Stable release {
 html = re.sub(r'(https://github.com/durable-workflow/sdk-rust/blob/)[^/]+(/examples/)', rf"\g<1>{identity['source_revision']}\2", html)
 landing.write_text(html)
 PY
+python3 scripts/ci/test-rustdoc-controls.py
+python3 scripts/ci/prepare-rustdoc-controls.py target/stable-docs
 python3 scripts/check-docs-analytics.py target/stable-docs
 python3 scripts/check-docs-site.py target/stable-docs
 python3 scripts/ci/validate-example-base-urls.py --root "$stable_source" --rendered-docs target/stable-docs
