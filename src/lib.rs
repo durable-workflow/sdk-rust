@@ -12068,6 +12068,7 @@ impl WorkflowState {
         if let Some(replay) = &scope_delivery {
             replay.bind_commands(&mut recorded_commands)?;
         }
+        let recorded_commands = group_condition_reopens_by_member(recorded_commands);
         let selection_markers = recorded_selection_markers(&history)?;
         let cancelled_selection_members = recorded_selection_cancellations(&history)?;
         let recorded_continue_as_new = history
@@ -17695,6 +17696,63 @@ fn recorded_commands(
     Ok(commands)
 }
 
+/// Within a run of grouped condition waits from one parallel group, move each
+/// physical reopen directly after the earlier waits of the same member.
+///
+/// Members replay in order from one shared cursor, and a member's chain reads
+/// only adjacent commands. When several members are woken in one task, the
+/// Server records their reopens after all originals (a1, b1, a2, b2), so each
+/// chain would stop at its sibling and leave reopens unconsumed (#191).
+/// Outcomes are looked up by sequence and occurrence, so only consumption order
+/// changes.
+fn group_condition_reopens_by_member(commands: Vec<RecordedCommand>) -> Vec<RecordedCommand> {
+    fn grouped_member(command: &RecordedCommand) -> Option<(String, String)> {
+        match command {
+            RecordedCommand::ConditionWait {
+                occurrence_id,
+                parallel_group_path: Some(path),
+                ..
+            } => path
+                .first()
+                .map(|entry| (entry.parallel_group_id.clone(), occurrence_id.clone())),
+            _ => None,
+        }
+    }
+    let mut ordered = Vec::with_capacity(commands.len());
+    let mut run: Vec<RecordedCommand> = Vec::new();
+    let mut run_group: Option<String> = None;
+    let flush = |run: &mut Vec<RecordedCommand>, ordered: &mut Vec<RecordedCommand>| {
+        let mut members: Vec<(String, Vec<RecordedCommand>)> = Vec::new();
+        for command in run.drain(..) {
+            let occurrence = grouped_member(&command)
+                .map(|(_, occurrence)| occurrence)
+                .unwrap_or_default();
+            match members.iter_mut().find(|(member, _)| *member == occurrence) {
+                Some((_, chain)) => chain.push(command),
+                None => members.push((occurrence, vec![command])),
+            }
+        }
+        ordered.extend(members.into_iter().flat_map(|(_, chain)| chain));
+    };
+    for command in commands {
+        match grouped_member(&command) {
+            Some((group, _)) if run_group.as_deref() == Some(group.as_str()) => run.push(command),
+            Some((group, _)) => {
+                flush(&mut run, &mut ordered);
+                run_group = Some(group);
+                run.push(command);
+            }
+            None => {
+                flush(&mut run, &mut ordered);
+                run_group = None;
+                ordered.push(command);
+            }
+        }
+    }
+    flush(&mut run, &mut ordered);
+    ordered
+}
+
 fn required_version_i32(payload: &Value, field: &str, sequence: u64) -> Result<i32> {
     payload
         .get(field)
@@ -18033,7 +18091,32 @@ fn recorded_condition_group_path(
                 && durable_event_sequence(event) == durable_event_sequence(previous)
         })
     });
-    if !identity_matches || reopened_path != original_path || !previously_satisfied {
+    // The PHP Server also accepts a grouped re-send of a member whose latest
+    // wait is still open, and records it as a new physical open without
+    // resolving the earlier one (#191). That predecessor was unresolved when
+    // this wait opened: it is a repeated open of the same logical member.
+    let previously_unresolved = previous.is_some_and(|previous| {
+        !previous_events
+            .iter()
+            .any(|event| match event.event_type.as_str() {
+                "ConditionWaitSatisfied" | "ConditionWaitTimedOut" => {
+                    event.payload.get("condition_wait_id")
+                        == previous.payload.get("condition_wait_id")
+                        && durable_event_sequence(event) == durable_event_sequence(previous)
+                }
+                "TimerFired" => {
+                    event.payload.get("timer_kind").and_then(Value::as_str)
+                        == Some("condition_timeout")
+                        && event.payload.get("condition_wait_id")
+                            == previous.payload.get("condition_wait_id")
+                }
+                _ => false,
+            })
+    });
+    if !identity_matches
+        || reopened_path != original_path
+        || !(previously_satisfied || previously_unresolved)
+    {
         return Err(invalid_recorded_history(
             "condition_wait_group_reopen_mismatch",
             sequence,
@@ -24536,6 +24619,127 @@ mod tests {
             .collect()
     }
 
+    // #191: the PHP Server 2.11.8 history for two condition members woken by
+    // one signal. It satisfies only the resume task's member (seq 2) but
+    // records a reopen of the other, still-open member (seq 3 after seq 1).
+    fn two_member_condition_history(extra_signals: &[(&str, &str)]) -> Vec<HistoryEvent> {
+        let member = |event_type: &str, seq: u64, index: u64, key: &str, at: &str| {
+            let occurrence = format!("rust:condition-wait:{index}");
+            timed_event(
+                event_type,
+                at,
+                json!({
+                    "sequence": seq,
+                    "condition_wait_id": format!("condition:{seq}"),
+                    "condition_wait_occurrence_id": occurrence,
+                    "condition_key": key,
+                    "condition_definition_fingerprint": format!("sha256:{key}-v1"),
+                    "timeout_seconds": 300,
+                    "parallel_group_id": "parallel-calls:1:2",
+                    "parallel_group_kind": "condition",
+                    "parallel_group_base_sequence": 1,
+                    "parallel_group_size": 2,
+                    "parallel_group_index": index,
+                }),
+            )
+        };
+        let mut history = vec![
+            member(
+                "ConditionWaitOpened",
+                1,
+                0,
+                "votes",
+                "2026-11-04T03:55:10.900000+00:00",
+            ),
+            member(
+                "ConditionWaitOpened",
+                2,
+                1,
+                "approvals",
+                "2026-11-04T03:55:10.901000+00:00",
+            ),
+            approval_signal("vote", "v1", "2026-11-04T03:55:13.000000+00:00"),
+            member(
+                "ConditionWaitSatisfied",
+                2,
+                1,
+                "approvals",
+                "2026-11-04T03:55:13.100000+00:00",
+            ),
+            member(
+                "ConditionWaitOpened",
+                3,
+                0,
+                "votes",
+                "2026-11-04T03:55:13.101000+00:00",
+            ),
+            member(
+                "ConditionWaitOpened",
+                4,
+                1,
+                "approvals",
+                "2026-11-04T03:55:13.102000+00:00",
+            ),
+        ];
+        for (index, (name, at)) in extra_signals.iter().enumerate() {
+            history.push(approval_signal(name, &format!("x{index}"), at));
+        }
+        history
+    }
+
+    fn poll_two_member_group(
+        history: Vec<HistoryEvent>,
+    ) -> (Poll<Result<Vec<ParallelResult>>>, Vec<Value>) {
+        let ctx = workflow_context(history);
+        let votes = ctx.clone();
+        let approvals = ctx.clone();
+        let mut group = Box::pin(ctx.parallel(vec![
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("votes", "sha256:votes-v1")
+                    .timeout(Duration::from_secs(300)),
+                move || Ok(votes.signals("vote")?.len() >= 2),
+            ),
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
+                    .timeout(Duration::from_secs(300)),
+                move || Ok(approvals.signals("approve")?.len() >= 1),
+            ),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let poll = group.as_mut().poll(&mut task_context);
+        if matches!(poll, Poll::Ready(Ok(_))) {
+            // Interleaved reopens (votes 1, approvals 2, votes 3, approvals 4)
+            // must all be consumed by their own members.
+            ctx.ensure_history_consumed()
+                .expect("every physical reopen is consumed");
+        }
+        (poll, ctx.take_commands().expect("commands"))
+    }
+
+    #[test]
+    fn two_grouped_condition_members_replay_the_servers_reopen_of_a_still_open_member() {
+        // The task after the false wake decodes and keeps both members waiting.
+        let (poll, _) = poll_two_member_group(two_member_condition_history(&[]));
+        assert!(matches!(poll, Poll::Pending), "{poll:?}");
+
+        // A second vote and an approval satisfy both members: the group completes.
+        let (poll, commands) = poll_two_member_group(two_member_condition_history(&[
+            ("vote", "2026-11-04T03:55:30.000000+00:00"),
+            ("approve", "2026-11-04T03:55:30.100000+00:00"),
+        ]));
+        let Poll::Ready(Ok(results)) = poll else {
+            panic!("both satisfied members must complete the group: {poll:?}");
+        };
+        assert_eq!(
+            results,
+            vec![
+                ParallelResult::Condition(ConditionWaitResult::Satisfied),
+                ParallelResult::Condition(ConditionWaitResult::Satisfied),
+            ]
+        );
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
     // #189: the PHP Server accepts a grouped reopen only with the authored
     // timeout, so a parallel or select member reopens with it, not with the
     // remaining time an ungrouped wait uses.
@@ -24745,21 +24949,25 @@ mod tests {
                 "reopen must reject changed {field}"
             );
         }
+        // #191: the PHP Server records a grouped re-send of a still-open member
+        // as a new physical open. A predecessor that was unresolved when the
+        // reopen opened (never resolved, or resolved only later) is the same
+        // logical member, decided by the state at that open.
         let mut unsettled = original.clone();
         unsettled.remove(2);
         assert!(
-            decode(&unsettled).is_err(),
-            "physical predecessor must be resolved"
+            decode(&unsettled).is_ok(),
+            "an unresolved predecessor is a repeated open"
+        );
+        let mut late_resolution = original.clone();
+        late_resolution.swap(2, 3);
+        assert!(
+            decode(&late_resolution).is_ok(),
+            "a predecessor resolved after the reopen was still open when it opened"
         );
         let mut timed_out = original.clone();
         timed_out[2]["event_type"] = json!("ConditionWaitTimedOut");
         assert!(decode(&timed_out).is_err(), "timeout is terminal");
-        let mut late_resolution = original.clone();
-        late_resolution.swap(2, 3);
-        assert!(
-            decode(&late_resolution).is_err(),
-            "later history cannot authorize a reopen"
-        );
     }
 
     #[test]
