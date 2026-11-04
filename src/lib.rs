@@ -5976,6 +5976,11 @@ impl ClientBuilder {
             http = http.add_root_certificate(certificate);
         }
         if self.danger_accept_invalid_certs {
+            tracing::warn!(
+                target: "durable_workflow::tls",
+                endpoint = %tls_warning_endpoint(&base_url),
+                "TLS certificate and hostname verification is disabled for this client"
+            );
             http = http.danger_accept_invalid_certs(true);
         }
         Ok(Client {
@@ -10307,6 +10312,20 @@ fn default_worker_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("rust-worker-{}-{millis}", std::process::id())
+}
+
+/// The base URL without userinfo, query or fragment, for log messages.
+fn tls_warning_endpoint(base_url: &str) -> String {
+    match reqwest::Url::parse(base_url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => "<unparseable base URL>".to_string(),
+    }
 }
 
 fn percent_encode_path_segment(segment: &str) -> String {

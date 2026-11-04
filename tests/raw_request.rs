@@ -456,3 +456,42 @@ async fn raw_requests_use_role_tokens_and_refuse_a_missing_role_credential() {
     ));
     assert!(server.requests.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn url_shaped_segments_stay_on_the_configured_origin_with_client_identity() {
+    let server = serve(vec![
+        reply("200 OK", &[], "{}"),
+        reply("200 OK", &[], "{}"),
+        reply("200 OK", &[], "{}"),
+    ])
+    .await;
+    let client = client(&server.url);
+    for segments in [
+        vec!["https://evil.example/steal"],
+        vec!["//evil.example", "x"],
+        vec!["workflows", "@evil.example"],
+    ] {
+        let response = client
+            .control_plane_request(RawRequest::get(segments))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    let captured = server.requests.lock().unwrap().clone();
+    let targets: Vec<&str> = captured.iter().map(Captured::target).collect();
+    assert_eq!(
+        targets,
+        [
+            "/api/https%3A%2F%2Fevil.example%2Fsteal",
+            "/api/%2F%2Fevil.example/x",
+            "/api/workflows/%40evil.example",
+        ]
+    );
+    for request in &captured {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer control-secret")
+        );
+        assert_eq!(request.header("x-namespace"), Some("orders"));
+    }
+}

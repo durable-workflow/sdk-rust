@@ -234,3 +234,68 @@ async fn certificate_verification_is_on_by_default_and_only_an_explicit_opt_out_
     assert_eq!(insecure.health().await.unwrap()["status"], "ok");
     assert_eq!(*server.requests.lock().unwrap(), ["/api/health"]);
 }
+
+/// Records warn-level events from the SDK's TLS target.
+#[derive(Default)]
+struct WarningLog(Mutex<Vec<String>>);
+
+struct FieldText<'a>(&'a mut String);
+
+impl tracing::field::Visit for FieldText<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={:?};", field.name(), value));
+    }
+}
+
+impl tracing::Subscriber for WarningLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let metadata = event.metadata();
+        if *metadata.level() == tracing::Level::WARN && metadata.target() == "durable_workflow::tls"
+        {
+            let mut text = String::new();
+            event.record(&mut FieldText(&mut text));
+            self.0.lock().unwrap().push(text);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn disabling_verification_warns_once_with_the_endpoint_and_no_credentials() {
+    let log = Arc::new(WarningLog::default());
+    tracing::subscriber::with_default(log.clone(), || {
+        Client::builder("https://operator:hunter2@workflow.internal:8443/base?x=1")
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        Client::builder("https://verified.internal")
+            .build()
+            .unwrap();
+        Client::builder("https://verified.internal")
+            .danger_accept_invalid_certs(false)
+            .build()
+            .unwrap();
+    });
+    let warnings = log.0.lock().unwrap().clone();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("endpoint=https://workflow.internal:8443/base"),
+        "{}",
+        warnings[0]
+    );
+    assert!(
+        warnings[0].contains("verification is disabled"),
+        "{}",
+        warnings[0]
+    );
+    assert!(!warnings[0].contains("hunter2") && !warnings[0].contains("operator"));
+}
