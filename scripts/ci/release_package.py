@@ -286,7 +286,7 @@ def verify_archive(
     _archive_files(archive_path, f"{source['package']}-{source['package_version']}")
     # One no-follow read: the checksum and the inspected members come from the
     # same bytes.
-    archive_bytes = _read_regular_no_follow(archive_path, "crate archive")
+    archive_bytes = _read_regular_no_follow(archive_path, CRATE_ARCHIVE)
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             root = f"{source['package']}-{source['package_version']}"
@@ -357,7 +357,7 @@ def restore_missing_lockfile(
         or identity["archive"]["sha256"] != expected_archive_sha256
     ):
         raise ReleasePackageError("registry archive checksum differs from expected SHA-256")
-    archive_bytes = _read_regular_no_follow(archive_path, "crate archive")
+    archive_bytes = _read_regular_no_follow(archive_path, CRATE_ARCHIVE)
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             member = _regular_member(
@@ -559,11 +559,23 @@ def parse_approval(raw: bytes) -> tuple[dict[str, Any], str]:
     return approval, sha256(raw)
 
 
+CRATE_ARCHIVE = "crate archive"
+
+
 def _read_regular_no_follow(path: Path, what: str = "approved package record") -> bytes:
+    """Read one regular file without following a link at its last component.
+
+    Callers pass only paths already confined under their explicit trust root
+    (confined_file under --archive-root or the approvals repository, which also
+    refuses links below the root), so this is the final read of a confined path.
+    """
+    # S8707 (both NOSONAR lines): the path is a CLI argument, but every caller
+    # confines it under its explicit root first (confined_root/confined_file);
+    # lstat and O_NOFOLLOW refuse a final link and fstat requires a regular file.
     try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
+        if not stat.S_ISREG(os.lstat(path).st_mode):  # NOSONAR
             raise ReleasePackageError(f"{what} is not a regular file")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))  # NOSONAR
     except OSError as error:
         raise ReleasePackageError(f"could not open {what}: {error.strerror}") from error
     with os.fdopen(descriptor, "rb") as handle:
@@ -703,7 +715,7 @@ def _archive_files(archive_path: Path, root: str) -> list[str]:
     prefix = f"{root}/"
     # Read the confined crate as a regular file without following links, then
     # list its members from memory; nothing is ever extracted.
-    data = _read_regular_no_follow(archive_path, "crate archive")
+    data = _read_regular_no_follow(archive_path, CRATE_ARCHIVE)
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
             members = archive.getmembers()
