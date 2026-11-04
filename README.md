@@ -393,6 +393,37 @@ Keep workflow command order deterministic:
 See the runnable [`workflow_testing`](examples/workflow_testing.rs) example and
 [`workflow_testing` tests](tests/workflow_testing.rs).
 
+## Inspect a run's activities
+
+Use `Client::get_run_activities(workflow_id, run_id)` next to the selected run's
+description to inspect its activities, attempts and last heartbeat:
+
+```rust,no_run
+# async fn inspect(client: durable_workflow::Client) -> durable_workflow::Result<()> {
+let description = client.describe_workflow_run("workflow-id", "run-id").await?;
+let view = client.get_run_activities("workflow-id", "run-id").await?;
+println!("run status: {}", description.status.as_deref().unwrap_or("unavailable"));
+for activity in view.activities {
+    println!(
+        "activity {:?}: status {:?}, attempts {:?}, last heartbeat {:?}",
+        activity.activity_type,
+        activity.status,
+        activity.attempt_count,
+        activity.last_heartbeat_at,
+    );
+}
+# Ok(())
+# }
+```
+
+The result belongs to that exact run in the client's namespace. Optional
+metadata stays `None` when unavailable; zero attempts and `false` flags remain
+explicit values. An omitted attempt list is distinct from an empty list.
+Unsupported, diagnostic and future status strings are preserved, and unknown
+response fields remain in each model's `raw` map. Heartbeat progress retains its
+structured JSON types. Attempt flags describe the received snapshot and do not
+grant worker authority. This read does not fetch or decode workflow payloads.
+
 ## Workflow lists and complete run history
 
 `Client::list_workflows(WorkflowListOptions)` and

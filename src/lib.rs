@@ -17,6 +17,7 @@ mod nexus;
 pub mod pagination;
 mod query_authority;
 mod raw_request;
+mod run_activities;
 mod runtime_payloads;
 mod runtime_uploads;
 mod sticky_worker;
@@ -47,6 +48,9 @@ pub use cancellation_scope_history::{
 #[doc(hidden)]
 pub use cancellation_scope_replay::CancellationScopeRequested;
 pub use failure_reporting::FailureReportError;
+pub use run_activities::{
+    WorkflowActivity, WorkflowActivityAttempt, WorkflowActivityList, WorkflowActivityMetadataError,
+};
 
 pub use cooperative_cancellation::{
     CancellationCallKind, CancellationDelivery, CancellationDeliveryReceipt,
@@ -287,6 +291,8 @@ pub enum Error {
     Testing(#[from] testing::TestingError),
     #[error(transparent)]
     Pagination(#[from] pagination::PaginationError),
+    #[error(transparent)]
+    WorkflowActivityMetadata(#[from] WorkflowActivityMetadataError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("http {status}: {body}")]

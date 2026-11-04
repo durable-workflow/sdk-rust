@@ -1,0 +1,61 @@
+{
+  "workflow_id": "workflow/one",
+  "run_id": "run?one",
+  "activities": [
+    {
+      "id": "execution-1",
+      "idempotency_key": "business-key",
+      "sequence": 4,
+      "type": "invoice",
+      "class": "InvoiceActivity",
+      "execution_mode": "remote",
+      "local_activity": false,
+      "history_authority": "typed_history",
+      "diagnostic_only": false,
+      "history_event_types": ["ActivityScheduled", "ActivityStarted", "ActivityHeartbeatRecorded"],
+      "history_unsupported_reason": null,
+      "row_status": "running",
+      "attempt_id": "attempt-2",
+      "worker_attempt_id": "worker-attempt",
+      "status": "running",
+      "attempt_count": 2,
+      "retry_policy": {"snapshot_version": 1, "backoff_seconds": [0]},
+      "connection": "default",
+      "queue": "invoices",
+      "last_heartbeat_at": "2026-11-04T12:00:05Z",
+      "last_heartbeat_progress": {"details": {"part": 3}},
+      "created_at": "2026-11-04T11:59:00Z",
+      "started_at": "2026-11-04T12:00:00Z",
+      "closed_at": null,
+      "parallel_group_kind": "all",
+      "parallel_group_id": "group-1",
+      "parallel_group_base_sequence": 3,
+      "parallel_group_size": 2,
+      "parallel_group_index": 1,
+      "parallel_group_path": [{"group_id": "group-1", "index": 1}],
+      "reused_from_run_id": "old-run",
+      "reused_activity_execution_id": "old-execution",
+      "reused_recorded_at": "2026-11-03T12:00:00Z",
+      "attempts": [
+        {
+          "id": "attempt-2",
+          "worker_attempt_id": "worker-attempt",
+          "attempt_number": 2,
+          "status": "running",
+          "task_id": "task-2",
+          "lease_owner": "worker-1",
+          "lease_expires_at": "2026-11-04T12:00:30Z",
+          "started_at": "2026-11-04T12:00:00Z",
+          "last_heartbeat_at": "2026-11-04T12:00:05Z",
+          "last_heartbeat_progress": {"details": {"part": 3}},
+          "closed_at": null,
+          "can_continue": true,
+          "cancel_requested": false,
+          "stop_reason": null,
+          "failure_reason": null
+        }
+      ],
+      "future_metadata": {"preserve": [true, null]}
+    }
+  ]
+}
