@@ -4,6 +4,8 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 
 
@@ -63,6 +65,26 @@ class BackControls(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "runtime once"):
                 controls.prepare(self.root)
             self.assertEqual((self.root / "help.html").read_text(), self.html)
+
+    def test_symlink_control_cannot_redirect_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rustdoc-outside-") as scratch:
+            outside = Path(scratch) / "settings.html"
+            outside.write_text(self.html)
+            target = self.root / "settings.html"
+            target.unlink()
+            target.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                controls.prepare(self.root)
+            self.assertEqual(outside.read_text(), self.html)
+            self.assertEqual((self.root / "help.html").read_text(), self.html)
+
+    def test_command_line_rejects_arbitrary_output_directories(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("prepare-rustdoc-controls.py")), str(self.root)],
+            capture_output=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.root / "help.html").read_text(), self.html)
 
 
 if __name__ == "__main__":

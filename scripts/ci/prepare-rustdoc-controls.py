@@ -10,16 +10,28 @@ SAFE_CONTROL = '<a id="back" href="./durable_workflow/index.html" data-rustdoc-h
 NAVIGATION = '<script type="module" src="/navigation.js"></script>'
 
 
+def regular_input(root: Path, relative: str) -> Path:
+    candidate = root / relative
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"rustdoc input must be a regular file: {relative}")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"rustdoc input escapes the output directory: {relative}")
+    return resolved
+
+
 def prepare(root: Path) -> int:
-    if not (root / "durable_workflow/index.html").is_file():
-        raise ValueError("rustdoc back-control fallback is missing")
-    runtime = root / "navigation.js"
-    if not runtime.is_file() or "data-rustdoc-history-back" not in runtime.read_text(encoding="utf-8"):
+    if root.is_symlink():
+        raise ValueError("rustdoc output directory must not be a symlink")
+    root = root.resolve(strict=True)
+    regular_input(root, "durable_workflow/index.html")
+    runtime = regular_input(root, "navigation.js")
+    if "data-rustdoc-history-back" not in runtime.read_text(encoding="utf-8"):
         raise ValueError("external rustdoc history-back listener is missing")
 
     updates: list[tuple[Path, bytes]] = []
     for name in ("help.html", "settings.html"):
-        target = root / name
+        target = regular_input(root, name)
         html = target.read_bytes().decode("utf-8")
         if html.count(NAVIGATION) != 1:
             raise ValueError(f"{name} must load the external navigation runtime once")
@@ -35,5 +47,13 @@ def prepare(root: Path) -> int:
 
 
 if __name__ == "__main__":
-    changed = prepare(Path(sys.argv[1] if len(sys.argv) > 1 else "target/doc"))
+    if not sys.argv[1:]:
+        output = Path("target/doc")
+    elif sys.argv[1:] == ["--stable"]:
+        output = Path("target/stable-docs")
+    else:
+        raise SystemExit("Usage: prepare-rustdoc-controls.py [--stable]")
+    if not output.resolve(strict=True).is_relative_to(Path.cwd().resolve() / "target"):
+        raise SystemExit("rustdoc output must stay inside the checkout's target directory")
+    changed = prepare(output)
     print(f"Prepared CSP-safe rustdoc back controls in {changed} pages.")
