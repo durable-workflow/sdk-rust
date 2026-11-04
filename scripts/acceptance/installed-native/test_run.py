@@ -45,7 +45,7 @@ class FakeDocker:
     the call raises, e.g. an inspect or remove that times out.
     """
 
-    def __init__(self, containers=None, networks=None, faults=None, created=None, raise_on=None):
+    def __init__(self, containers=None, networks=None, faults=None, created=None, raise_on=None, owners=None):
         self.commands = []
         self.containers = dict(containers or {})
         self.networks = dict(networks or {})
@@ -53,6 +53,7 @@ class FakeDocker:
         # Side effect of a foreground run, e.g. writing the binary; a returned string is its stdout.
         self.created = created
         self.raise_on = dict(raise_on or {})
+        self.owners = dict(owners or {})
 
     def __call__(self, command, timeout=120, check=True, **kwargs):
         command = list(command)
@@ -72,7 +73,10 @@ class FakeDocker:
             if command[-1] not in table:
                 return self._result(done(command, 1, stderr='No such object'), check)
             object_id, label = table[command[-1]]
-            return done(command, stdout='%s %s\n' % (object_id, label if label is not None else '<no value>'))
+            text = '%s %s' % (object_id, label if label is not None else '<no value>')
+            if run.OWNER_LABEL in command[-2]:
+                text += ' ' + str(self.owners.get(command[-1], 'general'))
+            return done(command, stdout=text + '\n')
         if command[:2] == ['docker', 'run']:
             name = command[command.index('--name') + 1]
             result = self._create(self.containers, name, command, timeout, check)
@@ -101,6 +105,7 @@ class FakeDocker:
             raise subprocess.TimeoutExpired(command, timeout)
         labels = [command[i + 1] for i, a in enumerate(command) if a == '--label']
         token = next((v.split('=', 1)[1] for v in labels if v.startswith(run.RUN_LABEL + '=')), None)
+        self.owners[name] = next((v.split('=', 1)[1] for v in labels if v.startswith(run.OWNER_LABEL + '=')), None)
         table[name] = ('id-' + name, token)
         if fault == 'created-then-timeout':
             raise subprocess.TimeoutExpired(command, timeout)
@@ -478,7 +483,9 @@ class CleanupStepsAreIndependent(HarnessRun):
         docker = self.run_with({(INSPECT, self.runtime): TIMEOUT})
         self.assertEqual(docker.removals(), [['docker', 'rm', '-f', 'id-' + self.proxy],
                                              ['docker', 'network', 'rm', 'id-' + self.cell.task]])
-        self.assertEqual(self.errors(), [('container-inspect', self.runtime, 'TimeoutExpired')])
+        self.assertEqual(self.errors(), [('container-inspect', self.runtime, 'TimeoutExpired'),
+                                         ('evidence-fence', 'lifecycle', 'RuntimeError')])
+        self.assertFalse(self.cell.dir.exists())
 
     def test_logs_failure(self):
         docker = self.run_with({(LOGS, 'id-' + self.runtime): TIMEOUT})
@@ -493,7 +500,9 @@ class CleanupStepsAreIndependent(HarnessRun):
                                              ['docker', 'rm', '-f', 'id-' + self.runtime],
                                              ['docker', 'network', 'rm', 'id-' + self.cell.task]])
         self.assertEqual(docker.containers, {self.proxy: ('id-' + self.proxy, TOKEN)})
-        self.assertEqual(self.errors(), [('container-remove', self.proxy, 'RuntimeError')])
+        self.assertEqual(self.errors(), [('container-remove', self.proxy, 'RuntimeError'),
+                                         ('evidence-fence', 'lifecycle', 'RuntimeError')])
+        self.assertFalse(self.cell.dir.exists())
 
     def test_network_remove_failure(self):
         self.run_with({(NETWORK_REMOVE, None): TIMEOUT})
@@ -508,7 +517,9 @@ class CleanupStepsAreIndependent(HarnessRun):
         self.assertEqual(docker.removals(), [])
         self.assertEqual(self.errors(), [('container-inspect', self.runtime, 'TimeoutExpired'),
                                          ('container-inspect', self.proxy, 'TimeoutExpired'),
-                                         ('network-cleanup', self.cell.task, 'TimeoutExpired')])
+                                         ('network-cleanup', self.cell.task, 'TimeoutExpired'),
+                                         ('evidence-fence', 'lifecycle', 'RuntimeError')])
+        self.assertFalse(self.cell.dir.exists())
 
     def test_clean_run_records_no_errors(self):
         self.run_with({})

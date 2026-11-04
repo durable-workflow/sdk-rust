@@ -6,6 +6,7 @@ import json
 import pathlib
 import subprocess
 import shutil
+import socket
 import time
 import tempfile
 import unittest
@@ -341,6 +342,136 @@ class CellLifetime(unittest.TestCase):
             self.cell.run()
         self.assertFalse(self.cell.dir.exists())
         self.assertTrue(any(e['step'] == 'credential-output' for e in self.harness.cleanup_errors))
+
+    def test_fifo_socket_and_hard_link_fail_and_purge_without_touching_foreign_files(self):
+        for kind in ('fifo', 'socket', 'hard-link'):
+            with self.subTest(kind=kind):
+                root = pathlib.Path(self.tmp.name) / kind
+                fixture = root / 'fixture'
+                write_binary(fixture)(None)
+                cell = run.Cell(args(), 'lifecycle', root, {'executed_manifest': 'img'}, fixture, self.harness)
+                foreign = root / 'foreign'
+                foreign.write_text('keep')
+                sockets = []
+
+                def create(command):
+                    if command[command.index('--name') + 1].endswith('-runtime'):
+                        artifact = cell.state / 'unexpected'
+                        if kind == 'fifo':
+                            os.mkfifo(artifact)
+                        elif kind == 'socket':
+                            handle = socket.socket(socket.AF_UNIX)
+                            sockets.append(handle)
+                            handle.bind(str(artifact))
+                        else:
+                            os.link(foreign, artifact)
+
+                docker = FakeDocker(created=create, faults={cell.task + '-proxy': 'created-then-error'})
+                try:
+                    with mock.patch.object(run, 'call', docker), self.assertRaises(RuntimeError):
+                        cell.run()
+                    self.assertFalse(cell.dir.exists())
+                    self.assertEqual(foreign.read_text(), 'keep')
+                    self.assertEqual(foreign.stat().st_nlink, 1)
+                finally:
+                    for handle in sockets:
+                        handle.close()
+
+    def test_normal_cleanup_refuses_symlinked_cell_root_and_only_unlinks_it(self):
+        foreign = pathlib.Path(self.tmp.name) / 'foreign'
+        (foreign / 'state/database').mkdir(parents=True)
+        marker = foreign / 'state/database/keep'
+        marker.write_text('untouched')
+        (foreign / 'logs').mkdir()
+        log_marker = foreign / 'logs/keep'
+        log_marker.write_text('untouched log')
+
+        def create(command):
+            if command[command.index('--name') + 1].endswith('-runtime'):
+                shutil.rmtree(self.cell.dir)
+                self.cell.dir.symlink_to(foreign)
+
+        docker = FakeDocker(created=create, faults={self.cell.task + '-proxy': 'created-then-error'})
+        with mock.patch.object(run, 'call', docker), self.assertRaises(RuntimeError):
+            self.cell.run()
+        self.assertFalse(os.path.lexists(self.cell.dir))
+        self.assertEqual(marker.read_text(), 'untouched')
+        self.assertEqual(log_marker.read_text(), 'untouched log')
+        self.assertEqual([p.name for p in (foreign / 'logs').iterdir()], ['keep'])
+
+    def test_known_report_fifo_is_refused_before_any_read_can_block(self):
+        self.cell.state.mkdir(parents=True)
+        report = self.cell.state / 'driver.json'
+        os.mkfifo(report)
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'nonregular'):
+            self.cell.artifact_bytes(report)
+        self.assertLess(time.monotonic() - started, 1)
+
+    def test_replacement_race_cannot_redirect_redaction_to_foreign_file(self):
+        foreign = pathlib.Path(self.tmp.name) / 'foreign'
+        foreign.write_text('untouched')
+        artifact = self.cell.state / 'report.stdout'
+
+        def create(command):
+            if command[command.index('--name') + 1].endswith('-runtime'):
+                artifact.write_text(self.cell.token)
+
+        original = self.cell.evidence
+
+        def evidence(data, label):
+            clean = original(data, label)
+            if label == 'artifact' and self.cell.token.encode() in data:
+                artifact.unlink()
+                artifact.symlink_to(foreign)
+            return clean
+
+        docker = FakeDocker(created=create, faults={self.cell.task + '-proxy': 'created-then-error'})
+        with mock.patch.object(run, 'call', docker), mock.patch.object(self.cell, 'evidence', evidence), \
+                self.assertRaises(RuntimeError):
+            self.cell.run()
+        self.assertEqual(foreign.read_text(), 'untouched')
+        self.assertFalse(self.cell.dir.exists())
+
+    def test_surviving_writer_prevents_retained_scan_and_forces_purge(self):
+        runtime = self.cell.task + '-runtime'
+        docker = FakeDocker(faults={self.cell.task + '-proxy': 'created-then-error'},
+                            raise_on={(('docker', 'rm', '-f'), 'id-' + runtime): RuntimeError('remove failed')})
+        with mock.patch.object(run, 'call', docker), mock.patch.object(self.cell, 'fence_artifacts') as fence, \
+                self.assertRaises(RuntimeError):
+            self.cell.run()
+        fence.assert_not_called()
+        self.assertIn(runtime, docker.containers)
+        self.assertFalse(self.cell.dir.exists())
+        self.assertTrue(self.harness.cleanup_errors)
+
+    def test_unreadable_walk_entry_fails_and_purges(self):
+        def denied(root, **kwargs):
+            kwargs['onerror'](PermissionError('denied'))
+            return iter(())
+        docker = FakeDocker(faults={self.cell.task + '-proxy': 'created-then-error'})
+        with mock.patch.object(run, 'call', docker), mock.patch.object(run.os, 'walk', denied), \
+                self.assertRaises(RuntimeError):
+            self.cell.run()
+        self.assertFalse(self.cell.dir.exists())
+        self.assertTrue(any(e['step'] == 'evidence-fence' for e in self.harness.cleanup_errors))
+
+    def test_same_token_wrong_owner_container_is_never_logged_or_removed(self):
+        name = self.cell.task + '-proxy'
+        docker = FakeDocker(containers={name: ('foreign-id', self.harness.token)}, owners={name: 'other'})
+        with mock.patch.object(run, 'call', docker), self.assertRaises(RuntimeError):
+            self.cell.run()
+        self.assertIn(name, docker.containers)
+        self.assertFalse(any(c[-1] == 'foreign-id' for c, _ in docker.commands
+                             if c[:2] == ['docker', 'logs'] or c[:3] == ['docker', 'rm', '-f']))
+
+    def test_same_token_wrong_owner_network_is_never_removed(self):
+        name = self.cell.task
+        docker = FakeDocker(networks={name: ('foreign-network', self.harness.token)}, owners={name: 'other'})
+        with mock.patch.object(run, 'call', docker), self.assertRaises(RuntimeError):
+            self.cell.run()
+        self.assertIn(name, docker.networks)
+        self.assertNotIn(['docker', 'network', 'rm', 'foreign-network'], docker.removals())
 
 
 class RecoveryDocker(FakeDocker):

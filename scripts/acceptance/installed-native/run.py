@@ -8,6 +8,7 @@ clean source commit. Nothing here contacts Cloud. See README.md for usage.
 """
 import argparse
 import base64
+import contextlib
 import datetime
 import hashlib
 import io
@@ -17,6 +18,7 @@ import pathlib
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -106,12 +108,17 @@ class Run:
 
 
 def owned_id(kind, name, run):
-    """The ID of container/network `name` if it carries this run's token, else None."""
+    """The ID only when both this run's token and owner labels match."""
+    labels = 'Config.Labels' if kind == 'container' else 'Labels'
     result = call(['docker', kind, 'inspect', '--format',
-                   '{{.Id}} {{index .%s "%s"}}' % ('Config.Labels' if kind == 'container' else 'Labels', RUN_LABEL),
+                   '{{.Id}} {{index .%s "%s"}} {{index .%s "%s"}}' % (labels, RUN_LABEL, labels, OWNER_LABEL),
                    name], check=False)
-    fields = result.stdout.split() if result.returncode == 0 else []
-    if len(fields) == 2 and fields[1] == run.token:
+    if result.returncode:
+        if any(missing in result.stderr.lower() for missing in ('no such object', 'no such container', 'no such network')):
+            return None
+        raise RuntimeError('Docker ownership query failed')
+    fields = result.stdout.split()
+    if len(fields) == 3 and fields[1:] == [run.token, run.prefix]:
         return fields[0]
     return None
 
@@ -767,6 +774,7 @@ def crate_provenance(args, fixture):
 class Cell:
     def __init__(self, args, name, root, server, fixture, run):
         self.args, self.name, self.server, self.fixture, self.harness_run = args, name, server, fixture, run
+        self.root = root
         self.dir = root / 'cells' / name
         self.state = self.dir / 'state'
         self.task = '%s-%s' % (run.base, name)
@@ -777,11 +785,47 @@ class Cell:
         self.harness_run.secret_values.extend((self.token, self.server_key))
         self.image_commands = {}
 
+    def cell_path(self, relative=''):
+        return confined_child(self.root, 'cells/' + self.name + ('/' + relative if relative else ''))
+
+    def purge_evidence(self):
+        # Refuse a redirected parent; unlink a redirected Cell root itself
+        # rather than traversing or removing its foreign target.
+        parent = confined_child(self.root, 'cells')
+        path = parent / self.name
+        if path.is_symlink():
+            path.unlink()
+        else:
+            remove_tree(self.cell_path())
+
     def evidence(self, data, label):
         clean, leaked = redact_credentials(data, (self.token, self.server_key))
         if leaked:
             credential_output(self.harness_run, self.name + '/' + label)
         return clean
+
+    @contextlib.contextmanager
+    def artifact_file(self, path, writable=False):
+        path = self.cell_path(path.relative_to(self.dir).as_posix())
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeError('refusing nonregular or linked Cell evidence')
+        descriptor = os.open(path, (os.O_RDWR if writable else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'r+b' if writable else 'rb') as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise RuntimeError('Cell evidence changed during validation')
+            yield handle
+            after = os.fstat(handle.fileno())
+            if not stat.S_ISREG(after.st_mode) or after.st_nlink != 1:
+                raise RuntimeError('Cell evidence changed during validation')
+
+    def artifact_bytes(self, path):
+        with self.artifact_file(path) as handle:
+            raw = handle.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024:
+            raise RuntimeError('Cell evidence exceeds the bounded artifact size')
+        return raw
 
     def fence_artifacts(self):
         """After writers stop, sanitize every retained Cell artifact or fail closed.
@@ -789,9 +833,17 @@ class Cell:
         JSON is normalized before scanning, so escaped credential characters
         cannot survive as a reusable structured value. Never follow a symlink.
         """
+        self.cell_path()  # Refuse a symlinked root before walking it.
         if not self.dir.exists():
             return
-        for path in self.dir.rglob('*'):
+        if not stat.S_ISDIR(self.dir.lstat().st_mode):
+            raise RuntimeError('Cell evidence root is not a real directory')
+        def unreadable(error):
+            raise RuntimeError('unreadable Cell evidence directory') from None
+        paths = (pathlib.Path(parent) / name
+                 for parent, directories, files in os.walk(self.dir, followlinks=False, onerror=unreadable)
+                 for name in directories + files)
+        for path in paths:
             _, named_secret = redact_credentials(path.relative_to(self.dir).as_posix().encode(),
                                                  (self.token, self.server_key))
             if named_secret:
@@ -799,24 +851,32 @@ class Cell:
                 raise RuntimeError('credential-bearing artifact name')
             if path.is_symlink():
                 raise RuntimeError('refusing symlinked Cell evidence')
-            if not path.is_file():
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
                 continue
-            path = confined_child(self.dir, path.relative_to(self.dir).as_posix())
-            if path.stat().st_size > 8 * 1024 * 1024:
-                raise RuntimeError('Cell evidence exceeds the bounded artifact size')
-            raw = path.read_bytes()
-            normalized = raw
-            try:
-                if path.suffix == '.json':
-                    normalized = json.dumps(json.loads(raw), ensure_ascii=False).encode()
-                elif path.suffix == '.jsonl':
-                    normalized = ('\n'.join(json.dumps(json.loads(line), ensure_ascii=False)
-                                            for line in raw.splitlines() if line) + '\n').encode()
-            except (ValueError, UnicodeError):
-                raise RuntimeError('malformed structured Cell evidence') from None
-            clean = self.evidence(normalized, 'artifact')
-            if clean != normalized:
-                path.write_bytes(clean)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise RuntimeError('refusing nonregular or linked Cell evidence')
+            with self.artifact_file(path, writable=True) as handle:
+                raw = handle.read(8 * 1024 * 1024 + 1)
+                if len(raw) > 8 * 1024 * 1024:
+                    raise RuntimeError('Cell evidence exceeds the bounded artifact size')
+                normalized = raw
+                try:
+                    if path.suffix == '.json':
+                        normalized = json.dumps(json.loads(raw), ensure_ascii=False).encode()
+                    elif path.suffix == '.jsonl':
+                        normalized = ('\n'.join(json.dumps(json.loads(line), ensure_ascii=False)
+                                                for line in raw.splitlines() if line) + '\n').encode()
+                except (ValueError, UnicodeError):
+                    raise RuntimeError('malformed structured Cell evidence') from None
+                clean = self.evidence(normalized, 'artifact')
+                if clean != normalized:
+                    if os.fstat(handle.fileno()).st_nlink != 1:
+                        raise RuntimeError('Cell evidence changed before redaction')
+                    handle.seek(0)
+                    handle.write(clean)
+                    handle.truncate()
+                    handle.flush()
 
     def launch(self, line, name, image, command, user, credentials):
         """Preserve the image entrypoint under a client-independent supervisor.
@@ -961,7 +1021,7 @@ class Cell:
         # All state setup is inside the protected region: a partial setup (say,
         # database/ created and storage/ failing) is still removed and verified.
         try:
-            self.state.mkdir(parents=True)
+            self.cell_path('state').mkdir(parents=True)
             for path in [self.dir, self.state]:
                 path.chmod(0o777)
             for sub in ['database', 'storage']:
@@ -1001,9 +1061,9 @@ class Cell:
             history_exit = int(call(['docker', 'wait', checker], timeout=120).stdout.strip())
             worker_running = call(['docker', 'inspect', '--format', '{{.State.Running}}', worker]).stdout.strip() == 'true'
             read = lambda name: json.loads(self.evidence(
-                json.dumps(json.loads((self.state / name).read_text())).encode(), 'structured')) if (self.state / name).exists() else None
+                json.dumps(json.loads(self.artifact_bytes(self.state / name))).encode(), 'structured')) if os.path.lexists(self.state / name) else None
             acks = [json.loads(self.evidence(json.dumps(json.loads(l)).encode(), 'structured'))
-                    for l in (self.state / 'acks.jsonl').read_text().splitlines()] if (self.state / 'acks.jsonl').exists() else []
+                    for l in self.artifact_bytes(self.state / 'acks.jsonl').splitlines()] if os.path.lexists(self.state / 'acks.jsonl') else []
             result = {'cell': self.name, 'deadline_unix': self.deadline,
                       'kill_after_seconds': CELL_KILL_AFTER_SECONDS,
                       'cluster_info': {k: cluster.get(k) for k in
@@ -1021,18 +1081,21 @@ class Cell:
                 raise RuntimeError('Cell failed with credential-bearing diagnostics') from None
             raise
         finally:
+            writers_stopped = False
             try:
-                self.remove_docker_objects()
+                writers_stopped = self.remove_docker_objects()
             finally:
                 # Local credential and state cleanup always runs, whatever Docker did.
                 self.remove_local_state(credentials)
                 try:
+                    if not writers_stopped:
+                        raise RuntimeError('Cell writer cleanup is uncertain')
                     self.fence_artifacts()
                 except Exception as error:
                     self.harness_run.cleanup_errors.append({
                         'step': 'evidence-fence', 'object': self.name, 'error': type(error).__name__})
                     # Unreadable/unsafe artifacts cannot be certified clean.
-                    self.harness_run.best_effort('evidence-purge', self.name, remove_tree, self.dir)
+                    self.harness_run.best_effort('evidence-purge', self.name, self.purge_evidence)
                     if os.path.lexists(self.dir):
                         self.harness_run.local_leftovers.append(self.name + '/evidence')
                 if result is not None and self.harness_run.cleanup_errors:
@@ -1046,7 +1109,8 @@ class Cell:
         paths = [('credentials.json', credentials, lambda path: path.unlink(missing_ok=True))]
         paths += [(sub, self.state / sub, remove_tree) for sub in ('database', 'storage')]
         for label, path, remove in paths:
-            run.best_effort('local-remove', '%s/%s' % (self.name, label), remove, path)
+            run.best_effort('local-remove', '%s/%s' % (self.name, label), lambda: remove(
+                self.cell_path(path.relative_to(self.dir).as_posix())))
         for label, path, _ in paths:
             label = '%s/%s' % (self.name, label)
             if os.path.lexists(path):
@@ -1058,7 +1122,8 @@ class Cell:
         skips the others. Only objects carrying this run's token are logged and
         removed, by ID; failures are recorded on the run."""
         run, logs = self.harness_run, self.dir / 'logs'
-        run.best_effort('logs-dir', self.task, logs.mkdir, exist_ok=True)
+        errors_before = len(run.cleanup_errors)
+        run.best_effort('logs-dir', self.task, lambda: self.cell_path('logs').mkdir(exist_ok=True))
         owned = [(name, run.best_effort('container-inspect', name, owned_id, 'container', name, run))
                  for name in self.containers]
         for name, container_id in owned:
@@ -1068,11 +1133,14 @@ class Cell:
             if container_id:
                 run.best_effort('container-remove', name, call, ['docker', 'rm', '-f', container_id])
         run.best_effort('network-cleanup', self.task, remove_owned_network, self.task, run)
+        return not any(e['step'] in ('container-inspect', 'container-remove')
+                       for e in run.cleanup_errors[errors_before:])
 
     def save_logs(self, logs, name, container_id):
         out = call(['docker', 'logs', '--tail', '300', container_id], check=False)
-        (logs / (name.removeprefix(self.task + '-') + '.stdout')).write_bytes(self.evidence(out.stdout.encode(), 'logs'))
-        (logs / (name.removeprefix(self.task + '-') + '.stderr')).write_bytes(self.evidence(out.stderr.encode(), 'logs'))
+        stem = name.removeprefix(self.task + '-')
+        self.cell_path('logs/' + stem + '.stdout').write_bytes(self.evidence(out.stdout.encode(), 'logs'))
+        self.cell_path('logs/' + stem + '.stderr').write_bytes(self.evidence(out.stderr.encode(), 'logs'))
 
 
 def harness_identity(args):

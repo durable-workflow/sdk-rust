@@ -268,7 +268,7 @@ state, even when the run fails. Each cell creates its network and containers
 inside the cleanup-protected region. It records each container name before running `docker run`, because
 the daemon can create a container (or network) even when the client then times
 out or errors. Cleanup inspects each recorded name, then logs and removes the
-object by ID only when its run label equals this invocation's token. A name
+object by ID only when both its run and owner labels match this invocation. A name
 collision or a failed create never touches anyone else's object.
 
 Each cell creates `state/`, `database/` and `storage/` inside the
@@ -360,9 +360,12 @@ command supplements the independent lifetime; it is not required to stop
 credentialed processes.
 
 Normal completion fences saved stdout/stderr before writing them. After the
-writers stop, it also scans every retained Cell artifact and normalizes JSON
-before exact-value scanning. Token/key output is redacted and makes acceptance
-fail; unreadable or unsafe artifacts are purged. The final summary has the
+writers stop, it scans every retained Cell artifact and normalizes JSON before
+exact-value scanning. Only real directories and regular single-link files are
+accepted. File reads and redaction use a validated no-follow descriptor;
+unreadable directories also fail closed. Token/key output is redacted and makes
+acceptance fail. Unsafe evidence or uncertain writer cleanup purges the complete
+Cell tree. The final summary has the
 same exact-value fence before serialization. A redacted credential incident
 can never produce an approved-package record.
 
