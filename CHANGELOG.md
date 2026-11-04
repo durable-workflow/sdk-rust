@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- A `wait_condition` timeout now runs from the first time the wait opens
+  (#187, parity with sdk-php#269). The Server wakes an open condition wait on
+  any signal and records it satisfied. When the predicate was still false, the
+  worker reopened the wait with the full `timeout_seconds`, so each
+  non-matching signal pushed the deadline back. The worker now reopens with
+  the time remaining since the first `ConditionWaitOpened`, rounded up to whole
+  seconds and never below zero; a reopen after the deadline opens with a zero
+  timeout so the Server resolves it as timed out. Histories whose reopens
+  carry the full timeout still replay, and a reopen longer than the authored
+  timeout is still refused. This needs no Server change.
 - Parse JSON floats with correct rounding by enabling serde_json's
   `float_roundtrip` feature (#181). Without it, some 16 to 17
   significant-digit doubles in Server JSON decoded one ULP off, for example

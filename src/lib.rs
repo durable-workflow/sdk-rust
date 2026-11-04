@@ -11136,6 +11136,9 @@ impl WorkflowContext {
     /// Wait for a deterministic predicate to become true or for its durable
     /// timeout to elapse.
     ///
+    /// The timeout runs from the first time the wait opens. A signal or update
+    /// that leaves the predicate false does not restart it.
+    ///
     /// Prefer [`wait_condition!`] for inline predicates so changes to the Rust
     /// predicate tokens automatically change the recorded definition
     /// fingerprint. Direct callers must provide an equally stable identity in
@@ -15569,7 +15572,7 @@ impl Future for ConditionWaitCall {
             return Poll::Pending;
         }
 
-        let options = match self.options.validate() {
+        let mut options = match self.options.validate() {
             Ok(options) => options,
             Err(error) => return Poll::Ready(Err(Error::InvalidConditionWaitOptions(error))),
         };
@@ -15623,6 +15626,7 @@ impl Future for ConditionWaitCall {
             let mut cursor = state.command_cursor;
             let mut result = None;
             let mut pending_delivery = false;
+            let mut first_sequence = None;
             loop {
                 if cursor > initial_cursor
                     && matches!(
@@ -15670,9 +15674,11 @@ impl Future for ConditionWaitCall {
                     timeout_seconds,
                     &occurrence_id,
                     &options,
+                    cursor > initial_cursor,
                 ) {
                     return Poll::Ready(Err(error));
                 }
+                first_sequence.get_or_insert(sequence);
                 if result == Some(ConditionWaitResult::TimedOut) {
                     return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
                         "condition_wait_reopened_after_timeout",
@@ -15706,7 +15712,21 @@ impl Future for ConditionWaitCall {
                 self.opened_wait = true;
                 return Poll::Pending;
             }
-            result
+            match (result, first_sequence) {
+                (None, Some(first_sequence)) => {
+                    // The logical wait stays open: its deadline is fixed at the
+                    // first physical open, not reset by a wake that left the
+                    // predicate false.
+                    options.timeout_seconds = condition_reopen_timeout(
+                        &state.history_events,
+                        first_sequence,
+                        &occurrence_id,
+                        options.timeout_seconds,
+                    );
+                    None
+                }
+                (result, _) => result,
+            }
         };
 
         if let Some(result) = recorded_result {
@@ -15715,6 +15735,52 @@ impl Future for ConditionWaitCall {
 
         self.poll_open_condition(options, true)
     }
+}
+
+/// The timeout for reopening a recorded logical condition wait: the authored
+/// timeout less the time from its first physical open to the latest recorded
+/// history event, rounded up and clamped to `0..=authored`. Without both
+/// times, the authored timeout is kept.
+fn condition_reopen_timeout(
+    history: &[HistoryEvent],
+    first_sequence: u64,
+    occurrence_id: &str,
+    authored: Option<u64>,
+) -> Option<u64> {
+    let authored = authored?;
+    let wall_time = |event: &HistoryEvent| {
+        event
+            .raw
+            .get("timestamp")
+            .filter(|value| !value.is_null())
+            .or_else(|| event.raw.get("recorded_at"))
+            .and_then(Value::as_str)
+            .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+            .map(|time| time.with_timezone(&chrono::Utc))
+    };
+    let opened_at = history
+        .iter()
+        .find(|event| {
+            event.event_type == "ConditionWaitOpened"
+                && event.payload.get("sequence").and_then(Value::as_u64) == Some(first_sequence)
+                && event
+                    .payload
+                    .get("condition_wait_occurrence_id")
+                    .and_then(Value::as_str)
+                    == Some(occurrence_id)
+        })
+        .and_then(wall_time);
+    let latest = history.iter().filter_map(wall_time).max();
+    let (Some(opened_at), Some(latest)) = (opened_at, latest) else {
+        return Some(authored);
+    };
+    let elapsed_ms = i128::from((latest - opened_at).num_milliseconds().max(0));
+    let remaining_ms = i128::from(authored) * 1000 - elapsed_ms;
+    if remaining_ms <= 0 {
+        return Some(0);
+    }
+    let remaining = (remaining_ms + 999) / 1000;
+    Some(u64::try_from(remaining).map_or(authored, |remaining| remaining.min(authored)))
 }
 
 impl ConditionWaitCall {
@@ -15761,7 +15827,9 @@ impl ConditionWaitCall {
             Ok(_) => {}
             Err(error) => return Poll::Ready(Err(error)),
         }
-        if options.timeout_seconds == Some(0) && !selection_member {
+        // A recorded wait reopened after its deadline still opens, with a zero
+        // timeout, so the Server resolves its wait and timer as timed out.
+        if options.timeout_seconds == Some(0) && !selection_member && !recorded_wait {
             return Poll::Ready(Ok(ConditionWaitResult::TimedOut));
         }
 
@@ -15802,6 +15870,7 @@ fn validate_recorded_condition_wait(
     recorded_timeout_seconds: Option<u64>,
     current_occurrence_id: &str,
     current: &ValidatedConditionWaitOptions,
+    physical_reopen: bool,
 ) -> Result<()> {
     if recorded_occurrence_id != current_occurrence_id {
         return Err(Error::NonDeterministicReplay(ReplayFailure::new(
@@ -15830,7 +15899,13 @@ fn validate_recorded_condition_wait(
             "recorded condition predicate behavior differs from current workflow code",
         )));
     }
-    if recorded_timeout_seconds != current.timeout_seconds {
+    // A physical reopen carries the remaining time of the first open, so it may
+    // record less than the authored timeout, never more.
+    let timeout_matches = match (recorded_timeout_seconds, current.timeout_seconds) {
+        (Some(recorded), Some(authored)) if physical_reopen => recorded <= authored,
+        (recorded, authored) => recorded == authored,
+    };
+    if !timeout_matches {
         return Err(Error::NonDeterministicReplay(ReplayFailure::new(
             "condition_wait_timeout_mismatch",
             Some(sequence),
@@ -24737,6 +24812,172 @@ mod tests {
                 json!(["satisfied", "satisfied"])
             );
         }
+    }
+
+    fn timed_event(event_type: &str, at: &str, payload: Value) -> HistoryEvent {
+        let mut event = history_event(event_type, payload);
+        event.raw.insert("timestamp".into(), json!(at));
+        event
+    }
+
+    fn approval_wait_open(sequence: u64, at: &str, timeout_seconds: u64) -> HistoryEvent {
+        timed_event(
+            "ConditionWaitOpened",
+            at,
+            json!({
+                "sequence": sequence,
+                "condition_wait_id": format!("condition:{sequence}"),
+                "condition_wait_occurrence_id": "rust:condition-wait:0",
+                "condition_key": "approval",
+                "condition_definition_fingerprint": "sha256:approval-v1",
+                "timeout_seconds": timeout_seconds,
+            }),
+        )
+    }
+
+    fn approval_signal(name: &str, id: &str, at: &str) -> HistoryEvent {
+        timed_event(
+            "SignalReceived",
+            at,
+            json!({
+                "signal_id": id,
+                "workflow_command_id": format!("command-{id}"),
+                "signal_name": name,
+                "arguments": encode_value_envelope(&json!(["proposal-1"]), DEFAULT_CODEC)
+                    .expect("signal input"),
+            }),
+        )
+    }
+
+    fn poll_approval_wait(
+        history: Vec<HistoryEvent>,
+    ) -> (Poll<Result<ConditionWaitResult>>, Vec<Value>) {
+        let ctx = workflow_context(history);
+        let predicate_ctx = ctx.clone();
+        let mut wait = Box::pin(
+            ctx.wait_condition(
+                ConditionWaitOptions::new("approval", "sha256:approval-v1")
+                    .timeout(Duration::from_secs(300)),
+                move || Ok(!predicate_ctx.signals("approve")?.is_empty()),
+            ),
+        );
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let poll = wait.as_mut().poll(&mut task_context);
+        (poll, ctx.take_commands().expect("commands"))
+    }
+
+    // The same vectors as sdk-php#271 (#187): a false wake satisfies the Server's
+    // wait, and the reopen keeps the deadline of the first open.
+    #[test]
+    fn reopened_condition_wait_keeps_its_first_opening_deadline() {
+        let opened = || approval_wait_open(1, "2026-11-04T02:36:05.295000+00:00", 300);
+        let satisfied = || {
+            timed_event(
+                "ConditionWaitSatisfied",
+                "2026-11-04T02:38:05.397000+00:00",
+                json!({
+                    "sequence": 1,
+                    "condition_wait_id": "condition:1",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "approval",
+                    "condition_definition_fingerprint": "sha256:approval-v1",
+                }),
+            )
+        };
+        let reopened = |timeout| approval_wait_open(2, "2026-11-04T02:38:05.402000+00:00", timeout);
+        let wrong = |id, at| approval_signal("reject", id, at);
+        for (label, history, expected) in [
+            (
+                "first false wake",
+                vec![opened(), wrong("w1", "2026-11-04T02:38:05.345000+00:00")],
+                180,
+            ),
+            (
+                "second false wake after a full-timeout reopen",
+                vec![
+                    opened(),
+                    wrong("w1", "2026-11-04T02:38:05.345000+00:00"),
+                    satisfied(),
+                    reopened(300),
+                    wrong("w2", "2026-11-04T02:40:05.000000+00:00"),
+                ],
+                61,
+            ),
+            (
+                "second false wake after a remaining-time reopen",
+                vec![
+                    opened(),
+                    wrong("w1", "2026-11-04T02:38:05.345000+00:00"),
+                    satisfied(),
+                    reopened(180),
+                    wrong("w2", "2026-11-04T02:40:05.000000+00:00"),
+                ],
+                61,
+            ),
+            (
+                "false wake after the deadline",
+                vec![opened(), wrong("w1", "2026-11-04T02:41:06.000000+00:00")],
+                0,
+            ),
+        ] {
+            let (poll, commands) = poll_approval_wait(history);
+            assert!(matches!(poll, Poll::Pending), "{label}: {poll:?}");
+            assert_eq!(commands.len(), 1, "{label}: {commands:?}");
+            assert_eq!(commands[0]["type"], json!("open_condition_wait"), "{label}");
+            assert_eq!(commands[0]["condition_key"], json!("approval"), "{label}");
+            assert_eq!(
+                commands[0]["condition_wait_occurrence_id"],
+                json!("rust:condition-wait:0"),
+                "{label}"
+            );
+            assert_eq!(commands[0]["timeout_seconds"], json!(expected), "{label}");
+        }
+
+        let (poll, commands) = poll_approval_wait(vec![
+            opened(),
+            wrong("w1", "2026-11-04T02:38:05.345000+00:00"),
+            satisfied(),
+            reopened(180),
+            approval_signal("approve", "a1", "2026-11-04T02:39:00.000000+00:00"),
+        ]);
+        assert!(
+            matches!(poll, Poll::Ready(Ok(ConditionWaitResult::Satisfied))),
+            "a true wake after a remaining-time reopen completes: {poll:?}"
+        );
+        assert!(commands.is_empty());
+
+        // Without recorded times the authored timeout is kept, as before.
+        let mut untimed = vec![opened(), wrong("w1", "2026-11-04T02:38:05.345000+00:00")];
+        for event in &mut untimed {
+            event.raw.remove("timestamp");
+        }
+        let (_, commands) = poll_approval_wait(untimed);
+        assert_eq!(commands[0]["timeout_seconds"], json!(300));
+    }
+
+    #[test]
+    fn a_reopen_longer_than_the_authored_timeout_is_not_the_same_wait() {
+        let history = vec![
+            approval_wait_open(1, "2026-11-04T02:36:05.295000+00:00", 300),
+            timed_event(
+                "ConditionWaitSatisfied",
+                "2026-11-04T02:38:05.397000+00:00",
+                json!({
+                    "sequence": 1,
+                    "condition_wait_id": "condition:1",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "approval",
+                    "condition_definition_fingerprint": "sha256:approval-v1",
+                }),
+            ),
+            approval_wait_open(2, "2026-11-04T02:38:05.402000+00:00", 301),
+        ];
+        let (poll, _) = poll_approval_wait(history);
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) = poll else {
+            panic!("a longer reopen must fail replay: {poll:?}");
+        };
+        assert_eq!(failure.reason, "condition_wait_timeout_mismatch");
+        assert_eq!(failure.sequence, Some(2));
     }
 
     #[test]
