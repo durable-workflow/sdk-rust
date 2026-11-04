@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -283,9 +284,11 @@ def verify_archive(
         raise ReleasePackageError("expected VCS commit must be a full lowercase SHA-1")
 
     _archive_files(archive_path, f"{source['package']}-{source['package_version']}")
+    # One no-follow read: the checksum and the inspected members come from the
+    # same bytes.
+    archive_bytes = _read_regular_no_follow(archive_path, "crate archive")
     try:
-        archive_bytes = archive_path.read_bytes()
-        with tarfile.open(archive_path, "r:*") as archive:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             root = f"{source['package']}-{source['package_version']}"
             packaged_changelog = _member_bytes(
                 archive, _regular_member(archive, f"{root}/CHANGELOG.md")
@@ -354,8 +357,9 @@ def restore_missing_lockfile(
         or identity["archive"]["sha256"] != expected_archive_sha256
     ):
         raise ReleasePackageError("registry archive checksum differs from expected SHA-256")
+    archive_bytes = _read_regular_no_follow(archive_path, "crate archive")
     try:
-        with tarfile.open(archive_path, "r:*") as archive:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             member = _regular_member(
                 archive, f"{identity['package']}-{identity['package_version']}/Cargo.lock"
             )
@@ -555,16 +559,16 @@ def parse_approval(raw: bytes) -> tuple[dict[str, Any], str]:
     return approval, sha256(raw)
 
 
-def _read_regular_no_follow(path: Path) -> bytes:
+def _read_regular_no_follow(path: Path, what: str = "approved package record") -> bytes:
     try:
         if not stat.S_ISREG(os.lstat(path).st_mode):
-            raise ReleasePackageError("approved package record is not a regular file")
+            raise ReleasePackageError(f"{what} is not a regular file")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
-        raise ReleasePackageError(f"could not open approved package record: {error.strerror}") from error
+        raise ReleasePackageError(f"could not open {what}: {error.strerror}") from error
     with os.fdopen(descriptor, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise ReleasePackageError("approved package record is not a regular file")
+            raise ReleasePackageError(f"{what} is not a regular file")
         return handle.read()
 
 
@@ -697,8 +701,11 @@ def verify_acceptance_summary(approval: dict[str, Any], summary_record: bytes) -
 
 def _archive_files(archive_path: Path, root: str) -> list[str]:
     prefix = f"{root}/"
+    # Read the confined crate as a regular file without following links, then
+    # list its members from memory; nothing is ever extracted.
+    data = _read_regular_no_follow(archive_path, "crate archive")
     try:
-        with tarfile.open(archive_path, "r:gz") as archive:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
             members = archive.getmembers()
     except (OSError, tarfile.TarError, EOFError) as error:
         raise ReleasePackageError(f"could not inspect crate archive: {error}") from error

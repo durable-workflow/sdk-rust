@@ -460,6 +460,19 @@ This is an example, not another release.
             identity["archive"]["release_entry_sha256"],
         )
 
+    def test_archive_reached_through_a_symlink_is_refused(self) -> None:
+        archive = self.archive()
+        link = archive.with_name("linked.crate")
+        link.symlink_to(archive.name)
+        self.assertEqual(
+            COMMIT,
+            verify_archive(archive, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT)[
+                "archive"
+            ]["vcs_commit"],
+        )
+        with self.assertRaisesRegex(ReleasePackageError, "crate archive is not a regular file"):
+            verify_archive(link, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT)
+
     def test_archive_rejects_changed_notes_or_vcs_identity(self) -> None:
         cases = (
             self.archive(
