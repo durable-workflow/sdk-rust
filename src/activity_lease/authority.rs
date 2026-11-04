@@ -569,7 +569,7 @@ impl Lease {
         worker: &str,
         queue: &str,
     ) -> Result<Option<Arc<Self>>> {
-        client.observe_activity_lease_capabilities(&wire["server_capabilities"]);
+        client.observe_worker_activity_lease_capabilities(&wire["server_capabilities"]);
         if wire["task"].is_null()
             || !client
                 .activity_lease_renewal_supported

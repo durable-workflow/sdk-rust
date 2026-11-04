@@ -73,6 +73,21 @@ fn server(overrides: RequestOverride) -> MockWorkerServer {
 }
 
 #[tokio::test]
+async fn advertised_activity_renewal_does_not_discover_on_the_hot_path() {
+    let server = server(replies);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async { Ok(json!(true)) });
+    for _ in 0..3 {
+        worker.poll_activity_once().await.unwrap();
+        // The first completion discovers the separate inline-payload policy.
+        // Subsequent activities must not add lease capability discoveries.
+        assert_eq!(server.request_count("/api/cluster/info"), 1);
+    }
+    assert_eq!(server.request_count(RENEW), 3);
+    assert_eq!(server.request_count(COMPLETE), 3);
+}
+
+#[tokio::test]
 async fn automatic_renewal_keeps_a_callback_past_its_original_lease() {
     let server = server(replies);
     let mut worker = worker(&server);

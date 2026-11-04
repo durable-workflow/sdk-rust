@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Keep one in-flight poll per task family while filling the configured workflow
+  and activity execution slots (#199). A received task finishes hydration and
+  initial lease confirmation before polling refills a spare slot. Its execution
+  slot stays occupied through completion reporting, so slow callbacks can run
+  concurrently without multiplying idle long polls.
+
+- Reuse worker-authenticated activity lease capability observations instead of
+  fetching `/cluster/info` for every activity (#199). Client clones share one
+  discovery when needed and refresh only after an explicit capability refusal. Original claim,
+  ownership and deadline validation still apply to every renewal.
+
 - Add a public raw request API for tools that must reach every Server route
   and report its response unchanged (#180). `Client::control_plane_request`
   and `Client::worker_plane_request` take a `RawRequest` (path segments the
