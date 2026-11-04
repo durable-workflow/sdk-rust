@@ -1269,6 +1269,20 @@ class PublishRustSdkContractTest(unittest.TestCase):
         "release": "release-tools/scripts/ci/install-release-tooling.sh",
     }
 
+    # A step outside the allowlist must not enter the tagged tree inline either.
+    ENTERS_TAGGED_TREE = re.compile(r"\b(?:cd|pushd)\b[^;&|\n]*release-source")
+
+    def test_inline_directory_change_into_the_tagged_tree_is_detected(self) -> None:
+        for command in ("cd release-source && cargo package", "pushd ./release-source",
+                        'cd "$GITHUB_WORKSPACE/release-source"; python3 -I x.py',
+                        "echo ok; cd -- release-source"):
+            with self.subTest(command=command):
+                self.assertRegex(command, self.ENTERS_TAGGED_TREE)
+        for command in ('head_commit="$(git -C release-source rev-parse HEAD)"',
+                        "cd release-tools && ls release-source"):
+            with self.subTest(command=command):
+                self.assertNotRegex(command, self.ENTERS_TAGGED_TREE)
+
     def test_tagged_tree_working_directory_runs_only_maintained_entrypoints(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         # A defaults block would set a working directory no step declares.
@@ -1280,6 +1294,8 @@ class PublishRustSdkContractTest(unittest.TestCase):
             for step in self._steps(job):
                 directories = re.findall(r"^        working-directory: (.*)$", step, flags=re.MULTILINE)
                 if not directories:
+                    with self.subTest(job=name, step=step.split("\n", 1)[0]):
+                        self.assertNotRegex(self._step_run(step), self.ENTERS_TAGGED_TREE)
                     continue
                 with self.subTest(job=name, step=step.split("\n", 1)[0]):
                     self.assertEqual(["release-source"], directories)
@@ -1323,6 +1339,8 @@ class ReleaseToolingInstallerTrustTest(unittest.TestCase):
                 #!{sys.executable}
                 import json, os, pathlib, sys
                 arguments = sys.argv[1:]
+                if "PYTHONPATH" in os.environ:
+                    raise SystemExit("PYTHONPATH reached the release tooling interpreter")
                 with pathlib.Path(os.environ["INSTALLER_CALLS"]).open("a") as handle:
                     handle.write(json.dumps(arguments) + "\\n")
                 if arguments[:3] == ["-I", "-m", "venv"]:
@@ -1338,7 +1356,8 @@ class ReleaseToolingInstallerTrustTest(unittest.TestCase):
             result = subprocess.run(
                 ["bash", str(RELEASE_TOOLING_INSTALLER), str(venv)],
                 env={**os.environ, "PATH": f"{command_directory}:{os.environ['PATH']}",
-                     "INSTALLER_CALLS": str(calls_file), "GITHUB_PATH": str(github_path)},
+                     "INSTALLER_CALLS": str(calls_file), "GITHUB_PATH": str(github_path),
+                     "PYTHONPATH": str(root / "hostile")},
                 capture_output=True, text=True, check=False, timeout=10,
             )
             self.assertEqual(0, result.returncode, result.stderr)

@@ -14,6 +14,10 @@ if [ -z "${GITHUB_PATH:-}" ]; then
     exit 2
 fi
 
+# -I protects the interpreters started here, but pip runs the target venv
+# interpreter as a child that would still read PYTHONPATH.
+unset PYTHONPATH
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 release_tooling_venv="$1"
 
