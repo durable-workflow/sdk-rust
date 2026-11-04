@@ -15,6 +15,9 @@
   members (for example a timer) is not covered yet. A wait that timed out
   before the next open still ends it. Both histories were refused by 4.11.1 as
   well.
+
+## 4.11.2
+
 - A `wait_condition` timeout now runs from the first time the wait opens
   (#187, parity with sdk-php#269). The Server wakes an open condition wait on
   any signal and records it satisfied. When the predicate was still false, the
@@ -54,7 +57,7 @@
   attempt and run, for example after the run was cancelled while the report
   was in flight. The receipt must carry `recorded=false`, the exact task,
   attempt and `run_id`, a terminal `run_status`, the `stop_reason` it implies
-  and `can_continue=false`, as native Server sends once server#994 ships.
+  and `can_continue=false`, as native Server 3.0.5 sends (server#994).
   Native 3.0.4's `run_closed` body lacks `recorded` and `run_id` and still
   surfaces, as do recorded, mismatched and other conflicts. Direct client
   calls keep the original HTTP error.
