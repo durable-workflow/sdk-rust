@@ -626,9 +626,7 @@ impl WorkflowState {
     }
 
     fn next_scope_cancellation_sequence(&self) -> Result<u64> {
-        self.recorded_commands
-            .last()
-            .map_or(0, RecordedCommand::sequence)
+        self.max_recorded_sequence()
             .checked_add(self.commands.len() as u64)
             .and_then(|sequence| sequence.checked_add(1))
             .filter(|sequence| *sequence < i64::MAX as u64)
@@ -703,5 +701,36 @@ impl WorkflowContext {
                     .clone()
                     .with_replay(Some(Arc::downgrade(&self.state)))
             }))
+    }
+}
+
+#[cfg(test)]
+mod reopen_order_tests {
+    use super::*;
+
+    // #193 review: the next authored sequence follows the highest recorded
+    // sequence even when grouped reopens are consumed out of sequence order.
+    #[test]
+    fn next_sequence_follows_the_highest_recorded_sequence() {
+        let mut state = WorkflowState::new(
+            crate::one_sided_grouped_reopen_history(Vec::new()),
+            "rust-workers".to_string(),
+            crate::DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect("one-sided grouped reopen history");
+        let consumed = state
+            .recorded_commands
+            .iter()
+            .map(RecordedCommand::sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(consumed, vec![1, 3, 2]);
+        state.command_cursor = state.recorded_commands.len();
+        assert_eq!(
+            state
+                .next_scope_cancellation_sequence()
+                .expect("next sequence"),
+            4
+        );
     }
 }

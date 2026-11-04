@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Replay condition-wait histories in which the Server recorded a second open
+  of a wait that was still open (#191, #192). A wait is now linked to the
+  same logical wait by its state when the next open was recorded: if it was
+  still open, the next open is a repeated open. So an orphaned duplicate whose
+  timer fires later no longer fails replay with
+  `condition_wait_reopened_after_timeout` (the sdk-php#283 shape). On PHP
+  Server 2.x, condition members of one `parallel` or `select` group whose waits
+  are recorded next to each other, woken by one signal, no longer fail the next
+  task with `condition_wait_group_reopen_mismatch`, and each member consumes
+  its own reopen. A group whose condition waits are separated by another of its
+  members (for example a timer) is not covered yet. A wait that timed out
+  before the next open still ends it. Both histories were refused by 4.11.1 as
+  well.
+
 ## 4.11.2
 
 - A `wait_condition` timeout now runs from the first time the wait opens
