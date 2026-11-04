@@ -208,3 +208,29 @@ async fn adding_a_private_ca_keeps_bundled_public_roots_trusted() {
         Ok(_) | Err(Error::Http { .. }) | Err(Error::Json(_))
     ));
 }
+
+#[tokio::test]
+async fn certificate_verification_is_on_by_default_and_only_an_explicit_opt_out_disables_it() {
+    let server = TestServer::start().await;
+    for client in [
+        Client::builder(server.url("127.0.0.1")).build().unwrap(),
+        Client::builder(server.url("127.0.0.1"))
+            .danger_accept_invalid_certs(false)
+            .build()
+            .unwrap(),
+    ] {
+        assert!(matches!(client.health().await, Err(Error::Transport(_))));
+    }
+    assert!(
+        server.requests.lock().unwrap().is_empty(),
+        "verified TLS must fail before HTTP"
+    );
+
+    // Untrusted issuer and a hostname the certificate does not name.
+    let insecure = Client::builder(server.url("127.0.0.1"))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    assert_eq!(insecure.health().await.unwrap()["status"], "ok");
+    assert_eq!(*server.requests.lock().unwrap(), ["/api/health"]);
+}

@@ -160,7 +160,7 @@ pub(super) struct ClientObservation {
     tags: MetricTags,
 }
 impl ClientObservation {
-    fn new(
+    pub(super) fn new(
         client: &Client,
         method: &reqwest::Method,
         path: &str,
@@ -191,7 +191,7 @@ impl ClientObservation {
     pub(super) fn status(&self, status: reqwest::StatusCode) {
         self.status.store(status.as_u16(), Ordering::Relaxed);
     }
-    fn finish<T>(&mut self, result: &Result<T>) {
+    pub(super) fn finish<T>(&mut self, result: &Result<T>) {
         if self.metrics.0.is_none() {
             return;
         }

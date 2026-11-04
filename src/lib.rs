@@ -16,6 +16,7 @@ pub mod metrics;
 mod nexus;
 pub mod pagination;
 mod query_authority;
+mod raw_request;
 mod runtime_payloads;
 mod runtime_uploads;
 mod sticky_worker;
@@ -73,6 +74,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
 pub use local_activity::LocalActivityOptions;
+pub use raw_request::{
+    worker_protocol_compatible, HttpRefusal, RawMethod, RawRequest, RawResponse,
+};
 use serde::{
     de::DeserializeOwned,
     ser::{SerializeMap, SerializeSeq},
@@ -275,6 +279,8 @@ pub enum Error {
     InvalidBaseUrl,
     #[error("invalid additional root certificates: {0}")]
     InvalidRootCertificates(String),
+    #[error("invalid raw request: {0}")]
+    InvalidRawRequest(String),
     #[error(transparent)]
     FailureReporting(#[from] FailureReportError),
     #[error(transparent)]
@@ -3063,6 +3069,7 @@ impl Client {
             max_external_payload_bytes: 64 * 1024 * 1024,
             worker_protocol_version: WorkerProtocolVersion::default(),
             additional_root_certificates: Vec::new(),
+            danger_accept_invalid_certs: false,
             metrics: metrics::Metrics::default(),
         }
     }
@@ -5905,6 +5912,7 @@ pub struct ClientBuilder {
     max_external_payload_bytes: usize,
     worker_protocol_version: WorkerProtocolVersion,
     additional_root_certificates: Vec<reqwest::Certificate>,
+    danger_accept_invalid_certs: bool,
 }
 
 impl ClientBuilder {
@@ -5966,6 +5974,9 @@ impl ClientBuilder {
             .redirect(reqwest::redirect::Policy::none());
         for certificate in self.additional_root_certificates {
             http = http.add_root_certificate(certificate);
+        }
+        if self.danger_accept_invalid_certs {
+            http = http.danger_accept_invalid_certs(true);
         }
         Ok(Client {
             metrics: self.metrics,
