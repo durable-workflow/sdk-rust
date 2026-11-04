@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -53,13 +54,42 @@ class StableDocsTests(unittest.TestCase):
             "files": sorted(self.files),
             "file_list_sha256": hashlib.sha256("".join(f"{name}\n" for name in sorted(self.files)).encode()).hexdigest(),
         }
+        template = json.loads((Path(__file__).resolve().parents[2] / "release/approved-packages/4.11.2.json").read_bytes())
+        acceptance = copy.deepcopy(template["acceptance"])
+        self.approval.update(cargo_version="1.86.0", acceptance=acceptance)
+        self.summary = {
+            "mode": "pre-publication", "outcome": "pass", "checks_outcome": "pass",
+            "cleanup": {"pass": True, "errors": [], "local_leftovers": [], "leftover_containers": [], "leftover_networks": []},
+            "harness_commit": acceptance["harness_commit"], "finished_at": acceptance["finished_at"],
+            "expected_server": {"version": acceptance["expected_server_version"], "revision": acceptance["expected_revision"], "release_tag": acceptance["expected_release_tag"]},
+            "server": {"index": acceptance["server_index"], "executed_manifest": acceptance["executed_manifest"], "platform": acceptance["platform"]},
+            "package": {"package": "durable-workflow", "version": VERSION, "commit": COMMIT,
+                        "vcs_info": {"git": {"sha1": COMMIT}, "path_in_vcs": ""},
+                        "crate_sha256": self.approval["crate_sha256"], "crate_sha256_after_cells": self.approval["crate_sha256"],
+                        "files": self.approval["files"], "file_list_sha256": self.approval["file_list_sha256"], "cargo_version": "cargo 1.86.0 (fixture)"},
+            "crate": {"sha256": self.approval["crate_sha256"], "lock_checksum": self.approval["crate_sha256"], "source_commit": COMMIT, "registry_published": False, "baselines": {"pass": True}},
+            "cells": {name: {"outcome": "pass", "cluster_info": {"version": acceptance["expected_server_version"]}} for name in acceptance["cells"]},
+        }
         self.metadata = {
             "crate": {"name": "durable-workflow", "max_stable_version": VERSION},
             "versions": [{"num": VERSION, "checksum": self.approval["crate_sha256"], "yanked": False}],
         }
         self.record = self.root / "release" / "approved-packages" / f"{VERSION}.json"
         self.record.parent.mkdir(parents=True)
+        self.summary_record = self.record.with_name(f"{VERSION}.summary.json")
+        summary_raw = json.dumps(self.summary).encode()
+        self.summary_record.write_bytes(summary_raw)
+        self.approval["acceptance"]["summary_sha256"] = hashlib.sha256(summary_raw).hexdigest()
         self.record.write_text(json.dumps(self.approval))
+        self.git("init", "--quiet")
+        self.checkpoint()
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args], cwd=self.root, check=True, capture_output=True)
+
+    def checkpoint(self):
+        self.git("add", "release")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "fixture")
 
     def refuse(self, raw=None, approval=None, source=COMMIT):
         with self.assertRaises(release.DocsReleaseError):
@@ -77,7 +107,7 @@ class StableDocsTests(unittest.TestCase):
 
     def test_missing_approval_has_no_main_fallback(self):
         self.record.unlink()
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaises(release.ReleasePackageError):
             release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
         self.assertFalse(self.output.exists())
 
@@ -100,8 +130,65 @@ class StableDocsTests(unittest.TestCase):
         for field, value in (("crate_sha256", "0" * 64), ("file_list_sha256", "0" * 64), ("commit", "main"), ("version", "4.12.0")):
             with self.subTest(field=field):
                 self.record.write_text(json.dumps({**self.approval, field: value}))
-                with self.assertRaises(release.DocsReleaseError):
+                self.checkpoint()
+                with self.assertRaises((release.DocsReleaseError, release.ReleasePackageError)):
                     release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+
+    def test_missing_or_failed_acceptance_receipt_refuses(self):
+        variants = [None, {**self.approval["acceptance"], "outcome": "fail"}]
+        for acceptance in variants:
+            with self.subTest(acceptance=acceptance):
+                record = {**self.approval, "acceptance": acceptance}
+                self.record.write_text(json.dumps(record))
+                self.checkpoint()
+                with self.assertRaises(release.ReleasePackageError):
+                    release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+
+    def test_summary_missing_drift_or_failed_outcome_refuses(self):
+        self.summary_record.unlink()
+        self.checkpoint()
+        with self.assertRaises(release.ReleasePackageError):
+            release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+        for summary, rebind in (({**self.summary, "outcome": "fail"}, False), ({**self.summary, "outcome": "fail"}, True)):
+            with self.subTest(rebind=rebind):
+                raw = json.dumps(summary).encode()
+                self.summary_record.write_bytes(raw)
+                record = copy.deepcopy(self.approval)
+                if rebind:
+                    record["acceptance"]["summary_sha256"] = hashlib.sha256(raw).hexdigest()
+                self.record.write_text(json.dumps(record))
+                self.checkpoint()
+                with self.assertRaises(release.ReleasePackageError):
+                    release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+
+    def test_untracked_modified_or_linked_approval_refuses(self):
+        self.record.write_text(json.dumps({**self.approval, "unexpected": True}))
+        with self.assertRaises(release.ReleasePackageError):
+            release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+        self.record.unlink()
+        other = self.root / "elsewhere.json"
+        other.write_text(json.dumps(self.approval))
+        self.record.symlink_to(other)
+        with self.assertRaises(release.ReleasePackageError):
+            release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+
+    def test_untracked_summary_refuses(self):
+        self.git("rm", "--cached", str(self.summary_record.relative_to(self.root)))
+        self.git("commit", "--quiet", "-m", "untracked summary")
+        with self.assertRaisesRegex(release.ReleasePackageError, "not tracked"):
+            release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+
+    def test_modified_summary_refuses_before_parsing(self):
+        self.summary_record.write_bytes(self.summary_record.read_bytes() + b"\n")
+        with self.assertRaisesRegex(release.ReleasePackageError, "differs from its tracked content"):
+            release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
+
+    def test_linked_summary_refuses(self):
+        other = self.root / "outside-summary.json"
+        self.summary_record.rename(other)
+        self.summary_record.symlink_to(other)
+        with self.assertRaises(release.ReleasePackageError):
+            release.approved_release(self.root, VERSION, self.approval["crate_sha256"])
 
     def test_tag_uses_peeled_commit_and_refuses_missing(self):
         refs = f"{'b' * 40}\trefs/tags/{VERSION}\n{COMMIT}\trefs/tags/{VERSION}^{{}}\n"

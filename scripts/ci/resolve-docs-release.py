@@ -13,13 +13,21 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from release_package import (
+    ReleasePackageError,
+    parse_approval,
+    read_approval_record,
+    verify_acceptance_summary,
+)
+
 PACKAGE = "durable-workflow"
 REPOSITORY = "https://github.com/durable-workflow/sdk-rust.git"
-VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", re.ASCII)
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 MAX_ARCHIVE = 32 * 1024 * 1024
@@ -61,22 +69,22 @@ def select_release(metadata: dict) -> tuple[str, str]:
 
 
 def approved_release(root: Path, version: str, checksum: str) -> dict:
-    approval = json.loads((root / "release" / "approved-packages" / f"{version}.json").read_bytes())
-    require(approval.get("schema") == "durable-workflow.rust-sdk.approved-package/v1", "approval schema differs")
+    record, summary, _ = read_approval_record(str(root.resolve()), version)
+    approval, _ = parse_approval(record)
+    verify_acceptance_summary(approval, summary)
     require(approval.get("package") == PACKAGE and approval.get("version") == version, "approval package/version differs")
     require(approval.get("crate_sha256") == checksum, "approval and public registry checksums differ")
-    commit = approval.get("commit", "")
-    require(isinstance(commit, str) and COMMIT.fullmatch(commit) is not None, "approval source commit is malformed")
     files = approval.get("files")
-    require(isinstance(files, list) and 0 < len(files) <= MAX_FILES and all(isinstance(name, str) for name in files), "approval file inventory is malformed")
-    require(files == sorted(set(files)), "approval file inventory must be unique and sorted")
-    digest = hashlib.sha256("".join(f"{name}\n" for name in files).encode()).hexdigest()
-    require(digest == approval.get("file_list_sha256"), "approval file inventory digest differs")
+    require(len(files) <= MAX_FILES, "approval file inventory exceeds its entry limit")
     return approval
 
 
 def tag_commit(refs: str, version: str) -> str:
-    entries = dict(line.split()[::-1] for line in refs.splitlines() if line.strip())
+    entries = {}
+    for line in refs.splitlines():
+        if line.strip():
+            commit, ref = line.split()
+            entries[ref] = commit
     ref = f"refs/tags/{version}"
     commit = entries.get(ref + "^{}", entries.get(ref, ""))
     require(COMMIT.fullmatch(commit) is not None, "published source tag is absent or malformed")
@@ -130,23 +138,26 @@ def unpack_crate(raw: bytes, destination: Path, approval: dict, source_commit: s
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--destination", type=Path, required=True)
-    parser.add_argument("--identity", type=Path, required=True)
-    args = parser.parse_args()
+    parser.parse_args()
+    root = Path(__file__).resolve().parents[2]
     try:
         metadata = json.loads(download(f"https://crates.io/api/v1/crates/{PACKAGE}", 4 * 1024 * 1024))
         version, checksum = select_release(metadata)
-        approval = approved_release(args.root, version, checksum)
+        approval = approved_release(root, version, checksum)
         refs = subprocess.run(["git", "ls-remote", REPOSITORY, f"refs/tags/{version}", f"refs/tags/{version}^{{}}"], check=True, capture_output=True, text=True, timeout=30).stdout
         source = tag_commit(refs, version)
         raw = download(f"https://static.crates.io/crates/{PACKAGE}/{PACKAGE}-{version}.crate", MAX_ARCHIVE)
-        unpack_crate(raw, args.destination, approval, source)
-        tooling = subprocess.run(["git", "rev-parse", "HEAD"], cwd=args.root, check=True, capture_output=True, text=True).stdout.strip()
+        # Outputs live only in an exclusively created temporary directory. No CLI
+        # argument can redirect an archive or identity write into the checkout.
+        working = Path(tempfile.mkdtemp(prefix="durable-workflow-stable-docs-"))
+        destination = working / "source"
+        identity_path = working / "__build.json"
+        unpack_crate(raw, destination, approval, source)
+        tooling = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
         identity = {"schema": "durable-workflow.rust-sdk.stable-docs/v1", "package": PACKAGE, "version": version, "crate_sha256": checksum, "source_revision": source, "tooling_revision": tooling}
-        args.identity.write_text(json.dumps(identity, indent=2) + "\n")
-        print(json.dumps(identity))
-    except (OSError, EOFError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError) as error:
+        identity_path.write_text(json.dumps(identity, indent=2) + "\n")
+        print(json.dumps({"source_directory": str(destination), "identity_file": str(identity_path), "release": identity}))
+    except (OSError, EOFError, ValueError, KeyError, TypeError, ReleasePackageError, tarfile.TarError, subprocess.SubprocessError) as error:
         print(f"stable documentation source refused: {error}", file=sys.stderr)
         return 1
     return 0

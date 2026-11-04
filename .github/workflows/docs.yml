@@ -12,14 +12,13 @@ on:
       - 'scripts/check-docs-site.py'
       - 'scripts/ci/test-docs-analytics.mjs'
       - 'scripts/ci/test-docs-navigation.mjs'
+      - 'scripts/ci/validate-example-base-urls.py'
       - 'scripts/ci/*docs-release.py'
+      - 'scripts/ci/build-stable-docs.sh'
+      - 'scripts/ci/release_package.py'
+      - 'scripts/ci/install-release-tooling.sh'
+      - 'scripts/ci/release-tooling-requirements.txt'
       - 'release/approved-packages/*.json'
-      - '.github/workflows/docs.yml'
-  pull_request:
-    paths:
-      - 'docs/**'
-      - 'scripts/ci/*docs-release.py'
-      - 'scripts/check-docs-*.py'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -27,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-api-documentation-${{ github.event.pull_request.number || github.ref }}
+  group: rust-api-documentation
   cancel-in-progress: false
 
 jobs:
@@ -49,59 +48,16 @@ jobs:
           clients: pip,python,cargo,curl,git
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
-      - name: Verify public stable package and source identity
-        run: |
-          python3 scripts/ci/test-resolve-docs-release.py
-          python3 scripts/ci/resolve-docs-release.py \
-            --destination "$RUNNER_TEMP/stable-source" \
-            --identity "$RUNNER_TEMP/docs-release.json"
-      - name: Build and check the documentation
+      - name: Install isolated approval verification tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+      - name: Build and check the published documentation
         env:
           CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}
-          CARGO_BUILD_JOBS: '2'
-        run: |
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            if ! printf '%s' "$CLOUDFLARE_WEB_ANALYTICS_TOKEN" | grep -Eq '^[a-f0-9]{32}$'; then
-              echo 'CLOUDFLARE_WEB_ANALYTICS_TOKEN must be a 32-character site token' >&2
-              exit 1
-            fi
-            sed -i "s/__CLOUDFLARE_WEB_ANALYTICS_TOKEN__/$CLOUDFLARE_WEB_ANALYTICS_TOKEN/" \
-              docs/analytics/analytics.js
-          fi
-          export RUSTDOCFLAGS="-D warnings --html-in-header $GITHUB_WORKSPACE/docs/analytics-head.html"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/stable-docs-target"
-          cargo doc --manifest-path "$RUNNER_TEMP/stable-source/Cargo.toml" --locked --all-features --no-deps
-          cargo doc --manifest-path "$RUNNER_TEMP/stable-source/Cargo.toml" --locked --all-features --no-deps --examples
-          mkdir -p target
-          mv "$CARGO_TARGET_DIR/doc" target/doc
-          printf '%s\n' 'rust.durable-workflow.com' > target/doc/CNAME
-          touch target/doc/.nojekyll
-          cp docs/index.html target/doc/index.html
-          cp docs/layout.css target/doc/layout.css
-          cp docs/navigation.js target/doc/navigation.js
-          mkdir -p target/doc/analytics target/doc/assets
-          cp docs/analytics/analytics.js target/doc/analytics/
-          cp docs/assets/* target/doc/assets/
-          cp "$RUNNER_TEMP/docs-release.json" target/doc/__build.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          import re
-          identity = json.loads(Path('target/doc/__build.json').read_text())
-          landing = Path('target/doc/index.html')
-          html = landing.read_text().replace('Stable release</strong>', f"Stable release {identity['version']}</strong>")
-          html = re.sub(r'(https://github.com/durable-workflow/sdk-rust/blob/)[^/]+(/examples/)', rf"\g<1>{identity['source_revision']}\2", html)
-          landing.write_text(html)
-          PY
-          python3 scripts/check-docs-analytics.py target/doc
-          python3 scripts/check-docs-site.py target/doc
-          python3 scripts/ci/validate-example-base-urls.py --root "$RUNNER_TEMP/stable-source" --rendered-docs target/doc
-          node scripts/ci/test-docs-analytics.mjs
-          node scripts/ci/test-docs-navigation.mjs
+        run: bash scripts/ci/build-stable-docs.sh
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
         if: github.ref == 'refs/heads/main'
         with:
-          path: target/doc
+          path: target/stable-docs
 
   deploy:
     name: Deploy the Rust documentation

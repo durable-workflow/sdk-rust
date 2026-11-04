@@ -56,7 +56,8 @@ volume are removed when the job finishes. These checks do not qualify Cloud.
 Normal CI documents the current source. The separate `API Documentation`
 workflow builds the latest stable public crate for the stable Pages site.
 `resolve-docs-release.py` checks crates.io's version and checksum against the
-maintained approved-package record, the public source tag, the archive's clean
+maintained tracked approved-package record and its complete passing acceptance
+summary, the public source tag, the archive's clean
 VCS identity, manifest and exact file inventory. It extracts that verified
 archive into a fresh build directory. Missing or mismatched publication evidence
 refuses the build; current SDK source is never a fallback.
