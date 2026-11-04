@@ -195,3 +195,26 @@ assert.equal(sidebar.inert, false);
 assert.equal(sidebar.hasAttribute('aria-hidden'), false);
 
 console.log('Validated compact rustdoc navigation isolation and focus behavior.');
+
+for (const length of [1, 2]) {
+  let listener;
+  let prevented = false;
+  let traversals = 0;
+  const back = {addEventListener(name, callback) { assert.equal(name, 'click'); listener = callback; }};
+  vm.runInNewContext(runtime, {
+    document: {querySelector(selector) { return selector === '[data-rustdoc-history-back]' ? back : null; }},
+    window: {history: {length, back() { traversals += 1; }}},
+  });
+  const event = {button: 0, preventDefault() { prevented = true; }};
+  listener(event);
+  assert.equal(prevented, length > 1);
+  assert.equal(traversals, length > 1 ? 1 : 0);
+  for (const override of [{button: 1}, {ctrlKey: true}, {metaKey: true}, {shiftKey: true}, {altKey: true}]) {
+    prevented = false;
+    const before = traversals;
+    listener({...event, ...override});
+    assert.equal(prevented, false);
+    assert.equal(traversals, before);
+  }
+}
+console.log('Validated external rustdoc history-back behavior and safe-link fallback.');
