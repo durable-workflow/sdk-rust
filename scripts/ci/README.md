@@ -8,7 +8,18 @@ These scripts support four public repository checks:
 - API documentation, analytics, navigation, and base-URL checks.
 
 The release workflow uses the crates.io publishing scripts after an immutable
-tag already exists. Ordinary pull requests run the product tests and package
+tag already exists. A version that is not yet on crates.io is published only
+when `cargo package` of the tag reproduces the reviewed pre-publication record
+`release/approved-packages/<version>.json` exactly. That record must be the
+regular file tracked at that path in the maintained-tooling checkout. Its
+acceptance receipt must be complete and passing, and must equal the run's
+committed `<version>.summary.json`. The release runs as four jobs (`gate`,
+`publish`, `verify` and `release`). Only `publish` has `id-token` and the
+crates.io credential, and it runs no crate build or test. The record must match the
+SHA-256, file set, version, VCS commit and Cargo release. After publication, the
+crates.io checksum, the downloaded archive and the tag read back from `origin`
+must still match it. See `scripts/acceptance/installed-native/README.md`
+(pre-publication mode) for how a passing acceptance run produces the record. Ordinary pull requests run the product tests and package
 checks directly from `.github/workflows/ci.yml`.
 
 GitHub release notes come from the exact versioned CHANGELOG section selected by
