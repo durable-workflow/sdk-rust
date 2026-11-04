@@ -270,32 +270,54 @@ impl tracing::Subscriber for WarningLog {
 }
 
 #[test]
-fn disabling_verification_warns_once_with_the_endpoint_and_no_credentials() {
-    let log = Arc::new(WarningLog::default());
-    tracing::subscriber::with_default(log.clone(), || {
-        Client::builder("https://operator:hunter2@workflow.internal:8443/base?x=1")
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        Client::builder("https://verified.internal")
-            .build()
-            .unwrap();
-        Client::builder("https://verified.internal")
-            .danger_accept_invalid_certs(false)
-            .build()
-            .unwrap();
-    });
-    let warnings = log.0.lock().unwrap().clone();
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(
-        warnings[0].contains("endpoint=https://workflow.internal:8443/base"),
-        "{}",
-        warnings[0]
-    );
-    assert!(
-        warnings[0].contains("verification is disabled"),
-        "{}",
-        warnings[0]
-    );
-    assert!(!warnings[0].contains("hunter2") && !warnings[0].contains("operator"));
+fn disabling_verification_warns_once_with_only_the_endpoint_origin() {
+    for (base_url, origin) in [
+        (
+            "https://operator:hunter2@workflow.internal:8443/api/runtime/v1/namespaces/customer-private/proxy-secret?query-secret=query-value#fragment-secret",
+            "https://workflow.internal:8443",
+        ),
+        (
+            "https://operator:hunter2@[2001:db8::1]:9443/customer-private/proxy-secret?query-secret=query-value#fragment-secret",
+            "https://[2001:db8::1]:9443",
+        ),
+    ] {
+        let log = Arc::new(WarningLog::default());
+        tracing::subscriber::with_default(log.clone(), || {
+            Client::builder(base_url)
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap();
+            Client::builder("https://verified.internal")
+                .build()
+                .unwrap();
+            Client::builder("https://verified.internal")
+                .danger_accept_invalid_certs(false)
+                .build()
+                .unwrap();
+        });
+        let warnings = log.0.lock().unwrap().clone();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!("endpoint={origin};")),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("verification is disabled"),
+            "{}",
+            warnings[0]
+        );
+        for sensitive in [
+            "operator",
+            "hunter2",
+            "/api/runtime",
+            "customer-private",
+            "proxy-secret",
+            "query-secret",
+            "query-value",
+            "fragment-secret",
+        ] {
+            assert!(!warnings[0].contains(sensitive), "{}", warnings[0]);
+        }
+    }
 }

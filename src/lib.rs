@@ -10314,16 +10314,11 @@ fn default_worker_id() -> String {
     format!("rust-worker-{}-{millis}", std::process::id())
 }
 
-/// The base URL without userinfo, query or fragment, for log messages.
+/// Only the endpoint origin, since base paths can contain namespace identities
+/// or proxy credentials that must not appear in logs.
 fn tls_warning_endpoint(base_url: &str) -> String {
     match reqwest::Url::parse(base_url) {
-        Ok(mut url) => {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.set_query(None);
-            url.set_fragment(None);
-            url.to_string()
-        }
+        Ok(url) => url.origin().ascii_serialization(),
         Err(_) => "<unparseable base URL>".to_string(),
     }
 }
