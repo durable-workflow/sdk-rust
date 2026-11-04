@@ -64,10 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     match mode.as_str() {
         "worker" => {
+            let capacity: usize = std::env::var("SDK_BENCH_CAPACITY")
+                .unwrap_or_else(|_| "16".into())
+                .parse()?;
+            if !(1..=16).contains(&capacity) {
+                return Err("benchmark capacity must be 1..16".into());
+            }
             let mut worker = Worker::new(client, queue)
                 .worker_id(format!("latency-{}", Uuid::new_v4()))
-                .max_concurrent_workflow_tasks(16)
-                .max_concurrent_activity_tasks(16);
+                .max_concurrent_workflow_tasks(capacity)
+                .max_concurrent_activity_tasks(capacity);
             worker.register_typed_activity("bench.echo", |_ctx, payload: String| async move {
                 Ok::<String, Error>(payload)
             });
@@ -88,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!(
                 "{}",
-                json!({"mode":"worker", "requests":requests.summary()})
+                json!({"mode":"worker", "capacity":capacity, "requests":requests.summary()})
             );
         }
         "drive" => {

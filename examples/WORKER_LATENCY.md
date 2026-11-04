@@ -4,6 +4,8 @@
 It uses 16 workflow slots and 16 activity slots. The driver warms up with five
 sequential workflows, then measures twenty, checking every typed result and
 polling for results every 5 ms. It prints samples, p50/p95 and SDK route metrics.
+`SDK_BENCH_CAPACITY` can select 1..16 slots for a separate poll-topology
+diagnostic. Report that capacity explicitly; the default comparison uses 16.
 
 Use a disposable Server and database. Set `DURABLE_WORKFLOW_SERVER_URL`,
 `DURABLE_WORKFLOW_TOKEN` to fixture authentication, and a unique `TASK_QUEUE`.
