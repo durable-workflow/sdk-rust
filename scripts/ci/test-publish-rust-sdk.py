@@ -691,7 +691,7 @@ class PublishRustSdkContractTest(unittest.TestCase):
         self.assertEqual({"publish"}, {call["phase"] for call in with_credential})
         self.assertEqual({"metadata", "publish"}, {call["argv"][0] for call in with_credential})
         [upload] = [call for call in calls if call["argv"][0] == "publish"]
-        self.assertTrue({"--locked", "--no-verify"} <= set(upload["argv"]))
+        self.assertLessEqual({"--locked", "--no-verify"}, set(upload["argv"]))
         packages = {call["phase"]: call["argv"] for call in calls if call["argv"][0] == "package"}
         self.assertNotIn("--no-verify", packages["gate"])  # the verify build runs credential-free
         self.assertIn("--no-verify", packages["preflight"])
@@ -1238,6 +1238,76 @@ class PublishRustSdkContractTest(unittest.TestCase):
                         release.index("- name: Create the source GitHub Release"))
         self.assertIsNone(re.search(r"\bcargo (build|test|run|check|package|publish)\b", release))
 
+    @staticmethod
+    def _step_run(step: str) -> str:
+        """A step's run command, with block lines and continuations joined."""
+        match = re.search(r"^        run: (.*)$", step, flags=re.MULTILINE)
+        if match is None:
+            return ""
+        if match.group(1).strip() != "|":
+            return match.group(1).strip()
+        lines = []
+        for line in step[match.end():].splitlines()[1:]:
+            if line.strip() and not line.startswith("          "):
+                break
+            lines.append(line.strip())
+        return re.sub(r"\s+", " ", " ".join(lines).replace("\\ ", " ")).strip()
+
+    # F5: the tagged tree is data. Only the maintained entrypoints run with it
+    # as the working directory; the installer and other steps never do.
+    TAGGED_TREE_ENTRYPOINTS = {
+        "gate": {"../release-tools/scripts/ci/publish-rust-sdk.sh gate"},
+        "publish": {"../scripts/ci/publish-rust-sdk.sh preflight", "../scripts/ci/publish-rust-sdk.sh publish"},
+        "verify": {"../release-tools/scripts/ci/publish-rust-sdk.sh verify"},
+        "release": {'python3 -I ../release-tools/scripts/ci/release_package.py --release-notes "$RELEASE_TAG" '
+                    '> "${RUNNER_TEMP}/rust-sdk-release-notes.md"'},
+    }
+    MAINTAINED_INSTALLER = {
+        "gate": "release-tools/scripts/ci/install-release-tooling.sh",
+        "publish": "scripts/ci/install-release-tooling.sh",
+        "verify": "release-tools/scripts/ci/install-release-tooling.sh",
+        "release": "release-tools/scripts/ci/install-release-tooling.sh",
+    }
+
+    def test_tagged_tree_working_directory_runs_only_maintained_entrypoints(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        # A defaults block would set a working directory no step declares.
+        self.assertNotIn("defaults:", workflow)
+        jobs = self._workflow_jobs()
+        self.assertEqual(set(self.TAGGED_TREE_ENTRYPOINTS), set(jobs))
+        for name, job in jobs.items():
+            observed = set()
+            for step in self._steps(job):
+                directories = re.findall(r"^        working-directory: (.*)$", step, flags=re.MULTILINE)
+                if not directories:
+                    continue
+                with self.subTest(job=name, step=step.split("\n", 1)[0]):
+                    self.assertEqual(["release-source"], directories)
+                    self.assertNotIn("\n        uses: ", step)
+                    command = self._step_run(step)
+                    self.assertIn(command, self.TAGGED_TREE_ENTRYPOINTS[name])
+                    observed.add(command)
+            with self.subTest(job=name):
+                # Every allowlisted entrypoint is still present: the list matches the workflow.
+                self.assertEqual(self.TAGGED_TREE_ENTRYPOINTS[name], observed)
+                [installer] = [step for step in self._steps(job) if "install-release-tooling.sh" in step]
+                self.assertNotIn("working-directory:", installer)
+                self.assertEqual(f'{self.MAINTAINED_INSTALLER[name]} "${{RUNNER_TEMP}}/release-tooling"',
+                                 self._step_run(installer))
+
+    def test_tagged_tree_python_runs_isolated(self) -> None:
+        publish = PUBLISH.read_text(encoding="utf-8")
+        invocations = re.findall(r"\bpython3\b[^\n]*", publish)
+        interpreters = [line for line in invocations if not line.startswith("python3 rustc")]
+        self.assertGreater(len(interpreters), 5)
+        for line in interpreters:
+            with self.subTest(line=line):
+                self.assertTrue(line.startswith("python3 -I "), line)
+        installer = RELEASE_TOOLING_INSTALLER.read_text(encoding="utf-8")
+        for line in re.findall(r"^python3\b[^\n]*", installer, flags=re.MULTILINE):
+            with self.subTest(line=line):
+                self.assertTrue(line.startswith("python3 -I -m "), line)
+
 
 class ReleaseToolingInstallerTrustTest(unittest.TestCase):
     def test_isolated_tools_use_the_bootstrapped_pip_client(self) -> None:
@@ -1255,7 +1325,7 @@ class ReleaseToolingInstallerTrustTest(unittest.TestCase):
                 arguments = sys.argv[1:]
                 with pathlib.Path(os.environ["INSTALLER_CALLS"]).open("a") as handle:
                     handle.write(json.dumps(arguments) + "\\n")
-                if arguments[:2] == ["-m", "venv"]:
+                if arguments[:3] == ["-I", "-m", "venv"]:
                     binary_directory = pathlib.Path(arguments[-1]) / "bin"
                     binary_directory.mkdir(parents=True)
                     bundled = binary_directory / "python"
@@ -1273,11 +1343,54 @@ class ReleaseToolingInstallerTrustTest(unittest.TestCase):
             )
             self.assertEqual(0, result.returncode, result.stderr)
             calls = [json.loads(line) for line in calls_file.read_text().splitlines()]
-            self.assertEqual(["-m", "venv", "--without-pip", str(venv)], calls[0])
+            self.assertEqual(["-I", "-m", "venv", "--without-pip", str(venv)], calls[0])
             self.assertEqual(["-I", "-m", "pip", "--python", str(venv / "bin/python")], calls[1][:5])
             self.assertIn("--require-hashes", calls[1])
             self.assertIn("--only-binary=:all:", calls[1])
             self.assertEqual(str(venv / "bin") + "\n", github_path.read_text())
+
+    def test_working_directory_cannot_shadow_the_venv_module(self) -> None:
+        """A venv/ package or stdlib-shadowing module in the caller's working
+        directory (the tagged tree, before F5) never runs in the installer."""
+        planted = {
+            "venv-package": {"venv/__init__.py"},
+            "stdlib-shadow": {"shutil.py"},
+        }
+        for case, files in planted.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker = root / "planted-code-ran"
+                hostile = root / "tagged-tree"
+                for relative in files:
+                    path = hostile / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(f"open({str(marker)!r}, 'w').write('ran')\n", encoding="utf-8")
+                command_directory = root / "bin"
+                command_directory.mkdir()
+                # The real interpreter creates the venv exactly as invoked; only
+                # the networked, hash-locked dependency install is stubbed.
+                wrapper = command_directory / "python3"
+                wrapper.write_text(textwrap.dedent("""\
+                    #!/bin/sh
+                    case " $* " in
+                        *" -m pip "*) exit 0 ;;
+                    esac
+                    exec "$INSTALLER_REAL_PYTHON" "$@"
+                    """), encoding="utf-8")
+                wrapper.chmod(0o755)
+                venv = root / "tools"
+                github_path = root / "github-path"
+                result = subprocess.run(
+                    ["bash", str(RELEASE_TOOLING_INSTALLER), str(venv)], cwd=hostile,
+                    env={**os.environ, "PATH": f"{command_directory}:{os.environ['PATH']}",
+                         "INSTALLER_REAL_PYTHON": sys.executable, "GITHUB_PATH": str(github_path)},
+                    capture_output=True, text=True, check=False, timeout=60,
+                )
+                self.assertFalse(marker.exists(), "working-directory code ran in the installer")
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertTrue((venv / "pyvenv.cfg").is_file(), result.stderr)
+                self.assertTrue(os.access(venv / "bin" / "python", os.X_OK))
+                self.assertEqual(str(venv / "bin") + "\n", github_path.read_text())
 
 
 class RegistryHttpsTest(unittest.TestCase):

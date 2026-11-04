@@ -35,6 +35,10 @@ concurrency:
 #   verify  - no credential: registry, approval and tag readback, then the
 #             fresh-consumer build.
 #   release - GitHub release notes and release, after verification.
+# The tagged tree (release-source) is data. A step runs with it as the working
+# directory only to invoke the maintained publish-rust-sdk.sh or
+# release_package.py, and every interpreter there runs isolated (-I). Tool
+# installation and other steps run from a maintained checkout or the workspace.
 jobs:
   gate:
     name: Gate the approved package (no publication credential)
@@ -69,7 +73,6 @@ jobs:
           persist-credentials: false
 
       - name: Resolve exact release identity
-        working-directory: release-source
         env:
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
           REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
@@ -84,8 +87,8 @@ jobs:
               "$REQUESTED_RELEASE_COMMIT" >&2
             exit 1
           fi
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
           if [[ "$tag_commit" != "$head_commit" ]]; then
             printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
               "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
@@ -112,8 +115,7 @@ jobs:
           clients: pip,python,cargo,curl,git
 
       - name: Install hash-locked release tooling
-        working-directory: release-source
-        run: ../release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+        run: release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
@@ -225,7 +227,6 @@ jobs:
           persist-credentials: false
 
       - name: Resolve exact release identity
-        working-directory: release-source
         env:
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
           REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
@@ -240,8 +241,8 @@ jobs:
               "$REQUESTED_RELEASE_COMMIT" >&2
             exit 1
           fi
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
           if [[ "$tag_commit" != "$head_commit" ]]; then
             printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
               "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
@@ -268,8 +269,7 @@ jobs:
           clients: pip,python,cargo,curl,git
 
       - name: Install hash-locked release tooling
-        working-directory: release-source
-        run: ../scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
@@ -342,7 +342,6 @@ jobs:
           persist-credentials: false
 
       - name: Resolve exact release identity
-        working-directory: release-source
         env:
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
           REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
@@ -357,8 +356,8 @@ jobs:
               "$REQUESTED_RELEASE_COMMIT" >&2
             exit 1
           fi
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
           if [[ "$tag_commit" != "$head_commit" ]]; then
             printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
               "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
@@ -385,8 +384,7 @@ jobs:
           clients: pip,python,cargo,curl,git
 
       - name: Install hash-locked release tooling
-        working-directory: release-source
-        run: ../release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+        run: release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
@@ -438,7 +436,6 @@ jobs:
           persist-credentials: false
 
       - name: Resolve exact release identity
-        working-directory: release-source
         env:
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
           REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
@@ -453,8 +450,8 @@ jobs:
               "$REQUESTED_RELEASE_COMMIT" >&2
             exit 1
           fi
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
           if [[ "$tag_commit" != "$head_commit" ]]; then
             printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
               "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
@@ -481,18 +478,17 @@ jobs:
           clients: pip,python,cargo,curl,git
 
       - name: Install hash-locked release tooling
-        working-directory: release-source
-        run: ../release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+        run: release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Prepare exact source release notes
         working-directory: release-source
         run: |
-          python3 ../release-tools/scripts/ci/release_package.py \
+          python3 -I ../release-tools/scripts/ci/release_package.py \
             --release-notes "$RELEASE_TAG" > "${RUNNER_TEMP}/rust-sdk-release-notes.md"
 
       - name: Create the source GitHub Release
-        working-directory: release-source
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

@@ -70,8 +70,10 @@ fi
 
 # The manifest and changelog must be regular files inside the release checkout
 # (the working directory): relative, no '..', no symbolic links, no escape.
+# The working directory is the tagged tree, so every interpreter here runs
+# isolated (-I): neither that tree nor PYTHON* variables can add import paths.
 source_root="$(pwd -P)"
-if ! python3 "$script_dir/release_package.py" --check-paths --source-root "$source_root" \
+if ! python3 -I "$script_dir/release_package.py" --check-paths --source-root "$source_root" \
     --manifest "$manifest_path" --changelog "$changelog_path" >/dev/null; then
     printf 'Rust SDK manifest and changelog must be regular files inside the release checkout\n' >&2
     exit 1
@@ -483,7 +485,7 @@ if [[ ! -f "$lockfile_path" || -L "$lockfile_path" ]]; then
         "$version_response")" || \
        ! crates_io_request --fail --silent --show-error --location \
         --header "User-Agent: ${user_agent}" --output "$published_archive" "$download_url" || \
-       ! python3 "$script_dir/release_package.py" \
+       ! python3 -I "$script_dir/release_package.py" \
         --source-root "$source_root" --manifest "$manifest_path" --changelog "$changelog_path" \
         --archive-root "$tmp_dir" --archive "$(basename "$published_archive")" \
         --expected-vcs-commit "$release_commit" \
@@ -515,7 +517,7 @@ if [[ ! -f "$local_archive" ]]; then
 fi
 local_checksum="$(sha256sum "$local_archive" | awk '{print $1}')"
 local_identity="$tmp_dir/local-package-identity.json"
-if ! python3 "$script_dir/release_package.py" \
+if ! python3 -I "$script_dir/release_package.py" \
     --source-root "$source_root" \
     --manifest "$manifest_path" \
     --changelog "$changelog_path" \
@@ -548,7 +550,7 @@ fi
 if [[ "$approval_present" == "true" ]]; then
     packaging_cargo="$(cargo -V | awk '{print $2}')"
     local_approval="$tmp_dir/local-approval.json"
-    if ! python3 "$script_dir/release_package.py" \
+    if ! python3 -I "$script_dir/release_package.py" \
         --source-root "$source_root" \
         --manifest "$manifest_path" \
         --changelog "$changelog_path" \
@@ -745,7 +747,7 @@ if [[ "$local_checksum" != "$published_checksum" ]]; then
 fi
 
 published_identity="$tmp_dir/published-package-identity.json"
-if ! python3 "$script_dir/release_package.py" \
+if ! python3 -I "$script_dir/release_package.py" \
     --source-root "$source_root" \
     --manifest "$manifest_path" \
     --changelog "$changelog_path" \
@@ -770,7 +772,7 @@ if [[ "$published_archive_vcs_commit" != "$archive_vcs_commit" || \
 fi
 
 if [[ "$approval_status" == "reproduced" ]]; then
-    if ! python3 "$script_dir/release_package.py" \
+    if ! python3 -I "$script_dir/release_package.py" \
         --source-root "$source_root" \
         --manifest "$manifest_path" \
         --changelog "$changelog_path" \
@@ -803,7 +805,7 @@ if [[ "$source_tag_readback_commit" != "$release_commit" ]]; then
     exit 1
 fi
 
-if ! python3 "$script_dir/verify-fresh-consumer.py" \
+if ! python3 -I "$script_dir/verify-fresh-consumer.py" \
     registry --manifest "$manifest_path"; then
     write_evidence "failed" "published_fresh_consumer_msrv_build_failed" "true"
     exit 1
