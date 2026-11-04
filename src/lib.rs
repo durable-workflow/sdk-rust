@@ -15628,6 +15628,7 @@ impl Future for ConditionWaitCall {
             let mut pending_delivery = false;
             let mut first_sequence = None;
             let mut latest_timeout_seconds = None;
+            let mut previous_sequence = None;
             loop {
                 if cursor > initial_cursor
                     && matches!(
@@ -15681,7 +15682,16 @@ impl Future for ConditionWaitCall {
                 }
                 first_sequence.get_or_insert(sequence);
                 latest_timeout_seconds = timeout_seconds;
-                if result == Some(ConditionWaitResult::TimedOut) {
+                if result == Some(ConditionWaitResult::TimedOut)
+                    && !previous_sequence.is_some_and(|previous| {
+                        condition_wait_opened_before_timeout(
+                            &state.history_events,
+                            &occurrence_id,
+                            previous,
+                            sequence,
+                        )
+                    })
+                {
                     return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
                         "condition_wait_reopened_after_timeout",
                         Some(sequence),
@@ -15707,6 +15717,7 @@ impl Future for ConditionWaitCall {
                 if result.is_some() {
                     state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
                 }
+                previous_sequence = Some(sequence);
                 cursor += 1;
             }
             state.command_cursor = cursor;
@@ -15750,6 +15761,56 @@ impl Future for ConditionWaitCall {
 
         self.poll_open_condition(options, true)
     }
+}
+
+/// Whether the physical wait at `next` was opened while the one at `previous`
+/// was still open, so that a later timeout of `previous` belongs to an orphaned
+/// duplicate open rather than ending the logical wait (#192, sdk-php#283). A
+/// Server can record a second open of a still-open wait (server#1015); the
+/// first wait's timer then fires after the chain has moved on.
+fn condition_wait_opened_before_timeout(
+    history: &[HistoryEvent],
+    occurrence_id: &str,
+    previous: u64,
+    next: u64,
+) -> bool {
+    let opened = |sequence: u64| {
+        history.iter().position(|event| {
+            event.event_type == "ConditionWaitOpened"
+                && event.payload.get("sequence").and_then(Value::as_u64) == Some(sequence)
+                && event
+                    .payload
+                    .get("condition_wait_occurrence_id")
+                    .and_then(Value::as_str)
+                    == Some(occurrence_id)
+        })
+    };
+    let (Some(previous_open), Some(next_open)) = (opened(previous), opened(next)) else {
+        return false;
+    };
+    let previous_wait_id = history[previous_open]
+        .payload
+        .get("condition_wait_id")
+        .cloned();
+    let timed_out = history
+        .iter()
+        .position(|event| match event.event_type.as_str() {
+            "ConditionWaitTimedOut" => {
+                event.payload.get("sequence").and_then(Value::as_u64) == Some(previous)
+                    && event
+                        .payload
+                        .get("condition_wait_occurrence_id")
+                        .and_then(Value::as_str)
+                        == Some(occurrence_id)
+            }
+            "TimerFired" => {
+                event.payload.get("timer_kind").and_then(Value::as_str) == Some("condition_timeout")
+                    && previous_wait_id.is_some()
+                    && event.payload.get("condition_wait_id") == previous_wait_id.as_ref()
+            }
+            _ => false,
+        });
+    timed_out.is_some_and(|timed_out| next_open < timed_out)
 }
 
 /// The timeout for reopening a recorded logical condition wait: the authored
@@ -25118,6 +25179,135 @@ mod tests {
             Poll::Pending => Poll::Pending,
         };
         (poll, ctx.take_commands().expect("commands"))
+    }
+
+    fn decision_history(reopen: u64, orphan_fires_before_reopen: bool) -> Vec<HistoryEvent> {
+        let wait = |seq: u64, at: &str, timeout: u64| {
+            timed_event(
+                "ConditionWaitOpened",
+                at,
+                json!({
+                    "sequence": seq,
+                    "condition_wait_id": format!("condition:{seq}"),
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "decision-1",
+                    "condition_definition_fingerprint": "sha256:decision-v1",
+                    "timeout_seconds": timeout,
+                }),
+            )
+        };
+        let timer = |kind: &str, seq: u64, at: &str, delay: u64| {
+            timed_event(
+                kind,
+                at,
+                json!({
+                    "sequence": seq,
+                    "timer_id": format!("condition-timer:{seq}"),
+                    "timer_kind": "condition_timeout",
+                    "condition_wait_id": format!("condition:{seq}"),
+                    "delay_seconds": delay,
+                }),
+            )
+        };
+        let orphan_fire = timer("TimerFired", 1, "2026-11-04T04:12:36.956000+00:00", 300);
+        let mut history = vec![
+            wait(1, "2026-11-04T04:07:36.890000+00:00", 300),
+            timer("TimerScheduled", 1, "2026-11-04T04:07:36.891000+00:00", 300),
+        ];
+        if orphan_fires_before_reopen {
+            // Control: the first wait really timed out before the next open.
+            history.push(orphan_fire.clone());
+        }
+        history.extend([
+            wait(2, "2026-11-04T04:07:36.908000+00:00", 300),
+            timer("TimerScheduled", 2, "2026-11-04T04:07:36.909000+00:00", 300),
+            approval_signal("decision", "s1", "2026-11-04T04:09:36.979000+00:00"),
+            timed_event(
+                "ConditionWaitSatisfied",
+                "2026-11-04T04:09:37.008000+00:00",
+                json!({
+                    "sequence": 2,
+                    "condition_wait_id": "condition:2",
+                    "condition_wait_occurrence_id": "rust:condition-wait:0",
+                    "condition_key": "decision-1",
+                    "condition_definition_fingerprint": "sha256:decision-v1",
+                }),
+            ),
+            timer("TimerCancelled", 2, "2026-11-04T04:09:37.009000+00:00", 300),
+            wait(3, "2026-11-04T04:09:37.010000+00:00", reopen),
+            timer(
+                "TimerScheduled",
+                3,
+                "2026-11-04T04:09:37.011000+00:00",
+                reopen,
+            ),
+        ]);
+        if !orphan_fires_before_reopen {
+            history.push(orphan_fire);
+        }
+        history
+    }
+
+    fn poll_decision_wait(
+        history: Vec<HistoryEvent>,
+    ) -> (Poll<Result<ConditionWaitResult>>, Vec<Value>) {
+        let ctx = workflow_context(history);
+        let mut wait = Box::pin(
+            ctx.wait_condition(
+                ConditionWaitOptions::new("decision-1", "sha256:decision-v1")
+                    .timeout(Duration::from_secs(300)),
+                || Ok(false),
+            ),
+        );
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let poll = wait.as_mut().poll(&mut task_context);
+        (poll, ctx.take_commands().expect("commands"))
+    }
+
+    // #192 (sdk-php#283 shape): a duplicate open left the first wait orphaned;
+    // its timer firing later must not end the logical wait, because the next
+    // same-occurrence wait opened while it was still open.
+    #[test]
+    fn an_orphaned_duplicate_wait_timing_out_later_does_not_end_the_logical_wait() {
+        for reopen in [300, 180] {
+            // Only the orphan's timer has fired: the chain continues, and the
+            // deadline from the first open has passed, so it reopens with 0.
+            let (poll, commands) = poll_decision_wait(decision_history(reopen, false));
+            assert!(matches!(poll, Poll::Pending), "reopen {reopen}: {poll:?}");
+            assert_eq!(commands.len(), 1, "reopen {reopen}: {commands:?}");
+            assert_eq!(commands[0]["type"], json!("open_condition_wait"));
+            assert_eq!(commands[0]["timeout_seconds"], json!(0), "reopen {reopen}");
+
+            // The reopened wait's own timer fires as well: the logical wait
+            // times out, as the workflow intended.
+            let mut history = decision_history(reopen, false);
+            history.push(timed_event(
+                "TimerFired",
+                "2026-11-04T04:12:37.216000+00:00",
+                json!({
+                    "sequence": 3,
+                    "timer_id": "condition-timer:3",
+                    "timer_kind": "condition_timeout",
+                    "condition_wait_id": "condition:3",
+                    "delay_seconds": reopen,
+                }),
+            ));
+            let (poll, commands) = poll_decision_wait(history);
+            assert!(
+                matches!(poll, Poll::Ready(Ok(ConditionWaitResult::TimedOut))),
+                "reopen {reopen}: {poll:?}"
+            );
+            assert!(commands.is_empty());
+        }
+
+        // A genuine timeout before the next open still ends the wait: reopening
+        // it is non-deterministic.
+        let (poll, _) = poll_decision_wait(decision_history(300, true));
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) = poll else {
+            panic!("a reopen after a real timeout must fail replay: {poll:?}");
+        };
+        assert_eq!(failure.reason, "condition_wait_reopened_after_timeout");
+        assert_eq!(failure.sequence, Some(2));
     }
 
     // A separate wait after a timed-out one is its own logical wait: it
