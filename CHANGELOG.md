@@ -4,7 +4,7 @@
 
 - Reuse worker-authenticated activity lease capability observations instead of
   fetching `/cluster/info` for every activity (#199). Client clones share one
-  discovery when needed and refresh after a failed renewal. Original claim,
+  discovery when needed and refresh only after an explicit capability refusal. Original claim,
   ownership and deadline validation still apply to every renewal.
 
 - Add a public raw request API for tools that must reach every Server route
