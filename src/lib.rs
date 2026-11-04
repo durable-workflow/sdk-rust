@@ -17715,8 +17715,9 @@ fn recorded_commands(
     Ok(commands)
 }
 
-/// Within a run of grouped condition waits from one parallel group, move each
-/// physical reopen directly after the earlier waits of the same member.
+/// Within a run of commands from one parallel group, move each physical
+/// condition reopen directly after the earlier waits of the same member; other
+/// leaves keep their place.
 ///
 /// Members replay in order from one shared cursor, and a member's chain reads
 /// only adjacent commands. When several members are woken in one task, the
@@ -17724,6 +17725,73 @@ fn recorded_commands(
 /// chain would stop at its sibling and leave reopens unconsumed (#191).
 /// Outcomes are looked up by sequence and occurrence, so only consumption order
 /// changes.
+fn group_condition_reopens_by_member(commands: Vec<RecordedCommand>) -> Vec<RecordedCommand> {
+    // Every leaf of a group belongs to the run; a condition member is keyed by
+    // its occurrence so its reopens join it, any other leaf by its sequence so
+    // it keeps its place (#194: a timer between condition members).
+    fn grouped_member(command: &RecordedCommand) -> Option<(String, String)> {
+        let (path, member) = match command {
+            RecordedCommand::ConditionWait {
+                occurrence_id,
+                parallel_group_path: Some(path),
+                ..
+            } => (path, format!("condition:{occurrence_id}")),
+            RecordedCommand::Activity {
+                parallel_group_path: Some(path),
+                ..
+            }
+            | RecordedCommand::Timer {
+                parallel_group_path: Some(path),
+                ..
+            }
+            | RecordedCommand::ChildWorkflow {
+                parallel_group_path: Some(path),
+                ..
+            }
+            | RecordedCommand::SignalWait {
+                parallel_group_path: Some(path),
+                ..
+            } => (path, format!("leaf:{}", command.sequence())),
+            _ => return None,
+        };
+        path.first()
+            .map(|entry| (entry.parallel_group_id.clone(), member))
+    }
+    let mut ordered = Vec::with_capacity(commands.len());
+    let mut run: Vec<RecordedCommand> = Vec::new();
+    let mut run_group: Option<String> = None;
+    let flush = |run: &mut Vec<RecordedCommand>, ordered: &mut Vec<RecordedCommand>| {
+        let mut members: Vec<(String, Vec<RecordedCommand>)> = Vec::new();
+        for command in run.drain(..) {
+            let occurrence = grouped_member(&command)
+                .map(|(_, occurrence)| occurrence)
+                .unwrap_or_default();
+            match members.iter_mut().find(|(member, _)| *member == occurrence) {
+                Some((_, chain)) => chain.push(command),
+                None => members.push((occurrence, vec![command])),
+            }
+        }
+        ordered.extend(members.into_iter().flat_map(|(_, chain)| chain));
+    };
+    for command in commands {
+        match grouped_member(&command) {
+            Some((group, _)) if run_group.as_deref() == Some(group.as_str()) => run.push(command),
+            Some((group, _)) => {
+                flush(&mut run, &mut ordered);
+                run_group = Some(group);
+                run.push(command);
+            }
+            None => {
+                flush(&mut run, &mut ordered);
+                run_group = None;
+                ordered.push(command);
+            }
+        }
+    }
+    flush(&mut run, &mut ordered);
+    ordered
+}
+
 /// A two-member condition group where only member `a` was reopened:
 /// a1 (seq 1), b1 (seq 2), a1 satisfied, a2 (seq 3). Replay consumes it as
 /// a1, a2, b1, so the last recorded command is not the highest sequence.
@@ -17768,54 +17836,6 @@ impl WorkflowState {
             .max()
             .unwrap_or(0)
     }
-}
-
-fn group_condition_reopens_by_member(commands: Vec<RecordedCommand>) -> Vec<RecordedCommand> {
-    fn grouped_member(command: &RecordedCommand) -> Option<(String, String)> {
-        match command {
-            RecordedCommand::ConditionWait {
-                occurrence_id,
-                parallel_group_path: Some(path),
-                ..
-            } => path
-                .first()
-                .map(|entry| (entry.parallel_group_id.clone(), occurrence_id.clone())),
-            _ => None,
-        }
-    }
-    let mut ordered = Vec::with_capacity(commands.len());
-    let mut run: Vec<RecordedCommand> = Vec::new();
-    let mut run_group: Option<String> = None;
-    let flush = |run: &mut Vec<RecordedCommand>, ordered: &mut Vec<RecordedCommand>| {
-        let mut members: Vec<(String, Vec<RecordedCommand>)> = Vec::new();
-        for command in run.drain(..) {
-            let occurrence = grouped_member(&command)
-                .map(|(_, occurrence)| occurrence)
-                .unwrap_or_default();
-            match members.iter_mut().find(|(member, _)| *member == occurrence) {
-                Some((_, chain)) => chain.push(command),
-                None => members.push((occurrence, vec![command])),
-            }
-        }
-        ordered.extend(members.into_iter().flat_map(|(_, chain)| chain));
-    };
-    for command in commands {
-        match grouped_member(&command) {
-            Some((group, _)) if run_group.as_deref() == Some(group.as_str()) => run.push(command),
-            Some((group, _)) => {
-                flush(&mut run, &mut ordered);
-                run_group = Some(group);
-                run.push(command);
-            }
-            None => {
-                flush(&mut run, &mut ordered);
-                run_group = None;
-                ordered.push(command);
-            }
-        }
-    }
-    flush(&mut run, &mut ordered);
-    ordered
 }
 
 fn required_version_i32(payload: &Value, field: &str, sequence: u64) -> Result<i32> {
@@ -24736,6 +24756,25 @@ mod tests {
             vec![1, 2, 3, 4]
         );
 
+        // A timer of the same group between condition members keeps its place
+        // while each condition member's reopens join it (#194):
+        // a1 t b1 a2 b2 -> a1 a2 t b1 b2.
+        assert_eq!(
+            order(vec![
+                grouped_wait(1, 1, 3, 0),
+                RecordedCommand::Timer {
+                    sequence: 2,
+                    delay_seconds: 5,
+                    fired: false,
+                    parallel_group_path: Some(vec![parallel_group_entry(1, 3, 1, "condition")]),
+                },
+                grouped_wait(3, 1, 3, 2),
+                grouped_wait(4, 1, 3, 0),
+                grouped_wait(5, 1, 3, 2),
+            ]),
+            vec![1, 4, 2, 3, 5]
+        );
+
         // Two different groups interleaved never merge into one run.
         assert_eq!(
             order(vec![
@@ -24832,6 +24871,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    // #194: a timer member between two condition members. The Server reopens
+    // both condition members (votes 1, timer 2, approvals 3, votes 4,
+    // approvals 5); each member must still consume its own reopen.
+    #[test]
+    fn a_timer_between_grouped_condition_members_does_not_strand_their_reopens() {
+        let group = |index: u64| {
+            json!({
+                "parallel_group_id": "parallel-calls:1:3",
+                "parallel_group_kind": "mixed",
+                "parallel_group_base_sequence": 1,
+                "parallel_group_size": 3,
+                "parallel_group_index": index,
+            })
+        };
+        let member = |event_type: &str, sequence: u64, index: u64, key: &str, at: &str| {
+            let mut payload = group(index);
+            payload["sequence"] = json!(sequence);
+            payload["condition_wait_id"] = json!(format!("condition:{sequence}"));
+            payload["condition_wait_occurrence_id"] = json!(format!(
+                "rust:condition-wait:{}",
+                if index == 0 { 0 } else { 1 }
+            ));
+            payload["condition_key"] = json!(key);
+            payload["condition_definition_fingerprint"] = json!(format!("sha256:{key}-v1"));
+            payload["timeout_seconds"] = json!(300);
+            timed_event(event_type, at, payload)
+        };
+        let timer = |event_type: &str, at: &str| {
+            let mut payload = group(1);
+            payload["sequence"] = json!(2);
+            payload["timer_id"] = json!("timer-2");
+            payload["delay_seconds"] = json!(5);
+            timed_event(event_type, at, payload)
+        };
+        let history = vec![
+            member(
+                "ConditionWaitOpened",
+                1,
+                0,
+                "votes",
+                "2026-11-04T03:55:10.900000+00:00",
+            ),
+            timer("TimerScheduled", "2026-11-04T03:55:10.901000+00:00"),
+            member(
+                "ConditionWaitOpened",
+                3,
+                2,
+                "approvals",
+                "2026-11-04T03:55:10.902000+00:00",
+            ),
+            timer("TimerFired", "2026-11-04T03:55:15.901000+00:00"),
+            approval_signal("vote", "v1", "2026-11-04T03:55:16.000000+00:00"),
+            member(
+                "ConditionWaitSatisfied",
+                1,
+                0,
+                "votes",
+                "2026-11-04T03:55:16.100000+00:00",
+            ),
+            member(
+                "ConditionWaitOpened",
+                4,
+                0,
+                "votes",
+                "2026-11-04T03:55:16.101000+00:00",
+            ),
+            member(
+                "ConditionWaitOpened",
+                5,
+                2,
+                "approvals",
+                "2026-11-04T03:55:16.102000+00:00",
+            ),
+            approval_signal("vote", "v2", "2026-11-04T03:55:30.000000+00:00"),
+            approval_signal("approve", "a1", "2026-11-04T03:55:30.100000+00:00"),
+        ];
+        let ctx = workflow_context(history);
+        let votes = ctx.clone();
+        let approvals = ctx.clone();
+        let mut group = Box::pin(ctx.parallel(vec![
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("votes", "sha256:votes-v1")
+                    .timeout(Duration::from_secs(300)),
+                move || Ok(votes.signals("vote")?.len() >= 2),
+            ),
+            ParallelOperation::timer(Duration::from_secs(5)),
+            ParallelOperation::condition(
+                ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
+                    .timeout(Duration::from_secs(300)),
+                move || Ok(approvals.signals("approve")?.len() >= 1),
+            ),
+        ]));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        let poll = group.as_mut().poll(&mut task_context);
+        let Poll::Ready(Ok(results)) = poll else {
+            panic!("the group must complete: {poll:?}");
+        };
+        assert_eq!(results.len(), 3);
+        ctx.ensure_history_consumed()
+            .expect("every member consumes its own reopen");
+        assert!(ctx.take_commands().expect("commands").is_empty());
     }
 
     // #191: the PHP Server 2.11.8 history for two condition members woken by

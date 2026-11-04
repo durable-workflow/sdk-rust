@@ -484,6 +484,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.grouped-condition-timed-reopen"
             | "corpus.selected-condition-timed-reopen"
             | "corpus.two-member-condition-group"
+            | "corpus.timer-separated-condition-group"
             | "corpus.cancellation-remaining-condition"
             | "corpus.durable-selection"
             | "corpus.durable-selection-portable-affinity"
@@ -780,6 +781,27 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 ])
                 .await?;
                 Ok(json!(context.remaining()?.as_secs_f64()))
+            });
+        }
+        "corpus.timer-separated-condition-group" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let votes = ctx.clone();
+                let approvals = ctx.clone();
+                ctx.parallel(vec![
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("votes", "sha256:votes-v1")
+                            .timeout(Duration::from_secs(300)),
+                        move || Ok(votes.signals("vote")?.len() >= 2),
+                    ),
+                    ParallelOperation::timer(Duration::from_secs(5)),
+                    ParallelOperation::condition(
+                        ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
+                            .timeout(Duration::from_secs(300)),
+                        move || Ok(approvals.signals("approve")?.len() >= 1),
+                    ),
+                ])
+                .await?;
+                Ok(json!("both"))
             });
         }
         "corpus.two-member-condition-group" => {

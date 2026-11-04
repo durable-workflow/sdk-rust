@@ -29,13 +29,13 @@
   still open, the next open is a repeated open. So an orphaned duplicate whose
   timer fires later no longer fails replay with
   `condition_wait_reopened_after_timeout` (the sdk-php#283 shape). On PHP
-  Server 2.x, condition members of one `parallel` or `select` group whose waits
-  are recorded next to each other, woken by one signal, no longer fail the next
-  task with `condition_wait_group_reopen_mismatch`, and each member consumes
-  its own reopen. A group whose condition waits are separated by another of its
-  members (for example a timer) is not covered yet. A wait that timed out
-  before the next open still ends it. Both histories were refused by 4.11.1 as
-  well.
+  Server 2.x, condition members of one `parallel` or `select` group woken by
+  one signal no longer fail the next task with
+  `condition_wait_group_reopen_mismatch`, and each member consumes its own
+  reopen, including when another member such as a timer sits between them
+  (#194). A pending scope cancellation over such a group selects its original
+  members by sequence. A wait that timed out before the next open still ends
+  it. Both histories were refused by 4.11.1 as well.
 
 ## 4.11.2
 
