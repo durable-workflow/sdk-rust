@@ -73,6 +73,9 @@ impl FixtureServer {
             while !server_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS/BSD accepted sockets inherit the listener's O_NONBLOCK.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                         handle_request(
                             &mut stream,
                             &server_requests,
