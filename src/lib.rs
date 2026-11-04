@@ -17919,13 +17919,29 @@ fn recorded_condition_group_path(
         return recorded_parallel_group_path(condition_events, sequence);
     }
     let reopened_path = recorded_parallel_group_path(condition_events, authored_sequence)?;
-    let identity_matches = [
-        "condition_key",
-        "condition_definition_fingerprint",
-        "timeout_seconds",
-    ]
-    .iter()
-    .all(|field| opened.payload.get(*field) == original.payload.get(*field));
+    // A reopen carries the time remaining since the original open (#187), so
+    // its timeout may be smaller than the original's, never larger.
+    let timeout_matches = match (
+        opened
+            .payload
+            .get("timeout_seconds")
+            .filter(|value| !value.is_null()),
+        original
+            .payload
+            .get("timeout_seconds")
+            .filter(|value| !value.is_null()),
+    ) {
+        (None, None) => true,
+        (Some(reopened), Some(original)) => reopened
+            .as_u64()
+            .zip(original.as_u64())
+            .is_some_and(|(reopened, original)| reopened <= original),
+        _ => false,
+    };
+    let identity_matches = timeout_matches
+        && ["condition_key", "condition_definition_fingerprint"]
+            .iter()
+            .all(|field| opened.payload.get(*field) == original.payload.get(*field));
     let previous = originals
         .iter()
         .copied()
@@ -24442,6 +24458,64 @@ mod tests {
                 history_event(event["event_type"].as_str().unwrap(), payload)
             })
             .collect()
+    }
+
+    // #187: a grouped reopen carries the remaining time, so the next task must
+    // accept a smaller recorded timeout and still refuse a larger or missing one.
+    #[test]
+    fn grouped_condition_reopen_accepts_a_remaining_time_timeout() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/grouped-condition-physical-reopen.json"
+        ))
+        .expect("grouped condition fixture");
+        let mut original = fixture["history"]
+            .as_array()
+            .expect("fixture history")
+            .clone();
+        for index in [1, 2, 3] {
+            original[index]["payload"]["timeout_seconds"] = json!(30);
+        }
+        let decode = |events: &[Value]| {
+            let history = events
+                .iter()
+                .map(|event| {
+                    history_event(
+                        event["event_type"].as_str().unwrap(),
+                        event["payload"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            recorded_commands(
+                &history,
+                DEFAULT_CODEC,
+                WorkflowIdentity {
+                    workflow_id: None,
+                    run_id: None,
+                },
+            )
+        };
+        assert!(
+            decode(&original).is_ok(),
+            "full-timeout reopen still replays"
+        );
+        for (reopen, accepted) in [
+            (json!(18), true),
+            (json!(0), true),
+            (json!(31), false),
+            (Value::Null, false),
+        ] {
+            let mut changed = original.clone();
+            changed[3]["payload"]["timeout_seconds"] = reopen.clone();
+            let result = decode(&changed);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "reopen timeout {reopen}: {result:?}"
+            );
+            if let Err(Error::NonDeterministicReplay(failure)) = result {
+                assert_eq!(failure.reason, "condition_wait_group_reopen_mismatch");
+            }
+        }
     }
 
     #[test]

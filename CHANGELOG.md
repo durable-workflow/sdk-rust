@@ -9,7 +9,8 @@
   non-matching signal pushed the deadline back. The worker now reopens with
   the time remaining since the first `ConditionWaitOpened`, rounded up to whole
   seconds and never below zero; a reopen after the deadline opens with a zero
-  timeout so the Server resolves it as timed out. Histories whose reopens
+  timeout so the Server resolves it as timed out. This applies to condition
+  waits inside `parallel` and `select` groups too. Histories whose reopens
   carry the full timeout still replay, and a reopen longer than the authored
   timeout is still refused. A reopen links only to the same logical wait
   (`condition_wait_occurrence_id`), so a separate wait that follows a timed-out
