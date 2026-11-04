@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- A `wait_condition` timeout now runs from the first time the wait opens
+  (#187, parity with sdk-php#269). The Server wakes an open condition wait on
+  any signal and records it satisfied. When the predicate was still false, the
+  worker reopened the wait with the full `timeout_seconds`, so each
+  non-matching signal pushed the deadline back. The worker now reopens with
+  the time remaining since the first `ConditionWaitOpened`, rounded up to whole
+  seconds and never below zero; a reopen after the deadline opens with a zero
+  timeout so the Server resolves it as timed out. A condition wait inside a
+  `parallel` or `select` group reopens with its authored timeout, as sdk-php
+  does, because the PHP Server accepts a grouped reopen only when its timeout
+  equals the original open's (#189). Histories whose reopens
+  carry the full timeout still replay, and a reopen longer than the authored
+  timeout is still refused. A reopen links only to the same logical wait
+  (`condition_wait_occurrence_id`), so a separate wait that follows a timed-out
+  one measures from its own open. This needs no Server change. Rolling deploys
+  and rollback: workers on 4.11.1 or earlier refuse a history whose reopen
+  records less than the authored timeout (`condition_wait_timeout_mismatch`),
+  so keep those runs on fixed workers.
+- Parse JSON floats with correct rounding by enabling serde_json's
+  `float_roundtrip` feature (#181). Without it, some 16 to 17
+  significant-digit doubles in Server JSON decoded one ULP off, for example
+  `1.4820142857142857` became `1.4820142857142855`. Replay compared those
+  values with the workflow's own floats, so a recorded float search attribute
+  could fail as `search_attribute_value_mismatch`. Other JSON numbers read
+  from Server responses and history had the same drift. Avro payloads
+  (arguments, results, memos, query and update values) carry binary doubles
+  and were not affected. Cargo unifies features, so this applies to every
+  serde_json user in a worker binary; float parsing is slightly slower.
 - Qualify replay of Workflow 2.19 redrive successors that reuse
   `MemoUpserted`, `SearchAttributesUpserted` or an applied signal wait
   (`SignalWaitOpened`, `SignalReceived`, `SignalApplied`). Values replay

@@ -135,7 +135,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustls-webpki = { version = "0.103.16", default-features = false }
 webpki-roots = { version = "1.0.10", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Correctly rounded float parsing, so doubles in Server JSON keep their exact
+# digits (#181). Cargo unifies features across a worker binary.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde-value = "0.7"
 sha2 = "0.10"
 thiserror = "1"
