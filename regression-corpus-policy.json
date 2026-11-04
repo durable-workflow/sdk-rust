@@ -54,6 +54,7 @@
             "History",
             "history",
             "fn continue_as_new_command\\b",
+            "fn group_condition_reopens_by_member\\b",
             "impl<T: PartialEq> RecordedSnapshotValue<T>",
             "impl ActivityRetrySnapshot",
             "fn recorded_optional_(?:u64|string)\\b",

@@ -1,0 +1,172 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-timer-separated-condition-group-server-reopen",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.timer-separated-condition-group",
+    "payload_codec": "avro",
+    "input": []
+  },
+  "history": [
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T03:55:10.900000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 0,
+        "sequence": 1,
+        "condition_wait_id": "condition:1",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "votes",
+        "condition_definition_fingerprint": "sha256:votes-v1",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "event_type": "TimerScheduled",
+      "timestamp": "2026-11-04T03:55:10.901000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 1,
+        "sequence": 2,
+        "timer_id": "timer-2",
+        "delay_seconds": 5
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T03:55:10.902000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 2,
+        "sequence": 3,
+        "condition_wait_id": "condition:3",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "condition_key": "approvals",
+        "condition_definition_fingerprint": "sha256:approvals-v1",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "event_type": "TimerFired",
+      "timestamp": "2026-11-04T03:55:15.901000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 1,
+        "sequence": 2,
+        "timer_id": "timer-2",
+        "delay_seconds": 5
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "timestamp": "2026-11-04T03:55:16.000000+00:00",
+      "payload": {
+        "signal_id": "v1",
+        "workflow_command_id": "command-v1",
+        "signal_name": "vote",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCgZBZGEA"
+        }
+      }
+    },
+    {
+      "event_type": "ConditionWaitSatisfied",
+      "timestamp": "2026-11-04T03:55:16.100000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 0,
+        "sequence": 1,
+        "condition_wait_id": "condition:1",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "votes",
+        "condition_definition_fingerprint": "sha256:votes-v1",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T03:55:16.101000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 0,
+        "sequence": 4,
+        "condition_wait_id": "condition:4",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "votes",
+        "condition_definition_fingerprint": "sha256:votes-v1",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "timestamp": "2026-11-04T03:55:16.102000+00:00",
+      "payload": {
+        "parallel_group_id": "parallel-calls:1:3",
+        "parallel_group_kind": "mixed",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 3,
+        "parallel_group_index": 2,
+        "sequence": 5,
+        "condition_wait_id": "condition:5",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "condition_key": "approvals",
+        "condition_definition_fingerprint": "sha256:approvals-v1",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "timestamp": "2026-11-04T03:55:30.000000+00:00",
+      "payload": {
+        "signal_id": "v2",
+        "workflow_command_id": "command-v2",
+        "signal_name": "vote",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCgZBZGEA"
+        }
+      }
+    },
+    {
+      "event_type": "SignalReceived",
+      "timestamp": "2026-11-04T03:55:30.100000+00:00",
+      "payload": {
+        "signal_id": "a1",
+        "workflow_command_id": "command-a1",
+        "signal_name": "approve",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCgZBZGEA"
+        }
+      }
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": "both"
+  }
+}
