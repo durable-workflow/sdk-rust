@@ -2554,6 +2554,16 @@ fn redrive_step_event(kind: &str) -> bool {
     )
 }
 
+fn redrive_requester_is_valid(value: &Value) -> bool {
+    value.as_object().is_some_and(|requester| {
+        !requester.is_empty()
+            && requester.iter().all(|(key, value)| {
+                matches!(key.as_str(), "type" | "id" | "label")
+                    && value.as_str().is_some_and(|value| !value.is_empty())
+            })
+    })
+}
+
 /// Core 28893f97 root cancellation for one sequential call. Propagated scope,
 /// group, selection and operation deliveries require separate evidence models.
 fn check_successor_cancellation(
@@ -2643,13 +2653,7 @@ fn check_successor_cancellation(
         "cancellation lineage must end at the successor and contain only its own address",
     )?;
     require(
-        context["requester"].as_object().is_some_and(|requester| {
-            !requester.is_empty()
-                && requester.iter().all(|(key, value)| {
-                    matches!(key.as_str(), "type" | "id" | "label")
-                        && value.as_str().is_some_and(|value| !value.is_empty())
-                })
-        }),
+        redrive_requester_is_valid(&context["requester"]),
         "context requester must identify its caller",
     )?;
     require(
