@@ -435,13 +435,10 @@ impl WorkflowState {
         if (sequence..sequence + span).all(resolved) {
             return Ok(false);
         }
-        let original: Vec<_> = self
-            .recorded_commands
-            .iter()
-            .skip(index)
-            .take(descriptors.len())
-            .cloned()
-            .collect();
+        // Recorded commands are in replay order, where a grouped condition
+        // member's reopens follow it (#193), so select the original members by
+        // sequence rather than by position.
+        let original = scoped_group_originals(&self.recorded_commands, sequence, span);
         self.validate_scoped_group_members(descriptors, &original)?;
         let boundary = CancellationDelivery {
             request_id: request.context.request_id().into(),
@@ -468,7 +465,13 @@ impl WorkflowState {
             command_count: self.commands.len(),
         });
         self.matched_recorded_pending = true;
-        self.command_cursor = index + descriptors.len();
+        self.command_cursor = scoped_group_end(
+            &self.recorded_commands,
+            index,
+            sequence,
+            span,
+            &descriptors[0].group_path[0].parallel_group_id,
+        );
         Ok(true)
     }
 
@@ -704,6 +707,48 @@ impl WorkflowContext {
     }
 }
 
+/// The group's original members, by sequence `base..base + span`.
+fn scoped_group_originals(
+    commands: &[RecordedCommand],
+    base: u64,
+    span: u64,
+) -> Vec<RecordedCommand> {
+    (base..base.saturating_add(span))
+        .filter_map(|sequence| {
+            commands
+                .iter()
+                .find(|command| command.sequence() == sequence)
+                .cloned()
+        })
+        .collect()
+}
+
+/// The cursor just past the group's commands starting at `index`: its original
+/// members and any grouped condition reopens of the same group, which replay
+/// order places next to them.
+fn scoped_group_end(
+    commands: &[RecordedCommand],
+    index: usize,
+    base: u64,
+    span: u64,
+    group_id: &str,
+) -> usize {
+    let owned = |command: &RecordedCommand| {
+        (base..base.saturating_add(span)).contains(&command.sequence())
+            || matches!(
+                command,
+                RecordedCommand::ConditionWait { parallel_group_path: Some(path), .. }
+                    if path.first().is_some_and(|entry| entry.parallel_group_id == group_id)
+            )
+    };
+    index
+        + commands
+            .iter()
+            .skip(index)
+            .take_while(|command| owned(command))
+            .count()
+}
+
 #[cfg(test)]
 mod reopen_order_tests {
     use super::*;
@@ -731,6 +776,34 @@ mod reopen_order_tests {
                 .next_scope_cancellation_sequence()
                 .expect("next sequence"),
             4
+        );
+    }
+
+    // #194: with a one-sided reopen consumed as a1, a2, b1, a pending scope
+    // cancellation selects the originals a1 and b1 by sequence and moves past
+    // all three of the group's commands.
+    #[test]
+    fn scoped_group_selection_follows_sequence_not_position() {
+        let state = WorkflowState::new(
+            crate::one_sided_grouped_reopen_history(Vec::new()),
+            "rust-workers".to_string(),
+            crate::DEFAULT_CODEC.to_string(),
+            None,
+        )
+        .expect("one-sided grouped reopen history");
+        let originals = scoped_group_originals(&state.recorded_commands, 1, 2)
+            .iter()
+            .map(RecordedCommand::sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(originals, vec![1, 2]);
+        assert_eq!(
+            scoped_group_end(&state.recorded_commands, 0, 1, 2, "parallel-calls:1:2"),
+            3
+        );
+        // A command of another group ends the scoped group's commands.
+        assert_eq!(
+            scoped_group_end(&state.recorded_commands, 0, 1, 2, "parallel-calls:9:2"),
+            1
         );
     }
 }
