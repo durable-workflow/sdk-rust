@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -90,7 +91,11 @@ def unpack_crate(raw: bytes, destination: Path, approval: dict, source_commit: s
     files: dict[str, bytes] = {}
     seen: set[str] = set()
     total = 0
-    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+    # Bound decompression before tarfile can parse a PAX or GNU long-name header.
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+        tar_bytes = compressed.read(MAX_UNPACKED + 1)
+    require(len(tar_bytes) <= MAX_UNPACKED, "crate tar bytes exceed their limit")
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
         for count, member in enumerate(archive, 1):
             require(count <= MAX_FILES, "crate archive has too many entries")
             path = PurePosixPath(member.name)
@@ -141,7 +146,7 @@ def main() -> int:
         identity = {"schema": "durable-workflow.rust-sdk.stable-docs/v1", "package": PACKAGE, "version": version, "crate_sha256": checksum, "source_revision": source, "tooling_revision": tooling}
         args.identity.write_text(json.dumps(identity, indent=2) + "\n")
         print(json.dumps(identity))
-    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError) as error:
+    except (OSError, EOFError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError) as error:
         print(f"stable documentation source refused: {error}", file=sys.stderr)
         return 1
     return 0
