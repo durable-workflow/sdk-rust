@@ -319,6 +319,8 @@ jobs:
           mkdir -p target/doc/analytics target/doc/assets
           cp docs/analytics/analytics.js target/doc/analytics/
           cp docs/assets/* target/doc/assets/
+          python3 scripts/ci/test-rustdoc-controls.py
+          python3 scripts/ci/prepare-rustdoc-controls.py
           python3 scripts/check-docs-analytics.py target/doc
           python3 scripts/check-docs-site.py target/doc
           python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc

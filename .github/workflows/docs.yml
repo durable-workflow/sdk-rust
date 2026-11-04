@@ -15,6 +15,7 @@ on:
       - 'scripts/ci/validate-example-base-urls.py'
       - 'scripts/ci/*docs-release.py'
       - 'scripts/ci/build-stable-docs.sh'
+      - 'scripts/ci/*rustdoc-controls.py'
       - 'scripts/ci/release_package.py'
       - 'scripts/ci/install-release-tooling.sh'
       - 'scripts/ci/release-tooling-requirements.txt'
