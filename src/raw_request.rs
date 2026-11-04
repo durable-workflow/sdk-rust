@@ -330,6 +330,8 @@ impl Client {
     /// [`worker_protocol_compatible`]) in its header, and its JSON body must
     /// carry the same `protocol_version`; otherwise the result is
     /// [`Error::Protocol`] with reason `invalid_worker_protocol_response`.
+    /// A numeric body value is compared in its JSON spelling (`1.2` stays
+    /// `"1.2"`, `1.20` becomes `"1.2"`). Servers send it as a string.
     /// Non-2xx responses are not checked.
     pub async fn worker_plane_request(&self, request: RawRequest) -> Result<RawResponse> {
         self.raw_request(request, RequestProtocol::DefaultWorker)
@@ -361,13 +363,11 @@ impl Client {
     ) -> Result<RawResponse> {
         // Both version headers go on every request, on both planes, as the
         // CLI 2.x client sends them.
-        let worker_version = match &request.protocol_version {
-            Some(version) => version.clone(),
-            None => match self.worker_request_protocol(RequestProtocol::DefaultWorker)? {
-                RequestProtocol::Worker(version) => version.to_string(),
-                _ => self.worker_protocol_version.as_str().to_string(),
-            },
-        };
+        // The configured version, with no negotiation or worker-loop checks.
+        let worker_version = request
+            .protocol_version
+            .clone()
+            .unwrap_or_else(|| self.worker_protocol_version.as_str().to_string());
         let control_version = request
             .control_plane_version
             .as_deref()
