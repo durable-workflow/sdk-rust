@@ -6,7 +6,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -14,11 +16,23 @@ import tempfile
 import unittest
 
 from release_package import (
+    APPROVAL_SCHEMA,
     ReleasePackageError,
+    approval_record_relative,
+    approval_summary_relative,
+    confined_file,
+    confined_root,
+    file_list_sha256,
+    load_approval,
+    parse_approval,
+    read_approval_record,
+    validate_acceptance,
+    verify_acceptance_summary,
     load_package,
     release_entry,
     render_release_notes,
     restore_missing_lockfile,
+    verify_approved_archive,
     verify_archive,
     verify_source,
 )
@@ -29,6 +43,21 @@ MANIFEST = ROOT / "Cargo.toml"
 CHANGELOG = ROOT / "CHANGELOG.md"
 REQUIREMENTS = ROOT / "scripts/ci/release-tooling-requirements.txt"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
+# The exact receipt approval_candidate() emits for a passing 3.0.5 run.
+ACCEPTANCE = {
+    "summary_sha256": "c" * 64,
+    "harness_commit": "e" * 40,
+    "server_index": "ghcr.io/durable-workflow/server@sha256:" + "d" * 64,
+    "executed_manifest": "ghcr.io/durable-workflow/server@sha256:" + "f" * 64,
+    "platform": "linux/arm64",
+    "expected_server_version": "3.0.5",
+    "expected_revision": "b" * 40,
+    "expected_release_tag": "3.0.5",
+    "cluster_versions": ["3.0.5"],
+    "cells": ["deadline", "lifecycle"],
+    "finished_at": "2026-11-03T23:00:00+00:00",
+    "outcome": "pass",
+}
 
 
 class ReleasePackageTest(unittest.TestCase):
@@ -431,6 +460,19 @@ This is an example, not another release.
             identity["archive"]["release_entry_sha256"],
         )
 
+    def test_archive_reached_through_a_symlink_is_refused(self) -> None:
+        archive = self.archive()
+        link = archive.with_name("linked.crate")
+        link.symlink_to(archive.name)
+        self.assertEqual(
+            COMMIT,
+            verify_archive(archive, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT)[
+                "archive"
+            ]["vcs_commit"],
+        )
+        with self.assertRaisesRegex(ReleasePackageError, "crate archive is not a regular file"):
+            verify_archive(link, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT)
+
     def test_archive_rejects_changed_notes_or_vcs_identity(self) -> None:
         cases = (
             self.archive(
@@ -447,6 +489,584 @@ This is an example, not another release.
                         archive, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT
                     )
 
+
+    def archive_files(self, archive: Path) -> list[str]:
+        root = f"{self.package['name']}-{self.package['version']}/"
+        with tarfile.open(archive) as crate:
+            return sorted(member.name.removeprefix(root) for member in crate.getmembers())
+
+    def summary_dict(self, archive: Path) -> dict[str, object]:
+        """The harness summary.json of a passing run that produced `archive`."""
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        files = self.archive_files(archive)
+        return {
+            "started_at": "2026-11-03T22:00:00+00:00", "outcome": "pass", "mode": "pre-publication",
+            "expected_server": {"version": "3.0.5", "revision": ACCEPTANCE["expected_revision"], "release_tag": "3.0.5"},
+            "harness_commit": ACCEPTANCE["harness_commit"],
+            "server": {"index": ACCEPTANCE["server_index"], "executed_manifest": ACCEPTANCE["executed_manifest"],
+                       "platform": ACCEPTANCE["platform"]},
+            "package": {"mode": "pre-publication", "package": self.package["name"], "version": self.package["version"],
+                        "commit": COMMIT, "crate_sha256": digest, "crate_sha256_after_cells": digest,
+                        "files": files, "file_list_sha256": file_list_sha256(files),
+                        "vcs_info": {"git": {"sha1": COMMIT}, "path_in_vcs": ""},
+                        "cargo_version": "cargo 1.86.0 (adf9b6ad1 2025-02-28)"},
+            "crate": {"mode": "pre-publication", "sha256": digest, "lock_checksum": digest, "source_commit": COMMIT,
+                      "registry_published": False, "baselines": {"pass": True}},
+            "cells": {name: {"cell": name, "outcome": "pass", "cluster_info": {"version": "3.0.5"}}
+                      for name in ("lifecycle", "deadline")},
+            "checks_outcome": "pass",
+            "cleanup": {"pass": True, "errors": [], "local_leftovers": [], "leftover_containers": [],
+                        "leftover_networks": []},
+            "finished_at": ACCEPTANCE["finished_at"],
+        }
+
+    def summary_bytes(self, archive: Path, **changes: object) -> bytes:
+        return (json.dumps({**self.summary_dict(archive), **changes}, ensure_ascii=False, indent=2) + "\n").encode()
+
+    def approval_bytes(self, archive: Path, summary: bytes | None = None, **changes: object) -> bytes:
+        """A record bound to `summary` (default: the passing summary), kept as self.summary."""
+        self.summary = summary if summary is not None else self.summary_bytes(archive)
+        files = self.archive_files(archive)
+        record = {
+            "schema": APPROVAL_SCHEMA,
+            "package": self.package["name"],
+            "version": self.package["version"],
+            "commit": COMMIT,
+            "crate_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "cargo_version": "1.86.0",
+            "files": files,
+            "file_list_sha256": file_list_sha256(files),
+            "acceptance": {**ACCEPTANCE, "summary_sha256": hashlib.sha256(self.summary).hexdigest()},
+        }
+        record.update(changes)
+        return json.dumps(record).encode()
+
+    def approval(self, archive: Path, **changes: object) -> Path:
+        path = self.root / "approved.json"
+        path.write_bytes(self.approval_bytes(archive, **changes))
+        return path
+
+    def test_approved_archive_binds_checksum_files_commit_version_and_cargo(self) -> None:
+        archive = self.archive()
+        identity = verify_approved_archive(
+            archive, MANIFEST, CHANGELOG, COMMIT, self.approval_bytes(archive), self.summary, "1.86.0"
+        )
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), identity["approval"]["crate_sha256"])
+        self.assertEqual(COMMIT, identity["approval"]["commit"])
+        self.assertEqual(3, identity["approval"]["file_count"])
+        self.assertEqual("3.0.5", identity["approval"]["server_version"])
+
+    def test_approved_archive_counterfactuals_are_refused(self) -> None:
+        archive = self.archive()
+        files = sorted([".cargo_vcs_info.json", "CHANGELOG.md", "Cargo.lock"])
+        extra = files + ["src/extra.rs"]
+        cases = {
+            "one-byte checksum drift": ({"crate_sha256": "0" * 64}, "SHA-256 differs"),
+            "wrong commit": ({"commit": "f" * 40}, "commit differs"),
+            "wrong version": ({"version": "9.9.9"}, "version differs"),
+            "wrong package": ({"package": "other"}, "name differs"),
+            "extra file": ({"files": sorted(extra), "file_list_sha256": file_list_sha256(extra)}, "file set differs"),
+            "missing file": ({"files": files[1:], "file_list_sha256": file_list_sha256(files[1:])}, "file set differs"),
+            "unsorted files": ({"files": list(reversed(files))}, "malformed"),
+            "list digest drift": ({"file_list_sha256": "0" * 64}, "malformed"),
+            "wrong schema": ({"schema": "other"}, "malformed"),
+            "empty acceptance": ({"acceptance": {}}, "acceptance receipt"),
+            "extra field": ({"note": "x"}, "unexpected fields"),
+        }
+        for label, (change, message) in cases.items():
+            record = self.approval_bytes(archive, **change)
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, message):
+                verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, record, self.summary)
+        record = self.approval_bytes(archive)
+        with self.assertRaisesRegex(ReleasePackageError, "differs from approved Cargo"):
+            verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, record, self.summary, "1.99.0")
+        # A one-byte drift in the archive itself, with the approval recorded before it.
+        drifted = self.archive(changelog=CHANGELOG.read_bytes(), name="drifted.crate", lockfile=(ROOT / "Cargo.lock").read_bytes() + b"#")
+        with self.assertRaisesRegex(ReleasePackageError, "SHA-256 differs"):
+            verify_approved_archive(drifted, MANIFEST, CHANGELOG, COMMIT, record, self.summary)
+        with self.assertRaises(ReleasePackageError):
+            verify_approved_archive(archive, MANIFEST, CHANGELOG, "e" * 40, record, self.summary)
+
+    # Security review of #178 (501d0311), hold 1: a truncated or fabricated
+    # acceptance receipt must never authorize publication.
+
+    def test_acceptance_receipt_positive_control(self) -> None:
+        validate_acceptance(dict(ACCEPTANCE))
+        validate_acceptance({**ACCEPTANCE, "platform": "linux/amd64", "finished_at": "2026-11-03T23:00:00Z",
+                             "server_index": "docker.io/durableworkflow/server@sha256:" + "1" * 64,
+                             "executed_manifest": "docker.io/durableworkflow/server@sha256:" + "2" * 64})
+
+    def test_harness_candidate_is_exactly_the_receipt_publication_accepts(self) -> None:
+        # Guard against schema drift between installed-native/run.py and this verifier.
+        sys.path.insert(0, str(ROOT / "scripts/acceptance/installed-native"))
+        self.addCleanup(sys.path.remove, str(ROOT / "scripts/acceptance/installed-native"))
+        import run as harness
+        files = sorted(["Cargo.toml", "Cargo.toml.orig", "src/lib.rs"])
+        summary = {
+            "harness_commit": "e" * 40, "outcome": "pass", "finished_at": "2026-11-03T23:00:00.000001+00:00",
+            "expected_server": {"version": "3.0.5", "revision": "b" * 40, "release_tag": "3.0.5"},
+            "server": {"index": "ghcr.io/durable-workflow/server@sha256:" + "d" * 64,
+                       "executed_manifest": "ghcr.io/durable-workflow/server@sha256:" + "f" * 64,
+                       "platform": "linux/arm64"},
+            "cells": {"lifecycle": {"cluster_info": {"version": "3.0.5"}},
+                      "deadline": {"cluster_info": {"version": "3.0.5"}}},
+            "package": {"package": "durable-workflow", "version": "4.11.2", "commit": COMMIT,
+                        "crate_sha256": "a" * 64, "cargo_version": "cargo 1.86.0 (adf9b6ad1 2025-02-28)",
+                        "files": files, "file_list_sha256": file_list_sha256(files)},
+        }
+        candidate = harness.approval_candidate(summary, b"{}")
+        approval, _ = parse_approval(json.dumps(candidate).encode())
+        self.assertEqual("3.0.5", approval["acceptance"]["expected_server_version"])
+        failed = json.dumps(harness.approval_candidate({**summary, "outcome": "fail"}, b"{}")).encode()
+        with self.assertRaisesRegex(ReleasePackageError, "outcome"):
+            parse_approval(failed)
+
+    def test_acceptance_receipt_deletions_are_refused(self) -> None:
+        for field in sorted(ACCEPTANCE):
+            receipt = {key: value for key, value in ACCEPTANCE.items() if key != field}
+            with self.subTest(deleted=field), self.assertRaisesRegex(ReleasePackageError, "missing or unexpected"):
+                validate_acceptance(receipt)
+        for label, receipt in (("extra key", {**ACCEPTANCE, "note": "x"}), ("not an object", ["pass"]),
+                               ("null", None)):
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, "missing or unexpected"):
+                validate_acceptance(receipt)
+
+    def test_acceptance_receipt_wrong_types_are_refused(self) -> None:
+        wrong = {
+            "summary_sha256": 0, "harness_commit": None, "server_index": ["x"], "executed_manifest": {},
+            "platform": 1, "expected_server_version": 3.05, "expected_revision": True,
+            "expected_release_tag": 305, "cluster_versions": "3.0.5", "cells": "deadline,lifecycle",
+            "finished_at": 1793745600, "outcome": True,
+        }
+        self.assertEqual(set(wrong), set(ACCEPTANCE))
+        for field, value in wrong.items():
+            with self.subTest(field=field), self.assertRaisesRegex(ReleasePackageError, "is invalid"):
+                validate_acceptance({**ACCEPTANCE, field: value})
+
+    def test_acceptance_receipt_mismatches_are_refused(self) -> None:
+        digest = "@sha256:" + "d" * 64
+        mismatches = {
+            "summary_sha256": ["C" * 64, "c" * 63, ""],
+            "harness_commit": ["e" * 39, "E" * 40, "main"],
+            "expected_revision": ["b" * 41, "3.0.5"],
+            "server_index": ["ghcr.io/durable-workflow/server:3.0.5", "ghcr.io/durable-workflow/server@sha256:" + "d" * 63,
+                             "ghcr.io/Durable/server" + digest, "img@sha256:x", "sha256:" + "d" * 64],
+            "executed_manifest": ["ghcr.io/other/server@sha256:" + "f" * 64, "ghcr.io/durable-workflow/server:3.0.5"],
+            "platform": ["linux/riscv64", "windows/amd64", "linux/arm64/v8", ""],
+            "expected_server_version": ["3.0", "v3.0.5", "3.0.5/../x"],
+            "expected_release_tag": ["native-3.0.5", "3.0.4", ""],
+            "cluster_versions": [[], ["3.0.4"], ["3.0.5", "3.0.5"], ["", "3.0.5"], [None]],
+            "cells": [["lifecycle"], ["deadline"], ["lifecycle", "deadline"], ["deadline", "lifecycle", "extra"], []],
+            "finished_at": ["", "yesterday", "2026-11-03T23:00:00", "2026-13-03T23:00:00+00:00"],
+            "outcome": ["fail", "PASS", ""],
+        }
+        self.assertEqual(set(mismatches), set(ACCEPTANCE))
+        for field, values in mismatches.items():
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ReleasePackageError, field):
+                    validate_acceptance({**ACCEPTANCE, field: value})
+        # Relationship: tag, cluster versions and expected version must agree.
+        moved = {**ACCEPTANCE, "expected_server_version": "3.0.6"}
+        with self.assertRaisesRegex(ReleasePackageError, "cluster_versions, expected_release_tag"):
+            validate_acceptance(moved)
+
+    # Hold 2: the approval is the tracked regular file at its exact path in
+    # the maintained-tooling checkout.
+
+    def git(self, repository: Path, *arguments: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repository), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", *arguments],
+            check=True, capture_output=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+
+    def tooling(self, record: bytes, relative: str | None = None, summary: bytes | None = None) -> Path:
+        """A maintained-tooling repository tracking `record` (default: the exact
+        path, together with its summary at <version>.summary.json)."""
+        repository = self.root / "tooling"
+        if not repository.exists():
+            repository.mkdir()
+            self.git(repository, "init", "--quiet")
+        files = {relative or approval_record_relative(self.package["version"]): record}
+        if relative is None:
+            files[approval_summary_relative(self.package["version"])] = summary if summary is not None else self.summary
+        for name, content in files.items():
+            path = repository / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            self.git(repository, "add", "--", name)
+        self.git(repository, "commit", "--quiet", "--allow-empty", "-m", "approve")
+        return repository
+
+    def test_tracked_approval_record_positive_control(self) -> None:
+        record = self.approval_bytes(self.archive())
+        repository = self.tooling(record)
+        content, summary, relative = read_approval_record(confined_root(repository), self.package["version"])
+        self.assertEqual((record, self.summary, f"release/approved-packages/{self.package['version']}.json"),
+                         (content, summary, relative))
+
+    def test_approval_record_symlinks_and_wrong_paths_are_refused(self) -> None:
+        record = self.approval_bytes(self.archive())
+        version = self.package["version"]
+        relative = approval_record_relative(version)
+        secret = self.outside_file()
+        forged = secret.parent / "forged.json"
+        forged.write_bytes(record)
+        cases = {}
+
+        def external_symlink(repository: Path) -> None:
+            (repository / relative).unlink()
+            (repository / relative).symlink_to(forged)
+        cases["external symlink"] = (external_symlink, "symbolic link")
+
+        def tracked_symlink(repository: Path) -> None:
+            external_symlink(repository)
+            self.git(repository, "add", "--", relative)
+            self.git(repository, "commit", "--quiet", "-m", "link")
+        cases["tracked symlink"] = (tracked_symlink, "symbolic link")
+
+        def symlinked_directory(repository: Path) -> None:
+            directory = repository / "release" / "approved-packages"
+            shutil.move(directory, secret.parent / "approved-packages")
+            directory.symlink_to(secret.parent / "approved-packages", target_is_directory=True)
+        cases["symlinked directory"] = (symlinked_directory, "symbolic link")
+
+        def untracked(repository: Path) -> None:
+            self.git(repository, "rm", "--quiet", "--cached", "--", relative)
+            self.git(repository, "commit", "--quiet", "-m", "untrack")
+        cases["untracked record"] = (untracked, "not tracked at its exact path")
+
+        def wrong_tracked_path(repository: Path) -> None:
+            self.git(repository, "rm", "--quiet", "--", relative)
+            self.git(repository, "commit", "--quiet", "-m", "move")
+            self.tooling(record, f"release/approved-packages/nested/{version}.json")
+            self.tooling(record, f"release/{version}.json")
+        cases["wrong tracked path"] = (wrong_tracked_path, "not an existing regular file")
+
+        def edited(repository: Path) -> None:
+            (repository / relative).write_bytes(record + b" ")
+        cases["worktree differs from tracked blob"] = (edited, "differs from its tracked content")
+
+        def directory_in_place(repository: Path) -> None:
+            (repository / relative).unlink()
+            (repository / relative).mkdir()
+        cases["directory at the record path"] = (directory_in_place, "not an existing regular file")
+
+        for label, (mutate, message) in cases.items():
+            with self.subTest(label=label):
+                shutil.rmtree(self.root / "tooling", ignore_errors=True)
+                shutil.rmtree(secret.parent / "approved-packages", ignore_errors=True)
+                repository = self.tooling(record)
+                mutate(repository)
+                root = confined_root(repository)
+                with self.assertRaisesRegex(ReleasePackageError, message):
+                    read_approval_record(root, version)
+
+    def test_approval_version_is_strict_semver_before_naming_a_path(self) -> None:
+        secret = self.outside_file()
+        for version in ("4.11.2/../../x", "../4.11.2", "4.11.2\0", "v4.11.2", "4.11", "04.11.2",
+                        "4.11.2-..", "4.11.2-rc..1", "4.11.2/", "/4.11.2", "４.11.2", "",
+                        os.path.relpath(secret.parent / "x", self.root)):
+            with self.subTest(version=version), self.assertRaisesRegex(ReleasePackageError, "strict SemVer"):
+                approval_record_relative(version)
+        for version in ("4.11.2", "4.11.2-rc.1+build.5"):
+            with self.subTest(positive=version):
+                self.assertEqual(f"release/approved-packages/{version}.json", approval_record_relative(version))
+
+    def test_approval_record_rejects_unsafe_file_names_and_versions(self) -> None:
+        archive = self.archive()
+        for label, change in {
+            "dot-dot file": {"files": ["../escape"]},
+            "absolute file": {"files": ["/etc/passwd"]},
+            "NUL file": {"files": ["a\0b"]},
+            "backslash file": {"files": ["a\\..\\b"]},
+            "empty component": {"files": ["src//lib.rs"]},
+            "dot component": {"files": ["./Cargo.toml"]},
+            "crafted version": {"version": "4.11.2/../../x"},
+        }.items():
+            files = change.get("files")
+            if files is not None:
+                change = {**change, "file_list_sha256": file_list_sha256(files)}
+            approval = self.approval(archive, **change)
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, "malformed"):
+                load_approval(approval)
+        # The plain reader never follows a link either.
+        link = self.root / "linked.json"
+        link.symlink_to(self.approval(archive))
+        with self.assertRaisesRegex(ReleasePackageError, "not a regular file"):
+            load_approval(link)
+
+    # F3: the committed summary.json is the run the approval names.
+
+    def test_committed_summary_positive_control(self) -> None:
+        archive = self.archive()
+        approval, _ = parse_approval(self.approval_bytes(archive))
+        verify_acceptance_summary(approval, self.summary)
+        self.assertEqual(f"release/approved-packages/{self.package['version']}.summary.json",
+                         approval_summary_relative(self.package["version"]))
+
+    def test_summary_hash_must_equal_the_approval(self) -> None:
+        archive = self.archive()
+        approval, _ = parse_approval(self.approval_bytes(archive))
+        for label, summary in (("one byte appended", self.summary + b" "),
+                               ("reformatted", json.dumps(json.loads(self.summary)).encode()),
+                               ("empty", b"")):
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, "summary SHA-256"):
+                verify_acceptance_summary(approval, summary)
+
+    def test_summary_content_must_match_the_record(self) -> None:
+        archive = self.archive()
+        base = self.summary_dict(archive)
+        package, crate, cells = base["package"], base["crate"], base["cells"]
+        cases = {
+            "failed run": ({"outcome": "fail"}, "outcome"),
+            "failed checks": ({"checks_outcome": "fail"}, "outcome"),
+            "run error": ({"error": "RuntimeError: x"}, "error"),
+            "cleanup error": ({"cleanup": {**base["cleanup"], "pass": False,
+                                           "errors": [{"step": "x", "object": "y", "error": "Z"}]}}, "cleanup"),
+            "leftover container": ({"cleanup": {**base["cleanup"], "leftover_containers": ["abc"]}}, "cleanup"),
+            "published mode": ({"mode": "published"}, "mode"),
+            "other harness": ({"harness_commit": "0" * 40}, "harness_commit"),
+            "other finish": ({"finished_at": "2026-11-04T00:00:00+00:00"}, "finished_at"),
+            "other Server": ({"expected_server": {**base["expected_server"], "revision": "0" * 40}}, "expected_server"),
+            "other index": ({"server": {**base["server"], "index": "ghcr.io/durable-workflow/server@sha256:" + "0" * 64}}, "server"),
+            "package commit": ({"package": {**package, "commit": "f" * 40}}, "package.identity"),
+            "package sha256": ({"package": {**package, "crate_sha256": "0" * 64}}, "package.crate_sha256"),
+            "sha256 after cells": ({"package": {**package, "crate_sha256_after_cells": "0" * 64}}, "package.crate_sha256"),
+            "file-list digest": ({"package": {**package, "file_list_sha256": "0" * 64}}, "package.files"),
+            "file set": ({"package": {**package, "files": package["files"][1:]}}, "package.files"),
+            "Cargo version": ({"package": {**package, "cargo_version": "cargo 1.99.0 (5f94df478 2026-08-27)"}}, "package.cargo_version"),
+            "lock checksum": ({"crate": {**crate, "lock_checksum": "0" * 64}}, "crate"),
+            "baselines failed": ({"crate": {**crate, "baselines": {"pass": False}}}, "crate"),
+            "failed cell": ({"cells": {**cells, "deadline": {**cells["deadline"], "outcome": "fail"}}}, "cells"),
+            "missing cell": ({"cells": {"lifecycle": cells["lifecycle"]}}, "cells"),
+            "cell on other Server": ({"cells": {**cells, "lifecycle": {**cells["lifecycle"], "cluster_info": {"version": "3.0.4"}}}}, "cells"),
+        }
+        for label, (change, field) in cases.items():
+            summary = self.summary_bytes(archive, **change)
+            approval, _ = parse_approval(self.approval_bytes(archive, summary=summary))
+            with self.subTest(label=label), self.assertRaisesRegex(ReleasePackageError, field):
+                verify_acceptance_summary(approval, summary)
+        # The same refusal through the archive verifier the publisher calls.
+        record = self.approval_bytes(archive, summary=self.summary_bytes(archive, outcome="fail"))
+        with self.assertRaisesRegex(ReleasePackageError, "outcome"):
+            verify_approved_archive(archive, MANIFEST, CHANGELOG, COMMIT, record, self.summary)
+        not_object = b"[]"
+        approval, _ = parse_approval(self.approval_bytes(archive, summary=not_object))
+        with self.assertRaisesRegex(ReleasePackageError, "summary"):
+            verify_acceptance_summary(approval, not_object)
+
+    def test_committed_summary_is_read_with_the_tracked_rules(self) -> None:
+        archive = self.archive()
+        record = self.approval_bytes(archive)
+        version = self.package["version"]
+        summary_path = approval_summary_relative(version)
+        secret = self.outside_file()
+        forged = secret.parent / "forged.summary.json"
+        forged.write_bytes(self.summary)
+
+        def symlink(repository: Path) -> None:
+            (repository / summary_path).unlink()
+            (repository / summary_path).symlink_to(forged)
+
+        def untracked(repository: Path) -> None:
+            self.git(repository, "rm", "--quiet", "--cached", "--", summary_path)
+            self.git(repository, "commit", "--quiet", "-m", "untrack")
+
+        def missing(repository: Path) -> None:
+            self.git(repository, "rm", "--quiet", "--", summary_path)
+            self.git(repository, "commit", "--quiet", "-m", "remove")
+
+        def edited(repository: Path) -> None:
+            (repository / summary_path).write_bytes(self.summary + b" ")
+        for label, mutate, message in (("symlink", symlink, "symbolic link"),
+                                       ("untracked", untracked, "not tracked"),
+                                       ("missing", missing, "not an existing regular file"),
+                                       ("worktree edit", edited, "differs from its tracked content")):
+            with self.subTest(label=label):
+                shutil.rmtree(self.root / "tooling", ignore_errors=True)
+                repository = self.tooling(record)
+                mutate(repository)
+                root = confined_root(repository)
+                with self.assertRaisesRegex(ReleasePackageError, message):
+                    read_approval_record(root, version)
+        # Through the CLI, a committed summary that is not the bound one refuses.
+        shutil.rmtree(self.root / "tooling", ignore_errors=True)
+        other = self.summary_bytes(archive, finished_at="2026-11-04T00:00:00+00:00")
+        repository = self.tooling(record, summary=other)
+        result = self.cli("--archive-root", str(self.root), "--archive", archive.name,
+                          "--expected-vcs-commit", COMMIT, "--approval-repository", str(repository))
+        self.assertEqual(1, result.returncode)
+        self.assertIn("summary SHA-256", result.stderr)
+
+    # Defense in depth: every .crate member is checked independently.
+
+    def raw_archive(self, extra: list[tuple[tarfile.TarInfo, bytes | None]], name: str = "raw.crate") -> Path:
+        base = self.archive(name="base-" + name)
+        path = self.root / name
+        with tarfile.open(base) as source, tarfile.open(path, "w:gz") as archive:
+            for member in source.getmembers():
+                archive.addfile(member, source.extractfile(member))
+            for info, content in extra:
+                archive.addfile(info, io.BytesIO(content) if content is not None else None)
+        return path
+
+    def test_crate_members_must_be_canonical_regular_files(self) -> None:
+        root = f"{self.package['name']}-{self.package['version']}/"
+
+        def regular(name: str) -> tuple[tarfile.TarInfo, bytes]:
+            info = tarfile.TarInfo(name)
+            info.size = 1
+            return info, b"x"
+
+        symlink = tarfile.TarInfo(root + "src/link.rs")
+        symlink.type, symlink.linkname = tarfile.SYMTYPE, "/etc/passwd"
+        hardlink = tarfile.TarInfo(root + "src/hard.rs")
+        hardlink.type, hardlink.linkname = tarfile.LNKTYPE, root + "Cargo.lock"
+        directory = tarfile.TarInfo(root + "src")
+        directory.type = tarfile.DIRTYPE
+        cases = {
+            "symlink": [(symlink, None)],
+            "hardlink": [(hardlink, None)],
+            "directory": [(directory, None)],
+            "dot-dot": [regular(root + "../escape.rs")],
+            "inner dot-dot": [regular(root + "src/../../escape.rs")],
+            "absolute": [regular("/" + root + "x.rs")],
+            "backslash": [regular(root + "src\\..\\x.rs")],
+            "empty component": [regular(root + "src//x.rs")],
+            "dot component": [regular(root + "./x.rs")],
+            "wrong prefix": [regular("other-1.0.0/x.rs")],
+            "prefix only": [regular(root)],
+            "duplicate": [regular(root + "Cargo.lock")],
+        }
+        for label, extra in cases.items():
+            archive = self.raw_archive(extra, name=label.replace(" ", "-") + ".crate")
+            with self.subTest(label=label), self.assertRaises(ReleasePackageError):
+                verify_archive(archive, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT)
+        # Positive control: an extra canonical regular member is accepted.
+        archive = self.raw_archive([regular(root + "src/extra.rs")], name="canonical.crate")
+        verify_archive(archive, MANIFEST, CHANGELOG, expected_vcs_commit=COMMIT)
+
+    def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts/ci/release_package.py"), *arguments],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+
+    def test_approved_package_cli_requires_archive_and_commit(self) -> None:
+        archive = self.archive()
+        repository = self.tooling(self.approval_bytes(archive))
+        base = ["--archive-root", str(self.root), "--archive", archive.name]
+        for arguments in (
+            ["--approval-repository", str(repository)],
+            ["--approval-repository", str(repository), *base],
+            [*base, "--expected-vcs-commit", COMMIT, "--cargo-version", "1.86.0"],
+            ["--archive", archive.name, "--expected-vcs-commit", COMMIT],
+            ["--check-paths", *base],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(2, self.cli(*arguments).returncode)
+        result = self.cli(*base, "--expected-vcs-commit", COMMIT,
+                          "--approval-repository", str(repository), "--cargo-version", "1.86.0")
+        self.assertEqual(0, result.returncode, result.stderr)
+        identity = json.loads(result.stdout)
+        self.assertEqual(COMMIT, identity["approval"]["commit"])
+        self.assertEqual(approval_record_relative(self.package["version"]), identity["approval"]["record_path"])
+
+    # Path confinement: every CLI path is confined to an explicit root before
+    # it is opened.
+
+    def outside_file(self) -> Path:
+        outside = Path(tempfile.mkdtemp(prefix="release-package-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        secret = outside / "secret.crate"
+        secret.write_bytes(b"PRIVATE-TEST-CONTENT")
+        return secret
+
+    def test_confined_file_refusals_and_positive_controls(self) -> None:
+        root = confined_root(self.root)
+        (self.root / "nested").mkdir()
+        (self.root / "nested" / "ok.crate").write_bytes(b"x")
+        (self.root / "ok.crate").write_bytes(b"x")
+        secret = self.outside_file()
+        (self.root / "link.crate").symlink_to(secret)
+        (self.root / "linkdir").symlink_to(secret.parent, target_is_directory=True)
+        refusals = {
+            "dot-dot escape": "../" + secret.parent.name + "/secret.crate",
+            "inner dot-dot": "nested/../ok.crate",
+            "symlink to outside": "link.crate",
+            "symlinked directory": "linkdir/secret.crate",
+            "absolute": str(secret),
+            "absolute inside root": str(self.root / "ok.crate"),
+            "NUL byte": "ok.crate\0.json",
+            "empty": "",
+            "directory": "nested",
+            "missing": "absent.crate",
+        }
+        for label, value in refusals.items():
+            with self.subTest(label=label), self.assertRaises(ReleasePackageError):
+                confined_file(root, value)
+        for value in ("ok.crate", "nested/ok.crate", "./ok.crate"):
+            with self.subTest(positive=value):
+                self.assertEqual(Path(root, value).resolve(), confined_file(root, value))
+        with self.assertRaisesRegex(ReleasePackageError, "already exists"):
+            confined_file(root, "ok.crate", must_exist=False)
+        self.assertEqual(Path(root, "new.lock"), confined_file(root, "new.lock", must_exist=False))
+
+    def test_confined_root_refusals(self) -> None:
+        (self.root / "real").mkdir()
+        (self.root / "rootlink").symlink_to(self.root / "real", target_is_directory=True)
+        (self.root / "file").write_bytes(b"x")
+        for label, value in (("symlink", str(self.root / "rootlink")), ("dot-dot", str(self.root / "real" / "..")),
+                             ("NUL", str(self.root) + "\0"), ("file", str(self.root / "file")),
+                             ("missing", str(self.root / "absent")), ("empty", "")):
+            with self.subTest(label=label), self.assertRaises(ReleasePackageError):
+                confined_root(value)
+        self.assertEqual(os.path.realpath(self.root / "real"), confined_root(self.root / "real"))
+
+    def test_cli_refuses_paths_outside_their_roots(self) -> None:
+        archive = self.archive()
+        repository = self.tooling(self.approval_bytes(archive))
+        secret = self.outside_file()
+        (self.root / "escape.crate").symlink_to(secret)
+        verify = ["--expected-vcs-commit", COMMIT]
+        # A NUL byte cannot cross argv (exec refuses it); confined_file's own
+        # NUL refusal is covered in test_confined_file_refusals_and_positive_controls.
+        cases = {
+            "archive dot-dot": ["--archive-root", str(self.root), "--archive", "../" + secret.parent.name + "/secret.crate", *verify],
+            "archive absolute": ["--archive-root", str(self.root), "--archive", str(secret), *verify],
+            "archive symlink": ["--archive-root", str(self.root), "--archive", "escape.crate", *verify],
+            "manifest absolute": ["--manifest", str(MANIFEST), "--archive-root", str(self.root), "--archive", archive.name, *verify],
+            "manifest dot-dot": ["--manifest", "../" + ROOT.name + "/Cargo.toml", "--archive-root", str(self.root), "--archive", archive.name, *verify],
+            "changelog absolute": ["--check-paths", "--changelog", str(CHANGELOG)],
+            "root symlink": ["--archive-root", str(self.root / "rootlink"), "--archive", archive.name, *verify],
+        }
+        (self.root / "rootlink").symlink_to(secret.parent, target_is_directory=True)
+        for label, arguments in cases.items():
+            with self.subTest(label=label):
+                result = self.cli(*arguments)
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual("", result.stdout)
+                self.assertNotIn("PRIVATE-TEST-CONTENT", result.stderr)
+        record = repository / approval_record_relative(self.package["version"])
+        moved = secret.parent / "approved.json"
+        record.replace(moved)
+        record.symlink_to(moved)
+        result = self.cli("--archive-root", str(self.root), "--archive", archive.name, *verify,
+                          "--approval-repository", str(repository))
+        self.assertEqual(1, result.returncode)
+        self.assertIn("symbolic link", result.stderr)
+        # Positive controls: the same inputs, confined, are accepted.
+        record.unlink()
+        moved.replace(record)
+        for arguments in (["--check-paths"],
+                          ["--archive-root", str(self.root), "--archive", archive.name, *verify],
+                          ["--archive-root", str(self.root), "--archive", archive.name, *verify,
+                           "--approval-repository", str(repository)]):
+            with self.subTest(positive=arguments):
+                result = self.cli(*arguments)
+                self.assertEqual(0, result.returncode, result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

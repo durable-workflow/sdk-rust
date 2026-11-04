@@ -21,21 +21,41 @@ concurrency:
   group: release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
+# The crates.io credential never shares a runner with crate code. Hosted
+# runners keep every secret a job references in memory, grant passwordless
+# sudo, and let any step of an id-token job mint OIDC tokens, so isolation is
+# per job, not per step:
+#   gate    - no credential: reproduce the tag's package with Cargo's full
+#             verify build, require the reviewed approval and an absent
+#             version, and hand the exact .crate on as a digest-bound artifact.
+#   publish - the only job with id-token and the credential. It runs no build,
+#             test or other crate code: it validates the handed-off .crate,
+#             reproduces it with --no-verify, requires it to equal the gate
+#             output and the approval, then runs cargo publish --no-verify.
+#   verify  - no credential: registry, approval and tag readback, then the
+#             fresh-consumer build.
+#   release - GitHub release notes and release, after verification.
+# The tagged tree (release-source) is data. A step runs with it as the working
+# directory only to invoke the maintained publish-rust-sdk.sh or
+# release_package.py, and every interpreter there runs isolated (-I). Tool
+# installation and other steps run from a maintained checkout or the workspace.
 jobs:
-  publish:
-    name: Publish exact crates.io package
+  gate:
+    name: Gate the approved package (no publication credential)
     if: >-
       github.repository == 'durable-workflow/sdk-rust' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: crates-io
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
-      contents: write
-      id-token: write
-    defaults:
-      run:
-        working-directory: release-source
+      contents: read
+    outputs:
+      publish_required: ${{ steps.gate.outputs.publish_required }}
+      crate_sha256: ${{ steps.gate.outputs.crate_sha256 }}
+      gated_artifact_id: ${{ steps.gated-upload.outputs.artifact-id }}
+      gated_artifact_digest: ${{ steps.gated-upload.outputs.artifact-digest }}
+      source_run_id: ${{ github.run_id }}
+      source_run_attempt: ${{ github.run_attempt }}
     steps:
       - name: Check out maintained release tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
@@ -67,8 +87,8 @@ jobs:
               "$REQUESTED_RELEASE_COMMIT" >&2
             exit 1
           fi
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
           if [[ "$tag_commit" != "$head_commit" ]]; then
             printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
               "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
@@ -95,15 +115,176 @@ jobs:
           clients: pip,python,cargo,curl,git
 
       - name: Install hash-locked release tooling
-        run: ../release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
-
-      - name: Prepare exact source release notes
-        run: |
-          python3 ../release-tools/scripts/ci/release_package.py \
-            --release-notes "$RELEASE_TAG" > "${RUNNER_TEMP}/rust-sdk-release-notes.md"
+        run: release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
 
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
+
+      - name: Reproduce, build and gate the approved package
+        id: gate
+        working-directory: release-source
+        env:
+          RUSTUP_TOOLCHAIN: 1.86.0
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUST_SDK_APPROVED_PACKAGE_REPOSITORY: ${{ github.workspace }}/release-tools
+          RUST_SDK_GATED_PACKAGE_FILE: ${{ github.workspace }}/gated-package.crate
+        run: ../release-tools/scripts/ci/publish-rust-sdk.sh gate
+
+      - name: Hand the gated package to the publish job
+        id: gated-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          archive: 'false'
+          if-no-files-found: error
+          path: gated-package.crate
+
+      - name: Upload gate evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: rust-sdk-release-evidence-gate-${{ inputs.release_tag }}
+          path: release-source/rust-sdk-release-evidence.json
+          if-no-files-found: error
+
+  publish:
+    name: Upload the gated package (only job with the publication credential)
+    needs: gate
+    if: >-
+      github.repository == 'durable-workflow/sdk-rust' &&
+      github.ref == 'refs/heads/main' &&
+      needs.gate.outputs.publish_required == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out maintained release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: '0'
+          persist-credentials: 'false'
+          ref: ${{ github.sha }}
+
+      - name: Download the gated package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          artifact-ids: ${{ needs.gate.outputs.gated_artifact_id }}
+          digest-mismatch: error
+          github-token: ${{ github.token }}
+          path: isolated-gated-package
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.gate.outputs.source_run_id }}
+
+      - name: Validate the gated package handoff
+        env:
+          ARTIFACT_DIRECTORY: isolated-gated-package
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.gate.outputs.gated_artifact_digest }}
+          EXPECTED_ARTIFACT_ID: ${{ needs.gate.outputs.gated_artifact_id }}
+          EXPECTED_SOURCE_RUN_ATTEMPT: ${{ needs.gate.outputs.source_run_attempt }}
+          EXPECTED_SOURCE_RUN_ID: ${{ needs.gate.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            printf 'producer artifact digest is not an exact SHA-256 digest\n' >&2
+            exit 1
+          fi
+          for identity in "$EXPECTED_ARTIFACT_ID" "$EXPECTED_SOURCE_RUN_ID" "$EXPECTED_SOURCE_RUN_ATTEMPT"; do
+            if [[ ! "$identity" =~ ^[1-9][0-9]*$ ]]; then
+              printf 'producer artifact identity is invalid\n' >&2
+              exit 1
+            fi
+          done
+          if [[ ! "$ARTIFACT_DIRECTORY" =~ ^isolated-[a-z0-9][a-z0-9._-]*$ ]]; then
+            printf 'artifact validation directory is unsafe\n' >&2
+            exit 1
+          fi
+          mapfile -d '' entries < <(
+            /usr/bin/find "$ARTIFACT_DIRECTORY" -mindepth 1 -maxdepth 1 -print0
+          )
+          if [ "${#entries[@]}" -ne 1 ] || [ ! -f "${entries[0]}" ] || [ -L "${entries[0]}" ]; then
+            printf 'artifact handoff must contain exactly one regular file\n' >&2
+            exit 1
+          fi
+          observed_digest="$(/usr/bin/sha256sum "${entries[0]}")"
+          observed_digest="${observed_digest%% *}"
+          if [ "$observed_digest" != "$EXPECTED_ARTIFACT_DIGEST" ]; then
+            printf 'artifact digest mismatch: expected %s, got %s\n' \
+              "$EXPECTED_ARTIFACT_DIGEST" "$observed_digest" >&2
+            exit 1
+          fi
+          printf 'validated artifact %s from run %s attempt %s\n' \
+            "$EXPECTED_ARTIFACT_ID" "$EXPECTED_SOURCE_RUN_ID" "$EXPECTED_SOURCE_RUN_ATTEMPT"
+
+      - name: Check out immutable package source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ format('refs/tags/{0}', inputs.release_tag) }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Resolve exact release identity
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'release tag must be an exact SDK SemVer: %s\n' "$REQUESTED_RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'release commit must be a full lowercase Git commit: %s\n' \
+              "$REQUESTED_RELEASE_COMMIT" >&2
+            exit 1
+          fi
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$REQUESTED_RELEASE_COMMIT" ]]; then
+            printf 'release tag %s resolves to %s, not requested commit %s at checkout %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$REQUESTED_RELEASE_COMMIT" "$head_commit" >&2
+            exit 1
+          fi
+          {
+            printf 'RELEASE_TAG=%s\n' "$REQUESTED_RELEASE_TAG"
+            printf 'RELEASE_COMMIT=%s\n' "$head_commit"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Python for release tooling
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap patched pip trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
+
+      - name: Install hash-locked release tooling
+        run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
+
+      - name: Preflight the gated package without the publication credential
+        working-directory: release-source
+        env:
+          RUSTUP_TOOLCHAIN: 1.86.0
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUST_SDK_APPROVED_PACKAGE_REPOSITORY: ${{ github.workspace }}
+          RUST_SDK_GATED_PACKAGE_FILE: ${{ github.workspace }}/isolated-gated-package/gated-package.crate
+          RUST_SDK_GATED_SHA256: ${{ needs.gate.outputs.gated_artifact_digest }}
+          RUST_SDK_GATED_CRATE_SHA256: ${{ needs.gate.outputs.crate_sha256 }}
+        run: ../scripts/ci/publish-rust-sdk.sh preflight
 
       - name: Obtain a short-lived crates.io publication token
         id: crates-auth
@@ -114,15 +295,200 @@ jobs:
           NODE_USE_SYSTEM_CA: '0'
           NODE_TLS_REJECT_UNAUTHORIZED: '1'
 
-      - name: Publish and verify exact crate
+      - name: Publish the gated package
+        working-directory: release-source
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+          RUSTUP_TOOLCHAIN: 1.86.0
           RELEASE_RUN_ID: ${{ github.run_id }}
           RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: ../release-tools/scripts/ci/publish-rust-sdk.sh
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: ../scripts/ci/publish-rust-sdk.sh publish
+
+      - name: Upload publish evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: rust-sdk-release-evidence-publish-${{ inputs.release_tag }}
+          path: release-source/rust-sdk-release-evidence.json
+          if-no-files-found: error
+
+  verify:
+    name: Verify the published package (no publication credential)
+    needs: [gate, publish]
+    if: >-
+      always() &&
+      github.repository == 'durable-workflow/sdk-rust' &&
+      github.ref == 'refs/heads/main' &&
+      needs.gate.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out maintained release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-tools
+          persist-credentials: false
+
+      - name: Check out immutable package source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ format('refs/tags/{0}', inputs.release_tag) }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Resolve exact release identity
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'release tag must be an exact SDK SemVer: %s\n' "$REQUESTED_RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'release commit must be a full lowercase Git commit: %s\n' \
+              "$REQUESTED_RELEASE_COMMIT" >&2
+            exit 1
+          fi
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$REQUESTED_RELEASE_COMMIT" ]]; then
+            printf 'release tag %s resolves to %s, not requested commit %s at checkout %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$REQUESTED_RELEASE_COMMIT" "$head_commit" >&2
+            exit 1
+          fi
+          {
+            printf 'RELEASE_TAG=%s\n' "$REQUESTED_RELEASE_TAG"
+            printf 'RELEASE_COMMIT=%s\n' "$head_commit"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Python for release tooling
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap patched pip trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
+
+      - name: Install hash-locked release tooling
+        run: release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866  # 1.86.0
+
+      - name: Read back and verify the exact published crate
+        working-directory: release-source
+        env:
+          RUSTUP_TOOLCHAIN: 1.86.0
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUST_SDK_APPROVED_PACKAGE_REPOSITORY: ${{ github.workspace }}/release-tools
+          RUST_SDK_PUBLISHED_IN_RUN: ${{ needs.publish.result == 'success' }}
+        run: ../release-tools/scripts/ci/publish-rust-sdk.sh verify
+
+      - name: Upload verify evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: rust-sdk-release-evidence-verify-${{ inputs.release_tag }}
+          path: release-source/rust-sdk-release-evidence.json
+          if-no-files-found: error
+
+  release:
+    name: Create the source GitHub Release
+    needs: verify
+    if: >-
+      always() &&
+      github.repository == 'durable-workflow/sdk-rust' &&
+      github.ref == 'refs/heads/main' &&
+      needs.verify.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out maintained release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-tools
+          persist-credentials: false
+
+      - name: Check out immutable package source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ format('refs/tags/{0}', inputs.release_tag) }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Resolve exact release identity
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'release tag must be an exact SDK SemVer: %s\n' "$REQUESTED_RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'release commit must be a full lowercase Git commit: %s\n' \
+              "$REQUESTED_RELEASE_COMMIT" >&2
+            exit 1
+          fi
+          head_commit="$(git -C release-source rev-parse HEAD)"
+          tag_commit="$(git -C release-source rev-list -n 1 "$REQUESTED_RELEASE_TAG")"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            printf 'release tag %s resolves to %s, not checked-out commit %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$head_commit" >&2
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$REQUESTED_RELEASE_COMMIT" ]]; then
+            printf 'release tag %s resolves to %s, not requested commit %s at checkout %s\n' \
+              "$REQUESTED_RELEASE_TAG" "$tag_commit" "$REQUESTED_RELEASE_COMMIT" "$head_commit" >&2
+            exit 1
+          fi
+          {
+            printf 'RELEASE_TAG=%s\n' "$REQUESTED_RELEASE_TAG"
+            printf 'RELEASE_COMMIT=%s\n' "$head_commit"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Python for release tooling
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap patched pip trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
+
+      - name: Install hash-locked release tooling
+        run: release-tools/scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
+
+      - name: Prepare exact source release notes
+        working-directory: release-source
+        run: |
+          python3 -I ../release-tools/scripts/ci/release_package.py \
+            --release-notes "$RELEASE_TAG" > "${RUNNER_TEMP}/rust-sdk-release-notes.md"
 
       - name: Create the source GitHub Release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -132,11 +498,3 @@ jobs:
             fi
             gh release create "$RELEASE_TAG" "${arguments[@]}"
           fi
-
-      - name: Upload release evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
-        with:
-          name: rust-sdk-release-evidence-${{ env.RELEASE_TAG }}
-          path: release-source/rust-sdk-release-evidence.json
-          if-no-files-found: error

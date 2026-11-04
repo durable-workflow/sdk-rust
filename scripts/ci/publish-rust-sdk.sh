@@ -2,6 +2,36 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The release runs as separate jobs so the publication credential never shares
+# a runner with crate code:
+#   gate      (job 1, no credential): reproduce the tag's package with Cargo's
+#             full verify build, require the approved record, require that the
+#             version is absent, and hand the exact .crate to job 2.
+#   preflight (job 2, before minting): reproduce the package with --no-verify,
+#             require it to equal job 1's .crate, its output digest and the
+#             approval, and require the version to still be absent.
+#   publish   (job 2, the only phase with the credential): cargo publish
+#             --locked --no-verify. No build, test or other crate code runs.
+#   verify    (job 3, no credential): registry and tag readback against the
+#             approval, then the fresh-consumer build.
+phase="${1:-}"
+case "$phase" in
+    gate | preflight | publish | verify) ;;
+    *)
+        printf 'usage: %s gate|preflight|publish|verify\n' "$0" >&2
+        exit 2
+        ;;
+esac
+if [[ "$phase" == "publish" ]]; then
+    if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+        printf 'the publish phase requires CARGO_REGISTRY_TOKEN\n' >&2
+        exit 1
+    fi
+elif [[ -n "${CARGO_REGISTRY_TOKEN:-}${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
+    printf 'the %s phase must not see a crates.io publication credential\n' "$phase" >&2
+    exit 1
+fi
 # shellcheck source=crates-io-publish-lib.sh
 source "$script_dir/crates-io-publish-lib.sh"
 
@@ -14,6 +44,13 @@ release_run_id="${RELEASE_RUN_ID:-}"
 release_run_attempt="${RELEASE_RUN_ATTEMPT:-}"
 release_tooling_commit="$(git -C "$script_dir" rev-parse HEAD)"
 lockfile_source="source_checkout"
+# A reviewed record of the pre-publication package that passed installed-native
+# acceptance (scripts/acceptance/installed-native, --package-from). New versions
+# publish only when the reproduced package is exactly that artifact.
+# The maintained-tooling checkout (main) that tracks the reviewed records at
+# release/approved-packages/<version>.json.
+approved_package_repository="${RUST_SDK_APPROVED_PACKAGE_REPOSITORY:-}"
+approved_package_path=""
 
 for command in cargo curl git jq python3 rustc sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -31,10 +68,35 @@ if [[ ! -f "$changelog_path" ]]; then
     exit 1
 fi
 
+# The manifest and changelog must be regular files inside the release checkout
+# (the working directory): relative, no '..', no symbolic links, no escape.
+# The working directory is the tagged tree, so every interpreter here runs
+# isolated (-I): neither that tree nor PYTHON* variables can add import paths.
+source_root="$(pwd -P)"
+if ! python3 -I "$script_dir/release_package.py" --check-paths --source-root "$source_root" \
+    --manifest "$manifest_path" --changelog "$changelog_path" >/dev/null; then
+    printf 'Rust SDK manifest and changelog must be regular files inside the release checkout\n' >&2
+    exit 1
+fi
+evidence_parent="$(dirname "$evidence_path")"
+if [[ -L "$evidence_path" || -L "$evidence_parent" || ! -d "$evidence_parent" || \
+      "/$evidence_path/" == *"/../"* ]]; then
+    printf 'release evidence path must be a plain path without links or ".." components\n' >&2
+    exit 1
+fi
+
 if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
     printf 'Rust SDK publication requires a clean release checkout\n' >&2
     exit 1
 fi
+# The tagged source is package data, never configuration for the tools that
+# package or upload it: no Cargo configuration or toolchain override.
+for override in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
+    if [[ -e "$override" || -L "$override" ]]; then
+        printf 'release source must not contain %s\n' "$override" >&2
+        exit 1
+    fi
+done
 
 metadata="$(cargo metadata --manifest-path "$manifest_path" --no-deps --format-version 1)"
 package_name="$(jq -er '.packages[0].name' <<<"$metadata")"
@@ -185,6 +247,11 @@ release_entry_checksum=""
 published_changelog_checksum=""
 published_release_entry_checksum=""
 fresh_consumer_verified="false"
+approval_status="absent"
+approved_checksum=""
+approved_record_sha256=""
+approved_matches_registry="false"
+source_tag_readback_commit=""
 
 write_evidence() {
     local outcome="$1"
@@ -265,6 +332,12 @@ write_evidence() {
         --arg published_changelog_checksum "$published_changelog_checksum" \
         --arg published_release_entry_checksum "$published_release_entry_checksum" \
         --arg fresh_consumer_verified "$fresh_consumer_verified" \
+        --arg approval_status "$approval_status" \
+        --arg approved_package_path "$approved_package_path" \
+        --arg approved_checksum "$approved_checksum" \
+        --arg approved_record_sha256 "$approved_record_sha256" \
+        --arg approved_matches_registry "$approved_matches_registry" \
+        --arg source_tag_readback_commit "$source_tag_readback_commit" \
         --arg outcome "$outcome" \
         --arg reason "$reason" \
         --arg registry_verified "$registry_verified" \
@@ -353,6 +426,17 @@ write_evidence() {
                 commit: $release_tooling_commit,
                 lockfile_source: $lockfile_source
             },
+            approved_package: {
+                status: $approval_status,
+                record_path: $approved_package_path,
+                record_sha256: $approved_record_sha256,
+                crate_sha256: $approved_checksum,
+                registry_matches_approved_package: ($approved_matches_registry == "true")
+            },
+            source_tag_readback: {
+                tag: $release_tag,
+                commit: $source_tag_readback_commit
+            },
             fresh_consumer: {
                 rust_version: $rust_version,
                 exact_dependency: ($package + " = \"=" + $version + "\""),
@@ -365,6 +449,21 @@ write_evidence() {
             exact_registry_archive_matches_release_checkout: ($registry_verified == "true")
         }' > "$evidence_path"
 }
+
+if [[ "$phase" == "publish" ]]; then
+    # Token-only step. --no-verify packages and uploads without building, so no
+    # build script, proc-macro or test of the crate or its dependencies runs
+    # here. The preflight phase in this job already required this clean tag's
+    # --no-verify package to equal job 1's gated .crate and the approval; the
+    # verify job reads the published bytes back against the approval.
+    if ! cargo publish --locked --no-verify --manifest-path "$manifest_path" --registry crates-io; then
+        write_evidence "failed" "cargo_publish_failed"
+        exit 1
+    fi
+    write_evidence "published" "exact_public_version_published"
+    printf 'Rust SDK %s %s was uploaded to crates.io.\n' "$package_name" "$package_version"
+    exit 0
+fi
 
 # Older immutable tags ignored Cargo.lock. Recover only that missing input from
 # their verified registry archive; complete local/archive equality still follows.
@@ -386,9 +485,10 @@ if [[ ! -f "$lockfile_path" || -L "$lockfile_path" ]]; then
         "$version_response")" || \
        ! crates_io_request --fail --silent --show-error --location \
         --header "User-Agent: ${user_agent}" --output "$published_archive" "$download_url" || \
-       ! python3 "$script_dir/release_package.py" \
-        --manifest "$manifest_path" --changelog "$changelog_path" \
-        --archive "$published_archive" --expected-vcs-commit "$release_commit" \
+       ! python3 -I "$script_dir/release_package.py" \
+        --source-root "$source_root" --manifest "$manifest_path" --changelog "$changelog_path" \
+        --archive-root "$tmp_dir" --archive "$(basename "$published_archive")" \
+        --expected-vcs-commit "$release_commit" \
         --expected-archive-sha256 "$published_checksum" \
         --restore-missing-lockfile > "$tmp_dir/restored-lockfile.json"; then
         write_evidence "failed" "legacy_release_lockfile_verification_failed"
@@ -397,12 +497,19 @@ if [[ ! -f "$lockfile_path" || -L "$lockfile_path" ]]; then
     lockfile_source="verified_registry_archive"
 fi
 
-if ! cargo package --locked --manifest-path "$manifest_path"; then
+# Only the gate phase (job 1, no credential) runs Cargo's verify build of the
+# package; the other phases reproduce the same bytes without building.
+package_arguments=(package --locked --manifest-path "$manifest_path")
+if [[ "$phase" != "gate" ]]; then
+    package_arguments+=(--no-verify)
+fi
+if ! cargo "${package_arguments[@]}"; then
     write_evidence "failed" "local_package_archive_build_failed"
     exit 1
 fi
 
-local_archive="${target_directory}/package/${package_name}-${package_version}.crate"
+local_archive_root="${target_directory}/package"
+local_archive="${local_archive_root}/${package_name}-${package_version}.crate"
 if [[ ! -f "$local_archive" ]]; then
     write_evidence "failed" "local_package_archive_missing"
     printf 'local Cargo package archive was not created: %s\n' "$local_archive" >&2
@@ -410,10 +517,12 @@ if [[ ! -f "$local_archive" ]]; then
 fi
 local_checksum="$(sha256sum "$local_archive" | awk '{print $1}')"
 local_identity="$tmp_dir/local-package-identity.json"
-if ! python3 "$script_dir/release_package.py" \
+if ! python3 -I "$script_dir/release_package.py" \
+    --source-root "$source_root" \
     --manifest "$manifest_path" \
     --changelog "$changelog_path" \
-    --archive "$local_archive" \
+    --archive-root "$local_archive_root" \
+    --archive "$(basename "$local_archive")" \
     --expected-vcs-commit "$release_commit" > "$local_identity"; then
     write_evidence "failed" "local_package_release_identity_mismatch"
     printf 'local Cargo package does not contain the authorized release notes and VCS identity\n' >&2
@@ -424,6 +533,42 @@ archive_vcs_dirty="$(jq -r '.archive.vcs_dirty' "$local_identity")"
 changelog_checksum="$(jq -er '.changelog.sha256' "$local_identity")"
 release_entry_checksum="$(jq -er '.changelog.entry_sha256' "$local_identity")"
 
+# package_version is already an exact SemVer here; release_package.py validates
+# it strictly again before naming the record, and reads only a regular,
+# link-free file that equals the blob tracked at that exact path.
+approved_package_path="release/approved-packages/${package_version}.json"
+approval_present="false"
+approval_tracked=""
+if [[ -n "$approved_package_repository" ]]; then
+    approval_tracked="$(git -C "$approved_package_repository" ls-tree --full-tree HEAD -- "$approved_package_path" 2>/dev/null || true)"
+fi
+if [[ -n "$approved_package_repository" && \
+      ( -e "$approved_package_repository/$approved_package_path" || \
+        -L "$approved_package_repository/$approved_package_path" || -n "$approval_tracked" ) ]]; then
+    approval_present="true"
+fi
+if [[ "$approval_present" == "true" ]]; then
+    packaging_cargo="$(cargo -V | awk '{print $2}')"
+    local_approval="$tmp_dir/local-approval.json"
+    if ! python3 -I "$script_dir/release_package.py" \
+        --source-root "$source_root" \
+        --manifest "$manifest_path" \
+        --changelog "$changelog_path" \
+        --archive-root "$local_archive_root" \
+        --archive "$(basename "$local_archive")" \
+        --expected-vcs-commit "$release_commit" \
+        --approval-repository "$approved_package_repository" \
+        --cargo-version "$packaging_cargo" > "$local_approval"; then
+        approval_status="reproduction_mismatch"
+        write_evidence "failed" "approved_package_mismatch"
+        printf 'reproduced package is not the approved pre-publication package; refusing to publish\n' >&2
+        exit 1
+    fi
+    approved_checksum="$(jq -er '.approval.crate_sha256' "$local_approval")"
+    approved_record_sha256="$(jq -er '.approval.record_sha256' "$local_approval")"
+    approval_status="reproduced"
+fi
+
 write_evidence "pending" "checking_public_registry"
 
 if ! http_status="$(crates_io_version_lookup "$version_api" "$version_response" "$user_agent")"; then
@@ -432,17 +577,101 @@ if ! http_status="$(crates_io_version_lookup "$version_api" "$version_response" 
     exit 1
 fi
 
-if ! publish_exact_crate_if_absent "$http_status" "$manifest_path"; then
-    write_evidence "failed" "$publish_error"
-    case "$publish_error" in
-        registry_token_missing)
-            printf 'CARGO_REGISTRY_TOKEN is required to publish %s %s\n' "$package_name" "$package_version" >&2
-            ;;
-        registry_version_lookup_http_*)
-            printf 'crates.io version lookup failed with HTTP %s\n' "$http_status" >&2
-            ;;
-    esac
+if [[ "$http_status" != "200" && "$http_status" != "404" ]]; then
+    write_evidence "failed" "registry_version_lookup_http_${http_status}"
+    printf 'crates.io version lookup failed with HTTP %s\n' "$http_status" >&2
     exit 1
+fi
+if [[ "$http_status" == "404" && "$phase" != "verify" && "$approval_status" != "reproduced" ]]; then
+    write_evidence "failed" "approved_package_required"
+    printf 'publishing %s %s requires a reviewed approved-package record (RUST_SDK_APPROVED_PACKAGE_REPOSITORY)\n' \
+        "$package_name" "$package_version" >&2
+    exit 1
+fi
+
+write_output() {
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+    fi
+}
+
+if [[ "$phase" == "gate" ]]; then
+    # Hand the exact reproduced bytes to the publish job (uploaded unarchived,
+    # digest-bound by the central artifact handoff contract). Job 2 trusts
+    # neither this file nor these outputs alone: it requires both to equal its
+    # own reproduction and the reviewed approval.
+    gated_file="${RUST_SDK_GATED_PACKAGE_FILE:-}"
+    if [[ -z "$gated_file" || -e "$gated_file" || -L "$gated_file" ]]; then
+        write_evidence "failed" "gated_package_path_invalid"
+        printf 'RUST_SDK_GATED_PACKAGE_FILE must name a new file\n' >&2
+        exit 1
+    fi
+    cp "$local_archive" "$gated_file"
+    gated_file_sha256="$(sha256sum "$gated_file" | awk '{print $1}')"
+    if [[ "$gated_file_sha256" != "$local_checksum" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        exit 1
+    fi
+    write_output crate_sha256 "$gated_file_sha256"
+    if [[ "$http_status" == "200" ]]; then
+        write_output publish_required false
+        write_evidence "gated" "exact_public_version_already_exists"
+        exit 0
+    fi
+    if [[ "$gated_file_sha256" != "$approved_checksum" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        exit 1
+    fi
+    write_output publish_required true
+    write_evidence "gated" "approved_package_reproduced_and_built"
+    printf 'Rust SDK %s %s is approved, reproduced, built and absent from crates.io.\n' "$package_name" "$package_version"
+    exit 0
+fi
+
+if [[ "$phase" == "preflight" ]]; then
+    if [[ "$http_status" != "404" ]]; then
+        write_evidence "failed" "registry_version_already_exists"
+        printf '%s %s already exists on crates.io; nothing to publish\n' "$package_name" "$package_version" >&2
+        exit 1
+    fi
+    gated_file="${RUST_SDK_GATED_PACKAGE_FILE:-}"
+    gated_digest="${RUST_SDK_GATED_SHA256:-}"
+    gated_output="${RUST_SDK_GATED_CRATE_SHA256:-}"
+    gated_entries=""
+    if [[ -n "$gated_file" ]]; then
+        gated_entries="$(find "$(dirname "$gated_file")" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)"
+    fi
+    if [[ ! "$gated_digest" =~ ^[0-9a-f]{64}$ || ! "$gated_output" =~ ^[0-9a-f]{64}$ || \
+          -z "$gated_file" || "$gated_entries" != "$gated_file" || -L "$gated_file" || ! -f "$gated_file" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        printf 'the gated package handoff must be exactly one regular file with exact digests\n' >&2
+        exit 1
+    fi
+    gated_file_sha256="$(sha256sum "$gated_file" | awk '{print $1}')"
+    if [[ "$gated_file_sha256" != "$gated_digest" || "$gated_file_sha256" != "$gated_output" || \
+          "$gated_file_sha256" != "$local_checksum" || "$gated_file_sha256" != "$approved_checksum" ]]; then
+        write_evidence "failed" "gated_package_mismatch"
+        printf 'gated package %s, artifact digest %s, gate output %s, reproduction %s and approval %s must be equal\n' \
+            "$gated_file_sha256" "$gated_digest" "$gated_output" "$local_checksum" "$approved_checksum" >&2
+        exit 1
+    fi
+    write_evidence "preflight_passed" "approved_package_reproduced_without_build"
+    printf 'Rust SDK %s %s matches the gated package and the approval.\n' "$package_name" "$package_version"
+    exit 0
+fi
+
+# verify phase
+if [[ "${RUST_SDK_PUBLISHED_IN_RUN:-false}" == "true" ]]; then
+    publish_outcome="published"
+    publish_reason="exact_public_version_published"
+else
+    if [[ "$http_status" != "200" ]]; then
+        write_evidence "failed" "registry_version_absent"
+        printf '%s %s is not on crates.io\n' "$package_name" "$package_version" >&2
+        exit 1
+    fi
+    publish_outcome="already_published"
+    publish_reason="exact_public_version_already_exists"
 fi
 
 if [[ "$publish_outcome" == "published" ]]; then
@@ -505,6 +734,12 @@ if [[ "$download_checksum" != "$published_checksum" ]]; then
     printf 'downloaded crate checksum does not match the crates.io registry checksum\n' >&2
     exit 1
 fi
+if [[ "$approval_status" == "reproduced" && \
+      ( "$published_checksum" != "$approved_checksum" || "$download_checksum" != "$approved_checksum" ) ]]; then
+    write_evidence "failed" "published_checksum_differs_from_approved_package"
+    printf 'crates.io checksum %s differs from the approved package %s\n' "$published_checksum" "$approved_checksum" >&2
+    exit 1
+fi
 if [[ "$local_checksum" != "$published_checksum" ]]; then
     write_evidence "failed" "published_source_archive_mismatch"
     printf 'published crate archive differs from the exact release checkout package\n' >&2
@@ -512,10 +747,12 @@ if [[ "$local_checksum" != "$published_checksum" ]]; then
 fi
 
 published_identity="$tmp_dir/published-package-identity.json"
-if ! python3 "$script_dir/release_package.py" \
+if ! python3 -I "$script_dir/release_package.py" \
+    --source-root "$source_root" \
     --manifest "$manifest_path" \
     --changelog "$changelog_path" \
-    --archive "$published_archive" \
+    --archive-root "$tmp_dir" \
+    --archive "$(basename "$published_archive")" \
     --expected-vcs-commit "$release_commit" > "$published_identity"; then
     write_evidence "failed" "published_package_release_identity_mismatch"
     printf 'downloaded crate does not contain the authorized release notes and VCS identity\n' >&2
@@ -534,7 +771,41 @@ if [[ "$published_archive_vcs_commit" != "$archive_vcs_commit" || \
     exit 1
 fi
 
-if ! python3 "$script_dir/verify-fresh-consumer.py" \
+if [[ "$approval_status" == "reproduced" ]]; then
+    if ! python3 -I "$script_dir/release_package.py" \
+        --source-root "$source_root" \
+        --manifest "$manifest_path" \
+        --changelog "$changelog_path" \
+        --archive-root "$tmp_dir" \
+        --archive "$(basename "$published_archive")" \
+        --expected-vcs-commit "$release_commit" \
+        --approval-repository "$approved_package_repository" > "$tmp_dir/published-approval.json"; then
+        write_evidence "failed" "published_package_differs_from_approved_package"
+        printf 'downloaded crate is not the approved pre-publication package\n' >&2
+        exit 1
+    fi
+    approved_matches_registry="true"
+fi
+
+# Read the source tag back from the repository: it must still name the release
+# (and approved) commit after publication.
+if ! remote_tag_refs="$(git ls-remote origin "refs/tags/${release_tag}" "refs/tags/${release_tag}^{}")"; then
+    write_evidence "failed" "source_tag_readback_failed"
+    printf 'could not read source tag %s back from origin\n' "$release_tag" >&2
+    exit 1
+fi
+source_tag_readback_commit="$(awk -v ref="refs/tags/${release_tag}^{}" '$2 == ref {print $1}' <<<"$remote_tag_refs")"
+if [[ -z "$source_tag_readback_commit" ]]; then
+    source_tag_readback_commit="$(awk -v ref="refs/tags/${release_tag}" '$2 == ref {print $1}' <<<"$remote_tag_refs")"
+fi
+if [[ "$source_tag_readback_commit" != "$release_commit" ]]; then
+    write_evidence "failed" "source_tag_readback_mismatch"
+    printf 'source tag %s reads back as %s, not release commit %s\n' \
+        "$release_tag" "${source_tag_readback_commit:-<missing>}" "$release_commit" >&2
+    exit 1
+fi
+
+if ! python3 -I "$script_dir/verify-fresh-consumer.py" \
     registry --manifest "$manifest_path"; then
     write_evidence "failed" "published_fresh_consumer_msrv_build_failed" "true"
     exit 1
