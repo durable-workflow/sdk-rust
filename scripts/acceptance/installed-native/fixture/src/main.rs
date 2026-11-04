@@ -41,9 +41,7 @@ fn lines(path: &str) -> Vec<Value> {
 }
 
 fn client(role: &str) -> Outcome<Client> {
-    let credentials: Value =
-        serde_json::from_str(&std::fs::read_to_string("/state/credentials.json")?)?;
-    let token = credentials[role].as_str().map(str::to_owned);
+    let token = Some(std::fs::read_to_string("/credentials/token")?);
     let builder = Client::builder(RUNTIME).namespace("default");
     let builder = if role == "worker" { builder.worker_token(token) } else { builder.token(token) };
     Ok(builder.build()?)

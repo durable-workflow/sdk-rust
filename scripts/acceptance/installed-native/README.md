@@ -263,23 +263,20 @@ token is fresh per invocation. Each carries the labels `task`,
 `dev.durable-workflow.acceptance.run=<token>` and
 `dev.durable-workflow.acceptance.owner=<prefix>`.
 
-While the client is alive, it removes its containers, its network and the
-fixture credentials, even when the run fails. Each cell writes its credential
-file and creates its network and containers inside the cleanup-protected
-region. It records each container name before running `docker run`, because
+While the client is alive, it removes its containers, its network and transient
+state, even when the run fails. Each cell creates its network and containers
+inside the cleanup-protected region. It records each container name before running `docker run`, because
 the daemon can create a container (or network) even when the client then times
 out or errors. Cleanup inspects each recorded name, then logs and removes the
-object by ID only when its run label equals this invocation's token. A name
+object by ID only when both its run and owner labels match this invocation. A name
 collision or a failed create never touches anyone else's object.
 
-Each cell creates `state/`, `database/`, `storage/` and its credential file
-inside the cleanup-protected region, so a partial setup failure is cleaned up
-too. The credential file is created owner-only (`0600`). Its readers (the
-fixture worker, driver and history check) run as the host UID, and the server
-roles get the token from their environment.
+Each cell creates `state/`, `database/` and `storage/` inside the
+cleanup-protected region, so a partial setup failure is cleaned up too.
+Credential material stays in each container's private tmpfs, described below.
 
 Each Docker inspect, log and remove step is best-effort: a failure or timeout
-is recorded and the remaining steps still run. The credential file,
+is recorded and the remaining steps still run. The legacy credential path,
 `database/` and `storage/` are removed separately, in an outer `finally`,
 whatever Docker did. Afterwards each one is checked for absence, and any
 survivor is listed in `local_leftovers`. A failed step never replaces the
@@ -322,11 +319,55 @@ uses:
 | `runtime` | `CHOWN`, `DAC_OVERRIDE`, `KILL`, `SETGID`, `SETUID` | The Apache root master chowns its mutex, switches its children to www-data and signals them. |
 | `queue`, `repair` | none | They run as uid 1000. |
 
-Cell containers are detached and have no client-independent lifetime bound. If
-the client is killed mid-cell, its containers, its network and the cell's
-`state/` (credential file, database and storage) stay behind until removed by
-hand. Removing the containers labelled with the run token alone is not a
-complete cleanup. Issue #171 tracks an independent cell lifetime and reaper.
+Every Cell captures one absolute deadline before its first container starts.
+All native and PHP roles, including bootstrap, driver and history checks, run
+their original image entrypoint under `cell-supervisor.sh`. GNU `timeout` sends
+TERM at that same deadline and KILL ten seconds later. The bound includes the
+wait for credentials and remains effective if the Python client dies. The
+default Cell lifetime is ten minutes. Selected images must provide `/bin/sh`,
+GNU `timeout`, `date`, `cat`, `sleep` and `mv`; missing tools fail the run.
+
+Each container gets its own 64 KiB credential tmpfs, owned by its initial user.
+The client sends only that role's required Cell token/Server key through stdin,
+with an atomic ready marker after delivery. The supervisor validates the values
+before starting the role. Both are absent from host evidence files and Docker
+create arguments/environment, and disappear with the tmpfs after exit.
+The fixture and history checker read `/credentials/token`; the Server receives
+its values only in its child process environment. Native runtime gets both;
+proxy/worker/driver/history get only auth; MySQL/Redis get neither. PHP bootstrap,
+queue and repair get only the shared Server key. They run CLI migrations,
+seeding and maintenance, not authenticated HTTP handlers. PHP HTTP runtime gets
+both. Its generated `/app/bootstrap/cache` is also tmpfs so cached configuration
+does not retain credentials in a stopped container's writable layer.
+
+If the client dies, stopped container metadata, the network and transient
+database/storage state can remain. Recover that invocation with its exact
+`run.json` owner and token:
+
+```sh
+python3 scripts/acceptance/installed-native/run.py cleanup \
+  --work-dir <the run's work directory> \
+  --container-prefix sdk-rust --run-token <the 16-hex token in run.json>
+```
+
+Recovery verifies the work-directory ownership record, enumerates by both
+exact labels, rechecks each object's labels before deleting it, and removes
+that run's entire Cell trees. An interrupted client no longer has the secret
+values needed to certify partial logs/results, so recovery retains none of
+those unqualified artifacts. It refuses symlinked Cell roots and never follows
+inner symlinks. Any failed query, removal or survivor returns nonzero. This
+command supplements the independent lifetime; it is not required to stop
+credentialed processes.
+
+Normal completion fences saved stdout/stderr before writing them. After the
+writers stop, it scans every retained Cell artifact and normalizes JSON before
+exact-value scanning. Only real directories and regular single-link files are
+accepted. File reads and redaction use a validated no-follow descriptor;
+unreadable directories also fail closed. Token/key output is redacted and makes
+acceptance fail. Unsafe evidence or uncertain writer cleanup purges the complete
+Cell tree. The final summary has the
+same exact-value fence before serialization. A redacted credential incident
+can never produce an approved-package record.
 
 The cell runtime uses SQLite, normal native maintenance, and one shared
 fixture token for all roles. It does not cover role-only authentication, other
