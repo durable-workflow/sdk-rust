@@ -15627,6 +15627,7 @@ impl Future for ConditionWaitCall {
             let mut result = None;
             let mut pending_delivery = false;
             let mut first_sequence = None;
+            let mut latest_timeout_seconds = None;
             loop {
                 if cursor > initial_cursor
                     && matches!(
@@ -15679,6 +15680,7 @@ impl Future for ConditionWaitCall {
                     return Poll::Ready(Err(error));
                 }
                 first_sequence.get_or_insert(sequence);
+                latest_timeout_seconds = timeout_seconds;
                 if result == Some(ConditionWaitResult::TimedOut) {
                     return Poll::Ready(Err(Error::NonDeterministicReplay(ReplayFailure::new(
                         "condition_wait_reopened_after_timeout",
@@ -15713,6 +15715,19 @@ impl Future for ConditionWaitCall {
                 return Poll::Pending;
             }
             match (result, first_sequence) {
+                // A grouped (parallel or select) reopen keeps the authored
+                // timeout while the history does: the PHP Server accepts a
+                // grouped reopen only when its timeout equals both the original
+                // and the latest open (#189), so the remaining time would stall
+                // the run. A history that already recorded a shorter grouped
+                // reopen came from a Server that accepts them; keep its
+                // convention.
+                (None, Some(_))
+                    if !self.parallel_group_path.is_empty()
+                        && latest_timeout_seconds == options.timeout_seconds =>
+                {
+                    None
+                }
                 (None, Some(first_sequence)) => {
                     // The logical wait stays open: its deadline is fixed at the
                     // first physical open, not reset by a wake that left the
@@ -24458,6 +24473,90 @@ mod tests {
                 history_event(event["event_type"].as_str().unwrap(), payload)
             })
             .collect()
+    }
+
+    // #189: the PHP Server accepts a grouped reopen only with the authored
+    // timeout, so a parallel or select member reopens with it, not with the
+    // remaining time an ungrouped wait uses.
+    #[test]
+    fn grouped_condition_reopen_sends_the_authored_timeout() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay-regressions/grouped-condition-physical-reopen.json"
+        ))
+        .expect("grouped condition fixture");
+        let base = fixture["history"].as_array().expect("fixture history")[..2].to_vec();
+        for mode in ["parallel", "select"] {
+            let mut history = base
+                .iter()
+                .map(|event| {
+                    let mut payload = event["payload"].clone();
+                    if mode == "select" {
+                        let index = payload["parallel_group_index"].as_u64().unwrap();
+                        payload["parallel_group_id"] = json!("select-calls:1:2");
+                        payload["parallel_group_mode"] = json!("select");
+                        payload["selection_member_key"] =
+                            json!(if index == 0 { "timer" } else { "votes" });
+                        payload["selection_member_index"] = json!(index);
+                        payload["selection_member_base_sequence"] = json!(index + 1);
+                        payload["selection_member_size"] = json!(1);
+                        payload["selection_member_kind"] =
+                            json!(if index == 0 { "timer" } else { "condition" });
+                    }
+                    if event["event_type"] == "ConditionWaitOpened" {
+                        payload["timeout_seconds"] = json!(300);
+                    }
+                    timed_event(
+                        event["event_type"].as_str().unwrap(),
+                        "2026-11-04T02:36:05.000000+00:00",
+                        payload,
+                    )
+                })
+                .collect::<Vec<_>>();
+            history.push(approval_signal(
+                "vote",
+                "v1",
+                "2026-11-04T02:36:17.000000+00:00",
+            ));
+            let ctx = workflow_context(history);
+            let condition = ConditionWaitOptions::new("two-votes", "sha256:two-votes-v1")
+                .timeout(Duration::from_secs(300));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            let poll = if mode == "parallel" {
+                let mut group = Box::pin(ctx.parallel(vec![
+                    ParallelOperation::timer(Duration::from_secs(300)),
+                    ParallelOperation::condition(condition, || Ok(false)),
+                ]));
+                group
+                    .as_mut()
+                    .poll(&mut task_context)
+                    .map(|result| result.map(|_| ()))
+            } else {
+                let mut group = Box::pin(ctx.select_keyed(vec![
+                    ("timer", ParallelOperation::timer(Duration::from_secs(300))),
+                    (
+                        "votes",
+                        ParallelOperation::condition(condition, || Ok(false)),
+                    ),
+                ]));
+                group
+                    .as_mut()
+                    .poll(&mut task_context)
+                    .map(|result| result.map(|_| ()))
+            };
+            assert!(matches!(poll, Poll::Pending), "{mode}: {poll:?}");
+            let commands = ctx.take_commands().expect("commands");
+            let reopens = commands
+                .iter()
+                .filter(|command| command["type"] == "open_condition_wait")
+                .collect::<Vec<_>>();
+            assert_eq!(reopens.len(), 1, "{mode}: {commands:?}");
+            assert_eq!(
+                reopens[0]["condition_wait_occurrence_id"],
+                json!("rust:condition-wait:0"),
+                "{mode}"
+            );
+            assert_eq!(reopens[0]["timeout_seconds"], json!(300), "{mode}");
+        }
     }
 
     // #187: a grouped reopen carries the remaining time, so the next task must
