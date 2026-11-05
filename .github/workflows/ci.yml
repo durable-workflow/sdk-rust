@@ -159,6 +159,8 @@ jobs:
           python -m unittest discover -s scripts/acceptance/installed-native -p test_cell_lifetime.py
       - name: Test the condition-history runner without Docker or Cargo
         run: python -B -m unittest discover -s scripts/acceptance/condition-history -p 'test_*.py'
+      - name: Test the one-shot Colima window with fake native controls
+        run: python -B -m unittest discover -s scripts/acceptance/colima-window -p 'test_*.py'
       - name: Check committed Cargo locks for known advisories
         run: python scripts/ci/check-dependency-advisories.py
 
