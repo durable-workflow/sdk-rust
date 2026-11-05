@@ -17,6 +17,7 @@ mod nexus;
 pub mod pagination;
 mod query_authority;
 mod raw_request;
+mod replay_clock;
 mod run_activities;
 mod runtime_payloads;
 mod runtime_uploads;
@@ -275,6 +276,8 @@ pub use nexus::{
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("replay time is unavailable without a supported authoritative consumed boundary")]
+    ReplayClockUnavailable,
     #[error("transport error: {0}")]
     Transport(#[from] reqwest::Error),
     #[error(
@@ -7184,6 +7187,7 @@ pub struct QueryContext {
     workflow_input_avro_value: AvroValue,
     history_events: Arc<Vec<HistoryEvent>>,
     signal_events: Arc<Vec<QuerySignal>>,
+    replay_time: Option<DateTime<chrono::Utc>>,
 }
 
 impl QueryContext {
@@ -9613,13 +9617,14 @@ impl Worker {
             )
         })?;
         let history_events = Arc::new(std::mem::take(&mut task.history_events));
-        let context = QueryContext {
+        let mut context = QueryContext {
             workflow_id: task.workflow_id,
             run_id: task.run_id,
             workflow_type: task.workflow_type.clone(),
             run_status: task.run_status,
             workflow_input,
             workflow_input_avro_value: workflow_input_typed.clone(),
+            replay_time: replay_clock::snapshot_time(&history_events, &task.payload_codec),
             history_events: Arc::clone(&history_events),
             signal_events: Arc::new(signal_events),
         };
@@ -9676,16 +9681,20 @@ impl Worker {
                     cancellation_scope_id: "root".into(),
                 };
                 query_authority::before_handler(authority, &self.client).await?;
-                let mut invocation = replay(workflow_context.clone(), workflow_input_typed.clone())
-                    .map_err(|error| {
-                        QueryTaskExecutionFailure::new(
-                            "query_workflow_state_unavailable",
-                            error.to_string(),
-                            "QueryWorkflowStateUnavailable",
-                        )
-                    })?;
+                let mut invocation = {
+                    let _clock = replay_clock::Guard::enter(&workflow_context);
+                    replay(workflow_context.clone(), workflow_input_typed.clone())
+                }
+                .map_err(|error| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        error.to_string(),
+                        "QueryWorkflowStateUnavailable",
+                    )
+                })?;
                 let outcome = {
                     let mut cx = TaskContext::from_waker(noop_waker_ref());
+                    let _clock = replay_clock::Guard::enter(&workflow_context);
                     let _replay = cancellation_replay_clock::ReplayGuard::enter(&workflow_context)
                         .map_err(|error| {
                             QueryTaskExecutionFailure::new(
@@ -9750,6 +9759,18 @@ impl Worker {
                     )
                 })?;
                 query_authority::before_handler(authority, &self.client).await?;
+                context.replay_time = workflow_context
+                    .state
+                    .lock()
+                    .map_err(|_| {
+                        QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            "workflow state poisoned",
+                            "QueryWorkflowStateUnavailable",
+                        )
+                    })?
+                    .replay_time()
+                    .ok();
                 handler(context, state, args).map_err(|message| {
                     QueryTaskExecutionFailure::new(
                         "query_workflow_state_unavailable",
@@ -9910,7 +9931,10 @@ impl Worker {
             state,
             cancellation_scope_id: "root".into(),
         };
-        let future = (workflow.execute)(ctx.clone(), input)?;
+        let future = {
+            let _clock = replay_clock::Guard::enter(&ctx);
+            (workflow.execute)(ctx.clone(), input)?
+        };
         Ok(PreparedWorkflowTask::Execution {
             task,
             context: ctx,
@@ -9923,6 +9947,7 @@ impl Worker {
         future: &mut WorkflowFuture,
     ) -> Result<Poll<Result<AvroValue>>> {
         let mut cx = TaskContext::from_waker(noop_waker_ref());
+        let _clock = replay_clock::Guard::enter(ctx);
         let _replay = cancellation_replay_clock::ReplayGuard::enter(ctx)?;
         Ok(future.as_mut().poll(&mut cx))
     }
@@ -10144,6 +10169,7 @@ impl Worker {
             run_status: Some("running".to_string()),
             workflow_input,
             workflow_input_avro_value,
+            replay_time: replay_clock::update_time(&task.history_events, update_id),
             history_events: Arc::new(task.history_events.clone()),
             signal_events: Arc::new(signal_events),
         };
@@ -11322,6 +11348,7 @@ impl WorkflowContext {
             if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
                 return match recorded {
                     RecordedCommand::SideEffect { sequence, value } => {
+                        state.replay_clock.unavailable();
                         state.command_cursor += 1;
                         value.deserialize().map_err(|error| {
                             Error::NonDeterministicReplay(ReplayFailure::new(
@@ -11345,6 +11372,7 @@ impl WorkflowContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
         let result = encode_typed_envelope(&avro_value, &state.payload_codec)?;
+        state.replay_clock.unavailable();
         state.commands.push(json!({
             "type": "record_side_effect",
             "result": result,
@@ -11365,6 +11393,7 @@ impl WorkflowContext {
             if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
                 return match recorded {
                     RecordedCommand::SideEffect { value, .. } => {
+                        state.replay_clock.unavailable();
                         state.command_cursor += 1;
                         Ok(value)
                     }
@@ -11379,6 +11408,7 @@ impl WorkflowContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
         let result = encode_typed_envelope(&value, &state.payload_codec)?;
+        state.replay_clock.unavailable();
         state.commands.push(json!({
             "type": "record_side_effect",
             "result": result,
@@ -11424,6 +11454,7 @@ impl WorkflowContext {
             state.workflow_stream_command_counter += 1;
             return match recorded {
                 RecordedCommand::SideEffect { .. } => {
+                    state.replay_clock.unavailable();
                     state.command_cursor += 1;
                     Ok(())
                 }
@@ -11453,6 +11484,7 @@ impl WorkflowContext {
             directive["max_pending_items"] = json!(max_pending_items);
         }
         let result = encode_typed_envelope(&AvroValue::Null, &state.payload_codec)?;
+        state.replay_clock.unavailable();
         state.commands.push(json!({
             "type": "record_side_effect",
             "result": result,
@@ -11511,6 +11543,7 @@ impl WorkflowContext {
             state.workflow_stream_command_counter += 1;
             return match recorded {
                 RecordedCommand::SideEffect { .. } => {
+                    state.replay_clock.unavailable();
                     state.command_cursor += 1;
                     Ok(())
                 }
@@ -11532,6 +11565,7 @@ impl WorkflowContext {
             directive["retention_seconds"] = json!(retention_seconds);
         }
         let result = encode_typed_envelope(&AvroValue::Null, &state.payload_codec)?;
+        state.replay_clock.unavailable();
         state.commands.push(json!({
             "type": "record_side_effect",
             "result": result,
@@ -11588,6 +11622,7 @@ impl WorkflowContext {
                             )));
                         }
                     }
+                    state.replay_clock.unavailable();
                     state.command_cursor += 1;
                     Ok(())
                 }
@@ -11602,6 +11637,7 @@ impl WorkflowContext {
         if !attribute_types.is_empty() {
             command.insert("attribute_types".to_string(), json!(attribute_types));
         }
+        state.replay_clock.unavailable();
         state.commands.push(Value::Object(command));
         Ok(())
     }
@@ -11676,6 +11712,7 @@ impl WorkflowContext {
                     )?;
                     // Older workers could record the same decision again. Keep
                     // each physical boundary without skipping intervening work.
+                    state.replay_clock.unavailable();
                     state.command_cursor += 1;
                     return Ok(version);
                 }
@@ -11708,6 +11745,7 @@ impl WorkflowContext {
                         max_supported,
                         sequence,
                     )?;
+                    state.replay_clock.unavailable();
                     state.command_cursor += 1;
                     state.version_markers.insert(change_id, (version, sequence));
                     Ok(version)
@@ -11742,6 +11780,7 @@ impl WorkflowContext {
         }
 
         let version = max_supported;
+        state.replay_clock.unavailable();
         state.commands.push(json!({
             "type": "record_version_marker",
             "change_id": change_id,
@@ -11791,6 +11830,7 @@ impl WorkflowContext {
                             "recorded memo entries differ from the current workflow update",
                         )));
                     }
+                    state.replay_clock.unavailable();
                     state.command_cursor += 1;
                     Ok(())
                 }
@@ -11799,6 +11839,7 @@ impl WorkflowContext {
         }
 
         let entries_envelope = encode_typed_envelope(&entries, DEFAULT_CODEC)?;
+        state.replay_clock.unavailable();
         state.commands.push(json!({
             "type": "upsert_memo",
             "entries": entries_envelope,
@@ -12010,6 +12051,7 @@ struct WorkflowState {
     cancellation_history: CancellationHistory,
     cancellation_consumed: bool,
     cancellation_clock: Option<cancellation_replay_clock::ReplayClock>,
+    replay_clock: replay_clock::Clock,
     cancellation_shield_depth: u64,
     cancellation_delivery_enabled: bool,
     cancellation_delivery_intent: Option<CancellationDelivery>,
@@ -12272,6 +12314,7 @@ impl WorkflowState {
             run_id,
             task_queue,
             payload_codec,
+            replay_clock: replay_clock::Clock::new(&history),
             history_events: Arc::new(history),
             history_budget: WorkflowHistoryBudget {
                 event_count,
@@ -13826,7 +13869,7 @@ impl ParallelCall {
                 .state
                 .lock()
                 .map_err(|_| Error::WorkflowStatePoisoned)?
-                .advance_cancellation_sequences(&sequences, Some(failed.sequence));
+                .consume_replay_group(&sequences, Some(failed.sequence));
             return Poll::Ready(Err(Error::ParallelFailed(ParallelFailure {
                 group_id,
                 member_path: failed.member_path.clone(),
@@ -13866,7 +13909,7 @@ impl ParallelCall {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?
-            .advance_cancellation_sequences(&sequences, None);
+            .consume_replay_group(&sequences, None);
         Poll::Ready(Ok(match results {
             ParallelAvroResult::Group(results) => results,
             ParallelAvroResult::Activity(_)
@@ -14512,7 +14555,7 @@ impl Future for SelectCall {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?
-            .advance_cancellation_selection(&marker.selection_group_id);
+            .consume_replay_selection(&marker.selection_group_id);
         Poll::Ready(Ok(SelectionResult {
             key: winner.key.clone(),
             index: winner.index,
@@ -14941,7 +14984,7 @@ impl Future for DurableOperationAwaitCall {
             Err(error) => return Poll::Ready(Err(error)),
             Ok(false) => {}
             Ok(true) => {
-                state.advance_cancellation_receipt(
+                state.consume_replay_receipt(
                     &self.handle.selection_group_id,
                     self.handle.base_sequence,
                 );
@@ -14958,13 +15001,13 @@ impl Future for DurableOperationAwaitCall {
         }
         match recorded_selection_member_outcome(&state, &self.handle) {
             Ok(Some(result)) => {
-                state.advance_cancellation_handle(&self.handle, false);
+                state.consume_replay_handle(&self.handle, false);
                 Poll::Ready(Ok(result))
             }
             Ok(None) => Poll::Pending,
             Err(error) => {
                 if !workflow_task_integrity_error(&error) {
-                    state.advance_cancellation_handle(&self.handle, true);
+                    state.consume_replay_handle(&self.handle, true);
                 }
                 Poll::Ready(Err(error))
             }
@@ -15046,7 +15089,7 @@ impl Future for CancelDurableOperationCall {
         match selection_cancellation_for_handle(&state, &self.handle) {
             Err(error) => return Poll::Ready(Err(error)),
             Ok(true) => {
-                state.advance_cancellation_receipt(
+                state.consume_replay_receipt(
                     &self.handle.selection_group_id,
                     self.handle.base_sequence,
                 );
@@ -15217,6 +15260,7 @@ impl ActivityCall {
         if let Some(result) = &self.local_result {
             return match result.lock() {
                 Ok(mut result) => result.take().map_or(Poll::Pending, |result| {
+                    state.replay_clock.unavailable();
                     Poll::Ready(result.map_err(Error::ActivityFailed))
                 }),
                 Err(_) => Poll::Ready(Err(Error::WorkflowStatePoisoned)),
@@ -15406,7 +15450,10 @@ impl ActivityCall {
                     }
                     state.command_cursor += 1;
                     if let Some(outcome) = outcome {
-                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
+                        state.consume_replay_sequence(sequence, &self.parallel_group_path);
+                        if self.local {
+                            state.replay_clock.unavailable();
+                        }
                         return Poll::Ready(outcome.map_err(Error::ActivityFailed));
                     }
                     state.matched_recorded_pending = true;
@@ -15604,7 +15651,7 @@ impl Future for TimerCall {
                     }
                     state.command_cursor += 1;
                     if fired {
-                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
+                        state.consume_replay_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(Ok(()));
                     }
                     state.matched_recorded_pending = true;
@@ -15812,7 +15859,7 @@ impl Future for ConditionWaitCall {
                 }
                 result = recorded_result;
                 if result.is_some() {
-                    state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
+                    state.consume_replay_sequence(sequence, &self.parallel_group_path);
                 }
                 previous_sequence = Some(sequence);
                 cursor += 1;
@@ -15993,7 +16040,13 @@ impl ConditionWaitCall {
             .parallel_group_path
             .first()
             .is_some_and(|entry| entry.parallel_group_mode.as_deref() == Some("select"));
-        match (self.predicate)() {
+        let predicate_result = {
+            // This predicate inspects the full signal/update view; the current
+            // executor does not retain its exact triggering event prefix.
+            let _clock = replay_clock::Guard::unavailable();
+            (self.predicate)()
+        };
+        match predicate_result {
             Ok(true) if !selection_member || recorded_wait => {
                 return Poll::Ready(Ok(ConditionWaitResult::Satisfied))
             }
@@ -16180,7 +16233,7 @@ impl ChildWorkflowCall {
                     }
                     state.command_cursor += 1;
                     if let Some(outcome) = outcome {
-                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
+                        state.consume_replay_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(outcome.map_err(Error::ChildWorkflowFailed));
                     }
                     state.matched_recorded_pending = true;
@@ -16415,7 +16468,7 @@ impl SignalCall {
                     }
                     state.command_cursor += 1;
                     if let Some(value) = value {
-                        state.advance_cancellation_sequence(sequence, &self.parallel_group_path);
+                        state.consume_replay_sequence(sequence, &self.parallel_group_path);
                         return Poll::Ready(Ok(value));
                     }
                     if state
@@ -16427,7 +16480,7 @@ impl SignalCall {
                             .resume_signal
                             .take()
                             .expect("matching resume signal is present");
-                        state.unavailable_cancellation_boundary(&self.parallel_group_path);
+                        state.consume_unproven_boundary(&self.parallel_group_path);
                         return Poll::Ready(Ok(signal.arguments));
                     }
 
@@ -16468,7 +16521,7 @@ impl SignalCall {
                 .resume_signal
                 .take()
                 .expect("matching resume signal is present");
-            state.unavailable_cancellation_boundary(&self.parallel_group_path);
+            state.consume_unproven_boundary(&self.parallel_group_path);
             return Poll::Ready(Ok(signal.arguments));
         }
 
