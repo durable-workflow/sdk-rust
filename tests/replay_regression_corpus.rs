@@ -2278,7 +2278,8 @@ fn successor_signal_progress(fixture: &mut Value) {
         }
         if event["event_type"] == "ActivityScheduled" {
             event["event_type"] = json!("SignalWaitOpened");
-            event["payload"] = json!({"sequence": 3, "signal_wait_id": "successor-wait", "signal_name": "ready"});
+            event["payload"] =
+                json!({"sequence": 3, "signal_wait_id": "successor-wait", "signal_name": "ready"});
         } else if event["event_type"] == "ActivityCompleted" {
             event["event_type"] = json!("SignalApplied");
             event["payload"] = json!({"sequence": 3, "signal_wait_id": "successor-wait", "signal_name": "ready",
@@ -2291,10 +2292,14 @@ fn successor_signal_progress(fixture: &mut Value) {
         .unwrap();
     history.insert(
         applied,
-        successor_event("SignalReceived", "2026-11-03T00:05:01+00:00", json!({
+        successor_event(
+            "SignalReceived",
+            "2026-11-03T00:05:01+00:00",
+            json!({
             "workflow_instance_id": instance, "workflow_run_id": run,
             "workflow_command_id": "successor-signal-command", "signal_id": "successor-signal",
-            "signal_wait_id": "successor-wait", "signal_name": "ready"})),
+            "signal_wait_id": "successor-wait", "signal_name": "ready"}),
+        ),
     );
 }
 
@@ -2319,7 +2324,10 @@ fn redrive_successor_check_refuses_duplicate_or_contradictory_scalar_terminals()
                 later_step_cancellation(fixture, 4);
                 for event in fixture["history"].as_array_mut().unwrap() {
                     if event["payload"]["sequence"] == 3
-                        && matches!(event["event_type"].as_str(), Some("ActivityScheduled" | "ActivityCompleted"))
+                        && matches!(
+                            event["event_type"].as_str(),
+                            Some("ActivityScheduled" | "ActivityCompleted")
+                        )
                     {
                         event["payload"]["local_activity"] = json!(shape.starts_with("local"));
                     }
@@ -2333,7 +2341,10 @@ fn redrive_successor_check_refuses_duplicate_or_contradictory_scalar_terminals()
             .iter()
             .position(|event| {
                 event["payload"]["sequence"] == 3
-                    && matches!(event["event_type"].as_str(), Some("ActivityCompleted" | "TimerFired" | "SignalApplied"))
+                    && matches!(
+                        event["event_type"].as_str(),
+                        Some("ActivityCompleted" | "TimerFired" | "SignalApplied")
+                    )
             })
             .unwrap();
         let duplicate = history[terminal].clone();
@@ -2354,7 +2365,10 @@ fn redrive_successor_check_refuses_duplicate_or_contradictory_scalar_terminals()
             admitted.push(shape);
         }
     }
-    assert!(admitted.is_empty(), "invalid terminal multiplicity admitted: {admitted:?}");
+    assert!(
+        admitted.is_empty(),
+        "invalid terminal multiplicity admitted: {admitted:?}"
+    );
 }
 
 #[test]
