@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 from pathlib import Path
+import hashlib
+import json
 import re
 import struct
 import sys
@@ -56,6 +58,10 @@ def main() -> None:
         crate_home,
         build / "layout.css",
         build / "navigation.js",
+        build / "status.js",
+        build / "assets/status.mjs",
+        build / "assets/identity-tokens.css",
+        build / "assets/logo.svg",
         build / "analytics/analytics.js",
         build / "assets/favicon.svg",
         build / "assets/social-card.png",
@@ -63,6 +69,24 @@ def main() -> None:
         require(path.is_file() and path.stat().st_size > 0, f"missing documentation asset: {path}")
 
     html = landing.read_text(encoding="utf-8")
+    logo_sha = '24e3ef905304b6bbb255ca7855cb47d2e9712d7af82dcfbea15570851ee091f8'
+    for name in ('logo.svg', 'favicon.svg'):
+        require(hashlib.sha256((build / 'assets' / name).read_bytes()).hexdigest() == logo_sha,
+                f'{name} must preserve the canonical flowchart mark')
+    fonts = json.loads((build / 'assets/fonts/manifest.json').read_text())
+    font_files = {
+        'Inter': ('inter-latin.woff2', 'inter-OFL.txt'),
+        'JetBrains Mono': ('jetbrains-mono-latin.woff2', 'jetbrainsmono-OFL.txt'),
+        'Space Grotesk': ('space-grotesk-latin.woff2', 'spacegrotesk-OFL.txt'),
+    }
+    require({font['family'] for font in fonts['fonts']} == set(font_files), 'shared font families differ')
+    for font in fonts['fonts']:
+        expected = font_files[font['family']]
+        require((font['file'], font['license_file']) == expected, 'unexpected shared font filename')
+        for filename, digest_key in zip(expected, ('sha256', 'license_sha256')):
+            path = build / 'assets/fonts' / filename
+            require(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == font[digest_key],
+                    'font or OFL license differs from the recorded source')
     parser = AssetParser()
     parser.feed(html)
     require(parser.h1_count == 1, "documentation landing must contain one h1")

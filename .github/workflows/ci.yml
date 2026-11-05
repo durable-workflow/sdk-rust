@@ -320,9 +320,12 @@ jobs:
           cp docs/index.html target/doc/index.html
           cp docs/layout.css target/doc/layout.css
           cp docs/navigation.js target/doc/navigation.js
+          cp docs/status.js target/doc/status.js
           mkdir -p target/doc/analytics target/doc/assets
           cp docs/analytics/analytics.js target/doc/analytics/
-          cp docs/assets/* target/doc/assets/
+          cp -R docs/assets/. target/doc/assets/
+          python3 scripts/ci/test-docs-identity.py
+          python3 scripts/ci/prepare-docs-identity.py
           python3 scripts/ci/test-rustdoc-controls.py
           python3 scripts/ci/prepare-rustdoc-controls.py
           python3 scripts/check-docs-analytics.py target/doc
@@ -330,6 +333,7 @@ jobs:
           python3 scripts/ci/validate-example-base-urls.py --rendered-docs target/doc
           node scripts/ci/test-docs-analytics.mjs
           node scripts/ci/test-docs-navigation.mjs
+          node scripts/ci/test-docs-status.mjs
 
   package:
     name: Package

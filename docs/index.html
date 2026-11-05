@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -17,106 +17,37 @@
   <link rel="stylesheet" href="layout.css">
   <link rel="canonical" href="https://rust.durable-workflow.com/">
   <title>Durable Workflow for Rust</title>
+  <script type="module" src="/navigation.js"></script>
+<script type="module" src="/status.js"></script>
   <script type="module" src="/analytics/analytics.js"></script>
 </head>
 <body class="dw-landing" data-landing-contract="general-rust-first" data-rust-version="1.86">
-  <header class="dw-nav" data-landing-region="primary-navigation">
-    <a class="dw-brand" href="/" aria-label="Durable Workflow Rust home">
-      <span class="dw-brand__mark" aria-hidden="true">DW</span>
-      <span>Durable Workflow <strong>Rust</strong></span>
-    </a>
-    <nav aria-label="Documentation">
-      <a data-docs-destination="sdk-guide" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">SDK guide</a>
-      <a data-docs-destination="api-reference" href="durable_workflow/">API reference</a>
-      <a href="https://github.com/durable-workflow/sdk-rust">GitHub</a>
-    </nav>
-  </header>
-
-  <main>
+  <!-- dw:header -->
+  <main id="main-content" tabindex="-1">
     <header class="dw-page-heading" data-journey="general">
       <p class="dw-kicker">Rust SDK · stable</p>
-      <h1>Durable Workflow Rust SDK</h1>
+      <h1>Durable workflows in Rust.</h1>
       <p data-landing-lead>Author deterministic workflows and activities, run workers, and control workflow executions with the first-party Rust SDK.</p>
-      <p class="dw-version">
-        <strong>Stable release</strong>
-        <span>Compatible with Durable Workflow 2.x runtimes</span>
-        <span>Requires Rust 1.86+</span>
-      </p>
-      <div class="dw-actions">
-        <a class="dw-button dw-button--primary" data-docs-destination="api-reference" data-docs-priority="primary" data-access="general" href="durable_workflow/">Browse the API reference</a>
-        <a class="dw-button" data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">Read the SDK guide</a>
-      </div>
+      <p class="dw-version"><strong>Stable release</strong><span>Durable Workflow 2.x runtimes</span><span>Rust 1.86+</span></p>
+      <div class="dw-actions"><a class="dw-button dw-button--primary" data-docs-destination="api-reference" data-docs-priority="primary" data-access="general" href="durable_workflow/">Browse the API reference <span aria-hidden="true">→</span></a><a class="dw-button" data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">Read the SDK guide</a></div>
     </header>
-
     <section class="dw-quickstart" data-landing-section="first-task" data-journey="general" aria-labelledby="install-title">
-      <div class="dw-section-heading">
-        <p class="dw-kicker">Start here</p>
-        <h2 id="install-title">Add the SDK to a Rust project</h2>
-        <p>The public crate and generated reference are available without an account.</p>
-      </div>
-
+      <div class="dw-section-heading"><p class="dw-kicker">Start here</p><h2 id="install-title">Add the SDK to a Rust project</h2><p>The public crate and generated reference are available without an account.</p></div>
       <ol class="dw-steps">
-        <li>
-          <span class="dw-step-number">1</span>
-          <div>
-            <h3>Confirm the Rust toolchain</h3>
-            <p>Use Rust 1.86 or newer.</p>
-            <pre><code>rustc --version</code></pre>
-          </div>
-        </li>
-        <li>
-          <span class="dw-step-number">2</span>
-          <div>
-            <h3>Add the SDK</h3>
-            <p>Use Cargo to select the current stable crate.</p>
-            <pre><code>cargo add durable-workflow</code></pre>
-          </div>
-        </li>
-        <li>
-          <span class="dw-step-number">3</span>
-          <div>
-            <h3>Explore the authoring surface</h3>
-            <p>Open the generated modules, traits, structs, and methods, then use the guide for runtime setup and deployment.</p>
-            <div class="dw-inline-links">
-              <a data-docs-destination="api-reference" data-access="general" href="durable_workflow/">Generated API reference</a>
-              <a data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/">Rust SDK guide</a>
-              <a href="https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs">Runnable typed example</a>
-              <a href="https://github.com/durable-workflow/sdk-rust/blob/3.1.0/examples/local_activities.rs">Local activity example</a>
-              <a href="https://github.com/durable-workflow/sdk-rust/blob/3.4.0/examples/sticky_execution.rs">Bounded sticky execution example</a>
-            </div>
-          </div>
-        </li>
+        <li><span class="dw-step-number">01</span><h3>Confirm the toolchain</h3><p>Use Rust 1.86 or newer.</p><div class="dw-code"><pre><code><span aria-hidden="true">$ </span><span id="dw-command-toolchain">rustc --version</span></code></pre><button type="button" class="dw-copy" data-dw-copy="dw-command-toolchain" aria-label="Copy toolchain command">Copy</button></div></li>
+        <li><span class="dw-step-number">02</span><h3>Add the SDK</h3><p>Use Cargo to select the current stable crate.</p><div class="dw-code"><pre><code><span aria-hidden="true">$ </span><span id="dw-command-install">cargo add durable-workflow</span></code></pre><button type="button" class="dw-copy" data-dw-copy="dw-command-install" aria-label="Copy Cargo install command">Copy</button></div></li>
+        <li><span class="dw-step-number">03</span><h3>Explore the authoring surface</h3><p>Open the generated modules, traits, structs and methods, then use the guide for runtime setup.</p><div class="dw-example-links"><a href="https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs">Runnable typed example <span aria-hidden="true">→</span></a><a href="https://github.com/durable-workflow/sdk-rust/blob/3.1.0/examples/local_activities.rs">Local activity example <span aria-hidden="true">→</span></a><a href="https://github.com/durable-workflow/sdk-rust/blob/3.4.0/examples/sticky_execution.rs">Bounded sticky execution example <span aria-hidden="true">→</span></a></div></li>
       </ol>
+      <output class="dw-sr-only" data-dw-copy-feedback aria-live="polite"></output>
     </section>
-
-    <section class="dw-next" data-journey="general" aria-labelledby="reference-title">
-      <div>
-        <p class="dw-kicker">Build with Rust</p>
-        <h2 id="reference-title">Continue with the SDK</h2>
-        <p>Choose the depth you need: generated API details or the broader SDK guide.</p>
-      </div>
-      <div class="dw-next__links">
-        <a data-docs-destination="api-reference" data-access="general" href="durable_workflow/"><strong>Generated API reference</strong><span>Modules, traits, structs, and methods</span></a>
-        <a data-docs-destination="sdk-guide" data-access="general" href="https://durable-workflow.com/docs/2.0/polyglot/rust/"><strong>Rust SDK guide</strong><span>Concepts, compatibility, runtime setup, and deployment</span></a>
-      </div>
-    </section>
-
-    <section class="dw-cloud" data-journey="cloud" data-access="limited-early-access" aria-labelledby="cloud-title">
-      <div>
-        <p class="dw-kicker">Managed runtime · limited early access</p>
-        <h2 id="cloud-title">Durable Workflow Cloud</h2>
-        <p>Cloud is a limited early-access deployment option for teams with a provisioned namespace. Request access to join the cohort; existing participants can review the managed-runtime guide.</p>
-      </div>
-      <div class="dw-cloud__links">
-        <a class="dw-button" data-docs-destination="cloud-access" data-access="limited-early-access" href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-landing">Request early access</a>
-        <a data-docs-destination="cloud-guide" data-access="limited-early-access" href="https://durable-workflow.com/docs/2.0/polyglot/cloud-control-plane/">Read the Cloud runtime guide</a>
+    <section class="dw-runtime" aria-labelledby="runtime-title">
+      <div class="dw-section-heading"><h2 id="runtime-title">Choose who runs the runtime</h2><p>Workflow types, activity types and task queue stay the same. Only the endpoint, credentials and operating boundary change.</p></div>
+      <div class="dw-runtime-cards">
+        <article data-journey="general"><p class="dw-kicker">Your infrastructure · no account</p><h3>Self-hosted Server</h3><p>Run the published Server image with your database, auth policy and operational controls.</p><a href="https://durable-workflow.com/docs/polyglot/server/">Run Server <span aria-hidden="true">→</span></a></article>
+        <article data-journey="cloud" data-access="limited-early-access"><p class="dw-kicker dw-kicker--muted">Managed · limited access</p><h3>Durable Workflow Cloud</h3><p>A limited early-access option for teams with a provisioned namespace. Existing participants can review the managed-runtime guide.</p><a data-docs-destination="cloud-access" data-access="limited-early-access" href="https://cloud.durable-workflow.com/early-access#source=sdk-rust-landing">Request early access <span aria-hidden="true">→</span></a><a class="dw-secondary-link" data-docs-destination="cloud-guide" data-access="limited-early-access" href="https://durable-workflow.com/docs/2.0/polyglot/cloud-control-plane/">Cloud runtime guide <span aria-hidden="true">→</span></a></article>
       </div>
     </section>
   </main>
-
-  <footer>
-    <span>Durable Workflow Rust SDK</span>
-    <span>Stable documentation</span>
-  </footer>
+  <!-- dw:footer -->
 </body>
 </html>

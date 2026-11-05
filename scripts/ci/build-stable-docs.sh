@@ -27,10 +27,10 @@ test ! -e target/stable-docs
 mv "$CARGO_TARGET_DIR/doc" target/stable-docs
 printf '%s\n' 'rust.durable-workflow.com' > target/stable-docs/CNAME
 touch target/stable-docs/.nojekyll
-cp docs/index.html docs/layout.css docs/navigation.js target/stable-docs/
+cp docs/index.html docs/layout.css docs/navigation.js docs/status.js target/stable-docs/
 mkdir -p target/stable-docs/analytics target/stable-docs/assets
 cp docs/analytics/analytics.js target/stable-docs/analytics/
-cp docs/assets/* target/stable-docs/assets/
+cp -R docs/assets/. target/stable-docs/assets/
 cp "$stable_identity" target/stable-docs/__build.json
 python3 - <<'PY'
 import json
@@ -42,6 +42,8 @@ html = landing.read_text().replace('Stable release</strong>', f"Stable release {
 html = re.sub(r'(https://github.com/durable-workflow/sdk-rust/blob/)[^/]+(/examples/)', rf"\g<1>{identity['source_revision']}\2", html)
 landing.write_text(html)
 PY
+python3 scripts/ci/test-docs-identity.py
+python3 scripts/ci/prepare-docs-identity.py --stable
 python3 scripts/ci/test-rustdoc-controls.py
 python3 scripts/ci/prepare-rustdoc-controls.py --stable
 python3 scripts/check-docs-analytics.py target/stable-docs
@@ -49,3 +51,4 @@ python3 scripts/check-docs-site.py target/stable-docs
 python3 scripts/ci/validate-example-base-urls.py --root "$stable_source" --rendered-docs target/stable-docs
 node scripts/ci/test-docs-analytics.mjs
 node scripts/ci/test-docs-navigation.mjs
+node scripts/ci/test-docs-status.mjs
