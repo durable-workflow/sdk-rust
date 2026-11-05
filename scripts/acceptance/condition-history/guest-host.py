@@ -1,7 +1,7 @@
 """Source proposal for an external, task-scoped Lima/VZ storage guardian.
 
-The plan is inert. Guard/audit require a separately admitted private authority
-record from fixed-disk setup; they never create or start a VM.
+The plan is inert. Prepare allocates native storage only after separate admission;
+guard/audit consume captured private authority. No mode creates or starts a VM.
 """
 import argparse
 import ctypes
@@ -31,6 +31,7 @@ AUTHORITY_KEYS = {'schema', 'token', 'runner_commit', 'manifest_sha256', 'guardi
                   'started_unix', 'active_unix', 'cleanup_unix', 'parent', 'limactl',
                   'guest_agent', 'host_boot_id', 'image_dev', 'image_ino', 'whole_device',
                   'volume_uuid', 'profile_sha256'}
+INTENT_KEYS = (AUTHORITY_KEYS - {'image_dev', 'image_ino', 'whole_device', 'volume_uuid', 'profile_sha256'}) | {'cached_image'}
 
 
 def require(ok, label):
@@ -88,7 +89,7 @@ def environment(record):
     scoped = paths(record['parent'], record['token'])
     return {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(pathlib.Path.home()),
             'LIMA_HOME': str(scoped['home']),
-            'LIMA_SHELLENV_BLOCK': '*', 'TMPDIR': str(scoped['mount'] / 'tmp')}
+            'LIMA_SHELLENV_BLOCK': '*', 'TMPDIR': record.get('_setup_tmp', str(scoped['mount'] / 'tmp'))}
 
 
 def plan(parent, token, limactl, image_path, profile):
@@ -129,13 +130,13 @@ def plan(parent, token, limactl, image_path, profile):
 
 
 def call(record, argv):
-    remaining = record['_cleanup_mono'] - time.monotonic()
+    remaining = min(record['_cleanup_mono'], record.get('_stage_mono', float('inf'))) - time.monotonic()
     require(remaining > 0, 'external cleanup deadline exhausted')
     # Read with a hard in-memory ceiling; native commands cannot fill host logs.
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              env=environment(record), close_fds=True)
     data = bytearray()
-    cutoff = time.monotonic() + min(20, remaining)
+    cutoff = time.monotonic() + min(record.get('_command_seconds', 20), remaining)
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(child.stdout, selectors.EVENT_READ)
@@ -222,7 +223,7 @@ def authority(path, expected_sha, source_sha):
     return value
 
 
-def verify_store(record):
+def verify_store(record, profile_required=True):
     scoped = paths(record['parent'], record['token'])
     info = scoped['image'].lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid()
@@ -237,9 +238,190 @@ def verify_store(record):
     whole = plistlib.loads(call(record, ['/usr/sbin/diskutil', 'info', '-plist', record['whole_device']]))
     volume = plistlib.loads(call(record, ['/usr/sbin/diskutil', 'info', '-plist', str(scoped['mount'])]))
     require(whole['TotalSize'] == STORE_BYTES and volume['VolumeUUID'].lower() == record['volume_uuid'].lower()
-            and volume['TotalSize'] <= STORE_BYTES and scoped['home'].stat().st_dev == scoped['mount'].stat().st_dev,
+            and volume['TotalSize'] <= STORE_BYTES and volume['MountPoint'] == str(scoped['mount'])
+            and volume['FilesystemType'] == 'apfs',
             'host store does not have its fixed byte boundary')
-    require(digest(regular(scoped['mount'] / 'guest.yaml')) == record['profile_sha256'], 'reviewed guest profile changed')
+    if profile_required:
+        require(scoped['home'].stat().st_dev == scoped['mount'].stat().st_dev
+                and digest(regular(scoped['mount'] / 'guest.yaml')) == record['profile_sha256'],
+                'reviewed guest profile changed')
+
+
+def input_bytes(path, expected_size, expected_sha, destination=None, deadline=None):
+    """Hash/copy only the pinned public inputs, streaming within the setup bound."""
+    path = pathlib.Path(path).resolve(strict=True)
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size == expected_size,
+            'wrong public input size or type')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    stream = os.fdopen(fd, 'rb')
+    target = None
+    state, count = hashlib.sha256(), 0
+    try:
+        if destination:
+            target = os.fdopen(os.open(destination, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600), 'wb')
+        with stream:
+            opened = os.fstat(stream.fileno())
+            require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'public input replaced')
+            while True:
+                if deadline is not None:require(time.monotonic() < deadline, 'public input setup cutoff')
+                block = stream.read(1024**2)
+                if not block:break
+                count += len(block)
+                require(count <= expected_size, 'public input grew')
+                state.update(block)
+                if target:target.write(block)
+            after = os.fstat(stream.fileno())
+            require((opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                    == (after.st_size, after.st_mtime_ns, after.st_ctime_ns) and after.st_nlink == 1,
+                    'public input changed')
+        require(count == expected_size and state.hexdigest() == expected_sha, 'public input digest mismatch')
+        if target:
+            target.flush()
+            os.fsync(target.fileno())
+    finally:
+        if not stream.closed:stream.close()
+        if target:target.close()
+
+
+def setup_intent(path, expected_sha, source_sha):
+    require(stat.S_IMODE(path.lstat().st_mode) == 0o600, 'private setup intent required')
+    raw = regular(path, 64 * 1024)
+    require(digest(raw) == expected_sha, 'setup intent digest mismatch')
+    value = json.loads(raw)
+    require(set(value) == INTENT_KEYS and value['schema'] == 'durable-workflow.condition-host-setup/v1',
+            'wrong setup intent schema')
+    require(value['guardian_sha256'] == source_sha and re.fullmatch('[0-9a-f]{40}', value['runner_commit'])
+            and re.fullmatch('[0-9a-f]{64}', value['manifest_sha256']), 'wrong setup source authority')
+    require(all(type(value[k]) is int for k in ('started_unix', 'active_unix', 'cleanup_unix'))
+            and value['active_unix'] == value['started_unix'] + 1740
+            and value['cleanup_unix'] == value['started_unix'] + 1800
+            and value['started_unix'] <= time.time() < value['started_unix'] + 300, 'wrong setup deadlines')
+    require(value['host_boot_id'] == boot_identity(), 'setup host boot changed')
+    scoped = paths(value['parent'], value['token'])
+    require(not os.path.lexists(scoped['parent']), 'setup scope already exists')
+    for key in ('limactl', 'guest_agent', 'cached_image'):
+        require(pathlib.Path(value[key]).is_absolute(), 'absolute pinned input required')
+    now, monotonic = time.time(), time.monotonic()
+    value['_cleanup_mono'] = monotonic + max(0, value['cleanup_unix'] - now)
+    value['_active_mono'] = monotonic + max(0, value['active_unix'] - now)
+    value['_stage_mono'] = monotonic + max(0, value['started_unix'] + 300 - now)
+    return value
+
+
+def capacity(record):
+    require(sys.platform == 'darwin' and os.uname().machine == 'x86_64', 'native Intel VZ host required')
+    version = call(record, ['/usr/bin/sw_vers', '-productVersion']).decode().strip()
+    build = call(record, ['/usr/bin/sw_vers', '-buildVersion']).decode().strip()
+    require((version, build) == ('15.8.2', '24H232'), 'reviewed native OS changed')
+    memory = call(record, ['/usr/bin/vm_stat']).decode()
+    page = re.search(r'page size of (\d+) bytes', memory)
+    require(page, 'missing host page geometry')
+    available = 0
+    for label in ('Pages free', 'Pages inactive', 'Pages speculative'):
+        match = re.search(r'^' + label + r':\s+(\d+)\.', memory, re.MULTILINE)
+        require(match, 'missing host memory readback')
+        available += int(match[1]) * int(page[1])
+    filesystem = os.statvfs(paths(record['parent'], record['token'])['parent'].parent)
+    free = filesystem.f_bavail * filesystem.f_frsize
+    require(available >= 10 * 1024**3 and free >= 48 * 1024**3, 'fresh host capacity gate refused')
+    return {'available_bytes': available, 'free_disk_bytes': free, 'os': version, 'build': build}
+
+
+def observe_attachment(record):
+    scoped = paths(record['parent'], record['token'])
+    entries = plistlib.loads(call(record, ['/usr/bin/hdiutil', 'info', '-plist']))['images']
+    matches = [entry for entry in entries if pathlib.Path(entry['image-path']).resolve() == scoped['image']]
+    require(len(matches) == 1, 'setup image attachment missing or ambiguous')
+    entities = matches[0]['system-entities']
+    require(any(e.get('mount-point') == str(scoped['mount']) for e in entities), 'setup image mount missing')
+    devices = []
+    for entity in entities:
+        device = entity.get('dev-entry', '')
+        if re.fullmatch('/dev/disk[0-9]+', device):
+            info = plistlib.loads(call(record, ['/usr/sbin/diskutil', 'info', '-plist', device]))
+            if info['TotalSize'] == STORE_BYTES:devices.append(device)
+    require(len(devices) == 1, 'fixed setup device is ambiguous')
+    volume = plistlib.loads(call(record, ['/usr/sbin/diskutil', 'info', '-plist', str(scoped['mount'])]))
+    require(volume['FilesystemType'] == 'apfs' and volume['MountPoint'] == str(scoped['mount'])
+            and 0 < volume['TotalSize'] <= STORE_BYTES
+            and re.fullmatch('[0-9A-Fa-f-]{36}', volume['VolumeUUID']), 'wrong setup volume readback')
+    return {'whole_device': devices[0], 'volume_uuid': volume['VolumeUUID']}
+
+
+def remove_store(record):
+    scoped = paths(record['parent'], record['token'])
+    call(record, ['/usr/bin/hdiutil', 'detach', record['whole_device']])
+    require(not os.path.ismount(scoped['mount']), 'owned host store remains mounted')
+    info = scoped['image'].lstat()
+    require((info.st_dev, info.st_ino) == (record['image_dev'], record['image_ino'])
+            and info.st_nlink == 1 and stat.S_ISREG(info.st_mode), 'host image changed before deletion')
+    scoped['image'].unlink()
+
+
+def prepare(record, template):
+    """Resident watchdog owns setup before the first disk mutation. No VM start."""
+    scoped = paths(record['parent'], record['token'])
+    proposal = plan(record['parent'], record['token'], record['limactl'],
+                    str(scoped['mount'] / 'a/guest.raw.gz'), template)
+    observed = capacity(record)
+    for key, size, sha in (('limactl', 35_175_712, LIMA_SHA), ('guest_agent', 8_257_812, AGENT_SHA),
+                           ('cached_image', IMAGE_BYTES, IMAGE_SHA)):
+        input_bytes(record[key], size, sha, deadline=record['_stage_mono'])
+    scoped['parent'].mkdir(mode=0o700)
+    record['_setup_tmp'] = str(scoped['parent'])
+    exclusive(scoped['parent'] / 'setup-ready.json', {'guardian_sha256': record['guardian_sha256'],
+        'runner_commit': record['runner_commit'], 'manifest_sha256': record['manifest_sha256'],
+        'process': process_identity(os.getpid()), 'capacity': observed})
+    attached = False
+    try:
+        record['_command_seconds'] = 180
+        call(record, proposal['create_store'])
+        info = scoped['image'].lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid()
+                and 0 < info.st_size <= STORE_BYTES + 2 * 1024**2, 'wrong newly created store')
+        record.update(image_dev=info.st_dev, image_ino=info.st_ino)
+        scoped['mount'].mkdir(mode=0o700)
+        call(record, proposal['attach_store'])
+        record.update(observe_attachment(record))
+        attached = True
+        verify_store(record, profile_required=False)
+        for directory in ('a', 'l', 'tmp'):(scoped['mount'] / directory).mkdir(mode=0o700)
+        record.pop('_setup_tmp')
+        input_bytes(record['cached_image'], IMAGE_BYTES, IMAGE_SHA, scoped['mount'] / 'a/guest.raw.gz', record['_stage_mono'])
+        record['profile_sha256'] = exclusive(scoped['mount'] / 'guest.yaml', proposal['profile'])
+        require(record['profile_sha256'] == proposal['profile_sha256'], 'rendered setup template changed')
+        value = {key: record[key] for key in AUTHORITY_KEYS if key != 'schema'}
+        value['schema'] = 'durable-workflow.condition-host/v1'
+        record_sha = exclusive(scoped['parent'] / 'host-record.json', value)
+        verify_store(record)
+        require(time.monotonic() < record['_stage_mono'], 'setup window exhausted')
+        for key in ('_stage_mono', '_command_seconds'):record.pop(key, None)
+        return value, record_sha
+    except BaseException as error:
+        # Failed native create/attach may not return enough identity to authorize
+        # destructive recovery. Uncertain objects remain explicit external custody.
+        record.pop('_stage_mono', None)
+        record['_command_seconds'] = 20
+        disposition = 'retained_uncertain_task_store'
+        if not attached and 'image_ino' in record:
+            try:
+                record.update(observe_attachment(record))
+                attached = True
+            except BaseException:
+                pass
+        if attached:
+            try:
+                verify_store(record, profile_required=False)
+                remove_store(record)
+                disposition = 'owned_store_removed'
+            except BaseException:
+                pass
+        exclusive(scoped['parent'] / 'setup-failure.json', {'outcome': 'fail',
+            'error_type': type(error).__name__, 'custody': disposition,
+            'runner_commit': record['runner_commit'], 'manifest_sha256': record['manifest_sha256'],
+            'store_authority': {key: record[key] for key in ('image_dev', 'image_ino', 'whole_device', 'volume_uuid') if key in record}})
+        raise
 
 
 def capture_agent(record):
@@ -303,13 +485,7 @@ def cleanup(record):
         call(record, [record['limactl'], '--tty=false', 'delete', '--force', scoped['name']])
     require(not scoped['instance'].exists(), 'VM instance storage survived')
     verify_store(record)
-    call(record, ['/usr/bin/hdiutil', 'detach', record['whole_device']])
-    require(not os.path.ismount(scoped['mount']), 'owned host store remains mounted')
-    # A changed inode never gains deletion authority through the pathname.
-    info = scoped['image'].lstat()
-    require((info.st_dev, info.st_ino) == (record['image_dev'], record['image_ino']) and info.st_nlink == 1,
-            'host image changed before deletion')
-    scoped['image'].unlink()
+    remove_store(record)
     return {'guest_absent': True, 'store_unmounted': True, 'image_absent': True,
             'image_cache_disposition': 'whole_task_guest_and_store_removed'}
 
@@ -345,10 +521,11 @@ def audit(record, record_sha, source_sha):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=('plan', 'guard', 'audit'))
+    parser.add_argument('mode', choices=('plan', 'prepare', 'guard', 'audit'))
     parser.add_argument('--record')
     parser.add_argument('--record-sha256')
     parser.add_argument('--plan-input')
+    parser.add_argument('--profile')
     args = parser.parse_args(argv)
     if args.mode == 'plan':
         value = json.loads(pathlib.Path(args.plan_input).read_bytes())
@@ -356,9 +533,17 @@ def main(argv=None):
         return
     require('-I' in sys.orig_argv and '-S' in sys.orig_argv and '-c' in sys.orig_argv, 'captured host guardian required')
     source_sha = digest(sys.orig_argv[sys.orig_argv.index('-c') + 1].encode())
+    mode = args.mode
+    if mode == 'prepare':
+        initial = setup_intent(pathlib.Path(args.record), args.record_sha256, source_sha)
+        template = json.loads(regular(pathlib.Path(args.profile), 64 * 1024))
+        _, record_sha = prepare(initial, template)
+        args.record = str(paths(initial['parent'], initial['token'])['parent'] / 'host-record.json')
+        args.record_sha256 = record_sha
+        mode = 'guard'
     record = authority(pathlib.Path(args.record), args.record_sha256, source_sha)
     scoped = paths(record['parent'], record['token'])
-    if args.mode == 'guard':
+    if mode == 'guard':
         require(record['started_unix'] <= time.time() < record['started_unix'] + 300,
                 'host setup cutoff exceeded')
         verify_store(record)

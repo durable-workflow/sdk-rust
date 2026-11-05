@@ -65,36 +65,50 @@ and resource/deadline budgets. It accepts private canonical parent P named
 private path must satisfy Lima's Unix socket limit. No shell interpolation is
 used for native controls.
 
-1. Before the first mutation, an external setup owner captures R/M, S and both
+1. Before the first mutation, the external owner captures R/M, S and both
    cutoffs, input/tool hashes, architecture, OS, native Python version, free space
-   and current capacity. It creates an exclusive owner-only P and records intent.
-   An outside-guest setup watchdog owns the 300-second setup cutoff and partial
-   image/attachment custody. This source packet does not implement that setup
-   watchdog: its captured source and precise invocation are a remaining admission
-   prerequisite, even if every inert control passes.
-2. Use only the plan's `hdiutil create -sectors 67108864 -type UDIF -layout
+   and current capacity. Write an exclusive 0600 setup intent outside the fresh P,
+   schema `durable-workflow.condition-host-setup/v1`, with exactly `INTENT_KEYS`
+   from the captured source. It binds the guardian SHA, R/M, host boot UUID,
+   token, S/cutoffs, scope, launcher/agent and already cached public image paths.
+   Capture its digest externally. Start the captured guardian in a detached new
+   session with native Python `-I -S -c`, mode `prepare`, `--record INTENT`,
+   `--record-sha256 INTENT_SHA` and `--profile CAPTURED_PROFILE`. No mutable
+   checkout executable is loaded. This resident process is the setup watchdog;
+   it owns the first native disk mutation and remains the guardian afterward.
+2. The watchdog verifies the closed intent, pinned template and all three public
+   input hashes, native Intel architecture, exact OS and fresh RAM/disk gates.
+   Insufficient capacity refuses before even creating P. It creates P exclusively
+   at 0700 and writes `setup-ready.json` with its kernel epoch and capacity.
+   Only its plan's `hdiutil create -sectors 67108864 -type UDIF -layout
    GPTSPUD -fs APFS -nospotlight` and `attach -nobrowse -owners on -mountpoint P/v
-   -plist` commands. Capture image device/inode, the whole `/dev/diskN`, APFS volume
+   -plist` commands run. Native command output has the hard in-memory ceiling;
+   create/attach are each additionally bounded by the remaining 300-second setup
+   cutoff. Setup temporary files stay in P until the fixed filesystem is mounted,
+   then all VM/input/cache/tmp/log writes use that filesystem. Capture image
+   device/inode, the whole `/dev/diskN`, APFS volume
    UUID and the 32-GiB whole-device readback. Refuse an existing image, attachment,
-   mount, Lima home or instance. Copy the already verified public gzip and guest
-   agent into the store without networking, check hashes again, and write the
+   mount, Lima home or instance. Copy the already verified public gzip into the
+   store without networking, check its hash again, and write the
    rendered JSON-as-YAML profile exclusively. No private host source or credential
-   tree is copied. Local image input and disabled containerd downloads avoid
-   Lima's global downloader cache.
-3. Write an exclusive 0600 authority record with schema
+   tree is copied. The installed public guest agent remains a pinned read-only
+   input. Local image input and disabled containerd downloads avoid Lima's global
+   downloader cache. Native readbacks must identify exactly one 32-GiB device,
+   one matching image attachment and an APFS volume at the exact mount point.
+3. The resident watchdog writes an exclusive 0600 authority record with schema
    `durable-workflow.condition-host/v1`. Its exact fields are `AUTHORITY_KEYS` in
    `guest-host.py`: R/M, guardian digest, token, host boot UUID, S/cutoffs, private
    scope and launcher/agent paths, image device/inode, whole device, volume UUID
-   and rendered-profile digest. Capture its SHA-256 outside the store. The
-   external setup watchdog retains custody until the guardian is ready.
-4. Start **captured Git bytes**, not a mutable script path, with native Python
-   `-I -S -c`, mode `guard`, `--record` and `--record-sha256`. The guardian verifies
+   and rendered-profile digest. Its SHA-256 is captured outside the store.
+4. The same process verifies its new record and becomes the active guardian
+   without a process or custody gap. Standalone `guard` mode can only consume an
+   already admitted complete authority record. The guardian verifies
    launcher/agent digests, host boot, authority, image inode/geometry, attachment
    and profile. Its exclusive `host-ready.json` binds authority/source and the
    guardian's kernel process epoch. Only after independent readiness verification
-   may the setup owner run the exact scoped Lima `create` and `start` vectors.
-   The VM must not start before this custody transfer. Setup failure before that
-   transfer remains the setup watchdog's responsibility.
+   may the external owner run the exact scoped Lima `create` and `start` vectors.
+   The VM must not start before this readiness verification. The prepared mode
+   itself cannot create or start a VM.
 5. Lima receives a fresh `LIMA_HOME`, a minimal environment, and no SSH agent,
    Docker context, proxy or cloud environment. Its host HOME remains the actual
    account home, with host SSH-key loading disabled. The complete profile has no
@@ -135,8 +149,13 @@ used for native controls.
     digest agreement. Its exclusive `host-audit.json` may then record pass. A
     guest pass alone remains `pending_external_guest_teardown`.
 
-Failure at any stage is terminal for this attempt. The external setup owner
-handles partial create/attach failures under its setup watchdog. The guardian
+Failure at any stage is terminal for this attempt. The resident setup watchdog
+handles partial create/attach/copy failures within the unchanged cleanup cutoff.
+After a lost attach response, it attempts a read-only recovery of the complete
+attachment identity before authorizing detach. A failed create or uncertain
+identity retains the task image explicitly; `setup-failure.json` records the
+captured inode/device/volume authority it actually obtained. It never guesses
+ownership or declares absence after an uncertain native result. The guardian
 attempts cleanup after malformed exports or failed process observation. If a
 device, inode, PID epoch or mount changed, it refuses destructive guesses and
 records retained custody for the external owner, who must resolve it before any
@@ -146,10 +165,16 @@ recovery case, not an unattended-success claim.
 
 ## Remaining review gates
 
-This packet intentionally cannot create/start a guest by itself. Before asking
-for execution, supply the private setup/watchdog source and exact handoff, verify
-the native APFS/Lima readback schema and guest dependency expectations, and obtain
-fresh sufficient capacity. Security reviews the full executable/storage packet;
+This packet intentionally cannot create/start a guest by itself. Setup watchdog
+and teardown source are included in the same sealed guardian. Read-only native
+inspection confirmed the supported `diskutil` property names and Darwin epoch
+structure; fake native controls bind physical/synthesized devices, APFS geometry
+and mount/UUID authority. No new attachment or guest readback is claimed.
+Before execution, supply the exact private intent/command/handoff and fresh
+sufficient capacity. The guest dependency assertions and all effective native
+readbacks must pass on the sole admitted attempt; a missing tool or unexpected
+schema fails rather than authorizing installation or a fallback. Security reviews
+the full executable/storage packet;
 General admits its exact R/M/command/window. Any admitted source change requires
 new exact review. The old missing #191 raw capture and PHP-only #192 producer
 provenance remain explicit; this guest does not alter either acceptance boundary.

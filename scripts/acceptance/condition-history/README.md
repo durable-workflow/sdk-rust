@@ -180,8 +180,9 @@ The run record binds that storage identity. Image/cache inventories remain in
 external-guardian custody until whole-guest/store teardown; the guest never
 guesses which layers to delete from a shared daemon. The concrete
 [guest/guardian source proposal](guest-proposal.md) selects cached native Lima/VZ
-inputs and a fixed enclosing host disk. Its setup/watchdog and exact admission
-prerequisites remain open; no VM execution is admitted.
+inputs and a fixed enclosing host disk. The captured external guardian also owns
+bounded setup before allocation. Exact source review, private handoff and fresh
+capacity remain prerequisites; no VM execution is admitted.
 
 The comparator scans every opened wait, condition outcome and timer row, binding
 the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.
