@@ -2372,6 +2372,130 @@ fn redrive_successor_check_refuses_duplicate_or_contradictory_scalar_terminals()
 }
 
 #[test]
+fn redrive_successor_scalar_activity_terminals_bind_mode_type_and_resource() {
+    for local in [false, true] {
+        for kind in [
+            "ActivityCompleted",
+            "ActivityFailed",
+            "ActivityTimedOut",
+            "ActivityCancelled",
+        ] {
+            let positive = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+                later_step_cancellation(fixture, 4);
+                for event in fixture["history"].as_array_mut().unwrap() {
+                    if event["payload"]["sequence"] != 3 {
+                        continue;
+                    }
+                    if event["event_type"] == "ActivityCompleted" {
+                        event["event_type"] = json!(kind);
+                        if kind != "ActivityCompleted" {
+                            let payload = event["payload"].as_object_mut().unwrap();
+                            payload.remove("result");
+                            payload.remove("payload_codec");
+                            payload.insert("message".into(), json!("terminal activity outcome"));
+                        }
+                    }
+                    if event["event_type"] == "ActivityScheduled" || event["event_type"] == kind {
+                        event["payload"]["local_activity"] = json!(local);
+                    }
+                }
+            });
+            check_redrive_successor(&positive)
+                .unwrap_or_else(|error| panic!("valid local={local} {kind}: {error}"));
+            for (key, value) in [
+                ("activity_execution_id", json!("foreign-activity")),
+                ("activity_type", json!("foreign.type")),
+                ("local_activity", json!(!local)),
+            ] {
+                let mut invalid = positive.clone();
+                let terminal = invalid["history"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|event| event["payload"]["sequence"] == 3 && event["event_type"] == kind)
+                    .unwrap();
+                terminal["payload"][key] = value;
+                assert!(
+                    check_redrive_successor(&invalid).is_err(),
+                    "foreign {key} in {kind}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn redrive_successor_signal_progress_binds_receipt_and_refuses_timed_wait_models() {
+    let positive = changed_successor(CANCELLATION_SUCCESSOR, successor_signal_progress);
+    check_redrive_successor(&positive).unwrap();
+    for (key, value) in [
+        ("signal_wait_id", json!("foreign-wait")),
+        ("signal_name", json!("foreign-name")),
+        ("signal_id", json!("foreign-signal")),
+        ("workflow_command_id", json!("foreign-command")),
+    ] {
+        let mut invalid = positive.clone();
+        history_event(&mut invalid, "SignalApplied")["payload"][key] = value;
+        assert!(
+            check_redrive_successor(&invalid).is_err(),
+            "foreign signal {key}"
+        );
+    }
+    // Backed waits may legitimately have TimerFired/TimerCancelled alongside
+    // their logical outcome. This scalar model explicitly excludes them.
+    let mut timed = positive.clone();
+    history_event(&mut timed, "SignalWaitOpened")["payload"]["timeout_seconds"] = json!(30);
+    assert!(check_redrive_successor(&timed)
+        .unwrap_err()
+        .contains("untimed signal"));
+    for kind in ["condition_timeout", "signal_timeout"] {
+        let mut internal = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+            successor_timer_progress(fixture, "TimerCancelled");
+        });
+        for event in internal["history"].as_array_mut().unwrap() {
+            if event["payload"]["sequence"] == 3
+                && matches!(
+                    event["event_type"].as_str(),
+                    Some("TimerScheduled" | "TimerCancelled")
+                )
+            {
+                event["payload"]["timer_kind"] = json!(kind);
+            }
+        }
+        assert!(check_redrive_successor(&internal)
+            .unwrap_err()
+            .contains("plain timers"));
+    }
+}
+
+#[test]
+fn redrive_successor_scalar_model_refuses_scoped_grouped_and_operation_metadata() {
+    for key in [
+        "cancellation_scope_id",
+        "parallel_group_id",
+        "selection_id",
+        "operation_sequence",
+    ] {
+        for nested in [false, true] {
+            let fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+                later_step_cancellation(fixture, 4);
+                let opened = history_event(fixture, "ActivityScheduled");
+                if nested {
+                    opened["payload"]["activity"] = json!({});
+                    opened["payload"]["activity"][key] = json!("foreign-membership");
+                } else {
+                    opened["payload"][key] = json!("foreign-membership");
+                }
+            });
+            assert!(
+                check_redrive_successor(&fixture).is_err(),
+                "unmodeled {key}, nested={nested}"
+            );
+        }
+    }
+}
+
+#[test]
 fn redrive_successor_check_rejects_impossible_histories() {
     let name = CANCELLATION_SUCCESSOR;
     // The 4.11.1 order: the successor's cancellation before the reused prefix.
@@ -2708,10 +2832,9 @@ fn redrive_event_fields(event: &Value) -> Result<(), String> {
     let fields: &[&str] = match kind {
         "MemoUpserted" | "SearchAttributesUpserted" | "SideEffectRecorded" => &["sequence"],
         "VersionMarkerRecorded" => &["sequence", "change_id"],
-        "ActivityScheduled" | "ActivityCompleted" | "ActivityCancelled" => {
-            &["sequence", "activity_type", "activity_execution_id"]
-        }
-        "TimerScheduled" | "TimerFired" => &["sequence", "timer_id"],
+        "ActivityScheduled" | "ActivityCompleted" | "ActivityFailed" | "ActivityTimedOut"
+        | "ActivityCancelled" => &["sequence", "activity_type", "activity_execution_id"],
+        "TimerScheduled" | "TimerFired" | "TimerCancelled" => &["sequence", "timer_id"],
         "SignalWaitOpened" => &["sequence", "signal_name", "signal_wait_id"],
         "SignalReceived" => &[
             "workflow_command_id",
@@ -2753,7 +2876,128 @@ fn redrive_event_fields(event: &Value) -> Result<(), String> {
             });
         }
     }
+    let payload = &event["payload"];
+    if redrive_call_kind(event).is_some()
+        || redrive_terminal_event(event)
+        || kind == "CooperativeCancellationDelivered"
+    {
+        for descriptor in [payload, &payload["activity"], &payload["timer"]] {
+            if [
+                "cancellation_scope_id",
+                "parallel_group_id",
+                "parallel_group_index",
+                "selection_id",
+                "selection_key",
+                "operation_sequence",
+                "operation_sequence_span",
+            ]
+            .iter()
+            .any(|key| descriptor.get(*key).is_some_and(|value| !value.is_null()))
+            {
+                return Err("successor evidence does not model scoped, grouped, selected or operation calls".into());
+            }
+        }
+    }
+    if kind.starts_with("Activity")
+        && payload
+            .get("local_activity")
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+    {
+        return Err("activity mode must be a boolean when supplied".into());
+    }
+    if matches!(kind, "TimerScheduled" | "TimerFired" | "TimerCancelled")
+        && !redrive_plain_timer(payload)
+    {
+        return Err("successor evidence models plain timers, not internal wait timeouts".into());
+    }
+    if kind == "SignalWaitOpened"
+        && payload
+            .get("timeout_seconds")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err("successor evidence models untimed signal waits only".into());
+    }
     Ok(())
+}
+
+fn redrive_plain_timer(payload: &Value) -> bool {
+    [
+        "timer_kind",
+        "cancellation_cleanup",
+        "cancellation_scope_id",
+        "parallel_group_id",
+        "condition_wait_id",
+        "signal_wait_id",
+    ]
+    .iter()
+    .all(|key| payload.get(*key).is_none_or(Value::is_null))
+}
+
+fn redrive_call_kind(event: &Value) -> Option<&'static str> {
+    match event["event_type"].as_str()? {
+        "ActivityScheduled" if event["payload"]["local_activity"] == true => Some("local_activity"),
+        "ActivityScheduled" => Some("activity"),
+        "TimerScheduled" => Some("timer"),
+        "SignalWaitOpened" => Some("signal"),
+        _ => None,
+    }
+}
+
+fn redrive_terminal_event(event: &Value) -> bool {
+    matches!(
+        event["event_type"].as_str(),
+        Some(
+            "ActivityCompleted"
+                | "ActivityFailed"
+                | "ActivityTimedOut"
+                | "ActivityCancelled"
+                | "TimerFired"
+                | "TimerCancelled"
+                | "SignalApplied"
+        )
+    )
+}
+
+fn redrive_terminal_matches(opened: &Value, terminal: &Value) -> bool {
+    if !opened["sequence"]
+        .as_u64()
+        .zip(terminal["sequence"].as_u64())
+        .is_some_and(|(opened, terminal)| opened < terminal)
+        || opened["payload"]["sequence"] != terminal["payload"]["sequence"]
+    {
+        return false;
+    }
+    let call = &opened["payload"];
+    let outcome = &terminal["payload"];
+    match opened["event_type"].as_str() {
+        Some("ActivityScheduled") => {
+            matches!(
+                terminal["event_type"].as_str(),
+                Some(
+                    "ActivityCompleted"
+                        | "ActivityFailed"
+                        | "ActivityTimedOut"
+                        | "ActivityCancelled"
+                )
+            ) && call["activity_execution_id"] == outcome["activity_execution_id"]
+                && call["activity_type"] == outcome["activity_type"]
+                && (call["local_activity"] == true) == (outcome["local_activity"] == true)
+        }
+        Some("TimerScheduled") => {
+            matches!(
+                terminal["event_type"].as_str(),
+                Some("TimerFired" | "TimerCancelled")
+            ) && redrive_plain_timer(call)
+                && redrive_plain_timer(outcome)
+                && call["timer_id"] == outcome["timer_id"]
+        }
+        Some("SignalWaitOpened") => {
+            terminal["event_type"] == "SignalApplied"
+                && call["signal_wait_id"] == outcome["signal_wait_id"]
+                && call["signal_name"] == outcome["signal_name"]
+        }
+        _ => false,
+    }
 }
 
 fn redrive_step_event(kind: &str) -> bool {
@@ -2765,9 +3009,12 @@ fn redrive_step_event(kind: &str) -> bool {
             | "VersionMarkerRecorded"
             | "ActivityScheduled"
             | "ActivityCompleted"
+            | "ActivityFailed"
+            | "ActivityTimedOut"
             | "ActivityCancelled"
             | "TimerScheduled"
             | "TimerFired"
+            | "TimerCancelled"
             | "SignalWaitOpened"
             | "SignalApplied"
             | "CooperativeCancellationDelivered"
@@ -2784,8 +3031,9 @@ fn redrive_requester_is_valid(value: &Value) -> bool {
     })
 }
 
-/// Core 28893f97 root cancellation for one sequential call. Propagated scope,
-/// group, selection and operation deliveries require separate evidence models.
+/// Core 28893f97 root cancellation evidence for sequential remote/local
+/// activities, plain timers and untimed signal waits. Condition/child/service
+/// calls, timed waits, scopes, groups and selections need separate models.
 fn check_successor_cancellation(
     events: &[Value],
     instance: &str,
@@ -2914,15 +3162,9 @@ fn check_successor_cancellation(
     require(
         matches!(
             call_kind,
-            "activity"
-                | "local_activity"
-                | "timer"
-                | "condition"
-                | "signal"
-                | "child"
-                | "service_operation"
+            "activity" | "local_activity" | "timer" | "signal"
         ),
-        "delivery call_kind must be a single call kind",
+        "delivery call_kind must be a modeled single call kind",
     )?;
     require(
         [
@@ -2936,6 +3178,53 @@ fn check_successor_cancellation(
     )?;
     let delivery_row = delivery["sequence"].as_u64().unwrap();
     let request_row = request["sequence"].as_u64().unwrap();
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|event| redrive_call_kind(event).is_some())
+        .collect();
+    for opened in &calls {
+        require(
+            calls
+                .iter()
+                .filter(|other| other["payload"]["sequence"] == opened["payload"]["sequence"])
+                .count()
+                == 1,
+            "successor evidence must have one opener per modeled call",
+        )?;
+        require(
+            events
+                .iter()
+                .filter(|terminal| redrive_terminal_matches(opened, terminal))
+                .count()
+                <= 1,
+            "successor call has duplicate or contradictory terminal rows",
+        )?;
+    }
+    for terminal in events.iter().filter(|event| redrive_terminal_event(event)) {
+        require(
+            calls
+                .iter()
+                .any(|opened| redrive_terminal_matches(opened, terminal)),
+            "successor terminal has no matching earlier call kind, mode, step and resource",
+        )?;
+        if terminal["event_type"] == "SignalApplied" {
+            require(
+                events.iter().any(|received| {
+                    received["event_type"] == "SignalReceived"
+                        && received["sequence"].as_u64() < terminal["sequence"].as_u64()
+                        && [
+                            "workflow_command_id",
+                            "signal_id",
+                            "signal_wait_id",
+                            "signal_name",
+                        ]
+                        .iter()
+                        .all(|key| received["payload"][*key] == terminal["payload"][*key])
+                }),
+                "signal application must match its earlier receipt",
+            )?;
+        }
+    }
     let at_step: Vec<_> = events
         .iter()
         .filter(|event| {
@@ -2945,37 +3234,18 @@ fn check_successor_cancellation(
         })
         .collect();
     let opened = at_step.iter().find(|event| {
-        event["sequence"].as_u64().unwrap() < delivery_row
-            && matches!(
-                event["event_type"].as_str(),
-                Some("ActivityScheduled" | "TimerScheduled" | "SignalWaitOpened")
-            )
+        event["sequence"].as_u64().unwrap() < delivery_row && redrive_call_kind(event).is_some()
     });
-    let resolved = |event: &&Value| {
-        matches!(
-            event["event_type"].as_str(),
-            Some("ActivityCompleted" | "ActivityCancelled" | "TimerFired" | "SignalApplied")
-        )
-    };
     if let Some(opened) = opened {
-        let kind = match opened["event_type"].as_str().unwrap() {
-            "ActivityScheduled" if opened["payload"]["local_activity"] == true => "local_activity",
-            "ActivityScheduled" => "activity",
-            "TimerScheduled" => match opened["payload"]["timer_kind"].as_str() {
-                Some("condition_timeout") => "condition",
-                Some("signal_timeout") => "signal",
-                _ => "timer",
-            },
-            _ => "signal",
-        };
         require(
-            call_kind == kind,
+            Some(call_kind) == redrive_call_kind(opened),
             "delivery call_kind must match its recorded call",
         )?;
         require(
-            !at_step
-                .iter()
-                .any(|event| resolved(event) && event["sequence"].as_u64().unwrap() < request_row),
+            !at_step.iter().any(|event| {
+                redrive_terminal_matches(opened, event)
+                    && event["sequence"].as_u64().unwrap() < request_row
+            }),
             "delivery targets a call resolved before its request",
         )?;
     } else {
@@ -2995,23 +3265,13 @@ fn check_successor_cancellation(
         // Match terminal kind, step and resource identity. An unrelated or later
         // resolution cannot justify advancing this sequential fixture.
         for earlier in &before {
-            let (identity, terminal_kinds): (&str, &[&str]) =
-                match earlier["event_type"].as_str().unwrap() {
-                    "ActivityScheduled" => (
-                        "activity_execution_id",
-                        &["ActivityCompleted", "ActivityCancelled"],
-                    ),
-                    "TimerScheduled" => ("timer_id", &["TimerFired"]),
-                    "SignalWaitOpened" => ("signal_wait_id", &["SignalApplied"]),
-                    _ => continue,
-                };
+            if redrive_call_kind(earlier).is_none() {
+                continue;
+            }
             require(
-                before.iter().any(|terminal| {
-                    terminal["sequence"].as_u64() > earlier["sequence"].as_u64()
-                        && terminal_kinds.contains(&terminal["event_type"].as_str().unwrap())
-                        && terminal["payload"]["sequence"] == earlier["payload"]["sequence"]
-                        && terminal["payload"][identity] == earlier["payload"][identity]
-                }),
+                before
+                    .iter()
+                    .any(|terminal| redrive_terminal_matches(earlier, terminal)),
                 "successor has reached no next step: an earlier call is unresolved",
             )?;
         }
