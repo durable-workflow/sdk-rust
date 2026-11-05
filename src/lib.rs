@@ -281,6 +281,11 @@ pub enum Error {
         "invalid Durable Workflow base URL: omit the SDK-owned /api suffix and pass the Server or Cloud runtime base URL; the SDK appends /api automatically"
     )]
     InvalidBaseUrl,
+    /// A supplied static credential failed validation before client construction.
+    #[error(
+        "invalid static credential option {option}: leading or trailing Unicode whitespace or control character"
+    )]
+    InvalidStaticCredential { option: &'static str },
     #[error("invalid additional root certificates: {0}")]
     InvalidRootCertificates(String),
     #[error("invalid raw request: {0}")]
@@ -5934,6 +5939,39 @@ pub struct ClientBuilder {
     danger_accept_invalid_certs: bool,
 }
 
+fn validate_static_credential(option: &'static str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    // The cross-SDK policy fixes Unicode White_Space at the edges and Cc
+    // anywhere. Do not normalize, trim, or broaden the accepted token alphabet.
+    let edge_whitespace = |character| {
+        matches!(
+            character,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{0085}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+        )
+    };
+    if value.chars().next().is_some_and(edge_whitespace)
+        || value.chars().next_back().is_some_and(edge_whitespace)
+        || value
+            .chars()
+            .any(|character| matches!(character, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}'))
+    {
+        return Err(Error::InvalidStaticCredential { option });
+    }
+    Ok(())
+}
+
 impl ClientBuilder {
     /// Configure stable request metrics. Newly constructed workers inherit this recorder.
     pub fn metrics_recorder(mut self, recorder: Arc<dyn metrics::MetricsRecorder>) -> Self {
@@ -5946,16 +5984,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the shared static token. Build validates every supplied token without
+    /// trimming it. `None` is absent; `Some("")` remains a supplied empty token.
     pub fn token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
     }
 
+    /// Set the control-plane token, which takes precedence over the shared token
+    /// even when empty. Build also validates tokens for unused roles.
     pub fn control_token(mut self, token: Option<String>) -> Self {
         self.control_token = token;
         self
     }
 
+    /// Set the worker-plane token, which takes precedence over the shared token
+    /// even when empty. Build also validates tokens for unused roles.
     pub fn worker_token(mut self, token: Option<String>) -> Self {
         self.worker_token = token;
         self
@@ -5979,6 +6023,9 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client> {
+        validate_static_credential("token", self.token.as_deref())?;
+        validate_static_credential("control_token", self.control_token.as_deref())?;
+        validate_static_credential("worker_token", self.worker_token.as_deref())?;
         let base_url = self.base_url.trim_end_matches('/').to_string();
         let has_sdk_api_suffix = reqwest::Url::parse(&base_url)
             .map(|url| url.path().trim_end_matches('/').ends_with("/api"))
