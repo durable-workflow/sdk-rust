@@ -2371,6 +2371,27 @@ fn redrive_successor_check_refuses_duplicate_or_contradictory_scalar_terminals()
     );
 }
 
+fn successor_activity_progress(fixture: &mut Value, kind: &str, local: bool) {
+    later_step_cancellation(fixture, 4);
+    for event in fixture["history"].as_array_mut().unwrap() {
+        if event["payload"]["sequence"] != 3 {
+            continue;
+        }
+        if event["event_type"] == "ActivityCompleted" {
+            event["event_type"] = json!(kind);
+            if kind != "ActivityCompleted" {
+                let payload = event["payload"].as_object_mut().unwrap();
+                payload.remove("result");
+                payload.remove("payload_codec");
+                payload.insert("message".into(), json!("terminal activity outcome"));
+            }
+        }
+        if event["event_type"] == "ActivityScheduled" || event["event_type"] == kind {
+            event["payload"]["local_activity"] = json!(local);
+        }
+    }
+}
+
 #[test]
 fn redrive_successor_scalar_activity_terminals_bind_mode_type_and_resource() {
     for local in [false, true] {
@@ -2381,24 +2402,7 @@ fn redrive_successor_scalar_activity_terminals_bind_mode_type_and_resource() {
             "ActivityCancelled",
         ] {
             let positive = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
-                later_step_cancellation(fixture, 4);
-                for event in fixture["history"].as_array_mut().unwrap() {
-                    if event["payload"]["sequence"] != 3 {
-                        continue;
-                    }
-                    if event["event_type"] == "ActivityCompleted" {
-                        event["event_type"] = json!(kind);
-                        if kind != "ActivityCompleted" {
-                            let payload = event["payload"].as_object_mut().unwrap();
-                            payload.remove("result");
-                            payload.remove("payload_codec");
-                            payload.insert("message".into(), json!("terminal activity outcome"));
-                        }
-                    }
-                    if event["event_type"] == "ActivityScheduled" || event["event_type"] == kind {
-                        event["payload"]["local_activity"] = json!(local);
-                    }
-                }
+                successor_activity_progress(fixture, kind, local);
             });
             check_redrive_successor(&positive)
                 .unwrap_or_else(|error| panic!("valid local={local} {kind}: {error}"));
