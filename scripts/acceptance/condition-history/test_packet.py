@@ -1,7 +1,6 @@
-"""Inert source controls. Every Docker/Cargo/process launch is stubbed."""
+"""Packet guard and unchanged history controls. No Docker/Cargo/network is executed."""
 import ast
 import copy
-import importlib.util
 import json
 import os
 import pathlib
@@ -12,69 +11,56 @@ import time
 import types
 import unittest
 from unittest import mock
-
-HERE = pathlib.Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('condition_packet', HERE / 'run.py')
-packet = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(packet)
-
+from test_subject import subject, fixture_subject, remove_private, REPO, HERE
 
 class Packet(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = pathlib.Path(self.tmp.name)
+        self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(remove_private, self.root)
         now = int(time.time())
-        self.args = types.SimpleNamespace(work_dir=self.root / 'fresh', package_commit=packet.H,
-            runner_commit='a' * 40, run_token='0123456789abcdef', started_unix=now,
-            active_unix=now + 1740, cleanup_unix=now + 1800)
+        self.args = types.SimpleNamespace(mode='run', checkout=str(REPO), work_dir=str(self.root / 'fresh'),
+            package_commit=subject.H, runner_commit='a' * 40, run_token='0123456789abcdef',
+            docker_endpoint='unix:///synthetic.sock', started_unix=now, active_unix=now+1740, cleanup_unix=now+1800)
+        subject.ARGS = self.args
+        subject.CURRENT = fixture_subject(self.root)
+        self.packet = subject.CURRENT.module('engine')
+        global packet
+        packet = self.packet
 
-    def git(self, *args):
-        return {'HEAD': 'a' * 40, 'refs/tags/4.12.0^{commit}': packet.H}.get(args[-1], '')
+    def git(self, checkout, *args):
+        return {'HEAD': 'a' * 40, 'refs/tags/4.12.0^{commit}': subject.H}.get(args[-1], '')
 
-    def test_preflight_refusals_precede_construction_and_launch(self):
-        cases = {'package_commit': 'b' * 40, 'runner_commit': 'not-a-commit',
-                 'run_token': 'foreign', 'active_unix': 0, 'started_unix': 0}
-        for field, value in cases.items():
-            args = copy.copy(self.args)
-            setattr(args, field, value)
-            with self.subTest(field=field), mock.patch.object(packet, 'git', self.git), \
-                    mock.patch.object(packet, 'command') as command, \
-                    mock.patch.object(packet.subprocess, 'Popen') as launch, \
-                    self.assertRaises(SystemExit):
-                packet.execute(args)
-            command.assert_not_called()
-            launch.assert_not_called()
-            self.assertFalse(args.work_dir.exists())
+    def test_preflight_refusals_precede_any_side_effect(self):
+        for field, value in {'package_commit':'b'*40, 'run_token':'foreign', 'active_unix':0,
+                             'started_unix':0, 'docker_endpoint':'tcp://foreign'}.items():
+            args = copy.copy(self.args);setattr(args, field, value)
+            with self.subTest(field=field), mock.patch.object(subject,'git',self.git), self.assertRaises(SystemExit):
+                subject.validate(args)
+            self.assertFalse(pathlib.Path(args.work_dir).exists())
 
     def test_wrong_h_refuses_under_python_optimization(self):
-        result = subprocess.run([sys.executable, str(HERE / 'run.py'), 'run', '--work-dir',
-            str(self.args.work_dir), '--run-token', self.args.run_token, '--package-commit', 'b' * 40],
-            env=dict(os.environ, PYTHONOPTIMIZE='1'), capture_output=True, text=True, timeout=5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('wrong fixed package source', result.stderr)
-        self.assertFalse(self.args.work_dir.exists())
+        result = subprocess.run([sys.executable,str(HERE/'run.py'),'run','--checkout',str(REPO),
+            '--runner-commit','a'*40,'--package-commit','b'*40], env=dict(os.environ,PYTHONOPTIMIZE='1'),
+            capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('wrong fixed package source',result.stderr)
+        self.assertFalse(pathlib.Path(self.args.work_dir).exists())
 
-    def test_no_optimizable_assert_and_preflight_precedes_effects(self):
-        tree = ast.parse((HERE / 'run.py').read_text())
-        self.assertFalse(any(isinstance(n, ast.Assert) for n in ast.walk(tree)))
-        execute = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'execute')
-        self.assertEqual(ast.unparse(execute.body[0]), 'preflight(args)')
+    def test_no_optimizable_runtime_assert(self):
+        for name in ('run.py','subject.py','engine.py','resources.py','recover.py'):
+            with self.subTest(name=name):
+                self.assertFalse(any(isinstance(n,ast.Assert) for n in ast.walk(ast.parse((HERE/name).read_text()))))
 
     def test_dirty_head_tag_and_existing_work_refuse(self):
-        for response in ('dirty', 'wrong-head', 'wrong-tag', 'existing'):
-            def git(*args):
-                if response == 'dirty' and args[0] == 'status':
-                    return ' M source'
-                if response == 'wrong-head' and args[-1] == 'HEAD':
-                    return 'b' * 40
-                if response == 'wrong-tag' and args[-1].startswith('refs/tags'):
-                    return 'b' * 40
-                return self.git(*args)
-            if response == 'existing':
-                self.args.work_dir.mkdir()
-            with self.subTest(response=response), mock.patch.object(packet, 'git', git), self.assertRaises(SystemExit):
-                packet.preflight(self.args)
+        for response in ('dirty','wrong-head','wrong-tag','existing'):
+            def git(checkout,*args):
+                if response=='dirty' and args[0]=='status':return ' M source'
+                if response=='wrong-head' and args[-1]=='HEAD':return 'b'*40
+                if response=='wrong-tag' and args[-1].startswith('refs/tags'):return 'b'*40
+                return self.git(checkout,*args)
+            if response=='existing':pathlib.Path(self.args.work_dir).mkdir()
+            with self.subTest(response=response),mock.patch.object(subject,'git',git),self.assertRaises(SystemExit):
+                subject.validate(self.args)
 
     def test_exact_immutable_consumer_inputs_export_without_sdk_overlay(self):
         fixture = self.root / 'fixture'
@@ -90,33 +76,6 @@ class Packet(unittest.TestCase):
         self.assertNotIn('patch', manifest)
         self.assertFalse((fixture / 'Cargo.lock').exists())
         self.assertFalse((fixture / '.cargo').exists())
-
-    def test_roles_keep_reviewed_bounds_and_credential_scopes(self):
-        owner = packet.native.Run(packet.PREFIX, token=self.args.run_token)
-        cell = packet.ConditionCell(types.SimpleNamespace(), packet.CELL, self.root,
-            {'executed_manifest': packet.SERVER}, self.root / 'fixture', owner)
-        calls = []
-        def launch(_self, line, name, image, child, user, credentials):
-            calls.append((line, credentials))
-            return name
-        def inspect(*args, **kwargs):
-            line, _ = calls[-1]
-            return types.SimpleNamespace(stdout=json.dumps({'id': 'synthetic', 'image': 'synthetic',
-                'run': owner.token, 'owner': owner.prefix, 'pid': 1, 'mounts': 'tmpfs:/credentials;',
-                'memory': int(line[line.index('--memory') + 1].removesuffix('m')) * 1024 * 1024,
-                'nano_cpus': int(float(line[line.index('--cpus') + 1]) * 1_000_000_000)}))
-        with mock.patch.object(packet.native.Cell, 'launch', launch), mock.patch.object(packet.native, 'call', inspect):
-            for role, credentials in [('mysql', 'none'), ('redis', 'none'), ('bootstrap', 'server'),
-                                      ('runtime', 'both'), ('queue', 'server'), ('consumer', 'auth')]:
-                cell.launch(['docker', 'run', '--cpus', '1', '--memory', '1g'], cell.task + '-' + role,
-                            packet.SERVER, ['original'], '1000:1000', credentials)
-                line, observed = calls[-1]
-                self.assertEqual(line[line.index('--cpus') + 1], packet.LIMITS[role][0])
-                self.assertEqual(line[line.index('--memory') + 1], packet.LIMITS[role][1])
-                self.assertEqual(observed, credentials)
-        cell.containers = ['held'] * 5
-        with self.assertRaisesRegex(SystemExit, 'ceiling'):
-            cell.launch(['docker', 'run'], cell.task + '-consumer', packet.RUST, [], '1000:1000', 'auth')
 
     def report(self):
         fixture = packet.native.call(['git', '-C', str(packet.REPO), 'show', packet.H +
@@ -144,19 +103,6 @@ class Packet(unittest.TestCase):
             change(report)
             with self.subTest(change=change), self.assertRaises((ValueError, KeyError, TypeError)):
                 packet.comparator.check(report)
-
-    def test_foreign_recovery_record_refuses_before_docker(self):
-        self.args.work_dir.mkdir()
-        (self.args.work_dir / 'run.json').write_text(json.dumps({'owner': 'other',
-            'token': self.args.run_token, 'cells': [packet.CELL]}))
-        with mock.patch.object(packet.native, 'recover_run') as recover, self.assertRaises(SystemExit):
-            packet.recover(self.args.work_dir, self.args.run_token)
-        recover.assert_not_called()
-
-    def test_malformed_recovery_token_refuses_before_reading_a_record(self):
-        with mock.patch.object(packet.native, 'confined_child') as read, self.assertRaises(SystemExit):
-            packet.recover(self.root / 'absent', 'malformed')
-        read.assert_not_called()
 
     def test_server_review_countercontrols(self):
         cases = []
@@ -232,5 +178,4 @@ class Packet(unittest.TestCase):
                 packet.comparator.check(self.snapshots(events))
 
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == "__main__":unittest.main()

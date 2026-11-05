@@ -35,67 +35,123 @@ All executable image references select immutable `linux/amd64` manifests:
 | MySQL | `mysql@sha256:80f4933e3835f9dc4d35a28ec500d7986cb4414e6c6821c5461239cb7beb8995` |
 | Redis | `redis@sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e7b116c23de501af2` |
 
-The Server index is `sha256:3848d5d5cd1b23bd2881e3fdecea64cc44b72e6fb812e577c2db6d0872d065dd`,
-source `fa3fc2f2f6b8935ea4a6eea47f6a9221e2adafff`. The MySQL and Redis manifests
-were resolved from the existing installed-native pins using digest-verified public
-registry index reads. Their indices remain
-`sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242`
-and `sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499`.
+Provenance is limited to those executed child manifests and their effective
+`linux/amd64` content readbacks. The Server source label must equal
+`fa3fc2f2f6b8935ea4a6eea47f6a9221e2adafff`. This packet makes no registry-index
+membership claim.
 
-The build uses two jobs and 3 GiB, with a fresh Cargo home, lock, downloaded crate
-and test binary. The public sparse index, lock, archive and VCS commit must agree.
-Only dependency resolution/fetch has network access. Compilation is offline.
-There is no SDK source replacement or reuse of a prior acceptance binary/cache.
+The closed subject manifest binds Git R, H and every executable member's Git
+blob, SHA-256, mode and size. `run.py` loads the subject directly from Git R.
+The subject captures the engine, comparator, Rust fixture, inherited helper and
+supervisor, new role supervisor and recovery program from allowlisted Git blobs.
+It materializes a private read-only snapshot and refuses extra, missing, linked
+or nonregular members. Imports, fixture exports and recovery launch use the
+captured bytes. Python runs with `-I -S`; no checkout file is imported or reopened
+as executable code after preflight. The inherited launch methods are overridden
+by the literal role launcher in this packet.
+
+The build has two sequential phases with two Cargo jobs, 2 CPU, 3 GiB memory,
+equal total memory-swap, 1024 PIDs, non-root user, read-only root, all capabilities
+dropped and no-new-privileges. Cargo uses a fresh home, lock, public archive and
+binary. The public sparse index, lock, archive and VCS commit must agree. Fetch
+alone has the default network. Compilation is offline, with source mounted
+read-only and only Cargo cache and target output writable. No prior acceptance
+binary, lock or registry cache is reused.
 
 Runtime starts after all build containers are absent. Loopback replay runs alone.
-The PHP case has at most five roles: MySQL 1 CPU/1.25 GiB, Redis 0.25 CPU/128 MiB,
-HTTP 0.75 CPU/768 MiB, queue 0.5 CPU/512 MiB, and a combined Worker/driver
-0.5 CPU/768 MiB. Bootstrap is removed before HTTP and queue startup. Total runtime
-caps are 3 CPU/3.375 GiB. There is no repair or proxy role. Each role retains the
-accepted installed-native supervisor, private stdin-to-tmpfs credential delivery,
-dual ownership labels, evidence fence and cleanup. Database/cache data is tmpfs;
-image volume declarations must be fully covered before any runtime starts.
-Docker uses an empty registry configuration and the existing local Unix daemon.
-No host credential, Docker socket or published port is mounted into a container.
+The PHP case has at most five roles:
+
+| Role | CPU | Memory and equal total swap | PIDs | User |
+| --- | ---: | ---: | ---: | --- |
+| MySQL | 1 | 1280 MiB | 512 | 0:0, image drops to service user |
+| Redis | 0.25 | 128 MiB | 256 | 0:0, image drops to service user |
+| HTTP | 0.75 | 768 MiB | 256 | 0:0, image starts its service processes |
+| Queue | 0.5 | 512 MiB | 256 | 1000:1000 |
+| Worker and driver | 0.5 | 768 MiB | 256 | Non-root owner UID:GID |
+
+Bootstrap uses the HTTP CPU/memory/PID profile and is removed before HTTP and
+queue startup. Total runtime caps are 3 CPU/3.375 GiB. `resources.PROFILES`
+literally defines capability additions for each service; all roles drop ALL
+before those additions. Worker has a read-only root and read-only fixture/binary
+mounts, with only task state writable. Database/cache data and PHP cached
+configuration use bounded tmpfs. Image volume declarations must be fully covered.
+
+Each role is created and started while its inline captured supervisor waits for
+a private ready marker. Before releasing that gate, the owner independently reads
+back image/content/platform, resource and swap/PID caps, user, root mode,
+capabilities, init/security settings, exact command/deadline, environment,
+network/internal ownership and mount destinations/types/access. Tokens and the
+Server key arrive through private stdin into role tmpfs only after readback.
+No host credential, Docker socket, published port or host network is admitted.
+The owner uses a fixed anonymous Docker configuration and an explicit local Unix
+daemon. Before work creation or registry requests, read-only preflight refuses
+any existing owner/run container, network or volume and every colliding exact name.
+An uncertain query is a refusal.
 
 One 30-minute absolute owner window includes setup, fetch, compilation, execution
-and cleanup. Active work ends 60 seconds before the final ceiling. Each role in
-the one Cell shares a maximum 600-second deadline, followed by TERM/KILL.
-A detached owner recovery process is armed before pulls or build. It removes only
-the exact owner/run labels and purges the interrupted Cell tree, since credential
-values intentionally never enter `run.json`. It is canceled only after direct
-zero-survivor readbacks. A failed attempt is retained as failed; no edit, retry,
-fallback or extension is part of this command.
+and cleanup. Active work ends 60 seconds before the final ceiling. The Cell's
+roles share one maximum 600-second deadline plus a 10-second TERM/KILL grace.
+`run.json` is an exclusive owner-only regular single-link record binding R, H,
+manifest and recovery digests, token, local daemon, root, UID/GID, isolated owner
+PID/group/session epoch and all three deadlines. Its digest is captured outside
+the work root in the private launch handoff.
 
-After the exact packet is reviewed and admitted, substitute the reviewed runner
-commit R, a fresh absolute start S, an unused private work directory W and a
-16-hex owner token T in this one command:
+Before any pull, the owner starts a detached recovery process from captured
+inline bytes and requires its exact readiness receipt. At the active cutoff it
+uses its captured complete authority to stop the exact owner and remove only
+matching immutable container/network IDs. A later source/record drift fails the
+result but cannot replace the already-captured cleanup authority. Foreign process
+epochs, labels or names are refused. Interrupted Cell evidence is purged because
+credential values are deliberately absent from the recovery record. Cleanup is
+bounded by the final ceiling. No edit, retry, fallback or extension is included.
+
+After source review and a separate exact execution admission, use the reviewed
+inline collector below. `R`, `M`, `CHECKOUT`, fresh `W`, token `T`, local daemon
+`D`, and captured `S`/`ACTIVE`/`CLEANUP` belong in the private proposal. `ACTIVE`
+is `S + 1740` and `CLEANUP` is `S + 1800`. Do not substitute a mutable script path
+for the captured entry point.
 
 ```sh
-python3 scripts/acceptance/condition-history/run.py run \
+python3 -I -S -c '
+import pathlib, re, subprocess, sys
+checkout, revision = sys.argv[1:3]
+if not re.fullmatch("[0-9a-f]{40}", revision):
+    raise SystemExit("invalid reviewed runner")
+entry = subprocess.run(["git", "--no-replace-objects", "-C", checkout, "show",
+    revision + ":scripts/acceptance/condition-history/run.py"],
+    check=True, capture_output=True, timeout=20).stdout.decode()
+raise SystemExit(subprocess.run([sys.executable, "-I", "-S", "-c", entry,
+    "run", "--checkout", checkout, "--runner-commit", revision, *sys.argv[3:]],
+    start_new_session=True).returncode)
+' CHECKOUT R --manifest-sha256 M \
   --package-commit 4b2440a5618ccc1c98960ea2e1e62127042c3590 \
-  --runner-commit R --work-dir W --run-token T \
+  --work-dir W --run-token T --docker-endpoint D \
   --started-unix S --active-unix ACTIVE --cleanup-unix CLEANUP
 ```
 
-`ACTIVE` must equal `S + 1740`; `CLEANUP` must equal `S + 1800`. The runner refuses
-wrong H, a dirty/wrong R, an existing work directory or stale/malformed deadlines
-before harness command construction or launch. Host/capacity facts and actual
-private paths belong in task evidence, not public GitHub prose.
+The collector preserves the exact Git blob's trailing newline and starts a new
+owner session. A `manifest` invocation of the same captured entry reads Git only
+and prints the deterministic manifest and its digest. It does not contact Docker
+or registries. The run refuses wrong H, dirty/wrong R, wrong M, existing work,
+stale deadlines or a changed entry before importing the engine or creating roles.
+Host aliases, live capacity samples and private paths stay out of public records.
 
-If the client dies, the same reviewed source supports immediate standalone cleanup:
+For immediate recovery or the mandatory independent final audit, capture
+`recover.py` directly from the reviewed Git R and invoke those bytes with
+`python3 -I -S -c`. Supply `recover` or `audit` and all of `--work-dir`,
+`--record-sha256`, `--manifest-sha256`, `--runner-commit`, `--package-commit`,
+`--run-token`. Audit also requires the externally captured `--summary-sha256`.
+Standalone recovery does not depend on a mutable checkout entry point.
 
-```sh
-python3 scripts/acceptance/condition-history/run.py recover --work-dir W --run-token T
-```
-
-The summary retains source/input/lock/package/binary identities, actual toolchain,
-role ownership/resource readbacks, typed replay outputs, fresh raw live history and
-an offline lineage comparator. The comparator has adversarial lineage/order/timer
-controls. Its fetch transport is the public SDK raw control-plane method; it is
-not an independent second HTTP client. After execution, a separate read-only owner
-audit must confirm all matching containers, networks, volumes and processes absent.
-Publish a sanitized immutable result before acceptance or closure.
+The owner writes `summary.json` with `O_EXCL|O_NOFOLLOW`, mode 0600, and returns
+its immutable SHA-256. It records package/source/lock/binary inputs, exact role
+readbacks and fresh typed replay/live results. The fetch transport is the public
+SDK raw control-plane method, not an independent second HTTP client. Owner checks
+remain `pending_independent_audit`. Only after owner exit can a separately invoked
+captured audit bind that summary digest, verify the original record/snapshot and
+recovery-process receipt, and confirm every matching container, network, volume,
+owner and recovery process group absent. It writes its own exclusive handoff.
+Sanitize and retain both immutable results before any acceptance or closure.
 
 The comparator scans every opened wait, condition outcome and timer row, binding
 the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.
@@ -110,7 +166,7 @@ returning `both`. These are source assertions for review, not observed live resu
 Inert source checks, which do not invoke Docker or Cargo:
 
 ```sh
-python3 -m unittest discover -s scripts/acceptance/condition-history -p test_packet.py
+python3 -m unittest discover -s scripts/acceptance/condition-history -p 'test_*.py'
 rustfmt --edition 2021 --check scripts/acceptance/condition-history/fixture/tests/conditions.rs
 ```
 
