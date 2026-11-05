@@ -409,11 +409,12 @@ class WindowControls(unittest.TestCase):
         self.w.job=mock.Mock(return_value={'pid':4321})
         args=type('Args',(),{'sdk_code':CODE,'profile':str(self.root/'profile')})()
         profile=(HERE.parent/'condition-history/guest-profile.json').read_bytes()
+        code=(HERE/'window.py').read_text()
         with mock.patch.object(window.os,'isatty',return_value=True), mock.patch.object(window.sys,'platform','darwin'), \
                 mock.patch.object(window,'validate'), mock.patch.object(window,'Window',return_value=self.w), \
                 mock.patch.object(window.selectors,'DefaultSelector',side_effect=SystemExit('test after go')), \
                 mock.patch('builtins.print'), self.assertRaisesRegex(SystemExit,'test after go'):
-            window.owner(self.sdk,proposal,'a'*64,args,(HERE/'window.py').read_text(),profile)
+            window.owner(self.sdk,proposal,'a'*64,args,code,profile)
         job=captured[0]
         self.assertFalse(job['KeepAlive']);self.assertTrue(job['RunAtLoad'] and job['LaunchOnlyOnce'])
         self.assertFalse(job['AbandonProcessGroup'])
