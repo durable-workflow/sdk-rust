@@ -48,9 +48,17 @@ class Packet(unittest.TestCase):
             self.assertFalse(pathlib.Path(args.work_dir).exists())
 
     def test_wrong_h_refuses_under_python_optimization(self):
-        result = subprocess.run([sys.executable,str(HERE/'run.py'),'run','--checkout',str(REPO),
-            '--runner-commit','a'*40,'--package-commit','b'*40], env=dict(os.environ,PYTHONOPTIMIZE='1'),
-            capture_output=True,text=True,timeout=5)
+        startup = self.root / 'ambient-startup';startup.mkdir()
+        (startup / 'sitecustomize.py').write_text("raise SystemExit('unexpected ambient startup')\n")
+        env = dict(os.environ, PYTHONPATH=str(startup), PYTHONOPTIMIZE='1')
+        argv = [str(HERE/'run.py'),'run','--checkout',str(REPO),
+            '--runner-commit','a'*40,'--package-commit','b'*40]
+        ambient = subprocess.run([sys.executable, *argv], env=env,
+            capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(ambient.returncode, 0)
+        self.assertIn('unexpected ambient startup', ambient.stderr)
+        result = subprocess.run([sys.executable,'-I','-S','-B','-O', *argv], env=env,
+            capture_output=True,text=True,timeout=20)
         self.assertNotEqual(result.returncode,0)
         self.assertIn('wrong fixed package source',result.stderr)
         self.assertFalse(pathlib.Path(self.args.work_dir).exists())
