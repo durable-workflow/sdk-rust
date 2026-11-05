@@ -2175,8 +2175,7 @@ fn redrive_successor_check_accepts_failed_and_timed_out_activity_progress() {
                 .unwrap()
                 .iter_mut()
                 .find(|event| {
-                    event["event_type"] == "ActivityCompleted"
-                        && event["payload"]["sequence"] == 3
+                    event["event_type"] == "ActivityCompleted" && event["payload"]["sequence"] == 3
                 })
                 .unwrap();
             event["event_type"] = json!(terminal);
