@@ -1,0 +1,28 @@
+{
+  "outcome": "pass",
+  "checks": 126,
+  "browser": "156.0.8078.80",
+  "statusEvidence": "screenshots use synthetic unknown; functional states use synthetic fixtures, no live-health claim",
+  "source_revision": "863a1b1ee9fc67bc56b9a4844fc254fd1ab773a1",
+  "published_source_revision": "4b2440a5618ccc1c98960ea2e1e62127042c3590",
+  "base_artifact": {
+    "id": 13457709462,
+    "run": 42120452486,
+    "sha256": "cbd5fc57268c4346ec013602b98d77da4645693bd4fc50e049dfce6bec0633d5"
+  },
+  "overlays": {
+    "layout.css": "e150910ba11e431cb2112023c51a63d3729ecb3cabcb0620a7b9201bcf164d9c",
+    "assets/status.mjs": "1ec3125c8001db03207026eea55493e38c210ebbe55189bacf749c6d546b1a14"
+  },
+  "screenshots": {
+    "landing-1440-light.png": "9b5d01eb5e55ddbfbbdc7ee5e33375ff8fda8856dbb27d4327e15e76f841be63",
+    "landing-1440-dark.png": "71fd5c98fd42631f6f2f80d583bba9994746c1109b6d6157929d34163a1ffa7a",
+    "landing-390-light.png": "ff913209cf86cb7625b441526242ac12e2dd7fc8f74fe7fed55f1f4ed5a00715",
+    "landing-390-dark.png": "972363d8adc418383bc03d28e0ffd552da0186305f0e5398395442a5c3cc389f",
+    "api-1440-light.png": "c4d0ae32588d78ba7f3148ef1036bf7f8b66ef70626560f6a1e0a9e45b406c7c",
+    "api-1440-dark.png": "168cb96ebc5a1adb36d6642ae5520741c7f2a0066e20ec0df639c7ff51e21e6a",
+    "api-390-light.png": "85ebdc58703cc188ab6511140e1a095cc049262b14c2f4e0e1e2e47247d8106d",
+    "api-390-dark.png": "17fae19844f7be480f1eed0a7d1b9c841cc454812d997155b6e7c5e6df5ffe93"
+  },
+  "social_card_sha256": "edd38cf20d77eb14a5117b13116707d94bb47f06cbfc21a1c5ce9b49d7799e05"
+}
