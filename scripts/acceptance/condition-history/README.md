@@ -171,7 +171,10 @@ Standalone recovery does not depend on a mutable checkout entry point.
 
 Recovery records use schema `condition-run/v5`, binding the same parent clock
 and derived monotonic deadlines through recovery, summary, guest audit and the
-independent host audit. Command timeouts and recovery wakeups use those fixed
+independent host audit. The resident host guardian retains its produced clock
+digest in memory, checks it before accepting finish, and carries it in the
+cleanup receipt checked by independent host audit. Recomputing export digests
+cannot replace that clock observation. Command timeouts and recovery wakeups use those fixed
 monotonic deadlines; changing UTC cannot grant more time.
 
 The owner writes `summary.json` with `O_EXCL|O_NOFOLLOW`, mode 0600, and returns

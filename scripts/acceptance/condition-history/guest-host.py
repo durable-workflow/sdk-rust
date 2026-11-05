@@ -561,7 +561,17 @@ def finish_requested(record, record_sha):
     value = json.loads(regular(marker, 64 * 1024))
     _, export_sha = export_handoff(record, record_sha)
     require(value == {'record_sha256': record_sha, 'exports_sha256': export_sha}, 'wrong cleanup request authority')
+    clock_receipt(record)
     return True
+
+
+def clock_receipt(record):
+    expected = record.get('_clock_sha256')
+    require(isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected),
+            'resident clock receipt not captured')
+    raw = regular(paths(record['parent'], record['token'])['parent'] / 'guest-clock.json')
+    require(digest(raw) == expected, 'resident clock receipt changed')
+    return json.loads(raw)
 
 
 def effective_config(record, status):
@@ -690,7 +700,7 @@ def capture_guest_clock(record, record_sha):
         host_cleanup_unix=record['cleanup_unix'], host_active_monotonic_ns=active,
         host_cleanup_monotonic_ns=active + 60_000_000_000,
         host_before_monotonic_ns=before, host_after_monotonic_ns=after)
-    exclusive(scoped['parent'] / 'guest-clock.json', clock)
+    record['_clock_sha256'] = exclusive(scoped['parent'] / 'guest-clock.json', clock)
     return clock
 
 
@@ -732,11 +742,12 @@ def audit(record, record_sha, source_sha):
             and result['guest_absent'] is True and result['store_unmounted'] is True and result['image_absent'] is True,
             'external cleanup did not pass')
     exports, export_sha = export_handoff(record, record_sha)
+    record['_clock_sha256'] = result.get('clock_sha256')
     require(finish_requested(record, record_sha), 'completed guest export request required')
     guest = json.loads(regular(scoped['parent'] / 'guest-summary.json'))
     guest_audit = json.loads(regular(scoped['parent'] / 'guest-audit.json'))
     started = json.loads(regular(scoped['parent'] / 'vm-started.json'))
-    clock = json.loads(regular(scoped['parent'] / 'guest-clock.json'))
+    clock = clock_receipt(record)
     require(guest.get('parent_clock') == clock and guest_audit.get('parent_clock') == clock
             and clock['host_record_sha256'] == record_sha and clock['host_boot_id'] == record['host_boot_id']
             and clock['host_started_unix'] == record['started_unix']
@@ -816,7 +827,8 @@ def main(argv=None):
                       'custody': 'external_owner_must_resolve_retained_task_objects'}
         if control_error:
             result.update(outcome='fail', control_error_type=control_error)
-        result.update(record_sha256=args.record_sha256, guardian_sha256=source_sha)
+        result.update(record_sha256=args.record_sha256, guardian_sha256=source_sha,
+                      clock_sha256=record.get('_clock_sha256'))
         exclusive(scoped['parent'] / 'host-cleanup.json', result)
         require(result['outcome'] != 'fail', 'external cleanup incomplete')
     else:

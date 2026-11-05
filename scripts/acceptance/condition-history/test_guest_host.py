@@ -94,7 +94,7 @@ class GuestHost(unittest.TestCase):
         clock = parent_clock(self.record['started_unix'])
         self.record['host_boot_id'] = clock['host_boot_id']
         for key in ('started_unix', 'active_unix', 'cleanup_unix', 'active_monotonic_ns', 'cleanup_monotonic_ns'):clock['host_'+key] = self.record[key]
-        self.put('guest-clock.json', clock)
+        self.record['_clock_sha256'] = self.put('guest-clock.json', clock)
         storage = {'guest_boot_id': BOOT}
         summary_sha = self.put('guest-summary.json', {'runner_commit': self.record['runner_commit'],
             'manifest_sha256': self.record['manifest_sha256'], 'checks_outcome': 'pass', 'storage': storage, 'parent_clock': clock})
@@ -123,7 +123,7 @@ class GuestHost(unittest.TestCase):
             'agent': {'guest_boot_id': BOOT, 'sha256': self.record['guest_agent_binary_sha256']}})
         self.put('host-cleanup.json', {'record_sha256': 'd' * 64, 'guardian_sha256': 'c' * 64,
             'outcome': 'pending_independent_host_audit', 'guest_absent': True,
-            'store_unmounted': True, 'image_absent': True})
+            'store_unmounted': True, 'image_absent': True, 'clock_sha256': self.record['_clock_sha256']})
 
     def test_independent_host_audit_requires_guest_proof_and_both_processes_absent(self):
         self.audit_files()
@@ -478,6 +478,7 @@ class GuestHost(unittest.TestCase):
         self.assertEqual(clock['host_after_monotonic_ns']-clock['host_before_monotonic_ns'],2000000000)
         self.assertEqual(clock['guest_unix_ns'],sample['guest_unix_ns'])
         self.assertEqual(json.loads((self.parent/'guest-clock.json').read_bytes()),clock)
+        self.assertEqual(self.record['_clock_sha256'], host.digest(host.canonical(clock)))
         with mock.patch.object(host,'call',return_value=host.canonical(sample)),self.assertRaises(FileExistsError):
             host.capture_guest_clock(self.record,'d'*64)
 
@@ -522,8 +523,35 @@ class GuestHost(unittest.TestCase):
             digests[name]=self.put(name,value)
         export_sha=self.put('exports.json',dict(record_sha256='d'*64,guest_boot_id=BOOT,**digests))
         self.put('finish.json',{'record_sha256':'d'*64,'exports_sha256':export_sha})
-        with mock.patch.object(host,'process_identity',return_value=None),self.assertRaisesRegex(SystemExit,'clock/parent'):
+        with mock.patch.object(host,'process_identity',return_value=None),self.assertRaisesRegex(SystemExit,'clock'):
             host.audit(self.record,'d'*64,'c'*64)
+
+    def test_actual_clock_draft_admits_rebound_samples_but_resident_digest_refuses(self):
+        self.audit_files()
+        old_source = subprocess.check_output(['git', 'show',
+            'cc359c063085cfa6ef9227c7e216833c47b231dd:scripts/acceptance/condition-history/guest-host.py'], text=True)
+        old = types.ModuleType('unbound_clock_draft')
+        exec(compile(old_source, 'git:cc359c0:guest-host.py', 'exec'), old.__dict__)
+        clock = json.loads((self.parent / 'guest-clock.json').read_bytes())
+        clock['host_after_monotonic_ns'] -= 100_000_000_000
+        self.put('guest-clock.json', clock)
+        digests = {}
+        for name in ('guest-summary.json', 'guest-audit.json'):
+            value = json.loads((self.parent / name).read_bytes());value['parent_clock'] = clock
+            if name == 'guest-audit.json':
+                value['summary_sha256'] = digests['guest-summary.json']
+            digests[name] = self.put(name, value)
+        export_sha = self.put('exports.json', dict(record_sha256='d'*64, guest_boot_id=BOOT, **digests))
+        self.put('finish.json', {'record_sha256':'d'*64, 'exports_sha256':export_sha})
+        self.assertTrue(old.finish_requested(self.record, 'd'*64))
+        with self.assertRaisesRegex(SystemExit, 'clock receipt changed'):
+            host.finish_requested(self.record, 'd'*64)
+        with mock.patch.object(host, 'process_identity', return_value=None), \
+                mock.patch.object(old, 'process_identity', return_value=None):
+            self.assertEqual(old.audit(self.record, 'd'*64, 'c'*64)['outcome'], 'pass')
+            (self.parent / 'host-audit.json').unlink()
+            with self.assertRaisesRegex(SystemExit, 'clock receipt changed'):
+                host.audit(self.record, 'd'*64, 'c'*64)
 
 
     def test_reopening_host_authority_never_renews_monotonic_ceilings(self):

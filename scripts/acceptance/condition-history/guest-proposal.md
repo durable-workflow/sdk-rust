@@ -160,7 +160,9 @@ used for native controls.
    original monotonic remaining budget around a captured read-only guest
    Unix/monotonic/boot probe. Both observation intervals must be at most five
    seconds. Its exclusive `guest-clock.json` binds those domains and the host
-   authority digest. A setup/launch with less than 600 seconds of work plus
+   authority digest. The guardian retains that receipt's digest in memory and
+   refuses a finish handoff if the file changes. Its final cleanup receipt
+   carries the same digest for independent host audit. A setup/launch with less than 600 seconds of work plus
    180 seconds of cleanup/audit reserve refuses before allocation or start.
    Capture fresh guest G and invoke the README entry with B and this exact
    parent clock JSON/digest. Guest active is `min(G+1740, mapped_parent_active-180)`
