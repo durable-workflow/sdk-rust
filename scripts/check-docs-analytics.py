@@ -3,9 +3,10 @@ import sys
 from pathlib import Path
 
 build_directory = Path(sys.argv[1] if len(sys.argv) > 1 else "target/doc")
-runtime = Path("docs/analytics/analytics.js").read_text(encoding="utf-8")
-navigation = Path("docs/navigation.js").read_text(encoding="utf-8")
-styles = Path("docs/layout.css").read_text(encoding="utf-8")
+repository_root = Path(__file__).resolve().parents[1]
+runtime = (repository_root / "docs/analytics/analytics.js").read_text(encoding="utf-8")
+navigation = (repository_root / "docs/navigation.js").read_text(encoding="utf-8")
+styles = (repository_root / "docs/layout.css").read_text(encoding="utf-8")
 landing_styles = styles.split(".sidebar .sidebar-elems", maxsplit=1)[0]
 
 if (build_directory / "analytics/analytics.js").read_text(encoding="utf-8") != runtime:
