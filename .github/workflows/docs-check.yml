@@ -45,3 +45,11 @@ jobs:
         run: scripts/ci/install-release-tooling.sh "${RUNNER_TEMP}/release-tooling"
       - name: Build and check the published documentation
         run: bash scripts/ci/build-stable-docs.sh
+      - name: Retain the checked documentation for source preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: rust-docs-preview
+          path: target/stable-docs
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error

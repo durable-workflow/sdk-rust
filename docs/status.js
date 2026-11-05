@@ -1,4 +1,4 @@
-import {watchPublicStatus} from '/assets/status.mjs';
+import {watchPublicStatus} from './assets/status.mjs';
 
 const pill = document.querySelector('[data-dw-status-link]');
 if (pill) {
