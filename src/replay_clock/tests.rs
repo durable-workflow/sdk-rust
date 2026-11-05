@@ -395,3 +395,116 @@ fn replay_now_reads_real_published_activity_evidence_without_inventing_entry_tim
         .unwrap();
     assert_eq!(actual, recorded_time(selected, true).unwrap());
 }
+
+#[test]
+fn replay_now_inline_local_result_has_no_persistence_time_on_either_path() {
+    let ctx = context(vec![start()]);
+    let inner = ctx.clone();
+    let mut call = inner.local_activity("local", json!([]));
+    let outcome = Ok(AvroValue::String("local-result".into()));
+    call.local_result = Some(Arc::new(Mutex::new(Some(outcome))));
+    ready(
+        &ctx,
+        Box::pin(async move {
+            assert_eq!(call.await?, json!("local-result"));
+            assert!(inner.replay_now().is_err());
+            Ok(AvroValue::Null)
+        }),
+    );
+    let complete = event(
+        "ActivityCompleted",
+        json!({"sequence":1,"activity_type":"local","execution_mode":"local","result":encode_typed_envelope(&AvroValue::String("local-result".into()),DEFAULT_CODEC).unwrap()}),
+        "2026-01-01T00:00:04Z",
+    );
+    let ctx = context(vec![start(), complete]);
+    let inner = ctx.clone();
+    ready(
+        &ctx,
+        Box::pin(async move {
+            assert_eq!(
+                inner.local_activity("local", json!([])).await?,
+                json!("local-result")
+            );
+            assert!(inner.replay_now().is_err());
+            Ok(AvroValue::Null)
+        }),
+    );
+}
+
+#[test]
+fn replay_now_failure_uses_its_consumed_throw_time_and_equal_events_keep_order() {
+    let failure = event(
+        "ActivityFailed",
+        json!({"sequence":1,"activity_type":"a","message":"expected failure","reused_recorded_at":START}),
+        "2026-01-01T00:00:05.999999Z",
+    );
+    let ctx = context(vec![start(), failure]);
+    let inner = ctx.clone();
+    ready(
+        &ctx,
+        Box::pin(async move {
+            assert!(matches!(
+                inner.activity("a", json!([])).await,
+                Err(Error::ActivityFailed(_))
+            ));
+            assert_eq!(read(&inner), "2026-01-01T00:00:05.999999Z");
+            Ok(AvroValue::Null)
+        }),
+    );
+    let mut history = vec![start()];
+    history.extend(timer(1, START));
+    history.extend(timer(2, START));
+    let ctx = context(history);
+    let inner = ctx.clone();
+    ready(
+        &ctx,
+        Box::pin(async move {
+            inner.sleep(Duration::from_secs(1)).await?;
+            assert_eq!(read(&inner), START);
+            inner.sleep(Duration::from_secs(1)).await?;
+            assert_eq!(read(&inner), START);
+            assert_eq!(inner.state.lock().unwrap().command_cursor, 2);
+            Ok(AvroValue::Null)
+        }),
+    );
+}
+
+#[tokio::test]
+async fn replay_now_reconstructed_query_uses_consumed_prefix_not_snapshot_tail() {
+    let mut worker = Worker::new(Client::new("http://127.0.0.1:8080").unwrap(), "clock-tests");
+    worker.register_replayed_workflow(
+        "clock",
+        || 0_u64,
+        |ctx, _args, _state| async move {
+            ctx.sleep(Duration::from_secs(1)).await?;
+            ctx.sleep(Duration::from_secs(1)).await?;
+            Ok(Value::Null)
+        },
+    );
+    worker.register_replayed_query::<u64, _, _>(
+        "clock",
+        "inspect",
+        |ctx, _state, _args| async move {
+            Ok(json!(ctx
+                .replay_now()?
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
+        },
+    );
+    let mut history = vec![start()];
+    history.extend(timer(1, "2026-01-01T00:00:03.765432Z"));
+    history.push(event(
+        "TimerScheduled",
+        json!({"sequence":2,"timer_id":"timer-2","delay_seconds":1}),
+        "2099-01-01T00:00:00Z",
+    ));
+    let task:QueryTask=serde_json::from_value(json!({"query_task_id":"q1","workflow_type":"clock","query_name":"inspect","payload_codec":DEFAULT_CODEC,"history_events":history})).unwrap();
+    assert_eq!(
+        worker
+            .execute_query_task(task)
+            .await
+            .unwrap()
+            .into_json()
+            .unwrap(),
+        json!("2026-01-01T00:00:03.765432Z")
+    );
+}

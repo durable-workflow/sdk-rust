@@ -1,0 +1,93 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-business-replay-clock-consumed-boundaries",
+  "protocol_version": "1.19",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.business-replay-clock",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "payload": {
+        "recovery_kind": "redrive",
+        "replayed_started_at": "2026-01-01T00:00:00.123456Z"
+      },
+      "recorded_at": "2026-02-01T00:00:00Z"
+    },
+    {
+      "sequence": 2,
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "clock-timer",
+        "delay_seconds": 1
+      },
+      "recorded_at": "2026-02-01T00:00:00Z"
+    },
+    {
+      "sequence": 3,
+      "event_type": "TimerFired",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "clock-timer",
+        "delay_seconds": 1,
+        "reused_recorded_at": "2026-01-01T00:00:01.123456Z"
+      },
+      "recorded_at": "2026-02-01T00:00:00Z"
+    },
+    {
+      "sequence": 4,
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 2,
+        "activity_type": "clock-activity"
+      },
+      "recorded_at": "2026-02-01T00:00:00Z"
+    },
+    {
+      "sequence": 5,
+      "event_type": "ActivityCompleted",
+      "payload": {
+        "sequence": 2,
+        "activity_type": "clock-activity",
+        "result": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwoQcmVjb3JkZWQ="
+        },
+        "reused_recorded_at": "2026-01-01T00:00:05.123456Z"
+      },
+      "recorded_at": "2026-02-01T00:00:00Z"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "start": "2026-01-01T00:00:00.123456Z",
+      "timer": "2026-01-01T00:00:01.123456Z",
+      "activity": "2026-01-01T00:00:05.123456Z",
+      "unchanged_prefix": true,
+      "elapsed_seconds": 5,
+      "result": "recorded"
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "start": "2026-01-01T00:00:00.123456Z",
+        "timer": "2026-01-01T00:00:01.123456Z",
+        "activity": "2026-01-01T00:00:05.123456Z",
+        "unchanged_prefix": true,
+        "elapsed_seconds": 5,
+        "result": "recorded"
+      }
+    }
+  ]
+}

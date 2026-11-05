@@ -65,12 +65,58 @@ fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
 #[derive(Debug)]
 pub(super) struct Clock {
     time: Option<DateTime<Utc>>,
+    boundaries: HashMap<u64, usize>,
 }
 
 impl Clock {
-    pub(super) fn new(history: &[HistoryEvent]) -> Self {
+    pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
+        let supported: HashMap<_, _> = commands
+            .iter()
+            .filter_map(|command| match command {
+                RecordedCommand::Activity {
+                    sequence,
+                    outcome: Some(_),
+                    parallel_group_path,
+                    ..
+                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+                    Some((*sequence, true))
+                }
+                RecordedCommand::Timer {
+                    sequence,
+                    fired: true,
+                    parallel_group_path,
+                    ..
+                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+                    Some((*sequence, false))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut boundaries = HashMap::new();
+        for (index, event) in history.iter().enumerate() {
+            let Some(sequence) = durable_event_sequence(event) else {
+                continue;
+            };
+            let matched = match supported.get(&sequence) {
+                Some(true) => matches!(
+                    event.event_type.as_str(),
+                    "ActivityCompleted"
+                        | "ActivityFailed"
+                        | "ActivityTimedOut"
+                        | "ActivityCancelled"
+                ),
+                Some(false) => event.event_type == "TimerFired" && !is_internal_timer_event(event),
+                None => false,
+            };
+            if matched {
+                boundaries.entry(sequence).or_insert(index);
+            }
+        }
+        // Index identities once. Timestamps are read only when that boundary
+        // is actually consumed, never by scanning ahead from the accessor.
         Self {
             time: start_time(history),
+            boundaries,
         }
     }
 
@@ -128,37 +174,21 @@ impl WorkflowState {
     }
 
     pub(super) fn observe_replay_sequence(&mut self, sequence: u64) {
-        self.replay_clock.time =
-            sequence_time(&self.history_events, &self.recorded_commands, sequence);
+        self.replay_clock.time = self
+            .replay_clock
+            .boundaries
+            .get(&sequence)
+            .and_then(|index| self.history_events.get(*index))
+            .and_then(|event| {
+                recorded_time(
+                    event,
+                    matches!(
+                        event.event_type.as_str(),
+                        "ActivityCompleted" | "TimerFired"
+                    ),
+                )
+            });
     }
-}
-
-fn sequence_time(
-    history: &[HistoryEvent],
-    commands: &[RecordedCommand],
-    sequence: u64,
-) -> Option<DateTime<Utc>> {
-    let command = commands
-        .iter()
-        .find(|command| command.sequence() == sequence);
-    let event = history.iter().find(|event| {
-        if durable_event_sequence(event) != Some(sequence) {
-            return false;
-        }
-        match command {
-            Some(RecordedCommand::Activity {
-                outcome: Some(_), ..
-            }) => matches!(
-                event.event_type.as_str(),
-                "ActivityCompleted" | "ActivityFailed" | "ActivityTimedOut" | "ActivityCancelled"
-            ),
-            Some(RecordedCommand::Timer { fired: true, .. }) => {
-                event.event_type == "TimerFired" && !is_internal_timer_event(event)
-            }
-            _ => false,
-        }
-    })?;
-    recorded_time(event, event.event_type != "ActivityFailed")
 }
 
 impl WorkflowContext {
@@ -221,7 +251,19 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
         },
     )
     .ok()?;
-    sequence_time(history, &commands, durable_event_sequence(event)?)
+    Clock::new(history, &commands)
+        .boundaries
+        .get(&durable_event_sequence(event)?)
+        .and_then(|index| history.get(*index))
+        .and_then(|event| {
+            recorded_time(
+                event,
+                matches!(
+                    event.event_type.as_str(),
+                    "ActivityCompleted" | "TimerFired"
+                ),
+            )
+        })
 }
 
 pub(super) fn update_time(history: &[HistoryEvent], update_id: &str) -> Option<DateTime<Utc>> {

@@ -12314,7 +12314,7 @@ impl WorkflowState {
             run_id,
             task_queue,
             payload_codec,
-            replay_clock: replay_clock::Clock::new(&history),
+            replay_clock: replay_clock::Clock::new(&history, &recorded_commands),
             history_events: Arc::new(history),
             history_budget: WorkflowHistoryBudget {
                 event_count,
