@@ -20,9 +20,9 @@ import tempfile
 import time
 import types
 
-SDK_R = 'df617fb681958801182e67ca63e886041bec6de0'
-SDK_M = '9ce029dcfb64220ff233e9f42605400ea4a73aceb598272a4034b3e8a65d6e38'
-SDK_CODE_SHA = 'bf9dbd8166c71dd1b87bc5761640ce26d07e624d56b19d26e40e5ff02eeab9a1'
+SDK_R = '3fbd145c5c36cc7c30b164ed8b3e94919441abf1'
+SDK_M = 'f0ca803c10b7d43357dbb44539f2c4d6020f25f302b7a94651ee525f37aef070'
+SDK_CODE_SHA = '5cd5584187b95587f10eb216fa34ead1f632555532353ed6a3d41841bcbfd297'
 KEYS = {'schema', 'token', 'source_sha256', 'host_boot_id', 'uid', 'scope', 'owner_process',
         'started_unix', 'sdk_intent', 'tools', 'service', 'config_files', 'disks',
         'docker_host', 'engine', 'profile_home'}
