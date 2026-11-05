@@ -16,8 +16,18 @@
       "sequence": 1,
       "event_type": "WorkflowStarted",
       "payload": {
+        "workflow_class": "ClockWorkflow",
+        "workflow_type": "corpus.business-replay-clock",
+        "workflow_instance_id": "clock-replay-workflow",
+        "workflow_run_id": "regression-corpus-run",
+        "workflow_command_id": "clock-redrive-command",
+        "continued_from_run_id": "clock-source-run",
+        "resume_step_sequence": 3,
         "recovery_kind": "redrive",
-        "replayed_started_at": "2026-01-01T00:00:00.123456Z"
+        "execution_deadline_at": null,
+        "run_deadline_at": null,
+        "replayed_started_at": "2026-01-01T00:00:00.123456Z",
+        "workflow_link_id": "clock-redrive-link"
       },
       "recorded_at": "2026-02-01T00:00:00Z"
     },
@@ -27,7 +37,8 @@
       "payload": {
         "sequence": 1,
         "timer_id": "clock-timer",
-        "delay_seconds": 1
+        "delay_seconds": 1,
+        "fire_at": "2026-01-01T00:00:01.123456Z"
       },
       "recorded_at": "2026-02-01T00:00:00Z"
     },
@@ -38,21 +49,15 @@
         "sequence": 1,
         "timer_id": "clock-timer",
         "delay_seconds": 1,
-        "reused_recorded_at": "2026-01-01T00:00:01.123456Z"
+        "reused_recorded_at": "2026-01-01T00:00:01.123456Z",
+        "fire_at": "2026-01-01T00:00:01.123456Z",
+        "fired_at": "2026-01-01T00:00:01.123456Z",
+        "reused_from_run_id": "clock-source-run"
       },
       "recorded_at": "2026-02-01T00:00:00Z"
     },
     {
       "sequence": 4,
-      "event_type": "ActivityScheduled",
-      "payload": {
-        "sequence": 2,
-        "activity_type": "clock-activity"
-      },
-      "recorded_at": "2026-02-01T00:00:00Z"
-    },
-    {
-      "sequence": 5,
       "event_type": "ActivityCompleted",
       "payload": {
         "sequence": 2,
@@ -61,7 +66,10 @@
           "codec": "avro",
           "blob": "wwHioz3/VYAiNwoQcmVjb3JkZWQ="
         },
-        "reused_recorded_at": "2026-01-01T00:00:05.123456Z"
+        "reused_recorded_at": "2026-01-01T00:00:05.123456Z",
+        "activity_execution_id": "clock-successor-activity",
+        "reused_activity_execution_id": "clock-source-activity",
+        "reused_from_run_id": "clock-source-run"
       },
       "recorded_at": "2026-02-01T00:00:00Z"
     }
@@ -89,5 +97,9 @@
         "result": "recorded"
       }
     }
-  ]
+  ],
+  "worker_task": {
+    "workflow_id": "clock-replay-workflow",
+    "payload_codec": "avro"
+  }
 }

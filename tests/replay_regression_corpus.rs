@@ -1981,6 +1981,7 @@ fn redrive_successor_fixture_path(name: &str) -> PathBuf {
 
 /// The valid successor fixtures and the step each resumes at.
 const REDRIVE_SUCCESSOR_FIXTURES: &[(&str, u64)] = &[
+    ("business-replay-clock-consumed-boundaries.json", 3),
     ("redrive-successor-reused-markers.json", 4),
     ("redrive-successor-reused-timer.json", 3),
     ("redrive-successor-reused-cancellation-clock.json", 3),
