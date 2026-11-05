@@ -88,6 +88,12 @@ async function renderCase({width, theme}) {
   check(await page.locator('html').getAttribute('data-theme') === theme, 'explicit theme persists into generated API');
   check(await page.locator('body').getAttribute('class').then(value => value.includes('dw-reference')), 'generated API has shared chrome');
   await widthCheck(width);
+  const commandStyle = await page.locator('.docblock pre code').first().evaluate(element => {
+    const code = getComputedStyle(element), block = getComputedStyle(element.closest('pre'));
+    return {foreground:code.color, background:code.backgroundColor, block:block.backgroundColor};
+  });
+  check(commandStyle.background === 'rgba(0, 0, 0, 0)', 'API command background inherits Ink block');
+  check(contrast(commandStyle.foreground, commandStyle.block) >= 4.5, 'API command contrast >= 4.5:1');
   await capture(`api-${width}-${theme}.png`, false);
   const footerSize = await page.locator('.dw-footer-columns h2').first().evaluate(element => getComputedStyle(element).fontSize);
   check(footerSize === '12px', 'footer labels keep shared label size');
@@ -114,6 +120,7 @@ async function run() {
       return route.fulfill({status:200, contentType:'application/json', headers:{'access-control-allow-origin':'*'}, body:JSON.stringify(snapshot(fixture))});
     }
     if (url.startsWith(base.origin + '/')) return route.continue();
+    if (route.request().resourceType() === 'image' && ['https://sonarcloud.io','https://github.com','https://img.shields.io'].includes(new URL(url).origin)) return route.continue();
     return route.abort();
   });
   page = await context.newPage();

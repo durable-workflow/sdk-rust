@@ -98,7 +98,7 @@ body.rustdoc.dw-reference {
   --sidebar-background-color: var(--dw-surface);
   --main-color: var(--dw-ink);
   --font-family: var(--dw-font-body);
-  --font-family-monospace: var(--dw-font-mono);
+  --font-family-monospace: var(--dw-font-mono); --font-family-code: var(--dw-font-mono);
   font-family: var(--dw-font-body);
 }
 .dw-reference > .dw-site-header, .dw-reference > .dw-skip-link, .dw-reference > .dw-site-footer { grid-column: 1 / -1; }
@@ -109,6 +109,7 @@ body.rustdoc.dw-reference {
 .dw-reference > .sidebar-resizer { top: var(--dw-header-height); height: calc(100vh - var(--dw-header-height)); }
 .sidebar .sidebar-elems .block li a { overflow: visible; text-overflow: clip; white-space: normal; }
 body.rustdoc.dw-reference pre { background: var(--dw-code-background); color: var(--dw-code-foreground); overflow-x: auto; }
+body.rustdoc.dw-reference pre code { background: transparent; color: var(--dw-code-foreground); }
 .dw-reference :is(h1,h2,h3) { font-family: var(--dw-font-display); }
 .dw-reference .dw-site-footer h2 { font-family: var(--dw-font-mono); }
 .dw-cloud-promotion { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 24px 0 32px; padding: 24px; border: 1px solid var(--dw-line); border-radius: 8px; background: var(--dw-surface); }
