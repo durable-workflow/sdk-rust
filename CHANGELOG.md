@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `Client::get_run_activities` with typed run activity and attempt metadata,
+  preserving unavailable fields, diagnostic authority and heartbeat progress.
+
 ## 4.12.0
 
 - Keep one in-flight poll per task family while filling the configured workflow
