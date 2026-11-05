@@ -51,12 +51,12 @@ class WindowControls(unittest.TestCase):
         self.native_fault, self.bad_properties, self.bad_arguments = None, False, False
         self.original_files = {}
         tools = {}
-        for name in ('python', 'launchctl', 'plutil', 'colima', 'docker', 'dm'):
+        for name in ('python', 'launchctl', 'plutil', 'colima', 'docker', 'ps', 'dm'):
             path = self.temp / name
             path.write_bytes(('fake executable ' + name).encode())
             tools[name] = self.bind(path)
         # Native absolute launchctl/plutil paths have synthetic, checked bytes.
-        for name, path in [('launchctl', '/bin/launchctl'), ('plutil', '/usr/bin/plutil')]:
+        for name, path in [('launchctl', '/bin/launchctl'), ('plutil', '/usr/bin/plutil'), ('ps', '/bin/ps')]:
             tools[name]['path'] = path
             self.original_files[path] = ('fake executable ' + name).encode()
         verify = window.verify_file
@@ -123,7 +123,8 @@ class WindowControls(unittest.TestCase):
             if args[0] == 'print':
                 controller = args[1].endswith(window.job_label(self.record))
                 if not (self.controller if controller else self.loaded):
-                    return 113, b'', b'Could not find service'
+                    label=args[1].split('/')[-1]
+                    return 113, b'', ('Bad request.\nCould not find service \"'+label+'\" in domain for user gui: '+str(self.record['uid'])+'\n').encode()
                 pid = os.getpid() if controller else 6789
                 program = self.record['tools']['python' if controller else 'colima']['path']
                 properties = 'wrong' if self.bad_properties else self.record['service']['properties']
@@ -298,7 +299,7 @@ class WindowControls(unittest.TestCase):
         with mock.patch.object(window.time, 'sleep'), self.assertRaises(SystemExit):self.w.restore(self.original_plist)
 
     def test_uncertain_service_query_cannot_authorize_bootstrap(self):
-        self.w.native = lambda *args, **kwargs:(5,b'',b'permission denied')
+        self.w.call = lambda *args, **kwargs:(5,b'',b'permission denied')
         with self.assertRaises(SystemExit):self.w.restore(self.original_plist)
         self.assertFalse(self.bootstraps)
 
@@ -504,6 +505,179 @@ class WindowControls(unittest.TestCase):
         with self.assertRaises(SystemExit):window.verify_file(self.sdk,binding)
         path.chmod(0o600);link.symlink_to(path)
         with self.assertRaises(SystemExit):window.verify_file(self.sdk,dict(binding,path=str(link)))
+
+    def test_permission_error_cannot_be_hidden_in_absence_diagnostic(self):
+        label=self.record['service']['label']
+        error=('permission denied\nBad request.\nCould not find service "'+label+'" in domain for user gui: '+str(self.record['uid'])+'\n').encode()
+        self.w.call=lambda *args,**kwargs:(113,b'',error)
+        with self.assertRaises(SystemExit):self.w.job(label)
+
+    def test_only_exact_native_absence_status_and_diagnostics_are_accepted(self):
+        label=self.record['service']['label']
+        exact=('Bad request.\nCould not find service "'+label+'" in domain for user gui: '+str(self.record['uid'])+'\n').encode()
+        self.w.call=lambda *args,**kwargs:(113,b'',exact)
+        self.assertIsNone(self.w.job(label))
+        self.assertEqual(self.w.native_fault_count,0)
+        cases=[(1,b'',exact),(5,b'',exact),(113,b'unexpected stdout',exact),
+            (113,b'',b'permission denied\n'+exact),(113,b'',exact+b'permission denied\n'),
+            (113,b'',b'Could not find service'),(113,b'',exact.replace(label.encode(),b'other-service')),
+            (113,b'',exact.replace(str(self.record['uid']).encode(),b'99999')),
+            (113,b'',exact.replace(b'\n',b'\r\n')),(0,b'',b'permission denied')]
+        for response in cases:
+            with self.subTest(response=response):
+                self.w.call=lambda *args,**kwargs:response
+                with self.assertRaises(SystemExit):self.w.job(label)
+        self.assertEqual(self.w.native_fault_count,len(cases))
+
+    def test_mixed_absence_cannot_bootstrap_restore_or_authorize_final_audit(self):
+        self.completed()
+        exact=('Bad request.\nCould not find service "'+window.job_label(self.record)+'" in domain for user gui: '+str(self.record['uid'])+'\n').encode()
+        self.w.call=lambda *args,**kwargs:(113,b'',b'permission denied\n'+exact)
+        with self.assertRaises(SystemExit):window.audit(self.w,SOURCE)
+        with self.assertRaises(SystemExit):self.w.restore(self.original_plist)
+        self.assertFalse((self.root/'window-audit.json').exists())
+        self.assertEqual(self.bootstraps,[self.original_plist])
+
+    def test_ps_must_be_bound_and_reverified_before_effective_argument_readback(self):
+        candidate=copy.deepcopy(self.record);candidate['tools'].pop('ps')
+        with self.assertRaises(SystemExit):window.validate(self.sdk,candidate,SOURCE)
+        self.original_files['/bin/ps']=b'different native ps'
+        with self.assertRaises(SystemExit):self.w.service_matches()
+        self.assertFalse(any(pathlib.Path(call[0]).name=='ps' for call in self.calls))
+        self.assertEqual(self.w.native_faults[-1]['tool'],'ps')
+
+    def test_native_status_and_safe_diagnostic_digests_survive_stop_failure(self):
+        original=self.call
+        stdout=b'private diagnostic payload'
+        stderr=b'permission denied token=never-echo-this-value'
+        def stop_fault(argv,cutoff,**kwargs):
+            if pathlib.Path(argv[0]).name=='colima':return 77,stdout,stderr
+            return original(argv,cutoff,**kwargs)
+        self.w.call=stop_fault
+        result=self.run_fake_task()
+        self.assertIn('failed_stage',result)
+        self.assertEqual(result['failed_stage'],'stop-default')
+        fault=result['native_faults'][0]
+        self.assertEqual((fault['tool'],fault['operation'],fault['exit_status']),('colima','stop',77))
+        self.assertEqual(fault['stdout']['sha256'],window.sha(stdout))
+        self.assertEqual(fault['stderr']['sha256'],window.sha(stderr))
+        self.assertEqual(fault['stderr']['safe_excerpt'],['permission denied'])
+        self.assertNotIn('never-echo-this-value',json.dumps(result))
+        self.assertNotIn('private diagnostic payload',json.dumps(result))
+        self.assertTrue(result['original_engine_unchanged'])
+
+    def test_failed_recovery_restoration_retains_both_stages_and_diagnostics(self):
+        original=self.call
+        def faults(argv,cutoff,**kwargs):
+            if pathlib.Path(argv[0]).name=='colima':return 77,b'first private failure',b'permission denied'
+            if 'bootstrap' in argv:return 88,b'restore private failure',b'input/output error'
+            return original(argv,cutoff,**kwargs)
+        self.w.call=faults
+        result=self.run_fake_task()
+        self.assertIn('failed_stage',result)
+        self.assertEqual(result['failed_stage'],'stop-default')
+        self.assertEqual(result['restoration_failure']['failed_stage'],'restore-after-fault')
+        self.assertEqual([(item['stage'],item['exit_status']) for item in result['native_faults']],
+                         [('stop-default',77),('restore-after-fault',88)])
+        self.assertTrue(result['operator_notified'])
+
+    def test_normal_restoration_native_failure_is_terminal_and_recoverable(self):
+        original=self.call;attempts=[]
+        def faults(argv,cutoff,**kwargs):
+            if 'bootstrap' in argv:
+                attempts.append(argv);return 88,b'',b'input/output error'
+            return original(argv,cutoff,**kwargs)
+        self.w.call=faults
+        result=self.run_fake_task()
+        self.assertEqual(len(attempts),1)
+        self.assertEqual(result['failed_stage'],'restore-original')
+        self.assertEqual(result['native_faults'][-1]['exit_status'],88)
+        self.assertTrue(result['operator_notified'])
+
+    def test_fault_evidence_has_fixed_size_and_retains_early_and_late_failures(self):
+        self.w.call=lambda *args,**kwargs:(77,b'private stdout',b'permission denied')
+        for number in range(40):
+            self.w.stage='restore-original'
+            with self.assertRaises(SystemExit):self.w.native('launchctl','kickstart','ignored')
+            self.w.native_faults[-1]['sequence_for_test']=number
+        self.assertEqual(self.w.native_fault_count,40)
+        self.assertEqual(len(self.w.native_faults),16)
+        self.assertEqual([item['sequence_for_test'] for item in self.w.native_faults],list(range(8))+list(range(32,40)))
+        self.assertLess(len(window.canonical(self.w.failure_details(SystemExit()))),16000)
+
+    def test_bounded_call_retains_actual_nonzero_status_and_captured_bytes(self):
+        class FakeNativeChild:
+            returncode=91
+            def __init__(self):
+                read,write=os.pipe();os.write(write,b'private stdout');os.close(write);self.stdout=os.fdopen(read,'rb')
+                read,write=os.pipe();os.write(write,b'permission denied private token');os.close(write);self.stderr=os.fdopen(read,'rb')
+            def poll(self):return self.returncode
+            def wait(self,timeout):return self.returncode
+        self.w.call=window.Window.call.__get__(self.w,window.Window)
+        self.w.stage='stop-default'
+        with mock.patch.object(window.subprocess,'Popen',return_value=FakeNativeChild()), self.assertRaises(window.NativeFailure):
+            self.w.native('colima','--profile','default','stop')
+        fault=self.w.native_faults[-1]
+        self.assertEqual(fault['exit_status'],91)
+        self.assertEqual(fault['stdout']['sha256'],window.sha(b'private stdout'))
+        self.assertEqual(fault['stderr']['sha256'],window.sha(b'permission denied private token'))
+        self.assertNotIn('private token',json.dumps(fault))
+
+    def test_owner_bootstrap_failure_retains_private_recovery_evidence(self):
+        proposal=copy.deepcopy(self.record);proposal['owner_process']=None
+        proposal['tools']['python']['path']=str(pathlib.Path(sys.executable).resolve())
+        (self.root/'go.json').unlink()
+        args=type('Args',(),{'sdk_code':CODE,'profile':str(self.root/'profile')})()
+        profile=(HERE.parent/'condition-history/guest-profile.json').read_bytes()
+        code=(HERE/'window.py').read_text()
+        self.w.call=lambda *args,**kwargs:(5,b'private bootstrap payload',b'permission denied')
+        with mock.patch.object(window.os,'isatty',return_value=True), mock.patch.object(window.sys,'platform','darwin'), \
+                mock.patch.object(window,'validate'), mock.patch.object(window,'Window',return_value=self.w), \
+                self.assertRaises(window.NativeFailure):
+            window.owner(self.sdk,proposal,'a'*64,args,code,profile)
+        result=json.loads((self.root/'owner-failure.json').read_bytes())
+        self.assertEqual(result['failed_stage'],'owner-bootstrap')
+        self.assertEqual(result['native_faults'][0]['exit_status'],5)
+        self.assertEqual(result['native_faults'][0]['tool'],'plutil')
+        self.assertFalse((self.root/'go.json').exists())
+        self.assertNotIn('private bootstrap payload',json.dumps(result))
+
+    def test_timeout_fault_retains_killed_status_without_a_native_process(self):
+        class WaitingChild:
+            returncode=None
+            def __init__(self):
+                read,self.writer=os.pipe();self.stdout=os.fdopen(read,'rb')
+                read,write=os.pipe();os.close(write);self.stderr=os.fdopen(read,'rb')
+            def poll(self):return self.returncode
+            def kill(self):self.returncode=-9;os.close(self.writer)
+            def wait(self,timeout):return self.returncode
+        self.w.call=window.Window.call.__get__(self.w,window.Window)
+        self.w.stage='restore-original'
+        cutoff=time.monotonic()+0.03
+        with mock.patch.object(window.subprocess,'Popen',return_value=WaitingChild()), self.assertRaises(window.NativeFailure):
+            self.w.native('launchctl','kickstart','ignored',cutoff=cutoff)
+        fault=self.w.native_faults[-1]
+        self.assertEqual((fault['reason'],fault['exit_status']),('timeout',-9))
+        self.assertEqual(fault['stage'],'restore-original')
+        self.assertEqual(fault['stdout']['bytes']+fault['stderr']['bytes'],0)
+
+    def test_oversize_diagnostic_binds_only_the_bounded_capture(self):
+        class FakeNativeChild:
+            returncode=91
+            def __init__(self):
+                read,write=os.pipe();os.write(write,b'x');os.close(write);self.stdout=os.fdopen(read,'rb')
+                read,write=os.pipe();os.close(write);self.stderr=os.fdopen(read,'rb')
+            def poll(self):return self.returncode
+            def wait(self,timeout):return self.returncode
+        self.w.call=window.Window.call.__get__(self.w,window.Window)
+        child=FakeNativeChild()
+        with mock.patch.object(window.subprocess,'Popen',return_value=child), \
+                mock.patch.object(window.os,'read',return_value=b'x'*65536), self.assertRaises(window.NativeFailure):
+            self.w.native('launchctl','print','ignored')
+        fault=self.w.native_faults[-1]
+        self.assertEqual(fault['reason'],'output-limit')
+        self.assertEqual(fault['stdout']['bytes']+fault['stderr']['bytes'],2*1024**2)
+        self.assertLess(len(window.canonical(fault)),2000)
 
     def test_minimal_environment_excludes_forwarded_credentials_and_default_lima_home(self):
         with mock.patch.dict(os.environ,{'SSH_AUTH_SOCK':'secret','DOCKER_AUTH_CONFIG':'secret','LIMA_HOME':'foreign'}):

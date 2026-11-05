@@ -26,6 +26,24 @@ SDK_CODE_SHA = 'bf9dbd8166c71dd1b87bc5761640ce26d07e624d56b19d26e40e5ff02eeab9a1
 KEYS = {'schema', 'token', 'source_sha256', 'host_boot_id', 'uid', 'scope', 'owner_process',
         'started_unix', 'sdk_intent', 'tools', 'service', 'config_files', 'disks',
         'docker_host', 'engine', 'profile_home'}
+SAFE_DIAGNOSTICS = (b'permission denied', b'operation not permitted', b'input/output error',
+                    b'could not find service', b'bad request', b'connection refused',
+                    b'cannot connect to the docker daemon', b'no such file or directory')
+
+
+class NativeFailure(SystemExit):
+    def __init__(self, reason, status, output=b'', errors=b'', os_errno=None):
+        super().__init__(reason)
+        self.reason, self.status, self.output, self.errors = reason, status, output, errors
+        self.os_errno = os_errno
+
+
+def diagnostic(data):
+    # No arbitrary diagnostic bytes enter the receipt or terminal. Only these
+    # fixed phrases are exposed; the complete bounded captured bytes are hashed.
+    lower = data.lower()
+    return {'bytes': len(data), 'sha256': sha(data),
+            'safe_excerpt': [phrase.decode() for phrase in SAFE_DIAGNOSTICS if phrase in lower]}
 
 
 def require(ok, message):
@@ -134,9 +152,10 @@ def validate(sdk, record, source_sha):
     require(record['docker_host'].startswith('unix:///') and pathlib.Path(record['profile_home']).is_absolute(), 'local original profile required')
     home = pathlib.Path(record['profile_home'])
     require(home.resolve() == home and record['docker_host'] == 'unix://' + str(home / 'default/docker.sock'), 'wrong default engine endpoint')
-    require(set(record['tools']) == {'python', 'launchctl', 'plutil', 'colima', 'docker', 'dm'}, 'wrong window tool set')
+    require(set(record['tools']) == {'python', 'launchctl', 'plutil', 'colima', 'docker', 'ps', 'dm'}, 'wrong window tool set')
     require(record['tools']['launchctl']['path'] == '/bin/launchctl'
-            and record['tools']['plutil']['path'] == '/usr/bin/plutil', 'native service tools required')
+            and record['tools']['plutil']['path'] == '/usr/bin/plutil'
+            and record['tools']['ps']['path'] == '/bin/ps', 'native service tools required')
     service = record['service']
     require(set(service) == {'label', 'plist', 'arguments', 'keep_alive', 'properties', 'vm_processes'}
             and service['label'] != job_label(record) and not service['label'].startswith('sdk-rust-')
@@ -175,6 +194,32 @@ class Window:
         self.launched = False
         self.stop_attempted = False
         self.original_plist = None
+        self.stage = 'created'
+        self.native_faults = []
+        self.native_fault_count = 0
+        self.last_native = None
+
+    def evidence(self, tool, argv, status, output, errors, reason):
+        operation = argv[2] if tool == 'docker' and len(argv) > 2 else (argv[0] if argv else '')
+        if tool == 'colima':operation = 'stop'
+        if tool == 'ps':operation = 'command'
+        if tool == 'dm':operation = 'notify'
+        if operation not in {'print', 'bootout', 'bootstrap', 'kickstart', 'remove', '-lint',
+                             'info', 'ps', 'image', 'volume', 'stop', 'command', 'notify'}:operation = 'other'
+        return {'stage': self.stage, 'tool': tool, 'operation': operation, 'exit_status': status,
+                'reason': reason, 'stdout': diagnostic(output), 'stderr': diagnostic(errors)}
+
+    def remember_fault(self, evidence):
+        self.native_fault_count += 1
+        # Keep the first eight failures and latest eight, including late restore
+        # or notification faults, within a fixed receipt/storage bound.
+        if len(self.native_faults) == 16:del self.native_faults[8]
+        self.native_faults.append(evidence)
+
+    def failure_details(self, error):
+        return {'failed_stage': self.stage, 'error_type': type(error).__name__,
+                'native_fault_count': self.native_fault_count, 'native_faults': list(self.native_faults),
+                'last_native_result': self.last_native}
 
     def env(self, stop=False):
         result = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(pathlib.Path.home()),
@@ -187,7 +232,7 @@ class Window:
 
     def call(self, argv, cutoff, *, pass_fds=(), stop=False, check=True):
         remaining = cutoff - time.monotonic()
-        require(remaining > 0, 'window command cutoff')
+        if remaining <= 0:raise NativeFailure('deadline', None)
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, pass_fds=pass_fds, env=self.env(stop), close_fds=True)
         output, errors = bytearray(), bytearray()
@@ -197,28 +242,62 @@ class Window:
                 selector.register(child.stdout, selectors.EVENT_READ, output)
                 selector.register(child.stderr, selectors.EVENT_READ, errors)
                 while selector.get_map():
-                    require(time.monotonic() < end, 'window native command timed out')
+                    if time.monotonic() >= end:
+                        raise NativeFailure('timeout', None, bytes(output), bytes(errors))
                     for key, _ in selector.select(min(0.1, max(0, end - time.monotonic()))):
                         data = os.read(key.fileobj.fileno(), 65536)
                         if not data:selector.unregister(key.fileobj);continue
-                        require(len(output) + len(errors) + len(data) <= 2 * 1024**2, 'oversize native window response')
+                        if len(output) + len(errors) + len(data) > 2 * 1024**2:
+                            key.data.extend(data[:2 * 1024**2 - len(output) - len(errors)])
+                            raise NativeFailure('output-limit', None, bytes(output), bytes(errors))
                         key.data.extend(data)
                 child.wait(timeout=max(0.001, end - time.monotonic()))
-            require(not check or child.returncode == 0, 'window native control failed')
+            if check and child.returncode != 0:
+                raise NativeFailure('exit-status', child.returncode, bytes(output), bytes(errors))
             return child.returncode, bytes(output), bytes(errors)
+        except (SystemExit, OSError, subprocess.TimeoutExpired) as error:
+            if child.poll() is None:child.kill();child.wait(timeout=2)
+            if isinstance(error, NativeFailure):
+                if error.status is None:error.status = child.returncode
+                raise
+            raise NativeFailure(type(error).__name__, child.returncode, bytes(output), bytes(errors),
+                                getattr(error, 'errno', None)) from None
         finally:
             if child.poll() is None:child.kill();child.wait(timeout=2)
             child.stdout.close();child.stderr.close()
 
-    def native(self, name, *argv, cutoff=None, **kwargs):
-        verify_file(self.sdk, self.record['tools'][name])
-        return self.call([self.record['tools'][name]['path'], *argv], cutoff or self.restore_cutoff, **kwargs)
+    def native(self, name, *argv, cutoff=None, check=True, **kwargs):
+        try:
+            verify_file(self.sdk, self.record['tools'][name])
+            result = self.call([self.record['tools'][name]['path'], *argv],
+                               cutoff or self.restore_cutoff, check=False, **kwargs)
+        except NativeFailure as error:
+            self.last_native = dict(self.evidence(name, argv, error.status, error.output, error.errors, error.reason),
+                                    os_errno=error.os_errno)
+            self.remember_fault(self.last_native)
+            raise
+        except (OSError, SystemExit) as error:
+            self.last_native = dict(self.evidence(name, argv, None, b'', b'', type(error).__name__),
+                                    os_errno=getattr(error, 'errno', None))
+            self.remember_fault(self.last_native)
+            raise
+        self.last_native = self.evidence(name, argv, *result, 'returned')
+        if check and result[0] != 0:
+            self.remember_fault(dict(self.last_native, reason='exit-status'))
+            raise NativeFailure('exit-status', *result)
+        return result
 
     def job(self, label, cutoff=None):
         code, output, error = self.native('launchctl', 'print', target(self.record, label), cutoff=cutoff, check=False)
         if code:
-            require(b'Could not find service' in error, 'uncertain launchd query')
-            return None
+            expected = ('Bad request.\nCould not find service "' + label
+                        + '" in domain for user gui: ' + str(self.record['uid']) + '\n').encode()
+            if code == 113 and output == b'' and error == expected:return None
+            self.remember_fault(dict(self.last_native, reason='uncertain-absence'))
+            raise SystemExit('uncertain launchd query')
+        if error:
+            self.remember_fault(dict(self.last_native, reason='unexpected-print-diagnostic'))
+            raise SystemExit('unexpected launchd diagnostic')
         text = output.decode()
         def one(name, optional=False):
             # Only top-level fields, never a similarly named line inside the
@@ -246,7 +325,7 @@ class Window:
         job = self.job(self.record['service']['label'])
         require(job and job['pid'] and pathlib.Path(job['program']).resolve() == pathlib.Path(self.record['tools']['colima']['path'])
                 and job['properties'] == self.record['service']['properties'], 'effective original service changed')
-        command = self.call(['/bin/ps', '-ww', '-p', str(job['pid']), '-o', 'command='], self.restore_cutoff)[1]
+        command = self.native('ps', '-ww', '-p', str(job['pid']), '-o', 'command=')[1]
         require(shlex.split(command.decode()) == self.record['service']['arguments'], 'effective original service arguments changed')
         return job
 
@@ -361,39 +440,53 @@ class Window:
     def notify_failure(self):
         # The host's existing local dm cache is used only for a real fault.
         # No credential or vault value is copied into the task guest or a log.
+        previous, self.stage = self.stage, 'fault-notify'
         try:
             self.native('dm', 'sdk-rust: default Colima window has unresolved task/restoration custody; inspect the private window receipt.', cutoff=self.cleanup_cutoff)
             return True
         except BaseException:return False
+        finally:self.stage = previous
 
     def run(self, source_sha, profile):
         original = None
         restoration_attempted = False
         result = {'outcome': 'fail', 'intent_sha256': self.intent_sha, 'source_sha256': source_sha}
         try:
+            self.stage = 'preflight'
             original = verify_original(self.sdk, self.record)
             self.original_plist = original
             self.sdk.exclusive(self.root / 'window-ready.json', {'intent_sha256': self.intent_sha,
                 'source_sha256': source_sha, 'process': self.sdk.process_identity(os.getpid())})
+            self.stage = 'wait-go'
             while not (self.root / 'go.json').exists():
                 require(self.owner_alive() and time.monotonic() < self.stop_cutoff, 'owner/go window lost')
                 time.sleep(0.1)
             require(json.loads(self.sdk.regular(self.root / 'go.json')) == {'intent_sha256': self.intent_sha, 'action': 'one-window'}, 'wrong window request')
+            self.stage = 'stop-default'
             self.stop_default()
+            self.stage = 'start-task'
             self.start_task(profile)
+            self.stage = 'monitor-task'
             self.monitor_task()
             restoration_attempted = True
+            self.stage = 'restore-original'
             result.update(self.restore(original), outcome='pending_independent_audit')
         except BaseException as error:
-            result['error_type'] = type(error).__name__
+            result.update(self.failure_details(error))
             if self.stop_attempted:
                 if restoration_attempted:
                     result['operator_notified'] = self.notify_failure()
                 else:
-                    try:result.update(self.restore(original))
-                    except BaseException:result['operator_notified'] = self.notify_failure()
+                    try:
+                        self.stage = 'restore-after-fault'
+                        result.update(self.restore(original))
+                    except BaseException as restoration_error:
+                        result['restoration_failure'] = self.failure_details(restoration_error)
+                        result['operator_notified'] = self.notify_failure()
         finally:
             try:
+                result.update(native_fault_count=self.native_fault_count, native_faults=list(self.native_faults),
+                              last_native_result=self.last_native)
                 result['controller_process'] = self.sdk.process_identity(os.getpid())
                 self.sdk.exclusive(self.root / 'window-result.json', result)
             finally:
@@ -402,11 +495,16 @@ class Window:
     def remove_controller(self):
         # Receipt precedes self-removal. A separate invocation must prove that
         # this job/process is gone; this process cannot certify its own absence.
+        self.stage = 'controller-remove'
         try:
             self.native('launchctl', 'remove', job_label(self.record), cutoff=self.cleanup_cutoff)
-        except BaseException:
+        except BaseException as error:
+            detail = self.failure_details(error)
+            notified = self.notify_failure()
+            detail.update(native_fault_count=self.native_fault_count, native_faults=list(self.native_faults),
+                          last_native_result=self.last_native)
             self.sdk.exclusive(self.root / 'controller-cleanup-failure.json', {
-                'outcome': 'fail', 'intent_sha256': self.intent_sha, 'operator_notified': self.notify_failure()})
+                **detail, 'outcome': 'fail', 'intent_sha256': self.intent_sha, 'operator_notified': notified})
             raise
 
 
@@ -447,18 +545,25 @@ def owner(sdk, proposal, proposal_sha, args, code, profile_raw):
         '--sdk-code', args.sdk_code, '--profile', args.profile], 'RunAtLoad': True, 'KeepAlive': False,
         'LaunchOnlyOnce': True, 'AbandonProcessGroup': False, 'WorkingDirectory': '/',
         'EnvironmentVariables': window.env(), 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
-    window.bootstrap_fd(plistlib.dumps(job))
-    while time.monotonic() < window.stop_cutoff:
-        ready_path = root / 'window-ready.json'
-        if ready_path.exists():
-            ready = json.loads(sdk.regular(ready_path))
-            effective = window.job(job_label(record))
-            require(ready['intent_sha256'] == intent_sha and ready['source_sha256'] == source_sha
-                    and effective and ready['process']['pid'] == effective['pid']
-                    and sdk.process_identity(effective['pid']) == ready['process'], 'independent controller readiness mismatch')
-            break
-        time.sleep(0.1)
-    else:raise SystemExit('outside-agent controller did not become ready')
+    try:
+        window.stage = 'owner-bootstrap'
+        window.bootstrap_fd(plistlib.dumps(job))
+        window.stage = 'owner-readiness'
+        while time.monotonic() < window.stop_cutoff:
+            ready_path = root / 'window-ready.json'
+            if ready_path.exists():
+                ready = json.loads(sdk.regular(ready_path))
+                effective = window.job(job_label(record))
+                require(ready['intent_sha256'] == intent_sha and ready['source_sha256'] == source_sha
+                        and effective and ready['process']['pid'] == effective['pid']
+                        and sdk.process_identity(effective['pid']) == ready['process'], 'independent controller readiness mismatch')
+                break
+            time.sleep(0.1)
+        else:raise SystemExit('outside-agent controller did not become ready')
+    except BaseException as error:
+        sdk.exclusive(root / 'owner-failure.json', {'intent_sha256': intent_sha,
+            'source_sha256': source_sha, **window.failure_details(error)})
+        raise
     sdk.exclusive(root / 'go.json', {'intent_sha256': intent_sha, 'action': 'one-window'})
     print(json.dumps({'window_intent_sha256': intent_sha, 'source_sha256': source_sha,
                       'proposal_sha256': proposal_sha, 'owner_process': record['owner_process']}), flush=True)

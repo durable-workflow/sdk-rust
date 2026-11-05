@@ -27,7 +27,7 @@ contact Docker nor load/unload a service or create a VM.
 ## Contingent invocation and custody
 
 A private proposal supplies the exact source digest, host boot/UID, original
-LaunchAgent bytes/effective properties and arguments, six launcher hashes,
+LaunchAgent bytes/effective properties and arguments, seven launcher hashes (including `/bin/ps`),
 original profile/configuration hashes, original disk device/inode identities,
 local Docker endpoint and idle engine ID/version/architecture/CPU/image/volume
 inventory. The supported original service invocation is its existing foreground
@@ -83,6 +83,22 @@ failure is terminal and also reports the fault. There is no retry or provisionin
 fallback. Host reboot or killing the independent controller is outside this
 same-boot guarantee and requires operator recovery; no unconditional boot-time
 restoration service is installed.
+
+Only exit 113 with empty stdout and the selected native two-line stderr schema
+(`Bad request.` followed by the exact queried label and GUI UID) means a service
+is absent. Any mixed, additional or mismatched diagnostic refuses restoration
+and auditing. Effective-service arguments are read through the separately
+hash-bound and reverified `ps` tool.
+
+Native failures retain the failed stage, tool/operation, exit status or OS errno,
+and each captured stdout/stderr byte count and SHA-256. Excerpts contain only a
+fixed reviewed list of diagnostic phrases; arbitrary output, arguments,
+environment values and credentials are never copied into receipts or terminals.
+Each command still captures at most 2 MiB total. The final result retains the
+first eight and latest eight faults plus their total count, including any
+failed restoration attempt. Owner bootstrap and controller-removal failures
+also retain bounded evidence. These private receipts are recovery evidence,
+not additional operating authority.
 
 A normal restoration bootstraps the captured original plist, starts that same
 service and independently reads back its effective arguments/properties, all
