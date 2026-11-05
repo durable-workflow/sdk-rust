@@ -50,9 +50,11 @@ window could release the existing 6-GiB shared VM allocation; this proposal does
 not authorize stopping it. The fixed disk is additional to that shared VM, which
 is never an acceptance input. No global daemon setting or host package changes.
 
-The entire invocation starts at S, active work ends at S+1740 seconds, and all
-cleanup ends by S+1800. Setup consumes the same window and must finish within
-300 seconds. Host guardian timers use monotonic time once the externally captured
+The parent invocation starts at S, active work ends at S+1740 seconds, and all
+parent cleanup ends by S+1800. Those ceilings never move. Setup captures their
+monotonic counterparts once; the schema-v2 host authority persists them across
+setup/guard and later readback rather than recomputing a lease from wall time.
+Setup consumes the same window and must finish within 300 seconds. Host guardian timers use monotonic time once the externally captured
 absolute cutoffs are bound. The existing guest Cell keeps its 600-second bound,
 two Cargo jobs, sequential build/runtime phases and per-role caps.
 
@@ -152,8 +154,23 @@ used for native controls.
    effective configuration; no SDK consumer is released before this receipt.
    These probes are source under review and have not run in a guest.
    Independently obtain B over the generated control path and match that receipt.
-   Transfer a clean public R checkout with the immutable H tag and invoke
-   the README's captured entry with that B and the same S/cutoffs. No host source
+   Transfer a clean public R checkout with the immutable annotated H tag. Then
+   write exclusive `guest-clock-request.json` with exactly `record_sha256` and
+   `action: "capture-guest-clock"`. The resident guardian alone samples its
+   original monotonic remaining budget around a captured read-only guest
+   Unix/monotonic/boot probe. Both observation intervals must be at most five
+   seconds. Its exclusive `guest-clock.json` binds those domains and the host
+   authority digest. The guardian retains that receipt's digest in memory and
+   refuses a finish handoff if the file changes. Its final cleanup receipt
+   carries the same digest for independent host audit. A setup/launch with less than 600 seconds of work plus
+   180 seconds of cleanup/audit reserve refuses before allocation or start.
+   Capture fresh guest G and invoke the README entry with B and this exact
+   parent clock JSON/digest. Guest active is `min(G+1740, mapped_parent_active-180)`
+   and guest cleanup is active+60. The guest requires at least 600 active seconds
+   before its work allocation. Independent audit/export keeps at least 120 seconds
+   before parent active. Delaying setup or choosing fresh G never grants a new
+   parent envelope. The run, recovery, summary and audits bind the same clock.
+   Command/recovery cutoffs use its conservative guest monotonic mapping. No host source
    mount or credential is used. The guest requires an empty daemon/build cache
    and ext4 root/work/Docker data on its fixed block device before pulling.
    Existing Linux boot/start-tick recovery and full internal-network readbacks
@@ -173,7 +190,9 @@ used for native controls.
 10. After guardian exit, run the same captured source in independent `audit`
     mode. Require image/mount/instance absence, guardian and VM hostagent absence,
     exact host custody/source receipts, R/M/B agreement, guest audit and summary
-    digest agreement. Its exclusive `host-audit.json` may then record pass. A
+    digest agreement and equality with the resident clock receipt, including
+    the original parent ceilings and both boot identities. Its exclusive
+    `host-audit.json` may then record pass. A
     guest pass alone remains `pending_external_guest_teardown`.
 
 Failure at any stage is terminal for this attempt. The resident setup watchdog

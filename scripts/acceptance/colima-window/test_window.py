@@ -6,6 +6,7 @@ import os
 import pathlib
 import plistlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,7 +17,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('colima_window_controls', HERE / 'window.py')
 window = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(window)
-CODE = (HERE.parent / 'condition-history/guest-host.py').read_text()
+CODE = subprocess.check_output(['git', '--no-replace-objects', '-C', str(HERE.parents[2]),
+    'show', window.SDK_R + ':scripts/acceptance/condition-history/guest-host.py'], text=True, timeout=20)
 SOURCE = window.sha((HERE / 'window.py').read_bytes())
 TOKEN = '0123456789abcdef'
 BOOT = '11111111-1111-1111-1111-111111111111'

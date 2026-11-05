@@ -1,11 +1,17 @@
 # One-shot default-Colima handoff proposal
 
-This source accompanies #210. It is not admitted for execution. It preserves the
-separately reviewed task controller at `df617fb681958801182e67ca63e886041bec6de0`
-and its 13-member manifest
-`9ce029dcfb64220ff233e9f42605400ea4a73aceb598272a4034b3e8a65d6e38`.
-The outer source is a separate review subject. It does not change the Linux
-process epochs, guest/network controls, fixed task store or acceptance rules.
+This source continues #191/#192 after #210. It is not admitted for execution.
+The exact successor task controller, runtime manifest and controller digest are
+bound by `SDK_R`, `SDK_M` and `SDK_CODE_SHA` in `window.py`. The outer controls
+load that selected Git blob, independently of the working checkout's task code.
+The successor constrains the guest work/cleanup/audit schedule to the unchanged
+parent ceilings using a resident guardian's paired clock observation.
+
+The original `df617fb` / `bdbb4d4` source and private invocation stay frozen and
+unexecuted. This successor requires its own source/input subject and private
+invocation; it inherits no blocked-review PASS or operating authority. Linux
+process epochs, guest/network controls, fixed task store and history acceptance
+rules remain unchanged.
 
 The selected existing Intel macOS/VZ host cannot currently meet the task's
 10-GiB available-memory gate while its default Colima profile runs. General owns

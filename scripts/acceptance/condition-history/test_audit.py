@@ -30,7 +30,7 @@ class Audit(unittest.TestCase):
         self.summary = {'checks_outcome': 'pass', 'outcome': 'pending_independent_audit',
             'record_sha256': self.record_sha, 'runner_commit': self.authority['runner_commit'],
             'package_commit': subject.H, 'manifest_sha256': self.sealed.sha256,
-            'recovery_process_sha256': watcher_sha, 'cleanup_errors': [],
+            'recovery_process_sha256': watcher_sha, 'cleanup_errors': [], 'parent_clock': self.authority['parent_clock'],
             'cleanup': {'pass': True, 'errors': [],
                 'remaining': {'container': [], 'network': [], 'volume': []}}}
         self.summary_sha = subject.exclusive(self.root / 'summary.json', subject.canonical(self.summary))
@@ -59,6 +59,13 @@ class Audit(unittest.TestCase):
         self.assertEqual(result['outcome'], 'pending_external_guest_teardown')
         self.assertEqual(result['storage'], self.authority['storage'])
         with self.assertRaises(FileExistsError):self.invoke()
+
+    def test_changed_clock_cannot_gain_audit_authority_with_a_new_summary_digest(self):
+        value=dict(self.summary,parent_clock=dict(self.authority['parent_clock'],host_record_sha256='f'*64))
+        raw=subject.canonical(value);(self.root/'summary.json').write_bytes(raw)
+        self.summary_sha=subject.digest(raw)
+        with self.assertRaisesRegex(SystemExit,'summary subject'):self.invoke()
+        self.assertFalse((self.root/'independent-audit.json').exists())
 
     def test_changed_summary_never_gains_authority(self):
         (self.root / 'summary.json').write_bytes(b'{}\n')

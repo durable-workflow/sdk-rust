@@ -20,7 +20,15 @@ SUBJECT = 'dev.durable-workflow.acceptance.subject'
 ROLE = 'dev.durable-workflow.acceptance.role'
 RECORD_KEYS = {'schema', 'owner', 'token', 'cells', 'runner_commit', 'package_commit', 'manifest_sha256',
                'recovery_sha256', 'started_unix', 'active_unix', 'cleanup_unix', 'work_dir',
-               'docker_endpoint', 'uid', 'gid', 'owner_process', 'storage'}
+               'docker_endpoint', 'uid', 'gid', 'owner_process', 'storage', 'parent_clock',
+               'active_monotonic_ns', 'cleanup_monotonic_ns'}
+NS = 1_000_000_000
+MIN_WORK_SECONDS = 600
+CLOCK_KEYS = {'schema', 'host_record_sha256', 'host_boot_id', 'guest_boot_id',
+              'host_started_unix', 'host_active_unix', 'host_cleanup_unix',
+              'host_active_monotonic_ns', 'host_cleanup_monotonic_ns',
+              'host_before_monotonic_ns', 'host_after_monotonic_ns',
+              'guest_before_monotonic_ns', 'guest_after_monotonic_ns', 'guest_unix_ns'}
 STORAGE_KEYS = {'schema', 'guest_boot_id', 'device', 'block_bytes', 'filesystem_bytes', 'docker_root', 'daemon_id'}
 GUEST_DISK_BYTES = 20 * 1024**3
 ROLES = ('fetch', 'build', 'mysql', 'redis', 'bootstrap', 'runtime', 'queue', 'consumer')
@@ -38,6 +46,54 @@ def digest(data):
 
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
+
+
+def clock_envelope(clock, started, guest_boot):
+    """Map the resident parent's remaining monotonic lease conservatively."""
+    require(set(clock) == CLOCK_KEYS and clock['schema'] == 'durable-workflow.condition-parent-clock/v1',
+            'wrong parent clock schema')
+    integers = CLOCK_KEYS - {'schema', 'host_record_sha256', 'host_boot_id', 'guest_boot_id'}
+    require(all(type(clock[k]) is int and clock[k] > 0 for k in integers)
+            and type(started) is int, 'wrong clock integer authority')
+    require(isinstance(clock['host_record_sha256'], str) and re.fullmatch('[0-9a-f]{64}', clock['host_record_sha256'])
+            and all(isinstance(clock[k], str) and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', clock[k])
+                    for k in ('host_boot_id', 'guest_boot_id'))
+            and clock['guest_boot_id'] == guest_boot, 'wrong clock source/boot authority')
+    require(clock['host_active_unix'] == clock['host_started_unix'] + 1740
+            and clock['host_cleanup_unix'] == clock['host_started_unix'] + 1800
+            and clock['host_cleanup_monotonic_ns'] == clock['host_active_monotonic_ns'] + 60 * NS,
+            'parent clock ceilings changed')
+    require(0 <= clock['host_after_monotonic_ns'] - clock['host_before_monotonic_ns'] <= 5 * NS
+            and 0 <= clock['guest_after_monotonic_ns'] - clock['guest_before_monotonic_ns'] <= 5 * NS
+            and clock['host_after_monotonic_ns'] < clock['host_active_monotonic_ns'],
+            'clock observation is late or unbounded')
+    sample = clock['guest_unix_ns']
+    require(sample // NS <= started < sample // NS + 30, 'stale guest clock mapping')
+    # The guest sample precedes the host response. Using the parent's remaining
+    # lease at that later response can only shorten the mapped parent deadline.
+    parent_active = (sample + clock['host_active_monotonic_ns'] - clock['host_after_monotonic_ns']) // NS
+    active = min(started + 1740, parent_active - 180)
+    cleanup = active + 60
+    require(active - started >= MIN_WORK_SECONDS and cleanup <= parent_active - 120,
+            'minimum guest work/audit reserve consumed')
+    active_mono = clock['guest_before_monotonic_ns'] + active * NS - sample
+    return {'active_unix': active, 'cleanup_unix': cleanup,
+            'active_monotonic_ns': active_mono, 'cleanup_monotonic_ns': active_mono + 60 * NS}
+
+
+def launch_clock(args):
+    require(isinstance(args.parent_clock_json, str) and len(args.parent_clock_json.encode()) <= 8192,
+            'oversize parent clock input')
+    clock = json.loads(args.parent_clock_json)
+    require(digest(canonical(clock)) == args.parent_clock_sha256, 'parent clock digest mismatch')
+    envelope = clock_envelope(clock, args.started_unix, args.guest_boot_id)
+    require(all(getattr(args, k) == envelope[k] for k in ('active_unix', 'cleanup_unix')),
+            'guest deadlines differ from parent-constrained envelope')
+    require(args.started_unix <= time.time() < args.started_unix + 30, 'stale launch timestamp')
+    require(envelope['active_monotonic_ns'] - time.monotonic_ns() >= MIN_WORK_SECONDS * NS,
+            'minimum guest work/audit reserve consumed before launch')
+    args.parent_clock = clock
+    for key in ('active_monotonic_ns', 'cleanup_monotonic_ns'):setattr(args, key, envelope[key])
 
 
 def read(path, mode=0o600, limit=8 * 1024 * 1024):
@@ -180,13 +236,14 @@ def make_record(args, manifest_sha, recovery_sha):
     require(owner and owner['pid'] == owner['pgid'] == owner['sid'], 'isolated owner session required')
     root = pathlib.Path(args.work_dir)
     require(root.is_absolute() and root.resolve() == root, 'canonical work root required')
-    return {'schema': 'durable-workflow.condition-run/v4', 'owner': PREFIX, 'token': args.run_token,
+    return {'schema': 'durable-workflow.condition-run/v5', 'owner': PREFIX, 'token': args.run_token,
             'cells': [CELL], 'runner_commit': args.runner_commit, 'package_commit': H,
             'manifest_sha256': manifest_sha, 'recovery_sha256': recovery_sha,
             'started_unix': args.started_unix, 'active_unix': args.active_unix,
             'cleanup_unix': args.cleanup_unix, 'work_dir': str(root),
             'docker_endpoint': args.docker_endpoint, 'uid': os.getuid(), 'gid': os.getgid(),
-            'owner_process': owner, 'storage': args.guest_storage}
+            'owner_process': owner, 'storage': args.guest_storage, 'parent_clock': args.parent_clock,
+            'active_monotonic_ns': args.active_monotonic_ns, 'cleanup_monotonic_ns': args.cleanup_monotonic_ns}
 
 
 def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sha, token):
@@ -198,7 +255,7 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
     raw = read(root / 'run.json')
     require(digest(raw) == expected_record_sha, 'run record digest mismatch')
     record = json.loads(raw)
-    require(set(record) == RECORD_KEYS and record['schema'] == 'durable-workflow.condition-run/v4', 'wrong run record schema')
+    require(set(record) == RECORD_KEYS and record['schema'] == 'durable-workflow.condition-run/v5', 'wrong run record schema')
     require(record['owner'] == PREFIX and record['token'] == token and re.fullmatch('[0-9a-f]{16}', token)
             and record['cells'] == [CELL], 'wrong recovery ownership')
     require(record['runner_commit'] == runner and re.fullmatch('[0-9a-f]{40}', runner)
@@ -206,9 +263,9 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
             and record['recovery_sha256'] == recovery_sha, 'wrong recovery source subject')
     require(record['work_dir'] == str(root) and record['uid'] == os.getuid() and record['gid'] == os.getgid()
             and record['docker_endpoint'].startswith('unix:///'), 'wrong recovery placement')
-    require(all(type(record[k]) is int for k in ('started_unix', 'active_unix', 'cleanup_unix'))
-            and record['cleanup_unix'] == record['started_unix'] + 1800
-            and record['active_unix'] == record['cleanup_unix'] - 60, 'wrong recovery deadlines')
+    envelope = clock_envelope(record['parent_clock'], record['started_unix'], record['storage']['guest_boot_id'])
+    require(all(type(record[k]) is int and record[k] == value for k, value in envelope.items()),
+            'wrong recovery deadlines')
     process = record['owner_process']
     validate_process(process, 'wrong captured owner process')
     validate_storage(record['storage'], root, observe=False)
@@ -251,7 +308,7 @@ def docker(record, command, check=True):
     require(json.loads(read(root / 'recovery-docker/config.json')) == PUBLIC_CONFIG, 'anonymous Docker configuration changed')
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(root / 'public-home'),
            'DOCKER_CONFIG': str(root / 'recovery-docker'), 'DOCKER_HOST': record['docker_endpoint']}
-    remaining = record['cleanup_unix'] - time.time()
+    remaining = (record['cleanup_monotonic_ns'] - time.monotonic_ns()) / NS
     require(remaining > 0, 'cleanup deadline exhausted')
     result = subprocess.run(['docker', *command], capture_output=True, text=True, timeout=min(5, remaining), env=env)
     require(not check or result.returncode == 0, 'recovery Docker query/removal failed')
@@ -376,7 +433,7 @@ def main(argv=None):
         try:
             if args.at is not None:
                 require(args.at == record['active_unix'], 'wrong recovery wake deadline')
-                time.sleep(max(0, args.at - time.time()))
+                time.sleep(max(0, (record['active_monotonic_ns'] - time.monotonic_ns()) / NS))
             # A later file drift fails evidence but cannot replace the captured
             # authority/code or prevent its already-authorized exact cleanup.
             try:
@@ -417,7 +474,8 @@ def main(argv=None):
         summary = json.loads(raw)
         require(summary.get('record_sha256') == args.record_sha256
                 and summary.get('runner_commit') == args.runner_commit and summary.get('package_commit') == H
-                and summary.get('manifest_sha256') == args.manifest_sha256, 'summary subject mismatch')
+                and summary.get('manifest_sha256') == args.manifest_sha256
+                and summary.get('parent_clock') == record['parent_clock'], 'summary subject mismatch')
         remaining = {kind: objects(record, kind) for kind in ('container', 'network', 'volume')}
         require(all(v == [] for v in remaining.values()), 'independent object survivor')
         require(not group_members(record['owner_process']['pgid']), 'independent owner process survivor')
@@ -437,7 +495,7 @@ def main(argv=None):
         result = {'outcome': 'pending_external_guest_teardown', 'record_sha256': args.record_sha256,
                   'manifest_sha256': args.manifest_sha256, 'summary_sha256': args.summary_sha256,
                   'remaining': remaining, 'owner_process_absent': True, 'recovery_process_absent': True,
-                  'storage': record['storage']}
+                  'storage': record['storage'], 'parent_clock': record['parent_clock']}
         exclusive(pathlib.Path(args.work_dir) / 'independent-audit.json', canonical(result))
         print(json.dumps(result))
 

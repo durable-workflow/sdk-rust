@@ -29,12 +29,15 @@ STORE_BYTES = 32 * 1024**3
 GUEST_BYTES = 20 * 1024**3
 MEMORY_BYTES = 6 * 1024**3
 PROFILE_SHA = 'fd12240c0a04fbe0614901038586a9cc411f154e11a56d6d1fcd3f4f045f0516'
+MIN_WORK_RESERVE = 600 + 180
 AUTHORITY_KEYS = {'schema', 'token', 'runner_commit', 'manifest_sha256', 'guardian_sha256',
                   'started_unix', 'active_unix', 'cleanup_unix', 'parent', 'limactl',
                   'guest_agent', 'host_boot_id', 'image_dev', 'image_ino', 'whole_device',
-                  'volume_uuid', 'profile_sha256', 'profile', 'guest_image', 'guest_agent_binary_sha256'}
+                  'volume_uuid', 'profile_sha256', 'profile', 'guest_image', 'guest_agent_binary_sha256',
+                  'active_monotonic_ns', 'cleanup_monotonic_ns'}
 INTENT_KEYS = (AUTHORITY_KEYS - {'image_dev', 'image_ino', 'whole_device', 'volume_uuid',
-    'profile_sha256', 'profile', 'guest_image', 'guest_agent_binary_sha256'}) | {'cached_image'}
+    'profile_sha256', 'profile', 'guest_image', 'guest_agent_binary_sha256',
+    'active_monotonic_ns', 'cleanup_monotonic_ns'}) | {'cached_image'}
 
 
 def require(ok, label):
@@ -208,7 +211,7 @@ def authority(path, expected_sha, source_sha):
     raw = regular(path, 64 * 1024)
     require(digest(raw) == expected_sha, 'host authority digest mismatch')
     value = json.loads(raw)
-    require(set(value) == AUTHORITY_KEYS and value['schema'] == 'durable-workflow.condition-host/v1', 'wrong host authority schema')
+    require(set(value) == AUTHORITY_KEYS and value['schema'] == 'durable-workflow.condition-host/v2', 'wrong host authority schema')
     require(value['guardian_sha256'] == source_sha and re.fullmatch('[0-9a-f]{40}', value['runner_commit'])
             and re.fullmatch('[0-9a-f]{64}', value['manifest_sha256']), 'wrong captured host source')
     require(all(type(value[k]) is int for k in ('started_unix', 'active_unix', 'cleanup_unix', 'image_dev', 'image_ino'))
@@ -233,8 +236,12 @@ def authority(path, expected_sha, source_sha):
     require(re.fullmatch('/dev/disk[0-9]+', value['whole_device'])
             and re.fullmatch('[0-9A-Fa-f-]{36}', value['volume_uuid'])
             and re.fullmatch('[0-9a-f]{64}', value['profile_sha256']), 'invalid native store authority')
-    value['_cleanup_mono'] = time.monotonic() + max(0, value['cleanup_unix'] - time.time())
-    value['_active_mono'] = time.monotonic() + max(0, value['active_unix'] - time.time())
+    require(type(value['active_monotonic_ns']) is int and value['active_monotonic_ns'] > 0
+            and type(value['cleanup_monotonic_ns']) is int
+            and value['cleanup_monotonic_ns'] == value['active_monotonic_ns'] + 60_000_000_000,
+            'wrong fixed host monotonic ceilings')
+    value['_cleanup_mono'] = value['cleanup_monotonic_ns'] / 1_000_000_000
+    value['_active_mono'] = value['active_monotonic_ns'] / 1_000_000_000
     return value
 
 
@@ -402,6 +409,11 @@ def capacity(record):
     return {'available_bytes': available, 'free_disk_bytes': free, 'os': version, 'build': build}
 
 
+def require_work_reserve(record):
+    require(record['_active_mono'] - time.monotonic() >= MIN_WORK_RESERVE,
+            'minimum guest work/audit reserve consumed before allocation or launch')
+
+
 def observe_attachment(record):
     scoped = paths(record['parent'], record['token'])
     entries = plistlib.loads(call(record, ['/usr/bin/hdiutil', 'info', '-plist']))['images']
@@ -436,6 +448,10 @@ def remove_store(record):
 def prepare(record, template):
     """Resident watchdog owns setup before the first disk mutation. No VM start."""
     scoped = paths(record['parent'], record['token'])
+    active = min(int(record['_active_mono'] * 1_000_000_000),
+                 int(record['_cleanup_mono'] * 1_000_000_000) - 60_000_000_000)
+    record.update(active_monotonic_ns=active, cleanup_monotonic_ns=active + 60_000_000_000)
+    require_work_reserve(record)
     proposal = plan(record['parent'], record['token'], record['limactl'],
                     str(scoped['mount'] / 'a/guest.raw.gz'), template)
     observed = capacity(record)
@@ -443,6 +459,7 @@ def prepare(record, template):
     for key, size, sha in (('limactl', 35_175_712, LIMA_SHA), ('guest_agent', 8_257_812, AGENT_SHA),
                            ('cached_image', IMAGE_BYTES, IMAGE_SHA)):
         input_bytes(record[key], size, sha, deadline=record['_stage_mono'])
+    require_work_reserve(record)
     scoped['parent'].mkdir(mode=0o700)
     record['_setup_tmp'] = str(scoped['parent'])
     exclusive(scoped['parent'] / 'setup-ready.json', {'guardian_sha256': record['guardian_sha256'],
@@ -450,6 +467,7 @@ def prepare(record, template):
         'process': process_identity(os.getpid()), 'capacity': observed})
     attached = False
     try:
+        require_work_reserve(record)
         record['_command_seconds'] = 180
         call(record, proposal['create_store'])
         info = scoped['image'].lstat()
@@ -470,7 +488,7 @@ def prepare(record, template):
         record['profile_sha256'] = exclusive(scoped['mount'] / 'guest.yaml', proposal['profile'])
         require(record['profile_sha256'] == proposal['profile_sha256'], 'rendered setup template changed')
         value = {key: record[key] for key in AUTHORITY_KEYS if key != 'schema'}
-        value['schema'] = 'durable-workflow.condition-host/v1'
+        value['schema'] = 'durable-workflow.condition-host/v2'
         record_sha = exclusive(scoped['parent'] / 'host-record.json', value)
         verify_store(record)
         require(time.monotonic() < record['_stage_mono'], 'setup window exhausted')
@@ -543,7 +561,17 @@ def finish_requested(record, record_sha):
     value = json.loads(regular(marker, 64 * 1024))
     _, export_sha = export_handoff(record, record_sha)
     require(value == {'record_sha256': record_sha, 'exports_sha256': export_sha}, 'wrong cleanup request authority')
+    clock_receipt(record)
     return True
+
+
+def clock_receipt(record):
+    expected = record.get('_clock_sha256')
+    require(isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected),
+            'resident clock receipt not captured')
+    raw = regular(paths(record['parent'], record['token'])['parent'] / 'guest-clock.json')
+    require(digest(raw) == expected, 'resident clock receipt changed')
+    return json.loads(raw)
 
 
 def effective_config(record, status):
@@ -612,12 +640,14 @@ def launch_guest(record, record_sha):
     record['_stage_mono'] = record['_active_mono']
     record['_command_seconds'] = 180
     try:
+        require_work_reserve(record)
         call(record, [record['limactl'], '--tty=false', 'create', '--name', scoped['name'], '-'], profile)
         before = effective_config(record, 'Stopped')
         exclusive(scoped['parent'] / 'vm-created.json', {'record_sha256': record_sha,
             'profile_sha256': digest(profile), 'guest_image': record['guest_image'], 'effective': before})
         verify_guest_inputs(record)
         require(effective_config(record, 'Stopped') == before, 'VM config changed before guardian start')
+        require_work_reserve(record)
         record['_command_seconds'] = 300
         call(record, [record['limactl'], '--tty=false', 'start', '--timeout', '5m', scoped['name']])
         after = effective_config(record, 'Running')
@@ -635,6 +665,43 @@ def launch_guest(record, record_sha):
             'effective': after, 'host_process': process, 'agent': proof})
     finally:
         for key in ('_stage_mono', '_command_seconds'):record.pop(key, None)
+
+
+GUEST_CLOCK_PROBE = '''import json,pathlib,time
+boot=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+before=time.monotonic_ns();unix=time.time_ns();after=time.monotonic_ns()
+if boot!=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip():raise SystemExit('guest boot changed')
+print(json.dumps({'guest_boot_id':boot,'guest_before_monotonic_ns':before,'guest_after_monotonic_ns':after,'guest_unix_ns':unix}))
+'''
+
+
+def capture_guest_clock(record, record_sha):
+    """Only the resident guardian can sample its original monotonic cutoffs."""
+    scoped = paths(record['parent'], record['token'])
+    request = json.loads(regular(scoped['parent'] / 'guest-clock-request.json', 4096))
+    require(request == {'record_sha256': record_sha, 'action': 'capture-guest-clock'}, 'wrong clock request')
+    require_work_reserve(record)
+    started = json.loads(regular(scoped['parent'] / 'vm-started.json'))
+    before = time.monotonic_ns()
+    value = json.loads(call(record, [record['limactl'], 'shell', scoped['name'], '--',
+                                   'python3', '-I', '-S', '-c', GUEST_CLOCK_PROBE]))
+    after = time.monotonic_ns()
+    require(set(value) == {'guest_boot_id', 'guest_before_monotonic_ns', 'guest_after_monotonic_ns', 'guest_unix_ns'}
+            and value['guest_boot_id'] == started['agent']['guest_boot_id']
+            and all(type(value[k]) is int and value[k] > 0 for k in value if k != 'guest_boot_id')
+            and 0 <= value['guest_after_monotonic_ns'] - value['guest_before_monotonic_ns'] <= 5_000_000_000
+            and 0 <= after - before <= 5_000_000_000, 'unbounded or changed guest clock sample')
+    require_work_reserve(record)
+    # Round toward an earlier deadline and preserve the original cleanup bound.
+    active = record['active_monotonic_ns']
+    clock = dict(value, schema='durable-workflow.condition-parent-clock/v1',
+        host_record_sha256=record_sha, host_boot_id=record['host_boot_id'],
+        host_started_unix=record['started_unix'], host_active_unix=record['active_unix'],
+        host_cleanup_unix=record['cleanup_unix'], host_active_monotonic_ns=active,
+        host_cleanup_monotonic_ns=active + 60_000_000_000,
+        host_before_monotonic_ns=before, host_after_monotonic_ns=after)
+    record['_clock_sha256'] = exclusive(scoped['parent'] / 'guest-clock.json', clock)
+    return clock
 
 
 def cleanup(record):
@@ -675,10 +742,20 @@ def audit(record, record_sha, source_sha):
             and result['guest_absent'] is True and result['store_unmounted'] is True and result['image_absent'] is True,
             'external cleanup did not pass')
     exports, export_sha = export_handoff(record, record_sha)
+    record['_clock_sha256'] = result.get('clock_sha256')
     require(finish_requested(record, record_sha), 'completed guest export request required')
     guest = json.loads(regular(scoped['parent'] / 'guest-summary.json'))
     guest_audit = json.loads(regular(scoped['parent'] / 'guest-audit.json'))
     started = json.loads(regular(scoped['parent'] / 'vm-started.json'))
+    clock = clock_receipt(record)
+    require(guest.get('parent_clock') == clock and guest_audit.get('parent_clock') == clock
+            and clock['host_record_sha256'] == record_sha and clock['host_boot_id'] == record['host_boot_id']
+            and clock['host_started_unix'] == record['started_unix']
+            and clock['host_active_unix'] == record['active_unix']
+            and clock['host_cleanup_unix'] == record['cleanup_unix']
+            and clock['host_active_monotonic_ns'] == record['active_monotonic_ns']
+            and clock['host_cleanup_monotonic_ns'] == record['cleanup_monotonic_ns']
+            and clock['guest_boot_id'] == exports['guest_boot_id'], 'guest clock/parent authority mismatch')
     require(guest['runner_commit'] == record['runner_commit'] and guest['manifest_sha256'] == record['manifest_sha256']
             and guest['checks_outcome'] == 'pass' and guest_audit['outcome'] == 'pending_external_guest_teardown'
             and guest['storage']['guest_boot_id'] == exports['guest_boot_id']
@@ -730,6 +807,9 @@ def main(argv=None):
                 if not launched and os.path.lexists(scoped['parent'] / 'launch.json'):
                     launch_guest(record, args.record_sha256)
                     launched = True
+                if launched and (scoped['parent'] / 'guest-clock-request.json').exists() \
+                        and not (scoped['parent'] / 'guest-clock.json').exists():
+                    capture_guest_clock(record, args.record_sha256)
                 process = capture_agent(record)
                 receipt = scoped['parent'] / 'vm-process.json'
                 if process and not receipt.exists():
@@ -747,7 +827,8 @@ def main(argv=None):
                       'custody': 'external_owner_must_resolve_retained_task_objects'}
         if control_error:
             result.update(outcome='fail', control_error_type=control_error)
-        result.update(record_sha256=args.record_sha256, guardian_sha256=source_sha)
+        result.update(record_sha256=args.record_sha256, guardian_sha256=source_sha,
+                      clock_sha256=record.get('_clock_sha256'))
         exclusive(scoped['parent'] / 'host-cleanup.json', result)
         require(result['outcome'] != 'fail', 'external cleanup incomplete')
     else:

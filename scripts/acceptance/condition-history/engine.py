@@ -259,7 +259,8 @@ def execute(args):
     watchdog, recovery_process_sha = start_recovery(args, record)
     result = {'outcome': 'fail', 'checks_outcome': 'fail', 'record_sha256': subject.RECORD_SHA,
               'runner_commit': args.runner_commit, 'package_commit': H, 'manifest_sha256': subject.CURRENT.sha256,
-              'recovery_process_sha256': recovery_process_sha, 'storage': record['storage']}
+              'recovery_process_sha256': recovery_process_sha, 'storage': record['storage'],
+              'parent_clock': record['parent_clock']}
     try:
         registry = registry_identity()
         images = [RUST, SERVER, MYSQL, REDIS]

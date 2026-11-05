@@ -11,7 +11,7 @@ import time
 import types
 import unittest
 from unittest import mock
-from test_subject import subject, fixture_subject, remove_private, REPO, HERE
+from test_subject import subject, recovery, parent_clock, fixture_subject, remove_private, REPO, HERE
 
 class Packet(unittest.TestCase):
     def setUp(self):
@@ -21,6 +21,10 @@ class Packet(unittest.TestCase):
         self.args = types.SimpleNamespace(mode='run', checkout=str(REPO), work_dir=str(self.root / 'fresh'),
             package_commit=subject.H, runner_commit='a' * 40, run_token='0123456789abcdef',
             docker_endpoint='unix:///synthetic.sock', guest_boot_id='11111111-1111-1111-1111-111111111111', started_unix=now, active_unix=now+1740, cleanup_unix=now+1800)
+        self.args.parent_clock_json = recovery.canonical(parent_clock(now)).decode()
+        self.args.parent_clock_sha256 = recovery.digest(self.args.parent_clock_json.encode())
+        envelope = recovery.clock_envelope(json.loads(self.args.parent_clock_json), now, self.args.guest_boot_id)
+        for key, value in envelope.items():setattr(self.args, key, value)
         subject.ARGS = self.args
         subject.CURRENT = fixture_subject(self.root)
         self.packet = subject.CURRENT.module('engine')
@@ -34,8 +38,13 @@ class Packet(unittest.TestCase):
         for field, value in {'package_commit':'b'*40, 'run_token':'foreign', 'active_unix':0,
                              'started_unix':0, 'docker_endpoint':'tcp://foreign'}.items():
             args = copy.copy(self.args);setattr(args, field, value)
-            with self.subTest(field=field), mock.patch.object(subject,'git',self.git), self.assertRaises(SystemExit):
-                subject.validate(args)
+            with self.subTest(field=field), mock.patch.object(subject,'git',self.git):
+                check = subject.validate
+                if field in ('active_unix', 'started_unix'):
+                    subject.validate(args)
+                    check = recovery.launch_clock
+                with self.assertRaises(SystemExit):
+                    check(args)
             self.assertFalse(pathlib.Path(args.work_dir).exists())
 
     def test_wrong_h_refuses_under_python_optimization(self):
@@ -233,4 +242,113 @@ class Packet(unittest.TestCase):
                 packet.comparator.check(report)
 
 
-if __name__ == "__main__":unittest.main()
+class ClockContract(unittest.TestCase):
+    BOOT = '11111111-1111-1111-1111-111111111111'
+
+    def clock(self, setup=60, offset=0):
+        host_start=2_000_000_000;host_mono=10_000*recovery.NS;guest_mono=20_000*recovery.NS
+        return {'schema':'durable-workflow.condition-parent-clock/v1','host_record_sha256':'d'*64,
+            'host_boot_id':'22222222-2222-2222-2222-222222222222','guest_boot_id':self.BOOT,
+            'host_started_unix':host_start,'host_active_unix':host_start+1740,'host_cleanup_unix':host_start+1800,
+            'host_active_monotonic_ns':host_mono+1740*recovery.NS,
+            'host_cleanup_monotonic_ns':host_mono+1800*recovery.NS,
+            'host_before_monotonic_ns':host_mono+setup*recovery.NS,
+            'host_after_monotonic_ns':host_mono+setup*recovery.NS,
+            'guest_before_monotonic_ns':guest_mono+setup*recovery.NS,
+            'guest_after_monotonic_ns':guest_mono+setup*recovery.NS,
+            'guest_unix_ns':(host_start+setup+offset)*recovery.NS}
+
+    def args(self, clock, start=None):
+        start=clock['guest_unix_ns']//recovery.NS if start is None else start
+        envelope=recovery.clock_envelope(clock,start,self.BOOT)
+        raw=recovery.canonical(clock)
+        return types.SimpleNamespace(started_unix=start,guest_boot_id=self.BOOT,
+            parent_clock_json=raw.decode(),parent_clock_sha256=recovery.digest(raw),**envelope)
+
+    def old_validate(self):
+        source=subprocess.check_output(['git','show','df617fb:scripts/acceptance/condition-history/subject.py'],text=True)
+        fn=next(node for node in ast.parse(source).body if isinstance(node,ast.FunctionDef) and node.name=='validate')
+        space={'require':subject.require,'H':subject.H,'git':lambda repo,*args:
+            {'HEAD':'a'*40,'refs/tags/4.12.0^{commit}':subject.H}.get(args[-1],''),
+            'os':os,'pathlib':pathlib,'re':__import__('re'),'time':time}
+        exec(compile(ast.Module(body=[fn],type_ignores=[]),'frozen-df617-clock','exec'),space)
+        return space['validate']
+
+    def old_args(self, started):
+        return types.SimpleNamespace(mode='run',package_commit=subject.H,runner_commit='a'*40,
+            checkout='/unused',work_dir='/nonexistent/sdk-rust-clock-control',run_token='0'*16,
+            docker_endpoint='unix:///synthetic.sock',guest_boot_id=self.BOOT,
+            started_unix=started,active_unix=started+1740,cleanup_unix=started+1800)
+
+    def test_actual_predecessor_refuses_allowed_60s_setup_but_successor_accepts(self):
+        clock=self.clock();guest_start=clock['guest_unix_ns']//recovery.NS
+        old=self.old_validate();args=self.old_args(clock['host_started_unix'])
+        with mock.patch.object(time,'time',return_value=guest_start),self.assertRaisesRegex(SystemExit,'stale launch'):
+            old(args)
+        args=self.args(clock)
+        with mock.patch.object(recovery.time,'time',return_value=guest_start), \
+                mock.patch.object(recovery.time,'monotonic_ns',return_value=clock['guest_after_monotonic_ns']):
+            recovery.launch_clock(args)
+        self.assertEqual(args.active_unix,clock['host_active_unix']-180)
+        self.assertEqual(args.cleanup_unix,args.active_unix+60)
+        self.assertEqual(clock['host_active_unix']-args.cleanup_unix,120)
+
+    def test_actual_predecessor_admits_fresh_full_extension_successor_refuses(self):
+        clock=self.clock();guest_start=clock['guest_unix_ns']//recovery.NS
+        old=self.old_validate();old_args=self.old_args(guest_start)
+        with mock.patch.object(time,'time',return_value=guest_start):old(old_args)
+        self.assertGreater(old_args.cleanup_unix,clock['host_cleanup_unix'])
+        args=self.args(clock);args.active_unix=old_args.active_unix;args.cleanup_unix=old_args.cleanup_unix
+        with self.assertRaisesRegex(SystemExit,'parent-constrained'):recovery.launch_clock(args)
+
+    def test_setup_and_fresh_start_never_renew_parent_monotonic_cutoffs(self):
+        values=[]
+        for setup in (0,60,300,900):
+            clock=self.clock(setup)
+            values.append(recovery.clock_envelope(clock,clock['guest_unix_ns']//recovery.NS,self.BOOT))
+        self.assertEqual(len({item['active_monotonic_ns'] for item in values}),1)
+        self.assertEqual(len({item['cleanup_monotonic_ns'] for item in values}),1)
+        clock=self.clock(60)
+        for delay in (0,10,29):
+            value=recovery.clock_envelope(clock,clock['guest_unix_ns']//recovery.NS+delay,self.BOOT)
+            self.assertEqual(value,values[0])
+
+    def test_late_setup_refuses_before_storage_or_allocation(self):
+        clock=self.clock(961);start=clock['guest_unix_ns']//recovery.NS
+        with mock.patch.object(recovery.subprocess,'run',side_effect=AssertionError('no native operation')), \
+                self.assertRaisesRegex(SystemExit,'reserve consumed'):
+            recovery.clock_envelope(clock,start,self.BOOT)
+        clock=self.clock(950);args=self.args(clock)
+        with mock.patch.object(recovery.time,'time',return_value=args.started_unix+20), \
+                mock.patch.object(recovery.time,'monotonic_ns',return_value=clock['guest_after_monotonic_ns']+20*recovery.NS), \
+                self.assertRaisesRegex(SystemExit,'before launch'):recovery.launch_clock(args)
+
+    def test_clock_offsets_cancel_and_response_delay_only_shortens(self):
+        base=self.clock();start=base['guest_unix_ns']//recovery.NS
+        expected=recovery.clock_envelope(base,start,self.BOOT)
+        for offset in (-3600,300,3600):
+            clock=self.clock(offset=offset)
+            value=recovery.clock_envelope(clock,start+offset,self.BOOT)
+            self.assertEqual(value['active_monotonic_ns'],expected['active_monotonic_ns'])
+            self.assertEqual(value['cleanup_monotonic_ns'],expected['cleanup_monotonic_ns'])
+            self.assertEqual(value['active_unix'],expected['active_unix']+offset)
+        delayed=dict(base,host_after_monotonic_ns=base['host_after_monotonic_ns']+3*recovery.NS)
+        value=recovery.clock_envelope(delayed,start,self.BOOT)
+        self.assertEqual(value['active_unix'],expected['active_unix']-3)
+        self.assertEqual(value['active_monotonic_ns'],expected['active_monotonic_ns']-3*recovery.NS)
+
+    def test_closed_clock_authority_and_deadline_mutations_refuse(self):
+        base=self.clock();start=base['guest_unix_ns']//recovery.NS
+        changes=[('extra',1),('host_record_sha256','foreign'),('guest_boot_id','foreign'),
+            ('host_active_unix',base['host_active_unix']+1),('host_cleanup_unix',base['host_cleanup_unix']+1),
+            ('host_cleanup_monotonic_ns',base['host_cleanup_monotonic_ns']+1),
+            ('host_after_monotonic_ns',base['host_before_monotonic_ns']+6*recovery.NS),
+            ('guest_before_monotonic_ns',True),('guest_unix_ns',base['guest_unix_ns']-31*recovery.NS)]
+        for key,value in changes:
+            with self.subTest(key=key),self.assertRaises(SystemExit):
+                recovery.clock_envelope(dict(base,**{key:value}),start,self.BOOT)
+        args=self.args(base);args.parent_clock_sha256='0'*64
+        with self.assertRaisesRegex(SystemExit,'digest mismatch'):recovery.launch_clock(args)
+
+
+if __name__ == '__main__':unittest.main()
