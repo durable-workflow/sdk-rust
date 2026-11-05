@@ -716,4 +716,18 @@ mod tests {
             assert_eq!(methods, ["get", "post", "post"]);
         }
     }
+
+    #[tokio::test]
+    async fn slow_capability_refresh_preserves_the_original_typed_refusal() {
+        let (client, requests) = server(vec![
+            (200, discovery(json!(true)), Duration::ZERO),
+            (422, json!({"reason":"activity_lease_renewal_unavailable","lease_renewed":false,"can_continue":false}), Duration::ZERO),
+            (200, discovery(json!(false)), Duration::from_millis(250)),
+        ]).await;
+        let result = client.renew_activity_task_lease("task","attempt","owner",Duration::from_millis(100)).await;
+        let Err(Error::ActivityTaskRejected(refusal)) = result else { panic!("original refusal must survive slow discovery: {result:?}"); };
+        assert_eq!(refusal.status, 422);
+        assert_eq!(refusal.reason, "activity_lease_renewal_unavailable");
+        assert_eq!(requests.await.unwrap().len(), 3);
+    }
 }
