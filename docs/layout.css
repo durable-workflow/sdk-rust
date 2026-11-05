@@ -80,7 +80,27 @@ body.dw-landing { margin: 0; background: var(--dw-paper); color: var(--dw-ink); 
 .dw-site-footer .dw-status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: var(--dw-paper); color: var(--dw-muted); font: 500 12px/1.5 var(--dw-font-mono); text-decoration: none; }
 .dw-status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 /* Keep rustdoc's API/search controls and compact navigation within the shared chrome. */
-body.rustdoc.dw-reference { display: grid; grid-template-columns: var(--desktop-sidebar-width,300px) minmax(0,1fr); grid-template-rows: auto 1fr auto; min-height: 100vh; --main-background-color: var(--dw-paper); --sidebar-background-color: var(--dw-surface); --main-color: var(--dw-ink); --font-family: var(--dw-font-body); --font-family-monospace: var(--dw-font-mono); font-family: var(--dw-font-body); }
+body.rustdoc.dw-reference {
+  --link-color: var(--dw-action);
+  --sidebar-link-color: var(--dw-ink-2);
+  --type-link-color: var(--dw-action);
+  --trait-link-color: var(--dw-action);
+  --function-link-color: var(--dw-action);
+  --macro-link-color: var(--dw-action);
+  --mod-link-color: var(--dw-action);
+  --keyword-link-color: var(--dw-action);
+  --assoc-item-link-color: var(--dw-action);
+  display: grid;
+  grid-template-columns: var(--desktop-sidebar-width,300px) minmax(0,1fr);
+  grid-template-rows: auto 1fr auto;
+  min-height: 100vh;
+  --main-background-color: var(--dw-paper);
+  --sidebar-background-color: var(--dw-surface);
+  --main-color: var(--dw-ink);
+  --font-family: var(--dw-font-body);
+  --font-family-monospace: var(--dw-font-mono);
+  font-family: var(--dw-font-body);
+}
 .dw-reference > .dw-site-header, .dw-reference > .dw-skip-link, .dw-reference > .dw-site-footer { grid-column: 1 / -1; }
 .dw-reference > .dw-site-header { grid-row: 1; }
 .dw-reference > .sidebar { grid-column: 1; grid-row: 2; top: var(--dw-header-height); height: calc(100vh - var(--dw-header-height)); }
@@ -144,22 +164,8 @@ body.rustdoc.dw-reference pre { background: var(--dw-code-background); color: va
 [data-theme='dark'] .dw-status-pill[data-status='degraded'] { color: #f2bf58; background: #332916; }
 [data-theme='dark'] .dw-status-pill[data-status='incident'] { color: #ff9c9c; background: #321b1b; }
 [data-theme='dark'] .dw-status-pill[data-status='maintenance'] { color: #abc3ff; background: #1b293d; }
-body.rustdoc.dw-reference pre.rust :is(.kw,.kw-2,.self,.bool,.lifetime,.macro) { color: #5fe0a6; }
-body.rustdoc.dw-reference pre.rust :is(.comment,.doccomment) { color: var(--dw-code-muted); }
 body.rustdoc.dw-reference pre.rust :is(.string,.number,.ident,.attribute,.prelude-ty,.prelude-val) { color: var(--dw-code-foreground); }
 
-/* Rustdoc links share the product action color, including its item categories. */
-body.rustdoc.dw-reference {
-  --link-color: var(--dw-action);
-  --sidebar-link-color: var(--dw-ink-2);
-  --type-link-color: var(--dw-action);
-  --trait-link-color: var(--dw-action);
-  --function-link-color: var(--dw-action);
-  --macro-link-color: var(--dw-action);
-  --mod-link-color: var(--dw-action);
-  --keyword-link-color: var(--dw-action);
-  --assoc-item-link-color: var(--dw-action);
-}
 body.rustdoc.dw-reference pre.rust * { color: inherit; }
 body.rustdoc.dw-reference pre.rust :is(.kw,.kw-2,.self,.bool,.lifetime,.macro) { color: #5fe0a6; }
 body.rustdoc.dw-reference pre.rust :is(.comment,.doccomment) { color: var(--dw-code-muted); }
