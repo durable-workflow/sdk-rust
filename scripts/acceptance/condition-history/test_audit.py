@@ -30,7 +30,9 @@ class Audit(unittest.TestCase):
         self.summary = {'checks_outcome': 'pass', 'outcome': 'pending_independent_audit',
             'record_sha256': self.record_sha, 'runner_commit': self.authority['runner_commit'],
             'package_commit': subject.H, 'manifest_sha256': self.sealed.sha256,
-            'recovery_process_sha256': watcher_sha}
+            'recovery_process_sha256': watcher_sha, 'cleanup_errors': [],
+            'cleanup': {'pass': True, 'errors': [],
+                'remaining': {'container': [], 'network': [], 'volume': []}}}
         self.summary_sha = subject.exclusive(self.root / 'summary.json', subject.canonical(self.summary))
 
     def args(self, mode='audit'):
@@ -80,6 +82,17 @@ class Audit(unittest.TestCase):
         (self.root / 'summary.json').symlink_to(foreign)
         with self.assertRaises(SystemExit):self.invoke()
         self.assertEqual(foreign.read_bytes(), b'preserved')
+
+    def test_failed_or_incomplete_owner_result_never_gains_audit_pass(self):
+        for field, value in [('outcome', 'fail'), ('checks_outcome', 'fail'),
+                             ('cleanup', {}), ('cleanup_errors', ['uncertain'])]:
+            bad = dict(self.summary, **{field: value})
+            raw = subject.canonical(bad)
+            (self.root / 'summary.json').write_bytes(raw)
+            self.summary_sha = subject.digest(raw)
+            with self.subTest(field=field), self.assertRaisesRegex(SystemExit, 'owner checks or cleanup'):
+                self.invoke()
+        self.assertFalse((self.root / 'independent-audit.json').exists())
 
     def test_late_source_drift_cannot_cancel_captured_exact_cleanup(self):
         with mock.patch.object(recovery, 'validate_record', side_effect=[self.authority, SystemExit('drift')]), \

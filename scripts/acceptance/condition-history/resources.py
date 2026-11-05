@@ -174,8 +174,10 @@ class Docker:
         require(caps(host['CapDrop']) == ['ALL'] and caps(host['CapAdd']) == caps(spec['cap_add']), 'wrong capability set')
         require(sorted(v.removesuffix(':true') for v in host['SecurityOpt']) == ['no-new-privileges'], 'wrong security options')
         require(host['NetworkMode'] == spec['network'] and not host.get('PortBindings') and not host.get('PublishAllPorts')
-                and not host.get('Devices') and not host.get('VolumesFrom')
-                and host.get('PidMode', '') != 'host' and host.get('IpcMode', 'private') != 'host', 'wrong effective network/device sharing')
+                and not host.get('Devices') and not host.get('DeviceRequests') and not host.get('DeviceCgroupRules')
+                and not host.get('VolumesFrom') and host.get('PidMode', '') == ''
+                and host.get('IpcMode', 'private') == 'private' and host.get('UTSMode', '') == '',
+                'wrong effective network/device sharing')
         if spec['network'] == self.task:
             network = json.loads(self.call(['docker', 'network', 'inspect', self.task]).stdout)[0]
             require(network['Internal'] is True and all(network['Labels'].get(k) == v for k, v in self.labels('network').items()), 'wrong internal network authority')

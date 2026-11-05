@@ -51,6 +51,60 @@ class Packet(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(any(isinstance(n,ast.Assert) for n in ast.walk(ast.parse((HERE/name).read_text()))))
 
+    def recovery_start(self, changed=None, process_missing=False, exited=False):
+        pathlib.Path(self.args.work_dir).mkdir()
+        subject.RECORD_SHA = 'c' * 64
+        process = {'pid': 23456, 'pgid': 23456, 'sid': 23456, 'started': 'synthetic watcher'}
+        recovery_sha = subject.CURRENT.value['files'][subject.PREFIX + 'recover.py']['sha256']
+        ready = {'record_sha256': subject.RECORD_SHA, 'manifest_sha256': subject.CURRENT.sha256,
+                 'recovery_sha256': recovery_sha, 'process': process}
+        ready.update(changed or {})
+        if not exited:
+            subject.exclusive(pathlib.Path(self.args.work_dir) / 'recovery-ready.json', subject.canonical(ready))
+        watcher = mock.Mock(pid=process['pid'])
+        watcher.poll.return_value = 1 if exited else None
+        with mock.patch.object(packet.subprocess, 'Popen', return_value=watcher) as launch, \
+                mock.patch.object(packet.recovery, 'process_identity', return_value=None if process_missing else process), \
+                mock.patch.object(packet, 'registry_identity', side_effect=AssertionError('no registry before readiness')), \
+                mock.patch.object(packet.resources, 'call', side_effect=AssertionError('no daemon')):
+            if changed or process_missing or exited:
+                with self.assertRaises(SystemExit):
+                    packet.start_recovery(self.args, {'recovery_sha256': recovery_sha})
+            else:
+                actual, receipt_sha = packet.start_recovery(self.args, {'recovery_sha256': recovery_sha})
+                self.assertIs(actual, watcher)
+                receipt = (pathlib.Path(self.args.work_dir) / 'recovery-process.json').read_bytes()
+                self.assertEqual(subject.digest(receipt), receipt_sha)
+                self.assertEqual(json.loads(receipt), {'source_sha256': recovery_sha, 'process': process})
+        argv = launch.call_args.args[0]
+        self.assertEqual(argv[:4], [sys.executable, '-I', '-S', '-c'])
+        self.assertEqual(subject.digest(argv[4].encode()), recovery_sha)
+        self.assertEqual(argv[-2:], ['--at', str(self.args.active_unix)])
+        self.assertTrue(launch.call_args.kwargs['start_new_session'])
+        return watcher
+
+    def test_captured_recovery_requires_exact_ready_receipt(self):
+        watcher = self.recovery_start()
+        watcher.terminate.assert_not_called()
+
+    def test_wrong_recovery_ready_refuses_before_registry_or_daemon(self):
+        for key in ('record_sha256', 'manifest_sha256', 'recovery_sha256', 'process'):
+            with self.subTest(key=key):
+                watcher = self.recovery_start({key: 'foreign'})
+                watcher.terminate.assert_called_once()
+                watcher.wait.assert_called_once_with(timeout=5)
+                import shutil
+                shutil.rmtree(self.args.work_dir)
+
+    def test_missing_recovery_identity_stops_the_started_child(self):
+        watcher = self.recovery_start(process_missing=True)
+        watcher.terminate.assert_called_once()
+        watcher.wait.assert_called_once_with(timeout=5)
+
+    def test_exited_recovery_refuses_without_launching_any_role(self):
+        watcher = self.recovery_start(exited=True)
+        watcher.terminate.assert_not_called()
+
     def test_dirty_head_tag_and_existing_work_refuse(self):
         for response in ('dirty','wrong-head','wrong-tag','existing'):
             def git(checkout,*args):

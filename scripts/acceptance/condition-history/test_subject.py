@@ -56,8 +56,10 @@ class SubjectControls(unittest.TestCase):
         self.sealed = fixture_subject(self.root)
 
     def old_function(self, name, namespace):
+        # This ancestor preserves the held f155 run.py blob and remains reachable
+        # in ordinary clones after the original review branches are removed.
         old = subprocess.check_output(['git', '--no-replace-objects', '-C', str(REPO), 'show',
-            'f15509d5e6e3e8029a92a754d0a6732421a4501d:scripts/acceptance/condition-history/run.py'], text=True)
+            '67a37f7f0e42ba63ee4e68cae3090a9ba73e1cc2:scripts/acceptance/condition-history/run.py'], text=True)
         node = next(n for n in ast.parse(old).body if isinstance(n, ast.FunctionDef) and n.name == name)
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'held-f155-function', 'exec'), namespace)
         return namespace[name]
@@ -90,7 +92,7 @@ class SubjectControls(unittest.TestCase):
 
     def test_actual_held_summary_statement_overwrites_an_existing_handoff(self):
         old = subprocess.check_output(['git','--no-replace-objects','-C',str(REPO),'show',
-            'f15509d5e6e3e8029a92a754d0a6732421a4501d:scripts/acceptance/condition-history/run.py'],text=True)
+            '67a37f7f0e42ba63ee4e68cae3090a9ba73e1cc2:scripts/acceptance/condition-history/run.py'],text=True)
         node=next(n for n in ast.walk(ast.parse(old)) if isinstance(n,ast.Call)
             and isinstance(n.func,ast.Attribute) and n.func.attr=='write_bytes'
             and isinstance(n.func.value,ast.BinOp) and isinstance(n.func.value.right,ast.Constant)

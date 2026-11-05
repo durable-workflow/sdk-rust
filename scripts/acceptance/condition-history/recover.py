@@ -330,7 +330,11 @@ def main(argv=None):
                 and process['pid'] > 1 and process['pid'] == process['pgid'] == process['sid']
                 and isinstance(process['started'], str) and process['started'], 'wrong recovery-process identity')
         require(not group_members(watcher['process']['pgid']), 'independent recovery process survivor')
-        require(summary.get('checks_outcome') == 'pass', 'source checks did not pass')
+        require(summary.get('checks_outcome') == 'pass'
+                and summary.get('outcome') == 'pending_independent_audit'
+                and summary.get('cleanup') == {'pass': True, 'errors': [],
+                    'remaining': {'container': [], 'network': [], 'volume': []}}
+                and summary.get('cleanup_errors') == [], 'owner checks or cleanup did not pass')
         result = {'outcome': 'pass', 'record_sha256': args.record_sha256,
                   'manifest_sha256': args.manifest_sha256, 'summary_sha256': args.summary_sha256,
                   'remaining': remaining, 'owner_process_absent': True, 'recovery_process_absent': True}

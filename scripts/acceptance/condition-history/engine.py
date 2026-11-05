@@ -216,15 +216,7 @@ class ConditionCell(native.Cell):
         return outcome
 
 
-def execute(args):
-    # The captured bootstrap has already verified R/H/manifest and refused all
-    # collisions before creating this root or contacting a registry.
-    record = recovery.validate_record(args.work_dir, subject.RECORD_SHA, args.runner_commit,
-        subject.CURRENT.sha256, subject.RECORD['recovery_sha256'], args.run_token)
-    owner = native.Run(PREFIX, token=args.run_token)
-    owner.base = PREFIX + '-' + args.run_token
-    controller = resources.Docker(args, subject.CURRENT, record)
-    native.call = lambda line, **kwargs: command(args, line, **kwargs)
+def start_recovery(args, record):
     program = subject.CURRENT.read(subject.PREFIX + 'recover.py').decode()
     require(subject.digest(program.encode()) == record['recovery_sha256'], 'captured recovery source mismatch')
     recovery_argv = [sys.executable, '-I', '-S', '-c', program, 'recover', '--work-dir', args.work_dir,
@@ -233,11 +225,11 @@ def execute(args):
         '--at', str(args.active_unix)]
     watchdog = subprocess.Popen(recovery_argv, start_new_session=True, stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=resources.environment(args))
-    process = recovery.process_identity(watchdog.pid)
-    require(process is not None, 'recovery did not start')
-    recovery_process_sha = subject.exclusive(pathlib.Path(args.work_dir) / 'recovery-process.json', subject.canonical({
-        'source_sha256': record['recovery_sha256'], 'process': process}))
     try:
+        process = recovery.process_identity(watchdog.pid)
+        require(process is not None, 'recovery did not start')
+        recovery_process_sha = subject.exclusive(pathlib.Path(args.work_dir) / 'recovery-process.json', subject.canonical({
+            'source_sha256': record['recovery_sha256'], 'process': process}))
         ready_path = pathlib.Path(args.work_dir) / 'recovery-ready.json'
         until = min(time.time() + 5, args.active_unix - 10)
         while not ready_path.exists():
@@ -248,8 +240,26 @@ def execute(args):
             'recovery_sha256': record['recovery_sha256'], 'process': process}, 'wrong recovery-ready authority')
     except BaseException:
         if watchdog.poll() is None:
-            watchdog.terminate();watchdog.wait(timeout=5)
+            watchdog.terminate()
+            try:
+                watchdog.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watchdog.kill()
+                watchdog.wait(timeout=5)
         raise
+    return watchdog, recovery_process_sha
+
+
+def execute(args):
+    # The captured bootstrap has already verified R/H/manifest and refused all
+    # collisions before creating this root or contacting a registry.
+    record = recovery.validate_record(args.work_dir, subject.RECORD_SHA, args.runner_commit,
+        subject.CURRENT.sha256, subject.RECORD['recovery_sha256'], args.run_token)
+    owner = native.Run(PREFIX, token=args.run_token)
+    owner.base = PREFIX + '-' + args.run_token
+    controller = resources.Docker(args, subject.CURRENT, record)
+    native.call = lambda line, **kwargs: command(args, line, **kwargs)
+    watchdog, recovery_process_sha = start_recovery(args, record)
     result = {'outcome': 'fail', 'checks_outcome': 'fail', 'record_sha256': subject.RECORD_SHA,
               'runner_commit': args.runner_commit, 'package_commit': H, 'manifest_sha256': subject.CURRENT.sha256,
               'recovery_process_sha256': recovery_process_sha}

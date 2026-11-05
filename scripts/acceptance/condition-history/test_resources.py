@@ -62,7 +62,7 @@ class Resources(unittest.TestCase):
     def test_actual_held_build_has_no_swap_cap(self):
         repo=HERE.parents[2]
         old=subprocess.check_output(['git','--no-replace-objects','-C',str(repo),'show',
-            'f15509d5e6e3e8029a92a754d0a6732421a4501d:scripts/acceptance/condition-history/run.py'],text=True)
+            '67a37f7f0e42ba63ee4e68cae3090a9ba73e1cc2:scripts/acceptance/condition-history/run.py'],text=True)
         node=next(n for n in ast.parse(old).body if isinstance(n,ast.FunctionDef) and n.name=='build')
         ledger=[]
         namespace={'remaining':lambda args:100,'os':__import__('os'),'RUST':IMAGE,
@@ -98,6 +98,9 @@ class Resources(unittest.TestCase):
                 ('HostConfig', 'Privileged', True), ('HostConfig', 'CapAdd', ['SYS_ADMIN']),
                 ('HostConfig', 'CapDrop', []), ('HostConfig', 'SecurityOpt', []),
                 ('HostConfig', 'NetworkMode', 'host'), ('HostConfig', 'PortBindings', {'80/tcp': [{}]}),
+                ('HostConfig', 'PidMode', 'container:foreign'), ('HostConfig', 'IpcMode', 'container:foreign'),
+                ('HostConfig', 'UTSMode', 'host'), ('HostConfig', 'DeviceRequests', [{'Count': -1}]),
+                ('HostConfig', 'DeviceCgroupRules', ['a *:* rwm']),
                 ('HostConfig', 'Tmpfs', {}), ('Config', 'User', '0:0'), ('Config', 'Cmd', ['foreign']),
                 ('Config', 'Entrypoint', ['foreign']), ('Config', 'Env', ['CARGO_BUILD_JOBS=99']),
                 ('Config', 'Image', 'foreign'), ('Config', 'WorkingDir', '/foreign'), ('Config', 'Labels', {}),
@@ -133,6 +136,23 @@ class Resources(unittest.TestCase):
             self.controller.start(role, token='synthetic-only', key='synthetic-only')
         self.assertFalse(any(line[:2] == ['docker', 'exec'] for line in ledger))
         self.assertEqual(self.controller.receipts, [])
+
+    def test_valid_readback_precedes_private_credential_release(self):
+        role = self.role();frame = self.frame(role)
+        ledger = []
+        def cli(line, **kwargs):
+            ledger.append((line, kwargs))
+            if line[:3] == ['docker', 'network', 'inspect']:
+                return self.network()
+            if line[:2] == ['docker', 'inspect']:
+                return types.SimpleNamespace(stdout=json.dumps([frame]))
+            return types.SimpleNamespace(stdout='')
+        with mock.patch.object(self.controller, 'call', cli):
+            self.assertEqual(self.controller.start(role, token='synthetic-only'), role['name'])
+        self.assertEqual(len(self.controller.receipts), 1)
+        self.assertEqual(ledger[-1][0][:3], ['docker', 'exec', '-i'])
+        self.assertEqual(ledger[-1][1]['input'], 'synthetic-only\n\n')
+        self.assertLess(next(i for i, (line, _) in enumerate(ledger) if line[:2] == ['docker', 'inspect']), len(ledger) - 1)
 
     def test_compile_input_and_replay_input_mounts_are_readonly(self):
         build = self.role('build');consumer = self.role('consumer')
