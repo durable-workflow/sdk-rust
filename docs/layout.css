@@ -74,7 +74,7 @@ body.dw-landing { margin: 0; background: var(--dw-paper); color: var(--dw-ink); 
 .dw-footer-brand .dw-brand { gap: 8px; }
 .dw-footer-brand .dw-brand__name { font-size: 16px; }
 .dw-footer-columns nav { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
-.dw-footer-columns h2 { margin: 0; color: var(--dw-muted); font: 400 12px/1.5 var(--dw-font-mono); letter-spacing: 0.08em; text-transform: uppercase; }
+.dw-site-footer .dw-footer-columns h2 { margin: 0; color: var(--dw-muted); font: 400 12px/1.5 var(--dw-font-mono); letter-spacing: 0.08em; text-transform: uppercase; }
 .dw-footer-columns a { text-decoration: none; color: var(--dw-ink-2); }
 .dw-footer-bottom { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; max-width: 1152px; margin: 0 auto; padding: 20px 0 32px; border-top: 1px solid var(--dw-line); color: var(--dw-muted); font-size: 13px; }
 .dw-site-footer .dw-status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: var(--dw-paper); color: var(--dw-muted); font: 500 12px/1.5 var(--dw-font-mono); text-decoration: none; }
@@ -147,3 +147,19 @@ body.rustdoc.dw-reference pre { background: var(--dw-code-background); color: va
 body.rustdoc.dw-reference pre.rust :is(.kw,.kw-2,.self,.bool,.lifetime,.macro) { color: #5fe0a6; }
 body.rustdoc.dw-reference pre.rust :is(.comment,.doccomment) { color: var(--dw-code-muted); }
 body.rustdoc.dw-reference pre.rust :is(.string,.number,.ident,.attribute,.prelude-ty,.prelude-val) { color: var(--dw-code-foreground); }
+
+/* Rustdoc links share the product action color, including its item categories. */
+body.rustdoc.dw-reference {
+  --link-color: var(--dw-action);
+  --sidebar-link-color: var(--dw-ink-2);
+  --type-link-color: var(--dw-action);
+  --trait-link-color: var(--dw-action);
+  --function-link-color: var(--dw-action);
+  --macro-link-color: var(--dw-action);
+  --mod-link-color: var(--dw-action);
+  --keyword-link-color: var(--dw-action);
+  --assoc-item-link-color: var(--dw-action);
+}
+body.rustdoc.dw-reference pre.rust * { color: inherit; }
+body.rustdoc.dw-reference pre.rust :is(.kw,.kw-2,.self,.bool,.lifetime,.macro) { color: #5fe0a6; }
+body.rustdoc.dw-reference pre.rust :is(.comment,.doccomment) { color: var(--dw-code-muted); }

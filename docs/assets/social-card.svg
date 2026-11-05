@@ -1,31 +1,21 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
   <title id="title">Durable Workflow Rust SDK</title>
-  <desc id="description">Build durable workflows and activities in Rust.</desc>
-  <defs>
-    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0b1118"/>
-      <stop offset="1" stop-color="#17283a"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(952 118) rotate(135) scale(530)">
-      <stop stop-color="#f46623" stop-opacity=".36"/>
-      <stop offset="1" stop-color="#f46623" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect width="1200" height="630" fill="url(#background)"/>
-  <rect width="1200" height="630" fill="url(#glow)"/>
-  <g fill="none" stroke="#9effc7" stroke-width="3" opacity=".38">
-    <path d="M765 420h90c40 0 40-62 80-62h105"/>
-    <circle cx="765" cy="420" r="8" fill="#9effc7"/>
-    <circle cx="1040" cy="358" r="8" fill="#9effc7"/>
-    <path d="M825 490h60c50 0 50-68 100-68h116"/>
-  </g>
-  <g transform="translate(92 88)">
-    <rect width="88" height="88" rx="22" fill="#9effc7"/>
-    <path d="M21 27h20c18 0 28 8 28 17s-10 17-28 17H21V27Zm14 10v14h7c8 0 12-3 12-7s-4-7-12-7h-7Z" fill="#101820"/>
-  </g>
-  <text x="92" y="265" fill="#9effc7" font-family="system-ui, sans-serif" font-size="28" font-weight="700" letter-spacing="3">DURABLE WORKFLOW</text>
-  <text x="92" y="365" fill="#f7f7f2" font-family="system-ui, sans-serif" font-size="88" font-weight="750">RUST SDK</text>
-  <text x="92" y="437" fill="#b9c6d3" font-family="system-ui, sans-serif" font-size="34">Build. Run. Recover. Keep going.</text>
-  <rect x="92" y="505" width="390" height="2" fill="#9effc7"/>
-  <text x="92" y="556" fill="#b9c6d3" font-family="ui-monospace, monospace" font-size="24">rust.durable-workflow.com</text>
+  <desc id="description">Durable workflows in Rust. Author workflows and activities, and run workers with the first-party SDK.</desc>
+  <style>
+    @font-face { font-family: Inter; font-weight: 400 600; src: url('fonts/inter-latin.woff2') format('woff2'); }
+    @font-face { font-family: 'Space Grotesk'; font-weight: 600; src: url('fonts/space-grotesk-latin.woff2') format('woff2'); }
+    @font-face { font-family: 'JetBrains Mono'; font-weight: 400 600; src: url('fonts/jetbrains-mono-latin.woff2') format('woff2'); }
+  </style>
+  <rect width="1200" height="630" fill="#F6F7F5"/>
+  <image href="logo.svg" x="72" y="58" width="64" height="64"/>
+  <text x="156" y="99" fill="#0F1513" font-family="Space Grotesk, sans-serif" font-size="30" font-weight="600">Durable Workflow</text>
+  <text x="445" y="98" fill="#5E6964" font-family="Inter, sans-serif" font-size="26">/</text>
+  <text x="472" y="98" fill="#0F7A52" font-family="JetBrains Mono, monospace" font-size="24">rust</text>
+  <text x="72" y="249" fill="#0F1513" font-family="Space Grotesk, sans-serif" font-size="76" font-weight="600" letter-spacing="-2">Durable workflows</text>
+  <text x="72" y="333" fill="#0F1513" font-family="Space Grotesk, sans-serif" font-size="76" font-weight="600" letter-spacing="-2">in Rust.</text>
+  <text x="72" y="396" fill="#3B4541" font-family="Inter, sans-serif" font-size="27">Author workflows and activities. Run workers.</text>
+  <rect x="72" y="450" width="600" height="64" rx="8" fill="#0F1513"/>
+  <text x="94" y="491" fill="#5FE0A6" font-family="JetBrains Mono, monospace" font-size="25">$</text>
+  <text x="125" y="491" fill="#E8EDEA" font-family="JetBrains Mono, monospace" font-size="25">cargo add durable-workflow</text>
+  <text x="72" y="575" fill="#5E6964" font-family="JetBrains Mono, monospace" font-size="21">rust.durable-workflow.com</text>
 </svg>

@@ -31,7 +31,7 @@ and Chrome/Chromium. This check performs no browser download or installation:
 python3 -m http.server 8000 --bind 127.0.0.1 --directory target/stable-docs
 # In another shell, with Playwright available to Node:
 CHROMIUM_PATH=/path/to/chromium node scripts/ci/check-docs-browser.cjs \
-  http://127.0.0.1:8000 target/docs-browser
+  http://127.0.0.1:8000
 ```
 
 `PLAYWRIGHT_MODULE` can select an existing public Playwright package. The check
@@ -39,6 +39,6 @@ uses a new disposable profile, at most two renderer processes and a 210-second
 bound. It captures desktop/tablet/narrow-mobile landing and API pages in both
 themes and checks theme persistence, copy, keyboard switching, API navigation,
 search and synthetic status/freshness cases. Screenshots and `summary.json` go
-to the output directory. Close the separate static server when finished.
+to `target/docs-browser` under the current working directory. Close the separate static server when finished.
 Synthetic status fixtures never establish live service health; production
 acceptance also verifies the existing public feed from the deployed origin.
