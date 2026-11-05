@@ -1,0 +1,36 @@
+/* One Durable Workflow. Shared role tokens; no framework or remote imports. */
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+  --dw-paper: #f6f7f5;
+  --dw-surface: #ffffff;
+  --dw-ink: #0f1513;
+  --dw-ink-2: #3b4541;
+  --dw-muted: #5e6964;
+  --dw-line: #dde2df;
+  --dw-action: #0f7a52;
+  --dw-tint: #e3f4ec;
+  --dw-on-action: #ffffff;
+  --dw-font-display: 'Space Grotesk', Inter, system-ui, sans-serif;
+  --dw-font-body: Inter, system-ui, sans-serif;
+  --dw-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+  --dw-code-background: #0f1513;
+  --dw-code-foreground: #e8edea;
+  --dw-code-muted: #9aa6a1;
+  --dw-logo-paper: #f6f7f5;
+  --dw-radius-action: 6px;
+  --dw-radius-card: 8px;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --dw-paper: #0f1513;
+  --dw-surface: #172019;
+  --dw-ink: #e8edea;
+  --dw-ink-2: #b7c2bd;
+  --dw-muted: #9aa6a1;
+  --dw-line: #2e3934;
+  --dw-action: #5fe0a6;
+  --dw-tint: #123b2a;
+  --dw-on-action: #0f1513;
+}

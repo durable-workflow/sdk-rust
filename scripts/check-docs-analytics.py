@@ -13,9 +13,9 @@ if (build_directory / "analytics/analytics.js").read_text(encoding="utf-8") != r
     raise SystemExit("Rendered rustdoc analytics runtime is stale")
 if (build_directory / "navigation.js").read_text(encoding="utf-8") != navigation:
     raise SystemExit("Rendered rustdoc navigation runtime is stale")
-if not re.search(r"\.dw-cloud-promotion__eyebrow\s*\{[^}]*letter-spacing:\s*0;", styles, re.DOTALL):
-    raise SystemExit("Promotion eyebrow letter spacing must remain zero")
-if re.search(r"gradient|clamp\(|letter-spacing:\s*-|\b\d+(?:\.\d+)?vw\b", landing_styles):
+if not re.search(r"\.dw-cloud-promotion__eyebrow\s*\{[^}]*letter-spacing:\s*0\.08em;", styles, re.DOTALL):
+    raise SystemExit("Promotion eyebrow must use shared identity label spacing")
+if re.search(r"gradient|clamp\(|\b\d+(?:\.\d+)?vw\b", landing_styles):
     raise SystemExit("Rust documentation landing must use fixed type and flat surfaces")
 
 for required in (
