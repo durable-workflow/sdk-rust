@@ -38,9 +38,13 @@ class Packet(unittest.TestCase):
         for field, value in {'package_commit':'b'*40, 'run_token':'foreign', 'active_unix':0,
                              'started_unix':0, 'docker_endpoint':'tcp://foreign'}.items():
             args = copy.copy(self.args);setattr(args, field, value)
-            with self.subTest(field=field), mock.patch.object(subject,'git',self.git), self.assertRaises(SystemExit):
-                subject.validate(args)
-                recovery.launch_clock(args)
+            with self.subTest(field=field), mock.patch.object(subject,'git',self.git):
+                check = subject.validate
+                if field in ('active_unix', 'started_unix'):
+                    subject.validate(args)
+                    check = recovery.launch_clock
+                with self.assertRaises(SystemExit):
+                    check(args)
             self.assertFalse(pathlib.Path(args.work_dir).exists())
 
     def test_wrong_h_refuses_under_python_optimization(self):
