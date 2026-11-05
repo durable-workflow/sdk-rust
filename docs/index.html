@@ -18,6 +18,7 @@
   <link rel="canonical" href="https://rust.durable-workflow.com/">
   <title>Durable Workflow for Rust</title>
   <script type="module" src="/navigation.js"></script>
+<script type="module" src="/status.js"></script>
   <script type="module" src="/analytics/analytics.js"></script>
 </head>
 <body class="dw-landing" data-landing-contract="general-rust-first" data-rust-version="1.86">
@@ -37,7 +38,7 @@
         <li><span class="dw-step-number">02</span><h3>Add the SDK</h3><p>Use Cargo to select the current stable crate.</p><div class="dw-code"><pre><code><span aria-hidden="true">$ </span><span id="dw-command-install">cargo add durable-workflow</span></code></pre><button type="button" class="dw-copy" data-dw-copy="dw-command-install" aria-label="Copy Cargo install command">Copy</button></div></li>
         <li><span class="dw-step-number">03</span><h3>Explore the authoring surface</h3><p>Open the generated modules, traits, structs and methods, then use the guide for runtime setup.</p><div class="dw-example-links"><a href="https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs">Runnable typed example <span aria-hidden="true">→</span></a><a href="https://github.com/durable-workflow/sdk-rust/blob/3.1.0/examples/local_activities.rs">Local activity example <span aria-hidden="true">→</span></a><a href="https://github.com/durable-workflow/sdk-rust/blob/3.4.0/examples/sticky_execution.rs">Bounded sticky execution example <span aria-hidden="true">→</span></a></div></li>
       </ol>
-      <p class="dw-sr-only" data-dw-copy-feedback role="status" aria-live="polite"></p>
+      <output class="dw-sr-only" data-dw-copy-feedback aria-live="polite"></output>
     </section>
     <section class="dw-runtime" aria-labelledby="runtime-title">
       <div class="dw-section-heading"><h2 id="runtime-title">Choose who runs the runtime</h2><p>Workflow types, activity types and task queue stay the same. Only the endpoint, credentials and operating boundary change.</p></div>

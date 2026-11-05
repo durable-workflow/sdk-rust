@@ -27,7 +27,7 @@ test ! -e target/stable-docs
 mv "$CARGO_TARGET_DIR/doc" target/stable-docs
 printf '%s\n' 'rust.durable-workflow.com' > target/stable-docs/CNAME
 touch target/stable-docs/.nojekyll
-cp docs/index.html docs/layout.css docs/navigation.js target/stable-docs/
+cp docs/index.html docs/layout.css docs/navigation.js docs/status.js target/stable-docs/
 mkdir -p target/stable-docs/analytics target/stable-docs/assets
 cp docs/analytics/analytics.js target/stable-docs/analytics/
 cp -R docs/assets/. target/stable-docs/assets/
@@ -43,7 +43,7 @@ html = re.sub(r'(https://github.com/durable-workflow/sdk-rust/blob/)[^/]+(/examp
 landing.write_text(html)
 PY
 python3 scripts/ci/test-docs-identity.py
-python3 scripts/ci/prepare-docs-identity.py target/stable-docs
+python3 scripts/ci/prepare-docs-identity.py --stable
 python3 scripts/ci/test-rustdoc-controls.py
 python3 scripts/ci/prepare-rustdoc-controls.py --stable
 python3 scripts/check-docs-analytics.py target/stable-docs
@@ -51,3 +51,4 @@ python3 scripts/check-docs-site.py target/stable-docs
 python3 scripts/ci/validate-example-base-urls.py --root "$stable_source" --rendered-docs target/stable-docs
 node scripts/ci/test-docs-analytics.mjs
 node scripts/ci/test-docs-navigation.mjs
+node scripts/ci/test-docs-status.mjs

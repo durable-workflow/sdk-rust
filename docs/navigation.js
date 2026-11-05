@@ -169,14 +169,7 @@
       await navigator.clipboard.writeText(text);
       return;
     }
-    const textarea = document.createElement('textarea');
-    textarea.value = text;
-    textarea.className = 'dw-sr-only';
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand('copy');
-    textarea.remove();
-    if (!copied) throw new Error('Clipboard unavailable');
+    throw new Error('Clipboard unavailable');
   }
   for (const button of document.querySelectorAll('[data-dw-copy]')) {
     button.addEventListener('click', async function () {

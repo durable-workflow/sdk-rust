@@ -14,7 +14,7 @@ class DocumentationIdentity(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        (self.root / "index.html").write_text('<html><body><!-- dw:header --><main id="main-content"><strong>Stable release</strong><a href="https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs">Example</a></main><!-- dw:footer --></body></html>')
+        (self.root / "index.html").write_text('<html><head></head><body><!-- dw:header --><main id="main-content"><strong>Stable release</strong><a href="https://github.com/durable-workflow/sdk-rust/blob/main/examples/hello_world.rs">Example</a></main><!-- dw:footer --></body></html>')
         self.api = self.root / "api.html"
         self.content = '<nav class="sidebar"><a href="#method.example">Method</a></nav><main><rustdoc-search></rustdoc-search><h1 id="method.example">Example API</h1><pre>fn example()</pre></main>'
         self.api.write_text('<html><head><meta name="generator" content="rustdoc"></head><body class="rustdoc mod">' + self.content + '</body></html>')
@@ -27,6 +27,7 @@ class DocumentationIdentity(unittest.TestCase):
         self.assertEqual(rendered.count('class="dw-site-header"'), 1)
         self.assertEqual(rendered.count('class="dw-site-footer"'), 1)
         self.assertEqual(rendered.count('<h1'), 1)
+        self.assertEqual(rendered.count('src="/status.js"'), 1)
         before = {p.name:p.read_bytes() for p in self.root.iterdir()}
         identity.prepare(self.root)
         self.assertEqual(before, {p.name:p.read_bytes() for p in self.root.iterdir()})
