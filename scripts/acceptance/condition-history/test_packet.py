@@ -228,8 +228,9 @@ class Packet(unittest.TestCase):
                 events.insert(2 if label == 'before-reopen' else -1, fired)
                 if label == 'duplicate-fire':
                     events.insert(-1, copy.deepcopy(fired))
+            report = self.snapshots(events)
             with self.subTest(label=label), self.assertRaises(ValueError):
-                packet.comparator.check(self.snapshots(events))
+                packet.comparator.check(report)
 
 
 if __name__ == "__main__":unittest.main()

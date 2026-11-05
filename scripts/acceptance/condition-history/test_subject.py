@@ -207,14 +207,15 @@ class SubjectControls(unittest.TestCase):
 
     def test_record_links_and_wrong_modes_refuse(self):
         record = self.record();self.validate(record)
+        record_sha = subject.digest(subject.canonical(record))
         path = self.root / 'run.json'
         path.chmod(0o644)
         with self.assertRaises(SystemExit):
-            recovery.validate_record(self.root, subject.digest(subject.canonical(record)), 'a' * 40,
+            recovery.validate_record(self.root, record_sha, 'a' * 40,
                 self.sealed.sha256, record['recovery_sha256'], record['token'])
         path.chmod(0o600);os.link(path, self.root / 'record-alias')
         with self.assertRaises(SystemExit):
-            recovery.validate_record(self.root, subject.digest(subject.canonical(record)), 'a' * 40,
+            recovery.validate_record(self.root, record_sha, 'a' * 40,
                 self.sealed.sha256, record['recovery_sha256'], record['token'])
 
     def test_foreign_owner_or_renamed_object_is_never_removed(self):

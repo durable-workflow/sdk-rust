@@ -168,7 +168,8 @@ class Resources(unittest.TestCase):
         with mock.patch.object(controller, 'call', return_value=types.SimpleNamespace(stdout=json.dumps([raw]))), self.assertRaises(SystemExit):
             controller.image(IMAGE)
         role = self.role();self.controller.images['image-id'] = dict(self.image, sha256='foreign')
-        with self.assertRaises(SystemExit):self.controller.validate(role, self.frame(role))
+        frame = self.frame(role)
+        with self.assertRaises(SystemExit):self.controller.validate(role, frame)
 
     def test_any_owner_or_exact_name_collision_precedes_mutation(self):
         for collide in ('container', 'network', 'volume', 'foreign-name', 'uncertain'):
