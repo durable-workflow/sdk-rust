@@ -20,6 +20,7 @@ execution proposal rather than this repository.
 | --- | --- |
 | `limactl` | Lima 2.2.1, 35,175,712 bytes, SHA-256 `216450fc8e3eeb7f50e3030de216c32efeef505b111ed3fb24912a36feebea49` |
 | Linux amd64 guest agent gzip | 8,257,812 bytes, SHA-256 `4aa75eacc151cbf2b7aec1b9ebe3886a0fc3268977c108308c802ce267c76959` |
+| Uncompressed guest agent | SHA-256 `d799765623d5fa3b52ac30dd437b8f867968aeac594933c8ddc3bf1ac78cb26a` |
 | Cached guest image | [colima-core v0.10.4 Ubuntu 24.04 Docker amd64 raw gzip](https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-amd64-docker.raw.gz), 358,298,593 bytes, SHA-256 `4cd967d2c58aa6971621343d372255b14ffbfe28a185cda0e3c34ac8a1eb15e6` |
 | Native tools | macOS 15.8.2 build 24H232 `hdiutil`, `diskutil`, `sysctl`, public `libproc` process information |
 | Host guardian | Captured `guest-host.py` Git blob at admitted R, SHA-256 in the R manifest and private authority |
@@ -89,7 +90,9 @@ used for native controls.
    device/inode, the whole `/dev/diskN`, APFS volume
    UUID and the 32-GiB whole-device readback. Refuse an existing image, attachment,
    mount, Lima home or instance. Copy the already verified public gzip into the
-   store without networking, check its hash again, and write the
+   store without networking, reopen/hash the destination through a no-follow
+   single-link owner file descriptor, and bind its device/inode/size/SHA. Recheck
+   destination identity and bytes at consumption. Write the
    rendered JSON-as-YAML profile exclusively. No private host source or credential
    tree is copied. The installed public guest agent remains a pinned read-only
    input. Local image input and disabled containerd downloads avoid Lima's global
@@ -99,16 +102,24 @@ used for native controls.
    `durable-workflow.condition-host/v1`. Its exact fields are `AUTHORITY_KEYS` in
    `guest-host.py`: R/M, guardian digest, token, host boot UUID, S/cutoffs, private
    scope and launcher/agent paths, image device/inode, whole device, volume UUID
-   and rendered-profile digest. Its SHA-256 is captured outside the store.
+   rendered profile/digest, copied image identity and uncompressed guest-agent
+   digest. Its SHA-256 is captured outside the store.
 4. The same process verifies its new record and becomes the active guardian
    without a process or custody gap. Standalone `guard` mode can only consume an
    already admitted complete authority record. The guardian verifies
    launcher/agent digests, host boot, authority, image inode/geometry, attachment
    and profile. Its exclusive `host-ready.json` binds authority/source and the
    guardian's kernel process epoch. Only after independent readiness verification
-   may the external owner run the exact scoped Lima `create` and `start` vectors.
-   The VM must not start before this readiness verification. The prepared mode
-   itself cannot create or start a VM.
+   may the external owner write an exclusive private `launch.json` with exactly
+   `record_sha256`, `manifest_sha256` and `action: "create-and-start"`. This request
+   is part of the separately admitted invocation. The resident guardian owns
+   both create and start. It revalidates the copied image and selected agent,
+   then passes the captured profile bytes on stdin to `limactl create --name NAME
+   -`; no mutable YAML pathname supplies executable settings. It records and
+   checks `limactl list --json --all-fields NAME` before start, including image,
+   resource, network, mount, SSH, forwarding, environment and provision settings.
+   Immediately before its own start call it repeats the input/config checks.
+   Setup/template file edits cannot replace the captured create input.
 5. Lima receives a fresh `LIMA_HOME`, a minimal environment, and no SSH agent,
    Docker context, proxy or cloud environment. Its host HOME remains the actual
    account home, with host SSH-key loading disabled. The complete profile has no
@@ -124,8 +135,24 @@ used for native controls.
    `limactl stop --force`. The guardian never sends a numeric host kill signal to
    a recovered PID. Missing, changed or foreign authority is a failed result
    requiring the external owner, not permission to stop another instance.
-7. Obtain the guest's Linux boot ID independently over the generated SSH control
-   path. Transfer a clean public R checkout with the immutable H tag and invoke
+   The supported Lima 2.2.1 selection is causal: the canonical launcher resolves
+   `<PREFIX>/share/lima/lima-guestagent.Linux-x86_64.gz` through
+   `usrlocal.GuestAgentBinary`, and `instance.Start` passes it as `--guestagent`
+   to hostagent. The source refuses another correctly hashed path, and the
+   independent hostagent command readback must name this exact selected path.
+   Primary source: [agent selection](https://github.com/lima-vm/lima/blob/v2.2.1/pkg/usrlocal/usrlocal.go)
+   and [start argument construction](https://github.com/lima-vm/lima/blob/v2.2.1/pkg/instance/start.go).
+7. After start, the guardian repeats effective configuration readback and runs
+   a captured read-only probe over Lima's generated SSH control connection. In
+   the disposable guest only, passwordless sudo lets the probe hash the unique
+   running guest agent's `/proc/PID/exe`, with consistent Linux boot/start ticks.
+   That kernel executable hash must match the pinned uncompressed agent above.
+   A path declaration alone cannot authorize the receipt. Exclusive
+   `vm-started.json` binds the actual guest boot, agent hash, hostagent epoch and
+   effective configuration; no SDK consumer is released before this receipt.
+   These probes are source under review and have not run in a guest.
+   Independently obtain B over the generated control path and match that receipt.
+   Transfer a clean public R checkout with the immutable H tag and invoke
    the README's captured entry with that B and the same S/cutoffs. No host source
    mount or credential is used. The guest requires an empty daemon/build cache
    and ext4 root/work/Docker data on its fixed block device before pulling.
@@ -165,11 +192,17 @@ recovery case, not an unattended-success claim.
 
 ## Remaining review gates
 
-This packet intentionally cannot create/start a guest by itself. Setup watchdog
-and teardown source are included in the same sealed guardian. Read-only native
+The packet requires both separate execution admission and the exact private
+launch request before it can create/start a guest. Setup watchdog, input
+consumption and teardown source are included in the same sealed guardian. Read-only native
 inspection confirmed the supported `diskutil` property names and Darwin epoch
-structure; fake native controls bind physical/synthesized devices, APFS geometry
-and mount/UUID authority. No new attachment or guest readback is claimed.
+structure. Native CLI help also confirms stdin create and effective Config
+readback support; a read-only public-agent probe confirms executable-relative
+selection and its uncompressed digest. Fake native controls bind
+physical/synthesized devices, APFS geometry and mount/UUID authority. Actual held
+source countercontrols expose destination corruption, post-ready YAML
+edit/restore and an unrelated hashed agent path; candidate controls refuse them.
+No new attachment, VM or guest-kernel readback is claimed.
 Before execution, supply the exact private intent/command/handoff and fresh
 sufficient capacity. The guest dependency assertions and all effective native
 readbacks must pass on the sole admitted attempt; a missing tool or unexpected

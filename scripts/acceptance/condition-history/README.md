@@ -182,7 +182,11 @@ guesses which layers to delete from a shared daemon. The concrete
 [guest/guardian source proposal](guest-proposal.md) selects cached native Lima/VZ
 inputs and a fixed enclosing host disk. The captured external guardian also owns
 bounded setup before allocation. Exact source review, private handoff and fresh
-capacity remain prerequisites; no VM execution is admitted.
+capacity remain prerequisites; no VM execution is admitted. After an exact
+private request, that guardian owns create from captured stdin, rechecks copied
+image identity, records effective configuration, starts the guest and verifies
+the running guest-agent executable before any consumer. These are source
+assertions under review, not observed guest results.
 
 The comparator scans every opened wait, condition outcome and timer row, binding
 the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.

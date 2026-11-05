@@ -1,11 +1,12 @@
 """Source proposal for an external, task-scoped Lima/VZ storage guardian.
 
-The plan is inert. Prepare allocates native storage only after separate admission;
-guard/audit consume captured private authority. No mode creates or starts a VM.
+The plan is inert. Prepare/guard may allocate storage and consume an exact
+private guest-launch request only after separate admission; audit is read-only.
 """
 import argparse
 import ctypes
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import time
 
 LIMA_SHA = '216450fc8e3eeb7f50e3030de216c32efeef505b111ed3fb24912a36feebea49'
 AGENT_SHA = '4aa75eacc151cbf2b7aec1b9ebe3886a0fc3268977c108308c802ce267c76959'
+AGENT_BINARY_SHA = 'd799765623d5fa3b52ac30dd437b8f867968aeac594933c8ddc3bf1ac78cb26a'
 IMAGE_SHA = '4cd967d2c58aa6971621343d372255b14ffbfe28a185cda0e3c34ac8a1eb15e6'
 IMAGE_BYTES = 358_298_593
 STORE_BYTES = 32 * 1024**3
@@ -30,8 +32,9 @@ PROFILE_SHA = 'fd12240c0a04fbe0614901038586a9cc411f154e11a56d6d1fcd3f4f045f0516'
 AUTHORITY_KEYS = {'schema', 'token', 'runner_commit', 'manifest_sha256', 'guardian_sha256',
                   'started_unix', 'active_unix', 'cleanup_unix', 'parent', 'limactl',
                   'guest_agent', 'host_boot_id', 'image_dev', 'image_ino', 'whole_device',
-                  'volume_uuid', 'profile_sha256'}
-INTENT_KEYS = (AUTHORITY_KEYS - {'image_dev', 'image_ino', 'whole_device', 'volume_uuid', 'profile_sha256'}) | {'cached_image'}
+                  'volume_uuid', 'profile_sha256', 'profile', 'guest_image', 'guest_agent_binary_sha256'}
+INTENT_KEYS = (AUTHORITY_KEYS - {'image_dev', 'image_ino', 'whole_device', 'volume_uuid',
+    'profile_sha256', 'profile', 'guest_image', 'guest_agent_binary_sha256'}) | {'cached_image'}
 
 
 def require(ok, label):
@@ -122,22 +125,27 @@ def plan(parent, token, limactl, image_path, profile):
                 '-volname', 'sr-' + token, str(scoped['image'])],
             'attach_store': ['/usr/bin/hdiutil', 'attach', '-nobrowse', '-owners', 'on',
                 '-mountpoint', str(scoped['mount']), '-plist', str(scoped['image'])],
-            'create_vm': [limactl, '--tty=false', 'create', '--name', scoped['name'], str(scoped['mount'] / 'guest.yaml')],
+            'create_vm': [limactl, '--tty=false', 'create', '--name', scoped['name'], '-'],
             'start_vm': [limactl, '--tty=false', 'start', '--timeout', '5m', scoped['name']],
             'stop_vm': [limactl, '--tty=false', 'stop', '--force', scoped['name']],
             'delete_vm': [limactl, '--tty=false', 'delete', '--force', scoped['name']],
             'environment': environment({'parent': parent, 'token': token})}
 
 
-def call(record, argv):
+def call(record, argv, input_data=None):
     remaining = min(record['_cleanup_mono'], record.get('_stage_mono', float('inf'))) - time.monotonic()
     require(remaining > 0, 'external cleanup deadline exhausted')
     # Read with a hard in-memory ceiling; native commands cannot fill host logs.
-    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    require(input_data is None or len(input_data) <= 8192, 'oversize native input')
+    child = subprocess.Popen(argv, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              env=environment(record), close_fds=True)
     data = bytearray()
     cutoff = time.monotonic() + min(record.get('_command_seconds', 20), remaining)
     try:
+        if input_data is not None:
+            child.stdin.write(input_data)
+            child.stdin.close()
         with selectors.DefaultSelector() as selector:
             selector.register(child.stdout, selectors.EVENT_READ)
             while selector.get_map():
@@ -215,6 +223,13 @@ def authority(path, expected_sha, source_sha):
     require(digest(binary.read_bytes()) == LIMA_SHA, 'reviewed VM launcher changed')
     agent = pathlib.Path(value['guest_agent']).resolve(strict=True)
     require(digest(agent.read_bytes()) == AGENT_SHA, 'reviewed guest agent changed')
+    selected_agent(value)
+    template = json.loads(json.dumps(value['profile']))
+    template['images'][0]['location'] = '__TASK_IMAGE__'
+    expected_profile = plan(value['parent'], value['token'], value['limactl'],
+                            str(scoped['mount'] / 'a/guest.raw.gz'), template)['profile']
+    require(value['profile'] == expected_profile and digest(canonical(value['profile'])) == value['profile_sha256']
+            and value['guest_agent_binary_sha256'] == AGENT_BINARY_SHA, 'captured profile or agent authority mismatch')
     require(re.fullmatch('/dev/disk[0-9]+', value['whole_device'])
             and re.fullmatch('[0-9A-Fa-f-]{36}', value['volume_uuid'])
             and re.fullmatch('[0-9a-f]{64}', value['profile_sha256']), 'invalid native store authority')
@@ -282,6 +297,65 @@ def input_bytes(path, expected_size, expected_sha, destination=None, deadline=No
     finally:
         if not stream.closed:stream.close()
         if target:target.close()
+
+
+def bound_input(path, expected_size, expected_sha, deadline=None):
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid == os.getuid(),
+            'unsafe consumed guest input')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    state, count = hashlib.sha256(), 0
+    with os.fdopen(fd, 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'consumed guest input replaced on open')
+        while True:
+            if deadline is not None:require(time.monotonic() < deadline, 'consumed input cutoff')
+            block = stream.read(1024**2)
+            if not block:break
+            count += len(block)
+            require(count <= expected_size, 'consumed guest input grew')
+            state.update(block)
+        after = os.fstat(stream.fileno())
+        current = path.lstat()
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+        require(identity(before) == identity(opened) == identity(after) == identity(current), 'consumed guest input changed')
+        require(count == expected_size and state.hexdigest() == expected_sha, 'consumed guest input digest mismatch')
+    return {'device': opened.st_dev, 'inode': opened.st_ino, 'bytes': expected_size, 'sha256': expected_sha}
+
+
+def selected_agent(record):
+    # Lima 2.2.1 usrlocal.ShareLima/GuestAgentBinary uses this executable-relative
+    # compressed path first; instance.Start passes it as --guestagent to hostagent.
+    launcher = pathlib.Path(record['limactl']).resolve()
+    expected = launcher.parent.parent / 'share/lima/lima-guestagent.Linux-x86_64.gz'
+    require(pathlib.Path(record['limactl']) == launcher and pathlib.Path(record['guest_agent']) == expected
+            and expected.resolve() == expected, 'pinned agent is not the executable-selected Lima agent')
+    return expected
+
+
+def agent_binary_sha(path, deadline=None):
+    state, count = hashlib.sha256(), 0
+    with gzip.open(path, 'rb') as stream:
+        while True:
+            if deadline is not None:require(time.monotonic() < deadline, 'guest agent input cutoff')
+            data = stream.read(1024**2)
+            if not data:break
+            count += len(data)
+            require(count <= 64 * 1024**2, 'oversize uncompressed guest agent')
+            state.update(data)
+    require(count > 0, 'empty guest agent')
+    require(state.hexdigest() == AGENT_BINARY_SHA, 'uncompressed pinned guest agent changed')
+    input_bytes(path, 8_257_812, AGENT_SHA, deadline=deadline)
+    return state.hexdigest()
+
+
+def verify_guest_inputs(record):
+    scoped = paths(record['parent'], record['token'])
+    identity = bound_input(scoped['mount'] / 'a/guest.raw.gz', IMAGE_BYTES, IMAGE_SHA, record['_active_mono'])
+    require(identity == record['guest_image'], 'consumed image identity differs from copied destination')
+    selected_agent(record)
+    input_bytes(record['guest_agent'], 8_257_812, AGENT_SHA, deadline=record['_active_mono'])
+    require(agent_binary_sha(record['guest_agent'], record['_active_mono']) == record['guest_agent_binary_sha256'], 'consumed guest agent changed')
 
 
 def setup_intent(path, expected_sha, source_sha):
@@ -365,6 +439,7 @@ def prepare(record, template):
     proposal = plan(record['parent'], record['token'], record['limactl'],
                     str(scoped['mount'] / 'a/guest.raw.gz'), template)
     observed = capacity(record)
+    selected_agent(record)
     for key, size, sha in (('limactl', 35_175_712, LIMA_SHA), ('guest_agent', 8_257_812, AGENT_SHA),
                            ('cached_image', IMAGE_BYTES, IMAGE_SHA)):
         input_bytes(record[key], size, sha, deadline=record['_stage_mono'])
@@ -389,6 +464,9 @@ def prepare(record, template):
         for directory in ('a', 'l', 'tmp'):(scoped['mount'] / directory).mkdir(mode=0o700)
         record.pop('_setup_tmp')
         input_bytes(record['cached_image'], IMAGE_BYTES, IMAGE_SHA, scoped['mount'] / 'a/guest.raw.gz', record['_stage_mono'])
+        record['guest_image'] = bound_input(scoped['mount'] / 'a/guest.raw.gz', IMAGE_BYTES, IMAGE_SHA, record['_stage_mono'])
+        record['guest_agent_binary_sha256'] = agent_binary_sha(record['guest_agent'], record['_stage_mono'])
+        record['profile'] = proposal['profile']
         record['profile_sha256'] = exclusive(scoped['mount'] / 'guest.yaml', proposal['profile'])
         require(record['profile_sha256'] == proposal['profile_sha256'], 'rendered setup template changed')
         value = {key: record[key] for key in AUTHORITY_KEYS if key != 'schema'}
@@ -439,6 +517,7 @@ def capture_agent(record):
     pairs = list(zip(argv, argv[1:]))
     require(argv and pathlib.Path(argv[0]).resolve() == pathlib.Path(record['limactl']).resolve()
             and 'hostagent' in argv and (binding in argv or ('--pidfile', str(pid_path)) in pairs)
+            and ('--guestagent', str(selected_agent(record))) in pairs
             and scoped['name'] in argv and process_identity(process['pid']) == process, 'foreign VM host agent')
     return process
 
@@ -465,6 +544,97 @@ def finish_requested(record, record_sha):
     _, export_sha = export_handoff(record, record_sha)
     require(value == {'record_sha256': record_sha, 'exports_sha256': export_sha}, 'wrong cleanup request authority')
     return True
+
+
+def effective_config(record, status):
+    scoped = paths(record['parent'], record['token'])
+    value = json.loads(call(record, [record['limactl'], 'list', '--json', '--all-fields', scoped['name']]))
+    require(value['name'] == scoped['name'] and value['dir'] == str(scoped['instance'])
+            and value['status'] == status and not value.get('errors')
+            and value['vmType'] == 'vz' and value['arch'] == 'x86_64' and value['cpus'] == 4
+            and value['memory'] == MEMORY_BYTES and value['disk'] == GUEST_BYTES,
+            'effective VM identity or resources changed')
+    def contains(actual, expected):
+        if expected == [] or expected == {}:
+            return actual is None or actual == expected
+        if isinstance(expected, dict):
+            return isinstance(actual, dict) and all(k in actual and contains(actual[k], v) for k, v in expected.items())
+        if isinstance(expected, list):
+            return isinstance(actual, list) and len(actual) == len(expected) and all(contains(a, e) for a, e in zip(actual, expected))
+        return type(actual) is type(expected) and actual == expected
+    # base/minimum version are template loader directives; every effective
+    # supplied field is checked, including mounts, images, ssh and provisioning.
+    expected = {k: v for k, v in record['profile'].items() if k not in ('base', 'minimumLimaVersion')}
+    config = dict(value['config'])
+    config.setdefault('env', {})
+    require(contains(config, expected), 'effective VM profile differs from captured configuration')
+    return value
+
+
+GUEST_AGENT_PROBE = '''import hashlib,json,pathlib
+root=pathlib.Path('/proc');boot=(root/'sys/kernel/random/boot_id').read_text().strip();found=[]
+for entry in root.iterdir():
+    if not entry.name.isdigit():continue
+    try:comm=(entry/'comm').read_text().strip()
+    except FileNotFoundError:continue
+    if comm!='lima-guestagent':continue
+    try:
+        first=(entry/'stat').read_text();state=hashlib.sha256();count=0
+        with (entry/'exe').open('rb') as stream:
+            while True:
+                data=stream.read(1048576)
+                if not data:break
+                count+=len(data)
+                if count>67108864:raise SystemExit('oversize running guest agent')
+                state.update(data)
+        second=(entry/'stat').read_text()
+        start=lambda value:int(value[value.rfind(') ')+2:].split()[19])
+        if start(first)!=start(second):raise SystemExit('guest agent epoch changed')
+        found.append({'pid':int(entry.name),'start_ticks':start(second),'guest_boot_id':boot,'sha256':state.hexdigest()})
+    except FileNotFoundError:raise SystemExit('guest process changed during probe')
+if len(found)!=1 or (root/'sys/kernel/random/boot_id').read_text().strip()!=boot:raise SystemExit('ambiguous guest agent authority')
+print(json.dumps(found[0],sort_keys=True))
+'''
+
+
+def launch_guest(record, record_sha):
+    scoped = paths(record['parent'], record['token'])
+    request = json.loads(regular(scoped['parent'] / 'launch.json', 64 * 1024))
+    require(request == {'record_sha256': record_sha, 'manifest_sha256': record['manifest_sha256'], 'action': 'create-and-start'},
+            'wrong exact guest launch request')
+    require(not scoped['instance'].exists(), 'guest instance already exists')
+    verify_store(record)
+    verify_guest_inputs(record)
+    # The bytes consumed by create come from captured authority, never the
+    # mutable guest.yaml pathname. No external process owns create/start.
+    profile = canonical(record['profile'])
+    require(digest(profile) == record['profile_sha256'], 'captured consumption profile changed')
+    record['_stage_mono'] = record['_active_mono']
+    record['_command_seconds'] = 180
+    try:
+        call(record, [record['limactl'], '--tty=false', 'create', '--name', scoped['name'], '-'], profile)
+        before = effective_config(record, 'Stopped')
+        exclusive(scoped['parent'] / 'vm-created.json', {'record_sha256': record_sha,
+            'profile_sha256': digest(profile), 'guest_image': record['guest_image'], 'effective': before})
+        verify_guest_inputs(record)
+        require(effective_config(record, 'Stopped') == before, 'VM config changed before guardian start')
+        record['_command_seconds'] = 300
+        call(record, [record['limactl'], '--tty=false', 'start', '--timeout', '5m', scoped['name']])
+        after = effective_config(record, 'Running')
+        process = capture_agent(record)
+        require(process, 'missing consumed VM hostagent authority')
+        proof = json.loads(call(record, [record['limactl'], 'shell', scoped['name'], '--',
+            'sudo', '-n', 'python3', '-I', '-S', '-c', GUEST_AGENT_PROBE]))
+        require(set(proof) == {'pid', 'start_ticks', 'guest_boot_id', 'sha256'}
+                and type(proof['pid']) is int and proof['pid'] > 1
+                and type(proof['start_ticks']) is int and proof['start_ticks'] > 0
+                and proof['sha256'] == record['guest_agent_binary_sha256']
+                and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', proof['guest_boot_id']),
+                'running guest agent does not match selected pinned agent')
+        exclusive(scoped['parent'] / 'vm-started.json', {'record_sha256': record_sha,
+            'effective': after, 'host_process': process, 'agent': proof})
+    finally:
+        for key in ('_stage_mono', '_command_seconds'):record.pop(key, None)
 
 
 def cleanup(record):
@@ -508,11 +678,15 @@ def audit(record, record_sha, source_sha):
     require(finish_requested(record, record_sha), 'completed guest export request required')
     guest = json.loads(regular(scoped['parent'] / 'guest-summary.json'))
     guest_audit = json.loads(regular(scoped['parent'] / 'guest-audit.json'))
+    started = json.loads(regular(scoped['parent'] / 'vm-started.json'))
     require(guest['runner_commit'] == record['runner_commit'] and guest['manifest_sha256'] == record['manifest_sha256']
             and guest['checks_outcome'] == 'pass' and guest_audit['outcome'] == 'pending_external_guest_teardown'
             and guest['storage']['guest_boot_id'] == exports['guest_boot_id']
             and guest_audit['storage'] == guest['storage']
             and guest_audit['manifest_sha256'] == record['manifest_sha256']
+            and started['record_sha256'] == record_sha
+            and started['agent']['guest_boot_id'] == exports['guest_boot_id']
+            and started['agent']['sha256'] == record['guest_agent_binary_sha256']
             and guest_audit['summary_sha256'] == exports['guest-summary.json'], 'guest evidence does not authorize acceptance')
     result.update(outcome='pass', exports_sha256=export_sha)
     exclusive(scoped['parent'] / 'host-audit.json', result)
@@ -550,8 +724,12 @@ def main(argv=None):
         exclusive(scoped['parent'] / 'host-ready.json', {'record_sha256': args.record_sha256,
             'source_sha256': source_sha, 'process': process_identity(os.getpid())})
         control_error = None
+        launched = False
         try:
             while time.monotonic() < record['_active_mono']:
+                if not launched and os.path.lexists(scoped['parent'] / 'launch.json'):
+                    launch_guest(record, args.record_sha256)
+                    launched = True
                 process = capture_agent(record)
                 receipt = scoped['parent'] / 'vm-process.json'
                 if process and not receipt.exists():
