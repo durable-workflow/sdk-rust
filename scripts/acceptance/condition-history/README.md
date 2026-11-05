@@ -93,7 +93,11 @@ and cleanup. Active work ends 60 seconds before the final ceiling. The Cell's
 roles share one maximum 600-second deadline plus a 10-second TERM/KILL grace.
 `run.json` is an exclusive owner-only regular single-link record binding R, H,
 manifest and recovery digests, token, local daemon, root, UID/GID, isolated owner
-PID/group/session epoch and all three deadlines. Its digest is captured outside
+PID/group/session, Linux boot ID and kernel start ticks, and all three deadlines.
+Execution requires Linux proc authority. Identity observations must agree across
+two kernel-stat reads and boot reads; recovery revalidates that tuple immediately
+before each TERM or KILL. A missing or changed authority refuses the signal.
+Its digest is captured outside
 the work root in the private launch handoff.
 
 Before any pull, the owner starts a detached recovery process from captured
@@ -152,6 +156,17 @@ captured audit bind that summary digest, verify the original record/snapshot and
 recovery-process receipt, and confirm every matching container, network, volume,
 owner and recovery process group absent. It writes its own exclusive handoff.
 Sanitize and retain both immutable results before any acceptance or closure.
+
+The task network has an explicit local bridge/IPv4-only IPAM profile and exact
+masquerade, inter-container and loopback-binding options. Driver, scope, ingress,
+attachable/configuration flags, labels, IPAM and endpoints are read back before
+releasing each role. This does not claim isolation from the daemon host itself.
+
+The current shared-daemon execution proposal is held by Security's storage
+finding on #210. A subsequent reviewed proposal must select a disposable
+task-owned daemon/work store with a hard byte ceiling and externally owned
+teardown. Capacity samples do not establish that ceiling. Neither the process
+nor network source correction admits a pull, build or runtime from this packet.
 
 The comparator scans every opened wait, condition outcome and timer row, binding
 the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.

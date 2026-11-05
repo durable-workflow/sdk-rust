@@ -68,10 +68,43 @@ def exclusive(path, data):
 
 
 def process_identity(pid):
-    result = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart='], capture_output=True, text=True, timeout=5)
-    if result.returncode or not result.stdout.strip():
+    require(sys.platform == 'linux' and type(pid) is int and pid > 1, 'Linux proc process authority required')
+    boot = boot_identity()
+    try:
+        first = process_stat(pid)
+        second = process_stat(pid)
+    except FileNotFoundError:
         return None
-    return {'pid': pid, 'pgid': os.getpgid(pid), 'sid': os.getsid(pid), 'started': ' '.join(result.stdout.split())}
+    require(first == second and boot == boot_identity(), 'process epoch changed during observation')
+    return dict(first, boot_id=boot)
+
+
+def boot_identity():
+    value = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    require(re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value), 'invalid Linux boot authority')
+    return value
+
+
+def process_stat(pid):
+    fd = os.open('/proc/%d/stat' % pid, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        raw = stream.read(4097)
+    require(len(raw) <= 4096 and raw.startswith(('%d (' % pid).encode()), 'invalid proc process authority')
+    # comm may contain spaces or parentheses. Fields after its final ')' start
+    # at state (field 3); starttime is field 22 in the kernel's proc ABI.
+    head, separator, tail = raw.rpartition(b') ')
+    fields = tail.split()
+    require(separator and head and len(fields) >= 20, 'incomplete proc process authority')
+    return {'pid': pid, 'pgid': int(fields[2]), 'sid': int(fields[3]), 'start_ticks': int(fields[19])}
+
+
+def validate_process(process, label):
+    require(set(process) == {'pid', 'pgid', 'sid', 'boot_id', 'start_ticks'}
+            and all(type(process[k]) is int for k in ('pid', 'pgid', 'sid', 'start_ticks'))
+            and process['pid'] > 1 and process['pid'] == process['pgid'] == process['sid']
+            and process['start_ticks'] > 0
+            and isinstance(process['boot_id'], str)
+            and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', process['boot_id']), label)
 
 
 def group_members(pgid):
@@ -85,7 +118,7 @@ def make_record(args, manifest_sha, recovery_sha):
     require(owner and owner['pid'] == owner['pgid'] == owner['sid'], 'isolated owner session required')
     root = pathlib.Path(args.work_dir)
     require(root.is_absolute() and root.resolve() == root, 'canonical work root required')
-    return {'schema': 'durable-workflow.condition-run/v2', 'owner': PREFIX, 'token': args.run_token,
+    return {'schema': 'durable-workflow.condition-run/v3', 'owner': PREFIX, 'token': args.run_token,
             'cells': [CELL], 'runner_commit': args.runner_commit, 'package_commit': H,
             'manifest_sha256': manifest_sha, 'recovery_sha256': recovery_sha,
             'started_unix': args.started_unix, 'active_unix': args.active_unix,
@@ -103,7 +136,7 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
     raw = read(root / 'run.json')
     require(digest(raw) == expected_record_sha, 'run record digest mismatch')
     record = json.loads(raw)
-    require(set(record) == RECORD_KEYS and record['schema'] == 'durable-workflow.condition-run/v2', 'wrong run record schema')
+    require(set(record) == RECORD_KEYS and record['schema'] == 'durable-workflow.condition-run/v3', 'wrong run record schema')
     require(record['owner'] == PREFIX and record['token'] == token and re.fullmatch('[0-9a-f]{16}', token)
             and record['cells'] == [CELL], 'wrong recovery ownership')
     require(record['runner_commit'] == runner and re.fullmatch('[0-9a-f]{40}', runner)
@@ -115,9 +148,7 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
             and record['cleanup_unix'] == record['started_unix'] + 1800
             and record['active_unix'] == record['cleanup_unix'] - 60, 'wrong recovery deadlines')
     process = record['owner_process']
-    require(set(process) == {'pid', 'pgid', 'sid', 'started'} and type(process['pid']) is int
-            and process['pid'] > 1 and process['pid'] == process['pgid'] == process['sid']
-            and isinstance(process['started'], str) and process['started'], 'wrong captured owner process')
+    validate_process(process, 'wrong captured owner process')
     snapshot = root / 'snapshot'
     require(not snapshot.is_symlink() and stat.S_ISDIR(snapshot.lstat().st_mode), 'unsafe recovery snapshot')
     raw_manifest = read(snapshot / 'manifest.json', mode=0o400)
@@ -236,13 +267,18 @@ def stop_owner(record):
     current = process_identity(expected['pid'])
     if current is not None:
         require(current == expected, 'owner PID epoch changed; refusing foreign process')
-        os.killpg(expected['pgid'], signal.SIGTERM)
+        signal_owner(expected, signal.SIGTERM)
         until = time.monotonic() + 5
         while group_members(expected['pgid']) and time.monotonic() < until:
             time.sleep(0.1)
         if group_members(expected['pgid']):
-            os.killpg(expected['pgid'], signal.SIGKILL)
+            signal_owner(expected, signal.SIGKILL)
     require(not group_members(expected['pgid']), 'owner group survived or cannot be attributed')
+
+
+def signal_owner(expected, signum):
+    require(process_identity(expected['pid']) == expected, 'owner process epoch changed before signal')
+    os.killpg(expected['pgid'], signum)
 
 
 def main(argv=None):
@@ -326,9 +362,7 @@ def main(argv=None):
         require(set(watcher) == {'source_sha256', 'process'} and watcher['source_sha256'] == source_sha,
                 'wrong captured recovery-process receipt')
         process = watcher['process']
-        require(set(process) == {'pid', 'pgid', 'sid', 'started'} and type(process['pid']) is int
-                and process['pid'] > 1 and process['pid'] == process['pgid'] == process['sid']
-                and isinstance(process['started'], str) and process['started'], 'wrong recovery-process identity')
+        validate_process(process, 'wrong recovery-process identity')
         require(not group_members(watcher['process']['pgid']), 'independent recovery process survivor')
         require(summary.get('checks_outcome') == 'pass'
                 and summary.get('outcome') == 'pending_independent_audit'

@@ -25,7 +25,7 @@ class Audit(unittest.TestCase):
         self.record_sha = subject.digest(subject.canonical(self.authority))
         self.program = self.sealed.captured[subject.PREFIX + 'recover.py'].decode()
         self.watcher = {'source_sha256': self.authority['recovery_sha256'],
-                        'process': {'pid': 23456, 'pgid': 23456, 'sid': 23456, 'started': 'synthetic watcher'}}
+                        'process': {'pid': 23456, 'pgid': 23456, 'sid': 23456, 'boot_id': '11111111-1111-1111-1111-111111111111', 'start_ticks': 234567}}
         watcher_sha = subject.exclusive(self.root / 'recovery-process.json', subject.canonical(self.watcher))
         self.summary = {'checks_outcome': 'pass', 'outcome': 'pending_independent_audit',
             'record_sha256': self.record_sha, 'runner_commit': self.authority['runner_commit'],

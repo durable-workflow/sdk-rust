@@ -181,10 +181,7 @@ class ConditionCell(native.Cell):
             self.cell_path('state').mkdir(parents=True)
             self.dir.chmod(0o777)
             self.state.chmod(0o777)
-            network = ['docker', 'network', 'create', '--internal']
-            for key, value in self.controller.labels('network').items():
-                network += ['--label', key + '=' + value]
-            command(args, network + [self.task])
+            command(args, self.controller.network_arguments())
             # No service roles exist during loopback replay; then exactly four
             # service roles plus one combined driver/Worker. No proxy/repair.
             replay = self.start('consumer', RUST, ['/fixture/condition-history', '--exact',

@@ -172,14 +172,14 @@ class SubjectControls(unittest.TestCase):
 
     def record(self):
         now = int(time.time())
-        return {'schema': 'durable-workflow.condition-run/v2', 'owner': recovery.PREFIX,
+        return {'schema': 'durable-workflow.condition-run/v3', 'owner': recovery.PREFIX,
             'token': '0123456789abcdef', 'cells': [recovery.CELL], 'runner_commit': 'a' * 40,
             'package_commit': subject.H, 'manifest_sha256': self.sealed.sha256,
             'recovery_sha256': self.sealed.value['files'][subject.PREFIX + 'recover.py']['sha256'],
             'started_unix': now, 'active_unix': now + 1740, 'cleanup_unix': now + 1800,
             'work_dir': str(self.root), 'docker_endpoint': 'unix:///synthetic.sock',
             'uid': os.getuid(), 'gid': os.getgid(),
-            'owner_process': {'pid': 12345, 'pgid': 12345, 'sid': 12345, 'started': 'synthetic epoch'}}
+            'owner_process': {'pid': 12345, 'pgid': 12345, 'sid': 12345, 'boot_id': '11111111-1111-1111-1111-111111111111', 'start_ticks': 123456}}
 
     def validate(self, record, expected_sha=None):
         path = self.root / 'run.json'
@@ -234,11 +234,101 @@ class SubjectControls(unittest.TestCase):
             self.assertEqual(cli.call_count, 1)
 
     def test_changed_pid_epoch_never_kills_a_foreign_group(self):
-        record = self.record();changed = dict(record['owner_process'], started='other epoch')
+        record = self.record();changed = dict(record['owner_process'], start_ticks=654321)
         with mock.patch.object(recovery, 'process_identity', return_value=changed), \
                 mock.patch.object(recovery.os, 'killpg') as kill, self.assertRaises(SystemExit):
             recovery.stop_owner(record)
         kill.assert_not_called()
+
+    def test_held_whole_second_identity_accepts_a_recycled_session(self):
+        source = subprocess.check_output(['git', '--no-replace-objects', '-C', str(REPO), 'show',
+            'e309116cb0dd79e415ae6a25b809515354cea026:scripts/acceptance/condition-history/recover.py'])
+        old = types.ModuleType('held_second_resolution_recovery')
+        exec(compile(source, 'held-e309-recovery', 'exec'), old.__dict__)
+        # Both incarnations have identical numeric IDs and ps whole-second text.
+        old.subprocess = types.SimpleNamespace(run=lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout='Thu Nov 5 01:00:00 2026'))
+        old.os = types.SimpleNamespace(getpgid=lambda pid: pid, getsid=lambda pid: pid, killpg=mock.Mock())
+        old.group_members = lambda pgid: []
+        legacy = old.process_identity(12345)
+        old.stop_owner({'owner_process': legacy})
+        old.os.killpg.assert_called_once_with(12345, old.signal.SIGTERM)
+        record = self.record()
+        for delta in ({'start_ticks': record['owner_process']['start_ticks'] + 1},
+                      {'boot_id': '22222222-2222-2222-2222-222222222222'}):
+            recycled = dict(record['owner_process'], **delta)
+            with self.subTest(delta=delta), mock.patch.object(recovery, 'process_identity', return_value=recycled), \
+                    mock.patch.object(recovery.os, 'killpg') as kill, self.assertRaisesRegex(SystemExit, 'epoch changed'):
+                recovery.stop_owner(record)
+            kill.assert_not_called()
+
+    def test_proc_stat_reads_kernel_fields_after_a_parenthesized_comm(self):
+        fields = ['R', '1', '12345', '12345'] + ['0'] * 15 + ['123456']
+        path = self.root / 'proc-stat'
+        path.write_bytes(('12345 (comm with ) spaces (and)) ' + ' '.join(fields)).encode())
+        original_open = os.open
+        with mock.patch.object(recovery.os, 'open', side_effect=lambda path_, flags: original_open(path, flags)):
+            result = recovery.process_stat(12345)
+        self.assertEqual(result, {'pid': 12345, 'pgid': 12345, 'sid': 12345, 'start_ticks': 123456})
+
+    def test_inconsistent_or_unavailable_kernel_authority_refuses(self):
+        first = {'pid': 12345, 'pgid': 12345, 'sid': 12345, 'start_ticks': 123456}
+        boot = self.record()['owner_process']['boot_id']
+        with mock.patch.object(recovery, 'boot_identity', return_value=boot), \
+                mock.patch.object(recovery, 'process_stat', side_effect=[first, dict(first, start_ticks=123457)]), \
+                self.assertRaisesRegex(SystemExit, 'during observation'):
+            recovery.process_identity(12345)
+        with mock.patch.object(recovery, 'boot_identity', side_effect=[boot, '22222222-2222-2222-2222-222222222222']), \
+                mock.patch.object(recovery, 'process_stat', return_value=first), \
+                self.assertRaisesRegex(SystemExit, 'during observation'):
+            recovery.process_identity(12345)
+        for error in (PermissionError('denied'), OSError('proc unavailable')):
+            with self.subTest(error=type(error).__name__), mock.patch.object(recovery, 'boot_identity', return_value=boot), \
+                    mock.patch.object(recovery, 'process_stat', side_effect=error), self.assertRaises(OSError):
+                recovery.process_identity(12345)
+        with mock.patch.object(recovery, 'boot_identity', return_value=boot), \
+                mock.patch.object(recovery, 'process_stat', side_effect=FileNotFoundError()):
+            self.assertIsNone(recovery.process_identity(12345))
+
+    def test_epoch_revalidated_immediately_before_term_and_kill(self):
+        record = self.record();expected = record['owner_process']
+        recycled = dict(expected, start_ticks=expected['start_ticks'] + 1)
+        with mock.patch.object(recovery, 'process_identity', side_effect=[expected, recycled]), \
+                mock.patch.object(recovery.os, 'killpg') as kill, self.assertRaisesRegex(SystemExit, 'before signal'):
+            recovery.stop_owner(record)
+        kill.assert_not_called()
+        with mock.patch.object(recovery, 'process_identity', side_effect=[expected, expected, recycled]), \
+                mock.patch.object(recovery, 'group_members', return_value=[expected['pid']]), \
+                mock.patch.object(recovery.time, 'monotonic', side_effect=[0, 10]), \
+                mock.patch.object(recovery.os, 'killpg') as kill, self.assertRaisesRegex(SystemExit, 'before signal'):
+            recovery.stop_owner(record)
+        kill.assert_called_once_with(expected['pgid'], recovery.signal.SIGTERM)
+
+    def test_exact_epoch_can_receive_both_signals_with_fresh_authority(self):
+        record = self.record();expected = record['owner_process']
+        with mock.patch.object(recovery, 'process_identity', return_value=expected) as observe, \
+                mock.patch.object(recovery, 'group_members', side_effect=[[expected['pid']], [expected['pid']], []]), \
+                mock.patch.object(recovery.time, 'monotonic', side_effect=[0, 10]), \
+                mock.patch.object(recovery.os, 'killpg') as kill:
+            recovery.stop_owner(record)
+        self.assertEqual(observe.call_count, 3)
+        self.assertEqual(kill.call_args_list, [mock.call(expected['pgid'], recovery.signal.SIGTERM),
+                                             mock.call(expected['pgid'], recovery.signal.SIGKILL)])
+
+    def test_legacy_process_record_cannot_authorize_a_signal(self):
+        record = self.record()
+        record['owner_process'] = {'pid': 12345, 'pgid': 12345, 'sid': 12345, 'started': 'whole second'}
+        with self.assertRaisesRegex(SystemExit, 'captured owner process'):
+            self.validate(record)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux proc authority is the execution contract')
+    def test_readonly_current_kernel_identity(self):
+        identity = recovery.process_identity(os.getpid())
+        self.assertEqual(identity['pid'], os.getpid())
+        self.assertEqual(identity['pgid'], os.getpgid(os.getpid()))
+        self.assertEqual(identity['sid'], os.getsid(os.getpid()))
+        self.assertGreater(identity['start_ticks'], 0)
+        self.assertEqual(identity['boot_id'], recovery.boot_identity())
 
 
 if __name__ == '__main__':unittest.main()

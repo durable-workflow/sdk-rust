@@ -54,7 +54,7 @@ class Packet(unittest.TestCase):
     def recovery_start(self, changed=None, process_missing=False, exited=False):
         pathlib.Path(self.args.work_dir).mkdir()
         subject.RECORD_SHA = 'c' * 64
-        process = {'pid': 23456, 'pgid': 23456, 'sid': 23456, 'started': 'synthetic watcher'}
+        process = {'pid': 23456, 'pgid': 23456, 'sid': 23456, 'boot_id': '11111111-1111-1111-1111-111111111111', 'start_ticks': 234567}
         recovery_sha = subject.CURRENT.value['files'][subject.PREFIX + 'recover.py']['sha256']
         ready = {'record_sha256': subject.RECORD_SHA, 'manifest_sha256': subject.CURRENT.sha256,
                  'recovery_sha256': recovery_sha, 'process': process}

@@ -55,9 +55,15 @@ class Resources(unittest.TestCase):
             'Mounts': [{'Type': 'bind', 'Source': s, 'Destination': d, 'RW': rw} for s, d, rw in role['binds']] + [{'Type':'tmpfs', 'Destination':d} for d in role['tmpfs']],
             'NetworkSettings': {'Networks': {role['network']: {'Aliases': [role['alias']] if role['alias'] else []}}}}
 
+    def network_frame(self):
+        return {'Id': 'e' * 64, 'Name': self.controller.task, 'Driver': 'bridge', 'Scope': 'local',
+            'Internal': True, 'Attachable': False, 'Ingress': False, 'EnableIPv4': True, 'EnableIPv6': False,
+            'ConfigOnly': False, 'ConfigFrom': {'Network': ''}, 'Labels': self.controller.labels('network'),
+            'IPAM': copy.deepcopy(resources.NETWORK_IPAM), 'Options': dict(resources.NETWORK_OPTIONS),
+            'Containers': {'d' * 64: {}}}
+
     def network(self):
-        return types.SimpleNamespace(stdout=json.dumps([{'Internal': True,
-            'Labels': self.controller.labels('network')}]))
+        return types.SimpleNamespace(stdout=json.dumps([self.network_frame()]))
 
     def test_actual_held_build_has_no_swap_cap(self):
         repo=HERE.parents[2]
@@ -113,8 +119,8 @@ class Resources(unittest.TestCase):
     def test_internal_network_and_mount_authority_are_effective_checks(self):
         role = self.role()
         frame = self.frame(role)
-        with mock.patch.object(self.controller, 'call', return_value=types.SimpleNamespace(stdout=json.dumps([
-                {'Internal': False, 'Labels': self.controller.labels('network')}]))), self.assertRaises(SystemExit):
+        network = self.network_frame();network['Internal'] = False
+        with mock.patch.object(self.controller, 'call', return_value=types.SimpleNamespace(stdout=json.dumps([network]))), self.assertRaises(SystemExit):
             self.controller.validate(role, frame)
         for mutate in (lambda f: f['Mounts'].append({'Type': 'volume', 'Destination': '/extra'}),
                        lambda f: f['Mounts'].pop(),
@@ -186,6 +192,39 @@ class Resources(unittest.TestCase):
                 resources.preflight_collisions(self.args)
             self.assertFalse(pathlib.Path(self.args.work_dir).exists())
             self.assertFalse(any(x in line for line in ledger for x in ('create', 'pull', 'start', 'rm')))
+
+    def test_complete_network_profile_and_ipam_are_read_back(self):
+        role = self.role();frame = self.frame(role)
+        cases = [('Driver', 'overlay'), ('Scope', 'swarm'), ('Internal', False), ('Attachable', True),
+                 ('Ingress', True), ('EnableIPv4', False), ('EnableIPv6', True), ('ConfigOnly', True),
+                 ('ConfigFrom', {'Network': 'foreign'}), ('Options', {}), ('Labels', {}),
+                 ('IPAM', dict(resources.NETWORK_IPAM, Driver='foreign')),
+                 ('IPAM', dict(resources.NETWORK_IPAM, Config=[{'Subnet': '10.0.0.0/8'}])),
+                 ('IPAM', dict(resources.NETWORK_IPAM, Options={'foreign': 'true'})),
+                 ('Containers', {'d' * 64: {}, 'f' * 64: {}})]
+        for key, value in cases:
+            network = self.network_frame();network[key] = value
+            with self.subTest(key=key, value=value), mock.patch.object(self.controller, 'call',
+                    return_value=types.SimpleNamespace(stdout=json.dumps([network]))), self.assertRaises(SystemExit):
+                self.controller.validate(role, frame)
+        args = self.controller.network_arguments()
+        self.assertIn('--ipv4=true', args);self.assertIn('--ipv6=false', args)
+        self.assertEqual(args[args.index('--subnet') + 1], '172.30.254.0/28')
+
+    def test_held_network_check_accepts_foreign_driver_scope_and_ipam(self):
+        source = subprocess.check_output(['git', '--no-replace-objects', '-C', str(HERE.parents[2]), 'show',
+            'e309116cb0dd79e415ae6a25b809515354cea026:scripts/acceptance/condition-history/resources.py'])
+        old = types.ModuleType('held_network_resource_controls')
+        exec(compile(source, 'held-e309-resources', 'exec'), old.__dict__)
+        controller = old.Docker(self.args, Frozen(), {})
+        controller.images = dict(self.controller.images)
+        role = self.role();frame = self.frame(role)
+        network = self.network_frame();network.update(Driver='overlay', Scope='swarm', IPAM={'Driver': 'foreign'})
+        with mock.patch.object(controller, 'call', return_value=types.SimpleNamespace(stdout=json.dumps([network]))):
+            self.assertEqual(controller.validate(role, frame)['container_id'], frame['Id'])
+        with mock.patch.object(self.controller, 'call', return_value=types.SimpleNamespace(stdout=json.dumps([network]))), \
+                self.assertRaisesRegex(SystemExit, 'network profile'):
+            self.controller.validate(role, frame)
 
 
 if __name__ == '__main__':unittest.main()

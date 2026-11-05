@@ -13,6 +13,11 @@ SUBJECT = 'dev.durable-workflow.acceptance.subject'
 ROLE = 'dev.durable-workflow.acceptance.role'
 PREFIX = 'sdk-rust-condition'
 CELL = 'condition-history'
+NETWORK_OPTIONS = {'com.docker.network.bridge.enable_ip_masquerade': 'false',
+                   'com.docker.network.bridge.enable_icc': 'true',
+                   'com.docker.network.bridge.host_binding_ipv4': '127.0.0.1'}
+NETWORK_IPAM = {'Driver': 'default', 'Options': {},
+                'Config': [{'Subnet': '172.30.254.0/28', 'Gateway': '172.30.254.1'}]}
 PROFILES = {
     'fetch': (2_000_000_000, 3 * 1024**3, 1024, True, ()),
     'build': (2_000_000_000, 3 * 1024**3, 1024, True, ()),
@@ -88,6 +93,32 @@ class Docker:
 
     def labels(self, role):
         return {RUN: self.args.run_token, OWNER: PREFIX, SUBJECT: self.subject.sha256, ROLE: role}
+
+    def network_arguments(self):
+        line = ['docker', 'network', 'create', '--driver', 'bridge', '--scope', 'local', '--internal',
+                '--ipv4=true', '--ipv6=false', '--ipam-driver', 'default',
+                '--subnet', NETWORK_IPAM['Config'][0]['Subnet'], '--gateway', NETWORK_IPAM['Config'][0]['Gateway']]
+        for key, value in NETWORK_OPTIONS.items():
+            line += ['--opt', key + '=' + value]
+        for key, value in self.labels('network').items():
+            line += ['--label', key + '=' + value]
+        return line + [self.task]
+
+    def validate_network(self, network, container_id):
+        require(re.fullmatch('[0-9a-f]{64}', network['Id']) and network['Name'] == self.task
+                and network['Driver'] == 'bridge' and network['Scope'] == 'local'
+                and network['Internal'] is True and network['Attachable'] is False and network['Ingress'] is False
+                and network['EnableIPv4'] is True and network['EnableIPv6'] is False
+                and network['ConfigOnly'] is False and network['ConfigFrom'] == {'Network': ''}, 'wrong effective network profile')
+        require(network['Labels'] == self.labels('network') and network['Options'] == NETWORK_OPTIONS,
+                'wrong internal network authority/options')
+        ipam = dict(network['IPAM'], Options=network['IPAM'].get('Options') or {})
+        require(ipam == NETWORK_IPAM, 'wrong effective network IPAM')
+        allowed = {r['container_id'] for r in self.receipts if r['network'] == self.task} | {container_id}
+        require(set(network['Containers']) <= allowed and container_id in network['Containers'], 'foreign or missing network endpoint')
+        return {'id': network['Id'], 'driver': 'bridge', 'scope': 'local', 'internal': True,
+                'attachable': False, 'ingress': False, 'ipv4': True, 'ipv6': False,
+                'options': NETWORK_OPTIONS, 'ipam': NETWORK_IPAM}
 
     def image(self, reference):
         if reference not in self.images:
@@ -180,7 +211,7 @@ class Docker:
                 'wrong effective network/device sharing')
         if spec['network'] == self.task:
             network = json.loads(self.call(['docker', 'network', 'inspect', self.task]).stdout)[0]
-            require(network['Internal'] is True and all(network['Labels'].get(k) == v for k, v in self.labels('network').items()), 'wrong internal network authority')
+            network_profile = self.validate_network(network, data['Id'])
             aliases = set(data['NetworkSettings']['Networks'].get(self.task, {}).get('Aliases') or [])
             require(not spec['alias'] or spec['alias'] in aliases, 'missing effective network alias')
         require(set(data['NetworkSettings']['Networks']) == {spec['network']}, 'unexpected attached network')
@@ -192,6 +223,7 @@ class Docker:
         require({m['Destination'] for m in data['Mounts'] if m['Type'] == 'tmpfs'} == set(spec['tmpfs'])
                 and len(data['Mounts']) == len(spec['tmpfs']) + len(spec['binds']), 'missing, duplicate or unexpected mount')
         return {'role': spec['role'], 'container_id': data['Id'], 'image': spec['image'],
+                'network_profile': network_profile if spec['network'] == self.task else None,
                 'image_content_sha256': self.image(spec['image'])['sha256'], 'user': spec['user'],
                 'memory': spec['memory'], 'memory_swap': spec['memory'], 'nano_cpus': spec['cpus'],
                 'pids': spec['pids'], 'readonly': spec['readonly'], 'cap_drop': ['ALL'], 'cap_add': spec['cap_add'],
