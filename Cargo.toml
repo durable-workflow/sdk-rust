@@ -11,7 +11,7 @@ readme = "README.md"
 rust-version = "1.86"
 keywords = ["durable", "workflow", "temporal", "worker", "sdk"]
 categories = ["api-bindings", "asynchronous"]
-include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json", "/tests/fixtures/sdk-metrics-contract.json"]
+include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json", "/tests/fixtures/sdk-metrics-contract.json", "/tests/fixtures/auth-configuration/static-credentials-v1.json"]
 
 [package.metadata.durable-workflow]
 product-train = "4.12.0"

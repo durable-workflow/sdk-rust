@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reject malformed supplied shared, control and worker static tokens during
+  client construction, including unused or masked options. Diagnostics name
+  only the option. Empty tokens and valid token bytes retain their precedence.
+
 - Add `Client::get_run_activities` with typed run activity and attempt metadata,
   preserving unavailable fields, diagnostic authority and heartbeat progress.
 
