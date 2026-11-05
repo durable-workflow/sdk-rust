@@ -19299,6 +19299,7 @@ mod tests {
     mod nexus;
     mod runtime_payloads;
     mod runtime_uploads;
+    mod static_credentials;
     mod version_marker_contract;
     mod worker_capacity;
     mod worker_session;
