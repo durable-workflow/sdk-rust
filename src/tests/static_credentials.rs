@@ -68,7 +68,8 @@ fn static_credential_common_scalar_vectors_validate_every_option() {
     for row in rows {
         let value = text(&row["input_code_points"]);
         for option in ["token", "control_token", "worker_token"] {
-            let result = configure(Client::builder("http://127.0.0.1:1"), option, value.clone()).build();
+            let result =
+                configure(Client::builder("http://127.0.0.1:1"), option, value.clone()).build();
             match row["expected"].as_str().unwrap() {
                 "preserve" => {
                     let client = result.unwrap();
@@ -123,8 +124,16 @@ fn static_credential_refusal_precedes_other_client_construction_errors() {
 #[test]
 fn static_credential_absence_empty_and_role_precedence_stay_distinct() {
     let anonymous = Client::builder("http://127.0.0.1:1").build().unwrap();
-    assert_eq!(anonymous.auth_token(RequestProtocol::ControlPlane).unwrap(), None);
-    assert_eq!(anonymous.auth_token(RequestProtocol::DefaultWorker).unwrap(), None);
+    assert_eq!(
+        anonymous.auth_token(RequestProtocol::ControlPlane).unwrap(),
+        None
+    );
+    assert_eq!(
+        anonymous
+            .auth_token(RequestProtocol::DefaultWorker)
+            .unwrap(),
+        None
+    );
     for shared in ["fixture-shared", ""] {
         let client = Client::builder("http://127.0.0.1:1")
             .token(Some(shared.into()))
@@ -132,8 +141,14 @@ fn static_credential_absence_empty_and_role_precedence_stay_distinct() {
             .worker_token(None)
             .build()
             .unwrap();
-        assert_eq!(client.auth_token(RequestProtocol::ControlPlane).unwrap(), Some(shared));
-        assert_eq!(client.auth_token(RequestProtocol::DefaultWorker).unwrap(), Some(shared));
+        assert_eq!(
+            client.auth_token(RequestProtocol::ControlPlane).unwrap(),
+            Some(shared)
+        );
+        assert_eq!(
+            client.auth_token(RequestProtocol::DefaultWorker).unwrap(),
+            Some(shared)
+        );
     }
     for scoped in ["fixture-scoped", ""] {
         let client = Client::builder("http://127.0.0.1:1")
@@ -142,8 +157,14 @@ fn static_credential_absence_empty_and_role_precedence_stay_distinct() {
             .worker_token(Some(scoped.into()))
             .build()
             .unwrap();
-        assert_eq!(client.auth_token(RequestProtocol::ControlPlane).unwrap(), Some(scoped));
-        assert_eq!(client.auth_token(RequestProtocol::DefaultWorker).unwrap(), Some(scoped));
+        assert_eq!(
+            client.auth_token(RequestProtocol::ControlPlane).unwrap(),
+            Some(scoped)
+        );
+        assert_eq!(
+            client.auth_token(RequestProtocol::DefaultWorker).unwrap(),
+            Some(scoped)
+        );
     }
     let control_only = Client::builder("http://127.0.0.1:1")
         .control_token(Some("fixture-control".into()))
@@ -159,6 +180,9 @@ fn static_credential_absence_empty_and_role_precedence_stay_distinct() {
         .unwrap();
     assert!(matches!(
         worker_only.auth_token(RequestProtocol::ControlPlane),
-        Err(Error::MissingRoleCredentials { role: "control", .. })
+        Err(Error::MissingRoleCredentials {
+            role: "control",
+            ..
+        })
     ));
 }
