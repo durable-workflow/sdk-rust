@@ -2152,6 +2152,123 @@ fn redrive_successor_check_accepts_valid_successor_variants() {
 }
 
 #[test]
+fn redrive_successor_check_refuses_unmodeled_delivery_families() {
+    for kind in ["condition", "child", "service_operation"] {
+        let fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+            history_event(fixture, "CooperativeCancellationDelivered")["payload"]["call_kind"] =
+                json!(kind);
+        });
+        assert!(
+            check_redrive_successor(&fixture).is_err(),
+            "the single-call evidence model must explicitly refuse {kind}"
+        );
+    }
+}
+
+#[test]
+fn redrive_successor_check_accepts_failed_and_timed_out_activity_progress() {
+    for terminal in ["ActivityFailed", "ActivityTimedOut"] {
+        let fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+            later_step_cancellation(fixture, 4);
+            let event = fixture["history"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|event| {
+                    event["event_type"] == "ActivityCompleted"
+                        && event["payload"]["sequence"] == 3
+                })
+                .unwrap();
+            event["event_type"] = json!(terminal);
+            event["payload"].as_object_mut().unwrap().remove("result");
+            event["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("payload_codec");
+        });
+        assert!(
+            check_redrive_successor(&fixture).is_ok(),
+            "a matching {terminal} must close the earlier call"
+        );
+    }
+}
+
+fn successor_timer_progress(fixture: &mut Value, terminal: &str) {
+    later_step_cancellation(fixture, 4);
+    for event in fixture["history"].as_array_mut().unwrap() {
+        if event["payload"]["sequence"] != 3 {
+            continue;
+        }
+        let kind = event["event_type"].as_str().unwrap();
+        if matches!(kind, "ActivityScheduled" | "ActivityCompleted") {
+            event["event_type"] = json!(if kind == "ActivityScheduled" {
+                "TimerScheduled"
+            } else {
+                terminal
+            });
+            event["payload"] = json!({"sequence": 3, "timer_id": "successor-timer"});
+        }
+    }
+}
+
+#[test]
+fn redrive_successor_check_accepts_cancelled_plain_timer_progress() {
+    let fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+        successor_timer_progress(fixture, "TimerCancelled");
+    });
+    assert!(
+        check_redrive_successor(&fixture).is_ok(),
+        "a matching TimerCancelled must close the earlier plain timer"
+    );
+}
+
+#[test]
+fn redrive_successor_check_refuses_timeout_terminals_for_plain_timers() {
+    for (kind, wait_id) in [
+        ("condition_timeout", "condition_wait_id"),
+        ("signal_timeout", "signal_wait_id"),
+    ] {
+        let fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+            successor_timer_progress(fixture, "TimerFired");
+            let event = fixture["history"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|event| {
+                    event["event_type"] == "TimerFired" && event["payload"]["sequence"] == 3
+                })
+                .unwrap();
+            event["payload"]["timer_kind"] = json!(kind);
+            event["payload"][wait_id] = json!("internal-wait");
+        });
+        assert!(
+            check_redrive_successor(&fixture).is_err(),
+            "{kind} cannot resolve a plain timer merely by sharing timer_id"
+        );
+    }
+}
+
+#[test]
+fn redrive_successor_check_binds_activity_terminal_type() {
+    let fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+        later_step_cancellation(fixture, 4);
+        let event = fixture["history"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|event| {
+                event["event_type"] == "ActivityCompleted" && event["payload"]["sequence"] == 3
+            })
+            .unwrap();
+        event["payload"]["activity_type"] = json!("another.activity");
+    });
+    assert!(
+        check_redrive_successor(&fixture).is_err(),
+        "a foreign activity type cannot justify reaching the next step"
+    );
+}
+
+#[test]
 fn redrive_successor_check_rejects_impossible_histories() {
     let name = CANCELLATION_SUCCESSOR;
     // The 4.11.1 order: the successor's cancellation before the reused prefix.
