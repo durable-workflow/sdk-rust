@@ -481,14 +481,18 @@ class WindowControls(unittest.TestCase):
 
     def test_restoration_fault_notifies_without_retry_or_pass(self):
         call=self.call
+        attempts=[]
         def broken(argv,cutoff,**kwargs):
-            if 'bootstrap' in argv:raise SystemExit('restoration bootstrap failed')
+            if 'bootstrap' in argv:
+                attempts.append(argv)
+                raise SystemExit('restoration bootstrap failed')
             return call(argv,cutoff,**kwargs)
         self.w.call=broken
         result=self.run_fake_task()
         self.assertEqual(result['outcome'],'fail');self.assertTrue(result['operator_notified'])
         self.assertFalse(self.loaded);self.assertFalse(self.controller)
         self.assertEqual(len([x for x in self.calls if 'bootout' in x]),1)
+        self.assertEqual(len(attempts),1)
         self.assertFalse(self.bootstraps)
 
     def test_original_file_symlink_hardlink_and_writable_input_refuse(self):

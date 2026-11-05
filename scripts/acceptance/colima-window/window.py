@@ -368,6 +368,7 @@ class Window:
 
     def run(self, source_sha, profile):
         original = None
+        restoration_attempted = False
         result = {'outcome': 'fail', 'intent_sha256': self.intent_sha, 'source_sha256': source_sha}
         try:
             original = verify_original(self.sdk, self.record)
@@ -381,12 +382,16 @@ class Window:
             self.stop_default()
             self.start_task(profile)
             self.monitor_task()
+            restoration_attempted = True
             result.update(self.restore(original), outcome='pending_independent_audit')
         except BaseException as error:
             result['error_type'] = type(error).__name__
             if self.stop_attempted:
-                try:result.update(self.restore(original))
-                except BaseException:result['operator_notified'] = self.notify_failure()
+                if restoration_attempted:
+                    result['operator_notified'] = self.notify_failure()
+                else:
+                    try:result.update(self.restore(original))
+                    except BaseException:result['operator_notified'] = self.notify_failure()
         finally:
             try:
                 result['controller_process'] = self.sdk.process_identity(os.getpid())
