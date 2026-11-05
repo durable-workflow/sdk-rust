@@ -15,11 +15,13 @@ PREFIX = 'scripts/acceptance/condition-history/'
 H = '4b2440a5618ccc1c98960ea2e1e62127042c3590'
 RUNTIME_FILES = tuple(PREFIX + p for p in (
     'run.py', 'subject.py', 'engine.py', 'recover.py', 'resources.py',
-    'role-supervisor.sh', 'check_history.py', 'fixture/Cargo.toml', 'fixture/tests/conditions.rs')) + (
+    'role-supervisor.sh', 'check_history.py', 'guest-host.py', 'guest-profile.json',
+    'fixture/Cargo.toml', 'fixture/tests/conditions.rs')) + (
     'scripts/acceptance/installed-native/run.py',
     'scripts/acceptance/installed-native/cell-supervisor.sh')
 PACKET_FILES = {p for p in RUNTIME_FILES if p.startswith(PREFIX)} | {
-    PREFIX + p for p in ('README.md', 'test_packet.py', 'test_subject.py', 'test_resources.py', 'test_audit.py')}
+    PREFIX + p for p in ('README.md', 'guest-proposal.md', 'test_guest_host.py',
+                        'test_packet.py', 'test_subject.py', 'test_resources.py', 'test_audit.py')}
 MODULES = {'engine': PREFIX + 'engine.py', 'resources': PREFIX + 'resources.py',
            'native': 'scripts/acceptance/installed-native/run.py', 'comparator': PREFIX + 'check_history.py',
            'recovery': PREFIX + 'recover.py'}

@@ -178,8 +178,10 @@ parent and Docker data root. It refuses host/network filesystem shares, a
 nonempty daemon or build-cache baseline, and a later device/geometry drift.
 The run record binds that storage identity. Image/cache inventories remain in
 external-guardian custody until whole-guest/store teardown; the guest never
-guesses which layers to delete from a shared daemon. The concrete host guardian
-and guest proposal are still being prepared and are not admitted for execution.
+guesses which layers to delete from a shared daemon. The concrete
+[guest/guardian source proposal](guest-proposal.md) selects cached native Lima/VZ
+inputs and a fixed enclosing host disk. Its setup/watchdog and exact admission
+prerequisites remain open; no VM execution is admitted.
 
 The comparator scans every opened wait, condition outcome and timer row, binding
 the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.

@@ -1,0 +1,395 @@
+"""Source proposal for an external, task-scoped Lima/VZ storage guardian.
+
+The plan is inert. Guard/audit require a separately admitted private authority
+record from fixed-disk setup; they never create or start a VM.
+"""
+import argparse
+import ctypes
+import errno
+import hashlib
+import json
+import os
+import pathlib
+import plistlib
+import re
+import selectors
+import shlex
+import stat
+import subprocess
+import sys
+import time
+
+LIMA_SHA = '216450fc8e3eeb7f50e3030de216c32efeef505b111ed3fb24912a36feebea49'
+AGENT_SHA = '4aa75eacc151cbf2b7aec1b9ebe3886a0fc3268977c108308c802ce267c76959'
+IMAGE_SHA = '4cd967d2c58aa6971621343d372255b14ffbfe28a185cda0e3c34ac8a1eb15e6'
+IMAGE_BYTES = 358_298_593
+STORE_BYTES = 32 * 1024**3
+GUEST_BYTES = 20 * 1024**3
+MEMORY_BYTES = 6 * 1024**3
+PROFILE_SHA = 'fd12240c0a04fbe0614901038586a9cc411f154e11a56d6d1fcd3f4f045f0516'
+AUTHORITY_KEYS = {'schema', 'token', 'runner_commit', 'manifest_sha256', 'guardian_sha256',
+                  'started_unix', 'active_unix', 'cleanup_unix', 'parent', 'limactl',
+                  'guest_agent', 'host_boot_id', 'image_dev', 'image_ino', 'whole_device',
+                  'volume_uuid', 'profile_sha256'}
+
+
+def require(ok, label):
+    if not ok:
+        raise SystemExit(label)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
+
+
+def regular(path, limit=8 * 1024**2):
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid == os.getuid(), 'unsafe host handoff')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'host handoff replaced')
+        data = stream.read(limit + 1)
+        after = os.fstat(stream.fileno())
+        require(len(data) <= limit and after.st_nlink == 1
+                and (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                == (after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'host handoff changed')
+    return data
+
+
+def exclusive(path, value):
+    data = canonical(value)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    require(regular(path) == data, 'host handoff changed after write')
+    return digest(data)
+
+
+def paths(parent, token):
+    root = pathlib.Path(parent)
+    require(root.is_absolute() and root.resolve() == root and re.fullmatch('[0-9a-f]{16}', token), 'invalid host scope')
+    require(root.name == 'sr-' + token and not any(ch.isspace() for ch in str(root)), 'wrong host scope name')
+    home = root / 'v/l'
+    name = 'sdk-rust-' + token
+    require(len(str(home / name / 'ssh.sock.1234567890123456').encode()) < 104, 'Lima socket path is too long')
+    return {'parent': root, 'mount': root / 'v', 'image': root / 'store.dmg',
+            'home': home, 'instance': home / name, 'name': name}
+
+
+def environment(record):
+    scoped = paths(record['parent'], record['token'])
+    return {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(pathlib.Path.home()),
+            'LIMA_HOME': str(scoped['home']),
+            'LIMA_SHELLENV_BLOCK': '*', 'TMPDIR': str(scoped['mount'] / 'tmp')}
+
+
+def plan(parent, token, limactl, image_path, profile):
+    scoped = paths(parent, token)
+    image = pathlib.Path(image_path)
+    require(image == scoped['mount'] / 'a/guest.raw.gz', 'guest image is outside bounded store')
+    value = json.loads(json.dumps(profile))
+    # Pin the entire JSON document, including provision scripts and networking.
+    expected = json.dumps(value, sort_keys=True, indent=2) + '\n'
+    require(digest(expected.encode()) == PROFILE_SHA, 'unreviewed guest template')
+    require(pathlib.Path(limactl).is_absolute(), 'absolute VM launcher required')
+    require(value['images'] == [{'location': '__TASK_IMAGE__', 'arch': 'x86_64', 'digest': 'sha256:' + IMAGE_SHA}], 'wrong guest image profile')
+    require(value['cpus'] == 4 and value['memory'] == '6GiB' and value['disk'] == '20GiB'
+            and value['vmType'] == 'vz' and value['arch'] == 'x86_64', 'wrong guest resource profile')
+    require(value['base'] == [] and value['mounts'] == [] and value['additionalDisks'] == []
+            and value['copyToHost'] == [] and value['env'] == {} and value['propagateProxyEnv'] is False,
+            'inherited inputs or host shares refused')
+    require(all(value['ssh'][key] is False for key in ('loadDotSSHPubKeys', 'forwardAgent', 'forwardX11', 'forwardX11Trusted'))
+            and value['containerd'] == {'system': False, 'user': False}, 'forwarded credentials or implicit runtime refused')
+    require(value['portForwards'] == [{'guestIP': '0.0.0.0', 'guestIPMustBeZero': False,
+        'guestPortRange': [1, 65535], 'proto': 'any', 'ignore': True}], 'guest service forwarding refused')
+    value['images'][0]['location'] = str(image)
+    return {'schema': 'durable-workflow.condition-guest-plan/v1', 'profile': value,
+            'profile_sha256': digest(canonical(value)), 'guest_disk_bytes': GUEST_BYTES,
+            'host_store_bytes': STORE_BYTES, 'guest_memory_bytes': MEMORY_BYTES, 'vcpus': 4,
+            'minimum_host_available_bytes': 10 * 1024**3, 'minimum_host_free_disk_bytes': 48 * 1024**3,
+            'setup_seconds': 300, 'active_seconds': 1740, 'cleanup_seconds': 1800,
+            'create_store': ['/usr/bin/hdiutil', 'create', '-sectors', str(STORE_BYTES // 512),
+                '-type', 'UDIF', '-layout', 'GPTSPUD', '-fs', 'APFS', '-nospotlight',
+                '-volname', 'sr-' + token, str(scoped['image'])],
+            'attach_store': ['/usr/bin/hdiutil', 'attach', '-nobrowse', '-owners', 'on',
+                '-mountpoint', str(scoped['mount']), '-plist', str(scoped['image'])],
+            'create_vm': [limactl, '--tty=false', 'create', '--name', scoped['name'], str(scoped['mount'] / 'guest.yaml')],
+            'start_vm': [limactl, '--tty=false', 'start', '--timeout', '5m', scoped['name']],
+            'stop_vm': [limactl, '--tty=false', 'stop', '--force', scoped['name']],
+            'delete_vm': [limactl, '--tty=false', 'delete', '--force', scoped['name']],
+            'environment': environment({'parent': parent, 'token': token})}
+
+
+def call(record, argv):
+    remaining = record['_cleanup_mono'] - time.monotonic()
+    require(remaining > 0, 'external cleanup deadline exhausted')
+    # Read with a hard in-memory ceiling; native commands cannot fill host logs.
+    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=environment(record), close_fds=True)
+    data = bytearray()
+    cutoff = time.monotonic() + min(20, remaining)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                require(time.monotonic() < cutoff, 'native scoped control timed out')
+                for key, _ in selector.select(min(0.1, max(0, cutoff - time.monotonic()))):
+                    block = os.read(key.fileobj.fileno(), 65536)
+                    if not block:
+                        selector.unregister(key.fileobj)
+                        continue
+                    require(len(data) + len(block) <= 2 * 1024**2, 'oversize native control response')
+                    data.extend(block)
+            child.wait(timeout=max(0.001, cutoff - time.monotonic()))
+        require(child.returncode == 0, 'native scoped control failed')
+        return bytes(data)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+        child.stdout.close()
+
+
+def boot_identity():
+    value = subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], check=True,
+        capture_output=True, text=True, timeout=5).stdout.strip().lower()
+    require(re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value), 'missing Darwin boot authority')
+    return value
+
+
+class BsdInfo(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        'flags', 'status', 'xstatus', 'pid', 'ppid', 'uid', 'gid', 'ruid', 'rgid', 'svuid', 'svgid', 'reserved')]
+    _fields_ += [('comm', ctypes.c_char * 16), ('name', ctypes.c_char * 32)]
+    _fields_ += [(name, ctypes.c_uint32) for name in ('nfiles', 'pgid', 'pjobc', 'tdev', 'tpgid')]
+    _fields_ += [('nice', ctypes.c_int32), ('start_seconds', ctypes.c_uint64), ('start_microseconds', ctypes.c_uint64)]
+
+
+def bsd_identity(pid):
+    require(sys.platform == 'darwin', 'Darwin host guardian required')
+    library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    library.proc_pidinfo.restype = ctypes.c_int
+    info = BsdInfo()
+    count = library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if count == 0 and ctypes.get_errno() == errno.ESRCH:
+        return None
+    require(count == ctypes.sizeof(info) and info.pid == pid and info.uid == os.getuid()
+            and info.start_seconds > 0 and info.start_microseconds < 1_000_000, 'unavailable host kernel authority')
+    return {'pid': pid, 'pgid': info.pgid, 'uid': info.uid,
+            'start_seconds': info.start_seconds, 'start_microseconds': info.start_microseconds}
+
+
+def process_identity(pid):
+    boot = boot_identity()
+    first, second = bsd_identity(pid), bsd_identity(pid)
+    require(first == second and boot == boot_identity(), 'host process epoch changed during observation')
+    return dict(first, boot_id=boot) if first else None
+
+
+def authority(path, expected_sha, source_sha):
+    raw = regular(path, 64 * 1024)
+    require(digest(raw) == expected_sha, 'host authority digest mismatch')
+    value = json.loads(raw)
+    require(set(value) == AUTHORITY_KEYS and value['schema'] == 'durable-workflow.condition-host/v1', 'wrong host authority schema')
+    require(value['guardian_sha256'] == source_sha and re.fullmatch('[0-9a-f]{40}', value['runner_commit'])
+            and re.fullmatch('[0-9a-f]{64}', value['manifest_sha256']), 'wrong captured host source')
+    require(all(type(value[k]) is int for k in ('started_unix', 'active_unix', 'cleanup_unix', 'image_dev', 'image_ino'))
+            and value['active_unix'] == value['started_unix'] + 1740
+            and value['cleanup_unix'] == value['started_unix'] + 1800, 'wrong host deadlines or inode authority')
+    require(value['host_boot_id'] == boot_identity(), 'host boot changed')
+    scoped = paths(value['parent'], value['token'])
+    info = scoped['parent'].lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,
+            'wrong host parent authority')
+    binary = pathlib.Path(value['limactl']).resolve(strict=True)
+    require(digest(binary.read_bytes()) == LIMA_SHA, 'reviewed VM launcher changed')
+    agent = pathlib.Path(value['guest_agent']).resolve(strict=True)
+    require(digest(agent.read_bytes()) == AGENT_SHA, 'reviewed guest agent changed')
+    require(re.fullmatch('/dev/disk[0-9]+', value['whole_device'])
+            and re.fullmatch('[0-9A-Fa-f-]{36}', value['volume_uuid'])
+            and re.fullmatch('[0-9a-f]{64}', value['profile_sha256']), 'invalid native store authority')
+    value['_cleanup_mono'] = time.monotonic() + max(0, value['cleanup_unix'] - time.time())
+    value['_active_mono'] = time.monotonic() + max(0, value['active_unix'] - time.time())
+    return value
+
+
+def verify_store(record):
+    scoped = paths(record['parent'], record['token'])
+    info = scoped['image'].lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid()
+            and (info.st_dev, info.st_ino) == (record['image_dev'], record['image_ino'])
+            and 0 < info.st_size <= STORE_BYTES + 2 * 1024**2, 'fixed host image changed')
+    entries = plistlib.loads(call(record, ['/usr/bin/hdiutil', 'info', '-plist']))['images']
+    matches = [entry for entry in entries if pathlib.Path(entry['image-path']).resolve() == scoped['image']]
+    require(len(matches) == 1, 'host image attachment is missing or ambiguous')
+    entities = matches[0]['system-entities']
+    require(any(entry.get('dev-entry') == record['whole_device'] for entry in entities)
+            and any(entry.get('mount-point') == str(scoped['mount']) for entry in entities), 'foreign host image attachment')
+    whole = plistlib.loads(call(record, ['/usr/sbin/diskutil', 'info', '-plist', record['whole_device']]))
+    volume = plistlib.loads(call(record, ['/usr/sbin/diskutil', 'info', '-plist', str(scoped['mount'])]))
+    require(whole['TotalSize'] == STORE_BYTES and volume['VolumeUUID'].lower() == record['volume_uuid'].lower()
+            and volume['TotalSize'] <= STORE_BYTES and scoped['home'].stat().st_dev == scoped['mount'].stat().st_dev,
+            'host store does not have its fixed byte boundary')
+    require(digest(regular(scoped['mount'] / 'guest.yaml')) == record['profile_sha256'], 'reviewed guest profile changed')
+
+
+def capture_agent(record):
+    scoped = paths(record['parent'], record['token'])
+    pid_path = scoped['instance'] / 'ha.pid'
+    if not pid_path.exists():
+        return None
+    pid_text = regular(pid_path, 64).strip()
+    require(pid_text.isdigit() and int(pid_text) > 1, 'invalid owned VM PID file')
+    process = process_identity(int(pid_text))
+    require(process and process['start_seconds'] >= record['started_unix'], 'stale VM process epoch')
+    command = call(record, ['/bin/ps', '-ww', '-p', pid_text.decode(), '-o', 'command=']).decode()
+    argv = shlex.split(command)
+    binding = '--pidfile=' + str(pid_path)
+    pairs = list(zip(argv, argv[1:]))
+    require(argv and pathlib.Path(argv[0]).resolve() == pathlib.Path(record['limactl']).resolve()
+            and 'hostagent' in argv and (binding in argv or ('--pidfile', str(pid_path)) in pairs)
+            and scoped['name'] in argv and process_identity(process['pid']) == process, 'foreign VM host agent')
+    return process
+
+
+def export_handoff(record, record_sha):
+    scoped = paths(record['parent'], record['token'])
+    raw = regular(scoped['parent'] / 'exports.json', 64 * 1024)
+    value = json.loads(raw)
+    require(set(value) == {'record_sha256', 'guest_boot_id', 'guest-summary.json', 'guest-audit.json'}
+            and value['record_sha256'] == record_sha
+            and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value['guest_boot_id']),
+            'wrong external export authority')
+    for name in ('guest-summary.json', 'guest-audit.json'):
+        require(digest(regular(scoped['parent'] / name)) == value[name], 'exported guest proof changed')
+    return value, digest(raw)
+
+
+def finish_requested(record, record_sha):
+    scoped = paths(record['parent'], record['token'])
+    marker = scoped['parent'] / 'finish.json'
+    if not os.path.lexists(marker):
+        return False
+    value = json.loads(regular(marker, 64 * 1024))
+    _, export_sha = export_handoff(record, record_sha)
+    require(value == {'record_sha256': record_sha, 'exports_sha256': export_sha}, 'wrong cleanup request authority')
+    return True
+
+
+def cleanup(record):
+    scoped = paths(record['parent'], record['token'])
+    verify_store(record)
+    captured_path = scoped['parent'] / 'vm-process.json'
+    process = json.loads(regular(captured_path)) if captured_path.exists() else capture_agent(record)
+    if process:
+        current = process_identity(process['pid'])
+        if current:
+            require(current == process and capture_agent(record) == process,
+                    'VM process epoch changed before scoped stop')
+            require(process_identity(process['pid']) == process, 'VM process epoch changed at scoped stop')
+            call(record, [record['limactl'], '--tty=false', 'stop', '--force', scoped['name']])
+            require(process_identity(process['pid']) is None, 'owned VM process survived')
+    require(not (scoped['instance'] / 'ha.pid').exists(), 'VM process custody is uncertain')
+    if scoped['instance'].exists():
+        call(record, [record['limactl'], '--tty=false', 'delete', '--force', scoped['name']])
+    require(not scoped['instance'].exists(), 'VM instance storage survived')
+    verify_store(record)
+    call(record, ['/usr/bin/hdiutil', 'detach', record['whole_device']])
+    require(not os.path.ismount(scoped['mount']), 'owned host store remains mounted')
+    # A changed inode never gains deletion authority through the pathname.
+    info = scoped['image'].lstat()
+    require((info.st_dev, info.st_ino) == (record['image_dev'], record['image_ino']) and info.st_nlink == 1,
+            'host image changed before deletion')
+    scoped['image'].unlink()
+    return {'guest_absent': True, 'store_unmounted': True, 'image_absent': True,
+            'image_cache_disposition': 'whole_task_guest_and_store_removed'}
+
+
+def audit(record, record_sha, source_sha):
+    scoped = paths(record['parent'], record['token'])
+    require(not os.path.lexists(scoped['image']) and not os.path.ismount(scoped['mount'])
+            and not os.path.lexists(scoped['instance']), 'external VM/store survivor')
+    ready = json.loads(regular(scoped['parent'] / 'host-ready.json'))
+    require(ready['record_sha256'] == record_sha and ready['source_sha256'] == source_sha
+            and process_identity(ready['process']['pid']) is None, 'host guardian still active or changed')
+    vm = json.loads(regular(scoped['parent'] / 'vm-process.json'))
+    require(process_identity(vm['pid']) is None, 'VM host agent survived')
+    result = json.loads(regular(scoped['parent'] / 'host-cleanup.json'))
+    require(result['record_sha256'] == record_sha and result['guardian_sha256'] == source_sha
+            and result['outcome'] == 'pending_independent_host_audit'
+            and result['guest_absent'] is True and result['store_unmounted'] is True and result['image_absent'] is True,
+            'external cleanup did not pass')
+    exports, export_sha = export_handoff(record, record_sha)
+    require(finish_requested(record, record_sha), 'completed guest export request required')
+    guest = json.loads(regular(scoped['parent'] / 'guest-summary.json'))
+    guest_audit = json.loads(regular(scoped['parent'] / 'guest-audit.json'))
+    require(guest['runner_commit'] == record['runner_commit'] and guest['manifest_sha256'] == record['manifest_sha256']
+            and guest['checks_outcome'] == 'pass' and guest_audit['outcome'] == 'pending_external_guest_teardown'
+            and guest['storage']['guest_boot_id'] == exports['guest_boot_id']
+            and guest_audit['storage'] == guest['storage']
+            and guest_audit['manifest_sha256'] == record['manifest_sha256']
+            and guest_audit['summary_sha256'] == exports['guest-summary.json'], 'guest evidence does not authorize acceptance')
+    result.update(outcome='pass', exports_sha256=export_sha)
+    exclusive(scoped['parent'] / 'host-audit.json', result)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', choices=('plan', 'guard', 'audit'))
+    parser.add_argument('--record')
+    parser.add_argument('--record-sha256')
+    parser.add_argument('--plan-input')
+    args = parser.parse_args(argv)
+    if args.mode == 'plan':
+        value = json.loads(pathlib.Path(args.plan_input).read_bytes())
+        print(json.dumps(plan(**value), sort_keys=True))
+        return
+    require('-I' in sys.orig_argv and '-S' in sys.orig_argv and '-c' in sys.orig_argv, 'captured host guardian required')
+    source_sha = digest(sys.orig_argv[sys.orig_argv.index('-c') + 1].encode())
+    record = authority(pathlib.Path(args.record), args.record_sha256, source_sha)
+    scoped = paths(record['parent'], record['token'])
+    if args.mode == 'guard':
+        require(record['started_unix'] <= time.time() < record['started_unix'] + 300,
+                'host setup cutoff exceeded')
+        verify_store(record)
+        exclusive(scoped['parent'] / 'host-ready.json', {'record_sha256': args.record_sha256,
+            'source_sha256': source_sha, 'process': process_identity(os.getpid())})
+        control_error = None
+        try:
+            while time.monotonic() < record['_active_mono']:
+                process = capture_agent(record)
+                receipt = scoped['parent'] / 'vm-process.json'
+                if process and not receipt.exists():
+                    exclusive(receipt, process)
+                if finish_requested(record, args.record_sha256):
+                    break
+                time.sleep(0.25)
+        except BaseException as error:
+            # Bad handoffs or observations never bypass the cleanup attempt.
+            control_error = type(error).__name__
+        try:
+            result = dict(cleanup(record), outcome='pending_independent_host_audit')
+        except BaseException as error:
+            result = {'outcome': 'fail', 'error_type': type(error).__name__,
+                      'custody': 'external_owner_must_resolve_retained_task_objects'}
+        if control_error:
+            result.update(outcome='fail', control_error_type=control_error)
+        result.update(record_sha256=args.record_sha256, guardian_sha256=source_sha)
+        exclusive(scoped['parent'] / 'host-cleanup.json', result)
+        require(result['outcome'] != 'fail', 'external cleanup incomplete')
+    else:
+        print(json.dumps(audit(record, args.record_sha256, source_sha)))
+
+
+if __name__ == '__main__':
+    main()

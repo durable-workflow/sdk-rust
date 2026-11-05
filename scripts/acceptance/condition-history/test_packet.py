@@ -47,7 +47,7 @@ class Packet(unittest.TestCase):
         self.assertFalse(pathlib.Path(self.args.work_dir).exists())
 
     def test_no_optimizable_runtime_assert(self):
-        for name in ('run.py','subject.py','engine.py','resources.py','recover.py'):
+        for name in ('run.py','subject.py','engine.py','resources.py','recover.py','guest-host.py'):
             with self.subTest(name=name):
                 self.assertFalse(any(isinstance(n,ast.Assert) for n in ast.walk(ast.parse((HERE/name).read_text()))))
 

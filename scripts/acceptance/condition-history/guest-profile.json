@@ -1,0 +1,77 @@
+{
+  "additionalDisks": [],
+  "arch": "x86_64",
+  "base": [],
+  "caCerts": {
+    "certs": [],
+    "files": [],
+    "removeDefaults": false
+  },
+  "containerd": {
+    "system": false,
+    "user": false
+  },
+  "copyToHost": [],
+  "cpus": 4,
+  "disk": "20GiB",
+  "env": {},
+  "hostResolver": {
+    "enabled": false,
+    "hosts": {}
+  },
+  "images": [
+    {
+      "arch": "x86_64",
+      "digest": "sha256:4cd967d2c58aa6971621343d372255b14ffbfe28a185cda0e3c34ac8a1eb15e6",
+      "location": "__TASK_IMAGE__"
+    }
+  ],
+  "memory": "6GiB",
+  "minimumLimaVersion": "2.2.1",
+  "mountInotify": false,
+  "mountType": "virtiofs",
+  "mounts": [],
+  "nestedVirtualization": false,
+  "networks": [
+    {
+      "vzNAT": true
+    }
+  ],
+  "portForwards": [
+    {
+      "guestIP": "0.0.0.0",
+      "guestIPMustBeZero": false,
+      "guestPortRange": [
+        1,
+        65535
+      ],
+      "ignore": true,
+      "proto": "any"
+    }
+  ],
+  "propagateProxyEnv": false,
+  "provision": [
+    {
+      "mode": "dependency",
+      "script": "#!/bin/sh\nset -eu\ncommand -v docker >/dev/null\ncommand -v python3 >/dev/null\ncommand -v git >/dev/null\n",
+      "skipDefaultDependencyResolution": true
+    }
+  ],
+  "ssh": {
+    "forwardAgent": false,
+    "forwardX11": false,
+    "forwardX11Trusted": false,
+    "loadDotSSHPubKeys": false,
+    "localPort": 0
+  },
+  "timezone": "UTC",
+  "upgradePackages": false,
+  "user": {
+    "home": "/home/fixture.guest",
+    "name": "fixture",
+    "passwordlessSudo": true,
+    "shell": "/bin/bash",
+    "uid": 1000
+  },
+  "vmType": "vz"
+}
