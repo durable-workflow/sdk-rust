@@ -17,17 +17,17 @@ impl LegacyReplayClock for WorkflowContext {
 pub(super) fn register(worker: &mut Worker, workflow_type: &str) {
     worker.register_workflow(workflow_type, |ctx, _| async move {
         assert!(LegacyReplayClock::replay_now(&ctx).is_err());
-        let start = ctx.replay_now()?;
+        let start = ctx.replay_now().ok();
         ctx.sleep(Duration::from_secs(1)).await?;
-        let timer = ctx.replay_now()?;
+        let timer = ctx.replay_now().ok();
         let result = ctx.activity("clock-activity", json!([])).await?;
-        let activity = ctx.replay_now()?;
+        let activity = ctx.replay_now().ok();
         Ok(json!({
-            "start":start.to_rfc3339_opts(SecondsFormat::Micros,true),
-            "timer":timer.to_rfc3339_opts(SecondsFormat::Micros,true),
-            "activity":activity.to_rfc3339_opts(SecondsFormat::Micros,true),
-            "unchanged_prefix":activity==ctx.replay_now()?,
-            "elapsed_seconds":(activity-start).num_seconds(),
+            "start":start.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "timer":timer.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "activity":activity.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "unchanged_prefix":activity.is_some() && activity==ctx.replay_now().ok(),
+            "elapsed_seconds":start.zip(activity).map(|(start,end)| (end-start).num_seconds()),
             "result":result,
         }))
     });
