@@ -171,6 +171,8 @@ def arguments(argv=None):
     parser.add_argument('--run-token')
     parser.add_argument('--docker-endpoint')
     parser.add_argument('--guest-boot-id')
+    parser.add_argument('--parent-clock-json')
+    parser.add_argument('--parent-clock-sha256')
     for key in ('started-unix', 'active-unix', 'cleanup-unix'):
         parser.add_argument('--' + key, type=int)
     parser.add_argument('--record-sha256')
@@ -190,10 +192,8 @@ def validate(args):
     require(args.docker_endpoint and args.docker_endpoint.startswith('unix:///'), 'local daemon endpoint required')
     require(args.guest_boot_id and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', args.guest_boot_id),
             'exact disposable guest boot identity required')
-    require(type(args.started_unix) is int and type(args.active_unix) is int and type(args.cleanup_unix) is int
-            and args.cleanup_unix == args.started_unix + 1800
-            and args.active_unix == args.cleanup_unix - 60, 'wrong absolute deadline envelope')
-    require(args.started_unix <= time.time() < args.started_unix + 30, 'stale launch timestamp')
+    require(all(type(v) is int for v in (args.started_unix, args.active_unix, args.cleanup_unix))
+            and args.parent_clock_json and args.parent_clock_sha256, 'parent-constrained clock input required')
 
 
 def bootstrap():
@@ -229,9 +229,11 @@ def bootstrap():
     recovery = types.ModuleType('captured_recovery_preflight')
     recovery.__file__ = 'git:' + args.runner_commit + ':' + PREFIX + 'recover.py'
     exec(compile(captured[PREFIX + 'recover.py'], recovery.__file__, 'exec'), recovery.__dict__)
+    recovery.launch_clock(args)
     args.guest_storage = recovery.storage_preflight(args, lambda line: module.call(args, line))
     args.storage_guard = lambda: recovery.validate_storage(args.guest_storage, args.work_dir)
     module.preflight_collisions(args)
+    recovery.launch_clock(args)
     RECORD = recovery.make_record(args, actual, value['files'][PREFIX + 'recover.py']['sha256'])
     RECORD_SHA = digest(canonical(RECORD))
     print(json.dumps({'private_launch': RECORD, 'record_sha256': RECORD_SHA}), flush=True)

@@ -50,7 +50,7 @@ def environment(args):
 def call(args, line, timeout=120, check=True, **kwargs):
     if hasattr(args, 'storage_guard'):
         args.storage_guard()
-    remaining = int(args.active_unix - time.time())
+    remaining = (args.active_monotonic_ns - time.monotonic_ns()) / 1_000_000_000
     require(remaining > 0, 'active deadline exhausted')
     result = subprocess.run(line, capture_output=True, timeout=min(timeout, remaining),
                             env=environment(args), **dict({'text': True}, **kwargs))

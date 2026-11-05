@@ -13,7 +13,7 @@ import time
 import types
 import unittest
 from unittest import mock
-from test_subject import HERE, load
+from test_subject import HERE, load, parent_clock
 
 host = load('condition_guest_host_tests', HERE / 'guest-host.py')
 TOKEN = '0123456789abcdef'
@@ -26,7 +26,9 @@ class GuestHost(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.temp)
         self.parent = self.temp / ('sr-' + TOKEN)
         self.parent.mkdir(mode=0o700)
-        self.record = {'parent': str(self.parent), 'token': TOKEN, 'limactl': '/reviewed/bin/limactl',
+        active_ns = time.monotonic_ns() + 1740 * 1_000_000_000
+        self.record = {'active_monotonic_ns': active_ns, 'cleanup_monotonic_ns': active_ns + 60_000_000_000,
+            'parent': str(self.parent), 'token': TOKEN, 'limactl': '/reviewed/bin/limactl',
             'runner_commit': 'a' * 40, 'manifest_sha256': 'b' * 64, 'guardian_sha256': 'c' * 64,
             'guest_agent_binary_sha256': 'e' * 64,
             'started_unix': int(time.time()), 'active_unix': int(time.time()) + 1740,
@@ -89,11 +91,15 @@ class GuestHost(unittest.TestCase):
             host.process_identity(1234)
 
     def exports(self):
+        clock = parent_clock(self.record['started_unix'])
+        self.record['host_boot_id'] = clock['host_boot_id']
+        for key in ('started_unix', 'active_unix', 'cleanup_unix', 'active_monotonic_ns', 'cleanup_monotonic_ns'):clock['host_'+key] = self.record[key]
+        self.put('guest-clock.json', clock)
         storage = {'guest_boot_id': BOOT}
         summary_sha = self.put('guest-summary.json', {'runner_commit': self.record['runner_commit'],
-            'manifest_sha256': self.record['manifest_sha256'], 'checks_outcome': 'pass', 'storage': storage})
+            'manifest_sha256': self.record['manifest_sha256'], 'checks_outcome': 'pass', 'storage': storage, 'parent_clock': clock})
         audit_sha = self.put('guest-audit.json', {'outcome': 'pending_external_guest_teardown',
-            'manifest_sha256': self.record['manifest_sha256'], 'summary_sha256': summary_sha, 'storage': storage})
+            'manifest_sha256': self.record['manifest_sha256'], 'summary_sha256': summary_sha, 'storage': storage, 'parent_clock': clock})
         exports_sha = self.put('exports.json', {'record_sha256': 'd' * 64, 'guest_boot_id': BOOT,
             'guest-summary.json': summary_sha, 'guest-audit.json': audit_sha})
         self.put('finish.json', {'record_sha256': 'd' * 64, 'exports_sha256': exports_sha})
@@ -439,6 +445,121 @@ class GuestHost(unittest.TestCase):
             host.launch_guest(self.record, 'd' * 64)
         self.assertTrue((self.parent / 'vm-created.json').exists())
         self.assertFalse((self.parent / 'vm-started.json').exists())
+
+
+    def test_late_budget_refuses_before_store_allocation_and_guest_create(self):
+        self.record['_active_mono']=time.monotonic()+779
+        self.record['_stage_mono']=time.monotonic()+300
+        with mock.patch.object(host,'capacity',return_value={}),mock.patch.object(host,'selected_agent'), \
+                mock.patch.object(host,'input_bytes'),mock.patch.object(host,'call') as command, \
+                self.assertRaisesRegex(SystemExit,'reserve consumed'):
+            host.prepare(self.record,self.profile)
+        command.assert_not_called()
+        self.put('launch.json',{'record_sha256':'d'*64,'manifest_sha256':self.record['manifest_sha256'],'action':'create-and-start'})
+        self.record['profile']=self.proposal()['profile'];self.record['profile_sha256']=host.digest(host.canonical(self.record['profile']))
+        with mock.patch.object(host,'verify_store'),mock.patch.object(host,'verify_guest_inputs'), \
+                mock.patch.object(host,'call') as command,self.assertRaisesRegex(SystemExit,'reserve consumed'):
+            host.launch_guest(self.record,'d'*64)
+        command.assert_not_called()
+
+    def test_resident_clock_receipt_binds_original_parent_and_guest_domains(self):
+        self.record['host_boot_id']=BOOT
+        self.put('guest-clock-request.json',{'record_sha256':'d'*64,'action':'capture-guest-clock'})
+        self.put('vm-started.json',{'agent':{'guest_boot_id':BOOT}})
+        mono=time.monotonic_ns()
+        sample={'guest_boot_id':BOOT,'guest_before_monotonic_ns':900000000000,
+                'guest_after_monotonic_ns':900000000010,'guest_unix_ns':2000000000000000000}
+        with mock.patch.object(host,'call',return_value=host.canonical(sample)), \
+                mock.patch.object(host.time,'monotonic_ns',side_effect=[mono,mono+2000000000]):
+            clock=host.capture_guest_clock(self.record,'d'*64)
+        self.assertEqual(clock['host_record_sha256'],'d'*64)
+        self.assertEqual(clock['host_active_monotonic_ns'],self.record['active_monotonic_ns'])
+        self.assertEqual(clock['host_cleanup_monotonic_ns'],self.record['cleanup_monotonic_ns'])
+        self.assertEqual(clock['host_after_monotonic_ns']-clock['host_before_monotonic_ns'],2000000000)
+        self.assertEqual(clock['guest_unix_ns'],sample['guest_unix_ns'])
+        self.assertEqual(json.loads((self.parent/'guest-clock.json').read_bytes()),clock)
+        with mock.patch.object(host,'call',return_value=host.canonical(sample)),self.assertRaises(FileExistsError):
+            host.capture_guest_clock(self.record,'d'*64)
+
+    def test_budget_consumed_by_input_preflight_refuses_before_scope_creation(self):
+        # Read-only inspection must not make an initially adequate budget stale.
+        self.parent.rmdir()
+        self.record['_stage_mono'] = time.monotonic() + 300
+        self.record.update(guest_agent='/synthetic/guest-agent.gz', cached_image='/synthetic/guest.raw.gz')
+        def inspect(*args, **kwargs):
+            self.record['_active_mono'] = time.monotonic() + 779
+        with mock.patch.object(host, 'capacity', return_value={}), \
+                mock.patch.object(host, 'selected_agent'), mock.patch.object(host, 'input_bytes', side_effect=inspect), \
+                mock.patch.object(host, 'call') as command, self.assertRaisesRegex(SystemExit, 'reserve consumed'):
+            host.prepare(self.record, self.profile)
+        command.assert_not_called()
+        self.assertFalse(self.parent.exists())
+
+    def test_clock_probe_refuses_wrong_boot_slow_sample_or_late_budget(self):
+        self.record['host_boot_id']=BOOT
+        self.put('guest-clock-request.json',{'record_sha256':'d'*64,'action':'capture-guest-clock'})
+        self.put('vm-started.json',{'agent':{'guest_boot_id':BOOT}})
+        sample={'guest_boot_id':'foreign','guest_before_monotonic_ns':100,'guest_after_monotonic_ns':200,'guest_unix_ns':1000}
+        with mock.patch.object(host,'call',return_value=host.canonical(sample)),self.assertRaises(SystemExit):
+            host.capture_guest_clock(self.record,'d'*64)
+        sample['guest_boot_id']=BOOT
+        mono=time.monotonic_ns()
+        with mock.patch.object(host,'call',return_value=host.canonical(sample)), \
+                mock.patch.object(host.time,'monotonic_ns',side_effect=[mono,mono+6000000000]),self.assertRaises(SystemExit):
+            host.capture_guest_clock(self.record,'d'*64)
+        self.record['_active_mono']=time.monotonic()+779
+        with mock.patch.object(host,'call') as command,self.assertRaises(SystemExit):
+            host.capture_guest_clock(self.record,'d'*64)
+        command.assert_not_called();self.assertFalse((self.parent/'guest-clock.json').exists())
+
+    def test_final_host_audit_rejects_rebound_clock_even_with_matching_exports(self):
+        self.audit_files()
+        clock=json.loads((self.parent/'guest-clock.json').read_bytes());clock['host_active_unix']+=1
+        self.put('guest-clock.json',clock)
+        digests={}
+        for name in ('guest-summary.json','guest-audit.json'):
+            value=json.loads((self.parent/name).read_bytes());value['parent_clock']=clock
+            digests[name]=self.put(name,value)
+        export_sha=self.put('exports.json',dict(record_sha256='d'*64,guest_boot_id=BOOT,**digests))
+        self.put('finish.json',{'record_sha256':'d'*64,'exports_sha256':export_sha})
+        with mock.patch.object(host,'process_identity',return_value=None),self.assertRaisesRegex(SystemExit,'clock/parent'):
+            host.audit(self.record,'d'*64,'c'*64)
+
+
+    def test_reopening_host_authority_never_renews_monotonic_ceilings(self):
+        self.store_fixture()
+        binary=self.temp/'launcher';binary.write_bytes(b'launcher')
+        agent=self.temp/'agent.gz';agent.write_bytes(b'agent')
+        value={key:self.record.get(key) for key in host.AUTHORITY_KEYS}
+        value.update(schema='durable-workflow.condition-host/v2',limactl=str(binary),guest_agent=str(agent),
+                     guest_agent_binary_sha256=host.AGENT_BINARY_SHA)
+        sha=self.put('clock-authority.json',value)
+        with mock.patch.object(host,'LIMA_SHA',host.digest(binary.read_bytes())), \
+                mock.patch.object(host,'AGENT_SHA',host.digest(agent.read_bytes())), \
+                mock.patch.object(host,'selected_agent'),mock.patch.object(host,'boot_identity',return_value=BOOT), \
+                mock.patch.object(host.time,'time',return_value=self.record['started_unix']-3600):
+            observed=host.authority(self.parent/'clock-authority.json',sha,self.record['guardian_sha256'])
+        self.assertEqual(observed['_active_mono'],value['active_monotonic_ns']/1000000000)
+        self.assertEqual(observed['_cleanup_mono'],value['cleanup_monotonic_ns']/1000000000)
+
+
+    def test_budget_consumed_during_create_refuses_start_without_renewal(self):
+        self.store_fixture()
+        self.record['guest_image']={'device':1,'inode':2,'bytes':3,'sha256':'f'*64}
+        self.put('launch.json',{'record_sha256':'d'*64,'manifest_sha256':self.record['manifest_sha256'],'action':'create-and-start'})
+        calls=[]
+        def command(record,argv,input_data=None):
+            calls.append(argv)
+            if 'create' in argv:record['_active_mono']=time.monotonic()+779
+            return b''
+        original=self.record['active_monotonic_ns']
+        with mock.patch.object(host,'verify_store'),mock.patch.object(host,'verify_guest_inputs'), \
+                mock.patch.object(host,'call',side_effect=command), \
+                mock.patch.object(host,'effective_config',return_value={'status':'Stopped'}), \
+                self.assertRaisesRegex(SystemExit,'reserve consumed'):
+            host.launch_guest(self.record,'d'*64)
+        self.assertEqual(len(calls),1);self.assertIn('create',calls[0]);self.assertNotIn('start',calls[0])
+        self.assertEqual(self.record['active_monotonic_ns'],original)
 
 
 if __name__ == '__main__':

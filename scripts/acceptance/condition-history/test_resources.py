@@ -28,7 +28,8 @@ class Resources(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name)
         self.args = types.SimpleNamespace(work_dir=str(self.root / 'unused'), run_token='0123456789abcdef',
-            docker_endpoint='unix:///synthetic.sock', active_unix=int(time.time()) + 1740)
+            docker_endpoint='unix:///synthetic.sock', active_unix=int(time.time()) + 1740,
+            active_monotonic_ns=time.monotonic_ns()+1740*1_000_000_000)
         self.controller = resources.Docker(self.args, Frozen(), {})
         self.image = {'sha256': 'c' * 64, 'raw': {'Id': 'image-id', 'Os': 'linux', 'Architecture': 'amd64',
             'RootFS': {'Layers': []}, 'Config': {'Entrypoint': ['/entry'], 'Cmd': ['default'],
@@ -64,6 +65,20 @@ class Resources(unittest.TestCase):
 
     def network(self):
         return types.SimpleNamespace(stdout=json.dumps([self.network_frame()]))
+
+    def test_actual_predecessor_wall_clock_rollback_extends_command_budget(self):
+        import types
+        old_source=subprocess.check_output(['git','show','df617fb:scripts/acceptance/condition-history/resources.py'],text=True)
+        old=types.ModuleType('old_wall_budget');exec(compile(old_source,'frozen-df617-resources','exec'),old.__dict__)
+        self.args.active_unix=int(time.time())+2
+        mono=time.monotonic_ns();self.args.active_monotonic_ns=mono+2*1000000000
+        with mock.patch.object(time,'time',return_value=self.args.active_unix-3600), \
+                mock.patch.object(time,'monotonic_ns',return_value=mono), \
+                mock.patch.object(subprocess,'run',return_value=types.SimpleNamespace(returncode=0)) as command:
+            old.call(self.args,['never-executed'])
+            self.assertEqual(command.call_args.kwargs['timeout'],120)
+            resources.call(self.args,['never-executed'])
+            self.assertEqual(command.call_args.kwargs['timeout'],2)
 
     def test_actual_held_build_has_no_swap_cap(self):
         repo=HERE.parents[2]

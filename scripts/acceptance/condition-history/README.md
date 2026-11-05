@@ -6,6 +6,11 @@ It is source under review. It has not built its consumer or run a container.
 Server history review and Security executable review precede a separate General
 admission of the exact runner commit, command, fresh capacity and absolute deadline.
 
+The original `df617fb` / `bdbb4d4` private proposal remains frozen and unexecuted.
+This clock successor is a new source/input subject; its R/M and host guardian
+identity must be captured independently. Source integration does not select its
+lifecycle, guest launch, consumer build, publication or installed execution.
+
 The package is crates.io `durable-workflow =4.12.0`, archive SHA-256
 `620a8287af73c363dac61f0a91f20971a39f3b8cdc9513fbea85cdbd95a74ba4`,
 source `4b2440a5618ccc1c98960ea2e1e62127042c3590` (H). Its published tag,
@@ -88,12 +93,21 @@ daemon. Before work creation or registry requests, read-only preflight refuses
 any existing owner/run container, network or volume and every colliding exact name.
 An uncertain query is a refusal.
 
-One 30-minute absolute owner window includes setup, fetch, compilation, execution
-and cleanup. Active work ends 60 seconds before the final ceiling. The Cell's
-roles share one maximum 600-second deadline plus a 10-second TERM/KILL grace.
+The unchanged 30-minute parent window includes setup, fetch, compilation,
+execution and cleanup. The guest uses a fresh start G inside that parent lease,
+not a renewed 30-minute envelope. A resident-parent clock receipt maps the
+parent's original monotonic deadline conservatively into the guest clock.
+Guest active is `min(G+1740, mapped_parent_active-180)`; guest cleanup is active
+plus 60 seconds, leaving at least 120 seconds before parent active for the
+independent guest audit/export. Admission requires at least 600 active work
+seconds still available. Late setup refuses before store allocation, VM
+create/start and guest work allocation; it does not extend any parent cutoff.
+The Cell's roles share one maximum 600-second deadline plus a 10-second
+TERM/KILL grace.
 `run.json` is an exclusive owner-only regular single-link record binding R, H,
 manifest and recovery digests, token, local daemon, root, UID/GID, isolated owner
-PID/group/session, Linux boot ID and kernel start ticks, and all three deadlines.
+PID/group/session, Linux boot ID and kernel start ticks, the parent clock receipt,
+and all three deadlines plus the derived fixed guest monotonic cutoffs.
 Execution requires Linux proc authority. Identity observations must agree across
 two kernel-stat reads and boot reads; recovery revalidates that tuple immediately
 before each TERM or KILL. A missing or changed authority refuses the signal.
@@ -101,8 +115,8 @@ Its digest is captured outside
 the work root in the private launch handoff.
 
 Before any pull, the owner starts a detached recovery process from captured
-inline bytes and requires its exact readiness receipt. At the active cutoff it
-uses its captured complete authority to stop the exact owner and remove only
+inline bytes and requires its exact readiness receipt. At the fixed guest
+monotonic active cutoff it uses its captured complete authority to stop the exact owner and remove only
 matching immutable container/network IDs. A later source/record drift fails the
 result but cannot replace the already-captured cleanup authority. Foreign process
 epochs, labels or names are refused. Interrupted Cell evidence is purged because
@@ -111,9 +125,15 @@ bounded by the final ceiling. No edit, retry, fallback or extension is included.
 
 After source review and a separate exact execution admission, use the reviewed
 inline collector below. `R`, `M`, `CHECKOUT`, fresh `W`, token `T`, local daemon
-`D`, and captured `S`/`ACTIVE`/`CLEANUP` belong in the private proposal. `ACTIVE`
-is `S + 1740` and `CLEANUP` is `S + 1800`. Do not substitute a mutable script path
-for the captured entry point.
+`D`, and captured `S`/`ACTIVE`/`CLEANUP` belong in the private proposal. The CLI's
+`S` is fresh guest G. `ACTIVE` and `CLEANUP` follow
+the constrained formula above; `CLOCK_JSON`/`CLOCK_SHA` are the resident guardian's
+exclusive `guest-clock.json` and its canonical SHA-256. They bind the host record,
+both boot IDs, original parent Unix/monotonic ceilings and a bounded paired
+host/guest clock observation. The response-side remaining parent duration and
+rounding toward an earlier deadline account for transport uncertainty. They do
+not assume equal host/guest clocks or reopen a lease after a wall-clock change.
+Do not substitute a mutable script path for the captured entry point.
 
 ```sh
 python3 -I -S -c '
@@ -131,6 +151,7 @@ raise SystemExit(subprocess.run([sys.executable, "-I", "-S", "-c", entry,
   --package-commit 4b2440a5618ccc1c98960ea2e1e62127042c3590 \
   --work-dir W --run-token T --docker-endpoint D \
   --guest-boot-id B \
+  --parent-clock-json CLOCK_JSON --parent-clock-sha256 CLOCK_SHA \
   --started-unix S --active-unix ACTIVE --cleanup-unix CLEANUP
 ```
 
@@ -147,6 +168,11 @@ For immediate recovery or the mandatory independent final audit, capture
 `--record-sha256`, `--manifest-sha256`, `--runner-commit`, `--package-commit`,
 `--run-token`. Audit also requires the externally captured `--summary-sha256`.
 Standalone recovery does not depend on a mutable checkout entry point.
+
+Recovery records use schema `condition-run/v5`, binding the same parent clock
+and derived monotonic deadlines through recovery, summary, guest audit and the
+independent host audit. Command timeouts and recovery wakeups use those fixed
+monotonic deadlines; changing UTC cannot grant more time.
 
 The owner writes `summary.json` with `O_EXCL|O_NOFOLLOW`, mode 0600, and returns
 its immutable SHA-256. It records package/source/lock/binary inputs, exact role

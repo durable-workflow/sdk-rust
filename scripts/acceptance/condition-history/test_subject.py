@@ -29,6 +29,20 @@ subject = load('sealed_subject', HERE / 'subject.py')
 recovery = load('subject_recovery_tests', HERE / 'recover.py')
 
 
+def parent_clock(started=None, remaining=1680):
+    started = int(time.time()) if started is None else started
+    mono = time.monotonic_ns()
+    return {'schema': 'durable-workflow.condition-parent-clock/v1', 'host_record_sha256': 'd' * 64,
+        'host_boot_id': '22222222-2222-2222-2222-222222222222',
+        'guest_boot_id': '11111111-1111-1111-1111-111111111111',
+        'host_started_unix': started - 60, 'host_active_unix': started + 1680,
+        'host_cleanup_unix': started + 1740, 'host_active_monotonic_ns': mono + remaining * recovery.NS,
+        'host_cleanup_monotonic_ns': mono + (remaining + 60) * recovery.NS,
+        'host_before_monotonic_ns': mono, 'host_after_monotonic_ns': mono,
+        'guest_before_monotonic_ns': mono, 'guest_after_monotonic_ns': mono,
+        'guest_unix_ns': started * recovery.NS}
+
+
 def fixture_subject(root):
     data = {p: (REPO / p).read_bytes() for p in subject.RUNTIME_FILES}
     files = {p: {'git_blob': 'a' * 40, 'mode': '100644', 'bytes': len(v), 'sha256': subject.digest(v)}
@@ -172,11 +186,13 @@ class SubjectControls(unittest.TestCase):
 
     def record(self):
         now = int(time.time())
-        return {'schema': 'durable-workflow.condition-run/v4', 'owner': recovery.PREFIX,
+        clock = parent_clock(now)
+        envelope = recovery.clock_envelope(clock, now, clock['guest_boot_id'])
+        return {'schema': 'durable-workflow.condition-run/v5', 'owner': recovery.PREFIX,
             'token': '0123456789abcdef', 'cells': [recovery.CELL], 'runner_commit': 'a' * 40,
             'package_commit': subject.H, 'manifest_sha256': self.sealed.sha256,
             'recovery_sha256': self.sealed.value['files'][subject.PREFIX + 'recover.py']['sha256'],
-            'started_unix': now, 'active_unix': now + 1740, 'cleanup_unix': now + 1800,
+            'started_unix': now, **envelope, 'parent_clock': clock,
             'work_dir': str(self.root), 'docker_endpoint': 'unix:///synthetic.sock',
             'uid': os.getuid(), 'gid': os.getgid(),
             'storage': {'schema': 'durable-workflow.condition-guest-storage/v1', 'guest_boot_id': '11111111-1111-1111-1111-111111111111', 'device': '8:1', 'block_bytes': 20 * 1024**3, 'filesystem_bytes': 19 * 1024**3, 'docker_root': '/synthetic/docker', 'daemon_id': 'synthetic-daemon-id'},
