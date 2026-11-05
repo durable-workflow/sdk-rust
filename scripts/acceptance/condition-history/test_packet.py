@@ -20,7 +20,7 @@ class Packet(unittest.TestCase):
         now = int(time.time())
         self.args = types.SimpleNamespace(mode='run', checkout=str(REPO), work_dir=str(self.root / 'fresh'),
             package_commit=subject.H, runner_commit='a' * 40, run_token='0123456789abcdef',
-            docker_endpoint='unix:///synthetic.sock', started_unix=now, active_unix=now+1740, cleanup_unix=now+1800)
+            docker_endpoint='unix:///synthetic.sock', guest_boot_id='11111111-1111-1111-1111-111111111111', started_unix=now, active_unix=now+1740, cleanup_unix=now+1800)
         subject.ARGS = self.args
         subject.CURRENT = fixture_subject(self.root)
         self.packet = subject.CURRENT.module('engine')

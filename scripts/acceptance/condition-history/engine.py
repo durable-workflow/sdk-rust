@@ -259,7 +259,7 @@ def execute(args):
     watchdog, recovery_process_sha = start_recovery(args, record)
     result = {'outcome': 'fail', 'checks_outcome': 'fail', 'record_sha256': subject.RECORD_SHA,
               'runner_commit': args.runner_commit, 'package_commit': H, 'manifest_sha256': subject.CURRENT.sha256,
-              'recovery_process_sha256': recovery_process_sha}
+              'recovery_process_sha256': recovery_process_sha, 'storage': record['storage']}
     try:
         registry = registry_identity()
         images = [RUST, SERVER, MYSQL, REDIS]
@@ -310,6 +310,13 @@ def execute(args):
         cleanup = recovery.cleanup(record)
         result['cleanup'] = cleanup
         result['cleanup_errors'] = owner.cleanup_errors
+        try:
+            result['storage_custody'] = {'disposition': 'pending_external_guest_teardown',
+                'image_ids': recovery.docker(record, ['image', 'ls', '-q', '--no-trunc']).stdout.split(),
+                'image_cache_inventory': [json.loads(line) for line in recovery.docker(record,
+                    ['system', 'df', '--format', '{{json .}}']).stdout.splitlines() if line]}
+        except BaseException:
+            result.update(outcome='fail', checks_outcome='fail', storage_custody={'disposition': 'unverified'})
         if not cleanup['pass'] or owner.cleanup_errors:
             result.update(outcome='fail', checks_outcome='fail')
         subject.CURRENT.verify()

@@ -20,7 +20,9 @@ SUBJECT = 'dev.durable-workflow.acceptance.subject'
 ROLE = 'dev.durable-workflow.acceptance.role'
 RECORD_KEYS = {'schema', 'owner', 'token', 'cells', 'runner_commit', 'package_commit', 'manifest_sha256',
                'recovery_sha256', 'started_unix', 'active_unix', 'cleanup_unix', 'work_dir',
-               'docker_endpoint', 'uid', 'gid', 'owner_process'}
+               'docker_endpoint', 'uid', 'gid', 'owner_process', 'storage'}
+STORAGE_KEYS = {'schema', 'guest_boot_id', 'device', 'block_bytes', 'filesystem_bytes', 'docker_root', 'daemon_id'}
+GUEST_DISK_BYTES = 20 * 1024**3
 ROLES = ('fetch', 'build', 'mysql', 'redis', 'bootstrap', 'runtime', 'queue', 'consumer')
 PUBLIC_CONFIG = {'auths': {'https://index.docker.io/v1/': {}, 'ghcr.io': {}}}
 
@@ -107,6 +109,66 @@ def validate_process(process, label):
             and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', process['boot_id']), label)
 
 
+def filesystem_storage(work_dir, docker_root, expected_boot):
+    require(sys.platform == 'linux' and boot_identity() == expected_boot, 'wrong disposable guest boot identity')
+    root = pathlib.Path('/')
+    device = root.stat().st_dev
+    require(os.major(device) != 0, 'block-backed disposable guest root required')
+    for name in (pathlib.Path(work_dir).parent, pathlib.Path(docker_root)):
+        require(name.is_absolute() and name.resolve(strict=True) == name and name.stat().st_dev == device,
+                'work/daemon storage escapes guest root device')
+    block_path = pathlib.Path('/sys/dev/block/%d:%d/size' % (os.major(device), os.minor(device)))
+    block_bytes = int(block_path.read_text().strip()) * 512
+    fs = os.statvfs(root)
+    filesystem_bytes = fs.f_blocks * fs.f_frsize
+    require(0 < filesystem_bytes <= block_bytes <= GUEST_DISK_BYTES, 'guest storage exceeds hard block ceiling')
+    mounts = pathlib.Path('/proc/self/mountinfo').read_text().splitlines()
+    root_rows = []
+    for line in mounts:
+        before, separator, after = line.partition(' - ')
+        require(separator, 'invalid guest mount authority')
+        fields, tail = before.split(), after.split()
+        require(len(fields) >= 6 and len(tail) >= 3, 'invalid guest mount authority')
+        require(tail[0] not in ('9p', 'virtiofs', 'nfs', 'nfs4', 'cifs', 'fuse.sshfs'), 'host/network filesystem share refused')
+        if fields[4] == '/':
+            root_rows.append((fields, tail))
+    require(len(root_rows) == 1 and root_rows[0][1][0] == 'ext4'
+            and root_rows[0][0][2] == '%d:%d' % (os.major(device), os.minor(device)), 'wrong guest root filesystem')
+    return {'guest_boot_id': expected_boot, 'device': '%d:%d' % (os.major(device), os.minor(device)),
+            'block_bytes': block_bytes, 'filesystem_bytes': filesystem_bytes, 'docker_root': docker_root}
+
+
+def validate_storage(value, work_dir, observe=True):
+    require(set(value) == STORAGE_KEYS and value['schema'] == 'durable-workflow.condition-guest-storage/v1'
+            and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value['guest_boot_id'])
+            and re.fullmatch('[0-9]+:[0-9]+', value['device'])
+            and type(value['block_bytes']) is int and type(value['filesystem_bytes']) is int
+            and 0 < value['filesystem_bytes'] <= value['block_bytes'] <= GUEST_DISK_BYTES
+            and isinstance(value['docker_root'], str) and value['docker_root'].startswith('/')
+            and isinstance(value['daemon_id'], str) and re.fullmatch('[A-Za-z0-9:-]{12,128}', value['daemon_id']),
+            'wrong bounded guest storage authority')
+    if observe:
+        current = filesystem_storage(work_dir, value['docker_root'], value['guest_boot_id'])
+        require(all(value[k] == v for k, v in current.items()), 'guest storage authority changed')
+
+
+def storage_preflight(args, command):
+    info = json.loads(command(['docker', 'info', '--format', '{{json .}}']).stdout)
+    frame = filesystem_storage(args.work_dir, info['DockerRootDir'], args.guest_boot_id)
+    value = dict(frame, schema='durable-workflow.condition-guest-storage/v1', daemon_id=info['ID'])
+    validate_storage(value, args.work_dir)
+    # The public base image contains tools only. Nothing in this daemon may be
+    # inherited from a previous SDK experiment or another owner.
+    for line in (['docker', 'ps', '-aq'], ['docker', 'image', 'ls', '-q', '--no-trunc'], ['docker', 'volume', 'ls', '-q']):
+        require(not command(line).stdout.split(), 'disposable guest daemon is not empty')
+    rows = [json.loads(line) for line in command(['docker', 'system', 'df', '--format', '{{json .}}']).stdout.splitlines() if line]
+    require(len(rows) == 4 and {row['Type'] for row in rows} == {'Images', 'Containers', 'Local Volumes', 'Build Cache'}
+            and all((type(row['TotalCount']) is int and row['TotalCount'] == 0)
+                    or (type(row['TotalCount']) is str and row['TotalCount'] == '0') for row in rows),
+            'guest image/cache baseline is not empty')
+    return value
+
+
 def group_members(pgid):
     result = subprocess.run(['ps', '-axo', 'pid=,pgid='], capture_output=True, text=True, check=True, timeout=5)
     return [int(fields[0]) for line in result.stdout.splitlines()
@@ -118,13 +180,13 @@ def make_record(args, manifest_sha, recovery_sha):
     require(owner and owner['pid'] == owner['pgid'] == owner['sid'], 'isolated owner session required')
     root = pathlib.Path(args.work_dir)
     require(root.is_absolute() and root.resolve() == root, 'canonical work root required')
-    return {'schema': 'durable-workflow.condition-run/v3', 'owner': PREFIX, 'token': args.run_token,
+    return {'schema': 'durable-workflow.condition-run/v4', 'owner': PREFIX, 'token': args.run_token,
             'cells': [CELL], 'runner_commit': args.runner_commit, 'package_commit': H,
             'manifest_sha256': manifest_sha, 'recovery_sha256': recovery_sha,
             'started_unix': args.started_unix, 'active_unix': args.active_unix,
             'cleanup_unix': args.cleanup_unix, 'work_dir': str(root),
             'docker_endpoint': args.docker_endpoint, 'uid': os.getuid(), 'gid': os.getgid(),
-            'owner_process': owner}
+            'owner_process': owner, 'storage': args.guest_storage}
 
 
 def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sha, token):
@@ -136,7 +198,7 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
     raw = read(root / 'run.json')
     require(digest(raw) == expected_record_sha, 'run record digest mismatch')
     record = json.loads(raw)
-    require(set(record) == RECORD_KEYS and record['schema'] == 'durable-workflow.condition-run/v3', 'wrong run record schema')
+    require(set(record) == RECORD_KEYS and record['schema'] == 'durable-workflow.condition-run/v4', 'wrong run record schema')
     require(record['owner'] == PREFIX and record['token'] == token and re.fullmatch('[0-9a-f]{16}', token)
             and record['cells'] == [CELL], 'wrong recovery ownership')
     require(record['runner_commit'] == runner and re.fullmatch('[0-9a-f]{40}', runner)
@@ -149,6 +211,8 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
             and record['active_unix'] == record['cleanup_unix'] - 60, 'wrong recovery deadlines')
     process = record['owner_process']
     validate_process(process, 'wrong captured owner process')
+    validate_storage(record['storage'], root, observe=False)
+    require(process['boot_id'] == record['storage']['guest_boot_id'], 'owner/storage guest identity mismatch')
     snapshot = root / 'snapshot'
     require(not snapshot.is_symlink() and stat.S_ISDIR(snapshot.lstat().st_mode), 'unsafe recovery snapshot')
     raw_manifest = read(snapshot / 'manifest.json', mode=0o400)
@@ -182,6 +246,7 @@ def validate_record(root, expected_record_sha, runner, manifest_sha, recovery_sh
 
 
 def docker(record, command, check=True):
+    validate_storage(record['storage'], record['work_dir'])
     root = pathlib.Path(record['work_dir'])
     require(json.loads(read(root / 'recovery-docker/config.json')) == PUBLIC_CONFIG, 'anonymous Docker configuration changed')
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(root / 'public-home'),
@@ -369,9 +434,10 @@ def main(argv=None):
                 and summary.get('cleanup') == {'pass': True, 'errors': [],
                     'remaining': {'container': [], 'network': [], 'volume': []}}
                 and summary.get('cleanup_errors') == [], 'owner checks or cleanup did not pass')
-        result = {'outcome': 'pass', 'record_sha256': args.record_sha256,
+        result = {'outcome': 'pending_external_guest_teardown', 'record_sha256': args.record_sha256,
                   'manifest_sha256': args.manifest_sha256, 'summary_sha256': args.summary_sha256,
-                  'remaining': remaining, 'owner_process_absent': True, 'recovery_process_absent': True}
+                  'remaining': remaining, 'owner_process_absent': True, 'recovery_process_absent': True,
+                  'storage': record['storage']}
         exclusive(pathlib.Path(args.work_dir) / 'independent-audit.json', canonical(result))
         print(json.dumps(result))
 

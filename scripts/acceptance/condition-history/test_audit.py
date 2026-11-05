@@ -56,6 +56,8 @@ class Audit(unittest.TestCase):
         self.assertEqual(result['summary_sha256'], self.summary_sha)
         self.assertEqual(result['remaining'], {'container': [], 'network': [], 'volume': []})
         self.assertTrue(result['owner_process_absent'] and result['recovery_process_absent'])
+        self.assertEqual(result['outcome'], 'pending_external_guest_teardown')
+        self.assertEqual(result['storage'], self.authority['storage'])
         with self.assertRaises(FileExistsError):self.invoke()
 
     def test_changed_summary_never_gains_authority(self):

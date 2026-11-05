@@ -48,6 +48,8 @@ def environment(args):
 
 
 def call(args, line, timeout=120, check=True, **kwargs):
+    if hasattr(args, 'storage_guard'):
+        args.storage_guard()
     remaining = int(args.active_unix - time.time())
     require(remaining > 0, 'active deadline exhausted')
     result = subprocess.run(line, capture_output=True, timeout=min(timeout, remaining),

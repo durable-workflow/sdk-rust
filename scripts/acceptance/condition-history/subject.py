@@ -168,6 +168,7 @@ def arguments(argv=None):
     parser.add_argument('--work-dir')
     parser.add_argument('--run-token')
     parser.add_argument('--docker-endpoint')
+    parser.add_argument('--guest-boot-id')
     for key in ('started-unix', 'active-unix', 'cleanup-unix'):
         parser.add_argument('--' + key, type=int)
     parser.add_argument('--record-sha256')
@@ -185,6 +186,8 @@ def validate(args):
     require(args.work_dir and not os.path.lexists(args.work_dir), 'work directory is not fresh')
     require(args.run_token and re.fullmatch('[0-9a-f]{16}', args.run_token), 'invalid run token')
     require(args.docker_endpoint and args.docker_endpoint.startswith('unix:///'), 'local daemon endpoint required')
+    require(args.guest_boot_id and re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', args.guest_boot_id),
+            'exact disposable guest boot identity required')
     require(type(args.started_unix) is int and type(args.active_unix) is int and type(args.cleanup_unix) is int
             and args.cleanup_unix == args.started_unix + 1800
             and args.active_unix == args.cleanup_unix - 60, 'wrong absolute deadline envelope')
@@ -221,10 +224,12 @@ def bootstrap():
     module = types.ModuleType('sealed_resource_preflight')
     module.__file__ = 'git:' + args.runner_commit + ':' + PREFIX + 'resources.py'
     exec(compile(captured[PREFIX + 'resources.py'], module.__file__, 'exec'), module.__dict__)
-    module.preflight_collisions(args)
     recovery = types.ModuleType('captured_recovery_preflight')
     recovery.__file__ = 'git:' + args.runner_commit + ':' + PREFIX + 'recover.py'
     exec(compile(captured[PREFIX + 'recover.py'], recovery.__file__, 'exec'), recovery.__dict__)
+    args.guest_storage = recovery.storage_preflight(args, lambda line: module.call(args, line))
+    args.storage_guard = lambda: recovery.validate_storage(args.guest_storage, args.work_dir)
+    module.preflight_collisions(args)
     RECORD = recovery.make_record(args, actual, value['files'][PREFIX + 'recover.py']['sha256'])
     RECORD_SHA = digest(canonical(RECORD))
     print(json.dumps({'private_launch': RECORD, 'record_sha256': RECORD_SHA}), flush=True)

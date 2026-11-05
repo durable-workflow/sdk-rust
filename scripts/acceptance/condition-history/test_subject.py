@@ -172,13 +172,14 @@ class SubjectControls(unittest.TestCase):
 
     def record(self):
         now = int(time.time())
-        return {'schema': 'durable-workflow.condition-run/v3', 'owner': recovery.PREFIX,
+        return {'schema': 'durable-workflow.condition-run/v4', 'owner': recovery.PREFIX,
             'token': '0123456789abcdef', 'cells': [recovery.CELL], 'runner_commit': 'a' * 40,
             'package_commit': subject.H, 'manifest_sha256': self.sealed.sha256,
             'recovery_sha256': self.sealed.value['files'][subject.PREFIX + 'recover.py']['sha256'],
             'started_unix': now, 'active_unix': now + 1740, 'cleanup_unix': now + 1800,
             'work_dir': str(self.root), 'docker_endpoint': 'unix:///synthetic.sock',
             'uid': os.getuid(), 'gid': os.getgid(),
+            'storage': {'schema': 'durable-workflow.condition-guest-storage/v1', 'guest_boot_id': '11111111-1111-1111-1111-111111111111', 'device': '8:1', 'block_bytes': 20 * 1024**3, 'filesystem_bytes': 19 * 1024**3, 'docker_root': '/synthetic/docker', 'daemon_id': 'synthetic-daemon-id'},
             'owner_process': {'pid': 12345, 'pgid': 12345, 'sid': 12345, 'boot_id': '11111111-1111-1111-1111-111111111111', 'start_ticks': 123456}}
 
     def validate(self, record, expected_sha=None):
@@ -329,6 +330,75 @@ class SubjectControls(unittest.TestCase):
         self.assertEqual(identity['sid'], os.getsid(os.getpid()))
         self.assertGreater(identity['start_ticks'], 0)
         self.assertEqual(identity['boot_id'], recovery.boot_identity())
+
+    def storage_frame(self):
+        return {k: v for k, v in self.record()['storage'].items() if k not in ('schema', 'daemon_id')}
+
+    def observe_storage(self, *, block_bytes=None, foreign_device=False, mount_text=None, boot=None):
+        device = os.makedev(8, 1)
+        capacity = block_bytes or recovery.GUEST_DISK_BYTES
+        def read_text(path, *args, **kwargs):
+            if str(path).startswith('/sys/dev/block/'):
+                return str(capacity // 512)
+            return mount_text or '42 1 8:1 / / rw,nodev,nosuid - ext4 /dev/sda1 rw\n'
+        def file_stat(path, *args, **kwargs):
+            return types.SimpleNamespace(st_dev=os.makedev(8, 2) if foreign_device and str(path) == '/synthetic/docker' else device)
+        with mock.patch.object(recovery, 'boot_identity', return_value=boot or self.record()['storage']['guest_boot_id']), \
+                mock.patch.object(recovery.pathlib.Path, 'stat', autospec=True, side_effect=file_stat), \
+                mock.patch.object(recovery.pathlib.Path, 'resolve', autospec=True, side_effect=lambda path, **kw: path), \
+                mock.patch.object(recovery.pathlib.Path, 'read_text', autospec=True, side_effect=read_text), \
+                mock.patch.object(recovery.os, 'statvfs', return_value=types.SimpleNamespace(f_blocks=19 * 1024**3 // 4096, f_frsize=4096)):
+            return recovery.filesystem_storage('/synthetic/work', '/synthetic/docker', self.record()['storage']['guest_boot_id'])
+
+    def test_fixed_guest_block_device_bounds_work_and_daemon_storage(self):
+        self.assertEqual(self.observe_storage(), self.storage_frame())
+
+    def test_large_shared_device_foreign_mount_or_boot_refuses(self):
+        for changes in [dict(block_bytes=1024**4), dict(foreign_device=True),
+                        dict(boot='22222222-2222-2222-2222-222222222222'),
+                        dict(mount_text='42 1 8:1 / / rw - overlay overlay rw\n'),
+                        dict(mount_text='42 1 8:1 / / rw - ext4 /dev/sda1 rw\n43 1 8:1 / /share rw - virtiofs host rw\n')]:
+            with self.subTest(changes=changes), self.assertRaises(SystemExit):
+                self.observe_storage(**changes)
+
+    def test_storage_authority_is_closed_and_reobserved(self):
+        storage = self.record()['storage']
+        with mock.patch.object(recovery, 'filesystem_storage', return_value=self.storage_frame()):
+            recovery.validate_storage(storage, '/synthetic/work')
+        for field, value in [('extra', 1), ('block_bytes', recovery.GUEST_DISK_BYTES + 512),
+                             ('filesystem_bytes', True), ('daemon_id', ''), ('guest_boot_id', 'foreign')]:
+            bad = dict(storage, **{field: value})
+            with self.subTest(field=field), self.assertRaises(SystemExit):
+                recovery.validate_storage(bad, '/synthetic/work', observe=False)
+        changed = dict(self.storage_frame(), device='8:2')
+        with mock.patch.object(recovery, 'filesystem_storage', return_value=changed), \
+                self.assertRaisesRegex(SystemExit, 'storage authority changed'):
+            recovery.validate_storage(storage, '/synthetic/work')
+
+    def test_guest_daemon_images_and_build_cache_must_start_empty(self):
+        for existing in (None, 'image', 'cache'):
+            ledger = []
+            rows = [{'Type': name, 'TotalCount': '1' if existing == 'cache' and name == 'Build Cache' else '0'}
+                    for name in ('Images', 'Containers', 'Local Volumes', 'Build Cache')]
+            def command(line):
+                ledger.append(line)
+                if line[1] == 'info':
+                    data = json.dumps({'DockerRootDir': '/synthetic/docker', 'ID': 'synthetic-daemon-id'})
+                elif line[1] == 'image':
+                    data = 'sha256:existing' if existing == 'image' else ''
+                elif line[1] == 'system':
+                    data = '\n'.join(json.dumps(row) for row in rows)
+                else:
+                    data = ''
+                return types.SimpleNamespace(stdout=data)
+            args = types.SimpleNamespace(work_dir='/synthetic/work', guest_boot_id=self.record()['storage']['guest_boot_id'])
+            with mock.patch.object(recovery, 'filesystem_storage', return_value=self.storage_frame()):
+                if existing:
+                    with self.subTest(existing=existing), self.assertRaises(SystemExit):
+                        recovery.storage_preflight(args, command)
+                else:
+                    self.assertEqual(recovery.storage_preflight(args, command), self.record()['storage'])
+            self.assertFalse(any(word in line for line in ledger for word in ('pull', 'create', 'build', 'start', 'rm')))
 
 
 if __name__ == '__main__':unittest.main()

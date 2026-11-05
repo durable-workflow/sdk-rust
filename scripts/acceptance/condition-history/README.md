@@ -130,6 +130,7 @@ raise SystemExit(subprocess.run([sys.executable, "-I", "-S", "-c", entry,
 ' CHECKOUT R --manifest-sha256 M \
   --package-commit 4b2440a5618ccc1c98960ea2e1e62127042c3590 \
   --work-dir W --run-token T --docker-endpoint D \
+  --guest-boot-id B \
   --started-unix S --active-unix ACTIVE --cleanup-unix CLEANUP
 ```
 
@@ -155,7 +156,10 @@ remain `pending_independent_audit`. Only after owner exit can a separately invok
 captured audit bind that summary digest, verify the original record/snapshot and
 recovery-process receipt, and confirm every matching container, network, volume,
 owner and recovery process group absent. It writes its own exclusive handoff.
-Sanitize and retain both immutable results before any acceptance or closure.
+The guest audit returns `pending_external_guest_teardown`, not acceptance.
+Sanitize and retain both immutable results before the external guardian removes
+the guest and its enclosing store. Independent host absence/custody evidence
+remains required before any acceptance or closure.
 
 The task network has an explicit local bridge/IPv4-only IPAM profile and exact
 masquerade, inter-container and loopback-binding options. Driver, scope, ingress,
@@ -167,6 +171,15 @@ finding on #210. A subsequent reviewed proposal must select a disposable
 task-owned daemon/work store with a hard byte ceiling and externally owned
 teardown. Capacity samples do not establish that ceiling. Neither the process
 nor network source correction admits a pull, build or runtime from this packet.
+
+The guest entry now additionally binds the externally observed boot ID B, a
+block-backed ext4 root of at most 20 GiB, and the same device for its fresh work
+parent and Docker data root. It refuses host/network filesystem shares, a
+nonempty daemon or build-cache baseline, and a later device/geometry drift.
+The run record binds that storage identity. Image/cache inventories remain in
+external-guardian custody until whole-guest/store teardown; the guest never
+guesses which layers to delete from a shared daemon. The concrete host guardian
+and guest proposal are still being prepared and are not admitted for execution.
 
 The comparator scans every opened wait, condition outcome and timer row, binding
 the authored group, member key/fingerprint/occurrence, wait ID and integer timeout.
