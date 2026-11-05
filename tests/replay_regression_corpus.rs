@@ -2894,7 +2894,7 @@ fn redrive_event_fields(event: &Value) -> Result<(), String> {
             .iter()
             .any(|key| descriptor.get(*key).is_some_and(|value| !value.is_null()))
             {
-                return Err("successor evidence does not model scoped, grouped, selected or operation calls".into());
+                return Err("successor evidence must be one single call without scoped, grouped, selected or operation membership".into());
             }
         }
     }
@@ -3205,7 +3205,7 @@ fn check_successor_cancellation(
             calls
                 .iter()
                 .any(|opened| redrive_terminal_matches(opened, terminal)),
-            "successor terminal has no matching earlier call kind, mode, step and resource",
+            "successor has unresolved terminal evidence: no matching earlier call kind, mode, step and resource",
         )?;
         if terminal["event_type"] == "SignalApplied" {
             require(
