@@ -2267,6 +2267,96 @@ fn redrive_successor_check_binds_activity_terminal_type() {
     );
 }
 
+fn successor_signal_progress(fixture: &mut Value) {
+    later_step_cancellation(fixture, 4);
+    let instance = fixture["history"][0]["payload"]["workflow_instance_id"].clone();
+    let run = fixture["history"][0]["payload"]["workflow_run_id"].clone();
+    let history = fixture["history"].as_array_mut().unwrap();
+    for event in history.iter_mut() {
+        if event["payload"]["sequence"] != 3 {
+            continue;
+        }
+        if event["event_type"] == "ActivityScheduled" {
+            event["event_type"] = json!("SignalWaitOpened");
+            event["payload"] = json!({"sequence": 3, "signal_wait_id": "successor-wait", "signal_name": "ready"});
+        } else if event["event_type"] == "ActivityCompleted" {
+            event["event_type"] = json!("SignalApplied");
+            event["payload"] = json!({"sequence": 3, "signal_wait_id": "successor-wait", "signal_name": "ready",
+                "workflow_command_id": "successor-signal-command", "signal_id": "successor-signal"});
+        }
+    }
+    let applied = history
+        .iter()
+        .position(|event| event["event_type"] == "SignalApplied")
+        .unwrap();
+    history.insert(
+        applied,
+        successor_event("SignalReceived", "2026-11-03T00:05:01+00:00", json!({
+            "workflow_instance_id": instance, "workflow_run_id": run,
+            "workflow_command_id": "successor-signal-command", "signal_id": "successor-signal",
+            "signal_wait_id": "successor-wait", "signal_name": "ready"})),
+    );
+}
+
+#[test]
+fn redrive_successor_check_refuses_duplicate_or_contradictory_scalar_terminals() {
+    let mut admitted = Vec::new();
+    for shape in [
+        "remote-failed-completed",
+        "remote-completed-twice",
+        "local-failed-completed",
+        "local-completed-twice",
+        "timer-cancelled-fired",
+        "timer-fired-twice",
+        "untimed-signal-applied-twice",
+    ] {
+        let mut fixture = changed_successor(CANCELLATION_SUCCESSOR, |fixture| {
+            if shape.starts_with("timer") {
+                successor_timer_progress(fixture, "TimerFired");
+            } else if shape.starts_with("untimed-signal") {
+                successor_signal_progress(fixture);
+            } else {
+                later_step_cancellation(fixture, 4);
+                for event in fixture["history"].as_array_mut().unwrap() {
+                    if event["payload"]["sequence"] == 3
+                        && matches!(event["event_type"].as_str(), Some("ActivityScheduled" | "ActivityCompleted"))
+                    {
+                        event["payload"]["local_activity"] = json!(shape.starts_with("local"));
+                    }
+                }
+            }
+        });
+        check_redrive_successor(&fixture)
+            .unwrap_or_else(|error| panic!("single-terminal positive {shape}: {error}"));
+        let history = fixture["history"].as_array_mut().unwrap();
+        let terminal = history
+            .iter()
+            .position(|event| {
+                event["payload"]["sequence"] == 3
+                    && matches!(event["event_type"].as_str(), Some("ActivityCompleted" | "TimerFired" | "SignalApplied"))
+            })
+            .unwrap();
+        let duplicate = history[terminal].clone();
+        if shape.ends_with("failed-completed") {
+            history[terminal]["event_type"] = json!("ActivityFailed");
+            let payload = history[terminal]["payload"].as_object_mut().unwrap();
+            payload.remove("result");
+            payload.remove("payload_codec");
+            payload.insert("message".into(), json!("activity failed"));
+        } else if shape == "timer-cancelled-fired" {
+            history[terminal]["event_type"] = json!("TimerCancelled");
+        }
+        history.insert(terminal + 1, duplicate);
+        for (index, event) in history.iter_mut().enumerate() {
+            event["sequence"] = json!(index + 1);
+        }
+        if check_redrive_successor(&fixture).is_ok() {
+            admitted.push(shape);
+        }
+    }
+    assert!(admitted.is_empty(), "invalid terminal multiplicity admitted: {admitted:?}");
+}
+
 #[test]
 fn redrive_successor_check_rejects_impossible_histories() {
     let name = CANCELLATION_SUCCESSOR;
