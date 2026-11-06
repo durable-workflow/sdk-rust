@@ -29,56 +29,55 @@ fn child(sequence: u64, kind: &str, time: &str) -> Vec<HistoryEvent> {
 
 #[test]
 fn replay_now_child_completion_and_caught_failure_cold_replay_exact_times() {
-    let mut history = vec![start()];
-    history.extend(child(1, "ChildRunCompleted", CHILD_TIME));
-    history.extend(child(2, "ChildRunFailed", "2025-12-31T23:59:59.123456Z"));
-    let execute = || {
-        let ctx = context(history.clone());
-        let inner = ctx.clone();
-        let result = ready(
-            &ctx,
-            Box::pin(async move {
-                assert_eq!(read(&inner), START);
-                let result = inner
-                    .start_child_workflow(
-                        "clock-child",
-                        ChildWorkflowOptions::new("children"),
-                        json!([]),
-                    )
-                    .await?;
-                assert_eq!(result.child.run_id.as_deref(), Some("run-1"));
-                assert_eq!(result.result, json!("child-result"));
-                let completed = read(&inner);
-                assert_eq!(completed, read(&inner));
-                assert_eq!(completed, CHILD_TIME);
-                let Err(Error::ChildWorkflowFailed(failure)) = inner
-                    .start_child_workflow(
-                        "clock-child",
-                        ChildWorkflowOptions::new("children"),
-                        json!([]),
-                    )
-                    .await
-                else {
-                    panic!("expected the recorded child failure");
-                };
-                assert_eq!(failure.kind, ChildWorkflowFailureKind::Failed);
-                assert_eq!(failure.child_workflow_run_id.as_deref(), Some("run-2"));
-                Ok(AvroValue::from_serialize(
-                    &json!({"completed":completed,"failed":read(&inner)}),
-                )?)
-            }),
-        );
-        assert_eq!(ctx.state.lock().unwrap().command_cursor, 2);
-        assert!(ctx.take_commands().unwrap().is_empty());
-        assert!(ctx.replay_now().is_err());
-        result
-    };
-    let first = execute();
-    assert_eq!(first, execute());
-    assert_eq!(
-        first.into_json().unwrap()["failed"],
-        "2025-12-31T23:59:59.123456Z"
-    );
+    for failed_time in ["2025-12-31T23:59:59.123456Z", CHILD_TIME] {
+        let mut history = vec![start()];
+        history.extend(child(1, "ChildRunCompleted", CHILD_TIME));
+        history.extend(child(2, "ChildRunFailed", failed_time));
+        let execute = || {
+            let ctx = context(history.clone());
+            let inner = ctx.clone();
+            let result = ready(
+                &ctx,
+                Box::pin(async move {
+                    assert_eq!(read(&inner), START);
+                    let result = inner
+                        .start_child_workflow(
+                            "clock-child",
+                            ChildWorkflowOptions::new("children"),
+                            json!([]),
+                        )
+                        .await?;
+                    assert_eq!(result.child.run_id.as_deref(), Some("run-1"));
+                    assert_eq!(result.result, json!("child-result"));
+                    let completed = read(&inner);
+                    assert_eq!(completed, read(&inner));
+                    assert_eq!(completed, CHILD_TIME);
+                    let Err(Error::ChildWorkflowFailed(failure)) = inner
+                        .start_child_workflow(
+                            "clock-child",
+                            ChildWorkflowOptions::new("children"),
+                            json!([]),
+                        )
+                        .await
+                    else {
+                        panic!("expected the recorded child failure");
+                    };
+                    assert_eq!(failure.kind, ChildWorkflowFailureKind::Failed);
+                    assert_eq!(failure.child_workflow_run_id.as_deref(), Some("run-2"));
+                    Ok(AvroValue::from_serialize(
+                        &json!({"completed":completed,"failed":read(&inner)}),
+                    )?)
+                }),
+            );
+            assert_eq!(ctx.state.lock().unwrap().command_cursor, 2);
+            assert!(ctx.take_commands().unwrap().is_empty());
+            assert!(ctx.replay_now().is_err());
+            result
+        };
+        let first = execute();
+        assert_eq!(first, execute());
+        assert_eq!(first.into_json().unwrap()["failed"], failed_time);
+    }
 }
 
 #[test]
@@ -125,6 +124,7 @@ fn replay_now_child_missing_or_conflicting_identity_preserves_legacy_result_with
             for replacement in [
                 None,
                 Some(json!("foreign-child")),
+                Some(json!("")),
                 Some(Value::Null),
                 Some(json!(17)),
             ] {
