@@ -503,6 +503,7 @@ impl Future for NexusServiceCall {
                     Err(error) => return Poll::Ready(Err(error)),
                 }
             }
+            state.replay_clock.unavailable();
             state.command_cursor += 1;
             if !self.options.completion_wait() {
                 if let Some(admission) = call.admission {

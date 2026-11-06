@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 
 const FIXTURE_SCHEMA: &str = "durable-workflow.replay-regression/v1";
 
+#[path = "replay_regression_corpus/business_clock.rs"]
+mod business_clock;
+
 #[path = "replay_regression_corpus/redrive_successor_strictness.rs"]
 mod redrive_successor_strictness;
 
@@ -502,6 +505,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.redrive-successor-timer-cancellation"
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
+            | "corpus.business-replay-clock"
             | "corpus.nexus-result"
             | "corpus.nexus-cancellation"
     ) {
@@ -617,6 +621,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.business-replay-clock" => business_clock::register(&mut worker, workflow_type),
         "corpus.nexus-result" => {
             worker.register_workflow(workflow_type, |ctx, _| async move {
                 ctx.call_nexus_service("endpoint", "service", "operation", json!(["world"]))
@@ -1976,6 +1981,7 @@ fn redrive_successor_fixture_path(name: &str) -> PathBuf {
 
 /// The valid successor fixtures and the step each resumes at.
 const REDRIVE_SUCCESSOR_FIXTURES: &[(&str, u64)] = &[
+    ("business-replay-clock-consumed-boundaries.json", 3),
     ("redrive-successor-reused-markers.json", 4),
     ("redrive-successor-reused-timer.json", 3),
     ("redrive-successor-reused-cancellation-clock.json", 3),
