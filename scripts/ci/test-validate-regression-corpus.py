@@ -663,6 +663,23 @@ mod tests {
             for guard in guards
         ))
 
+    def test_condition_timeout_clock_module_requires_replay_evidence(self) -> None:
+        source = "src/replay_clock/condition_timeout.rs"
+        path = self.root / source
+        path.parent.mkdir(parents=True)
+        path.write_text("fn boundary() -> Option<usize> { Some(0) }\n", encoding="utf-8")
+        guards = REPOSITORY_POLICY["categories"]["replay"]["guards"]
+
+        def matches(guard: dict[str, object]) -> bool:
+            return VALIDATOR._guard_matches(self.root, "HEAD", {source}, guard)
+
+        self.assertFalse(any(matches(guard) for guard in guards if guard["glob"] != source))
+        self.assertTrue(any(matches(guard) for guard in guards))
+        self.assertFalse(any(
+            VALIDATOR._guard_matches(self.root, "HEAD", {"src/replay_clock/tests/condition_timeout.rs"}, guard)
+            for guard in guards
+        ))
+
     def test_parallel_activity_clock_module_requires_replay_evidence(self) -> None:
         source = "src/replay_clock/parallel_activity.rs"
         path = self.root / source

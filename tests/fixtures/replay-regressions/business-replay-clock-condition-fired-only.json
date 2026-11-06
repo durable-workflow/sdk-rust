@@ -1,0 +1,86 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-business-replay-clock-condition-fired-only",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.business-replay-clock-condition-timeout",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 1,
+        "condition_wait_id": "native-shaped-condition",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1",
+        "timeout_seconds": 30
+      },
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "sequence": 1
+    },
+    {
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 1,
+        "condition_wait_id": "native-shaped-condition",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1",
+        "timer_id": "native-shaped-timeout",
+        "timer_kind": "condition_timeout",
+        "delay_seconds": 30,
+        "fire_at": "2026-01-01T00:00:30.000000Z"
+      },
+      "recorded_at": "2026-01-01T00:00:00.000001Z",
+      "sequence": 2
+    },
+    {
+      "event_type": "TimerFired",
+      "payload": {
+        "sequence": 1,
+        "condition_wait_id": "native-shaped-condition",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1",
+        "timer_id": "native-shaped-timeout",
+        "timer_kind": "condition_timeout",
+        "delay_seconds": 30,
+        "fire_at": "2026-01-01T00:00:30.000000Z",
+        "fired_at": "2026-01-01T00:00:30.123456Z"
+      },
+      "recorded_at": "2026-01-01T00:00:30.654321Z",
+      "sequence": 3
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "entry_unavailable": true,
+      "result": "TimedOut",
+      "time": "2026-01-01T00:00:30.654321Z",
+      "unchanged_prefix": true
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "entry_unavailable": true,
+        "result": "TimedOut",
+        "time": "2026-01-01T00:00:30.654321Z",
+        "unchanged_prefix": true
+      }
+    }
+  ],
+  "worker_task": {
+    "workflow_id": "condition-fired-clock-parent",
+    "payload_codec": "avro"
+  }
+}
