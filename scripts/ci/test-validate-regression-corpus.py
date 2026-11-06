@@ -627,6 +627,25 @@ mod tests {
 
         self.assertTrue(self._guard_matches(REPLAY_GUARD))
 
+    def test_business_clock_module_requires_replay_evidence(self) -> None:
+        source = "src/replay_clock.rs"
+        (self.root / source).write_text(
+            "fn child_boundary(history: &[usize]) -> Option<usize> { history.last().copied() }\n",
+            encoding="utf-8",
+        )
+        guards = REPOSITORY_POLICY["categories"]["replay"]["guards"]
+
+        def matches(guard: dict[str, object]) -> bool:
+            return VALIDATOR._guard_matches(self.root, "HEAD", {source}, guard)
+
+        # Reproduce the original module-coverage gap with the predecessor set.
+        self.assertFalse(any(matches(guard) for guard in guards if guard["glob"] != source))
+        self.assertTrue(any(matches(guard) for guard in guards))
+        self.assertFalse(any(
+            VALIDATOR._guard_matches(self.root, "HEAD", {"src/replay_clock/tests/child.rs"}, guard)
+            for guard in guards
+        ))
+
     def test_history_fixture_in_unchanged_test_module_is_not_production_replay(self) -> None:
         diff = """\
 diff --git a/src/lib.rs b/src/lib.rs
