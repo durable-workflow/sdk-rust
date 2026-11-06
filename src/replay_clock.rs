@@ -15,6 +15,7 @@ use std::{
 mod condition;
 mod condition_timeout;
 mod parallel_activity;
+mod parallel_timer;
 
 thread_local! {
     static ACTIVE: RefCell<Option<Weak<Mutex<WorkflowState>>>> = const { RefCell::new(None) };
@@ -112,6 +113,7 @@ pub(super) struct Clock {
     time: Option<DateTime<Utc>>,
     boundaries: HashMap<u64, usize>,
     parallel_activities: parallel_activity::Members,
+    parallel_timers: parallel_timer::Members,
 }
 
 enum BoundaryKind {
@@ -405,6 +407,7 @@ impl Clock {
             time: start_time(history),
             boundaries,
             parallel_activities: parallel_activity::Members::new(history, commands),
+            parallel_timers: parallel_timer::Members::new(history, commands),
         }
     }
 
@@ -438,11 +441,16 @@ impl WorkflowState {
         self.replay_clock.time = if QUERY_REPLAY.with(Cell::get) {
             None
         } else {
-            self.replay_clock.parallel_activities.consumed_time(
-                &self.history_events,
-                sequences,
-                failed,
-            )
+            self.replay_clock
+                .parallel_activities
+                .consumed_time(&self.history_events, sequences, failed)
+                .or_else(|| {
+                    self.replay_clock.parallel_timers.consumed_time(
+                        &self.history_events,
+                        sequences,
+                        failed,
+                    )
+                })
         };
         self.advance_cancellation_sequences(sequences, failed);
     }
@@ -489,10 +497,11 @@ impl WorkflowContext {
     /// or invalid evidence returns [`Error::ReplayClockUnavailable`]. The clock
     /// is available only while this workflow's handler/future is executing.
     ///
-    /// This source cohort supports correlated scalar activity/timer/child/signal
-    /// results, persisted Activity all groups, and the explicit redrive start anchor. Ordinary start authority,
-    /// inline metadata/local completions and other grouped operation families
-    /// remain unavailable. Cancellation's existing budget clock is unchanged.
+    /// Supported boundaries are correlated scalar activity, timer, child, signal
+    /// and condition results, persisted Activity and Timer all groups, and the
+    /// explicit redrive start anchor. Ordinary start authority, inline metadata
+    /// and local completions, and other grouped families remain unavailable.
+    /// Cancellation's existing budget clock is unchanged.
     /// Migrate business decisions through normal workflow versioning. Event
     /// timestamps do not provide a total order; retain stream/counter identity.
     pub fn replay_now(&self) -> Result<DateTime<Utc>> {

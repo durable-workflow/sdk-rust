@@ -15,10 +15,10 @@ struct Member {
 #[derive(Debug)]
 pub(super) struct Members(HashMap<u64, Member>);
 
-fn all_activity(path: &[ParallelGroupMetadata]) -> bool {
+pub(super) fn all_path(path: &[ParallelGroupMetadata], kind: &str) -> bool {
     !path.is_empty()
         && path.iter().all(|entry| {
-            entry.parallel_group_kind == "activity"
+            entry.parallel_group_kind == kind
                 && entry
                     .parallel_group_mode
                     .as_deref()
@@ -110,7 +110,7 @@ pub(super) fn milliseconds(time: DateTime<Utc>) -> Option<i64> {
     Some((micros as f64 / 1000.0).round() as i64)
 }
 
-fn time(event: &HistoryEvent) -> Option<DateTime<Utc>> {
+pub(super) fn event_time(event: &HistoryEvent) -> Option<DateTime<Utc>> {
     match event.raw.get("recorded_at") {
         None | Some(Value::Null) => parse(event.raw.get("created_at")),
         present => parse(present),
@@ -139,7 +139,7 @@ impl Members {
                     else {
                         return None;
                     };
-                    if !all_activity(path) {
+                    if !all_path(path, "activity") {
                         return None;
                     }
                     member(history, events.get(sequence)?, *sequence, path)
@@ -178,13 +178,13 @@ impl Members {
                 return None;
             }
             if member.failed {
-                let ms = milliseconds(time(history.get(member.terminal?)?)?)?;
+                let ms = milliseconds(event_time(history.get(member.terminal?)?)?)?;
                 // Descriptor iteration retains the first member on a tie.
                 if failure.is_none_or(|(current, _)| ms < current) {
                     failure = Some((ms, *sequence));
                 }
             } else if failed.is_none() {
-                let time = time(history.get(member.terminal?)?)?;
+                let time = event_time(history.get(member.terminal?)?)?;
                 let ms = milliseconds(time)?;
                 if success.is_none_or(|(current, _)| ms > current) {
                     success = Some((ms, time));

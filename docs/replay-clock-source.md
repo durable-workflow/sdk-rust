@@ -26,6 +26,7 @@ counter identity to order emitted events.
 | Scalar persisted condition outcome | One ordered canonical wait open/resolution, matching physical wait, logical occurrence, explicit command counter, key/fingerprint and timeout definition | Consumed satisfied/timed-out resolution event time, preserving its precision; timer and scalar redrive helpers are not substituted |
 | Persisted remote Activity all group | Exact authored group/path and each consumed member lifecycle/type/sequence/execution identity | Core millisecond aggregate on success, full chosen precision; exact agreed failure at Core millisecond precision |
 | Persisted scalar condition timeout without explicit resolution | One canonical wait and its exact ordered schedule/fire pair, with complete identity/definition/counters and unique physical timer | Executor uses the fired event’s own `recorded_at`; Core query has no corresponding resolution authority |
+| Persisted plain Timer all group | Exact authored paths/counters and one matching schedule/fire per member, with unique physical timer IDs | Core consumed-group millisecond fold, first descriptor on ties, full selected event precision; no grouped query authority |
 | Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer/child/signal/condition correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
 | Replayed-instance query | Clock of the actual reconstructed workflow prefix, rather than a later visible row | Same scalar boundary rules; grouped executor aggregation is not query authority |
 | Direct update handler | Unique committed `UpdateAccepted` correlated to the handler's update ID | That event's validated time; missing/ambiguous acceptance is unavailable |
@@ -193,3 +194,19 @@ preserved. Grouped conditions, predicate-trigger retention and the separate PHP
 occurrence-carrier gap remain open, as do published/native conformance and
 release adoption. The corpus fixture is synthetic source evidence shaped from
 the immutable writer, not a claim that a native experiment ran.
+
+Persisted plain Timer `all` follows Core
+[`dispatchParallelTimer`](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/WorkflowExecutor.php#L2007).
+Each authored descriptor needs one ordered schedule/fire, matching nonempty timer
+ID, numeric command counters, delay and complete group path. Internal or unknown
+timer kinds, cancellation, duplicates, aliases or unsupported time evidence do
+not supply an aggregate. Nested all-timer paths preserve descriptor order.
+
+The fold uses the same measured Carbon comparator as Activity groups. It selects
+only consumed group members, keeps the first descriptor on a rounded-ms tie,
+and returns that member's full represented precision. Raw `recorded_at` or Core's
+represented `created_at` fallback supplies time; scalar reuse helpers and payload
+fired/deadline timestamps do not. Pending/empty behavior and grouped query
+unavailability retain the existing rules. Mixed groups and other group families
+remain outside this bounded source mapping. No marker, wire or producer change
+is introduced, and no installed/native or published conformance is inferred.
