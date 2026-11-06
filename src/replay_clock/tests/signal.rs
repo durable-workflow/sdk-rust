@@ -211,7 +211,7 @@ fn replay_now_signal_time_and_reuse_do_not_borrow_unrelated_authority() {
 }
 
 #[test]
-fn replay_now_signal_ambiguous_order_payload_and_timed_shapes_are_unavailable() {
+fn replay_now_signal_ambiguous_order_payload_and_invalid_timeout_are_unavailable() {
     let mut history = signal(1, SIGNAL_TIME);
     history.swap(0, 1);
     assert!(observe(history)["time"].is_null());
@@ -221,7 +221,7 @@ fn replay_now_signal_ambiguous_order_payload_and_timed_shapes_are_unavailable() 
         assert!(observe(history)["time"].is_null());
     }
     let mut history = signal(1, SIGNAL_TIME);
-    history[0].payload["timeout_seconds"] = json!(5);
+    history[0].payload["timeout_seconds"] = json!("5");
     assert!(observe(history)["time"].is_null());
     let mut history = signal(1, SIGNAL_TIME);
     history[1].payload.as_object_mut().unwrap().remove("value");
@@ -345,3 +345,5 @@ async fn replay_now_signal_queries_use_the_selected_existing_prefix() {
     }
     assert!(snapshot_time(&history, DEFAULT_CODEC).is_none());
 }
+
+mod timed;

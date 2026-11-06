@@ -22,13 +22,13 @@ counter identity to order emitted events.
 | Scalar remote activity | Existing validated command sequence/type/result correlation, then the selected terminal event | Selected recorded time; successful redrive reuse retains `reused_recorded_at`; the existing Core failure branch uses its event time |
 | Scalar plain timer | Existing validated `TimerScheduled`/`TimerFired` pair, exact sequence/ID/delay | Matched fire time, with recorded reuse provenance |
 | Scalar child result | One schedule, optional start and unique parent `ChildRunCompleted` / `ChildRunFailed` / `ChildRunCancelled` / `ChildRunTerminated`, with matching nonempty child call, instance, run and type identities | Parent resolution event time for both send and throw; child `closed_at` and `reused_recorded_at` are not this branch's clock authority |
-| Scalar persisted signal delivery | One untimed `SignalWaitOpened` followed by a unique `SignalApplied`, matching nonempty wait ID/name and explicit command sequence, with the persisted value consumed | Applied event time, preserving valid `reused_recorded_at` exactly as Core signal resume does |
+| Scalar persisted signal delivery | One `SignalWaitOpened` followed by a unique `SignalApplied`, matching nonempty wait ID/name and explicit command sequence, with the persisted value consumed. A configured timeout requires valid numeric metadata and either no scheduled timer or the exact ordered schedule/cancel pair | Applied event time, preserving valid `reused_recorded_at` exactly as Core signal resume does |
 | Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer/child/signal correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
 | Replayed-instance query | Clock of the actual reconstructed workflow prefix, rather than a later visible row | Same supported boundary rules |
 | Direct update handler | Unique committed `UpdateAccepted` correlated to the handler's update ID | That event's validated time; missing/ambiguous acceptance is unavailable |
 | Executor condition predicate | Current executor exposes a full signal/update view without retaining the exact triggering consumed prefix | Unavailable inside the predicate; enclosing workflow scope is restored on return/error |
 | Inline side effect/version/memo/search/local result | User code can resume before its event is persisted | Unavailable on first execution and the corresponding cold path in this cohort; no implicit marker/yield/fence |
-| Condition result, timed signal wait, grouped/selection/Nexus or cancellation callback | Their dedicated clock algorithms are outside this initial cohort | Explicitly unavailable; existing execution/cancellation behavior remains intact |
+| Condition result, signal timeout result, grouped/selection/Nexus or cancellation callback | Their dedicated clock algorithms are outside this initial cohort | Explicitly unavailable; existing execution/cancellation behavior remains intact |
 
 The mutable workflow clock is bound only during handler construction and each
 future poll. A separate execution-local guard restores its predecessor on
@@ -85,8 +85,8 @@ which supplies `RedriveReplayClock::recordedAt` for the matched `SignalApplied`.
 Rust consumes that recorded wait by command sequence and signal name. Business
 time additionally requires matching nonempty persisted wait IDs and explicit
 numeric command counters, the canonical persisted value, one ordered open/apply
-pair and no timed-wait evidence. Missing/conflicting identity, duplicate/order
-ambiguity, invalid/missing time or a timed wait leaves time unavailable while
+pair. Missing/conflicting identity, duplicate/order
+ambiguity or invalid/missing time leaves time unavailable while
 preserving existing signal results, commands and cancellation behavior.
 
 A visible `SignalReceived` is not application. Neither an unconsumed future row
@@ -96,3 +96,16 @@ fallback; this cohort does not invent that authority for Rust or read a mutable
 projection as persisted time. No new observation envelope, event, wire field,
 marker, RPC or inline persistence fence is introduced. Reconstructed/snapshot
 queries retain the existing actually consumed/inspected prefix rules.
+
+Successful scalar timed waits follow the same consumed applied boundary. At
+[Core `ce24207e`](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/WorkflowExecutor.php#L1341),
+a signal already pending at the call may win even a zero timeout without a
+timer. A parked wait instead records open, schedule, cancel, then apply.
+[`TimerCancellation::record`](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/TimerCancellation.php#L55)
+preserves the scheduled timeout's ID, kind, wait/name, sequence, delay and fire
+time. Rust requires that complete ordered identity, consistent numeric timeout
+and valid cancellation metadata. Timer timestamps never replace the selected
+applied event's time. Missing, mismatched, duplicate, fired, grouped or otherwise
+ambiguous timeout evidence leaves business time unavailable while preserving
+legacy signal results. A timeout-only history remains outside this cohort, as do
+task-only and received-event resume paths. No timeout API or wire field is added.

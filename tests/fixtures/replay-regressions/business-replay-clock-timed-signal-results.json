@@ -1,0 +1,147 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-business-replay-clock-timed-signal-results",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.business-replay-clock-signal",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "payload": {
+        "workflow_type": "corpus.business-replay-clock-signal"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "sequence": 2,
+      "event_type": "SignalWaitOpened",
+      "payload": {
+        "sequence": 1,
+        "signal_name": "ready",
+        "signal_wait_id": "clock-signal-wait-1",
+        "timeout_seconds": 0
+      },
+      "recorded_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "sequence": 3,
+      "event_type": "SignalApplied",
+      "payload": {
+        "sequence": 1,
+        "signal_name": "ready",
+        "signal_wait_id": "clock-signal-wait-1",
+        "workflow_command_id": "clock-signal-command-1",
+        "signal_id": "clock-signal-1",
+        "value": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwoKR3JhY2U="
+        }
+      },
+      "recorded_at": "2026-01-01T00:00:05.654321Z"
+    },
+    {
+      "sequence": 4,
+      "event_type": "SignalWaitOpened",
+      "payload": {
+        "sequence": 2,
+        "signal_name": "ready",
+        "signal_wait_id": "clock-signal-wait-2",
+        "timeout_seconds": 30
+      },
+      "recorded_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 2,
+        "signal_name": "ready",
+        "signal_wait_id": "clock-signal-wait-2",
+        "timer_id": "clock-signal-timeout-2",
+        "timer_kind": "signal_timeout",
+        "delay_seconds": 30,
+        "fire_at": "2026-01-01T00:00:30Z"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "sequence": 5
+    },
+    {
+      "event_type": "TimerCancelled",
+      "payload": {
+        "sequence": 2,
+        "signal_name": "ready",
+        "signal_wait_id": "clock-signal-wait-2",
+        "timer_id": "clock-signal-timeout-2",
+        "timer_kind": "signal_timeout",
+        "delay_seconds": 30,
+        "fire_at": "2026-01-01T00:00:30Z",
+        "cancelled_at": "2026-01-01T00:00:03.123456Z"
+      },
+      "recorded_at": "2026-01-01T00:00:03.123456Z",
+      "sequence": 6
+    },
+    {
+      "sequence": 7,
+      "event_type": "SignalApplied",
+      "payload": {
+        "sequence": 2,
+        "signal_name": "ready",
+        "signal_wait_id": "clock-signal-wait-2",
+        "workflow_command_id": "clock-signal-command-2",
+        "signal_id": "clock-signal-2",
+        "value": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwoKR3JhY2U="
+        }
+      },
+      "recorded_at": "2026-01-01T00:00:03.123456Z"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "entry_unavailable": true,
+      "first_time": "2026-01-01T00:00:05.654321Z",
+      "second_time": "2026-01-01T00:00:03.123456Z",
+      "unchanged_prefix": true,
+      "arguments": [
+        [
+          "Grace"
+        ],
+        [
+          "Grace"
+        ]
+      ]
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "entry_unavailable": true,
+        "first_time": "2026-01-01T00:00:05.654321Z",
+        "second_time": "2026-01-01T00:00:03.123456Z",
+        "unchanged_prefix": true,
+        "arguments": [
+          [
+            "Grace"
+          ],
+          [
+            "Grace"
+          ]
+        ]
+      }
+    }
+  ],
+  "worker_task": {
+    "workflow_id": "signal-clock-parent",
+    "payload_codec": "avro"
+  }
+}
