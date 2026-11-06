@@ -24,8 +24,9 @@ counter identity to order emitted events.
 | Scalar child result | One schedule, optional start and unique parent `ChildRunCompleted` / `ChildRunFailed` / `ChildRunCancelled` / `ChildRunTerminated`, with matching nonempty child call, instance, run and type identities | Parent resolution event time for both send and throw; child `closed_at` and `reused_recorded_at` are not this branch's clock authority |
 | Scalar persisted signal delivery | One `SignalWaitOpened` followed by a unique `SignalApplied`, matching nonempty wait ID/name and explicit command sequence, with the persisted value consumed. A configured timeout requires valid numeric metadata and either no scheduled timer or the exact ordered schedule/cancel pair | Applied event time, preserving valid `reused_recorded_at` exactly as Core signal resume does |
 | Scalar persisted condition outcome | One ordered canonical wait open/resolution, matching physical wait, logical occurrence, explicit command counter, key/fingerprint and timeout definition | Consumed satisfied/timed-out resolution event time, preserving its precision; timer and scalar redrive helpers are not substituted |
-| Persisted remote Activity all group | Exact authored group/path and each consumed member lifecycle/type/sequence/execution identity | Core millisecond aggregate on success, full chosen precision; exact agreed failure at Core millisecond precision |
+| Persisted remote Activity all group | Exact authored group/path and each consumed member lifecycle/type/sequence/execution identity | Canonical v1 millisecond aggregate on success, full chosen precision; exact agreed failure at v1 millisecond precision |
 | Persisted scalar condition timeout without explicit resolution | One canonical wait and its exact ordered schedule/fire pair, with complete identity/definition/counters and unique physical timer | Executor uses the fired event’s own `recorded_at`; Core query has no corresponding resolution authority |
+| Persisted plain Timer all group | Exact authored paths/counters and one matching schedule/fire per member, with unique physical timer IDs | Canonical v1 consumed-group millisecond fold, first descriptor on ties, full selected event precision; no grouped query authority |
 | Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer/child/signal/condition correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
 | Replayed-instance query | Clock of the actual reconstructed workflow prefix, rather than a later visible row | Same scalar boundary rules; grouped executor aggregation is not query authority |
 | Direct update handler | Unique committed `UpdateAccepted` correlated to the handler's update ID | That event's validated time; missing/ambiguous acceptance is unavailable |
@@ -141,7 +142,7 @@ execution identity and complete matching group path. Nested all-activity paths
 retain authored descriptor order. Duplicate or ambiguous evidence preserves
 legacy results but cannot supply time.
 
-Success folds members in that order, comparing Carbon milliseconds and replacing
+Success folds members in that order, comparing canonical v1 milliseconds and replacing
 only on a strictly greater value. The first descriptor wins an equal-millisecond
 tie, retaining its full recorded microsecond precision. Each consumed success
 must have represented `recorded_at` or Core's actual `created_at` fallback.
@@ -150,8 +151,8 @@ unrepresented activity row never supply authority. Empty groups add no boundary;
 pending groups and other operation families have no aggregate clock here.
 
 Failure preserves Rust's existing lowest-member exception. Time is available
-only when that member also wins Core's earliest-millisecond/member-index rule;
-it is reconstructed with Core's millisecond precision. Conflicting multifailure
+only when that member also wins the canonical v1 earliest-millisecond/member-index rule;
+it is reconstructed with canonical v1 millisecond precision. Conflicting multifailure
 selection remains the [OPEN compatibility/versioning proposal](https://github.com/durable-workflow/.github/issues/215#issuecomment-6677866585),
 without rewriting legacy outcomes. Grouped snapshot and reconstructed-query time
 remain unavailable: Core's successful query group-send supplies no aggregate.
@@ -160,12 +161,12 @@ A later consumed supported scalar boundary can establish query time again.
 The measured reference in `tests/fixtures/replay-clock-carbon-reference.json`
 uses PHP 8.4.27 and Carbon 3.15.1 at `ce0e5636`. Its
 `Timestamp.php` SHA-256 is `57b2a235656f8edad7c333087a64e45491adaaf1b01ac9c40e53185b73db356d`.
-`getTimestampMs()` rounds to nearest milliseconds, with halfway values away from
-zero, including negative epochs. `createFromTimestampMs()` reconstructs those
-milliseconds. The clock accepts persisted microseconds within the exact float
-microsecond range used by that comparator; finer or out-of-range evidence stays
-unavailable. Reference vectors cover positive/negative epochs, 499/500/501
-microsecond edges, equal-millisecond candidates and timezone-equivalent instants.
+These are attributed legacy PHP 8.4/Carbon measurements, not a portable numeric
+contract. The same Carbon version can produce different rounding results under
+other PHP runtimes. Their original inputs and outputs remain unchanged.
+The separately labeled `tests/fixtures/replay-clock-canonical-v1.json` defines
+the new accessor's exact integer rule. Historical source qualifications are
+retained with their stated scope; they are not universal Core parity evidence.
 
 The persisted fired-only condition-timeout cohort follows Core
 [`resumeTimedOutCondition`](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/WorkflowExecutor.php#L895).
@@ -193,3 +194,43 @@ preserved. Grouped conditions, predicate-trigger retention and the separate PHP
 occurrence-carrier gap remain open, as do published/native conformance and
 release adoption. The corpus fixture is synthetic source evidence shaped from
 the immutable writer, not a claim that a native experiment ran.
+
+Persisted plain Timer `all` follows Core
+[`dispatchParallelTimer`](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/WorkflowExecutor.php#L2007).
+Each authored descriptor needs one ordered schedule/fire, matching nonempty timer
+ID, numeric command counters, delay and complete group path. Internal or unknown
+timer kinds, cancellation, duplicates, aliases or unsupported time evidence do
+not supply an aggregate. Nested all-timer paths preserve descriptor order.
+
+The fold uses the same canonical v1 integer comparator as Activity groups. It selects
+only consumed group members, keeps the first descriptor on a rounded-ms tie,
+and returns that member's full represented precision. Raw `recorded_at` or Core's
+represented `created_at` fallback supplies time; scalar reuse helpers and payload
+fired/deadline timestamps do not. Pending/empty behavior and grouped query
+unavailability retain the existing rules. Mixed groups and other group families
+remain outside this bounded source mapping. No marker, wire or producer change
+is introduced, and no installed/native or published conformance is inferred.
+
+The unreleased accessor's [canonical v1 numeric decision](https://github.com/durable-workflow/.github/issues/215#issuecomment-6679568700)
+uses an authoritative instant's exact signed UTC microsecond count `U`:
+`M = sign(U) * ((abs(U) + 500) div 1000)`. All operations are checked integers;
+there is no float conversion or runtime `round()`. A half millisecond rounds
+away from zero on both sides of the epoch. Unsupported precision or overflow
+is unavailable. This removes the earlier source implementation's float-range
+restriction for valid representable instants, without changing scalar event
+times or rewriting legacy group results, selected errors, cancellation or history.
+
+Success still compares only validated consumed authored members, preserves the
+first member on an equal `M`, and returns that member's original full-precision
+instant. Qualified failure reconstruction uses the selected integer `M` only
+when it agrees with the unchanged legacy winner. The multi-failure policy gap
+remains OPEN. The canonical table covers signed boundaries, offsets and large
+representable dates; a new real worker fixture independently contrasts the old
+source's unavailable large epochs against the exact v1 result.
+
+Core remains the identity/boundary/order reference. Existing Core legacy
+`Workflow::now()` values are unchanged and are not claimed numerically equivalent
+on every supported PHP runtime. A matching explicitly versioned additive-clock
+source/context on Core and published cross-SDK conformance remain required.
+Adoption uses ordinary workflow versioning. No automatic marker, run mutation,
+new public API name, live wire advertisement or release is introduced here.

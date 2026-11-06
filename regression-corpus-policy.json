@@ -80,6 +80,12 @@
         },
         {
           "glob": "src/replay_clock/condition_timeout.rs"
+        },
+        {
+          "glob": "src/replay_clock/parallel_timer.rs"
+        },
+        {
+          "glob": "src/replay_clock/parallel.rs"
         }
       ]
     }

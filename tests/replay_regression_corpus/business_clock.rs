@@ -159,3 +159,12 @@ pub(super) fn register_condition_timeout(worker: &mut Worker, workflow_type: &st
         }))
     });
 }
+
+pub(super) fn register_parallel_timer(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let entry_unavailable=ctx.replay_now().is_err();
+        let values=ctx.parallel(vec![ParallelOperation::timer(Duration::from_secs(1)),ParallelOperation::timer(Duration::from_secs(1))]).await?;
+        let time=ctx.replay_now().ok();
+        Ok(json!({"entry_unavailable":entry_unavailable,"members":values.len(),"time":time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),"unchanged_prefix":time.is_some() && time==ctx.replay_now().ok()}))
+    });
+}

@@ -214,7 +214,7 @@ fn replay_now_group_requires_all_success_times_and_never_substitutes_other_autho
         observe(history, false)["time"],
         json!("2026-01-01T00:00:10.123456Z")
     );
-    for time in ["2500-01-01T00:00:00Z", "2026-01-01T00:00:00.123456789Z"] {
+    for time in ["2026-01-01T00:00:00.123456789Z"] {
         assert!(
             observe(group(1, ["ActivityCompleted"; 2], [time; 2], false), false)["time"].is_null()
         );
@@ -299,6 +299,8 @@ async fn replay_now_group_query_does_not_borrow_executor_aggregate() {
 
 #[test]
 fn replay_now_group_carbon_reference_matches_measured_rounding_and_reconstruction() {
+    // These attributed PHP 8.4/Carbon observations coincide with v1 on these
+    // inputs. They are not universal runtime or producer-context authority.
     let reference: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/replay-clock-carbon-reference.json"
     ))
@@ -307,7 +309,7 @@ fn replay_now_group_carbon_reference_matches_measured_rounding_and_reconstructio
         let time = DateTime::parse_from_rfc3339(row["input"].as_str().unwrap())
             .unwrap()
             .with_timezone(&Utc);
-        let ms = super::super::parallel_activity::milliseconds(time).unwrap();
+        let ms = super::super::parallel::milliseconds(time).unwrap();
         assert_eq!(json!(ms), row["milliseconds"]);
         assert_eq!(
             DateTime::<Utc>::from_timestamp_millis(ms)
