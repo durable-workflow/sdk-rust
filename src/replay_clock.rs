@@ -7,32 +7,46 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
 };
 
 mod condition;
+mod parallel_activity;
 
 thread_local! {
     static ACTIVE: RefCell<Option<Weak<Mutex<WorkflowState>>>> = const { RefCell::new(None) };
+    static QUERY_REPLAY: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) struct Guard(Option<Weak<Mutex<WorkflowState>>>);
+pub(super) struct Guard(Option<Weak<Mutex<WorkflowState>>>, bool);
 
 impl Guard {
     pub(super) fn enter(context: &WorkflowContext) -> Self {
-        Self(ACTIVE.with(|active| active.replace(Some(Arc::downgrade(&context.state)))))
+        Self::scope(Some(Arc::downgrade(&context.state)), false)
+    }
+
+    pub(super) fn query(context: &WorkflowContext) -> Self {
+        Self::scope(Some(Arc::downgrade(&context.state)), true)
     }
 
     pub(super) fn unavailable() -> Self {
-        Self(ACTIVE.with(|active| active.replace(None)))
+        Self::scope(None, false)
+    }
+
+    fn scope(context: Option<Weak<Mutex<WorkflowState>>>, query: bool) -> Self {
+        Self(
+            ACTIVE.with(|active| active.replace(context)),
+            QUERY_REPLAY.with(|active| active.replace(query)),
+        )
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.replace(self.0.take()));
+        QUERY_REPLAY.with(|active| active.set(self.1));
     }
 }
 
@@ -76,6 +90,7 @@ fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
 pub(super) struct Clock {
     time: Option<DateTime<Utc>>,
     boundaries: HashMap<u64, usize>,
+    parallel_activities: parallel_activity::Members,
 }
 
 enum BoundaryKind {
@@ -365,6 +380,7 @@ impl Clock {
         Self {
             time: start_time(history),
             boundaries,
+            parallel_activities: parallel_activity::Members::new(history, commands),
         }
     }
 
@@ -393,7 +409,17 @@ impl WorkflowState {
     }
 
     pub(super) fn consume_replay_group(&mut self, sequences: &[u64], failed: Option<u64>) {
-        self.replay_clock.unavailable();
+        // Core's query group-send branch supplies no aggregate time. Do not
+        // transfer executor authority into reconstructed query execution.
+        self.replay_clock.time = if QUERY_REPLAY.with(Cell::get) {
+            None
+        } else {
+            self.replay_clock.parallel_activities.consumed_time(
+                &self.history_events,
+                sequences,
+                failed,
+            )
+        };
         self.advance_cancellation_sequences(sequences, failed);
     }
 
@@ -448,8 +474,8 @@ impl WorkflowContext {
     /// is available only while this workflow's handler/future is executing.
     ///
     /// This source cohort supports correlated scalar activity/timer/child/signal
-    /// results and the explicit redrive start anchor. Ordinary start authority,
-    /// inline metadata/local completions and grouped/other operation families
+    /// results, persisted Activity all groups, and the explicit redrive start anchor. Ordinary start authority,
+    /// inline metadata/local completions and other grouped operation families
     /// remain unavailable. Cancellation's existing budget clock is unchanged.
     /// Migrate business decisions through normal workflow versioning. Event
     /// timestamps do not provide a total order; retain stream/counter identity.
