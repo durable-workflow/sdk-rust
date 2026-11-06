@@ -357,11 +357,9 @@ impl Clock {
                 boundaries.insert(sequence, index);
             }
         }
-        for (sequence, indices) in conditions {
-            if let Some(index) = condition::boundary(history, &indices, sequence) {
-                boundaries.insert(sequence, index);
-            }
-        }
+        boundaries.extend(conditions.into_iter().filter_map(|(sequence, indices)| {
+            condition::boundary(history, &indices, sequence).map(|index| (sequence, index))
+        }));
         // Index identities once. Timestamps are read only when that boundary
         // is actually consumed, never by scanning ahead from the accessor.
         Self {
