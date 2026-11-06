@@ -67,3 +67,20 @@ pub(super) fn register_child(worker: &mut Worker, workflow_type: &str) {
         }))
     });
 }
+
+pub(super) fn register_signal(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let entry_unavailable = ctx.replay_now().is_err();
+        let first_arguments = ctx.wait_signal("ready").await?;
+        let first_time = ctx.replay_now().ok();
+        let second_arguments = ctx.wait_signal("ready").await?;
+        let second_time = ctx.replay_now().ok();
+        Ok(json!({
+            "entry_unavailable":entry_unavailable,
+            "first_time":first_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "second_time":second_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "unchanged_prefix":second_time.is_some() && second_time==ctx.replay_now().ok(),
+            "arguments":[first_arguments,second_arguments],
+        }))
+    });
+}

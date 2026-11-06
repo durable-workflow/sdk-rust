@@ -515,3 +515,4 @@ async fn replay_now_reconstructed_query_uses_consumed_prefix_not_snapshot_tail()
 }
 
 mod child;
+mod signal;

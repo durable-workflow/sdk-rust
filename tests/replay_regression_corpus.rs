@@ -507,6 +507,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.activity-policy-author"
             | "corpus.business-replay-clock"
             | "corpus.business-replay-clock-child"
+            | "corpus.business-replay-clock-signal"
             | "corpus.nexus-result"
             | "corpus.nexus-cancellation"
     ) {
@@ -623,6 +624,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     }
     match workflow_type {
         "corpus.business-replay-clock" => business_clock::register(&mut worker, workflow_type),
+        "corpus.business-replay-clock-signal" => {
+            business_clock::register_signal(&mut worker, workflow_type)
+        }
         "corpus.business-replay-clock-child" => {
             business_clock::register_child(&mut worker, workflow_type)
         }
