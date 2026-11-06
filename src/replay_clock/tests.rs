@@ -513,3 +513,5 @@ async fn replay_now_reconstructed_query_uses_consumed_prefix_not_snapshot_tail()
         json!("2026-01-01T00:00:03.765432Z")
     );
 }
+
+mod child;

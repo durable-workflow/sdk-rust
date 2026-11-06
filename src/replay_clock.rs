@@ -76,6 +76,54 @@ pub(super) struct Clock {
     boundaries: HashMap<u64, usize>,
 }
 
+enum BoundaryKind {
+    Activity,
+    Timer,
+    Child,
+}
+
+fn child_boundary(history: &[HistoryEvent], indices: &[usize]) -> Option<usize> {
+    // A scalar call has one schedule, an optional start, then one resolution.
+    // Legacy replay can accept duplicate payloads, but their time is ambiguous.
+    let (&scheduled, &terminal) = match indices {
+        [scheduled, terminal] => (scheduled, terminal),
+        [scheduled, started, terminal] if history[*started].event_type == "ChildRunStarted" => {
+            (scheduled, terminal)
+        }
+        _ => return None,
+    };
+    let schedule = &history[scheduled];
+    if schedule.event_type != "ChildWorkflowScheduled"
+        || !matches!(
+            history[terminal].event_type.as_str(),
+            "ChildRunCompleted" | "ChildRunFailed" | "ChildRunCancelled" | "ChildRunTerminated"
+        )
+    {
+        return None;
+    }
+    for key in [
+        "child_call_id",
+        "child_workflow_instance_id",
+        "child_workflow_run_id",
+        "child_workflow_type",
+    ] {
+        let identity = schedule
+            .payload
+            .get(key)?
+            .as_str()
+            .filter(|id| !id.is_empty())?;
+        if indices
+            .iter()
+            .any(|&index| history[index].payload.get(key).and_then(Value::as_str) != Some(identity))
+        {
+            // Changed-run retry/continuation needs its own lineage algorithm.
+            // Missing identities keep legacy result handling, without time.
+            return None;
+        }
+    }
+    Some(terminal)
+}
+
 impl Clock {
     pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
         let supported: HashMap<_, _> = commands
@@ -87,7 +135,7 @@ impl Clock {
                     parallel_group_path,
                     ..
                 } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, true))
+                    Some((*sequence, BoundaryKind::Activity))
                 }
                 RecordedCommand::Timer {
                     sequence,
@@ -95,29 +143,53 @@ impl Clock {
                     parallel_group_path,
                     ..
                 } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, false))
+                    Some((*sequence, BoundaryKind::Timer))
+                }
+                RecordedCommand::ChildWorkflow {
+                    sequence,
+                    outcome: Some(_),
+                    parallel_group_path,
+                    ..
+                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+                    Some((*sequence, BoundaryKind::Child))
                 }
                 _ => None,
             })
             .collect();
         let mut boundaries = HashMap::new();
+        let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, event) in history.iter().enumerate() {
             let Some(sequence) = durable_event_sequence(event) else {
                 continue;
             };
             let matched = match supported.get(&sequence) {
-                Some(true) => matches!(
+                Some(BoundaryKind::Activity) => matches!(
                     event.event_type.as_str(),
                     "ActivityCompleted"
                         | "ActivityFailed"
                         | "ActivityTimedOut"
                         | "ActivityCancelled"
                 ),
-                Some(false) => event.event_type == "TimerFired" && !is_internal_timer_event(event),
+                Some(BoundaryKind::Timer) => {
+                    event.event_type == "TimerFired" && !is_internal_timer_event(event)
+                }
+                Some(BoundaryKind::Child) => {
+                    if event.event_type == "ChildWorkflowScheduled"
+                        || event.event_type.starts_with("ChildRun")
+                    {
+                        children.entry(sequence).or_default().push(index);
+                    }
+                    false
+                }
                 None => false,
             };
             if matched {
                 boundaries.entry(sequence).or_insert(index);
+            }
+        }
+        for (sequence, indices) in children {
+            if let Some(index) = child_boundary(history, &indices) {
+                boundaries.insert(sequence, index);
             }
         }
         // Index identities once. Timestamps are read only when that boundary
@@ -207,7 +279,7 @@ impl WorkflowContext {
     /// or invalid evidence returns [`Error::ReplayClockUnavailable`]. The clock
     /// is available only while this workflow's handler/future is executing.
     ///
-    /// This initial source cohort supports correlated scalar activity/timer
+    /// This source cohort supports correlated scalar activity/timer/child
     /// results and the explicit redrive start anchor. Ordinary start authority,
     /// inline metadata/local completions and grouped/other operation families
     /// remain unavailable. Cancellation's existing budget clock is unchanged.
@@ -247,6 +319,10 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
             | "ActivityTimedOut"
             | "ActivityCancelled"
             | "TimerFired"
+            | "ChildRunCompleted"
+            | "ChildRunFailed"
+            | "ChildRunCancelled"
+            | "ChildRunTerminated"
     ) {
         return None;
     }

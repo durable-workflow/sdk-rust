@@ -1,0 +1,107 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-business-replay-clock-child-results",
+  "protocol_version": "1.19",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.business-replay-clock-child",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "payload": {
+        "workflow_type": "corpus.business-replay-clock-child"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "sequence": 2,
+      "event_type": "ChildWorkflowScheduled",
+      "payload": {
+        "sequence": 1,
+        "child_call_id": "clock-call-1",
+        "child_workflow_instance_id": "clock-child-1",
+        "child_workflow_run_id": "clock-child-run-1",
+        "child_workflow_type": "clock-child"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "sequence": 3,
+      "event_type": "ChildRunCompleted",
+      "payload": {
+        "sequence": 1,
+        "child_call_id": "clock-call-1",
+        "child_workflow_instance_id": "clock-child-1",
+        "child_workflow_run_id": "clock-child-run-1",
+        "child_workflow_type": "clock-child",
+        "result": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwoQcmVjb3JkZWQ="
+        }
+      },
+      "recorded_at": "2026-01-01T00:00:05.654321Z"
+    },
+    {
+      "sequence": 4,
+      "event_type": "ChildWorkflowScheduled",
+      "payload": {
+        "sequence": 2,
+        "child_call_id": "clock-call-2",
+        "child_workflow_instance_id": "clock-child-2",
+        "child_workflow_run_id": "clock-child-run-2",
+        "child_workflow_type": "clock-child"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "sequence": 5,
+      "event_type": "ChildRunFailed",
+      "payload": {
+        "sequence": 2,
+        "child_call_id": "clock-call-2",
+        "child_workflow_instance_id": "clock-child-2",
+        "child_workflow_run_id": "clock-child-run-2",
+        "child_workflow_type": "clock-child",
+        "message": "recorded child failure",
+        "failure_id": "clock-child-failure",
+        "failure_category": "child_workflow"
+      },
+      "recorded_at": "2026-01-01T00:00:03.123456Z"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "entry_unavailable": true,
+      "completed": "2026-01-01T00:00:05.654321Z",
+      "failed": "2026-01-01T00:00:03.123456Z",
+      "unchanged_prefix": true,
+      "result": "recorded",
+      "failure_reason": "child_workflow"
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "entry_unavailable": true,
+        "completed": "2026-01-01T00:00:05.654321Z",
+        "failed": "2026-01-01T00:00:03.123456Z",
+        "unchanged_prefix": true,
+        "result": "recorded",
+        "failure_reason": "child_workflow"
+      }
+    }
+  ],
+  "worker_task": {
+    "workflow_id": "child-clock-parent",
+    "payload_codec": "avro"
+  }
+}
