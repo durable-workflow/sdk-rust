@@ -86,6 +86,9 @@
         },
         {
           "glob": "src/replay_clock/parallel.rs"
+        },
+        {
+          "glob": "src/replay_clock/parallel_child.rs"
         }
       ]
     }

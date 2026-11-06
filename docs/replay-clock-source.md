@@ -27,6 +27,7 @@ counter identity to order emitted events.
 | Persisted remote Activity all group | Exact authored group/path and each consumed member lifecycle/type/sequence/execution identity | Canonical v1 millisecond aggregate on success, full chosen precision; exact agreed failure at v1 millisecond precision |
 | Persisted scalar condition timeout without explicit resolution | One canonical wait and its exact ordered schedule/fire pair, with complete identity/definition/counters and unique physical timer | Executor uses the fired event’s own `recorded_at`; Core query has no corresponding resolution authority |
 | Persisted plain Timer all group | Exact authored paths/counters and one matching schedule/fire per member, with unique physical timer IDs | Canonical v1 consumed-group millisecond fold, first descriptor on ties, full selected event precision; no grouped query authority |
+| Persisted Child all group | Exact authored paths/counters, one parent schedule, optional start and at most one resolution per canonical child call | Parent resolution `recorded_at` or represented `created_at`, using the same canonical v1 success/failure fold; distinct calls may reuse one child run |
 | Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer/child/signal/condition correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
 | Replayed-instance query | Clock of the actual reconstructed workflow prefix, rather than a later visible row | Same scalar boundary rules; grouped executor aggregation is not query authority |
 | Direct update handler | Unique committed `UpdateAccepted` correlated to the handler's update ID | That event's validated time; missing/ambiguous acceptance is unavailable |
@@ -234,3 +235,24 @@ on every supported PHP runtime. A matching explicitly versioned additive-clock
 source/context on Core and published cross-SDK conformance remain required.
 Adoption uses ordinary workflow versioning. No automatic marker, run mutation,
 new public API name, live wire advertisement or release is introduced here.
+
+
+Persisted Child `all` uses [Core's parent-resolution branch](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/WorkflowExecutor.php#L2403).
+Only the group actually consumed by the existing Rust parallel call participates.
+The child call, instance, run and type identities must match throughout its ordered
+schedule, optional start and unique resolution. Calls must be distinct within the
+group; two calls may legitimately refer to the same reused child run. Pending
+siblings supply no time. A pending group supplies no aggregate; an existing caught
+group failure may use its agreed selected parent's resolution time.
+
+The shared fold preserves canonical v1 integer rounding, authored descriptor order,
+first-millisecond ties and full selected success precision. Failure still returns
+Rust's legacy member and supplies time only when the canonical selector agrees.
+Raw parent resolution time is used; child `closed_at`, scalar timestamp aliases,
+redrive reuse payloads and future groups cannot substitute for it. Represented
+`created_at` is the Core group branch's fallback when `recorded_at` is absent or
+null, while a present invalid timestamp refuses. Missing identities, duplicate
+resolutions, changed-run start chains and grouped query context remain unavailable.
+Core's mutable child-row-only fallback has no corresponding authoritative SDK
+history carrier; this source does not invent one. These source controls do not
+close the separate versioned Core context or published conformance gaps.

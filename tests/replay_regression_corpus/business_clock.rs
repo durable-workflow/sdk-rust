@@ -168,3 +168,38 @@ pub(super) fn register_parallel_timer(worker: &mut Worker, workflow_type: &str) 
         Ok(json!({"entry_unavailable":entry_unavailable,"members":values.len(),"time":time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),"unchanged_prefix":time.is_some() && time==ctx.replay_now().ok()}))
     });
 }
+
+pub(super) fn register_parallel_child(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let operations = || {
+            vec![
+                ParallelOperation::child_workflow(
+                    "clock-child",
+                    ChildWorkflowOptions::new("children"),
+                    json!([]),
+                ),
+                ParallelOperation::child_workflow(
+                    "clock-child",
+                    ChildWorkflowOptions::new("children"),
+                    json!([]),
+                ),
+            ]
+        };
+        let entry_unavailable = ctx.replay_now().is_err();
+        ctx.parallel(operations()).await?;
+        let success = ctx.replay_now().ok();
+        let Err(Error::ParallelFailed(failure)) = ctx.parallel(operations()).await else {
+            return Err(Error::WorkerLoop(
+                "expected recorded child-group failure".into(),
+            ));
+        };
+        let failed = ctx.replay_now().ok();
+        Ok(json!({
+            "entry_unavailable":entry_unavailable,
+            "success_time":success.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "failure_time":failed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "failure_member":failure.member_path,
+            "unchanged_prefix":failed.is_some() && failed==ctx.replay_now().ok(),
+        }))
+    });
+}

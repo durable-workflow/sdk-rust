@@ -1,17 +1,6 @@
-use super::parallel::{all_path, event_indices, event_time, milliseconds};
-use super::{DateTime, HashMap, HistoryEvent, RecordedCommand, Utc, Value};
-use crate::{recorded_parallel_group_path, ParallelGroupMetadata};
-use std::collections::HashSet;
-
-#[derive(Debug)]
-struct Member {
-    path: Vec<ParallelGroupMetadata>,
-    timer: String,
-    fired: usize,
-}
-
-#[derive(Debug)]
-pub(super) struct Members(HashMap<u64, Member>);
+use super::parallel::{all_path, event_indices, member_path, Member, Members};
+use super::{HistoryEvent, RecordedCommand, Value};
+use crate::ParallelGroupMetadata;
 
 fn member(
     history: &[HistoryEvent],
@@ -20,6 +9,9 @@ fn member(
     delay: u64,
     path: &[ParallelGroupMetadata],
 ) -> Option<Member> {
+    if !member_path(history, indices, sequence, path) {
+        return None;
+    }
     let [scheduled, fired] = indices else {
         return None;
     };
@@ -35,102 +27,52 @@ fn member(
         .filter(|value| !value.is_empty())?;
     for &index in indices {
         let event = &history[index];
-        if event.payload.get("sequence").and_then(Value::as_u64) != Some(sequence)
-            || event
-                .payload
-                .get("workflow_sequence")
-                .is_some_and(|value| value.as_u64() != Some(sequence))
-            || event.payload.get("timer_id").and_then(Value::as_str) != Some(timer)
+        if event.payload.get("timer_id").and_then(Value::as_str) != Some(timer)
             || event.payload.get("delay_seconds").and_then(Value::as_u64) != Some(delay)
             || event
                 .payload
                 .get("timer_kind")
                 .is_some_and(|value| !value.is_null())
             || crate::is_internal_timer_event(event)
-            || recorded_parallel_group_path(&[event], sequence)
-                .ok()
-                .flatten()
-                .as_deref()
-                != Some(path)
         {
             return None;
         }
     }
     Some(Member {
         path: path.to_vec(),
-        timer: timer.into(),
-        fired: *fired,
+        identity: timer.into(),
+        terminal: Some(*fired),
+        failed: false,
     })
 }
 
-impl Members {
-    pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
-        let events = event_indices(history, "Timer");
-        Self(
-            commands
-                .iter()
-                .filter_map(|command| {
-                    let RecordedCommand::Timer {
-                        sequence,
-                        delay_seconds,
-                        fired: true,
-                        parallel_group_path: Some(path),
-                    } = command
-                    else {
-                        return None;
-                    };
-                    if !all_path(path, "timer") {
-                        return None;
-                    }
-                    member(
-                        history,
-                        events.get(sequence)?,
-                        *sequence,
-                        *delay_seconds,
-                        path,
-                    )
-                    .map(|member| (*sequence, member))
-                })
-                .collect(),
-        )
-    }
-
-    pub(super) fn consumed_time(
-        &self,
-        history: &[HistoryEvent],
-        sequences: &[u64],
-        failed: Option<u64>,
-    ) -> Option<DateTime<Utc>> {
-        if failed.is_some() {
-            return None;
-        }
-        let root = self.0.get(sequences.first()?)?.path.first()?;
-        if root.parallel_group_base_sequence != *sequences.first()?
-            || root.parallel_group_size != sequences.len()
-        {
-            return None;
-        }
-        let mut timers = HashSet::new();
-        let mut selected: Option<(i64, DateTime<Utc>)> = None;
-        for (index, sequence) in sequences.iter().enumerate() {
-            let member = self.0.get(sequence)?;
-            let mut expected = root.clone();
-            expected.parallel_group_index = index;
-            if member.path.first()? != &expected
-                || root
-                    .parallel_group_base_sequence
-                    .checked_add(index as u64)?
-                    != *sequence
-                || !timers.insert(&member.timer)
-            {
-                return None;
-            }
-            let time = event_time(history.get(member.fired)?)?;
-            let ms = milliseconds(time)?;
-            if selected.is_none_or(|(current, _)| ms > current) {
-                selected = Some((ms, time));
-            }
-        }
-        selected.map(|(_, time)| time)
-    }
+pub(super) fn members(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Members {
+    let events = event_indices(history, "Timer");
+    Members(
+        commands
+            .iter()
+            .filter_map(|command| {
+                let RecordedCommand::Timer {
+                    sequence,
+                    delay_seconds,
+                    fired: true,
+                    parallel_group_path: Some(path),
+                } = command
+                else {
+                    return None;
+                };
+                if !all_path(path, "timer") {
+                    return None;
+                }
+                member(
+                    history,
+                    events.get(sequence)?,
+                    *sequence,
+                    *delay_seconds,
+                    path,
+                )
+                .map(|member| (*sequence, member))
+            })
+            .collect(),
+    )
 }

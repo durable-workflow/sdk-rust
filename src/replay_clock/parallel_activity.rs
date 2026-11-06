@@ -1,18 +1,6 @@
-use super::parallel::{all_path, event_indices, event_time, milliseconds};
-use super::{DateTime, HashMap, HistoryEvent, RecordedCommand, Utc, Value};
-use crate::{recorded_parallel_group_path, ParallelGroupMetadata};
-use std::collections::HashSet;
-
-#[derive(Debug)]
-struct Member {
-    path: Vec<ParallelGroupMetadata>,
-    execution: String,
-    terminal: Option<usize>,
-    failed: bool,
-}
-
-#[derive(Debug)]
-pub(super) struct Members(HashMap<u64, Member>);
+use super::parallel::{all_path, event_indices, member_path, Member, Members};
+use super::{HistoryEvent, RecordedCommand, Value};
+use crate::ParallelGroupMetadata;
 
 fn member(
     history: &[HistoryEvent],
@@ -20,6 +8,9 @@ fn member(
     sequence: u64,
     path: &[ParallelGroupMetadata],
 ) -> Option<Member> {
+    if !member_path(history, indices, sequence, path) {
+        return None;
+    }
     let events: Vec<_> = indices.iter().map(|&index| &history[index]).collect();
     let schedules: Vec<_> = events
         .iter()
@@ -41,22 +32,12 @@ fn member(
     let mut terminal = None;
     for &index in indices {
         let event = &history[index];
-        if event.payload.get("sequence").and_then(Value::as_u64) != Some(sequence)
-            || event
-                .payload
-                .get("workflow_sequence")
-                .is_some_and(|value| value.as_u64() != Some(sequence))
-            || event
-                .payload
-                .get("activity_execution_id")
-                .and_then(Value::as_str)
-                != Some(execution)
+        if event
+            .payload
+            .get("activity_execution_id")
+            .and_then(Value::as_str)
+            != Some(execution)
             || event.payload.get("activity_type").and_then(Value::as_str) != Some(activity)
-            || recorded_parallel_group_path(&[event], sequence)
-                .ok()
-                .flatten()
-                .as_deref()
-                != Some(path)
         {
             return None;
         }
@@ -76,90 +57,32 @@ fn member(
     }
     Some(Member {
         path: path.to_vec(),
-        execution: execution.into(),
+        identity: execution.into(),
         terminal,
         failed: terminal.is_some_and(|index| history[index].event_type != "ActivityCompleted"),
     })
 }
 
-impl Members {
-    pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
-        let events = event_indices(history, "Activity");
-        Self(
-            commands
-                .iter()
-                .filter_map(|command| {
-                    let RecordedCommand::Activity {
-                        sequence,
-                        parallel_group_path: Some(path),
-                        ..
-                    } = command
-                    else {
-                        return None;
-                    };
-                    if !all_path(path, "activity") {
-                        return None;
-                    }
-                    member(history, events.get(sequence)?, *sequence, path)
-                        .map(|member| (*sequence, member))
-                })
-                .collect(),
-        )
-    }
-
-    pub(super) fn consumed_time(
-        &self,
-        history: &[HistoryEvent],
-        sequences: &[u64],
-        failed: Option<u64>,
-    ) -> Option<DateTime<Utc>> {
-        let root = self.0.get(sequences.first()?)?.path.first()?;
-        if root.parallel_group_base_sequence != *sequences.first()?
-            || root.parallel_group_size != sequences.len()
-        {
-            return None;
-        }
-        let mut executions = HashSet::new();
-        let mut success: Option<(i64, DateTime<Utc>)> = None;
-        let mut failure: Option<(i64, u64)> = None;
-        for (index, sequence) in sequences.iter().enumerate() {
-            let member = self.0.get(sequence)?;
-            let mut expected = root.clone();
-            expected.parallel_group_index = index;
-            if member.path.first()? != &expected
-                || root
-                    .parallel_group_base_sequence
-                    .checked_add(index as u64)?
-                    != *sequence
-                || !executions.insert(&member.execution)
-            {
-                return None;
-            }
-            if member.failed {
-                let ms = milliseconds(event_time(history.get(member.terminal?)?)?)?;
-                // Descriptor iteration retains the first member on a tie.
-                if failure.is_none_or(|(current, _)| ms < current) {
-                    failure = Some((ms, *sequence));
+pub(super) fn members(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Members {
+    let events = event_indices(history, "Activity");
+    Members(
+        commands
+            .iter()
+            .filter_map(|command| {
+                let RecordedCommand::Activity {
+                    sequence,
+                    parallel_group_path: Some(path),
+                    ..
+                } = command
+                else {
+                    return None;
+                };
+                if !all_path(path, "activity") {
+                    return None;
                 }
-            } else if failed.is_none() {
-                let time = event_time(history.get(member.terminal?)?)?;
-                let ms = milliseconds(time)?;
-                if success.is_none_or(|(current, _)| ms > current) {
-                    success = Some((ms, time));
-                }
-            }
-        }
-        match failed {
-            Some(selected) => {
-                let (ms, canonical_selected) = failure?;
-                // Keep the legacy exception even when v1 selects a different
-                // failed member. That compatibility gap has no clock authority.
-                (selected == canonical_selected)
-                    .then(|| DateTime::from_timestamp_millis(ms))
-                    .flatten()
-            }
-            None if failure.is_none() => success.map(|(_, time)| time),
-            None => None,
-        }
-    }
+                member(history, events.get(sequence)?, *sequence, path)
+                    .map(|member| (*sequence, member))
+            })
+            .collect(),
+    )
 }
