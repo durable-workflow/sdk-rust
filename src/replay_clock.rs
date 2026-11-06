@@ -12,6 +12,8 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+mod condition;
+
 thread_local! {
     static ACTIVE: RefCell<Option<Weak<Mutex<WorkflowState>>>> = const { RefCell::new(None) };
 }
@@ -81,6 +83,7 @@ enum BoundaryKind {
     Timer,
     Child,
     Signal,
+    Condition,
 }
 
 fn signal_boundary(history: &[HistoryEvent], indices: &[usize], sequence: u64) -> Option<usize> {
@@ -268,12 +271,21 @@ impl Clock {
                 } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
                     Some((*sequence, BoundaryKind::Signal))
                 }
+                RecordedCommand::ConditionWait {
+                    sequence,
+                    result: Some(_),
+                    parallel_group_path,
+                    ..
+                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+                    Some((*sequence, BoundaryKind::Condition))
+                }
                 _ => None,
             })
             .collect();
         let mut boundaries = HashMap::new();
         let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut signals: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut conditions: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut signal_timers: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, event) in history.iter().enumerate() {
             if event.event_type.starts_with("Timer") {
@@ -310,6 +322,12 @@ impl Clock {
                     }
                     false
                 }
+                Some(BoundaryKind::Condition) => {
+                    if super::is_recorded_condition_wait_event(event) {
+                        conditions.entry(sequence).or_default().push(index);
+                    }
+                    false
+                }
                 None => false,
             };
             if matched {
@@ -335,6 +353,11 @@ impl Clock {
             indices.sort_unstable();
             indices.dedup();
             if let Some(index) = signal_boundary(history, &indices, sequence) {
+                boundaries.insert(sequence, index);
+            }
+        }
+        for (sequence, indices) in conditions {
+            if let Some(index) = condition::boundary(history, &indices, sequence) {
                 boundaries.insert(sequence, index);
             }
         }
@@ -470,6 +493,8 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
             | "ChildRunCancelled"
             | "ChildRunTerminated"
             | "SignalApplied"
+            | "ConditionWaitSatisfied"
+            | "ConditionWaitTimedOut"
     ) {
         return None;
     }

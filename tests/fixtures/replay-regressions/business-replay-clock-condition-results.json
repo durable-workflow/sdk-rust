@@ -1,0 +1,132 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-business-replay-clock-condition-results",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.business-replay-clock-condition",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "WorkflowStarted",
+      "payload": {
+        "workflow_type": "corpus.business-replay-clock-condition"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "sequence": 1
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 1,
+        "condition_wait_id": "clock-condition-1",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1"
+      },
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "sequence": 2
+    },
+    {
+      "event_type": "ConditionWaitSatisfied",
+      "payload": {
+        "sequence": 1,
+        "condition_wait_id": "clock-condition-1",
+        "condition_wait_occurrence_id": "rust:condition-wait:0",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1"
+      },
+      "recorded_at": "2026-01-01T00:00:05.654321Z",
+      "sequence": 3
+    },
+    {
+      "event_type": "ConditionWaitOpened",
+      "payload": {
+        "sequence": 2,
+        "condition_wait_id": "clock-condition-2",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1",
+        "timeout_seconds": 30
+      },
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "sequence": 4
+    },
+    {
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 2,
+        "timer_id": "clock-condition-timeout-2",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "clock-condition-2",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "delay_seconds": 30
+      },
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "sequence": 5
+    },
+    {
+      "event_type": "TimerFired",
+      "payload": {
+        "sequence": 2,
+        "timer_id": "clock-condition-timeout-2",
+        "timer_kind": "condition_timeout",
+        "condition_wait_id": "clock-condition-2",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "delay_seconds": 30
+      },
+      "recorded_at": "2026-01-01T00:00:02.999999Z",
+      "sequence": 6
+    },
+    {
+      "event_type": "ConditionWaitTimedOut",
+      "payload": {
+        "sequence": 2,
+        "condition_wait_id": "clock-condition-2",
+        "condition_wait_occurrence_id": "rust:condition-wait:1",
+        "condition_key": "ready",
+        "condition_definition_fingerprint": "sha256:ready-v1",
+        "timeout_seconds": 30
+      },
+      "recorded_at": "2026-01-01T00:00:03.123456Z",
+      "sequence": 7
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "entry_unavailable": true,
+      "results": [
+        "Satisfied",
+        "TimedOut"
+      ],
+      "first_time": "2026-01-01T00:00:05.654321Z",
+      "second_time": "2026-01-01T00:00:03.123456Z",
+      "unchanged_prefix": true
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "entry_unavailable": true,
+        "results": [
+          "Satisfied",
+          "TimedOut"
+        ],
+        "first_time": "2026-01-01T00:00:05.654321Z",
+        "second_time": "2026-01-01T00:00:03.123456Z",
+        "unchanged_prefix": true
+      }
+    }
+  ],
+  "worker_task": {
+    "workflow_id": "condition-clock-parent",
+    "payload_codec": "avro"
+  }
+}
