@@ -509,6 +509,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.business-replay-clock-child"
             | "corpus.business-replay-clock-signal"
             | "corpus.business-replay-clock-condition"
+            | "corpus.business-replay-clock-condition-timeout"
             | "corpus.business-replay-clock-parallel-activity"
             | "corpus.nexus-result"
             | "corpus.nexus-cancellation"
@@ -631,6 +632,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         }
         "corpus.business-replay-clock-parallel-activity" => {
             business_clock::register_parallel_activity(&mut worker, workflow_type)
+        }
+        "corpus.business-replay-clock-condition-timeout" => {
+            business_clock::register_condition_timeout(&mut worker, workflow_type)
         }
         "corpus.business-replay-clock-condition" => {
             business_clock::register_condition(&mut worker, workflow_type)

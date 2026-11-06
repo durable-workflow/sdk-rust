@@ -13,6 +13,7 @@ use std::{
 };
 
 mod condition;
+mod condition_timeout;
 mod parallel_activity;
 
 thread_local! {
@@ -70,6 +71,26 @@ fn recorded_time(event: &HistoryEvent, reused: bool) -> Option<DateTime<Utc>> {
             .raw
             .get("timestamp")
             .or_else(|| event.raw.get("recorded_at")),
+    )
+}
+
+fn boundary_time(event: &HistoryEvent, query: bool) -> Option<DateTime<Utc>> {
+    let internal = event.event_type == "TimerFired" && is_internal_timer_event(event);
+    if internal {
+        // Core query replay requires the explicit condition resolution. Its
+        // executor-only fired-time branch does not grant callback authority.
+        return if query {
+            None
+        } else {
+            parse(event.raw.get("recorded_at"))
+        };
+    }
+    recorded_time(
+        event,
+        matches!(
+            event.event_type.as_str(),
+            "ActivityCompleted" | "TimerFired" | "SignalApplied"
+        ),
     )
 }
 
@@ -372,8 +393,11 @@ impl Clock {
                 boundaries.insert(sequence, index);
             }
         }
+        let condition_timeouts = condition_timeout::Index::new(history);
         boundaries.extend(conditions.into_iter().filter_map(|(sequence, indices)| {
-            condition::boundary(history, &indices, sequence).map(|index| (sequence, index))
+            condition::boundary(history, &indices, sequence)
+                .or_else(|| condition_timeouts.boundary(history, &indices, sequence))
+                .map(|index| (sequence, index))
         }));
         // Index identities once. Timestamps are read only when that boundary
         // is actually consumed, never by scanning ahead from the accessor.
@@ -453,15 +477,7 @@ impl WorkflowState {
             .boundaries
             .get(&sequence)
             .and_then(|index| self.history_events.get(*index))
-            .and_then(|event| {
-                recorded_time(
-                    event,
-                    matches!(
-                        event.event_type.as_str(),
-                        "ActivityCompleted" | "TimerFired" | "SignalApplied"
-                    ),
-                )
-            });
+            .and_then(|event| boundary_time(event, QUERY_REPLAY.with(Cell::get)));
     }
 }
 
@@ -536,15 +552,7 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
         .boundaries
         .get(&durable_event_sequence(event)?)
         .and_then(|index| history.get(*index))
-        .and_then(|event| {
-            recorded_time(
-                event,
-                matches!(
-                    event.event_type.as_str(),
-                    "ActivityCompleted" | "TimerFired" | "SignalApplied"
-                ),
-            )
-        })
+        .and_then(|event| boundary_time(event, true))
 }
 
 pub(super) fn update_time(history: &[HistoryEvent], update_id: &str) -> Option<DateTime<Utc>> {

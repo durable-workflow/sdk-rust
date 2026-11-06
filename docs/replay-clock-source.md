@@ -25,6 +25,7 @@ counter identity to order emitted events.
 | Scalar persisted signal delivery | One `SignalWaitOpened` followed by a unique `SignalApplied`, matching nonempty wait ID/name and explicit command sequence, with the persisted value consumed. A configured timeout requires valid numeric metadata and either no scheduled timer or the exact ordered schedule/cancel pair | Applied event time, preserving valid `reused_recorded_at` exactly as Core signal resume does |
 | Scalar persisted condition outcome | One ordered canonical wait open/resolution, matching physical wait, logical occurrence, explicit command counter, key/fingerprint and timeout definition | Consumed satisfied/timed-out resolution event time, preserving its precision; timer and scalar redrive helpers are not substituted |
 | Persisted remote Activity all group | Exact authored group/path and each consumed member lifecycle/type/sequence/execution identity | Core millisecond aggregate on success, full chosen precision; exact agreed failure at Core millisecond precision |
+| Persisted scalar condition timeout without explicit resolution | One canonical wait and its exact ordered schedule/fire pair, with complete identity/definition/counters and unique physical timer | Executor uses the fired event’s own `recorded_at`; Core query has no corresponding resolution authority |
 | Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer/child/signal/condition correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
 | Replayed-instance query | Clock of the actual reconstructed workflow prefix, rather than a later visible row | Same scalar boundary rules; grouped executor aggregation is not query authority |
 | Direct update handler | Unique committed `UpdateAccepted` correlated to the handler's update ID | That event's validated time; missing/ambiguous acceptance is unavailable |
@@ -122,8 +123,7 @@ numeric counters and complete matching definitions; legacy fallback parsing
 may still return a result when that time authority is missing. Each actual
 physical resolution in a logical reopen chain advances only when consumed.
 
-A timeout fire without its persisted condition resolution supplies no new
-condition clock. Core's live timeout branch has its own timer/fired-row time
+The explicit resolution branch does not borrow a timeout fire's time. Core's live timeout branch has its own timer/fired-row time
 input; it is not inferred for Rust from an unrelated timer. Predicate callbacks
 still have explicit unavailability inside the invocation. Synchronous local
 true/zero-timeout paths preserve the already accepted previous-prefix behavior,
@@ -166,3 +166,30 @@ milliseconds. The clock accepts persisted microseconds within the exact float
 microsecond range used by that comparator; finer or out-of-range evidence stays
 unavailable. Reference vectors cover positive/negative epochs, 499/500/501
 microsecond edges, equal-millisecond candidates and timezone-equivalent instants.
+
+The persisted fired-only condition-timeout cohort follows Core
+[`resumeTimedOutCondition`](https://github.com/durable-workflow/workflow/blob/ce24207ef86856e64f97b939c9aeef9d1fb387c8/src/V2/Support/WorkflowExecutor.php#L895).
+It consumes the selected `TimerFired.recorded_at`, including its precision.
+The native producer already carries the matching physical/logical wait,
+key/fingerprint, timer ID/kind, command sequence and delay through
+[`wait_fields`](https://github.com/durable-workflow/server/blob/fadf8729265e077f280c8f71a87c06d8f73a682e/rust/src/runtime/wait_timeouts.rs#L38)
+and the scheduled/fired history. It intentionally need not append a
+`ConditionWaitTimedOut` event. This source change adds no field or producer.
+
+One ordered open/schedule/fire and complete matching metadata are required.
+A cancelled, aliased, duplicate, reordered, superseded or otherwise ambiguous
+physical wait cannot provide time. A logical reopen uses the final actually
+consumed physical wait; an old orphan timeout cannot supply a pending reopen's
+clock. Indexing reads identities once, and accessors only read the consumed
+boundary. Payload `fired_at`, deadline, reuse, insertion aliases and an
+unrepresented timer-row fallback do not replace the selected `recorded_at`.
+Missing or invalid time is unavailable while legacy results remain unchanged.
+
+This fired-only authority is executor-specific. Current Core query replay stops
+without an explicit condition resolution, so snapshot and reconstructed-query
+clocks remain unavailable on this shape, including inside the reconstructed
+workflow. Existing explicit persisted condition-resolution query behavior is
+preserved. Grouped conditions, predicate-trigger retention and the separate PHP
+occurrence-carrier gap remain open, as do published/native conformance and
+release adoption. The corpus fixture is synthetic source evidence shaped from
+the immutable writer, not a claim that a native experiment ran.
