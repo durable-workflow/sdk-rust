@@ -277,3 +277,52 @@ fn replay_now_grouped_condition_remains_unavailable_after_actual_result() {
     );
     assert!(ctx.take_commands().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn replay_now_condition_queries_use_the_actual_selected_prefix() {
+    let mut worker = Worker::new(Client::new("http://127.0.0.1:8080").unwrap(), "clock-tests");
+    worker.register_replayed_workflow(
+        "condition-clock",
+        || 0_u64,
+        |ctx, _, _| async move {
+            ctx.wait_condition(options(false), || Ok(false)).await?;
+            ctx.sleep(Duration::from_secs(1)).await?;
+            Ok(Value::Null)
+        },
+    );
+    worker.register_query("condition-clock", "snapshot", |ctx, _| async move {
+        Ok(json!(ctx
+            .replay_now()?
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
+    });
+    worker.register_replayed_query::<u64, _, _>(
+        "condition-clock",
+        "reconstructed",
+        |ctx, _, _| async move {
+            Ok(json!(ctx
+                .replay_now()?
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
+        },
+    );
+    let mut history = condition(1, 0, false, RESOLVED);
+    for query in ["snapshot", "reconstructed"] {
+        if query == "reconstructed" {
+            history.push(event(
+                "TimerScheduled",
+                json!({"sequence":2,"timer_id":"future-timer","delay_seconds":1}),
+                "2099-01-01T00:00:00Z",
+            ));
+        }
+        let task: QueryTask = serde_json::from_value(json!({"query_task_id":"condition-q","workflow_type":"condition-clock","query_name":query,"payload_codec":DEFAULT_CODEC,"history_events":history})).unwrap();
+        assert_eq!(
+            worker
+                .execute_query_task(task)
+                .await
+                .unwrap()
+                .into_json()
+                .unwrap(),
+            json!(RESOLVED)
+        );
+    }
+    assert!(snapshot_time(&history, DEFAULT_CODEC).is_none());
+}
