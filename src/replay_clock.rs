@@ -84,22 +84,27 @@ enum BoundaryKind {
 }
 
 fn signal_boundary(history: &[HistoryEvent], indices: &[usize], sequence: u64) -> Option<usize> {
-    let [opened, applied] = indices else {
-        return None;
+    let (opened, timers, applied) = match indices {
+        [opened, applied] => (opened, &[][..], applied),
+        [opened, _, _, applied] => (opened, &indices[1..3], applied),
+        _ => return None,
     };
     let open = &history[*opened];
     let apply = &history[*applied];
     if open.event_type != "SignalWaitOpened"
         || apply.event_type != "SignalApplied"
-        || open
-            .payload
-            .get("timeout_seconds")
-            .is_some_and(|value| !value.is_null())
         || apply.payload.get("value").is_none_or(Value::is_null)
     {
         return None;
     }
-    for event in [open, apply] {
+    let events: Vec<_> = indices.iter().map(|&index| &history[index]).collect();
+    if super::recorded_parallel_group_path(&events, sequence)
+        .ok()?
+        .is_some_and(|path| !path.is_empty())
+    {
+        return None;
+    }
+    for event in &events {
         if event.payload.get("sequence").and_then(Value::as_u64) != Some(sequence)
             || event
                 .payload
@@ -115,11 +120,73 @@ fn signal_boundary(history: &[HistoryEvent], indices: &[usize], sequence: u64) -
             .get(key)?
             .as_str()
             .filter(|value| !value.is_empty())?;
-        if apply.payload.get(key).and_then(Value::as_str) != Some(identity) {
+        if events
+            .iter()
+            .any(|event| event.payload.get(key).and_then(Value::as_str) != Some(identity))
+        {
             return None;
         }
     }
+    signal_timeout(open, apply, history, timers)?;
     Some(*applied)
+}
+
+fn signal_timeout(
+    open: &HistoryEvent,
+    apply: &HistoryEvent,
+    history: &[HistoryEvent],
+    timers: &[usize],
+) -> Option<()> {
+    let timeout = open.payload.get("timeout_seconds").filter(|v| !v.is_null());
+    let seconds = match timeout {
+        Some(value) => Some(value.as_u64()?),
+        None => None,
+    };
+    if apply
+        .payload
+        .get("timeout_seconds")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| Some(value) != timeout)
+    {
+        return None;
+    }
+    let [scheduled, cancelled] = timers else {
+        // A signal already pending at the call can win even a zero timeout,
+        // without ever scheduling a timer. The persisted apply is authority.
+        return timers.is_empty().then_some(());
+    };
+    let schedule = &history[*scheduled];
+    let cancel = &history[*cancelled];
+    if seconds? == 0
+        || schedule.event_type != "TimerScheduled"
+        || cancel.event_type != "TimerCancelled"
+        || parse(cancel.payload.get("cancelled_at")).is_none()
+        || cancel
+            .payload
+            .get("cancellation_scope")
+            .is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
+    for event in [schedule, cancel] {
+        if event.payload["timer_kind"] != "signal_timeout"
+            || event.payload.get("delay_seconds").and_then(Value::as_u64) != seconds
+        {
+            return None;
+        }
+    }
+    let timer_id = schedule
+        .payload
+        .get("timer_id")?
+        .as_str()
+        .filter(|v| !v.is_empty())?;
+    if cancel.payload.get("timer_id").and_then(Value::as_str) != Some(timer_id)
+        || parse(schedule.payload.get("fire_at")).is_none()
+        || cancel.payload.get("fire_at") != schedule.payload.get("fire_at")
+    {
+        return None;
+    }
+    Some(())
 }
 
 fn child_boundary(history: &[HistoryEvent], indices: &[usize]) -> Option<usize> {
@@ -207,7 +274,13 @@ impl Clock {
         let mut boundaries = HashMap::new();
         let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut signals: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut signal_timers: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, event) in history.iter().enumerate() {
+            if event.event_type.starts_with("Timer") {
+                if let Some(wait) = event.payload.get("signal_wait_id").and_then(Value::as_str) {
+                    signal_timers.entry(wait).or_default().push(index);
+                }
+            }
             let Some(sequence) = durable_event_sequence(event) else {
                 continue;
             };
@@ -231,8 +304,7 @@ impl Clock {
                     false
                 }
                 Some(BoundaryKind::Signal) => {
-                    if is_recorded_signal_wait_event(event)
-                        || (event.event_type.starts_with("Timer") && is_internal_timer_event(event))
+                    if is_recorded_signal_wait_event(event) || event.event_type.starts_with("Timer")
                     {
                         signals.entry(sequence).or_default().push(index);
                     }
@@ -249,7 +321,19 @@ impl Clock {
                 boundaries.insert(sequence, index);
             }
         }
-        for (sequence, indices) in signals {
+        for (sequence, mut indices) in signals {
+            // A timer with a conflicting/missing counter must not disappear
+            // from its wait's evidence just because it uses another bucket.
+            let related: Vec<_> = indices
+                .iter()
+                .filter_map(|&index| history[index].payload.get("signal_wait_id")?.as_str())
+                .filter_map(|wait| signal_timers.get(wait))
+                .flatten()
+                .copied()
+                .collect();
+            indices.extend(related);
+            indices.sort_unstable();
+            indices.dedup();
             if let Some(index) = signal_boundary(history, &indices, sequence) {
                 boundaries.insert(sequence, index);
             }
