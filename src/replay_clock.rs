@@ -86,6 +86,52 @@ enum BoundaryKind {
     Condition,
 }
 
+fn supported_boundary(command: &RecordedCommand) -> Option<(u64, BoundaryKind)> {
+    match command {
+        RecordedCommand::Activity {
+            sequence,
+            outcome: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Activity))
+        }
+        RecordedCommand::Timer {
+            sequence,
+            fired: true,
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Timer))
+        }
+        RecordedCommand::ChildWorkflow {
+            sequence,
+            outcome: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Child))
+        }
+        RecordedCommand::SignalWait {
+            sequence,
+            value: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Signal))
+        }
+        RecordedCommand::ConditionWait {
+            sequence,
+            result: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Condition))
+        }
+        _ => None,
+    }
+}
+
 fn signal_boundary(history: &[HistoryEvent], indices: &[usize], sequence: u64) -> Option<usize> {
     let (opened, timers, applied) = match indices {
         [opened, applied] => (opened, &[][..], applied),
@@ -236,52 +282,7 @@ fn child_boundary(history: &[HistoryEvent], indices: &[usize]) -> Option<usize> 
 
 impl Clock {
     pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
-        let supported: HashMap<_, _> = commands
-            .iter()
-            .filter_map(|command| match command {
-                RecordedCommand::Activity {
-                    sequence,
-                    outcome: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Activity))
-                }
-                RecordedCommand::Timer {
-                    sequence,
-                    fired: true,
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Timer))
-                }
-                RecordedCommand::ChildWorkflow {
-                    sequence,
-                    outcome: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Child))
-                }
-                RecordedCommand::SignalWait {
-                    sequence,
-                    value: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Signal))
-                }
-                RecordedCommand::ConditionWait {
-                    sequence,
-                    result: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Condition))
-                }
-                _ => None,
-            })
-            .collect();
+        let supported: HashMap<_, _> = commands.iter().filter_map(supported_boundary).collect();
         let mut boundaries = HashMap::new();
         let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut signals: HashMap<u64, Vec<usize>> = HashMap::new();
