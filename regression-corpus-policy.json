@@ -83,6 +83,9 @@
         },
         {
           "glob": "src/replay_clock/parallel_timer.rs"
+        },
+        {
+          "glob": "src/replay_clock/parallel.rs"
         }
       ]
     }

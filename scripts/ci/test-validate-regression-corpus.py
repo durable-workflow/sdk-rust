@@ -714,6 +714,23 @@ mod tests {
             for guard in guards
         ))
 
+    def test_parallel_common_clock_module_requires_replay_evidence(self) -> None:
+        source = "src/replay_clock/parallel.rs"
+        path = self.root / source
+        path.parent.mkdir(parents=True)
+        path.write_text("fn boundary() -> Option<usize> { Some(0) }\n", encoding="utf-8")
+        guards = REPOSITORY_POLICY["categories"]["replay"]["guards"]
+
+        def matches(guard: dict[str, object]) -> bool:
+            return VALIDATOR._guard_matches(self.root, "HEAD", {source}, guard)
+
+        self.assertFalse(any(matches(guard) for guard in guards if guard["glob"] != source))
+        self.assertTrue(any(matches(guard) for guard in guards))
+        self.assertFalse(any(
+            VALIDATOR._guard_matches(self.root, "HEAD", {"src/replay_clock/tests/parallel.rs"}, guard)
+            for guard in guards
+        ))
+
     def test_history_fixture_in_unchanged_test_module_is_not_production_replay(self) -> None:
         diff = """\
 diff --git a/src/lib.rs b/src/lib.rs

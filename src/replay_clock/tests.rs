@@ -524,3 +524,5 @@ mod parallel_activity;
 mod condition_timeout;
 
 mod parallel_timer;
+
+mod parallel;

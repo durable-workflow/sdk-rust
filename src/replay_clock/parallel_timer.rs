@@ -1,5 +1,5 @@
-use super::parallel_activity::{all_path, event_time, milliseconds};
-use super::{durable_event_sequence, DateTime, HashMap, HistoryEvent, RecordedCommand, Utc, Value};
+use super::parallel::{all_path, event_indices, event_time, milliseconds};
+use super::{DateTime, HashMap, HistoryEvent, RecordedCommand, Utc, Value};
 use crate::{recorded_parallel_group_path, ParallelGroupMetadata};
 use std::collections::HashSet;
 
@@ -65,14 +65,7 @@ fn member(
 
 impl Members {
     pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
-        let mut events: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (index, event) in history.iter().enumerate() {
-            if event.event_type.starts_with("Timer") {
-                if let Some(sequence) = durable_event_sequence(event) {
-                    events.entry(sequence).or_default().push(index);
-                }
-            }
-        }
+        let events = event_indices(history, "Timer");
         Self(
             commands
                 .iter()

@@ -14,6 +14,7 @@ use std::{
 
 mod condition;
 mod condition_timeout;
+mod parallel;
 mod parallel_activity;
 mod parallel_timer;
 

@@ -1,0 +1,189 @@
+{
+  "schema": "durable-workflow.replay-clock-quantization/v1",
+  "arithmetic": "sign(U) * ((abs(U) + 500) div 1000)",
+  "integer_fields": "decimal strings preserve exact values across JSON runtimes",
+  "vectors": [
+    {
+      "id": "canonical-v1-01",
+      "input": "1970-01-01T00:00:00.000000Z",
+      "utc_microseconds": "0",
+      "milliseconds": "0",
+      "reconstructed": "1970-01-01T00:00:00.000000Z"
+    },
+    {
+      "id": "canonical-v1-02",
+      "input": "1970-01-01T00:00:00.000499Z",
+      "utc_microseconds": "499",
+      "milliseconds": "0",
+      "reconstructed": "1970-01-01T00:00:00.000000Z"
+    },
+    {
+      "id": "canonical-v1-03",
+      "input": "1970-01-01T00:00:00.000500Z",
+      "utc_microseconds": "500",
+      "milliseconds": "1",
+      "reconstructed": "1970-01-01T00:00:00.001000Z"
+    },
+    {
+      "id": "canonical-v1-04",
+      "input": "1970-01-01T00:00:00.000501Z",
+      "utc_microseconds": "501",
+      "milliseconds": "1",
+      "reconstructed": "1970-01-01T00:00:00.001000Z"
+    },
+    {
+      "id": "canonical-v1-05",
+      "input": "1969-12-31T23:59:59.999501Z",
+      "utc_microseconds": "-499",
+      "milliseconds": "0",
+      "reconstructed": "1970-01-01T00:00:00.000000Z"
+    },
+    {
+      "id": "canonical-v1-06",
+      "input": "1969-12-31T23:59:59.999500Z",
+      "utc_microseconds": "-500",
+      "milliseconds": "-1",
+      "reconstructed": "1969-12-31T23:59:59.999000Z"
+    },
+    {
+      "id": "canonical-v1-07",
+      "input": "1969-12-31T23:59:59.999499Z",
+      "utc_microseconds": "-501",
+      "milliseconds": "-1",
+      "reconstructed": "1969-12-31T23:59:59.999000Z"
+    },
+    {
+      "id": "canonical-v1-08",
+      "input": "2026-01-01T00:00:00.123400Z",
+      "utc_microseconds": "1767225600123400",
+      "milliseconds": "1767225600123",
+      "reconstructed": "2026-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-09",
+      "input": "2026-01-01T00:00:00.123499Z",
+      "utc_microseconds": "1767225600123499",
+      "milliseconds": "1767225600123",
+      "reconstructed": "2026-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-10",
+      "input": "2026-01-01T00:00:00.123500Z",
+      "utc_microseconds": "1767225600123500",
+      "milliseconds": "1767225600124",
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-11",
+      "input": "2026-01-01T00:00:00.123501Z",
+      "utc_microseconds": "1767225600123501",
+      "milliseconds": "1767225600124",
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-12",
+      "input": "2026-01-01T01:30:00.123500+01:30",
+      "utc_microseconds": "1767225600123500",
+      "milliseconds": "1767225600124",
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-13",
+      "input": "2026-01-01T00:00:00.123500-00:00",
+      "utc_microseconds": "1767225600123500",
+      "milliseconds": "1767225600124",
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-14",
+      "input": "1900-01-01T00:00:00.123499Z",
+      "utc_microseconds": "-2208988799876501",
+      "milliseconds": "-2208988799877",
+      "reconstructed": "1900-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-15",
+      "input": "1900-01-01T00:00:00.123500Z",
+      "utc_microseconds": "-2208988799876500",
+      "milliseconds": "-2208988799877",
+      "reconstructed": "1900-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-16",
+      "input": "1900-01-01T00:00:00.123501Z",
+      "utc_microseconds": "-2208988799876499",
+      "milliseconds": "-2208988799876",
+      "reconstructed": "1900-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-17",
+      "input": "1000-01-01T00:00:00.123499Z",
+      "utc_microseconds": "-30610223999876501",
+      "milliseconds": "-30610223999877",
+      "reconstructed": "1000-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-18",
+      "input": "1000-01-01T00:00:00.123500Z",
+      "utc_microseconds": "-30610223999876500",
+      "milliseconds": "-30610223999877",
+      "reconstructed": "1000-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-19",
+      "input": "1000-01-01T00:00:00.123501Z",
+      "utc_microseconds": "-30610223999876499",
+      "milliseconds": "-30610223999876",
+      "reconstructed": "1000-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-20",
+      "input": "3000-01-01T00:00:00.123499Z",
+      "utc_microseconds": "32503680000123499",
+      "milliseconds": "32503680000123",
+      "reconstructed": "3000-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-21",
+      "input": "3000-01-01T00:00:00.123500Z",
+      "utc_microseconds": "32503680000123500",
+      "milliseconds": "32503680000124",
+      "reconstructed": "3000-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-22",
+      "input": "3000-01-01T00:00:00.123501Z",
+      "utc_microseconds": "32503680000123501",
+      "milliseconds": "32503680000124",
+      "reconstructed": "3000-01-01T00:00:00.124000Z"
+    },
+    {
+      "id": "canonical-v1-23",
+      "input": "0001-01-01T00:00:00.000499Z",
+      "utc_microseconds": "-62135596799999501",
+      "milliseconds": "-62135596800000",
+      "reconstructed": "0001-01-01T00:00:00.000000Z"
+    },
+    {
+      "id": "canonical-v1-24",
+      "input": "0001-01-01T00:00:00.000500Z",
+      "utc_microseconds": "-62135596799999500",
+      "milliseconds": "-62135596800000",
+      "reconstructed": "0001-01-01T00:00:00.000000Z"
+    },
+    {
+      "id": "canonical-v1-25",
+      "input": "9999-01-01T00:00:00.123499Z",
+      "utc_microseconds": "253370764800123499",
+      "milliseconds": "253370764800123",
+      "reconstructed": "9999-01-01T00:00:00.123000Z"
+    },
+    {
+      "id": "canonical-v1-26",
+      "input": "9999-01-01T00:00:00.123500Z",
+      "utc_microseconds": "253370764800123500",
+      "milliseconds": "253370764800124",
+      "reconstructed": "9999-01-01T00:00:00.124000Z"
+    }
+  ]
+}
