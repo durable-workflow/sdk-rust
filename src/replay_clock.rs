@@ -1,9 +1,9 @@
 //! Additive business time, independent of cancellation's monotonic budget clock.
 
 use super::{
-    durable_event_sequence, is_internal_timer_event, recorded_commands, DurableOperationHandle,
-    Error, HistoryEvent, ParallelGroupMetadata, QueryContext, RecordedCommand, Result, Value,
-    WorkflowContext, WorkflowIdentity, WorkflowState,
+    durable_event_sequence, is_internal_timer_event, is_recorded_signal_wait_event,
+    recorded_commands, DurableOperationHandle, Error, HistoryEvent, ParallelGroupMetadata,
+    QueryContext, RecordedCommand, Result, Value, WorkflowContext, WorkflowIdentity, WorkflowState,
 };
 use chrono::{DateTime, Utc};
 use std::{
@@ -80,6 +80,46 @@ enum BoundaryKind {
     Activity,
     Timer,
     Child,
+    Signal,
+}
+
+fn signal_boundary(history: &[HistoryEvent], indices: &[usize], sequence: u64) -> Option<usize> {
+    let [opened, applied] = indices else {
+        return None;
+    };
+    let open = &history[*opened];
+    let apply = &history[*applied];
+    if open.event_type != "SignalWaitOpened"
+        || apply.event_type != "SignalApplied"
+        || open
+            .payload
+            .get("timeout_seconds")
+            .is_some_and(|value| !value.is_null())
+        || apply.payload.get("value").is_none_or(Value::is_null)
+    {
+        return None;
+    }
+    for event in [open, apply] {
+        if event.payload.get("sequence").and_then(Value::as_u64) != Some(sequence)
+            || event
+                .payload
+                .get("workflow_sequence")
+                .is_some_and(|value| value.as_u64() != Some(sequence))
+        {
+            return None;
+        }
+    }
+    for key in ["signal_wait_id", "signal_name"] {
+        let identity = open
+            .payload
+            .get(key)?
+            .as_str()
+            .filter(|value| !value.is_empty())?;
+        if apply.payload.get(key).and_then(Value::as_str) != Some(identity) {
+            return None;
+        }
+    }
+    Some(*applied)
 }
 
 fn child_boundary(history: &[HistoryEvent], indices: &[usize]) -> Option<usize> {
@@ -153,11 +193,20 @@ impl Clock {
                 } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
                     Some((*sequence, BoundaryKind::Child))
                 }
+                RecordedCommand::SignalWait {
+                    sequence,
+                    value: Some(_),
+                    parallel_group_path,
+                    ..
+                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+                    Some((*sequence, BoundaryKind::Signal))
+                }
                 _ => None,
             })
             .collect();
         let mut boundaries = HashMap::new();
         let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut signals: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, event) in history.iter().enumerate() {
             let Some(sequence) = durable_event_sequence(event) else {
                 continue;
@@ -181,6 +230,14 @@ impl Clock {
                     }
                     false
                 }
+                Some(BoundaryKind::Signal) => {
+                    if is_recorded_signal_wait_event(event)
+                        || (event.event_type.starts_with("Timer") && is_internal_timer_event(event))
+                    {
+                        signals.entry(sequence).or_default().push(index);
+                    }
+                    false
+                }
                 None => false,
             };
             if matched {
@@ -189,6 +246,11 @@ impl Clock {
         }
         for (sequence, indices) in children {
             if let Some(index) = child_boundary(history, &indices) {
+                boundaries.insert(sequence, index);
+            }
+        }
+        for (sequence, indices) in signals {
+            if let Some(index) = signal_boundary(history, &indices, sequence) {
                 boundaries.insert(sequence, index);
             }
         }
@@ -264,7 +326,7 @@ impl WorkflowState {
                     event,
                     matches!(
                         event.event_type.as_str(),
-                        "ActivityCompleted" | "TimerFired"
+                        "ActivityCompleted" | "TimerFired" | "SignalApplied"
                     ),
                 )
             });
@@ -279,7 +341,7 @@ impl WorkflowContext {
     /// or invalid evidence returns [`Error::ReplayClockUnavailable`]. The clock
     /// is available only while this workflow's handler/future is executing.
     ///
-    /// This source cohort supports correlated scalar activity/timer/child
+    /// This source cohort supports correlated scalar activity/timer/child/signal
     /// results and the explicit redrive start anchor. Ordinary start authority,
     /// inline metadata/local completions and grouped/other operation families
     /// remain unavailable. Cancellation's existing budget clock is unchanged.
@@ -323,6 +385,7 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
             | "ChildRunFailed"
             | "ChildRunCancelled"
             | "ChildRunTerminated"
+            | "SignalApplied"
     ) {
         return None;
     }
@@ -344,7 +407,7 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
                 event,
                 matches!(
                     event.event_type.as_str(),
-                    "ActivityCompleted" | "TimerFired"
+                    "ActivityCompleted" | "TimerFired" | "SignalApplied"
                 ),
             )
         })
