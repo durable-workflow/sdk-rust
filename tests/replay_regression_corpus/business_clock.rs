@@ -32,3 +32,38 @@ pub(super) fn register(worker: &mut Worker, workflow_type: &str) {
         }))
     });
 }
+
+pub(super) fn register_child(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let entry_unavailable = ctx.replay_now().is_err();
+        let child = ctx
+            .start_child_workflow(
+                "clock-child",
+                ChildWorkflowOptions::new("children"),
+                json!([]),
+            )
+            .await?;
+        let completed = ctx.replay_now().ok();
+        let outcome = ctx
+            .start_child_workflow(
+                "clock-child",
+                ChildWorkflowOptions::new("children"),
+                json!([]),
+            )
+            .await;
+        let Err(Error::ChildWorkflowFailed(failure)) = outcome else {
+            return Err(Error::WorkerLoop(
+                "expected the recorded child failure".into(),
+            ));
+        };
+        let failed = ctx.replay_now().ok();
+        Ok(json!({
+            "entry_unavailable":entry_unavailable,
+            "completed":completed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "failed":failed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "unchanged_prefix":failed.is_some() && failed==ctx.replay_now().ok(),
+            "result":child.result,
+            "failure_reason":failure.reason,
+        }))
+    });
+}

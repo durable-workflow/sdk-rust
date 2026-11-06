@@ -68,6 +68,9 @@
         },
         {
           "glob": "src/cancellation_replay_clock.rs"
+        },
+        {
+          "glob": "src/replay_clock.rs"
         }
       ]
     }

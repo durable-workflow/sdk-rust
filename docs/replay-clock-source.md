@@ -1,4 +1,4 @@
-# Additive replay clock: first Rust source cohort
+# Additive replay clock: Rust source cohorts
 
 This source checkpoint implements `WorkflowContext::replay_now()` and
 `QueryContext::replay_now()` toward [the cross-SDK replay-clock feature](https://github.com/durable-workflow/.github/issues/215).
@@ -21,12 +21,13 @@ counter identity to order emitted events.
 | Ordinary entry | Core uses original `WorkflowRun.started_at`; current Rust worker task has no such carrier | Unavailable, even if the start history row has an insertion timestamp |
 | Scalar remote activity | Existing validated command sequence/type/result correlation, then the selected terminal event | Selected recorded time; successful redrive reuse retains `reused_recorded_at`; the existing Core failure branch uses its event time |
 | Scalar plain timer | Existing validated `TimerScheduled`/`TimerFired` pair, exact sequence/ID/delay | Matched fire time, with recorded reuse provenance |
-| Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
+| Scalar child result | One schedule, optional start and unique parent `ChildRunCompleted` / `ChildRunFailed` / `ChildRunCancelled` / `ChildRunTerminated`, with matching nonempty child call, instance, run and type identities | Parent resolution event time for both send and throw; child `closed_at` and `reused_recorded_at` are not this branch's clock authority |
+| Snapshot query | Immutable inspected prefix whose final boundary has the same validated activity/timer/child correlation, or explicit redrive start | Repeated reads of that prefix are equal; unknown/invalid final boundary is unavailable |
 | Replayed-instance query | Clock of the actual reconstructed workflow prefix, rather than a later visible row | Same supported boundary rules |
 | Direct update handler | Unique committed `UpdateAccepted` correlated to the handler's update ID | That event's validated time; missing/ambiguous acceptance is unavailable |
 | Executor condition predicate | Current executor exposes a full signal/update view without retaining the exact triggering consumed prefix | Unavailable inside the predicate; enclosing workflow scope is restored on return/error |
 | Inline side effect/version/memo/search/local result | User code can resume before its event is persisted | Unavailable on first execution and the corresponding cold path in this cohort; no implicit marker/yield/fence |
-| Child/signal/condition result, grouped/selection/Nexus or cancellation callback | Their dedicated clock algorithms are outside this initial cohort | Explicitly unavailable; existing execution/cancellation behavior remains intact |
+| Signal/condition result, grouped/selection/Nexus or cancellation callback | Their dedicated clock algorithms are outside this initial cohort | Explicitly unavailable; existing execution/cancellation behavior remains intact |
 
 The mutable workflow clock is bound only during handler construction and each
 future poll. A separate execution-local guard restores its predecessor on
@@ -57,3 +58,22 @@ also consumed as source evidence, without inventing its ordinary start anchor.
 Normal current-head checks remain required. Published cross-SDK conformance,
 producer implementation/adoption, release and guide/localized delivery remain
 separate work on the owning issue.
+
+The scalar child cohort follows Core's persisted branches at
+[`4b2cdc55` `WorkflowExecutor::resumeChildResolution`](https://github.com/durable-workflow/workflow/blob/4b2cdc5507120d9c213b0b02a85738bec96c574a/src/V2/Support/WorkflowExecutor.php#L1638)
+and the corresponding `QueryStateReplayer` branch. Both completion and failure
+resume at the selected parent resolution event's own `recorded_at`. Unlike the
+successful activity/timer reuse path, they do not select `reused_recorded_at`.
+The child row's `closed_at` is not a substitute. Rust consumes the existing
+validated scalar command before advancing this clock. Identical duplicate
+terminal payloads, missing/conflicting lifecycle identities, changing-run
+retry/continuation lineage, out-of-order lifecycle or invalid/missing time keep
+business time unavailable without changing legacy result/failure behavior.
+A schedule without a resolution stays pending and does not advance time.
+
+Focused child controls exercise actual calls and caught terminal failures,
+unchanged-prefix and cold replay, backward/precise times, future-row isolation,
+identity/time refusals, snapshot/reconstructed query prefixes and interleaved
+poll/error scope restoration. The separate child corpus consumer runs unchanged
+against base and candidate production code, retaining an exact behavioral
+negative rather than a compilation failure.
