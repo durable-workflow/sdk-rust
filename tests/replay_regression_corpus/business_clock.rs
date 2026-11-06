@@ -84,3 +84,31 @@ pub(super) fn register_signal(worker: &mut Worker, workflow_type: &str) {
         }))
     });
 }
+
+pub(super) fn register_condition(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let entry_unavailable = ctx.replay_now().is_err();
+        let first = ctx
+            .wait_condition(
+                ConditionWaitOptions::new("ready", "sha256:ready-v1"),
+                || Ok(false),
+            )
+            .await?;
+        let first_time = ctx.replay_now().ok();
+        let second = ctx
+            .wait_condition(
+                ConditionWaitOptions::new("ready", "sha256:ready-v1")
+                    .timeout(Duration::from_secs(30)),
+                || Ok(false),
+            )
+            .await?;
+        let second_time = ctx.replay_now().ok();
+        Ok(json!({
+            "entry_unavailable":entry_unavailable,
+            "results":[format!("{first:?}"),format!("{second:?}")],
+            "first_time":first_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "second_time":second_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "unchanged_prefix":second_time.is_some() && second_time==ctx.replay_now().ok(),
+        }))
+    });
+}

@@ -12,6 +12,8 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+mod condition;
+
 thread_local! {
     static ACTIVE: RefCell<Option<Weak<Mutex<WorkflowState>>>> = const { RefCell::new(None) };
 }
@@ -81,6 +83,53 @@ enum BoundaryKind {
     Timer,
     Child,
     Signal,
+    Condition,
+}
+
+fn supported_boundary(command: &RecordedCommand) -> Option<(u64, BoundaryKind)> {
+    match command {
+        RecordedCommand::Activity {
+            sequence,
+            outcome: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Activity))
+        }
+        RecordedCommand::Timer {
+            sequence,
+            fired: true,
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Timer))
+        }
+        RecordedCommand::ChildWorkflow {
+            sequence,
+            outcome: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Child))
+        }
+        RecordedCommand::SignalWait {
+            sequence,
+            value: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Signal))
+        }
+        RecordedCommand::ConditionWait {
+            sequence,
+            result: Some(_),
+            parallel_group_path,
+            ..
+        } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
+            Some((*sequence, BoundaryKind::Condition))
+        }
+        _ => None,
+    }
 }
 
 fn signal_boundary(history: &[HistoryEvent], indices: &[usize], sequence: u64) -> Option<usize> {
@@ -233,47 +282,11 @@ fn child_boundary(history: &[HistoryEvent], indices: &[usize]) -> Option<usize> 
 
 impl Clock {
     pub(super) fn new(history: &[HistoryEvent], commands: &[RecordedCommand]) -> Self {
-        let supported: HashMap<_, _> = commands
-            .iter()
-            .filter_map(|command| match command {
-                RecordedCommand::Activity {
-                    sequence,
-                    outcome: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Activity))
-                }
-                RecordedCommand::Timer {
-                    sequence,
-                    fired: true,
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Timer))
-                }
-                RecordedCommand::ChildWorkflow {
-                    sequence,
-                    outcome: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Child))
-                }
-                RecordedCommand::SignalWait {
-                    sequence,
-                    value: Some(_),
-                    parallel_group_path,
-                    ..
-                } if parallel_group_path.as_ref().is_none_or(Vec::is_empty) => {
-                    Some((*sequence, BoundaryKind::Signal))
-                }
-                _ => None,
-            })
-            .collect();
+        let supported: HashMap<_, _> = commands.iter().filter_map(supported_boundary).collect();
         let mut boundaries = HashMap::new();
         let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut signals: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut conditions: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut signal_timers: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, event) in history.iter().enumerate() {
             if event.event_type.starts_with("Timer") {
@@ -310,6 +323,12 @@ impl Clock {
                     }
                     false
                 }
+                Some(BoundaryKind::Condition) => {
+                    if super::is_recorded_condition_wait_event(event) {
+                        conditions.entry(sequence).or_default().push(index);
+                    }
+                    false
+                }
                 None => false,
             };
             if matched {
@@ -338,6 +357,9 @@ impl Clock {
                 boundaries.insert(sequence, index);
             }
         }
+        boundaries.extend(conditions.into_iter().filter_map(|(sequence, indices)| {
+            condition::boundary(history, &indices, sequence).map(|index| (sequence, index))
+        }));
         // Index identities once. Timestamps are read only when that boundary
         // is actually consumed, never by scanning ahead from the accessor.
         Self {
@@ -470,6 +492,8 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
             | "ChildRunCancelled"
             | "ChildRunTerminated"
             | "SignalApplied"
+            | "ConditionWaitSatisfied"
+            | "ConditionWaitTimedOut"
     ) {
         return None;
     }
