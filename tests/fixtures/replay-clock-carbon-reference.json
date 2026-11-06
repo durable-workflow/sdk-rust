@@ -1,0 +1,93 @@
+{
+  "php": "8.4.27",
+  "carbon": "3.15.1",
+  "source": "ce0e5636fae7d1e99856eb70cae4c719a284aa08",
+  "timestamp_source_sha256": "57b2a235656f8edad7c333087a64e45491adaaf1b01ac9c40e53185b73db356d",
+  "vectors": [
+    {
+      "input": "1970-01-01T00:00:00.000000Z",
+      "milliseconds": 0,
+      "reconstructed": "1970-01-01T00:00:00.000000Z"
+    },
+    {
+      "input": "1970-01-01T00:00:00.000499Z",
+      "milliseconds": 0,
+      "reconstructed": "1970-01-01T00:00:00.000000Z"
+    },
+    {
+      "input": "1970-01-01T00:00:00.000500Z",
+      "milliseconds": 1,
+      "reconstructed": "1970-01-01T00:00:00.001000Z"
+    },
+    {
+      "input": "1970-01-01T00:00:00.000501Z",
+      "milliseconds": 1,
+      "reconstructed": "1970-01-01T00:00:00.001000Z"
+    },
+    {
+      "input": "1969-12-31T23:59:59.999501Z",
+      "milliseconds": 0,
+      "reconstructed": "1970-01-01T00:00:00.000000Z"
+    },
+    {
+      "input": "1969-12-31T23:59:59.999500Z",
+      "milliseconds": -1,
+      "reconstructed": "1969-12-31T23:59:59.999000Z"
+    },
+    {
+      "input": "1969-12-31T23:59:59.999499Z",
+      "milliseconds": -1,
+      "reconstructed": "1969-12-31T23:59:59.999000Z"
+    },
+    {
+      "input": "1969-12-31T23:59:59.998500Z",
+      "milliseconds": -2,
+      "reconstructed": "1969-12-31T23:59:59.998000Z"
+    },
+    {
+      "input": "2026-01-01T00:00:00.123100Z",
+      "milliseconds": 1767225600123,
+      "reconstructed": "2026-01-01T00:00:00.123000Z"
+    },
+    {
+      "input": "2026-01-01T00:00:00.123400Z",
+      "milliseconds": 1767225600123,
+      "reconstructed": "2026-01-01T00:00:00.123000Z"
+    },
+    {
+      "input": "2026-01-01T00:00:00.123499Z",
+      "milliseconds": 1767225600123,
+      "reconstructed": "2026-01-01T00:00:00.123000Z"
+    },
+    {
+      "input": "2026-01-01T00:00:00.123500Z",
+      "milliseconds": 1767225600124,
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    },
+    {
+      "input": "2026-01-01T00:00:00.123501Z",
+      "milliseconds": 1767225600124,
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    },
+    {
+      "input": "2026-01-01T00:00:00.999500Z",
+      "milliseconds": 1767225601000,
+      "reconstructed": "2026-01-01T00:00:01.000000Z"
+    },
+    {
+      "input": "1900-01-01T00:00:00.123499Z",
+      "milliseconds": -2208988799877,
+      "reconstructed": "1900-01-01T00:00:00.123000Z"
+    },
+    {
+      "input": "1900-01-01T00:00:00.123500Z",
+      "milliseconds": -2208988799877,
+      "reconstructed": "1900-01-01T00:00:00.123000Z"
+    },
+    {
+      "input": "2026-01-01T01:30:00.123500+01:30",
+      "milliseconds": 1767225600124,
+      "reconstructed": "2026-01-01T00:00:00.124000Z"
+    }
+  ]
+}

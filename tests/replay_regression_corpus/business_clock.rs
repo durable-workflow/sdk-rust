@@ -112,3 +112,30 @@ pub(super) fn register_condition(worker: &mut Worker, workflow_type: &str) {
         }))
     });
 }
+
+pub(super) fn register_parallel_activity(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let operations = || {
+            vec![
+                ParallelOperation::activity("clock-a", json!([])),
+                ParallelOperation::activity("clock-b", json!([])),
+            ]
+        };
+        let entry_unavailable = ctx.replay_now().is_err();
+        ctx.parallel(operations()).await?;
+        let success = ctx.replay_now().ok();
+        let Err(Error::ParallelFailed(failure)) = ctx.parallel(operations()).await else {
+            return Err(Error::WorkerLoop(
+                "expected recorded parallel failure".into(),
+            ));
+        };
+        let failed = ctx.replay_now().ok();
+        Ok(json!({
+            "entry_unavailable":entry_unavailable,
+            "success_time":success.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "failure_time":failed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "failure_member":failure.member_path,
+            "unchanged_prefix":failed.is_some() && failed==ctx.replay_now().ok(),
+        }))
+    });
+}

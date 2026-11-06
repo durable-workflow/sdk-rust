@@ -74,6 +74,9 @@
         },
         {
           "glob": "src/replay_clock/condition.rs"
+        },
+        {
+          "glob": "src/replay_clock/parallel_activity.rs"
         }
       ]
     }

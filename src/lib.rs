@@ -9682,7 +9682,7 @@ impl Worker {
                 };
                 query_authority::before_handler(authority, &self.client).await?;
                 let mut invocation = {
-                    let _clock = replay_clock::Guard::enter(&workflow_context);
+                    let _clock = replay_clock::Guard::query(&workflow_context);
                     replay(workflow_context.clone(), workflow_input_typed.clone())
                 }
                 .map_err(|error| {
@@ -9694,7 +9694,7 @@ impl Worker {
                 })?;
                 let outcome = {
                     let mut cx = TaskContext::from_waker(noop_waker_ref());
-                    let _clock = replay_clock::Guard::enter(&workflow_context);
+                    let _clock = replay_clock::Guard::query(&workflow_context);
                     let _replay = cancellation_replay_clock::ReplayGuard::enter(&workflow_context)
                         .map_err(|error| {
                             QueryTaskExecutionFailure::new(
