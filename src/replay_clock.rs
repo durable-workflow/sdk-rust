@@ -16,6 +16,7 @@ mod condition;
 mod condition_timeout;
 mod parallel;
 mod parallel_activity;
+mod parallel_child;
 mod parallel_timer;
 
 thread_local! {
@@ -113,8 +114,9 @@ fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
 pub(super) struct Clock {
     time: Option<DateTime<Utc>>,
     boundaries: HashMap<u64, usize>,
-    parallel_activities: parallel_activity::Members,
-    parallel_timers: parallel_timer::Members,
+    parallel_activities: parallel::Members,
+    parallel_timers: parallel::Members,
+    parallel_children: parallel::Members,
 }
 
 enum BoundaryKind {
@@ -278,21 +280,31 @@ fn signal_timeout(
 }
 
 fn child_boundary(history: &[HistoryEvent], indices: &[usize]) -> Option<usize> {
-    // A scalar call has one schedule, an optional start, then one resolution.
+    child_lifecycle(history, indices)?
+}
+
+fn child_lifecycle(history: &[HistoryEvent], indices: &[usize]) -> Option<Option<usize>> {
+    // One call has one schedule, an optional start, then at most one resolution.
     // Legacy replay can accept duplicate payloads, but their time is ambiguous.
-    let (&scheduled, &terminal) = match indices {
-        [scheduled, terminal] => (scheduled, terminal),
+    let (&scheduled, terminal) = match indices {
+        [scheduled] => (scheduled, None),
+        [scheduled, started] if history[*started].event_type == "ChildRunStarted" => {
+            (scheduled, None)
+        }
+        [scheduled, terminal] => (scheduled, Some(*terminal)),
         [scheduled, started, terminal] if history[*started].event_type == "ChildRunStarted" => {
-            (scheduled, terminal)
+            (scheduled, Some(*terminal))
         }
         _ => return None,
     };
     let schedule = &history[scheduled];
     if schedule.event_type != "ChildWorkflowScheduled"
-        || !matches!(
-            history[terminal].event_type.as_str(),
-            "ChildRunCompleted" | "ChildRunFailed" | "ChildRunCancelled" | "ChildRunTerminated"
-        )
+        || terminal.is_some_and(|terminal| {
+            !matches!(
+                history[terminal].event_type.as_str(),
+                "ChildRunCompleted" | "ChildRunFailed" | "ChildRunCancelled" | "ChildRunTerminated"
+            )
+        })
     {
         return None;
     }
@@ -407,8 +419,9 @@ impl Clock {
         Self {
             time: start_time(history),
             boundaries,
-            parallel_activities: parallel_activity::Members::new(history, commands),
-            parallel_timers: parallel_timer::Members::new(history, commands),
+            parallel_activities: parallel_activity::members(history, commands),
+            parallel_timers: parallel_timer::members(history, commands),
+            parallel_children: parallel_child::members(history, commands),
         }
     }
 
@@ -447,6 +460,13 @@ impl WorkflowState {
                 .consumed_time(&self.history_events, sequences, failed)
                 .or_else(|| {
                     self.replay_clock.parallel_timers.consumed_time(
+                        &self.history_events,
+                        sequences,
+                        failed,
+                    )
+                })
+                .or_else(|| {
+                    self.replay_clock.parallel_children.consumed_time(
                         &self.history_events,
                         sequences,
                         failed,

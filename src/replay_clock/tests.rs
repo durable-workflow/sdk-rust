@@ -526,3 +526,5 @@ mod condition_timeout;
 mod parallel_timer;
 
 mod parallel;
+
+mod parallel_child;
