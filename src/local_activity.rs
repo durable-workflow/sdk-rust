@@ -722,7 +722,10 @@ fn local_retry_backoff_seconds(policy: Option<&Value>, number: u64) -> u64 {
     policy
         .and_then(|p| p["backoff_seconds"].as_array())
         .and_then(|list| {
-            let index = usize::try_from(number).ok()?.min(list.len()).checked_sub(1)?;
+            let index = usize::try_from(number)
+                .ok()?
+                .min(list.len())
+                .checked_sub(1)?;
             list.get(index)
         })
         .and_then(Value::as_u64)
