@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.13.0
+
 - Local activities no longer retry with zero delay once their backoff list runs out.
   Each later retry repeats the final backoff entry, as Server-scheduled activities
   do (durable-workflow/.github#219).
