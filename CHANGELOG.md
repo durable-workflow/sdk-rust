@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Local activities no longer retry with zero delay once their backoff list runs out.
+  Each later retry repeats the final backoff entry, as Server-scheduled activities
+  do (durable-workflow/.github#219).
 - Reject malformed supplied shared, control and worker static tokens during
   client construction, including unused or masked options. Diagnostics name
   only the option. Empty tokens and valid token bytes retain their precedence.

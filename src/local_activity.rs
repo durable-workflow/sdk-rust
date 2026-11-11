@@ -602,10 +602,7 @@ impl Worker {
                     && !non_retryable
                     && timeout_kind != Some("schedule_to_close");
                 if retry {
-                    let backoff = policy
-                        .and_then(|p| p["backoff_seconds"].get((number - 1) as usize))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
+                    let backoff = local_retry_backoff_seconds(policy, number);
                     report["retry_reason"] = json!(if timeout_kind.is_some() {
                         "timeout"
                     } else {
@@ -715,4 +712,46 @@ fn local_error(error: Error) -> (String, String, bool, Option<&'static str>) {
 fn heartbeat_extended(reports: &Arc<Mutex<Heartbeats>>, timeout: Option<u64>) -> Result<bool> {
     let reports = reports.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
     Ok(timeout.is_some_and(|seconds| reports.last + Duration::from_secs(seconds) > Instant::now()))
+}
+
+/// The delay before retrying after attempt `number` (1-based). Once attempts
+/// outnumber the backoff list, the final entry repeats, as it does for
+/// Server-scheduled activities (durable-workflow/.github#219). No list means
+/// no delay.
+fn local_retry_backoff_seconds(policy: Option<&Value>, number: u64) -> u64 {
+    policy
+        .and_then(|p| p["backoff_seconds"].as_array())
+        .and_then(|list| {
+            let index = usize::try_from(number)
+                .ok()?
+                .min(list.len())
+                .checked_sub(1)?;
+            list.get(index)
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod local_retry_backoff_tests {
+    use super::local_retry_backoff_seconds;
+    use serde_json::json;
+
+    #[test]
+    fn repeats_the_final_entry_once_the_list_runs_out() {
+        let policy = json!({"max_attempts": 5, "backoff_seconds": [1, 2]});
+        let delays: Vec<u64> = (1..=4)
+            .map(|number| local_retry_backoff_seconds(Some(&policy), number))
+            .collect();
+        assert_eq!(delays, vec![1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn no_list_or_no_policy_means_no_delay() {
+        let empty = json!({"max_attempts": 3, "backoff_seconds": []});
+        let missing = json!({"max_attempts": 3});
+        assert_eq!(local_retry_backoff_seconds(Some(&empty), 2), 0);
+        assert_eq!(local_retry_backoff_seconds(Some(&missing), 2), 0);
+        assert_eq!(local_retry_backoff_seconds(None, 1), 0);
+    }
 }
