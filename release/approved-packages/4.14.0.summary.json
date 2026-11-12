@@ -1,0 +1,3682 @@
+{
+  "started_at": "2026-11-12T02:59:00.111923+00:00",
+  "outcome": "pass",
+  "mode": "pre-publication",
+  "expected_server": {
+    "version": "3.5.0",
+    "revision": "1b8e9ee4bc6402261cb465cb6996056bacedd97c",
+    "release_tag": "3.5.0"
+  },
+  "harness_commit": "7e5f1ab663868f2659b1dfce02aa235f1dde302e",
+  "server": {
+    "index": "ghcr.io/durable-workflow/server@sha256:b5776fea2a4627ebc477b3b350caaf600dc220e7ab75aa29d32b70e404fd7a68",
+    "executed_manifest": "ghcr.io/durable-workflow/server@sha256:0f394e96e7e8754e99e6f83ffad150c94b1a8010c0359ae07823d3844d5bd7fa",
+    "platform": "linux/amd64",
+    "other_manifests": [
+      {
+        "digest": "sha256:498c27960bb29a9915138a0b6cfe99139cce6bdbe9591ff0df816819a3a2b67f",
+        "platform": {
+          "architecture": "arm64",
+          "os": "linux"
+        }
+      }
+    ],
+    "image": {
+      "id": "sha256:0f394e96e7e8754e99e6f83ffad150c94b1a8010c0359ae07823d3844d5bd7fa",
+      "repo_digests": [
+        "ghcr.io/durable-workflow/server@sha256:0f394e96e7e8754e99e6f83ffad150c94b1a8010c0359ae07823d3844d5bd7fa"
+      ],
+      "os": "linux",
+      "architecture": "amd64",
+      "content_sha256": "3f6bd9262afadf9316c78560c7edc035c492097381acf5bf722789c15f16506b"
+    },
+    "image_by_index": {
+      "id": "sha256:b5776fea2a4627ebc477b3b350caaf600dc220e7ab75aa29d32b70e404fd7a68",
+      "repo_digests": [
+        "durableworkflow/server@sha256:b5776fea2a4627ebc477b3b350caaf600dc220e7ab75aa29d32b70e404fd7a68",
+        "ghcr.io/durable-workflow/server@sha256:b5776fea2a4627ebc477b3b350caaf600dc220e7ab75aa29d32b70e404fd7a68"
+      ],
+      "os": "linux",
+      "architecture": "amd64",
+      "content_sha256": "3f6bd9262afadf9316c78560c7edc035c492097381acf5bf722789c15f16506b"
+    },
+    "labels": {
+      "dev.durable-workflow.release.run-id": "43109713180",
+      "dev.durable-workflow.release.tag": "3.5.0",
+      "org.opencontainers.image.licenses": "MIT",
+      "org.opencontainers.image.revision": "1b8e9ee4bc6402261cb465cb6996056bacedd97c",
+      "org.opencontainers.image.source": "https://github.com/durable-workflow/server",
+      "org.opencontainers.image.title": "Durable Workflow Server (native)"
+    }
+  },
+  "package": {
+    "mode": "pre-publication",
+    "package": "durable-workflow",
+    "version": "4.14.0",
+    "commit": "7e5f1ab663868f2659b1dfce02aa235f1dde302e",
+    "crate_file": "durable-workflow-4.14.0.crate",
+    "crate_sha256": "91a508b730a0ec94634fe9d293ce60ebeb73d6e79f74202c55e386d7d6b1e3d9",
+    "crate_size": 570820,
+    "files": [
+      ".cargo_vcs_info.json",
+      "CHANGELOG.md",
+      "Cargo.lock",
+      "Cargo.toml",
+      "Cargo.toml.orig",
+      "LICENSE",
+      "README.md",
+      "examples/AVRO_VALUE_BENCHMARK.md",
+      "examples/WORKER_LATENCY.md",
+      "examples/activity_options.rs",
+      "examples/avro_value_benchmark.rs",
+      "examples/condition_search_attributes.rs",
+      "examples/continue_as_new.rs",
+      "examples/hello_world.rs",
+      "examples/local_activities.rs",
+      "examples/metrics_prometheus.rs",
+      "examples/nexus_cooperation.rs",
+      "examples/parallel_saga.rs",
+      "examples/runtime_payloads.rs",
+      "examples/sticky_execution.rs",
+      "examples/worker_latency.rs",
+      "examples/worker_sessions.rs",
+      "examples/workflow_pagination.rs",
+      "examples/workflow_testing.rs",
+      "schema/avro-value-benchmark-v1.json",
+      "schema/avro-value-v1-golden.json",
+      "schema/durable_workflow.protocol.Value.v1.avsc",
+      "src/activity_error.rs",
+      "src/activity_hydration.rs",
+      "src/activity_lease.rs",
+      "src/activity_lease/authority.rs",
+      "src/activity_lease/authority/session.rs",
+      "src/activity_retry.rs",
+      "src/bin/durable-workflow-memo-restart.rs",
+      "src/bin/durable-workflow-replay-conformance.rs",
+      "src/cancellation_context.rs",
+      "src/cancellation_replay_clock.rs",
+      "src/cancellation_scope.rs",
+      "src/cancellation_scope_history.rs",
+      "src/cancellation_scope_replay.rs",
+      "src/cooperative_cancellation.rs",
+      "src/failure_reporting.rs",
+      "src/lib.rs",
+      "src/local_activity.rs",
+      "src/metrics.rs",
+      "src/metrics/prometheus.rs",
+      "src/metrics/routes.rs",
+      "src/metrics/tests.rs",
+      "src/nexus.rs",
+      "src/pagination.rs",
+      "src/query_authority.rs",
+      "src/raw_request.rs",
+      "src/replay_clock.rs",
+      "src/replay_clock/condition.rs",
+      "src/replay_clock/condition_timeout.rs",
+      "src/replay_clock/parallel.rs",
+      "src/replay_clock/parallel_activity.rs",
+      "src/replay_clock/parallel_child.rs",
+      "src/replay_clock/parallel_timer.rs",
+      "src/replay_clock/tests.rs",
+      "src/replay_clock/tests/child.rs",
+      "src/replay_clock/tests/condition.rs",
+      "src/replay_clock/tests/condition_timeout.rs",
+      "src/replay_clock/tests/parallel.rs",
+      "src/replay_clock/tests/parallel_activity.rs",
+      "src/replay_clock/tests/parallel_child.rs",
+      "src/replay_clock/tests/parallel_timer.rs",
+      "src/replay_clock/tests/signal.rs",
+      "src/replay_clock/tests/signal/timed.rs",
+      "src/run_activities.rs",
+      "src/runtime_payloads.rs",
+      "src/runtime_uploads.rs",
+      "src/sticky_worker.rs",
+      "src/sticky_workflow_cache.rs",
+      "src/telemetry.rs",
+      "src/telemetry/carrier.rs",
+      "src/terminal_failure_detail.rs",
+      "src/testing/environment.rs",
+      "src/testing/history.rs",
+      "src/testing/mod.rs",
+      "src/testing/runner.rs",
+      "src/tests/activity_cancellation_policies.rs",
+      "src/tests/activity_lease_worker.rs",
+      "src/tests/cancellation_scope_admission.rs",
+      "src/tests/cancellation_scope_authoring.rs",
+      "src/tests/cancellation_scope_history.rs",
+      "src/tests/cancellation_scope_opening.rs",
+      "src/tests/cancellation_scope_replay.rs",
+      "src/tests/cancellation_scope_replay/descendants.rs",
+      "src/tests/cancellation_scope_replay/run_scopes.rs",
+      "src/tests/child_workflow_policies.rs",
+      "src/tests/condition_fingerprint.rs",
+      "src/tests/cooperative_cancellation.rs",
+      "src/tests/fixtures/cooperative-cancellation-context.json",
+      "src/tests/fixtures/scoped-run-cancellation-context.json",
+      "src/tests/local_activity.rs",
+      "src/tests/nexus.rs",
+      "src/tests/runtime_payloads.rs",
+      "src/tests/runtime_uploads.rs",
+      "src/tests/static_credentials.rs",
+      "src/tests/version_marker_contract.rs",
+      "src/tests/worker_capacity.rs",
+      "src/tests/worker_session.rs",
+      "src/tls.rs",
+      "src/worker_capacity.rs",
+      "src/worker_session.rs",
+      "src/workflow_hydration.rs",
+      "tests/fixtures/auth-configuration/static-credentials-v1.json",
+      "tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json",
+      "tests/fixtures/sdk-metrics-contract.json"
+    ],
+    "file_count": 110,
+    "file_list_sha256": "a03200679f8bf431287d6b8e18097084a834f154e332641ed685448a11cbeaf8",
+    "vcs_info": {
+      "git": {
+        "sha1": "7e5f1ab663868f2659b1dfce02aa235f1dde302e"
+      },
+      "path_in_vcs": ""
+    },
+    "cargo_version": "cargo 1.86.0 (adf9b6ad1 2025-02-28)",
+    "rust_image": {
+      "id": "sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081",
+      "repo_digests": [
+        "rust@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081"
+      ],
+      "os": "linux",
+      "architecture": "amd64",
+      "content_sha256": "bc360ba80df6d511c484d154cc94dedcc06864df6d464bdf3d4f0ba792ad8228"
+    },
+    "product_train": "4.14.0",
+    "verified_source_files": 108,
+    "unpacked": "package/durable-workflow-4.14.0",
+    "crate_sha256_after_cells": "91a508b730a0ec94634fe9d293ce60ebeb73d6e79f74202c55e386d7d6b1e3d9"
+  },
+  "build": {
+    "rust_image": {
+      "id": "sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081",
+      "repo_digests": [
+        "rust@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081"
+      ],
+      "os": "linux",
+      "architecture": "amd64",
+      "content_sha256": "bc360ba80df6d511c484d154cc94dedcc06864df6d464bdf3d4f0ba792ad8228"
+    },
+    "toolchain": [
+      "rustc 1.86.0 (05f9846f8 2025-03-31)",
+      "cargo 1.86.0 (adf9b6ad1 2025-02-28)"
+    ],
+    "network": "none",
+    "binary_sha256": "e8eca470cafdb911fd42c5f2f273285b03e669aa8e8499faa0b397bcbf961b44"
+  },
+  "crate": {
+    "mode": "pre-publication",
+    "version": "4.14.0",
+    "sha256": "91a508b730a0ec94634fe9d293ce60ebeb73d6e79f74202c55e386d7d6b1e3d9",
+    "lock_checksum": "91a508b730a0ec94634fe9d293ce60ebeb73d6e79f74202c55e386d7d6b1e3d9",
+    "lock_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "registry_published": false,
+    "source_commit": "7e5f1ab663868f2659b1dfce02aa235f1dde302e",
+    "installed_files": 110,
+    "verified_source_files": 108,
+    "product_train": "4.14.0",
+    "baselines": {
+      "mode": "required",
+      "pass": true,
+      "expected": {
+        "2": "2.0.0",
+        "3": "3.0.2"
+      },
+      "supported-server-release-baselines": {
+        "2": "2.0.0",
+        "3": "3.0.2"
+      },
+      "supported-server-versions": "2.0.0"
+    }
+  },
+  "python_image": {
+    "id": "sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267",
+    "repo_digests": [
+      "python@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267"
+    ],
+    "os": "linux",
+    "architecture": "amd64",
+    "content_sha256": "144648afda4af36c8c0b801a1463eeb627b3ae18f470f69da93bf256eeb94c0c"
+  },
+  "cells": {
+    "lifecycle": {
+      "cell": "lifecycle",
+      "deadline_unix": 1794453022,
+      "kill_after_seconds": 10,
+      "cluster_info": {
+        "version": "3.5.0",
+        "implementation": "rust",
+        "development": false,
+        "qualified_for_php_takeover": false
+      },
+      "driver_exit": 0,
+      "history_exit": 0,
+      "same_worker_running_after_cases": true,
+      "binary_unchanged": true,
+      "driver": {
+        "cases": {
+          "after-timeout": {
+            "final_run_id": "01M76V65GK0XD1K223AVCWKJ7M",
+            "original_run_id": "01M76V65FPD11B8JYAB3Z6VZKV",
+            "result": {
+              "bigint": 9223372036854775807,
+              "false": false,
+              "nil": null,
+              "step": 1,
+              "unicode": "雪☃",
+              "zero": 0
+            },
+            "status": "completed",
+            "workflow_id": "lifecycle-after-timeout"
+          },
+          "cancel": {
+            "described": {
+              "closed_reason": "cancelled",
+              "failure": null
+            },
+            "final_run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+            "original_run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+            "status": "cancelled",
+            "terminal": {
+              "reason": "cancelled",
+              "run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+              "sdk_error": "cancelled"
+            },
+            "workflow_id": "lifecycle-cancel"
+          },
+          "continue": {
+            "final_run_id": "01M76V62KQ1DM5474V1MZCRNCE",
+            "original_run_id": "01M76V62K2HW3H6CYBMVRJVYHB",
+            "result": {
+              "bigint": 9223372036854775807,
+              "false": false,
+              "nil": null,
+              "step": 1,
+              "unicode": "雪☃",
+              "zero": 0
+            },
+            "status": "completed",
+            "workflow_id": "lifecycle-continue"
+          },
+          "regular": {
+            "final_run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+            "original_run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+            "query_before_signal": {
+              "approvals": [],
+              "input": [
+                "regular",
+                0,
+                "ada"
+              ],
+              "run_status": "waiting"
+            },
+            "result": {
+              "approved_by": "operator",
+              "bigint": 9223372036854775807,
+              "greeting": "hello ada"
+            },
+            "status": "completed",
+            "workflow_id": "lifecycle-regular"
+          },
+          "reject": {
+            "described": {
+              "closed_reason": "failed",
+              "error": "activity failed (activity): rejected bob",
+              "exception": {
+                "class": "durable_workflow::ActivityFailure",
+                "message": "activity failed (activity): rejected bob",
+                "type": "ActivityFailed"
+              },
+              "failure": {
+                "activity_failures": [
+                  {
+                    "activity_attempt_id": "01M76V62G52Y6V74SQ2230G1QE",
+                    "activity_class": "qualification.reject",
+                    "activity_execution_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                    "activity_type": "qualification.reject",
+                    "event_sequence": 5,
+                    "event_type": "ActivityFailed",
+                    "exception_class": "RuntimeException",
+                    "exception_type": "QualificationRejected",
+                    "failure_category": "activity",
+                    "failure_id": "01M76V62H0D05S4J4HGFDC7PB8",
+                    "message": "rejected bob",
+                    "non_retryable": true
+                  }
+                ],
+                "event_sequence": 6,
+                "exception": {
+                  "class": "durable_workflow::ActivityFailure",
+                  "message": "activity failed (activity): rejected bob",
+                  "type": "ActivityFailed"
+                },
+                "exception_class": "durable_workflow::ActivityFailure",
+                "exception_type": "ActivityFailed",
+                "failure_category": "application",
+                "failures": [
+                  {
+                    "event_sequence": 5,
+                    "exception_class": "RuntimeException",
+                    "exception_payload": {
+                      "class": "RuntimeException",
+                      "message": "rejected bob",
+                      "type": "QualificationRejected"
+                    },
+                    "exception_type": "QualificationRejected",
+                    "failure_category": "activity",
+                    "handled": false,
+                    "history_authority": "typed_history",
+                    "id": "01M76V62H0D05S4J4HGFDC7PB8",
+                    "message": "rejected bob",
+                    "non_retryable": true,
+                    "propagation_kind": "activity",
+                    "source_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                    "source_kind": "activity_execution"
+                  },
+                  {
+                    "event_sequence": 6,
+                    "exception_class": "durable_workflow::ActivityFailure",
+                    "exception_payload": {
+                      "class": "durable_workflow::ActivityFailure",
+                      "message": "activity failed (activity): rejected bob",
+                      "type": "ActivityFailed"
+                    },
+                    "exception_type": "ActivityFailed",
+                    "failure_category": "application",
+                    "handled": false,
+                    "history_authority": "typed_history",
+                    "id": "01M76V62HV369NH7J228RFEGC2",
+                    "message": "activity failed (activity): rejected bob",
+                    "non_retryable": true,
+                    "propagation_kind": "terminal",
+                    "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                    "source_kind": "workflow_run"
+                  }
+                ],
+                "message": "activity failed (activity): rejected bob",
+                "non_retryable": true,
+                "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                "source_kind": "workflow_run"
+              },
+              "failures": [
+                {
+                  "event_sequence": 5,
+                  "exception_class": "RuntimeException",
+                  "exception_payload": {
+                    "class": "RuntimeException",
+                    "message": "rejected bob",
+                    "type": "QualificationRejected"
+                  },
+                  "exception_type": "QualificationRejected",
+                  "failure_category": "activity",
+                  "handled": false,
+                  "history_authority": "typed_history",
+                  "id": "01M76V62H0D05S4J4HGFDC7PB8",
+                  "message": "rejected bob",
+                  "non_retryable": true,
+                  "propagation_kind": "activity",
+                  "source_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                  "source_kind": "activity_execution"
+                },
+                {
+                  "event_sequence": 6,
+                  "exception_class": "durable_workflow::ActivityFailure",
+                  "exception_payload": {
+                    "class": "durable_workflow::ActivityFailure",
+                    "message": "activity failed (activity): rejected bob",
+                    "type": "ActivityFailed"
+                  },
+                  "exception_type": "ActivityFailed",
+                  "failure_category": "application",
+                  "handled": false,
+                  "history_authority": "typed_history",
+                  "id": "01M76V62HV369NH7J228RFEGC2",
+                  "message": "activity failed (activity): rejected bob",
+                  "non_retryable": true,
+                  "propagation_kind": "terminal",
+                  "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                  "source_kind": "workflow_run"
+                }
+              ]
+            },
+            "exception_detail_surfaced": true,
+            "final_run_id": "01M76V62EWA17MPVKG76EGKYK7",
+            "original_run_id": "01M76V62EWA17MPVKG76EGKYK7",
+            "status": "failed",
+            "terminal": {
+              "exception": {
+                "class": "durable_workflow::ActivityFailure",
+                "message": "activity failed (activity): rejected bob",
+                "type": "ActivityFailed"
+              },
+              "exception_type": "ActivityFailed",
+              "message": "activity failed (activity): rejected bob",
+              "non_retryable": true,
+              "reason": "failed",
+              "sdk_error": "failed"
+            },
+            "workflow_id": "lifecycle-reject"
+          },
+          "timeout": {
+            "described": {
+              "closed_reason": "timed_out",
+              "failure": {
+                "event_sequence": 5,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+                },
+                "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "failure_category": "timeout",
+                "failures": [
+                  {
+                    "event_sequence": 5,
+                    "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "exception_payload": {
+                      "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                      "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+                    },
+                    "failure_category": "timeout",
+                    "handled": false,
+                    "history_authority": "typed_history",
+                    "id": "01M76V65D6HP3D00QFGCXRT5BN",
+                    "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                    "non_retryable": false,
+                    "propagation_kind": "timeout",
+                    "reason": "run_timeout",
+                    "source_id": "01M76V62PA047MGYCP27PPBB10",
+                    "source_kind": "workflow_run"
+                  }
+                ],
+                "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                "non_retryable": false,
+                "reason": "run_timeout",
+                "source_id": "01M76V62PA047MGYCP27PPBB10",
+                "source_kind": "workflow_run"
+              }
+            },
+            "final_run_id": "01M76V62PA047MGYCP27PPBB10",
+            "original_run_id": "01M76V62PA047MGYCP27PPBB10",
+            "status": "failed",
+            "terminal": {
+              "reason": "run_timeout",
+              "run_id": "01M76V62PA047MGYCP27PPBB10",
+              "sdk_error": "timed_out"
+            },
+            "workflow_id": "lifecycle-timeout"
+          }
+        },
+        "cell": "lifecycle",
+        "outcome": "pass",
+        "problems": []
+      },
+      "history": {
+        "outcome": "pass",
+        "problems": [],
+        "cases": {
+          "after-timeout": {
+            "event_types": {
+              "01M76V65FPD11B8JYAB3Z6VZKV": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "WorkflowContinuedAsNew"
+              ],
+              "01M76V65GK0XD1K223AVCWKJ7M": [
+                "WorkflowStarted",
+                "WorkflowCompleted"
+              ]
+            },
+            "timeout_events": [],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 2,
+                "event_type": "WorkflowCompleted",
+                "timestamp": "2026-11-12T03:00:28.326000Z",
+                "principal": {
+                  "type": "auth:token",
+                  "id": "legacy-token",
+                  "label": "Admin"
+                },
+                "payload": {
+                  "output": {
+                    "codec": "avro",
+                    "blob": "wwHioz3/VYAiNw4MDGJpZ2ludAT+//////////8BCmZhbHNlAgAGbmlsAAhzdGVwBAIOdW5pY29kZQoM6Zuq4piDCHplcm8EAAA="
+                  },
+                  "payload_codec": "avro",
+                  "task": {
+                    "id": "01M76V65GMC0JPPAN71WZ12MAG",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 0,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:28.308000Z",
+                    "leased_at": "2026-11-12T03:00:28.314000Z",
+                    "lease_expires_at": "2026-11-12T03:01:28.314000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:28.308000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:28.308000Z",
+                    "lease_owner": "qualification-installed"
+                  },
+                  "command": {
+                    "type": "complete_workflow",
+                    "source": "worker_protocol",
+                    "principal_type": "auth:token",
+                    "principal_id": "legacy-token",
+                    "principal_label": "Admin"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "lifecycle-after-timeout",
+              "run_id": "01M76V65GK0XD1K223AVCWKJ7M",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "completed",
+              "commands_scope": "selected_run",
+              "commands": [],
+              "status_bucket": "completed",
+              "is_current_run": true,
+              "run_count": 2,
+              "is_terminal": true,
+              "closed_reason": "completed",
+              "run_number": 2,
+              "continued_from_run_id": "01M76V65FPD11B8JYAB3Z6VZKV",
+              "payload_codec": "avro",
+              "input": [
+                "continue",
+                1
+              ],
+              "output": {
+                "bigint": 9223372036854775807,
+                "false": false,
+                "nil": null,
+                "step": 1,
+                "unicode": "雪☃",
+                "zero": 0
+              },
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwEChBjb250aW51ZQQCAA=="
+              },
+              "output_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNw4MDGJpZ2ludAT+//////////8BCmZhbHNlAgAGbmlsAAhzdGVwBAIOdW5pY29kZQoM6Zuq4piDCHplcm8EAAA="
+              },
+              "started_at": "2026-11-12T03:00:28.307000Z",
+              "closed_at": "2026-11-12T03:00:28.326000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 30,
+              "execution_deadline_at": "2026-11-12T03:01:28+00:00",
+              "run_deadline_at": "2026-11-12T03:00:58+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:28+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": true,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "lifecycle-after-timeout",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V65GK0XD1K223AVCWKJ7M",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "completed",
+                "status_bucket": "completed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 2,
+                "run_count": 2,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:28.307000Z",
+                "closed_at": "2026-11-12T03:00:28.326000Z",
+                "last_progress_at": "2026-11-12T03:00:28+00:00",
+                "wait_kind": null,
+                "wait_reason": null
+              }
+            }
+          },
+          "cancel": {
+            "event_types": {
+              "01M76V65DVSQVHN2EQKC4DVJBB": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "TimerScheduled",
+                "CancelRequested",
+                "TimerCancelled",
+                "WorkflowCancelled"
+              ]
+            },
+            "timeout_events": [],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 6,
+                "event_type": "WorkflowCancelled",
+                "timestamp": "2026-11-12T03:00:28.260000Z",
+                "principal": {
+                  "type": "auth:token",
+                  "id": "legacy-token",
+                  "label": "Admin"
+                },
+                "payload": {
+                  "workflow_command_id": "01M76V65F38ZAC4S3EKMS6VPAA",
+                  "workflow_instance_id": "lifecycle-cancel",
+                  "workflow_run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+                  "reason": "qualification cancellation",
+                  "failure_id": "01M76V65F4974ZP2WEA6WK7TQJ",
+                  "failure_category": "cancelled",
+                  "closed_reason": "cancelled",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowCancelledException",
+                  "message": "Workflow cancelled: qualification cancellation",
+                  "command": {
+                    "id": "01M76V65F38ZAC4S3EKMS6VPAA",
+                    "sequence": 2,
+                    "type": "cancel",
+                    "target_scope": "instance",
+                    "resolved_run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+                    "payload_codec": "avro",
+                    "payload": {
+                      "codec": "avro",
+                      "blob": "wwHioz3/VYAiNw4CDHJlYXNvbgo0cXVhbGlmaWNhdGlvbiBjYW5jZWxsYXRpb24A"
+                    },
+                    "source": "control_plane",
+                    "context": {
+                      "principal": {
+                        "type": "auth:token",
+                        "id": "legacy-token",
+                        "label": "Admin"
+                      }
+                    },
+                    "caller_label": "Standalone Server",
+                    "principal_type": "auth:token",
+                    "principal_id": "legacy-token",
+                    "principal_label": "Admin",
+                    "auth_status": "authorized",
+                    "auth_method": "token",
+                    "request_method": "POST",
+                    "request_path": "/api/workflows/lifecycle-cancel/cancel",
+                    "request_fingerprint": "sha256:43abc4a86c550263e85264d3af36057404b47a37e2fdd8a32bffecee9b8f8068",
+                    "status": "accepted",
+                    "outcome": "cancelled",
+                    "accepted_at": "2026-11-12T03:00:28.259000Z",
+                    "applied_at": "2026-11-12T03:00:28.259000Z"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "lifecycle-cancel",
+              "run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "cancelled",
+              "commands_scope": "selected_run",
+              "commands": [
+                {
+                  "id": "01M76V65DVSQVHN2EQKC4DVJBC",
+                  "sequence": 1,
+                  "type": "start",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "started_new",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:28.219Z",
+                  "applied_at": "2026-11-12T03:00:28.219Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows",
+                  "request_fingerprint": "sha256:c35e43d1c82d2b9155efaeb40382075ce459a93607c1031d847dce248f0590eb"
+                },
+                {
+                  "id": "01M76V65F38ZAC4S3EKMS6VPAA",
+                  "sequence": 2,
+                  "type": "cancel",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "cancelled",
+                  "reason": "qualification cancellation",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:28.259Z",
+                  "applied_at": "2026-11-12T03:00:28.259Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows/lifecycle-cancel/cancel",
+                  "request_fingerprint": "sha256:43abc4a86c550263e85264d3af36057404b47a37e2fdd8a32bffecee9b8f8068"
+                }
+              ],
+              "status_bucket": "failed",
+              "is_current_run": true,
+              "run_count": 1,
+              "is_terminal": true,
+              "closed_reason": "cancelled",
+              "run_number": 1,
+              "continued_from_run_id": null,
+              "payload_codec": "avro",
+              "input": [
+                "cancel",
+                0
+              ],
+              "output": null,
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwECgxjYW5jZWwEAAA="
+              },
+              "output_envelope": null,
+              "started_at": "2026-11-12T03:00:28.219000Z",
+              "closed_at": "2026-11-12T03:00:28.259000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 30,
+              "execution_deadline_at": "2026-11-12T03:01:28+00:00",
+              "run_deadline_at": "2026-11-12T03:00:58+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:28+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": false,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "lifecycle-cancel",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "cancelled",
+                "status_bucket": "failed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 1,
+                "run_count": 1,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:28.219000Z",
+                "closed_at": "2026-11-12T03:00:28.259000Z",
+                "last_progress_at": "2026-11-12T03:00:28+00:00",
+                "wait_kind": null,
+                "wait_reason": null
+              }
+            }
+          },
+          "continue": {
+            "event_types": {
+              "01M76V62K2HW3H6CYBMVRJVYHB": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "WorkflowContinuedAsNew"
+              ],
+              "01M76V62KQ1DM5474V1MZCRNCE": [
+                "WorkflowStarted",
+                "WorkflowCompleted"
+              ]
+            },
+            "timeout_events": [],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 2,
+                "event_type": "WorkflowCompleted",
+                "timestamp": "2026-11-12T03:00:25.358000Z",
+                "principal": {
+                  "type": "auth:token",
+                  "id": "legacy-token",
+                  "label": "Admin"
+                },
+                "payload": {
+                  "output": {
+                    "codec": "avro",
+                    "blob": "wwHioz3/VYAiNw4MDGJpZ2ludAT+//////////8BCmZhbHNlAgAGbmlsAAhzdGVwBAIOdW5pY29kZQoM6Zuq4piDCHplcm8EAAA="
+                  },
+                  "payload_codec": "avro",
+                  "task": {
+                    "id": "01M76V62KRD3CRVTV6FEFJCF6M",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 0,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:25.336000Z",
+                    "leased_at": "2026-11-12T03:00:25.345000Z",
+                    "lease_expires_at": "2026-11-12T03:01:25.345000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:25.336000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:25.336000Z",
+                    "lease_owner": "qualification-installed"
+                  },
+                  "command": {
+                    "type": "complete_workflow",
+                    "source": "worker_protocol",
+                    "principal_type": "auth:token",
+                    "principal_id": "legacy-token",
+                    "principal_label": "Admin"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "lifecycle-continue",
+              "run_id": "01M76V62KQ1DM5474V1MZCRNCE",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "completed",
+              "commands_scope": "selected_run",
+              "commands": [],
+              "status_bucket": "completed",
+              "is_current_run": true,
+              "run_count": 2,
+              "is_terminal": true,
+              "closed_reason": "completed",
+              "run_number": 2,
+              "continued_from_run_id": "01M76V62K2HW3H6CYBMVRJVYHB",
+              "payload_codec": "avro",
+              "input": [
+                "continue",
+                1
+              ],
+              "output": {
+                "bigint": 9223372036854775807,
+                "false": false,
+                "nil": null,
+                "step": 1,
+                "unicode": "雪☃",
+                "zero": 0
+              },
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwEChBjb250aW51ZQQCAA=="
+              },
+              "output_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNw4MDGJpZ2ludAT+//////////8BCmZhbHNlAgAGbmlsAAhzdGVwBAIOdW5pY29kZQoM6Zuq4piDCHplcm8EAAA="
+              },
+              "started_at": "2026-11-12T03:00:25.335000Z",
+              "closed_at": "2026-11-12T03:00:25.358000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 30,
+              "execution_deadline_at": "2026-11-12T03:01:25+00:00",
+              "run_deadline_at": "2026-11-12T03:00:55+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:25+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": true,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "lifecycle-continue",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V62KQ1DM5474V1MZCRNCE",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "completed",
+                "status_bucket": "completed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 2,
+                "run_count": 2,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:25.335000Z",
+                "closed_at": "2026-11-12T03:00:25.358000Z",
+                "last_progress_at": "2026-11-12T03:00:25+00:00",
+                "wait_kind": null,
+                "wait_reason": null
+              }
+            }
+          },
+          "regular": {
+            "event_types": {
+              "01M76V626Q4REAJDBXGKHTTXTB": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "ActivityScheduled",
+                "ActivityStarted",
+                "ActivityCompleted",
+                "SignalWaitOpened",
+                "SignalReceived",
+                "MessageCursorAdvanced",
+                "SignalApplied",
+                "WorkflowCompleted"
+              ]
+            },
+            "timeout_events": [],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 10,
+                "event_type": "WorkflowCompleted",
+                "timestamp": "2026-11-12T03:00:25.146000Z",
+                "principal": {
+                  "type": "auth:token",
+                  "id": "legacy-token",
+                  "label": "Admin"
+                },
+                "payload": {
+                  "output": {
+                    "codec": "avro",
+                    "blob": "wwHioz3/VYAiNw4GFmFwcHJvdmVkX2J5ChBvcGVyYXRvcgxiaWdpbnQE/v//////////ARBncmVldGluZwoSaGVsbG8gYWRhAA=="
+                  },
+                  "payload_codec": "avro",
+                  "task": {
+                    "id": "01M76V62C1W9WR7WMWTZ2RBWZK",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 0,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:25.089000Z",
+                    "leased_at": "2026-11-12T03:00:25.123000Z",
+                    "lease_expires_at": "2026-11-12T03:01:25.123000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:25.089000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:25.089000Z",
+                    "lease_owner": "qualification-installed"
+                  },
+                  "command": {
+                    "type": "complete_workflow",
+                    "source": "worker_protocol",
+                    "principal_type": "auth:token",
+                    "principal_id": "legacy-token",
+                    "principal_label": "Admin"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "lifecycle-regular",
+              "run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "completed",
+              "commands_scope": "selected_run",
+              "commands": [
+                {
+                  "id": "01M76V626Q4REAJDBXGKHTTXTC",
+                  "sequence": 1,
+                  "type": "start",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "started_new",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:24.919Z",
+                  "applied_at": "2026-11-12T03:00:24.919Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows",
+                  "request_fingerprint": "sha256:2c0ddd30972708412cab5793db1f3f8c2d803c60a3369fc0133e732024a9b66c"
+                },
+                {
+                  "id": "01M76V62C086T1G3XTEJCQSE3Y",
+                  "sequence": 2,
+                  "type": "signal",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+                  "target_name": "approve",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "signal_received",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:25.088Z",
+                  "applied_at": "2026-11-12T03:00:25.144Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows/lifecycle-regular/signal/approve",
+                  "request_fingerprint": "sha256:eed2503b0c805dcbd9e6d5fa9ad558a73c7787594fadacd02f7b560452a28fd2",
+                  "request_id": "sdk-rust-signal-be25c1a4b5024af396f957e44ca99133"
+                }
+              ],
+              "status_bucket": "completed",
+              "is_current_run": true,
+              "run_count": 1,
+              "is_terminal": true,
+              "closed_reason": "completed",
+              "run_number": 1,
+              "continued_from_run_id": null,
+              "payload_codec": "avro",
+              "input": [
+                "regular",
+                0,
+                "ada"
+              ],
+              "output": {
+                "approved_by": "operator",
+                "bigint": 9223372036854775807,
+                "greeting": "hello ada"
+              },
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwGCg5yZWd1bGFyBAAKBmFkYQA="
+              },
+              "output_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNw4GFmFwcHJvdmVkX2J5ChBvcGVyYXRvcgxiaWdpbnQE/v//////////ARBncmVldGluZwoSaGVsbG8gYWRhAA=="
+              },
+              "started_at": "2026-11-12T03:00:24.919000Z",
+              "closed_at": "2026-11-12T03:00:25.145000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 30,
+              "execution_deadline_at": "2026-11-12T03:01:24+00:00",
+              "run_deadline_at": "2026-11-12T03:00:54+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:24+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": true,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "lifecycle-regular",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "completed",
+                "status_bucket": "completed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 1,
+                "run_count": 1,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:24.919000Z",
+                "closed_at": "2026-11-12T03:00:25.145000Z",
+                "last_progress_at": "2026-11-12T03:00:24+00:00",
+                "wait_kind": null,
+                "wait_reason": null
+              }
+            }
+          },
+          "reject": {
+            "event_types": {
+              "01M76V62EWA17MPVKG76EGKYK7": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "ActivityScheduled",
+                "ActivityStarted",
+                "ActivityFailed",
+                "WorkflowFailed"
+              ]
+            },
+            "timeout_events": [],
+            "failure_events": [
+              {
+                "sequence": 6,
+                "event_type": "WorkflowFailed",
+                "timestamp": "2026-11-12T03:00:25.276000Z",
+                "principal": {
+                  "type": "auth:token",
+                  "id": "legacy-token",
+                  "label": "Admin"
+                },
+                "payload": {
+                  "failure_id": "01M76V62HV369NH7J228RFEGC2",
+                  "source_kind": "workflow_run",
+                  "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                  "failure_category": "application",
+                  "non_retryable": true,
+                  "exception_type": "ActivityFailed",
+                  "exception_class": "durable_workflow::ActivityFailure",
+                  "message": "activity failed (activity): rejected bob",
+                  "exception": {
+                    "class": "durable_workflow::ActivityFailure",
+                    "type": "ActivityFailed",
+                    "message": "activity failed (activity): rejected bob",
+                    "code": 0,
+                    "file": "",
+                    "line": 0,
+                    "trace": [],
+                    "properties": {
+                      "activity_attempt_id": "01M76V62G52Y6V74SQ2230G1QE",
+                      "activity_class": "qualification.reject",
+                      "activity_code": 0,
+                      "activity_exception": {
+                        "code": 0,
+                        "message": "rejected bob",
+                        "non_retryable": true,
+                        "type": "QualificationRejected"
+                      },
+                      "activity_exception_class": "RuntimeException",
+                      "activity_exception_type": "QualificationRejected",
+                      "activity_execution_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                      "activity_non_retryable": true,
+                      "activity_type": "qualification.reject",
+                      "attempt_number": 1,
+                      "failure_category": "activity",
+                      "failure_id": "01M76V62H0D05S4J4HGFDC7PB8",
+                      "reason": "activity",
+                      "timeout_kind": null
+                    }
+                  },
+                  "task": {
+                    "id": "01M76V62H10F6FMCHPMR4DDJM6",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 0,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:25.249000Z",
+                    "leased_at": "2026-11-12T03:00:25.256000Z",
+                    "lease_expires_at": "2026-11-12T03:01:25.256000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:25.249000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:25.249000Z",
+                    "lease_owner": "qualification-installed"
+                  },
+                  "failed_step_sequence": 1,
+                  "failed_step_kind": "activity",
+                  "command": {
+                    "type": "fail_workflow",
+                    "source": "worker_protocol",
+                    "principal_type": "auth:token",
+                    "principal_id": "legacy-token",
+                    "principal_label": "Admin"
+                  }
+                }
+              }
+            ],
+            "terminal_events": [
+              {
+                "sequence": 6,
+                "event_type": "WorkflowFailed",
+                "timestamp": "2026-11-12T03:00:25.276000Z",
+                "principal": {
+                  "type": "auth:token",
+                  "id": "legacy-token",
+                  "label": "Admin"
+                },
+                "payload": {
+                  "failure_id": "01M76V62HV369NH7J228RFEGC2",
+                  "source_kind": "workflow_run",
+                  "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                  "failure_category": "application",
+                  "non_retryable": true,
+                  "exception_type": "ActivityFailed",
+                  "exception_class": "durable_workflow::ActivityFailure",
+                  "message": "activity failed (activity): rejected bob",
+                  "exception": {
+                    "class": "durable_workflow::ActivityFailure",
+                    "type": "ActivityFailed",
+                    "message": "activity failed (activity): rejected bob",
+                    "code": 0,
+                    "file": "",
+                    "line": 0,
+                    "trace": [],
+                    "properties": {
+                      "activity_attempt_id": "01M76V62G52Y6V74SQ2230G1QE",
+                      "activity_class": "qualification.reject",
+                      "activity_code": 0,
+                      "activity_exception": {
+                        "code": 0,
+                        "message": "rejected bob",
+                        "non_retryable": true,
+                        "type": "QualificationRejected"
+                      },
+                      "activity_exception_class": "RuntimeException",
+                      "activity_exception_type": "QualificationRejected",
+                      "activity_execution_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                      "activity_non_retryable": true,
+                      "activity_type": "qualification.reject",
+                      "attempt_number": 1,
+                      "failure_category": "activity",
+                      "failure_id": "01M76V62H0D05S4J4HGFDC7PB8",
+                      "reason": "activity",
+                      "timeout_kind": null
+                    }
+                  },
+                  "task": {
+                    "id": "01M76V62H10F6FMCHPMR4DDJM6",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 0,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:25.249000Z",
+                    "leased_at": "2026-11-12T03:00:25.256000Z",
+                    "lease_expires_at": "2026-11-12T03:01:25.256000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:25.249000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:25.249000Z",
+                    "lease_owner": "qualification-installed"
+                  },
+                  "failed_step_sequence": 1,
+                  "failed_step_kind": "activity",
+                  "command": {
+                    "type": "fail_workflow",
+                    "source": "worker_protocol",
+                    "principal_type": "auth:token",
+                    "principal_id": "legacy-token",
+                    "principal_label": "Admin"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "lifecycle-reject",
+              "run_id": "01M76V62EWA17MPVKG76EGKYK7",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "failed",
+              "commands_scope": "selected_run",
+              "commands": [
+                {
+                  "id": "01M76V62EWA17MPVKG76EGKYK8",
+                  "sequence": 1,
+                  "type": "start",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V62EWA17MPVKG76EGKYK7",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "started_new",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:25.180Z",
+                  "applied_at": "2026-11-12T03:00:25.180Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows",
+                  "request_fingerprint": "sha256:a50dad46fed739a6d1ebc5721b51e8aa9f4ad541a9362ded99e5b97137916b7e"
+                }
+              ],
+              "status_bucket": "failed",
+              "is_current_run": true,
+              "run_count": 1,
+              "is_terminal": true,
+              "closed_reason": "failed",
+              "run_number": 1,
+              "continued_from_run_id": null,
+              "payload_codec": "avro",
+              "input": [
+                "reject",
+                0,
+                "bob"
+              ],
+              "output": null,
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwGCgxyZWplY3QEAAoGYm9iAA=="
+              },
+              "output_envelope": null,
+              "started_at": "2026-11-12T03:00:25.180000Z",
+              "closed_at": "2026-11-12T03:00:25.275000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 30,
+              "execution_deadline_at": "2026-11-12T03:01:25+00:00",
+              "run_deadline_at": "2026-11-12T03:00:55+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:25+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": false,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "error": "activity failed (activity): rejected bob",
+              "failure": {
+                "message": "activity failed (activity): rejected bob",
+                "exception_type": "ActivityFailed",
+                "exception_class": "durable_workflow::ActivityFailure",
+                "failure_category": "application",
+                "non_retryable": true,
+                "source_kind": "workflow_run",
+                "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                "event_sequence": 6,
+                "exception": {
+                  "type": "ActivityFailed",
+                  "class": "durable_workflow::ActivityFailure",
+                  "message": "activity failed (activity): rejected bob"
+                },
+                "activity_failures": [
+                  {
+                    "event_sequence": 5,
+                    "event_type": "ActivityFailed",
+                    "activity_type": "qualification.reject",
+                    "activity_class": "qualification.reject",
+                    "activity_execution_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                    "activity_attempt_id": "01M76V62G52Y6V74SQ2230G1QE",
+                    "failure_id": "01M76V62H0D05S4J4HGFDC7PB8",
+                    "failure_category": "activity",
+                    "exception_type": "QualificationRejected",
+                    "exception_class": "RuntimeException",
+                    "message": "rejected bob",
+                    "non_retryable": true
+                  }
+                ],
+                "failures": [
+                  {
+                    "id": "01M76V62H0D05S4J4HGFDC7PB8",
+                    "source_kind": "activity_execution",
+                    "source_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                    "propagation_kind": "activity",
+                    "failure_category": "activity",
+                    "non_retryable": true,
+                    "handled": false,
+                    "exception_type": "QualificationRejected",
+                    "exception_class": "RuntimeException",
+                    "message": "rejected bob",
+                    "exception_payload": {
+                      "type": "QualificationRejected",
+                      "class": "RuntimeException",
+                      "message": "rejected bob"
+                    },
+                    "event_sequence": 5,
+                    "history_authority": "typed_history"
+                  },
+                  {
+                    "id": "01M76V62HV369NH7J228RFEGC2",
+                    "source_kind": "workflow_run",
+                    "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                    "propagation_kind": "terminal",
+                    "failure_category": "application",
+                    "non_retryable": true,
+                    "handled": false,
+                    "exception_type": "ActivityFailed",
+                    "exception_class": "durable_workflow::ActivityFailure",
+                    "message": "activity failed (activity): rejected bob",
+                    "exception_payload": {
+                      "type": "ActivityFailed",
+                      "class": "durable_workflow::ActivityFailure",
+                      "message": "activity failed (activity): rejected bob"
+                    },
+                    "event_sequence": 6,
+                    "history_authority": "typed_history"
+                  }
+                ]
+              },
+              "exception": {
+                "type": "ActivityFailed",
+                "class": "durable_workflow::ActivityFailure",
+                "message": "activity failed (activity): rejected bob"
+              },
+              "failures": [
+                {
+                  "id": "01M76V62H0D05S4J4HGFDC7PB8",
+                  "source_kind": "activity_execution",
+                  "source_id": "01M76V62FP2VPP8AAH85QZJ86Z",
+                  "propagation_kind": "activity",
+                  "failure_category": "activity",
+                  "non_retryable": true,
+                  "handled": false,
+                  "exception_type": "QualificationRejected",
+                  "exception_class": "RuntimeException",
+                  "message": "rejected bob",
+                  "exception_payload": {
+                    "type": "QualificationRejected",
+                    "class": "RuntimeException",
+                    "message": "rejected bob"
+                  },
+                  "event_sequence": 5,
+                  "history_authority": "typed_history"
+                },
+                {
+                  "id": "01M76V62HV369NH7J228RFEGC2",
+                  "source_kind": "workflow_run",
+                  "source_id": "01M76V62EWA17MPVKG76EGKYK7",
+                  "propagation_kind": "terminal",
+                  "failure_category": "application",
+                  "non_retryable": true,
+                  "handled": false,
+                  "exception_type": "ActivityFailed",
+                  "exception_class": "durable_workflow::ActivityFailure",
+                  "message": "activity failed (activity): rejected bob",
+                  "exception_payload": {
+                    "type": "ActivityFailed",
+                    "class": "durable_workflow::ActivityFailure",
+                    "message": "activity failed (activity): rejected bob"
+                  },
+                  "event_sequence": 6,
+                  "history_authority": "typed_history"
+                }
+              ],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "lifecycle-reject",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V62EWA17MPVKG76EGKYK7",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "failed",
+                "status_bucket": "failed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 1,
+                "run_count": 1,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:25.180000Z",
+                "closed_at": "2026-11-12T03:00:25.275000Z",
+                "last_progress_at": "2026-11-12T03:00:25+00:00",
+                "wait_kind": null,
+                "wait_reason": null,
+                "exception": {
+                  "type": "ActivityFailed",
+                  "class": "durable_workflow::ActivityFailure",
+                  "message": "activity failed (activity): rejected bob"
+                }
+              }
+            }
+          },
+          "timeout": {
+            "event_types": {
+              "01M76V62PA047MGYCP27PPBB10": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "TimerScheduled",
+                "TimerCancelled",
+                "WorkflowTimedOut"
+              ]
+            },
+            "timeout_events": [
+              {
+                "sequence": 5,
+                "event_type": "WorkflowTimedOut",
+                "timestamp": "2026-11-12T03:00:28.198000Z",
+                "principal": null,
+                "payload": {
+                  "failure_id": "01M76V65D6HP3D00QFGCXRT5BN",
+                  "timeout_kind": "run_timeout",
+                  "failure_category": "timeout",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "execution_deadline_at": "2026-11-12T03:01:25+00:00",
+                  "run_deadline_at": "2026-11-12T03:00:27+00:00",
+                  "task": {
+                    "id": "01M76V65CK4ADSSQKH29W3MSBW",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 1,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:28.179000Z",
+                    "leased_at": "2026-11-12T03:00:28.186000Z",
+                    "lease_expires_at": "2026-11-12T03:01:28.186000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:28.180000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:28.180000Z",
+                    "lease_owner": "qualification-installed"
+                  }
+                }
+              }
+            ],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 5,
+                "event_type": "WorkflowTimedOut",
+                "timestamp": "2026-11-12T03:00:28.198000Z",
+                "principal": null,
+                "payload": {
+                  "failure_id": "01M76V65D6HP3D00QFGCXRT5BN",
+                  "timeout_kind": "run_timeout",
+                  "failure_category": "timeout",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "execution_deadline_at": "2026-11-12T03:01:25+00:00",
+                  "run_deadline_at": "2026-11-12T03:00:27+00:00",
+                  "task": {
+                    "id": "01M76V65CK4ADSSQKH29W3MSBW",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 1,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:28.179000Z",
+                    "leased_at": "2026-11-12T03:00:28.186000Z",
+                    "lease_expires_at": "2026-11-12T03:01:28.186000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:28.180000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:28.180000Z",
+                    "lease_owner": "qualification-installed"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "lifecycle-timeout",
+              "run_id": "01M76V62PA047MGYCP27PPBB10",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "failed",
+              "commands_scope": "selected_run",
+              "commands": [
+                {
+                  "id": "01M76V62PA047MGYCP27PPBB11",
+                  "sequence": 1,
+                  "type": "start",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V62PA047MGYCP27PPBB10",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "started_new",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:25.418Z",
+                  "applied_at": "2026-11-12T03:00:25.418Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows",
+                  "request_fingerprint": "sha256:25d2af62a2daf010d09a8e5086373a5a19a0c22c49b32eab89323d8b16be6e4c"
+                }
+              ],
+              "status_bucket": "failed",
+              "is_current_run": true,
+              "run_count": 1,
+              "is_terminal": true,
+              "closed_reason": "timed_out",
+              "run_number": 1,
+              "continued_from_run_id": null,
+              "payload_codec": "avro",
+              "input": [
+                "timeout",
+                0
+              ],
+              "output": null,
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwECg50aW1lb3V0BAAA"
+              },
+              "output_envelope": null,
+              "started_at": "2026-11-12T03:00:25.418000Z",
+              "closed_at": "2026-11-12T03:00:28.198000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 2,
+              "execution_deadline_at": "2026-11-12T03:01:25+00:00",
+              "run_deadline_at": "2026-11-12T03:00:27+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:28+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": false,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "error": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+              "failure": {
+                "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                "reason": "run_timeout",
+                "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "failure_category": "timeout",
+                "non_retryable": false,
+                "source_kind": "workflow_run",
+                "source_id": "01M76V62PA047MGYCP27PPBB10",
+                "event_sequence": 5,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+                },
+                "failures": [
+                  {
+                    "id": "01M76V65D6HP3D00QFGCXRT5BN",
+                    "source_kind": "workflow_run",
+                    "source_id": "01M76V62PA047MGYCP27PPBB10",
+                    "propagation_kind": "timeout",
+                    "reason": "run_timeout",
+                    "failure_category": "timeout",
+                    "non_retryable": false,
+                    "handled": false,
+                    "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                    "exception_payload": {
+                      "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                      "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+                    },
+                    "event_sequence": 5,
+                    "history_authority": "typed_history"
+                  }
+                ]
+              },
+              "exception": {
+                "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+              },
+              "failures": [
+                {
+                  "id": "01M76V65D6HP3D00QFGCXRT5BN",
+                  "source_kind": "workflow_run",
+                  "source_id": "01M76V62PA047MGYCP27PPBB10",
+                  "propagation_kind": "timeout",
+                  "reason": "run_timeout",
+                  "failure_category": "timeout",
+                  "non_retryable": false,
+                  "handled": false,
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00.",
+                  "exception_payload": {
+                    "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+                  },
+                  "event_sequence": 5,
+                  "history_authority": "typed_history"
+                }
+              ],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "lifecycle-timeout",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V62PA047MGYCP27PPBB10",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "failed",
+                "status_bucket": "failed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 1,
+                "run_count": 1,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:25.418000Z",
+                "closed_at": "2026-11-12T03:00:28.198000Z",
+                "last_progress_at": "2026-11-12T03:00:28+00:00",
+                "wait_kind": null,
+                "wait_reason": null,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:27+00:00."
+                }
+              }
+            }
+          }
+        }
+      },
+      "acknowledgements": [
+        {
+          "time": 1794452424.9786692,
+          "path": "/api/worker/workflow-tasks/01M76V626SM1FBC7TRME51XG1Z/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V626SM1FBC7TRME51XG1Z",
+            "run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V62811ZBS1P1NPZ0BF3CM"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.0321913,
+          "path": "/api/worker/workflow-tasks/01M76V629B7C60MRTVYQY0DCFR/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V629B7C60MRTVYQY0DCFR",
+            "run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.1554375,
+          "path": "/api/worker/workflow-tasks/01M76V62C1W9WR7WMWTZ2RBWZK/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V62C1W9WR7WMWTZ2RBWZK",
+            "run_id": "01M76V626Q4REAJDBXGKHTTXTB",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.2149072,
+          "path": "/api/worker/workflow-tasks/01M76V62EXKNRTJXN76SS1KA0K/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V62EXKNRTJXN76SS1KA0K",
+            "run_id": "01M76V62EWA17MPVKG76EGKYK7",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V62FP2VPP8AAH85QZJ871"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.2874877,
+          "path": "/api/worker/workflow-tasks/01M76V62H10F6FMCHPMR4DDJM6/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V62H10F6FMCHPMR4DDJM6",
+            "run_id": "01M76V62EWA17MPVKG76EGKYK7",
+            "run_status": "failed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.3452723,
+          "path": "/api/worker/workflow-tasks/01M76V62K3FZ831WEFW87H48TD/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V62K3FZ831WEFW87H48TD",
+            "run_id": "01M76V62K2HW3H6CYBMVRJVYHB",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V62KRD3CRVTV6FEFJCF6M"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.368388,
+          "path": "/api/worker/workflow-tasks/01M76V62KRD3CRVTV6FEFJCF6M/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V62KRD3CRVTV6FEFJCF6M",
+            "run_id": "01M76V62KQ1DM5474V1MZCRNCE",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452425.4475038,
+          "path": "/api/worker/workflow-tasks/01M76V62PB9EG9CWNJ1SJP6KJ3/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V62PB9EG9CWNJ1SJP6KJ3",
+            "run_id": "01M76V62PA047MGYCP27PPBB10",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V62Q0HE4W2KEDXQNBTDMK"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452428.2042055,
+          "path": "/api/worker/workflow-tasks/01M76V65CK4ADSSQKH29W3MSBW/fail",
+          "status": 409,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": "WorkflowTaskWaitingForHistory",
+          "response": {
+            "task_id": "01M76V65CK4ADSSQKH29W3MSBW",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": false,
+            "run_id": "01M76V62PA047MGYCP27PPBB10",
+            "run_status": "failed",
+            "created_task_ids": [],
+            "reason": "run_timed_out",
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452428.252128,
+          "path": "/api/worker/workflow-tasks/01M76V65DW0RKZ5404KTSXPB83/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V65DW0RKZ5404KTSXPB83",
+            "run_id": "01M76V65DVSQVHN2EQKC4DVJBB",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V65EHW9CAG4HBATG2MP7S"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452428.3141572,
+          "path": "/api/worker/workflow-tasks/01M76V65FPD11B8JYAB3Z6VZKZ/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V65FPD11B8JYAB3Z6VZKZ",
+            "run_id": "01M76V65FPD11B8JYAB3Z6VZKV",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V65GMC0JPPAN71WZ12MAG"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452428.3382728,
+          "path": "/api/worker/workflow-tasks/01M76V65GMC0JPPAN71WZ12MAG/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V65GMC0JPPAN71WZ12MAG",
+            "run_id": "01M76V65GK0XD1K223AVCWKJ7M",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        }
+      ],
+      "outcome": "pass"
+    },
+    "deadline": {
+      "cell": "deadline",
+      "deadline_unix": 1794453030,
+      "kill_after_seconds": 10,
+      "cluster_info": {
+        "version": "3.5.0",
+        "implementation": "rust",
+        "development": false,
+        "qualified_for_php_takeover": false
+      },
+      "driver_exit": 0,
+      "history_exit": 0,
+      "same_worker_running_after_cases": true,
+      "binary_unchanged": true,
+      "driver": {
+        "cases": {
+          "execution": {
+            "described": {
+              "closed_reason": "timed_out",
+              "failure": {
+                "event_sequence": 5,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+                },
+                "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "failure_category": "timeout",
+                "failures": [
+                  {
+                    "event_sequence": 5,
+                    "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "exception_payload": {
+                      "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                      "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+                    },
+                    "failure_category": "timeout",
+                    "handled": false,
+                    "history_authority": "typed_history",
+                    "id": "01M76V6SY1VQ9YXRQF8EV7Y9ND",
+                    "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                    "non_retryable": false,
+                    "propagation_kind": "timeout",
+                    "reason": "execution_timeout",
+                    "source_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                    "source_kind": "workflow_run"
+                  }
+                ],
+                "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                "non_retryable": false,
+                "reason": "execution_timeout",
+                "source_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                "source_kind": "workflow_run"
+              }
+            },
+            "final_run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+            "next": {
+              "final_run_id": "01M76V6SZWRBE2535WK81C9AQV",
+              "original_run_id": "01M76V6SZ47GBSFSFD85RBCRVP",
+              "result": {
+                "bigint": 9223372036854775807,
+                "false": false,
+                "nil": null,
+                "step": 1,
+                "unicode": "雪☃",
+                "zero": 0
+              },
+              "status": "completed",
+              "workflow_id": "after-execution"
+            },
+            "original_run_id": "01M76V6G6MZX7WVWTMZGQAQ49G",
+            "receipt": {
+              "delay_seconds": 3.0,
+              "failure_type": "WorkflowTaskWaitingForHistory",
+              "path": "/api/worker/workflow-tasks/01M76V6PZHQ5HTKM9WQ1K974MT/fail",
+              "request_attempt": 1,
+              "response": {
+                "created_task_ids": [],
+                "outcome": "completed",
+                "protocol_version": "1.20",
+                "reason": "run_timed_out",
+                "recorded": false,
+                "run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                "run_status": "failed",
+                "task_id": "01M76V6PZHQ5HTKM9WQ1K974MT",
+                "workflow_task_attempt": 1
+              },
+              "status": 409,
+              "time": 1794452449.2258468
+            },
+            "status": "failed",
+            "terminal": {
+              "reason": "execution_timeout",
+              "run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+              "sdk_error": "timed_out"
+            },
+            "workflow_id": "deadline-execution"
+          },
+          "run": {
+            "described": {
+              "closed_reason": "timed_out",
+              "failure": {
+                "event_sequence": 6,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+                },
+                "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "failure_category": "timeout",
+                "failures": [
+                  {
+                    "event_sequence": 6,
+                    "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "exception_payload": {
+                      "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                      "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+                    },
+                    "failure_category": "timeout",
+                    "handled": false,
+                    "history_authority": "typed_history",
+                    "id": "01M76V6G30V70C88M9E4JV5PQ3",
+                    "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                    "non_retryable": false,
+                    "propagation_kind": "timeout",
+                    "reason": "run_timeout",
+                    "source_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                    "source_kind": "workflow_run"
+                  }
+                ],
+                "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                "non_retryable": false,
+                "reason": "run_timeout",
+                "source_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                "source_kind": "workflow_run"
+              }
+            },
+            "final_run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+            "next": {
+              "final_run_id": "01M76V6G558M0PYGH5HMPA436Q",
+              "original_run_id": "01M76V6G45019PVXCVDE3Z9BZH",
+              "result": {
+                "bigint": 9223372036854775807,
+                "false": false,
+                "nil": null,
+                "step": 1,
+                "unicode": "雪☃",
+                "zero": 0
+              },
+              "status": "completed",
+              "workflow_id": "after-run"
+            },
+            "original_run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+            "receipt": {
+              "delay_seconds": 3.0,
+              "failure_type": "WorkflowTaskWaitingForHistory",
+              "path": "/api/worker/workflow-tasks/01M76V6D4N40SWXAXX98Q3MTPT/fail",
+              "request_attempt": 1,
+              "response": {
+                "created_task_ids": [],
+                "outcome": "completed",
+                "protocol_version": "1.20",
+                "reason": "run_timed_out",
+                "recorded": false,
+                "run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                "run_status": "failed",
+                "task_id": "01M76V6D4N40SWXAXX98Q3MTPT",
+                "workflow_task_attempt": 1
+              },
+              "status": 409,
+              "time": 1794452439.1447494
+            },
+            "status": "failed",
+            "terminal": {
+              "reason": "run_timeout",
+              "run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+              "sdk_error": "timed_out"
+            },
+            "workflow_id": "deadline-run"
+          }
+        },
+        "cell": "deadline",
+        "outcome": "pass"
+      },
+      "history": {
+        "outcome": "pass",
+        "problems": [],
+        "cases": {
+          "execution": {
+            "event_types": {
+              "01M76V6G6MZX7WVWTMZGQAQ49G": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "TimerScheduled",
+                "TimerFired",
+                "WorkflowContinuedAsNew"
+              ],
+              "01M76V6JAJRY9MYFA9XE58YRSJ": [
+                "WorkflowStarted",
+                "TimerScheduled",
+                "SignalReceived",
+                "TimerCancelled",
+                "WorkflowTimedOut",
+                "SignalRejected"
+              ],
+              "next:01M76V6SZWRBE2535WK81C9AQV": [
+                "WorkflowStarted",
+                "WorkflowCompleted"
+              ]
+            },
+            "timeout_events": [
+              {
+                "sequence": 5,
+                "event_type": "WorkflowTimedOut",
+                "timestamp": "2026-11-12T03:00:49.217000Z",
+                "principal": null,
+                "payload": {
+                  "failure_id": "01M76V6SY1VQ9YXRQF8EV7Y9ND",
+                  "timeout_kind": "execution_timeout",
+                  "failure_category": "timeout",
+                  "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "execution_deadline_at": "2026-11-12T03:00:44+00:00",
+                  "run_deadline_at": "2026-11-12T03:00:45+00:00",
+                  "task": {
+                    "id": "01M76V6PZHQ5HTKM9WQ1K974MT",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 1,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:46.193000Z",
+                    "leased_at": "2026-11-12T03:00:46.199000Z",
+                    "lease_expires_at": "2026-11-12T03:01:46.199000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:46.193000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:46.193000Z",
+                    "lease_owner": "qualification-installed"
+                  }
+                }
+              }
+            ],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 5,
+                "event_type": "WorkflowTimedOut",
+                "timestamp": "2026-11-12T03:00:49.217000Z",
+                "principal": null,
+                "payload": {
+                  "failure_id": "01M76V6SY1VQ9YXRQF8EV7Y9ND",
+                  "timeout_kind": "execution_timeout",
+                  "failure_category": "timeout",
+                  "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "execution_deadline_at": "2026-11-12T03:00:44+00:00",
+                  "run_deadline_at": "2026-11-12T03:00:45+00:00",
+                  "task": {
+                    "id": "01M76V6PZHQ5HTKM9WQ1K974MT",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 1,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:46.193000Z",
+                    "leased_at": "2026-11-12T03:00:46.199000Z",
+                    "lease_expires_at": "2026-11-12T03:01:46.199000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:46.193000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:46.193000Z",
+                    "lease_owner": "qualification-installed"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "deadline-execution",
+              "run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "failed",
+              "commands_scope": "selected_run",
+              "commands": [
+                {
+                  "id": "01M76V6JCHWGNP8P9ZHYE2CXVZ",
+                  "sequence": 1,
+                  "type": "signal",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                  "target_name": "__durable_workflow_message_stream",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "signal_received",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:41.489Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows/deadline-execution/message-streams/qualification/messages",
+                  "request_fingerprint": "sha256:95588c22ccae48cec0bd1fa858a4724869a7a83f1e5e61274f6141a9bb349639"
+                }
+              ],
+              "status_bucket": "failed",
+              "is_current_run": true,
+              "run_count": 2,
+              "is_terminal": true,
+              "closed_reason": "timed_out",
+              "run_number": 2,
+              "continued_from_run_id": "01M76V6G6MZX7WVWTMZGQAQ49G",
+              "payload_codec": "avro",
+              "input": [
+                "exec-timeout",
+                1
+              ],
+              "output": null,
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwEChhleGVjLXRpbWVvdXQEAgA="
+              },
+              "output_envelope": null,
+              "started_at": "2026-11-12T03:00:41.426000Z",
+              "closed_at": "2026-11-12T03:00:49.216000Z",
+              "execution_timeout_seconds": 5,
+              "run_timeout_seconds": 4,
+              "execution_deadline_at": "2026-11-12T03:00:44+00:00",
+              "run_deadline_at": "2026-11-12T03:00:45+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:49+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": false,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "error": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+              "failure": {
+                "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                "reason": "execution_timeout",
+                "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "failure_category": "timeout",
+                "non_retryable": false,
+                "source_kind": "workflow_run",
+                "source_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                "event_sequence": 5,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+                },
+                "failures": [
+                  {
+                    "id": "01M76V6SY1VQ9YXRQF8EV7Y9ND",
+                    "source_kind": "workflow_run",
+                    "source_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                    "propagation_kind": "timeout",
+                    "reason": "execution_timeout",
+                    "failure_category": "timeout",
+                    "non_retryable": false,
+                    "handled": false,
+                    "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                    "exception_payload": {
+                      "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                      "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+                    },
+                    "event_sequence": 5,
+                    "history_authority": "typed_history"
+                  }
+                ]
+              },
+              "exception": {
+                "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+              },
+              "failures": [
+                {
+                  "id": "01M76V6SY1VQ9YXRQF8EV7Y9ND",
+                  "source_kind": "workflow_run",
+                  "source_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                  "propagation_kind": "timeout",
+                  "reason": "execution_timeout",
+                  "failure_category": "timeout",
+                  "non_retryable": false,
+                  "handled": false,
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00.",
+                  "exception_payload": {
+                    "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+                  },
+                  "event_sequence": 5,
+                  "history_authority": "typed_history"
+                }
+              ],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "deadline-execution",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "failed",
+                "status_bucket": "failed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 2,
+                "run_count": 2,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:41.426000Z",
+                "closed_at": "2026-11-12T03:00:49.216000Z",
+                "last_progress_at": "2026-11-12T03:00:49+00:00",
+                "wait_kind": null,
+                "wait_reason": null,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow execution deadline expired at 2026-11-12T03:00:44+00:00."
+                }
+              }
+            }
+          },
+          "run": {
+            "event_types": {
+              "01M76V69R7G7CFHC2C0H5MCQZS": [
+                "StartAccepted",
+                "WorkflowStarted",
+                "TimerScheduled",
+                "SignalReceived",
+                "TimerCancelled",
+                "WorkflowTimedOut",
+                "SignalRejected"
+              ],
+              "next:01M76V6G558M0PYGH5HMPA436Q": [
+                "WorkflowStarted",
+                "WorkflowCompleted"
+              ]
+            },
+            "timeout_events": [
+              {
+                "sequence": 6,
+                "event_type": "WorkflowTimedOut",
+                "timestamp": "2026-11-12T03:00:39.137000Z",
+                "principal": null,
+                "payload": {
+                  "failure_id": "01M76V6G30V70C88M9E4JV5PQ3",
+                  "timeout_kind": "run_timeout",
+                  "failure_category": "timeout",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "execution_deadline_at": "2026-11-12T03:01:32+00:00",
+                  "run_deadline_at": "2026-11-12T03:00:34+00:00",
+                  "task": {
+                    "id": "01M76V6D4N40SWXAXX98Q3MTPT",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 1,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:36.117000Z",
+                    "leased_at": "2026-11-12T03:00:36.123000Z",
+                    "lease_expires_at": "2026-11-12T03:01:36.123000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:36.117000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:36.117000Z",
+                    "lease_owner": "qualification-installed"
+                  }
+                }
+              }
+            ],
+            "failure_events": [],
+            "terminal_events": [
+              {
+                "sequence": 6,
+                "event_type": "WorkflowTimedOut",
+                "timestamp": "2026-11-12T03:00:39.137000Z",
+                "principal": null,
+                "payload": {
+                  "failure_id": "01M76V6G30V70C88M9E4JV5PQ3",
+                  "timeout_kind": "run_timeout",
+                  "failure_category": "timeout",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "execution_deadline_at": "2026-11-12T03:01:32+00:00",
+                  "run_deadline_at": "2026-11-12T03:00:34+00:00",
+                  "task": {
+                    "id": "01M76V6D4N40SWXAXX98Q3MTPT",
+                    "type": "workflow",
+                    "status": "leased",
+                    "attempt_count": 1,
+                    "repair_count": 1,
+                    "queue": "qualification-sdk",
+                    "connection": "sqlite",
+                    "available_at": "2026-11-12T03:00:36.117000Z",
+                    "leased_at": "2026-11-12T03:00:36.123000Z",
+                    "lease_expires_at": "2026-11-12T03:01:36.123000Z",
+                    "last_dispatch_attempt_at": "2026-11-12T03:00:36.117000Z",
+                    "last_dispatched_at": "2026-11-12T03:00:36.117000Z",
+                    "lease_owner": "qualification-installed"
+                  }
+                }
+              }
+            ],
+            "describe": {
+              "workflow_id": "deadline-run",
+              "run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+              "workflow_type": "qualification.lifecycle",
+              "namespace": "default",
+              "task_queue": "qualification-sdk",
+              "status": "failed",
+              "commands_scope": "selected_run",
+              "commands": [
+                {
+                  "id": "01M76V69R7G7CFHC2C0H5MCQZT",
+                  "sequence": 1,
+                  "type": "start",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "started_new",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:32.647Z",
+                  "applied_at": "2026-11-12T03:00:32.647Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows",
+                  "request_fingerprint": "sha256:9bae3c9ca7e53cf27ba9b5672ff888d1dbc6df3e8d08daabf678d805736333f6"
+                },
+                {
+                  "id": "01M76V69SGGWVRXBPCPP5EDMS5",
+                  "sequence": 2,
+                  "type": "signal",
+                  "target_scope": "instance",
+                  "resolved_run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                  "target_name": "__durable_workflow_message_stream",
+                  "source": "control_plane",
+                  "status": "accepted",
+                  "outcome": "signal_received",
+                  "workflow_type": "qualification.lifecycle",
+                  "workflow_class": "qualification.lifecycle",
+                  "payload_preview_omitted": false,
+                  "accepted_at": "2026-11-12T03:00:32.688Z",
+                  "context": {
+                    "caller": {
+                      "type": "server",
+                      "label": "Standalone Server"
+                    },
+                    "auth": {
+                      "status": "authorized",
+                      "method": "token",
+                      "role": "admin"
+                    },
+                    "principal": {
+                      "type": "auth:token",
+                      "id": "legacy-token",
+                      "label": "Admin"
+                    }
+                  },
+                  "caller_label": "Standalone Server",
+                  "principal_type": "auth:token",
+                  "principal_id": "legacy-token",
+                  "principal_label": "Admin",
+                  "principal": {
+                    "type": "auth:token",
+                    "id": "legacy-token",
+                    "label": "Admin"
+                  },
+                  "auth_status": "authorized",
+                  "auth_method": "token",
+                  "request_method": "POST",
+                  "request_path": "/api/workflows/deadline-run/message-streams/qualification/messages",
+                  "request_fingerprint": "sha256:6bcdca144ba4356dd0739f15f71379c1a4cedf2a9df8d201c0f71a281692e8f1"
+                }
+              ],
+              "status_bucket": "failed",
+              "is_current_run": true,
+              "run_count": 1,
+              "is_terminal": true,
+              "closed_reason": "timed_out",
+              "run_number": 1,
+              "continued_from_run_id": null,
+              "payload_codec": "avro",
+              "input": [
+                "timeout",
+                0
+              ],
+              "output": null,
+              "memo": [],
+              "input_envelope": {
+                "codec": "avro",
+                "blob": "wwHioz3/VYAiNwwECg50aW1lb3V0BAAA"
+              },
+              "output_envelope": null,
+              "started_at": "2026-11-12T03:00:32.647000Z",
+              "closed_at": "2026-11-12T03:00:39.136000Z",
+              "execution_timeout_seconds": 60,
+              "run_timeout_seconds": 2,
+              "execution_deadline_at": "2026-11-12T03:01:32+00:00",
+              "run_deadline_at": "2026-11-12T03:00:34+00:00",
+              "business_key": null,
+              "resume_step_sequence": null,
+              "recovery_kind": null,
+              "compatibility": null,
+              "compatibility_status": "compatible",
+              "compatibility_supported_in_fleet": true,
+              "compatibility_fleet_reason": null,
+              "definition_routing": {
+                "pinning_enabled": true,
+                "worker_pinned": false,
+                "recorded_fingerprint": null,
+                "workflow_type": "qualification.lifecycle",
+                "task_queue": "qualification-sdk",
+                "required_build_id": null,
+                "status": "not_worker_pinned",
+                "blocked": false,
+                "runnable_task": false,
+                "eligible_worker_count": 1,
+                "matching_worker_count": 0,
+                "changed_worker_count": 0,
+                "missing_fingerprint_count": 1,
+                "entry_validation_unavailable_count": 0,
+                "workers": [
+                  {
+                    "worker_id": "qualification-installed",
+                    "fingerprint": null
+                  }
+                ],
+                "workers_truncated": false,
+                "resolution": "Recorded build, namespace, type and replay-capability guards remain in force."
+              },
+              "payload_previews": {
+                "input_omitted": false,
+                "output_omitted": false,
+                "max_encoded_bytes": 2097152
+              },
+              "last_progress_at": "2026-11-12T03:00:39+00:00",
+              "wait_kind": null,
+              "wait_reason": null,
+              "search_attributes": [],
+              "actions": {
+                "can_signal": false,
+                "can_query": false,
+                "can_update": false,
+                "can_cancel": false,
+                "can_terminate": false,
+                "can_repair": false,
+                "can_archive": true
+              },
+              "updates_scope": "selected_run",
+              "updates": [],
+              "error": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+              "failure": {
+                "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                "reason": "run_timeout",
+                "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "failure_category": "timeout",
+                "non_retryable": false,
+                "source_kind": "workflow_run",
+                "source_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                "event_sequence": 6,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+                },
+                "failures": [
+                  {
+                    "id": "01M76V6G30V70C88M9E4JV5PQ3",
+                    "source_kind": "workflow_run",
+                    "source_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                    "propagation_kind": "timeout",
+                    "reason": "run_timeout",
+                    "failure_category": "timeout",
+                    "non_retryable": false,
+                    "handled": false,
+                    "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                    "exception_payload": {
+                      "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                      "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+                    },
+                    "event_sequence": 6,
+                    "history_authority": "typed_history"
+                  }
+                ]
+              },
+              "exception": {
+                "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+              },
+              "failures": [
+                {
+                  "id": "01M76V6G30V70C88M9E4JV5PQ3",
+                  "source_kind": "workflow_run",
+                  "source_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                  "propagation_kind": "timeout",
+                  "reason": "run_timeout",
+                  "failure_category": "timeout",
+                  "non_retryable": false,
+                  "handled": false,
+                  "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00.",
+                  "exception_payload": {
+                    "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                    "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+                  },
+                  "event_sequence": 6,
+                  "history_authority": "typed_history"
+                }
+              ],
+              "control_plane": {
+                "schema": "durable-workflow.v2.control-plane-response",
+                "version": 1,
+                "operation": "describe_run",
+                "workflow_id": "deadline-run",
+                "contract": {
+                  "schema": "durable-workflow.v2.control-plane-response.contract",
+                  "version": 1,
+                  "legacy_field_policy": "reject_non_canonical",
+                  "legacy_fields": {
+                    "query": "query_name",
+                    "signal": "signal_name",
+                    "update": "update_name",
+                    "wait_policy": "wait_for"
+                  },
+                  "required_fields": [
+                    "workflow_id"
+                  ],
+                  "success_fields": [
+                    "run_id"
+                  ],
+                  "rejection_fields": [
+                    "workflow_id",
+                    "run_id",
+                    "reason",
+                    "message",
+                    "retryable",
+                    "error_id",
+                    "exception"
+                  ],
+                  "rejection_reasons": [
+                    "control_plane_internal_error"
+                  ]
+                },
+                "run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+                "workflow_type": "qualification.lifecycle",
+                "namespace": "default",
+                "business_key": null,
+                "status": "failed",
+                "status_bucket": "failed",
+                "is_terminal": true,
+                "task_queue": "qualification-sdk",
+                "run_number": 1,
+                "run_count": 1,
+                "is_current_run": true,
+                "compatibility": null,
+                "started_at": "2026-11-12T03:00:32.647000Z",
+                "closed_at": "2026-11-12T03:00:39.136000Z",
+                "last_progress_at": "2026-11-12T03:00:39+00:00",
+                "wait_kind": null,
+                "wait_reason": null,
+                "exception": {
+                  "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
+                  "message": "Workflow run deadline expired at 2026-11-12T03:00:34+00:00."
+                }
+              }
+            }
+          }
+        }
+      },
+      "acknowledgements": [
+        {
+          "time": 1794452432.6784532,
+          "path": "/api/worker/workflow-tasks/01M76V69R8D7FT4WHSB3H9YRJ3/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V69R8D7FT4WHSB3H9YRJ3",
+            "run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V69RXJH0TF1EVHS6S522Q"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452439.1447494,
+          "path": "/api/worker/workflow-tasks/01M76V6D4N40SWXAXX98Q3MTPT/fail",
+          "status": 409,
+          "delay_seconds": 3.0,
+          "request_attempt": 1,
+          "failure_type": "WorkflowTaskWaitingForHistory",
+          "response": {
+            "task_id": "01M76V6D4N40SWXAXX98Q3MTPT",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": false,
+            "run_id": "01M76V69R7G7CFHC2C0H5MCQZS",
+            "run_status": "failed",
+            "created_task_ids": [],
+            "reason": "run_timed_out",
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452439.2150962,
+          "path": "/api/worker/workflow-tasks/01M76V6G46BJ10D74H339CV8PQ/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6G46BJ10D74H339CV8PQ",
+            "run_id": "01M76V6G45019PVXCVDE3Z9BZH",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V6G56PVDYP8SK36QA02D3"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452439.2350185,
+          "path": "/api/worker/workflow-tasks/01M76V6G56PVDYP8SK36QA02D3/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6G56PVDYP8SK36QA02D3",
+            "run_id": "01M76V6G558M0PYGH5HMPA436Q",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452439.2775497,
+          "path": "/api/worker/workflow-tasks/01M76V6G6NNGXPB73XRWDR8KX6/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6G6NNGXPB73XRWDR8KX6",
+            "run_id": "01M76V6G6MZX7WVWTMZGQAQ49G",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V6G78QCYTC9188VS69HR1"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452441.4330378,
+          "path": "/api/worker/workflow-tasks/01M76V6JA0GVB0JQEDXG6SP8XA/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6JA0GVB0JQEDXG6SP8XA",
+            "run_id": "01M76V6G6MZX7WVWTMZGQAQ49G",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V6JAKZ5G5AF0CJ4BEH4FD"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452441.4609973,
+          "path": "/api/worker/workflow-tasks/01M76V6JAKZ5G5AF0CJ4BEH4FD/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6JAKZ5G5AF0CJ4BEH4FD",
+            "run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+            "run_status": "waiting",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V6JB58TAX5JYTAZTR0ERW"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452449.2258468,
+          "path": "/api/worker/workflow-tasks/01M76V6PZHQ5HTKM9WQ1K974MT/fail",
+          "status": 409,
+          "delay_seconds": 3.0,
+          "request_attempt": 1,
+          "failure_type": "WorkflowTaskWaitingForHistory",
+          "response": {
+            "task_id": "01M76V6PZHQ5HTKM9WQ1K974MT",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": false,
+            "run_id": "01M76V6JAJRY9MYFA9XE58YRSJ",
+            "run_status": "failed",
+            "created_task_ids": [],
+            "reason": "run_timed_out",
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452449.2871048,
+          "path": "/api/worker/workflow-tasks/01M76V6SZ532S8YBNZ9ZXM4NQW/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6SZ532S8YBNZ9ZXM4NQW",
+            "run_id": "01M76V6SZ47GBSFSFD85RBCRVP",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [
+              "01M76V6SZX4E2V9C6ZSFTDVC6A"
+            ],
+            "protocol_version": "1.20"
+          }
+        },
+        {
+          "time": 1794452449.307103,
+          "path": "/api/worker/workflow-tasks/01M76V6SZX4E2V9C6ZSFTDVC6A/complete",
+          "status": 200,
+          "delay_seconds": 0,
+          "request_attempt": 1,
+          "failure_type": null,
+          "response": {
+            "task_id": "01M76V6SZX4E2V9C6ZSFTDVC6A",
+            "run_id": "01M76V6SZWRBE2535WK81C9AQV",
+            "run_status": "completed",
+            "workflow_task_attempt": 1,
+            "outcome": "completed",
+            "recorded": true,
+            "reason": null,
+            "created_task_ids": [],
+            "protocol_version": "1.20"
+          }
+        }
+      ],
+      "outcome": "pass"
+    }
+  },
+  "checks_outcome": "pass",
+  "cleanup": {
+    "pass": true,
+    "errors": [],
+    "local_leftovers": [],
+    "leftover_containers": [],
+    "leftover_networks": []
+  },
+  "finished_at": "2026-11-12T03:00:51.337994+00:00"
+}
