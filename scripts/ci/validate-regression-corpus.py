@@ -978,6 +978,13 @@ def _replay_fixture(document: Mapping[str, Any], path: str, binding: str | None)
         if document["worker_task"].get("external_input") is not True or document.get("expected_failure") != "task_not_leased":
             raise CorpusError(f"{path} hydration refusal must execute external input and assert task_not_leased")
         semantic = {"replay": semantic, "hydration": {"external_input": True, "expected_failure": "task_not_leased"}}
+    suffix_after = document.get("worker_task", {}).get("history_after_sequence")
+    if suffix_after is not None:
+        # A sticky_history_suffix delivery (server#1017) sends only events after this
+        # boundary, so the official worker executes a different task than a full delivery.
+        if type(suffix_after) is not int or suffix_after < 1:
+            raise CorpusError(f"{path}.worker_task.history_after_sequence must be a positive integer")
+        semantic = {"replay": semantic, "sticky_history_suffix": {"history_after_sequence": suffix_after}}
     return [
         _fixture_evidence(
             category="replay",

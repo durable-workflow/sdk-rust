@@ -3045,6 +3045,8 @@ pub struct Client {
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
     failure_request_limit: Arc<AtomicUsize>,
     activity_lease_renewal_supported: Arc<AtomicBool>,
+    /// Server #1017: the Server sends sticky hits only the history after the cached sequence.
+    sticky_history_suffix_supported: Arc<AtomicBool>,
     activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
@@ -4106,6 +4108,9 @@ impl Client {
             body["capability_manifest"]["sticky_execution"] = json!({"supported":true,
                 "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION,
                 "implementation":"bounded_durable_history_cache"});
+            body["capability_manifest"]["sticky_history_suffix"] = json!({"supported":true,
+                "minimum_protocol_version":PORTABLE_WORKER_AFFINITY_MINIMUM_PROTOCOL_VERSION,
+                "version":1});
         }
         if self.local_activities_enabled {
             body["capability_manifest"]["local_activities"] = json!({"supported":true,
@@ -6074,6 +6079,7 @@ impl ClientBuilder {
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
             failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
+            sticky_history_suffix_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
@@ -8568,6 +8574,10 @@ impl Worker {
                         .sticky_cache
                         .is_some()
                         .then(|| "sticky_execution".to_string()),
+                    self.client
+                        .sticky_cache
+                        .is_some()
+                        .then(|| "sticky_history_suffix".to_string()),
                     self.cooperative_cancellation_enabled
                         .then(|| "cooperative_cancellation".to_string()),
                     self.nexus_cooperative_cancellation_enabled
