@@ -21,6 +21,14 @@ impl Drop for ClearCacheOnDrop {
     }
 }
 
+/// Whether `events` run gap-free from `after + 1` (and, when given, end at `last`).
+fn suffix_continues(events: &[Value], after: u64, last: Option<u64>) -> bool {
+    let contiguous = events.iter().enumerate().all(|(index, event)| {
+        event.is_object() && event["sequence"].as_u64() == Some(after + index as u64 + 1)
+    });
+    contiguous && last.is_none_or(|last| last == after + events.len() as u64)
+}
+
 fn invalid(message: &str) -> Error {
     Error::Codec(format!("sticky_history_invalid: {message}"))
 }
@@ -157,12 +165,25 @@ impl Worker {
             return Ok(None);
         }
         let metrics = cache.metrics(Instant::now());
-        Ok(Some(
-            json!({"worker_id":self.worker_id,"workflow_id":snapshot.key.workflow_id,
+        let mut claim = json!({"worker_id":self.worker_id,"workflow_id":snapshot.key.workflow_id,
             "run_id":snapshot.key.run_id,"build_id":snapshot.key.build_id,"ttl_seconds":cache.ttl_seconds(),
             "metrics":{"hit":metrics.hit,"miss":metrics.miss,"eviction":metrics.eviction,
-                "forced_cold_replay":metrics.forced_cold_replay}}),
-        ))
+                "forced_cold_replay":metrics.forced_cold_replay}});
+        if self
+            .client
+            .sticky_history_suffix_supported
+            .load(Ordering::Acquire)
+        {
+            // sticky_history_suffix v1: the Server sends the next suffix after exactly this sequence.
+            if let Some(last) = snapshot
+                .history
+                .last()
+                .and_then(|event| event["sequence"].as_u64())
+            {
+                claim["history_last_sequence"] = json!(last);
+            }
+        }
+        Ok(Some(claim))
     }
 
     pub(super) fn discard_sticky_snapshot(&self, snapshot: Option<&StickySnapshot>) -> Result<()> {
@@ -220,8 +241,15 @@ impl Client {
             && response["capability_manifest"]["sticky_execution"]["supported"] == true
             && response["server_capabilities"]["sticky_execution"]["supported"] == true;
         if accepted {
+            let suffix = &response["server_capabilities"]["sticky_history_suffix"];
+            self.sticky_history_suffix_supported.store(
+                suffix["supported"] == true && suffix["version"] == 1,
+                Ordering::Release,
+            );
             return Ok(());
         }
+        self.sticky_history_suffix_supported
+            .store(false, Ordering::Release);
         self.clear_sticky_cache()?;
         let error = Error::WorkerLoop("sticky_registration_unconfirmed: Server must acknowledge this worker, namespace, queue, build and sticky capability".into());
         if response["registered"] == true && response["worker_id"].as_str() == Some(worker_id) {
@@ -265,6 +293,14 @@ impl Client {
         let inline: Vec<Value> =
             serde_json::from_value(serde_json::to_value(&task.history_events)?)?;
         let mode = wire["sticky_replay_mode"].as_str();
+        if let Some(after) = wire["history_after_sequence"]
+            .as_u64()
+            .filter(|after| *after > 0)
+        {
+            return self
+                .load_sticky_suffix(task, wire, key, inline, mode, after)
+                .await;
+        }
         let cache = self
             .sticky_cache
             .as_ref()
@@ -363,6 +399,85 @@ impl Client {
         if !complete_history(&history)
             || last_sequence.is_some_and(|last| (history.len() as u64) < last)
         {
+            return Err(invalid("cold replay lacks complete canonical history"));
+        }
+        task.history_events = serde_json::from_value(Value::Array(history.clone()))?;
+        task.next_history_page_token = None;
+        Ok(StickySnapshot {
+            key,
+            history,
+            resume,
+        })
+    }
+
+    /// Replay a sticky_history_suffix v1 answer (server#1017) or refetch full history.
+    ///
+    /// A suffix is used only on a sticky hit whose cached history ends at exactly
+    /// `after` and whose events run gap-free from `after + 1` to
+    /// `history_last_sequence`. It is never treated as a complete history.
+    async fn load_sticky_suffix(
+        &self,
+        task: &mut WorkflowTask,
+        wire: &Value,
+        key: CacheKey,
+        mut suffix: Vec<Value>,
+        mode: Option<&str>,
+        after: u64,
+    ) -> Result<StickySnapshot> {
+        let cache = self
+            .sticky_cache
+            .as_ref()
+            .ok_or_else(|| invalid("cache profile is disabled"))?;
+        let last = wire["history_last_sequence"].as_u64();
+        let usable = self.sticky_history_suffix_supported.load(Ordering::Acquire)
+            && mode == Some("sticky_hit_expected");
+        if usable && suffix_continues(&suffix, after, None) {
+            if let Some(next) = task.next_history_page_token.clone() {
+                let offset =
+                    usize::try_from(after).map_err(|_| invalid("suffix boundary is too large"))?;
+                suffix = self
+                    .fetch_sticky_pages(task, suffix, Some(next), offset)
+                    .await?
+                    .0;
+            }
+        }
+        let cached = if usable {
+            cache
+                .lock()
+                .map_err(|_| Error::WorkflowStatePoisoned)?
+                .lookup(&key, Instant::now())
+        } else {
+            None
+        };
+        if let Some((mut history, _)) = cached {
+            if history.last().and_then(|event| event["sequence"].as_u64()) == Some(after)
+                && last.is_some_and(|last| suffix_continues(&suffix, after, Some(last)))
+            {
+                history.extend(suffix);
+                if complete_history(&history) {
+                    cache
+                        .lock()
+                        .map_err(|_| Error::WorkflowStatePoisoned)?
+                        .record_replay(true, false);
+                    task.history_events = serde_json::from_value(Value::Array(history.clone()))?;
+                    task.next_history_page_token = None;
+                    return Ok(StickySnapshot {
+                        key,
+                        history,
+                        resume: None,
+                    });
+                }
+            }
+        }
+        {
+            let mut cache = cache.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+            cache.discard(&key);
+            cache.record_replay(false, true);
+        }
+        let (history, resume) = self
+            .fetch_sticky_pages(task, Vec::new(), Some("MA==".into()), 0)
+            .await?;
+        if !complete_history(&history) || last.is_some_and(|last| (history.len() as u64) < last) {
             return Err(invalid("cold replay lacks complete canonical history"));
         }
         task.history_events = serde_json::from_value(Value::Array(history.clone()))?;
@@ -828,5 +943,200 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(tiny.sticky_cache_metrics().unwrap().entries, 0);
+    }
+
+    fn suffix_wire(
+        events: Vec<Value>,
+        after: u64,
+        last: u64,
+        mode: &str,
+        token: Option<&str>,
+    ) -> Value {
+        json!({"task_id":"task-now","workflow_id":"workflow","run_id":"run","workflow_type":"Test",
+            "workflow_task_attempt":7,"lease_owner":"worker","payload_codec":"avro",
+            "history_events":events,"total_history_events":last,"last_history_sequence":last,
+            "history_after_sequence":after,"history_last_sequence":last,
+            "next_history_page_token":token,"sticky_replay_mode":mode})
+    }
+    fn suffix_worker(url: String, supported: bool, cached: usize) -> Worker {
+        let worker = worker(url, 1_000_000);
+        worker
+            .client
+            .sticky_history_suffix_supported
+            .store(supported, Ordering::Release);
+        assert!(worker
+            .client
+            .sticky_cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remember(key(), &history(cached), None, Instant::now()));
+        worker
+    }
+    async fn load(worker: &Worker, wire: &Value) -> StickySnapshot {
+        let mut task = serde_json::from_value(wire.clone()).unwrap();
+        worker
+            .client
+            .load_sticky_history(&mut task, wire, "worker")
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn suffix_hit_appends_to_the_cached_prefix_without_a_fetch() {
+        let (url, requests) = server(vec![]).await;
+        let worker = suffix_worker(url, true, 4);
+        let snapshot = load(
+            &worker,
+            &suffix_wire(history(6)[4..].to_vec(), 4, 6, "sticky_hit_expected", None),
+        )
+        .await;
+        assert_eq!(snapshot.history, history(6));
+        assert!(snapshot.resume.is_none());
+        assert_eq!(worker.sticky_cache_metrics().unwrap().hit, 1);
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn suffix_that_does_not_continue_the_cache_refetches_from_the_start() {
+        let all = history(7);
+        let cases: Vec<(&str, Vec<Value>, u64, u64)> = vec![
+            ("gap", all[5..7].to_vec(), 4, 7),
+            ("overlap", all[3..6].to_vec(), 4, 6),
+            ("non-contiguous", vec![all[4].clone(), all[6].clone()], 4, 7),
+            ("ends-short", all[4..5].to_vec(), 4, 6),
+            ("boundary-differs", all[4..6].to_vec(), 3, 6),
+        ];
+        for (name, events, after, last) in cases {
+            let (url, requests) = server(vec![(200, page(history(last as usize), None))]).await;
+            let worker = suffix_worker(url, true, 4);
+            let snapshot = load(
+                &worker,
+                &suffix_wire(events, after, last, "sticky_hit_expected", None),
+            )
+            .await;
+            assert_eq!(snapshot.history, history(last as usize), "{name}");
+            let metrics = worker.sticky_cache_metrics().unwrap();
+            assert_eq!((metrics.hit, metrics.forced_cold_replay), (0, 1), "{name}");
+            let requests = requests.await.unwrap();
+            assert_eq!(requests.len(), 1, "{name}");
+            assert_eq!(requests[0].2["next_history_page_token"], "MA==", "{name}");
+            assert_eq!(requests[0].2["lease_owner"], "worker", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_unsupported_or_non_sticky_suffix_is_never_replayed_as_full_history() {
+        for (supported, cached, mode) in [
+            (true, 0, "sticky_hit_expected"),
+            (false, 4, "sticky_hit_expected"),
+            (true, 4, "forced_cold_replay"),
+        ] {
+            let (url, requests) = server(vec![(200, page(history(6), None))]).await;
+            let worker = worker(url, 1_000_000);
+            worker
+                .client
+                .sticky_history_suffix_supported
+                .store(supported, Ordering::Release);
+            if cached > 0 {
+                assert!(worker
+                    .client
+                    .sticky_cache
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .remember(key(), &history(cached), None, Instant::now()));
+            }
+            let snapshot = load(
+                &worker,
+                &suffix_wire(history(6)[4..].to_vec(), 4, 6, mode, None),
+            )
+            .await;
+            assert_eq!(snapshot.history, history(6));
+            assert_eq!(
+                requests.await.unwrap()[0].2["next_history_page_token"],
+                "MA=="
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paged_suffix_is_assembled_before_it_is_checked() {
+        let (url, requests) = server(vec![(200, page(history(8)[6..].to_vec(), None))]).await;
+        let worker = suffix_worker(url, true, 4);
+        let wire = suffix_wire(
+            history(8)[4..6].to_vec(),
+            4,
+            8,
+            "sticky_hit_expected",
+            Some("suffix:6"),
+        );
+        assert_eq!(load(&worker, &wire).await.history, history(8));
+        assert_eq!(worker.sticky_cache_metrics().unwrap().hit, 1);
+        assert_eq!(
+            requests.await.unwrap()[0].2["next_history_page_token"],
+            "suffix:6"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_advertises_suffixes_and_reads_server_support() {
+        for (server_entry, expected) in [
+            (json!({"supported":true,"version":1}), true),
+            (json!({"supported":true,"version":2}), false),
+            (Value::Null, false),
+        ] {
+            let response = json!({"registered":true,"worker_id":"worker","namespace":"default","task_queue":"queue",
+                "protocol_version":"1.19","build_id":null,"capabilities":["sticky_execution","sticky_history_suffix"],
+                "capability_manifest":{"sticky_execution":{"supported":true}},
+                "server_capabilities":{"sticky_execution":{"supported":true},"sticky_history_suffix":server_entry}});
+            let (url, requests) = server(vec![(200, response)]).await;
+            let worker = worker(url, 1_000_000);
+            worker.register().await.unwrap();
+            assert_eq!(
+                worker
+                    .client
+                    .sticky_history_suffix_supported
+                    .load(Ordering::Acquire),
+                expected
+            );
+            let requests = requests.await.unwrap();
+            let body = &requests[0].2;
+            assert!(body["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "sticky_history_suffix"));
+            assert_eq!(
+                body["capability_manifest"]["sticky_history_suffix"],
+                json!({"supported":true,"minimum_protocol_version":"1.18","version":1})
+            );
+        }
+    }
+
+    #[test]
+    fn claim_reports_the_cached_last_sequence_only_with_server_support() {
+        let worker = worker("http://127.0.0.1:1".into(), 1_000_000);
+        let snapshot = StickySnapshot {
+            key: key(),
+            history: history(5),
+            resume: None,
+        };
+        let claim = worker
+            .sticky_claim(Some(&snapshot), &[json!({"type":"start_timer"})])
+            .unwrap()
+            .unwrap();
+        assert!(claim.get("history_last_sequence").is_none());
+        worker
+            .client
+            .sticky_history_suffix_supported
+            .store(true, Ordering::Release);
+        let claim = worker
+            .sticky_claim(Some(&snapshot), &[json!({"type":"start_timer"})])
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim["history_last_sequence"], 5);
     }
 }

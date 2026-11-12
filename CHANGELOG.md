@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Workers with a sticky cache advertise `sticky_history_suffix` (#234,
+  server#1017). On Server 3.5.0 or later, a sticky hit receives only the history
+  after the sequence the worker cached, instead of the full history on every
+  workflow task. A suffix is used only when it continues the cached history
+  exactly; otherwise the worker drops the entry and refetches full history.
+
 ## 4.13.0
 
 - Local activities no longer retry with zero delay once their backoff list runs out.

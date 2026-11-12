@@ -136,6 +136,9 @@ impl Drop for FixtureServer {
     }
 }
 
+/// Server-side only: the full history a suffix fixture's history pages serve.
+const AUTHORITATIVE_HISTORY: &str = "_corpus_authoritative_history";
+
 fn handle_request(
     stream: &mut TcpStream,
     requests: &Arc<Mutex<Vec<CapturedRequest>>>,
@@ -230,7 +233,12 @@ fn handle_request(
                 "heartbeat_interval_seconds": 3600,
                 "capabilities": registration["capabilities"],
                 "capability_manifest": registration["capability_manifest"],
-                "server_capabilities": {"sticky_execution": {"supported": true}}
+                "server_capabilities": if task.get(AUTHORITATIVE_HISTORY).is_some() {
+                    json!({"sticky_execution": {"supported": true},
+                        "sticky_history_suffix": {"supported": true, "version": 1}})
+                } else {
+                    json!({"sticky_execution": {"supported": true}})
+                }
             })
             .to_string()
         }
@@ -245,7 +253,21 @@ fn handle_request(
         })
         .to_string(),
         "/api/worker/workflow-tasks/poll" if request_number == 1 && task.get("query_task_id").is_none() => {
-            json!({"task": task}).to_string()
+            let mut delivered = task.clone();
+            if let Some(fields) = delivered.as_object_mut() {
+                fields.remove(AUTHORITATIVE_HISTORY);
+            }
+            json!({"task": delivered}).to_string()
+        }
+        // A sticky_history_suffix fixture's authoritative pages (server#1017).
+        path if path.starts_with("/api/worker/workflow-tasks/")
+            && path.ends_with("/history")
+            && task.get(AUTHORITATIVE_HISTORY).is_some() =>
+        {
+            let history = &task[AUTHORITATIVE_HISTORY];
+            json!({"task_id": task["task_id"], "workflow_task_attempt": task["workflow_task_attempt"],
+                "history_events": history, "total_history_events": history.as_array().map_or(0, Vec::len),
+                "next_history_page_token": null}).to_string()
         }
         "/api/worker/workflow-tasks/poll" | "/api/worker/activity-tasks/poll" => {
             json!({"task": null}).to_string()
@@ -586,6 +608,24 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         if let Some(value) = fixture["worker_task"].get(field) {
             task[field] = value.clone();
         }
+    }
+    if let Some(after) = fixture["worker_task"]["history_after_sequence"].as_u64() {
+        // sticky_history_suffix v1: deliver only the events after `after`; pages serve the rest.
+        let full = task["history_events"].clone();
+        let events = full.as_array().cloned().unwrap_or_default();
+        let last = events
+            .last()
+            .and_then(|event| event["sequence"].as_u64())
+            .unwrap_or(0);
+        task["history_events"] = json!(events
+            .into_iter()
+            .filter(|event| event["sequence"]
+                .as_u64()
+                .is_some_and(|sequence| sequence > after))
+            .collect::<Vec<_>>());
+        task["history_after_sequence"] = json!(after);
+        task["history_last_sequence"] = json!(last);
+        task[AUTHORITATIVE_HISTORY] = full;
     }
     let completion_storage_refusals = fixture["worker_task"]["completion_storage_refusals"]
         .as_u64()
