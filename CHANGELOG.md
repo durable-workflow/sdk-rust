@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.14.0
+
 - Workers with a sticky cache advertise `sticky_history_suffix` (#234,
   server#1017). On Server 3.5.0 or later, a sticky hit receives only the history
   after the sequence the worker cached, instead of the full history on every
