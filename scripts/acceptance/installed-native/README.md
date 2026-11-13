@@ -70,7 +70,7 @@ published-artifact acceptance.
 
 `tests/workflow_logging_server.rs` checks the logging feature separately from
 the lifecycle/deadline cells. Copy it into the exact-package consumer with
-`tracing`, `serde_json`, and Tokio's `macros`, `rt-multi-thread`, and `time`
+`tracing`, `sha2`, `serde_json`, and Tokio's `macros`, `rt-multi-thread`, and `time`
 features available. Preserve the caller's package checksum/source/lock proof;
 compiling this test against checkout source is preparation only.
 
@@ -90,8 +90,13 @@ workflow log with the original namespace/workflow/run identity; the final
 result and all three signal deliveries must match. The worker entrypoint is
 invoked by the parent and is not a separate acceptance command. Each child has
 a 30-second bound and owned-process cleanup. The caller owns the Server and
-its state cleanup. This proof covers committed-prefix suppression across cold
-workers; uncommitted task retries may still repeat process logs.
+its state cleanup. This Linux qualifier executes the parent's running image
+through `/proc/self/exe`; child image hash, length, device and inode must match
+before SDK client construction and in the returned observation. The ordinary
+path-replacement control uses only a private executable copy and an inert
+marker, without SDK/Server inputs. This proof covers committed-prefix
+suppression across cold workers; uncommitted task retries may still repeat
+process logs.
 
 ## Run
 

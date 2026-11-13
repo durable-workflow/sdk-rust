@@ -3,6 +3,8 @@
 use durable_workflow::{
     json, Client, Error, Value, Worker, WorkerRetryPolicy, WorkflowResultOptions,
 };
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -18,6 +20,56 @@ const TYPE: &str = "DURABLE_WORKFLOW_LOGGING_TYPE";
 const PHASE: &str = "DURABLE_WORKFLOW_LOGGING_PHASE";
 const OUTPUT: &str = "WORKFLOW_LOGGING_RESULT ";
 const OUTPUT_LIMIT: u64 = 65_536;
+const IMAGE: &str = "DURABLE_WORKFLOW_LOGGING_IMAGE";
+#[cfg(target_os = "linux")]
+const CONTROL: &str = "DURABLE_WORKFLOW_LOGGING_EXECUTABLE_CONTROL";
+
+const CHILD_ARGUMENTS: [&str; 6] = [
+    "--ignored",
+    "--exact",
+    "published_logging_worker_entrypoint",
+    "--nocapture",
+    "--test-threads=1",
+    "--quiet",
+];
+
+fn image_command() -> Command {
+    assert!(
+        cfg!(target_os = "linux"),
+        "the installed qualifier requires Linux parent-image execution"
+    );
+    // In the forked child this magic link still names the running parent image,
+    // even if its former pathname has been renamed or replaced.
+    let mut command = Command::new("/proc/self/exe");
+    command.args(CHILD_ARGUMENTS).env_clear();
+    command
+}
+
+fn executable_identity() -> Value {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut file = std::fs::File::open("/proc/self/exe").unwrap();
+        let metadata = file.metadata().unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 65_536];
+        let mut length = 0_u64;
+        loop {
+            let read = file.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            length += read as u64;
+            digest.update(&buffer[..read]);
+        }
+        assert_eq!(length, metadata.len());
+        json!({"sha256":format!("{:x}",digest.finalize()),"length":length,"device":metadata.dev(),"inode":metadata.ino()})
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        panic!("the installed qualifier requires Linux parent-image execution");
+    }
+}
 
 fn client() -> Client {
     assert_eq!(
@@ -100,7 +152,18 @@ impl tracing::Subscriber for Capture {
 #[tokio::test]
 #[ignore = "entrypoint invoked only by the isolated logging acceptance parent"]
 async fn published_logging_worker_entrypoint() {
+    #[cfg(target_os = "linux")]
+    if let Ok(mode) = std::env::var(CONTROL) {
+        executable_control(&mode).await;
+        return;
+    }
     assert_eq!(std::env::var(CHILD).as_deref(), Ok("1"));
+    let image = executable_identity();
+    assert_eq!(
+        image,
+        serde_json::from_str::<Value>(&std::env::var(IMAGE).unwrap()).unwrap(),
+        "child image must equal the captured parent before constructing a client"
+    );
     let queue = std::env::var(QUEUE).unwrap();
     let kind = std::env::var(TYPE).unwrap();
     let phase = std::env::var(PHASE).unwrap();
@@ -116,7 +179,7 @@ async fn published_logging_worker_entrypoint() {
     );
     println!(
         "{OUTPUT}{}",
-        json!({"pid":std::process::id(),"handled":handled,"logs":*capture.0.lock().unwrap()})
+        json!({"pid":std::process::id(),"executable":image,"handled":handled,"logs":*capture.0.lock().unwrap()})
     );
 }
 
@@ -132,21 +195,14 @@ impl Drop for OwnedChild {
     }
 }
 
-async fn activation(queue: &str, kind: &str, phase: usize) -> Value {
-    let mut command = Command::new(std::env::current_exe().unwrap());
+async fn activation(queue: &str, kind: &str, phase: usize, image: &Value) -> Value {
+    let mut command = image_command();
     command
-        .args([
-            "--ignored",
-            "--exact",
-            "published_logging_worker_entrypoint",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env_clear()
         .env(CHILD, "1")
         .env(QUEUE, queue)
         .env(TYPE, kind)
-        .env(PHASE, phase.to_string());
+        .env(PHASE, phase.to_string())
+        .env(IMAGE, image.to_string());
     for name in [
         "DURABLE_WORKFLOW_LOCAL_ISOLATED",
         "DURABLE_WORKFLOW_SERVER_URL",
@@ -154,6 +210,15 @@ async fn activation(queue: &str, kind: &str, phase: usize) -> Value {
     ] {
         command.env(name, std::env::var(name).unwrap());
     }
+    let (expected_pid, output) = run_child(command).await;
+    let record = parse_report(&output);
+    assert_eq!(record["pid"], expected_pid);
+    assert_eq!(record["executable"], *image);
+    assert_eq!(record["handled"], 1);
+    record
+}
+
+async fn run_child(mut command: Command) -> (u32, String) {
     let mut child = OwnedChild(
         command
             .stdout(Stdio::piped())
@@ -188,9 +253,13 @@ async fn activation(queue: &str, kind: &str, phase: usize) -> Value {
     );
     assert!(
         status.success(),
-        "fresh logging worker {phase} exited {status}"
+        "owned logging fixture process exited {status}"
     );
     let output = String::from_utf8(output).unwrap();
+    (expected_pid, output)
+}
+
+fn parse_report(output: &str) -> Value {
     // libtest may place its progress prefix before the captured result line.
     let records: Vec<Value> = output
         .lines()
@@ -198,9 +267,99 @@ async fn activation(queue: &str, kind: &str, phase: usize) -> Value {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(records.len(), 1, "one process result is required");
-    assert_eq!(records[0]["pid"], expected_pid);
-    assert_eq!(records[0]["handled"], 1);
     records.into_iter().next().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+async fn executable_control(mode: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if mode == "identity" {
+        let image = executable_identity();
+        assert_eq!(
+            image,
+            serde_json::from_str::<Value>(&std::env::var(IMAGE).unwrap()).unwrap()
+        );
+        println!(
+            "{OUTPUT}{}",
+            json!({"pid":std::process::id(),"executable":image})
+        );
+        return;
+    }
+    assert_eq!(mode, "replace-private-copy");
+    let path = std::env::current_exe().unwrap();
+    assert_eq!(path.file_name().unwrap(), "private-copy");
+    let root = path.parent().unwrap();
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("workflow-logging-executable-"));
+    assert_eq!(root.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+    let image = executable_identity();
+    // Capture both commands before replacing the name. The predecessor reopens
+    // the captured pathname; the actual image command must execute this image.
+    let mut predecessor = Command::new(&path);
+    predecessor.env_clear();
+    let mut candidate = image_command();
+    candidate
+        .env(CONTROL, "identity")
+        .env(IMAGE, image.to_string());
+    std::fs::rename(&path, root.join("running-image")).unwrap();
+    std::fs::write(&path, b"#!/bin/sh\nprintf 'PATH_REPLACED\\n'\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, old_output) = run_child(predecessor).await;
+    assert_eq!(old_output.trim(), "PATH_REPLACED");
+    let (pid, output) = run_child(candidate).await;
+    let record = parse_report(&output);
+    assert_eq!(record["pid"], pid);
+    assert_eq!(record["executable"], image);
+    println!("EXECUTABLE_CONTROL_PASS");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn replaced_executable_path_cannot_change_the_child_image() {
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Directory(std::env::temp_dir().join(format!(
+        "workflow-logging-executable-{}",
+        durable_workflow::Uuid::new_v4()
+    )));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root.0)
+        .unwrap();
+    let path = root.0.join("private-copy");
+    let mut source = std::fs::File::open("/proc/self/exe").unwrap();
+    let mut snapshot = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o700)
+        .open(&path)
+        .unwrap();
+    std::io::copy(&mut source, &mut snapshot).unwrap();
+    snapshot.flush().unwrap();
+    drop(snapshot);
+    let mut control = Command::new(path);
+    control
+        .args(CHILD_ARGUMENTS)
+        .env_clear()
+        .env(CONTROL, "replace-private-copy");
+    let (_, output) = run_child(control).await;
+    assert!(output
+        .lines()
+        .any(|line| line.contains("EXECUTABLE_CONTROL_PASS")));
+    std::fs::remove_dir_all(&root.0).unwrap();
+    assert!(!root.0.exists());
 }
 
 fn event_count(history: &Value, kind: &str) -> usize {
@@ -215,6 +374,7 @@ fn event_count(history: &Value, kind: &str) -> usize {
 #[tokio::test]
 #[ignore = "requires an isolated published Server and exact package provenance from the caller"]
 async fn published_logging_emits_once_per_committed_step_across_cold_worker_processes() {
+    let image = executable_identity();
     let client = client();
     let expected_version = std::env::var("DURABLE_WORKFLOW_EXPECT_SERVER_VERSION").unwrap();
     assert_eq!(
@@ -241,7 +401,7 @@ async fn published_logging_emits_once_per_committed_step_across_cold_worker_proc
         if phase > 0 {
             handle.signal("advance", json!([phase])).await.unwrap();
         }
-        let observation = activation(&id, &kind, phase).await;
+        let observation = activation(&id, &kind, phase, &image).await;
         assert!(
             pids.insert(observation["pid"].as_u64().unwrap()),
             "each activation must use a new process"
