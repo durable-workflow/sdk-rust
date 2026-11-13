@@ -45,10 +45,14 @@ impl Recorder {
         let bytes = include_bytes!("../../tests/fixtures/sdk-metrics-contract.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "c456f4f434c601fa26f0caba07ef0fd29f548ca8f5fc29ba2f6430f01e32c0f0"
+            "081d98ec6f5f6e3812f81ddbe8d2589d75e7c6e457c580dc6631d7857594516a"
         );
         let contract: Value = serde_json::from_slice(bytes).unwrap();
-        let samples = self.samples();
+        let all_samples = self.samples();
+        let samples: Vec<_> = all_samples
+            .into_iter()
+            .filter(|sample| sample.name != WORKER_TASK_SCHEDULE_TO_START_SECONDS)
+            .collect();
         assert!(!samples.is_empty());
         assert_eq!(samples.len() % 2, 0);
         for pair in samples.chunks_exact(2) {
@@ -416,4 +420,99 @@ async fn prometheus_adapter_exports_actual_request_counter_and_histogram() {
     assert!(text.contains("route=\"/health\""));
     assert!(text.contains("status_code=\"200\""));
     assert!(!text.contains("synthetic-secret"));
+}
+
+#[test]
+fn ready_age_requires_an_advertised_bounded_integer_and_preserves_real_zero() {
+    for (wire, expected) in [
+        (json!({"task":{"ready_age_ms":100}}), None),
+        (
+            json!({"server_capabilities":{"claimed_task_ready_age":false},"task":{"ready_age_ms":100}}),
+            None,
+        ),
+        (
+            json!({"server_capabilities":{"claimed_task_ready_age":"true"},"task":{"ready_age_ms":100}}),
+            None,
+        ),
+        (
+            json!({"server_capabilities":{"claimed_task_ready_age":true},"task":null}),
+            None,
+        ),
+    ] {
+        assert_eq!(ready_age_from_poll(&wire), expected);
+    }
+    for (value, expected) in [
+        (json!(0), Some(0.0)),
+        (json!(1250), Some(1.25)),
+        (json!(9_007_199_254_740_991u64), Some(9_007_199_254_740.99)),
+        (json!(9_007_199_254_740_992u64), None),
+        (json!(-1), None),
+        (json!(1.0), None),
+        (json!("100"), None),
+        (json!(true), None),
+        (Value::Null, None),
+        (json!({}), None),
+    ] {
+        let wire = json!({"server_capabilities":{"claimed_task_ready_age":true},"task":{"ready_age_ms":value}});
+        assert_eq!(ready_age_from_poll(&wire), expected, "{value}");
+    }
+}
+
+#[tokio::test]
+async fn actual_claim_ready_age_uses_the_worker_override_and_only_two_labels() {
+    let args = serde_json::to_value(crate::encode_payload(&json!([]), "avro").unwrap()).unwrap();
+    let server = Server::start(move |path| Some((200, if path.ends_with("workflow-tasks/poll") {
+        json!({"server_capabilities":{"claimed_task_ready_age":true},"task":{"task_id":"workflow-secret","workflow_type":"sample","payload_codec":"avro","arguments":args,"history_events":[],"ready_age_ms":1250}})
+    } else if path.ends_with("activity-tasks/poll") {
+        json!({"server_capabilities":{"claimed_task_ready_age":true},"task":{"task_id":"activity-secret","activity_type":"sample","activity_attempt_id":"attempt-secret","payload_codec":"avro","arguments":args,"ready_age_ms":0}})
+    } else { json!({"recorded":true}) }))).await;
+    let inherited = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::default());
+    let mut worker = Worker::new(server.client(inherited.clone()), "bounded-queue")
+        .metrics_recorder(recorder.clone());
+    worker.register_workflow("sample", |_, _| async { Ok(json!("ok")) });
+    worker.register_activity("sample", |_, _| async { Ok(json!("ok")) });
+    assert_eq!(worker.run_once().await.unwrap(), 2);
+    let samples: Vec<_> = recorder
+        .samples()
+        .into_iter()
+        .filter(|sample| sample.name == WORKER_TASK_SCHEDULE_TO_START_SECONDS)
+        .collect();
+    assert_eq!(samples.len(), 2);
+    for sample in samples {
+        assert_eq!(sample.method, "record");
+        assert_eq!(sample.tags.len(), 2);
+        assert_eq!(sample.tags["task_queue"], "bounded-queue");
+        assert_eq!(
+            sample.value,
+            if sample.tags["task_kind"] == "workflow" {
+                1.25
+            } else {
+                0.0
+            }
+        );
+    }
+    assert!(inherited
+        .samples()
+        .iter()
+        .all(|sample| sample.name.starts_with("durable_workflow_client_")));
+    recorder.assert_contract();
+}
+
+#[cfg(feature = "metrics-prometheus")]
+#[test]
+fn prometheus_exports_ready_age_without_an_outcome_label_or_counter() {
+    let recorder = PrometheusMetrics::new().unwrap();
+    recorder.record(
+        WORKER_TASK_SCHEDULE_TO_START_SECONDS,
+        1.25,
+        &[
+            ("task_kind".into(), "workflow".into()),
+            ("task_queue".into(), "orders".into()),
+        ]
+        .into(),
+    );
+    let text = String::from_utf8(recorder.encode().unwrap()).unwrap();
+    assert!(text.contains("durable_workflow_worker_task_schedule_to_start_seconds_sum{task_kind=\"workflow\",task_queue=\"orders\"} 1.25"));
+    assert!(!text.contains("schedule_to_start_seconds_total"));
 }
