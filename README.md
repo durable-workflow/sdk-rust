@@ -100,6 +100,46 @@ ordinary worker registration does not enable it.
 - Activity options cover retries, start-to-close, schedule-to-start,
   schedule-to-close, heartbeat timeouts, cancellation, and heartbeats.
 
+### Signal and update request IDs
+
+Every signal and update sends a `request_id` body field: the key you pass to a
+`*_with_request_id` method or `update_workflow`, or one generated per call. The
+receipt carries it. The SDK never resends a signal or update by itself, so keep
+the key (`Client::generate_signal_request_id()` gives you one up front) to retry
+after a lost response.
+
+On a Server that advertises `capabilities.command_request_keys` in
+`Client::cluster_info()` (native 3.9.0 and later), the key is a durable command
+key on the workflow instance. A retry with the same name, arguments and run
+target returns the original receipt. The same key with a different name,
+arguments or run target is refused with HTTP 409 `request_id_conflict`, and
+nothing is written. Detect it with `Error::request_id_conflict()`, which names
+the differing parts (`name`, `arguments` or `target_or_arguments`), the
+`retained_command_id` and the key you sent. Don't retry it unchanged: send the
+original input to recover the receipt, or use a new key.
+
+```rust,no_run
+# async fn approve(client: &durable_workflow::Client) -> durable_workflow::Result<()> {
+match client
+    .signal_workflow_with_request_id("order-1", "approve", ["Grace"], "approve-order-1")
+    .await
+{
+    Err(error) if error.is_request_id_conflict() => {
+        let conflict = error.request_id_conflict().expect("conflict details");
+        eprintln!("{} is already {:?}", conflict.request_id, conflict.retained_command_id);
+    }
+    other => {
+        other?;
+    }
+}
+# Ok(())
+# }
+```
+
+Older Servers (PHP Server 2.x and native up to 3.8) don't compare input under
+a key: a repeated signal key records a second signal, and an update retried
+with changed arguments returns the original receipt.
+
 ### Condition predicate identities
 
 `wait_condition!` derives the recorded predicate identity from the call site's
