@@ -1409,6 +1409,13 @@ impl Client {
         if let (Some(claim), Some(pending)) = (loaded.task.as_mut(), pending) {
             claim.cancellation_request = Some(pending);
         }
+        if loaded.task.is_some() {
+            self.worker_dispatch_metrics.ready_age(
+                "workflow",
+                task_queue,
+                metrics::ready_age_from_poll(&value),
+            );
+        }
         Ok(loaded)
     }
 

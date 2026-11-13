@@ -3184,6 +3184,8 @@ fn avro_value_ordered_map_encoding_schema() -> Result<&'static Schema> {
 #[derive(Clone, Debug)]
 pub struct Client {
     metrics: metrics::Metrics,
+    // Managed-worker dispatch recording is separate from client HTTP recording.
+    worker_dispatch_metrics: metrics::Metrics,
     http: reqwest::Client,
     hydration_timeout: Duration,
     base_url: String,
@@ -4643,6 +4645,7 @@ impl Client {
                 transport_retries,
             )
             .await?;
+        let ready_age = metrics::ready_age_from_poll(&wire);
         let claim =
             workflow_hydration::HydrationClaim::from_poll(&wire, worker_id, &self.namespace)?;
         let (data, _) = workflow_hydration::HydrationClaim::protect(claim, self, async {
@@ -4660,6 +4663,10 @@ impl Client {
             Ok(data)
         })
         .await?;
+        if data.task.is_some() {
+            self.worker_dispatch_metrics
+                .ready_age("workflow", task_queue, ready_age);
+        }
         Ok(data)
     }
 
@@ -4940,6 +4947,7 @@ impl Client {
                 transport_retries,
             )
             .await?;
+        let ready_age = metrics::ready_age_from_poll(&wire);
         let lease =
             activity_lease::authority::Lease::confirm(self, &wire, worker_id, task_queue).await?;
         let observed = self.with_activity_lease_authority(
@@ -4974,6 +4982,8 @@ impl Client {
         if let Some(task) = data.task.as_mut() {
             task.hydration_claim = claim;
             task.activity_lease = lease;
+            self.worker_dispatch_metrics
+                .ready_age("activity", task_queue, ready_age);
         }
         Ok(data)
     }
@@ -6257,6 +6267,7 @@ impl ClientBuilder {
         }
         Ok(Client {
             metrics: self.metrics,
+            worker_dispatch_metrics: metrics::Metrics::default(),
             http: http.build()?,
             hydration_timeout: self.timeout,
             base_url,
@@ -7696,9 +7707,11 @@ impl Worker {
     /// Override worker poll/task metrics; client request metrics retain their client's recorder.
     pub fn metrics_recorder(mut self, recorder: Arc<dyn metrics::MetricsRecorder>) -> Self {
         self.metrics = metrics::Metrics::new(recorder);
+        self.client.worker_dispatch_metrics = self.metrics.clone();
         self
     }
-    pub fn new(client: Client, task_queue: impl Into<String>) -> Self {
+    pub fn new(mut client: Client, task_queue: impl Into<String>) -> Self {
+        client.worker_dispatch_metrics = client.metrics.clone();
         Self {
             metrics: client.metrics.clone(),
             #[cfg(feature = "telemetry")]

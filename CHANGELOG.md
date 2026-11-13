@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Worker metrics emit the revision-2 schedule-to-start histogram in seconds
+  for workflow and activity claims when the Server advertises
+  `claimed_task_ready_age`. Missing or invalid producer values are omitted.
+  Prometheus export uses only the task kind and task queue labels.
+
 - A workflow-task completion that native Server 3.6.0 refuses as too large
   (HTTP 413, `limit_kind: workflow_task_completion_bytes`, server#1152,
   durable-workflow/.github#228) is now a typed, non-retryable outcome.

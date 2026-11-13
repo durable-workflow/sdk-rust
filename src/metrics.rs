@@ -31,6 +31,10 @@ pub const WORKER_POLL_DURATION_SECONDS: &str = "durable_workflow_worker_poll_dur
 pub const WORKER_TASKS: &str = "durable_workflow_worker_tasks";
 pub const WORKER_TASK_DURATION_SECONDS: &str = "durable_workflow_worker_task_duration_seconds";
 
+/// Server-measured eligibility-to-claim delay, in seconds.
+pub const WORKER_TASK_SCHEDULE_TO_START_SECONDS: &str =
+    "durable_workflow_worker_task_schedule_to_start_seconds";
+
 /// Pluggable, thread-safe recorder. Counter increments are counts; records are seconds.
 pub trait MetricsRecorder: Send + Sync + 'static {
     fn increment(&self, name: &str, value: u64, tags: &MetricTags);
@@ -59,6 +63,20 @@ impl Metrics {
         Self(Some(recorder))
     }
 
+    pub(super) fn ready_age(&self, kind: &str, queue: &str, age: Option<f64>) {
+        let (Some(recorder), Some(age)) = (&self.0, age) else {
+            return;
+        };
+        let tags = [
+            ("task_kind".into(), kind.into()),
+            ("task_queue".into(), queue.into()),
+        ]
+        .into();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            recorder.record(WORKER_TASK_SCHEDULE_TO_START_SECONDS, age, &tags)
+        }));
+    }
+
     fn pair(&self, counter: &str, histogram: &str, tags: &MetricTags, elapsed: f64) {
         if let Some(recorder) = &self.0 {
             let _ = catch_unwind(AssertUnwindSafe(|| recorder.increment(counter, 1, tags)));
@@ -85,6 +103,16 @@ impl Metrics {
             },
         }
     }
+}
+
+// This is producer data, not a wall-clock estimate. Missing/invalid data is
+// unavailable; in particular, never synthesize zero for an unsupported Server.
+pub(super) fn ready_age_from_poll(wire: &crate::Value) -> Option<f64> {
+    if wire["server_capabilities"]["claimed_task_ready_age"] != true {
+        return None;
+    }
+    let milliseconds = wire["task"]["ready_age_ms"].as_u64()?;
+    (milliseconds <= 9_007_199_254_740_991).then_some(milliseconds as f64 / 1000.0)
 }
 
 pub(super) struct WorkerObservation {

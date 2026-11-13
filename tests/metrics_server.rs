@@ -140,14 +140,16 @@ async fn published_worker_emits_the_pinned_contract_and_prometheus_exposition() 
             expected
         );
         assert!(value.is_finite() && *value >= 0.0);
-        let counts = paired
-            .entry((entry["scope"].as_str().unwrap().into(), tags.clone()))
-            .or_default();
-        if *method == "increment" {
-            assert_eq!(*value, 1.0);
-            counts.0 += 1;
-        } else {
-            counts.1 += 1;
+        if entry["scope"] != "worker_task_dispatch" {
+            let counts = paired
+                .entry((entry["scope"].as_str().unwrap().into(), tags.clone()))
+                .or_default();
+            if *method == "increment" {
+                assert_eq!(*value, 1.0);
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
         }
         *observed.entry(name.clone()).or_default() += 1;
         for (key, value) in tags {
@@ -158,7 +160,7 @@ async fn published_worker_emits_the_pinned_contract_and_prometheus_exposition() 
             }
         }
     }
-    assert_eq!(observed.len(), 6, "all shared metrics must actually emit");
+    assert_eq!(observed.len(), 7, "all shared metrics must actually emit");
     assert!(paired
         .values()
         .all(|(counter, histogram)| counter == histogram));
