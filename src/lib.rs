@@ -3736,6 +3736,49 @@ impl Client {
         query_name: &str,
         input: T,
     ) -> Result<AvroValue> {
+        let response = self
+            .query_workflow_response(workflow_id, run_id, query_name, input)
+            .await?;
+        let envelope = response
+            .get("result_envelope")
+            .filter(|envelope| !envelope.is_null())
+            .ok_or_else(|| {
+                Error::Codec(
+                    "missing_payload_envelope: typed query result requires result_envelope"
+                        .to_string(),
+                )
+            })?;
+        decode_wire_avro_value(envelope, DEFAULT_CODEC)
+    }
+
+    async fn query_workflow_target<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: Option<&str>,
+        query_name: &str,
+        input: T,
+    ) -> Result<Value> {
+        let response = self
+            .query_workflow_response(workflow_id, run_id, query_name, input)
+            .await?;
+        if let Some(envelope) = response
+            .get("result_envelope")
+            .filter(|envelope| !envelope.is_null())
+        {
+            return decode_wire_value(envelope, DEFAULT_CODEC);
+        }
+
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    // Typed and JSON readers share route validation and HTTP refusal handling.
+    async fn query_workflow_response<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        run_id: Option<&str>,
+        query_name: &str,
+        input: T,
+    ) -> Result<Value> {
         let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
         let body = json!({"input": encode_typed_envelope(&input, DEFAULT_CODEC)?});
         let path = match run_id {
@@ -3768,70 +3811,7 @@ impl Client {
             }
             Err(error) => return Err(error),
         };
-
-        let envelope = response
-            .get("result_envelope")
-            .filter(|envelope| !envelope.is_null())
-            .ok_or_else(|| {
-                Error::Codec(
-                    "missing_payload_envelope: typed query result requires result_envelope"
-                        .to_string(),
-                )
-            })?;
-        decode_wire_avro_value(envelope, DEFAULT_CODEC)
-    }
-
-    async fn query_workflow_target<T: Serialize>(
-        &self,
-        workflow_id: &str,
-        run_id: Option<&str>,
-        query_name: &str,
-        input: T,
-    ) -> Result<Value> {
-        let input = normalize_avro_arguments(AvroValue::from_serialize(&input)?);
-        let input_envelope = encode_typed_envelope(&input, DEFAULT_CODEC)?;
-        let body = json!({
-            "input": input_envelope
-        });
-        let path = match run_id {
-            Some(run_id) => {
-                format!(
-                    "/workflows/{}/runs/{}/query/{}",
-                    path_segment("workflow_id", workflow_id)?,
-                    path_segment("run_id", run_id)?,
-                    path_segment("query_name", query_name)?,
-                )
-            }
-            None => format!(
-                "/workflows/{}/query/{}",
-                path_segment("workflow_id", workflow_id)?,
-                path_segment("query_name", query_name)?,
-            ),
-        };
-        let response: Value = match self
-            .request_json(
-                reqwest::Method::POST,
-                &path,
-                RequestProtocol::ControlPlane,
-                Some(&body),
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(Error::Http { status, body }) => {
-                return Err(Error::QueryFailed(query_failure(status, body)));
-            }
-            Err(error) => return Err(error),
-        };
-
-        if let Some(envelope) = response
-            .get("result_envelope")
-            .filter(|envelope| !envelope.is_null())
-        {
-            return decode_wire_value(envelope, DEFAULT_CODEC);
-        }
-
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        Ok(response)
     }
 
     /// Send a synchronous update using fixed Avro Value arguments.
