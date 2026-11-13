@@ -179,6 +179,16 @@ fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 impl CancellationRequest {
+    /// Why this request was delivered, derived from its canonical context.
+    ///
+    /// An observation without a canonical context is an ordinary request.
+    /// Both causes arrive through [`Error::CooperativeCancellationRequested`].
+    pub fn cause(&self) -> CancellationCause {
+        self.context
+            .as_ref()
+            .map_or(CancellationCause::Requested, CancellationContext::cause)
+    }
+
     pub(super) fn preserve_observation(&self, current: &Self) -> Result<Self> {
         self.validate_observation()?;
         current.validate_observation()?;
@@ -1769,6 +1779,11 @@ impl Client {
         run_id: Option<&str>,
         options: CooperativeCancellationOptions,
     ) -> Result<WorkflowCancellationRequest> {
+        let mut path = format!("/workflows/{}", path_segment("workflow_id", workflow_id)?);
+        if let Some(run_id) = run_id {
+            path.push_str(&format!("/runs/{}", path_segment("run_id", run_id)?));
+        }
+        path.push_str("/request-cancellation");
         if workflow_id.trim().is_empty() || run_id.is_some_and(|id| id.trim().is_empty()) {
             return Err(invalid(
                 "workflow and selected run identities must be non-empty",
@@ -1798,11 +1813,6 @@ impl Client {
                 )
                 .await?;
             require_discovery(&info)?;
-            let mut path = format!("/workflows/{}", percent_encode_path_segment(workflow_id));
-            if let Some(run_id) = run_id {
-                path.push_str(&format!("/runs/{}", percent_encode_path_segment(run_id)));
-            }
-            path.push_str("/request-cancellation");
             let response: Value = self
                 .request_json(
                     reqwest::Method::POST,

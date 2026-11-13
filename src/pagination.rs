@@ -6,7 +6,7 @@
 //! the Server's ordering and consistency contract; it is not a snapshot across
 //! concurrent changes. No new Server query fields or filter grammar are added.
 
-use crate::{percent_encode_path_segment, Client, HistoryEvent, RequestProtocol, Result, Value};
+use crate::{path_segment, Client, HistoryEvent, RequestProtocol, Result, Value};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -191,8 +191,8 @@ impl Client {
         let path = query_path(
             &format!(
                 "/workflows/{}/runs/{}/history",
-                percent_encode_path_segment(workflow_id),
-                percent_encode_path_segment(run_id)
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("run_id", run_id)?
             ),
             [
                 ("page_size", options.page_size.map(|n| n.to_string())),
