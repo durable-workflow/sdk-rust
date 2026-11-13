@@ -139,6 +139,39 @@ async fn completion_limits_consume_shared_negotiation_vectors() {
 }
 
 #[tokio::test]
+async fn completion_limits_refuse_invalid_vectors_even_without_inline_payloads() {
+    let vectors = vectors();
+    for case in vectors["negotiation_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["expected"] == "refuse_completion_planning_before_upload_or_submission")
+    {
+        let profile = format!("vector-{}", case["id"].as_str().unwrap());
+        for body in [
+            json!({"commands":[]}),
+            json!({"commands":[{"type":"start_timer", "timer_id":"timer", "delay_seconds":1}]}),
+            json!({"commands":[{"type":"schedule_activity", "arguments":{
+                "codec":"avro", "external_payload":reference("fixture")
+            }}]}),
+        ] {
+            let (server, client) = setup(&profile);
+            let error = send(&client, WORKFLOW, true, &body).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid workflow completion request limit"),
+                "{profile}: {error}"
+            );
+            assert_eq!(
+                server.captured_paths(),
+                [format!("/{profile}/api/cluster/info")]
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn completion_limits_leave_unsupported_raw_continuation_offload_unchanged() {
     let (server, client) = setup("available");
     let body = json!({"result":batch(1)["commands"][0]["arguments"],

@@ -168,17 +168,21 @@ impl Client {
                 payloads.push((path, blob.len()));
             }
         }
-        if payloads.is_empty() {
+        let workflow_completion = is_workflow_completion(path, protocol);
+        if payloads.is_empty() && !workflow_completion {
             return Ok(());
         }
         let policy = self.runtime_upload_policy(protocol).await?;
-        let completion_bytes = if is_workflow_completion(path, protocol) {
+        let completion_bytes = if workflow_completion {
             policy
                 .completion_request_bytes
                 .map_err(|()| unsupported("invalid workflow completion request limit"))?
         } else {
             None
         };
+        if payloads.is_empty() {
+            return Ok(());
+        }
         let request_bytes = completion_bytes.unwrap_or(policy.request_bytes);
         // Plan every replacement before any upload. Aggregate JSON size matters,
         // even when each individual value is below the namespace threshold.
