@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One synthetic legacy state cell; no physical upgrade or response-loss authority."""
+"""One named command-key acceptance cell, with separate evidence scopes."""
 import argparse
 import re
 import tomllib
@@ -21,6 +21,7 @@ SOURCE = Path(__file__).resolve().parent
 sys.path.insert(0, str(SOURCE))
 import sqlite_legacy as legacy
 import execution_guards as guards
+import response_loss
 
 
 
@@ -43,6 +44,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state', choices=['open', 'completed', 'continued'], default='open')
     parser.add_argument('--scenario', choices=['readback', 'two-rows', 'legacy-token', 'modern-raw', 'case-only'], default='readback')
+    parser.add_argument('--response-loss-fixture', type=Path,
+                        help='accepted shared proxy file; selects the separate postcommit-loss cell')
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--consumer-binary',type=Path,required=True)
     parser.add_argument('--consumer-lock',type=Path,required=True)
@@ -56,6 +59,8 @@ def main():
     options=parser.parse_args()
     if options.state != 'open' and options.scenario != 'readback':
         parser.error('ambiguity/case scenarios require their own open-state cell')
+    if options.response_loss_fixture is not None and (options.state != 'open' or options.scenario != 'readback'):
+        parser.error('postcommit loss uses its own open-state admissions without a legacy transform')
     if not __debug__:
         parser.error('run conformance assertions without Python optimization')
     if (not re.fullmatch(r'sha256:[0-9a-f]{64}',options.server_index)
@@ -75,6 +80,8 @@ def main():
     build, build_receipt_sha = guards.verify_build_receipt(
         options.build_receipt, SOURCE, options.consumer_binary, options.consumer_lock,
         sdk_version=options.sdk_version, sdk_sha256=options.sdk_sha256, sdk_source=options.sdk_source)
+    if options.response_loss_fixture is not None:
+        response_loss.fixture(options.response_loss_fixture)  # Refuse changed source before effects.
     image='ghcr.io/durable-workflow/server@'+options.server_index
     info=json.loads(capture('docker','image','inspect',image))[0]
     assert info['Config']['Labels']['org.opencontainers.image.revision']==options.server_source
@@ -131,9 +138,9 @@ def main():
         capture('docker','rm','-v',owned_id)
         owned_id=None
 
-    def invoke(args):
+    def invoke(args, base=None):
         env={'PATH':os.environ['PATH'],'TMPDIR':str(work),
-             'DURABLE_WORKFLOW_LOCAL_ISOLATED':'1','DURABLE_WORKFLOW_SERVER_URL':origin,
+             'DURABLE_WORKFLOW_LOCAL_ISOLATED':'1','DURABLE_WORKFLOW_SERVER_URL':base or origin,
              'DURABLE_WORKFLOW_AUTH_TOKEN':token}
         result=binary.run(input=json.dumps(args), env=env, timeout=20)
         return json.loads(result.stdout)
@@ -154,6 +161,22 @@ def main():
         ok({'op':'register','queue':queue,'null_update':True})
         workflow_type = 'keys.continue' if options.state == 'continued' else 'keys.wait'
         created=ok({'op':'start','workflow_type':workflow_type,'workflow_id':queue,'queue':queue,'input':[0]})
+        if options.response_loss_fixture is not None:
+            cell = response_loss.run(options.response_loss_fixture, origin, queue, created['run_id'],
+                                     invoke, lambda:snapshot(database/'source.sqlite'), work)
+            stop()
+            binary.check()
+            cell.update(outcome='pass', started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                server_source=options.server_source,server_index=options.server_index,
+                server_version=options.server_version,server_platform='linux/amd64',
+                sdk_version=options.sdk_version,sdk_sha256=options.sdk_sha256,sdk_source=options.sdk_source,
+                runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                loss_adapter_sha256=hashlib.sha256((SOURCE/'response_loss.py').read_bytes()).hexdigest(),
+                binary_sha256=binary.record['sha256'],build_receipt_sha256=build_receipt_sha,
+                build_subject=build['subject'],build_command=build['build_command'])
+            print(json.dumps(cell),flush=True)
+            return
         seed={};selections=[]
         caller_key = document['keys']['case_exact'] if options.scenario == 'case-only' else document['keys']['original']
         for kind,operation in [('signal','touch'),('update','mutate')]:
