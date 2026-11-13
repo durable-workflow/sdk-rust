@@ -276,7 +276,7 @@ jobs:
       - name: Disable APT download retries (CVE-2026-109518)
         run: echo 'Acquire::Retries "0";' | sudo tee /etc/apt/apt.conf.d/99-no-retries >/dev/null
       - name: Set up the fixed Composer client
-        uses: durable-workflow/.github/.github/actions/setup-php-linux@411a14ac07d32073eed6ab4977f2825eba4739a7  # reviewed Ubuntu24 PHP profile
+        uses: durable-workflow/.github/.github/actions/setup-php-linux@411a14ac07d32073eed6ab4977f2825eba4739a7  # bound-linux-php
         with:
           php-version: '8.3'
           ini-file: production
