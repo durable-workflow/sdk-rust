@@ -168,7 +168,9 @@ async fn published_logging_worker_entrypoint() {
     let kind = std::env::var(TYPE).unwrap();
     let phase = std::env::var(PHASE).unwrap();
     let capture = std::sync::Arc::new(Capture::default());
-    let handled = worker(client(), &queue, &kind, &phase)
+    let worker = worker(client(), &queue, &kind, &phase);
+    worker.register().await.unwrap();
+    let handled = worker
         .run_once()
         .with_subscriber(capture.clone())
         .await
