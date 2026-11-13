@@ -41,12 +41,16 @@ caller type, ID and label. Timestamp helpers return immutable UTC dates.
 
 ## Timeout cleanup cause
 
+This parser support is experimental. Service-mode timeout-cleanup admission
+and execution require the upstream Core/native implementation and separate
+published-artifact qualification.
+
 A run that opted in to deadline-triggered cleanup receives its timeout-cleanup
 interruption as an ordinary cooperative cancellation request whose context has
 the top-level `cause: "timeout"`. It arrives as
 `Error::CooperativeCancellationRequested`, so cancellation handlers such as saga
 compensation run for it unchanged, and the run still ends timed out.
-`request.cause` (and `CancellationContext::cause()`) is the discriminator:
+`request.cause()` (and `CancellationContext::cause()`) is the discriminator:
 `CancellationCause::Requested` for an ordinary request or
 `CancellationCause::Timeout`. The cleanup deadline is the request's existing
 `cleanup_deadline_at`; the timeout kind and work deadline are recorded on the

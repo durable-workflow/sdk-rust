@@ -131,12 +131,6 @@ pub struct CancellationRequest {
     pub cleanup_deadline_at: String,
     pub history_refresh_page_token: Option<String>,
     pub context: Option<CancellationContext>,
-    /// Why the request was delivered, read from the canonical context's
-    /// `cause`. A timeout-cleanup request arrives through the same
-    /// [`Error::CooperativeCancellationRequested`] as an ordinary one, so
-    /// existing handlers run for both; match on this to tell them apart.
-    /// `Requested` when no canonical context is known yet.
-    pub cause: CancellationCause,
 }
 
 /// Acknowledgment of a request targeting the current durable run.
@@ -185,6 +179,16 @@ fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 impl CancellationRequest {
+    /// Why this request was delivered, derived from its canonical context.
+    ///
+    /// An observation without a canonical context is an ordinary request.
+    /// Both causes arrive through [`Error::CooperativeCancellationRequested`].
+    pub fn cause(&self) -> CancellationCause {
+        self.context
+            .as_ref()
+            .map_or(CancellationCause::Requested, CancellationContext::cause)
+    }
+
     pub(super) fn preserve_observation(&self, current: &Self) -> Result<Self> {
         self.validate_observation()?;
         current.validate_observation()?;
@@ -226,7 +230,6 @@ impl CancellationRequest {
             cleanup_deadline_at: cleanup_deadline_at.to_owned(),
             history_refresh_page_token: Some(text(value, "history_refresh_page_token")?.to_owned()),
             context: None,
-            cause: CancellationCause::Requested,
         })
     }
 }
@@ -508,7 +511,6 @@ impl CancellationHistory {
         let mut state = Self {
             request: observation.cloned().map(|mut request| {
                 request.context = None;
-                request.cause = CancellationCause::Requested;
                 request
             }),
             delivery: None,
@@ -597,9 +599,6 @@ impl CancellationHistory {
                     }
                 }
                 if context.is_some() || observation.is_none() {
-                    let cause = context
-                        .as_ref()
-                        .map_or(CancellationCause::Requested, CancellationContext::cause);
                     state.request = Some(CancellationRequest {
                         request_id: request_id.to_owned(),
                         requested_at: context.as_ref().map_or_else(
@@ -614,7 +613,6 @@ impl CancellationHistory {
                         history_refresh_page_token: observation
                             .and_then(|request| request.history_refresh_page_token.clone()),
                         context,
-                        cause,
                     });
                 }
                 state.request_index = index;

@@ -68,3 +68,27 @@ fn tasks_remain_constructible_with_explicit_absent_optional_metadata() {
     assert_eq!(workflow.payload_codec, activity.payload_codec);
     assert_eq!(activity.payload_codec, query.payload_codec);
 }
+
+#[test]
+fn cancellation_request_keeps_its_existing_literal_and_exhaustive_pattern() {
+    use durable_workflow::{CancellationCause, CancellationRequest};
+    let request = CancellationRequest {
+        request_id: "request-1".into(),
+        requested_at: "2026-10-01T00:00:00Z".into(),
+        cleanup_deadline_at: "2026-10-01T00:00:30Z".into(),
+        history_refresh_page_token: None,
+        context: None,
+    };
+    assert_eq!(request.cause(), CancellationCause::Requested);
+    let CancellationRequest {
+        request_id,
+        requested_at,
+        cleanup_deadline_at,
+        history_refresh_page_token,
+        context,
+    } = request;
+    assert_eq!(request_id, "request-1");
+    assert_ne!(requested_at, cleanup_deadline_at);
+    assert!(history_refresh_page_token.is_none());
+    assert!(context.is_none());
+}

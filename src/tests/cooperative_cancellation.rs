@@ -5786,13 +5786,14 @@ fn cancellation_cause_timeout_reaches_an_existing_cooperative_cancellation_arm()
         else {
             panic!("a timeout cleanup request is a cooperative cancellation request");
         };
-        assert_eq!(cancelled.request.cause, CancellationCause::Timeout);
+        assert_eq!(cancelled.request.cause(), CancellationCause::Timeout);
         assert_eq!(
             cancelled.request.cleanup_deadline_at,
             "2026-10-01T00:00:30.123456Z"
         );
+        let cause = cancelled.request.cause();
         let context = cancelled.request.context.unwrap();
-        assert_eq!(context.cause(), cancelled.request.cause);
+        assert_eq!(context.cause(), cause);
         assert!(ctx.cancellation_context()?.unwrap().is_timeout());
         Ok(context.to_value())
     });
@@ -5818,13 +5819,13 @@ fn cancellation_cause_ordinary_delivery_and_observation_stay_requested() {
         else {
             panic!("expected delivery");
         };
-        assert_eq!(cancelled.request.cause, CancellationCause::Requested);
+        assert_eq!(cancelled.request.cause(), CancellationCause::Requested);
         Ok(Value::Null)
     });
     worker
         .execute_workflow_task(context_task(vec![context_request(), context_delivery()]))
         .unwrap();
-    assert_eq!(context_observation().cause, CancellationCause::Requested);
+    assert_eq!(context_observation().cause(), CancellationCause::Requested);
 }
 
 #[test]
@@ -5853,5 +5854,5 @@ fn cancellation_cause_delivery_cannot_add_or_drop_the_timeout_cause() {
         None,
     )
     .unwrap();
-    assert!(history.request.unwrap().cause.is_timeout());
+    assert!(history.request.unwrap().cause().is_timeout());
 }
