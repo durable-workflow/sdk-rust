@@ -677,6 +677,31 @@ Server's whitespace/NUL trimming applied to the observed outcome. The final requ
 check never rewrites already observed local messages or unrelated business
 payloads; if those fixed inputs cannot fit, reporting refuses explicitly.
 
+### Workflow task completion size
+
+A workflow task's commands travel to the Server in one completion request.
+Native Server 3.6.0 and later accept a completion up to 16 times the
+per-payload limit (`DW_MAX_PAYLOAD_BYTES`, 2 MiB by default, so 32 MiB), while
+each command's arguments must still fit the per-payload limit. A larger
+completion, usually a very large fan-out, is refused with HTTP 413,
+`reason: "payload_too_large"` and `limit_kind: "workflow_task_completion_bytes"`.
+
+The SDK treats that refusal as a structural limit, not a transient error. It
+never resends the oversized completion. `Client::complete_workflow_task` returns
+`Error::WorkflowTaskCompletionTooLarge`, which carries the Server's `limit`, the
+encoded request `size` the SDK sent, and the Server's message. A `Worker`
+completes the same task once with a non-retryable `fail_workflow` command whose
+message starts with `Structural limit exceeded: workflow_task_completion_bytes:`
+and names both sizes, so the run fails with failure category
+`structural_limit` instead of retrying the task forever or parking the run. The
+failure's exception properties record `structural_limit_kind`,
+`structural_limit_value` (the request size) and `structural_limit_configured`
+(the limit). Other 413 responses and 5xx responses are unchanged.
+
+To stay under the limit, split the fan-out into smaller batches across workflow
+tasks, move groups of work into child workflows, or continue as new; offload
+large payloads with external payload storage.
+
 ### Local activities
 
 Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.

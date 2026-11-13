@@ -314,6 +314,11 @@ pub enum Error {
     QueryFailed(QueryFailure),
     #[error(transparent)]
     Protocol(ProtocolFailure),
+    /// The Server refused a workflow-task completion as larger than its
+    /// aggregate completion limit. Never retried; see
+    /// [`WorkflowTaskCompletionTooLarge`].
+    #[error(transparent)]
+    WorkflowTaskCompletionTooLarge(WorkflowTaskCompletionTooLarge),
     #[error(transparent)]
     NonDeterministicReplay(ReplayFailure),
     #[error(transparent)]
@@ -2251,6 +2256,52 @@ pub struct ProtocolFailure {
     pub supported_version: Option<String>,
     pub requested_version: Option<String>,
     pub body: Value,
+}
+
+/// The `limit_kind` a native Server (3.6.0 or later) reports when it refuses a
+/// workflow-task completion body as too large.
+pub const WORKFLOW_TASK_COMPLETION_BYTES_LIMIT_KIND: &str = "workflow_task_completion_bytes";
+
+/// A workflow-task completion the Server refused as larger than its aggregate
+/// completion limit (HTTP 413, `reason: "payload_too_large"`,
+/// `limit_kind: "workflow_task_completion_bytes"`).
+///
+/// Native Server 3.6.0 accepts a completion with commands up to 16 times the
+/// per-payload limit (32 MiB by default); each command's arguments must still
+/// meet the per-payload limit. The refusal is deterministic: running the same
+/// workflow task again produces the same completion, so the SDK never resends it. `limit`
+/// is the Server's limit in bytes when it reports one, and `size` is the
+/// encoded request body the SDK sent. A [`Worker`] answers the refusal by
+/// completing the same task once with a non-retryable `fail_workflow` command
+/// whose message starts with `Structural limit exceeded:`, so the run fails
+/// with failure category `structural_limit` instead of retrying the task or
+/// parking the run. Split the fan-out into smaller batches, move work into child
+/// workflows, or continue as new; offload large payloads with external payload
+/// storage.
+#[derive(Clone, Debug, Error)]
+pub struct WorkflowTaskCompletionTooLarge {
+    pub status: u16,
+    pub limit_kind: String,
+    pub limit: Option<u64>,
+    pub size: u64,
+    pub message: String,
+    pub body: Value,
+}
+
+impl std::fmt::Display for WorkflowTaskCompletionTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Structural limit exceeded: {}: the workflow task completion is {} bytes, over the server limit",
+            self.limit_kind, self.size
+        )?;
+        if let Some(limit) = self.limit {
+            write!(formatter, " of {limit} bytes")?;
+        }
+        formatter.write_str(
+            ". Split the fan-out into smaller batches, move work into child workflows, or continue-as-new; offload large payloads with external payload storage.",
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -5170,6 +5221,10 @@ impl Client {
                 .and_then(|body| body.get("poll_request_id")?.as_str().map(str::to_owned))
                 .unwrap_or_default()
         });
+        let request_bytes = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .map_or(0, |body| body.len() as u64);
         let mut storage_retries = 0_usize;
         let mut deferred_workflow_completion = false;
 
@@ -5217,6 +5272,12 @@ impl Client {
                 let body = String::from_utf8_lossy(&bytes).to_string();
                 if let Some(protocol) = protocol_failure(status, &body) {
                     return Err(Error::Protocol(protocol));
+                }
+                // A typed oversized completion is deterministic: never resend it.
+                if let Some(refusal) =
+                    workflow_task_completion_too_large(status, &body, request_bytes)
+                {
+                    return Err(Error::WorkflowTaskCompletionTooLarge(refusal));
                 }
                 let error = Error::Http { status, body };
                 deferred_workflow_completion |= worker_deferred_workflow_completion_retry_after(
@@ -5680,6 +5741,35 @@ fn run_closed_receipt_is_terminal(body: &Value) -> bool {
     };
     body.get("stop_reason").and_then(Value::as_str) == Some(stop_reason)
         && body.get("can_continue").and_then(Value::as_bool) == Some(false)
+}
+
+fn workflow_task_completion_too_large(
+    status: reqwest::StatusCode,
+    raw_body: &str,
+    size: u64,
+) -> Option<WorkflowTaskCompletionTooLarge> {
+    if status != reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        return None;
+    }
+    let body: Value = serde_json::from_str(raw_body).ok()?;
+    if body.get("reason").and_then(Value::as_str) != Some("payload_too_large")
+        || body.get("limit_kind").and_then(Value::as_str)
+            != Some(WORKFLOW_TASK_COMPLETION_BYTES_LIMIT_KIND)
+    {
+        return None;
+    }
+    Some(WorkflowTaskCompletionTooLarge {
+        status: status.as_u16(),
+        limit_kind: WORKFLOW_TASK_COMPLETION_BYTES_LIMIT_KIND.to_string(),
+        limit: body.get("limit").and_then(Value::as_u64),
+        size,
+        message: body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        body,
+    })
 }
 
 fn protocol_failure(status: reqwest::StatusCode, raw_body: &str) -> Option<ProtocolFailure> {
@@ -8943,6 +9033,15 @@ impl Worker {
     /// Direct callers of [`Client::complete_workflow_task`] and
     /// [`Client::fail_workflow_task`] continue to receive the original
     /// [`Error::Http`] status and response body.
+    ///
+    /// A completion the Server refuses as larger than its aggregate completion
+    /// limit (native Server 3.6.0: HTTP 413 with
+    /// `limit_kind: "workflow_task_completion_bytes"`) is never resent. The
+    /// worker completes the same task once with a non-retryable `fail_workflow`
+    /// command whose message starts with `Structural limit exceeded:`, so the
+    /// run fails with failure category `structural_limit`. Direct callers of
+    /// [`Client::complete_workflow_task`] receive
+    /// [`Error::WorkflowTaskCompletionTooLarge`] for that refusal.
     pub async fn run_once(&self) -> Result<usize> {
         self.validate_registration()?;
         if self.client.worker_sessions_enabled {
@@ -9052,6 +9151,54 @@ impl Worker {
         settled
     }
 
+    /// Answer a typed oversized-completion refusal (Server 3.6.0
+    /// `workflow_task_completion_bytes`) without resending the completion:
+    /// complete the same task once with a non-retryable structural-limit
+    /// `fail_workflow` command. A failed task would be retried into the same
+    /// refusal, or park the run. If this small completion is not recorded
+    /// either, the original refusal is returned (or the report's settled
+    /// receipt), and nothing is resent.
+    async fn fail_oversized_workflow_task(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        attempt: u64,
+        run_id: Option<&str>,
+        refusal: WorkflowTaskCompletionTooLarge,
+    ) -> Result<Value> {
+        let error = Error::WorkflowTaskCompletionTooLarge(refusal);
+        tracing::warn!(
+            target: "durable_workflow::worker",
+            task_id,
+            workflow_task_attempt = attempt,
+            run_id,
+            error = %error,
+            "the Server refused the workflow task completion as too large; failing the run with a structural-limit failure"
+        );
+        let command = workflow_failure_command(&error, None);
+        match self
+            .client
+            .complete_workflow_task(task_id, lease_owner, attempt, vec![command])
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(report) if workflow_task_report_is_settled(&report, task_id, attempt, run_id) => {
+                Err(report)
+            }
+            Err(report) => {
+                tracing::warn!(
+                    target: "durable_workflow::worker",
+                    task_id,
+                    workflow_task_attempt = attempt,
+                    run_id,
+                    error = %report,
+                    "the structural-limit workflow failure was not recorded"
+                );
+                Err(error)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn settle_workflow_task_decision(
         &self,
@@ -9104,7 +9251,8 @@ impl Worker {
             }
             Ok(decision) => {
                 let sticky_claim = self.sticky_claim(snapshot.as_ref(), &decision.commands)?;
-                self.client
+                match self
+                    .client
                     .complete_workflow_task_with_message_streams(
                         task_id,
                         lease_owner,
@@ -9115,6 +9263,21 @@ impl Worker {
                         sticky_claim,
                     )
                     .await
+                {
+                    Err(Error::WorkflowTaskCompletionTooLarge(refusal)) => {
+                        // The refused commands were never recorded.
+                        self.discard_sticky_snapshot(snapshot.as_ref())?;
+                        self.fail_oversized_workflow_task(
+                            task_id,
+                            lease_owner,
+                            attempt,
+                            run_id,
+                            refusal,
+                        )
+                        .await
+                    }
+                    reported => reported,
+                }
             }
             Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
             Err(error @ Error::FailureReporting(_)) => {
@@ -18977,6 +19140,16 @@ fn workflow_failure_command(
             "durable_workflow::Error",
             Value::Null,
         ),
+        Error::WorkflowTaskCompletionTooLarge(refusal) => (
+            "StructuralLimitExceeded",
+            "durable_workflow::WorkflowTaskCompletionTooLarge",
+            json!({
+                "structural_limit_kind": refusal.limit_kind,
+                "structural_limit_value": refusal.size,
+                "structural_limit_configured": refusal.limit,
+                "server_message": refusal.message,
+            }),
+        ),
         _ => ("RustWorkflowError", "durable_workflow::Error", Value::Null),
     };
     let non_retryable = match error {
@@ -18990,6 +19163,7 @@ fn workflow_failure_command(
         | Error::CooperativeCancellationRequested(_)
         | Error::CancellationScopeRequested(_) => true,
         Error::NonDeterministicReplay(_) => true,
+        Error::WorkflowTaskCompletionTooLarge(_) => true,
         _ => false,
     };
 
@@ -31185,6 +31359,212 @@ mod tests {
                     "{surface}: {name}: {error}"
                 );
             }
+        }
+    }
+
+    // durable-workflow/.github#228: native Server 3.6.0 refuses a completion
+    // over its aggregate limit with a typed 413.
+    fn completion_size_refusal(
+        path: &str,
+        _body: &str,
+        request: usize,
+    ) -> Option<(&'static str, String)> {
+        let typed = json!({"message":"Workflow task completion exceeds the maximum allowed size of 33554432 bytes. Each command's arguments may be up to 2097152 bytes; offload larger payloads or split the work across workflow tasks.",
+            "reason":"payload_too_large","limit":33_554_432,"limit_kind":"workflow_task_completion_bytes",
+            "protocol_version":"1.20","server_capabilities":{}});
+        let recorded = json!({"outcome":"completed","recorded":true}).to_string();
+        match (path, request) {
+            ("/api/worker/workflow-tasks/typed-413/complete", 1)
+            | ("/api/worker/workflow-tasks/typed-413-unrecorded/complete", 1) => {
+                Some(("413 Payload Too Large", typed.to_string()))
+            }
+            ("/api/worker/workflow-tasks/typed-413/complete", _) => Some(("200 OK", recorded)),
+            ("/api/worker/workflow-tasks/typed-413-unrecorded/complete", _) => Some((
+                "500 Internal Server Error",
+                json!({"message":"fixture"}).to_string(),
+            )),
+            ("/api/worker/workflow-tasks/plain-413/complete", _) => Some((
+                "413 Payload Too Large",
+                json!({"message":"Request payload exceeds the maximum allowed size of 2097152 bytes.",
+                    "reason":"payload_too_large","limit":2_097_152}).to_string(),
+            )),
+            ("/api/worker/workflow-tasks/other-kind-413/complete", _) => {
+                let mut other = typed.clone();
+                other["limit_kind"] = json!("payload_size_bytes");
+                Some(("413 Payload Too Large", other.to_string()))
+            }
+            ("/api/worker/workflow-tasks/server-503/complete", _) => Some((
+                "503 Service Unavailable",
+                json!({"message":"fixture"}).to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn fan_out_commands() -> Vec<Value> {
+        (0..10)
+            .map(|index| {
+                json!({"type":"schedule_activity","activity_type":"fan.out",
+                    "arguments":fixture_envelope(json!([index, "x".repeat(1024)]))})
+            })
+            .collect()
+    }
+
+    fn completion_size_worker() -> (MockWorkerServer, Worker) {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(completion_size_refusal),
+            ..MockWorkerBehavior::default()
+        });
+        let client = Client::builder(server.base_url())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        (server, Worker::new(client, "rust-workers"))
+    }
+
+    #[tokio::test]
+    async fn typed_completion_size_refusal_is_a_typed_error_and_is_not_resent() {
+        let (server, worker) = completion_size_worker();
+        let error = worker
+            .client
+            .complete_workflow_task("typed-413", "fan-worker", 2, fan_out_commands())
+            .await
+            .expect_err("the typed 413 is an error");
+        let path = "/api/worker/workflow-tasks/typed-413/complete";
+        let sent = server.request_bodies(path);
+        assert_eq!(sent.len(), 1, "the oversized completion is sent once");
+        let Error::WorkflowTaskCompletionTooLarge(refusal) = &error else {
+            panic!("expected a typed completion size refusal, got {error:?}");
+        };
+        assert_eq!(refusal.status, 413);
+        assert_eq!(refusal.limit_kind, "workflow_task_completion_bytes");
+        assert_eq!(refusal.limit, Some(33_554_432));
+        assert_eq!(refusal.size, sent[0].to_string().len() as u64);
+        assert!(refusal
+            .message
+            .starts_with("Workflow task completion exceeds"));
+        let text = error.to_string();
+        assert!(
+            text.starts_with("Structural limit exceeded: workflow_task_completion_bytes:"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("is {} bytes", refusal.size)),
+            "{text}"
+        );
+        assert!(text.contains("server limit of 33554432 bytes"), "{text}");
+        assert!(text.contains("child workflows"), "{text}");
+        assert!(!worker_operation_is_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn managed_worker_fails_the_run_once_on_a_typed_completion_size_refusal() {
+        let (server, worker) = completion_size_worker();
+        let outcome = worker
+            .settle_workflow_task_decision(
+                "typed-413",
+                "fan-worker",
+                2,
+                Some("fan-run"),
+                Ok(WorkflowTaskDecision::without_message_streams(
+                    fan_out_commands(),
+                )),
+                false,
+                None,
+            )
+            .await
+            .expect("the structural-limit failure settles the task");
+        assert!(matches!(outcome, ManagedPollOutcome::Handled));
+        let sent = server.request_bodies("/api/worker/workflow-tasks/typed-413/complete");
+        assert_eq!(sent.len(), 2, "one oversized completion, then one failure");
+        assert_eq!(sent[0]["commands"].as_array().unwrap().len(), 10);
+        let size = sent[0].to_string().len();
+        assert_eq!(sent[1]["lease_owner"], "fan-worker");
+        assert_eq!(sent[1]["workflow_task_attempt"], 2);
+        let commands = sent[1]["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1, "the oversized commands are not resent");
+        let failure = &commands[0];
+        assert_eq!(failure["type"], "fail_workflow");
+        assert_eq!(failure["non_retryable"], true);
+        assert_eq!(failure["exception_type"], "StructuralLimitExceeded");
+        let message = failure["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("Structural limit exceeded: workflow_task_completion_bytes:"),
+            "{message}"
+        );
+        assert!(message.contains(&format!("is {size} bytes")), "{message}");
+        assert!(message.contains("33554432 bytes"), "{message}");
+        let properties = &failure["exception"]["properties"];
+        assert_eq!(
+            properties["structural_limit_kind"],
+            "workflow_task_completion_bytes"
+        );
+        assert_eq!(properties["structural_limit_value"], size);
+        assert_eq!(properties["structural_limit_configured"], 33_554_432);
+        assert_eq!(
+            server.request_count("/api/worker/workflow-tasks/typed-413/fail"),
+            0,
+            "a failed task would be retried into the same refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worker_keeps_the_typed_refusal_when_the_failure_is_not_recorded() {
+        let (server, worker) = completion_size_worker();
+        let error = worker
+            .settle_workflow_task_decision(
+                "typed-413-unrecorded",
+                "fan-worker",
+                2,
+                Some("fan-run"),
+                Ok(WorkflowTaskDecision::without_message_streams(
+                    fan_out_commands(),
+                )),
+                false,
+                None,
+            )
+            .await
+            .expect_err("an unrecorded failure stays an error");
+        assert!(
+            matches!(error, Error::WorkflowTaskCompletionTooLarge(_)),
+            "{error:?}"
+        );
+        let sent =
+            server.request_bodies("/api/worker/workflow-tasks/typed-413-unrecorded/complete");
+        assert_eq!(sent.len(), 2, "no resend and no retry loop");
+        assert_eq!(sent[1]["commands"][0]["type"], "fail_workflow");
+    }
+
+    #[tokio::test]
+    async fn managed_worker_leaves_other_413_and_5xx_completion_refusals_unchanged() {
+        for (task, status) in [
+            ("plain-413", reqwest::StatusCode::PAYLOAD_TOO_LARGE),
+            ("other-kind-413", reqwest::StatusCode::PAYLOAD_TOO_LARGE),
+            ("server-503", reqwest::StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let (server, worker) = completion_size_worker();
+            let error = worker
+                .settle_workflow_task_decision(
+                    task,
+                    "fan-worker",
+                    2,
+                    Some("fan-run"),
+                    Ok(WorkflowTaskDecision::without_message_streams(
+                        fan_out_commands(),
+                    )),
+                    false,
+                    None,
+                )
+                .await
+                .expect_err("the refusal remains an error");
+            assert!(
+                matches!(&error, Error::Http { status: observed, .. } if *observed == status),
+                "{task}: {error:?}"
+            );
+            let sent =
+                server.request_bodies(&format!("/api/worker/workflow-tasks/{task}/complete"));
+            assert_eq!(sent.len(), 1, "{task}");
+            assert_eq!(sent[0]["commands"].as_array().unwrap().len(), 10, "{task}");
         }
     }
 
