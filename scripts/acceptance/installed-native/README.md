@@ -44,6 +44,28 @@ It does the following:
 `check_history.py` verifies each cell's durable history through the runtime's
 public HTTP API, independently of the SDK under test.
 
+### Completion-limit feature acceptance
+
+`tests/completion_limits_server.rs` exercises the planner fix separately from
+the lifecycle cells. Use an isolated published Server with the default limits,
+no payload store and explicit `limits.max_workflow_task_completion_bytes`.
+The test refuses other producers. Set the same fixture environment variables
+as the metrics qualifier, including `DURABLE_WORKFLOW_LOCAL_ISOLATED=1` and a
+loopback `DURABLE_WORKFLOW_SERVER_URL`, then run:
+
+```sh
+cargo test --locked --all-features --test completion_limits_server -- --ignored --nocapture
+```
+
+For published acceptance, copy this test and its
+`fixtures/workflow-task-completion-limits-v1-vectors.json` into a fresh consumer
+whose dependency pins the exact registry crate, with no source patch. It checks
+300 × 10 KB inline arguments, an over-limit batch's structural failure with no
+partially scheduled activities, and another workflow on the same worker.
+Record the package checksum, Server digest, runner commit and cleanup alongside
+the result. Compiling the ignored test or using source dependencies is not
+published-artifact acceptance.
+
 ## Run
 
 Fetch tags first (`git fetch --tags origin`), then run:

@@ -4,10 +4,30 @@ use super::*;
 const WORKFLOW: &str = "/worker/workflow-tasks/test/complete";
 const CONTINUATION: &str = "/worker/activity-tasks/test/continuation/complete";
 
+fn vectors() -> Value {
+    // Server e69df7c37d675681ca301b9eedc2398bc1a3ac18, #1136/#1203.
+    serde_json::from_str(include_str!(
+        "../../tests/fixtures/workflow-task-completion-limits-v1-vectors.json"
+    ))
+    .unwrap()
+}
+
 fn responses(path: &str, body: &str, _number: usize) -> Option<(&'static str, String)> {
     let profile = path.split('/').nth(1).unwrap_or_default();
     if path.ends_with("/api/cluster/info") {
         let mut info = policy();
+        if let Some(id) = profile.strip_prefix("vector-") {
+            let vectors = vectors();
+            let case = vectors["negotiation_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["id"] == id)
+                .unwrap();
+            info["limits"] = case["limits"].clone();
+            info["namespace"]["external_payload_storage"] = json!({"status":"unconfigured"});
+            return Some(("200 OK", info.to_string()));
+        }
         let limit = match profile {
             "null" => Value::Null,
             "zero" => json!(0),
@@ -39,6 +59,16 @@ fn responses(path: &str, body: &str, _number: usize) -> Option<(&'static str, St
         }
         return Some(("200 OK", info.to_string()));
     }
+    if profile == "vector-positive-smaller" {
+        return Some((
+            "413 Payload Too Large",
+            json!({
+                "reason":"payload_too_large", "limit_kind":"workflow_task_completion_bytes",
+                "limit":1024
+            })
+            .to_string(),
+        ));
+    }
     if path.ends_with("/api/external-payloads/v1") {
         return Some((
             "201 Created",
@@ -63,6 +93,65 @@ fn responses(path: &str, body: &str, _number: usize) -> Option<(&'static str, St
         "200 OK",
         json!({"outcome":"completed","recorded":true}).to_string(),
     ))
+}
+
+#[tokio::test]
+async fn completion_limits_consume_shared_negotiation_vectors() {
+    let vectors = vectors();
+    for case in vectors["negotiation_cases"].as_array().unwrap() {
+        let profile = format!("vector-{}", case["id"].as_str().unwrap());
+        let (server, client) = setup(&profile);
+        let body = batch(3);
+        let outcome = send(&client, WORKFLOW, true, &body).await;
+        match case["expected"].as_str().unwrap() {
+            "ordinary_fallback" => {
+                outcome.unwrap();
+            }
+            "completion_cap"
+                if body.to_string().len() as u64 <= case["completion_cap"].as_u64().unwrap() =>
+            {
+                outcome.unwrap();
+            }
+            "completion_cap" => {
+                let Error::WorkflowTaskCompletionTooLarge(refusal) = outcome.unwrap_err() else {
+                    panic!("{profile}");
+                };
+                assert_eq!(refusal.limit, case["completion_cap"].as_u64());
+                assert_eq!(refusal.size, body.to_string().len() as u64);
+            }
+            "refuse_completion_planning_before_upload_or_submission" => {
+                assert!(outcome
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid workflow completion request limit"));
+                assert_eq!(
+                    server.captured_paths(),
+                    [format!("/{profile}/api/cluster/info")]
+                );
+            }
+            expected => panic!("unknown vector outcome {expected}"),
+        }
+        assert_eq!(
+            server.request_count(&format!("/{profile}/api/external-payloads/v1")),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn completion_limits_leave_unsupported_raw_continuation_offload_unchanged() {
+    let (server, client) = setup("available");
+    let body = json!({"result":batch(1)["commands"][0]["arguments"],
+        "continuation":{"commands":batch(8)["commands"]}});
+    send(&client, CONTINUATION, true, &body).await.unwrap();
+    assert_eq!(
+        server.captured_paths(),
+        [format!("/available/api{CONTINUATION}")]
+    );
+    assert_eq!(
+        server.request_body(&format!("/available/api{CONTINUATION}")),
+        body
+    );
 }
 
 fn setup(profile: &str) -> (MockWorkerServer, Client) {
@@ -102,18 +191,17 @@ async fn completion_limits_preserve_inline_atomic_batches_without_storage() {
     let body = batch(3);
     assert!(body.to_string().len() > 2048 && body.to_string().len() < 8192);
     for profile in ["unconfigured", "disabled", "unsupported"] {
-        for path in [WORKFLOW, CONTINUATION] {
-            let (server, client) = setup(profile);
-            send(&client, path, true, &body).await.unwrap();
-            assert_eq!(
-                server.request_bodies(&format!("/{profile}/api{path}")),
-                [body.clone()]
-            );
-            assert_eq!(
-                server.request_count(&format!("/{profile}/api/external-payloads/v1")),
-                0
-            );
-        }
+        let path = WORKFLOW;
+        let (server, client) = setup(profile);
+        send(&client, path, true, &body).await.unwrap();
+        assert_eq!(
+            server.request_bodies(&format!("/{profile}/api{path}")),
+            [body.clone()]
+        );
+        assert_eq!(
+            server.request_count(&format!("/{profile}/api/external-payloads/v1")),
+            0
+        );
     }
 }
 
@@ -143,20 +231,19 @@ async fn completion_limits_validate_explicit_values_only_on_completion_routes() 
     for profile in [
         "null", "zero", "negative", "fraction", "string", "boolean", "list", "object",
     ] {
-        for path in [WORKFLOW, CONTINUATION] {
-            let (server, client) = setup(profile);
-            let error = send(&client, path, true, &batch(3)).await.unwrap_err();
-            assert!(
-                error.to_string().contains(
-                    "external_payload_unsupported: invalid workflow completion request limit"
-                ),
-                "{profile} {path}: {error}"
-            );
-            assert_eq!(
-                server.captured_paths(),
-                [format!("/{profile}/api/cluster/info")]
-            );
-        }
+        let path = WORKFLOW;
+        let (server, client) = setup(profile);
+        let error = send(&client, path, true, &batch(3)).await.unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "external_payload_unsupported: invalid workflow completion request limit"
+            ),
+            "{profile} {path}: {error}"
+        );
+        assert_eq!(
+            server.captured_paths(),
+            [format!("/{profile}/api/cluster/info")]
+        );
         let (server, client) = setup(profile);
         let body = json!({"input":encode_value_envelope(&Value::Null, DEFAULT_CODEC).unwrap()});
         send(&client, "/workflows", false, &body).await.unwrap();
@@ -196,40 +283,39 @@ async fn completion_limits_do_not_enlarge_ordinary_or_failure_requests() {
 
 #[tokio::test]
 async fn completion_limits_use_explicit_smaller_caps_and_plan_uploads_before_effects() {
-    for path in [WORKFLOW, CONTINUATION] {
-        let (server, client) = setup("available");
-        send(&client, path, true, &batch(3)).await.unwrap();
-        assert_eq!(
-            server.request_count("/available/api/external-payloads/v1"),
-            0
-        );
-        send(&client, path, true, &batch(8)).await.unwrap();
-        assert!(server.request_count("/available/api/external-payloads/v1") > 0);
-        assert!(
-            server.request_bodies(&format!("/available/api{path}"))[1]
-                .to_string()
-                .len()
-                <= 8192
-        );
+    let path = WORKFLOW;
+    let (server, client) = setup("available");
+    send(&client, path, true, &batch(3)).await.unwrap();
+    assert_eq!(
+        server.request_count("/available/api/external-payloads/v1"),
+        0
+    );
+    send(&client, path, true, &batch(8)).await.unwrap();
+    assert!(server.request_count("/available/api/external-payloads/v1") > 0);
+    assert!(
+        server.request_bodies(&format!("/available/api{path}"))[1]
+            .to_string()
+            .len()
+            <= 8192
+    );
 
-        let (server, client) = setup("small");
-        send(&client, path, true, &batch(1)).await.unwrap();
-        assert_eq!(server.request_count("/small/api/external-payloads/v1"), 1);
-        assert!(
-            server
-                .request_body(&format!("/small/api{path}"))
-                .to_string()
-                .len()
-                <= 1024
-        );
-        let body = json!({"commands":batch(3)["commands"], "metadata":"x".repeat(1500)});
-        let before = server.request_count("/small/api/external-payloads/v1");
-        assert!(send(&client, path, true, &body).await.is_err());
-        assert_eq!(
-            server.request_count("/small/api/external-payloads/v1"),
-            before
-        );
-    }
+    let (server, client) = setup("small");
+    send(&client, path, true, &batch(1)).await.unwrap();
+    assert_eq!(server.request_count("/small/api/external-payloads/v1"), 1);
+    assert!(
+        server
+            .request_body(&format!("/small/api{path}"))
+            .to_string()
+            .len()
+            <= 1024
+    );
+    let body = json!({"commands":batch(3)["commands"], "metadata":"x".repeat(1500)});
+    let before = server.request_count("/small/api/external-payloads/v1");
+    assert!(send(&client, path, true, &body).await.is_err());
+    assert_eq!(
+        server.request_count("/small/api/external-payloads/v1"),
+        before
+    );
 }
 
 #[tokio::test]

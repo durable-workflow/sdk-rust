@@ -172,7 +172,7 @@ impl Client {
             return Ok(());
         }
         let policy = self.runtime_upload_policy(protocol).await?;
-        let completion_bytes = if is_command_completion(path, protocol) {
+        let completion_bytes = if is_workflow_completion(path, protocol) {
             policy
                 .completion_request_bytes
                 .map_err(|()| unsupported("invalid workflow completion request limit"))?
@@ -541,7 +541,7 @@ fn replace(body: &mut Value, path: &str, reference: Value) -> Result<()> {
     Ok(())
 }
 
-fn is_command_completion(path: &str, protocol: RequestProtocol) -> bool {
+fn is_workflow_completion(path: &str, protocol: RequestProtocol) -> bool {
     if !matches!(
         protocol,
         RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
@@ -552,7 +552,7 @@ fn is_command_completion(path: &str, protocol: RequestProtocol) -> bool {
     let parts: Vec<_> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
     matches!(parts.as_slice(),
         ["worker", "workflow-tasks", task, "complete"]
-        | ["worker", "activity-tasks", task, "continuation", "complete"] if !task.is_empty())
+        if !task.is_empty())
 }
 
 // Only protocol-owned slots are eligible; arbitrary application maps are not envelopes.
@@ -565,8 +565,7 @@ fn payload_paths(body: &Value, path: &str, protocol: RequestProtocol) -> Vec<Str
         RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
     ) {
         match parts.as_slice() {
-            ["worker", "workflow-tasks", _, "complete"]
-            | ["worker", "activity-tasks", _, "continuation", "complete"] => {
+            ["worker", "workflow-tasks", _, "complete"] => {
                 for (index, command) in body["commands"]
                     .as_array()
                     .into_iter()
