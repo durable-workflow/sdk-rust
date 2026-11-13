@@ -2,6 +2,8 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -34,6 +36,28 @@ class PhysicalUpgradeTest(unittest.TestCase):
 
     def test_only_declared_version_journal_and_empty_intent_catalog_accept(self):
         self.validate(self.after)
+
+    def test_another_well_formed_handoff_sha_refuses_before_input_or_runtime_effects(self):
+        self.assertEqual(self.profile,physical.require_handoff(self.profile['producer_manifest_commit']))
+        with self.assertRaisesRegex(ValueError,'handoff commit'):
+            physical.require_handoff('0'*40)
+
+    def test_cli_wrong_handoff_refuses_before_any_file_or_container_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            command=[sys.executable,'-B',str(Path(__file__).with_name('run_open.py')),
+                '--physical-backup',str(root/'missing-backup'),'--physical-backup-sha256','a'*64,
+                '--physical-receipts',str(root/'missing-seed'),'--physical-receipts-sha256','b'*64,
+                '--physical-source-commit','0'*40,'--work-dir',str(root/'output'),
+                '--consumer-binary',str(root/'missing-binary'),'--consumer-lock',str(root/'missing-lock'),
+                '--build-receipt',str(root/'missing-receipt'),'--sdk-version','4.16.0',
+                '--sdk-sha256','c'*64,'--sdk-source','d'*40,
+                '--server-index',self.profile['server_index'],'--server-version',self.profile['server_version'],
+                '--server-source',self.profile['server_source']]
+            result=subprocess.run(command,text=True,capture_output=True,timeout=10)
+            self.assertNotEqual(0,result.returncode)
+            self.assertIn('producer handoff commit differs',result.stderr)
+            self.assertEqual([],list(root.iterdir()))
 
     def test_original_business_row_or_catalog_change_refuses(self):
         changed=deepcopy(self.after);changed['tables']['business']['rows'][0][0]=['text','changed']

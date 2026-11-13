@@ -202,6 +202,8 @@ Run it only after that source's required CI and final independent review clear
 and its owner confirms the accepted source identity. A producer diagnostic or
 published image alone does not clear the seed-source gate. Do not run a retained
 owner-specific control script or create another seed or synthetic transform.
+The supplied source commit must exactly equal the frozen profile's accepted
+producer commit. Another well-formed SHA refuses before input or runtime effects.
 
 Supply all five physical arguments with the normal recorded consumer and exact
 Server arguments:

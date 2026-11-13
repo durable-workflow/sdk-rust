@@ -24,6 +24,13 @@ def profile():
     return json.loads(raw)
 
 
+def require_handoff(commit):
+    selected = profile()
+    if commit != selected['producer_manifest_commit']:
+        raise ValueError('producer handoff commit differs from the reviewed physical profile')
+    return selected
+
+
 def read_owned(path, digest, limit):
     path = Path(path)
     if (not path.is_absolute() or path.resolve() != path

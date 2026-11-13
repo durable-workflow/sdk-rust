@@ -72,6 +72,8 @@ def main():
                           or options.response_loss_fixture is not None
                           or not re.fullmatch('[0-9a-f]{40}',options.physical_source_commit)):
         parser.error('physical upgrade needs all exact input identities and its own cell')
+    if physical_mode:
+        physical_upgrade.require_handoff(options.physical_source_commit)
     if options.state != 'open' and options.scenario != 'readback':
         parser.error('ambiguity/case scenarios require their own open-state cell')
     if options.response_loss_fixture is not None and (options.state != 'open' or options.scenario != 'readback'):
