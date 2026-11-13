@@ -1,0 +1,70 @@
+{
+  "baseline_index": "sha256:7988a23525d9e50e997a9f6f02e801300ed4f626de3cf6977033657ae7e9f58e",
+  "baseline_source": "28f084513235f6647e740c4b3d9e3aace7a323b7",
+  "baseline_version": "3.8.0",
+  "journal_checksum_sha384": "53b752529a1f7addaefe62ab61160dd42b3990f805cfdc4ecd1b48927a6c2f7ce42526fc04522ac887a37208f343fc73",
+  "journal_description": "full frozen PHP schema, native worker incarnations, session holders, stream reclaim deadlines, service call deadlines, service admission counters and committed external payload deletions and task ready origins and poll expiry indexes and bound run command contracts and task queue activity dispatch pauses and keyed command intents",
+  "new_schema_objects": [
+    "dw_command_intents",
+    "dw_command_intents_namespace",
+    "sqlite_autoindex_dw_command_intents_1"
+  ],
+  "producer_manifest_commit": "c542ae7928a73215e5dc9d1d67085e1a4191ba57",
+  "producer_manifest_sha256": "ceb4695643e48c7bfe3f81eea380c6ab9aa0b973da830cb552d070344047319f",
+  "schema": "durable-workflow.physical-sqlite-upgrade-profile.v1",
+  "schema_after": 13,
+  "schema_before": 12,
+  "server_index": "sha256:8ffcdb2a36af3129a1987849aafe8715fe0d3bf9a9648467f0b5cb8eeef43ba9",
+  "server_source": "5614274d2629d03f92932a07dfee0fb10349ddd9",
+  "server_version": "3.9.2",
+  "source_inputs": {
+    "rust/migrations/sqlite/0003_full_schema.sql": {
+      "git_blob": "3e58585408652a8e0622db183915f04e62349551",
+      "sha256": "661e8dc4ca329b5798bd661ebf1678fb43d813cdf61dd2d0c4e29978d908ccee"
+    },
+    "rust/migrations/sqlite/0004_worker_incarnations.sql": {
+      "git_blob": "375d6507b12fb469714180d4d7f57bdda0efc520",
+      "sha256": "51c59ea1bbd59129e5696660114139cadde1f0afdd984bba34f51c485b4798fe"
+    },
+    "rust/migrations/sqlite/0005_worker_session_holders.sql": {
+      "git_blob": "d7e099452e707fe6c93cb0b01187d2d92b8e3826",
+      "sha256": "9c6bc35eafb7f62535388b2f890509f63b2c877676e3e8fe63eb938e589e3fee"
+    },
+    "rust/migrations/sqlite/0006_stream_reclaims.sql": {
+      "git_blob": "481e73c9f0df21950e797dcd2caf784bde6aed20",
+      "sha256": "b7e99137ee8690612535639682c94e71a632d1ec45bb2b071b098425986a8a51"
+    },
+    "rust/migrations/sqlite/0007_service_calls.sql": {
+      "git_blob": "fa2de782c9ab06e195430bf47760c6b847f00451",
+      "sha256": "752a1a40556d940c0a99d22fd5e4b4419e9a97078cde29802d80337fbcf17ed9"
+    },
+    "rust/migrations/sqlite/0008_external_payload_deletions.sql": {
+      "git_blob": "3faec1972524eaa783fd8039c26d92be591107cf",
+      "sha256": "d66f652cb2bdd96ffb57c402d94b9ac3831e6425040c90cc6c2653c50dad961b"
+    },
+    "rust/migrations/sqlite/0009_task_ready_origin.sql": {
+      "git_blob": "559740942e5e7c15afbd75241adcea616bc564b0",
+      "sha256": "e5d47c5062ca0953151e315086323e173f5b2bd222c0806cef035aaa9417fcd8"
+    },
+    "rust/migrations/sqlite/0010_poll_expiry_indexes.sql": {
+      "git_blob": "23d7c3e6797e8c0a211bab6706fba2359d4e4e39",
+      "sha256": "4d4fb5e03ad1780c191dda35af0721de022009af2efedb9408bdefe1ace3a5b4"
+    },
+    "rust/migrations/sqlite/0011_run_command_contracts.sql": {
+      "git_blob": "eaacac26c1ee44289da98804cc669f1cddd8b416",
+      "sha256": "385f4134f409493178a11044348643ee15022ce050919ea88836a3e1d00c19f9"
+    },
+    "rust/migrations/sqlite/0012_task_queue_pauses.sql": {
+      "git_blob": "fa43906db894d91d7142c0a76d6213b311796ba2",
+      "sha256": "484ab3a84c09fbc27b6bb39965b4075a1ce6fac4751a209670fe148812beed1f"
+    },
+    "rust/migrations/sqlite/0013_command_intents.sql": {
+      "git_blob": "295c7f89e281fd9a8275a4100d525d566687145b",
+      "sha256": "fc3ad1730682c09704027dcbabc17cd6ded9c642a3ff20d7988d5f4b4a5726fd"
+    },
+    "rust/src/runtime/schema.rs": {
+      "git_blob": "78f4fc9f804f9c8b5130846db9cc9164c85179aa",
+      "sha256": "1575bb959f0abf3092da1c369bcd5ac8f13f621706f1f640da1d8e7cf2ddadd2"
+    }
+  }
+}

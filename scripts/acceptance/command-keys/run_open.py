@@ -22,6 +22,7 @@ sys.path.insert(0, str(SOURCE))
 import sqlite_legacy as legacy
 import execution_guards as guards
 import response_loss
+import physical_upgrade
 
 
 
@@ -48,6 +49,11 @@ def main():
     parser.add_argument('--scenario', choices=['readback', 'two-rows', 'legacy-token', 'modern-raw', 'case-only'], default='readback')
     parser.add_argument('--response-loss-fixture', type=Path,
                         help='accepted shared proxy file; selects the separate postcommit-loss cell')
+    parser.add_argument('--physical-backup',type=Path)
+    parser.add_argument('--physical-backup-sha256')
+    parser.add_argument('--physical-receipts',type=Path)
+    parser.add_argument('--physical-receipts-sha256')
+    parser.add_argument('--physical-source-commit',help='accepted producer seed-source commit from its owner handoff')
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--consumer-binary',type=Path,required=True)
     parser.add_argument('--consumer-lock',type=Path,required=True)
@@ -59,6 +65,13 @@ def main():
     parser.add_argument('--server-version',required=True)
     parser.add_argument('--server-source',required=True)
     options=parser.parse_args()
+    physical_args = (options.physical_backup, options.physical_backup_sha256, options.physical_receipts,
+                     options.physical_receipts_sha256, options.physical_source_commit)
+    physical_mode = any(value is not None for value in physical_args)
+    if physical_mode and (not all(physical_args) or options.state != 'open' or options.scenario != 'readback'
+                          or options.response_loss_fixture is not None
+                          or not re.fullmatch('[0-9a-f]{40}',options.physical_source_commit)):
+        parser.error('physical upgrade needs all exact input identities and its own cell')
     if options.state != 'open' and options.scenario != 'readback':
         parser.error('ambiguity/case scenarios require their own open-state cell')
     if options.response_loss_fixture is not None and (options.state != 'open' or options.scenario != 'readback'):
@@ -84,6 +97,14 @@ def main():
         sdk_version=options.sdk_version, sdk_sha256=options.sdk_sha256, sdk_source=options.sdk_source)
     if options.response_loss_fixture is not None:
         response_loss.fixture(options.response_loss_fixture)  # Refuse changed source before effects.
+    if physical_mode:
+        physical_raw, physical_original, physical_packet, physical_profile = physical_upgrade.prepare(
+            options.physical_backup,options.physical_backup_sha256,
+            options.physical_receipts,options.physical_receipts_sha256)
+        if (options.server_source != physical_profile['server_source']
+                or options.server_index != physical_profile['server_index']
+                or options.server_version != physical_profile['server_version']):
+            parser.error('physical profile does not bind this exact published producer tuple')
     image='ghcr.io/durable-workflow/server@'+options.server_index
     info=json.loads(capture('docker','image','inspect',image))[0]
     assert info['Config']['Labels']['org.opencontainers.image.revision']==options.server_source
@@ -100,7 +121,7 @@ def main():
     key = 'base64:' + base64.b64encode(secrets.token_bytes(32)).decode()
     with open(os.open(envfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w') as file:
         file.write('DW_AUTH_TOKEN='+token+'\nDW_SERVER_KEY='+key+'\n')
-    name = 'sdk-rust-216-legacy-' + options.state + '-' + secrets.token_hex(5)
+    name = ('sdk-rust-216-physical-' if physical_mode else 'sdk-rust-216-legacy-'+options.state+'-') + secrets.token_hex(5)
     owned_id = None
     binary = None
     worker_pool = None
@@ -158,6 +179,53 @@ def main():
 
     try:
         binary = guards.BoundExecutable(options.consumer_binary, build['binary'])
+        if physical_mode:
+            physical_path=database/'physical.sqlite'
+            physical_upgrade.copy_backup(physical_raw,physical_path)
+            del physical_raw
+            original_snapshot=snapshot(physical_path)
+            physical_upgrade.validate_original_commands(original_snapshot,physical_packet)
+            upgrade_started=time.time()
+            owned_id=capture('docker','create','--init','--read-only','--name',name+'-upgrade',
+                '--cpus','1','--memory','1g','--pids-limit','256','--network','none',
+                '--cap-drop','ALL','--security-opt','no-new-privileges',
+                '--tmpfs','/tmp:mode=1777,size=128m',
+                '--tmpfs','/app/storage:uid=1000,gid=1000,mode=0700,size=64m',
+                '--tmpfs','/app/database:uid=1000,gid=1000,mode=0700,size=16m',
+                '-v',str(database)+':/cohort:rw','--env-file',str(envfile),
+                '-e','DB_CONNECTION=sqlite','-e','DB_DATABASE=/cohort/physical.sqlite',image,'schema-upgrade')
+            capture('docker','start',owned_id)
+            exit_code=capture('docker','wait',owned_id)
+            upgrade_finished=time.time()
+            upgrade_log=capture('docker','logs',owned_id)
+            with open(os.open(work/'schema-upgrade.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as output:
+                output.write(upgrade_log+'\n')
+            assert exit_code == '0', 'physical schema-upgrade exited unsuccessfully'
+            upgraded=snapshot(physical_path)
+            physical_upgrade.validate_upgrade(original_snapshot,upgraded,json.loads(upgrade_log),
+                                               upgrade_started,upgrade_finished,physical_profile)
+            physical_upgrade.validate_original_commands(upgraded,physical_packet)
+            capture('docker','rm','-v',owned_id);owned_id=None
+            start(physical_path.name)
+            cell=physical_upgrade.readbacks(physical_packet,invoke,lambda:snapshot(physical_path),work)
+            stop()
+            _, rechecked = physical_upgrade.read_owned(options.physical_backup,options.physical_backup_sha256,
+                                                       legacy.MAX_DATABASE_BYTES)
+            assert rechecked == physical_original, 'original baseline changed during the owned-copy experiment'
+            binary.check()
+            cell.update(started_at=started_at,finished_at=datetime.now(timezone.utc).isoformat(),
+                baseline_sha256=options.physical_backup_sha256,seed_receipts_sha256=options.physical_receipts_sha256,
+                producer_seed_source=options.physical_source_commit,
+                profile_sha256=physical_upgrade.PROFILE_SHA256,
+                server_source=options.server_source,server_index=options.server_index,
+                server_version=options.server_version,server_platform='linux/amd64',
+                sdk_version=options.sdk_version,sdk_sha256=options.sdk_sha256,sdk_source=options.sdk_source,
+                runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                physical_adapter_sha256=hashlib.sha256((SOURCE/'physical_upgrade.py').read_bytes()).hexdigest(),
+                binary_sha256=binary.record['sha256'],build_receipt_sha256=build_receipt_sha,
+                build_subject=build['subject'],build_command=build['build_command'])
+            print(json.dumps(cell),flush=True)
+            return
         start('source.sqlite')
         queue='legacy-'+options.state+'-'+secrets.token_hex(5)
         ok({'op':'register','queue':queue,'null_update':True})

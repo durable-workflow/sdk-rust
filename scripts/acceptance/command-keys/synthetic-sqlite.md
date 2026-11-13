@@ -194,3 +194,53 @@ identities, proxy success/drop metadata and per-type zero-write digests. Private
 before/after snapshots remain mode0600 with the same seven-day retention. The
 cell performs no SQL transform, physical upgrade or worker execution. It does
 not qualify the synthetic legacy cells or the complete #216 cohort.
+
+## Consume a producer-owned physical upgrade seed
+
+The physical mode uses the separately accepted producer seed/receipt handoff.
+Run it only after that source's required CI and final independent review clear
+and its owner confirms the accepted source identity. A producer diagnostic or
+published image alone does not clear the seed-source gate. Do not run a retained
+owner-specific control script or create another seed or synthetic transform.
+
+Supply all five physical arguments with the normal recorded consumer and exact
+Server arguments:
+
+```sh
+--physical-backup "$STOPPED_BASELINE" \
+--physical-backup-sha256 "$BASELINE_SHA256" \
+--physical-receipts "$PRODUCER_SEED_RECEIPTS" \
+--physical-receipts-sha256 "$SEED_RECEIPTS_SHA256" \
+--physical-source-commit "$ACCEPTED_SEED_SOURCE"
+```
+
+The runner verifies owned canonical single-link bounded inputs, complete hashes,
+the physical seed's baseline/manifest identity and all six distinct cases. It
+copies the stopped checkpointed baseline into a new owned private file and runs
+the pinned image's `schema-upgrade` once, offline, at1CPU/1GiB/256PIDs. The
+original is never a write target and its complete identity/hash is rechecked.
+No legacy key or intent row is manufactured.
+
+The machine-owned [SQLite profile](physical-sqlite-profile.json) binds the exact
+published producer source/index, version step, tagged schema inputs, journal
+description/checksum and new schema objects. Every original row/catalog object
+must survive except the declared schema-version and source-defined SQLx journal
+replacement. All journal fields and the invocation timestamp interval are
+validated. The new intent table must be empty. Then the same image starts on
+that upgraded copy through the existing exact-peer/runtime guards.
+
+The installed Rust consumer performs four concurrent keyed-update retries in
+open/completed/continued states, original-run reads, typed pending or completed
+null results, and name/run409 fences retaining original identities. Genuine old
+NULL-key signals are checked through preserved rows and history only, without
+claiming a caller key, retained receipt or verified intent. Complete snapshots
+immediately before/after the SDK request window must match, including all task,
+history, update and intent rows. A post-stop repair snapshot is not substituted
+for that bounded request-window proof.
+
+The terminal receipt distinguishes the physical cell from synthetic/loss cells
+and binds producer source, original backup/receipt hashes, consumer build/binary
+and complete request-window digest. Runtime/upgrade containers, owned copy and
+env are removed. Private mode0600 snapshots/logs retain the same seven-day limit.
+This profile covers SQLite/amd64 only. It does not qualify other backends or the
+whole #216 cohort by itself.
