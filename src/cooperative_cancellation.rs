@@ -179,6 +179,16 @@ fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 impl CancellationRequest {
+    /// Why this request was delivered, derived from its canonical context.
+    ///
+    /// An observation without a canonical context is an ordinary request.
+    /// Both causes arrive through [`Error::CooperativeCancellationRequested`].
+    pub fn cause(&self) -> CancellationCause {
+        self.context
+            .as_ref()
+            .map_or(CancellationCause::Requested, CancellationContext::cause)
+    }
+
     pub(super) fn preserve_observation(&self, current: &Self) -> Result<Self> {
         self.validate_observation()?;
         current.validate_observation()?;
