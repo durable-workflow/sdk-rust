@@ -39,6 +39,35 @@ fn error_value(error: &Error) -> Value {
     }
 }
 
+async fn command_receipt(
+    client: &Client,
+    args: &Value,
+    kind: &str,
+) -> durable_workflow::Result<Value> {
+    let get = |field: &str| args[field].as_str().unwrap_or_default();
+    let mut body = json!({"input":PayloadEnvelope::avro(&args["input"])?,
+        "request_id":get("request_id")});
+    if kind == "update" {
+        body["wait_for"] = json!("accepted");
+    }
+    let path = if get("run_id").is_empty() {
+        vec!["workflows", get("workflow_id"), kind, get("name")]
+    } else {
+        vec![
+            "workflows",
+            get("workflow_id"),
+            "runs",
+            get("run_id"),
+            kind,
+            get("name"),
+        ]
+    };
+    let response = client
+        .control_plane_request(RawRequest::post(path).json(body))
+        .await?;
+    Ok(json!({"status":response.status(),"body":response.json()?}))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut text = String::new();
@@ -75,13 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get("name"), args["input"].clone(), get("request_id")).await,
         "update" => client.update_workflow(get("workflow_id"),get("name"),args["input"].clone(),
             Some(get("request_id"))).await,
-        "update_raw" | "update_run_raw" => {
-            let mut body=json!({"input":PayloadEnvelope::avro(&args["input"])?,
-                "request_id":get("request_id"),"wait_for":"accepted"});
-            if !get("run_id").is_empty() { body["run_id"] = json!(get("run_id")); }
-            client.control_plane_request(RawRequest::post(["workflows",get("workflow_id"),"update",get("name")])
-                .json(body)).await.and_then(|r| Ok(json!({"status":r.status(),"body":r.json()?})))
-        }
+        "signal_raw" => command_receipt(&client, &args, "signal").await,
+        "update_raw" | "update_run_raw" => command_receipt(&client, &args, "update").await,
         "outcome" => client.update_outcome_receipt(get("workflow_id"),get("update_id"),
             UpdateWaitStage::Accepted,None).await,
         "describe" => client.describe_workflow(get("workflow_id")).await

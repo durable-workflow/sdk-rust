@@ -24,11 +24,11 @@ Operations use `op` plus the applicable `workflow_id`, `run_id`, `name`,
 - `start`, `signal`, `signal_run`, `update`, `outcome`, `describe` and `history`
   use the corresponding public high-level SDK methods. Typed pending updates
   preserve their complete receipt; completed null remains an ordinary result.
-- `update_raw` reads the full admission receipt through the public
+- `signal_raw` and `update_raw` read the full admission receipt through the public
   `Client::control_plane_request` and `RawRequest` APIs, using the official
   `PayloadEnvelope::avro` encoder. An optional `run_id` explicitly pins the
-  original run. `update_run_raw` is an alias. These receipt checks complement
-  the high-level `update` result checks.
+  original run through its `/runs/{run_id}/...` route. `update_run_raw` is an
+  alias. These receipt checks complement the high-level signal/update checks.
 - `create_namespace` creates a synthetic namespace through the public raw
   control-plane surface for the namespace fence control.
 

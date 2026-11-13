@@ -25,7 +25,7 @@ class StoppedCopyTest(unittest.TestCase):
         with closing(sqlite3.connect(self.source)) as connection:
             connection.executescript("""
                 CREATE TABLE workflow_commands (
-                    id TEXT PRIMARY KEY, type TEXT, workflow_instance_id TEXT,
+                    id TEXT PRIMARY KEY, command_type TEXT, workflow_instance_id TEXT,
                     workflow_run_id TEXT, request_id TEXT, payload BLOB, extra REAL);
                 CREATE TABLE dw_command_intents (command_id TEXT UNIQUE, fingerprint TEXT);
                 CREATE TABLE history (id TEXT, payload BLOB);
@@ -87,6 +87,14 @@ class StoppedCopyTest(unittest.TestCase):
                 DROP TABLE old_intents;
             """)
         with self.assertRaises(ValueError):
+            self.run_transform()
+        self.assertFalse(self.destination.exists())
+
+    def test_incorrect_type_column_cannot_substitute_for_producer_command_type(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.execute("ALTER TABLE workflow_commands RENAME COLUMN command_type TO type")
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "producer command catalog"):
             self.run_transform()
         self.assertFalse(self.destination.exists())
 

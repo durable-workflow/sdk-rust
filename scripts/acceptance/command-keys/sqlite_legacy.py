@@ -177,11 +177,15 @@ def transform_copy(source, destination, selections, *, stopped=False):
                 copied.execute("PRAGMA trusted_schema=OFF")
                 copied.execute("BEGIN IMMEDIATE")
                 try:
+                    columns = {row[1] for row in copied.execute("PRAGMA table_info(workflow_commands)")}
+                    required = {"id", "command_type", "workflow_instance_id", "workflow_run_id", "request_id"}
+                    if not required.issubset(columns):
+                        raise ValueError("producer command catalog lacks required columns")
                     # Validate every selection before either mutation. This is
                     # exactly the accepted manifest's legacy_key precondition.
                     for row in selected:
                         command = copied.execute(
-                            "SELECT id,type,workflow_instance_id,workflow_run_id,request_id "
+                            "SELECT id,command_type,workflow_instance_id,workflow_run_id,request_id "
                             "FROM workflow_commands WHERE id=:command_id", row
                         ).fetchall()
                         token = row["command_type"] + "-v1:" + hashlib.sha256(row["caller_key"].encode()).hexdigest()
