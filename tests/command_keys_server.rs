@@ -114,9 +114,11 @@ async fn direct_cases() {
         .unwrap_err();
     assert!(error.is_request_id_conflict());
     assert_eq!(error.request_id().as_deref(), Some("signal-key"));
+    // Export metadata contains a fresh exported_at timestamp. Only durable
+    // history events are a no-write invariant across two exports.
     assert_eq!(
-        client.export_workflow_history(&id, run).await.unwrap(),
-        history
+        client.export_workflow_history(&id, run).await.unwrap()["history_events"],
+        history["history_events"]
     );
 
     let pending = match client
@@ -157,8 +159,8 @@ async fn direct_cases() {
     assert!(error.is_request_id_conflict());
     assert_eq!(error.request_id().as_deref(), Some("update-key"));
     assert_eq!(
-        client.export_workflow_history(&id, run).await.unwrap(),
-        history
+        client.export_workflow_history(&id, run).await.unwrap()["history_events"],
+        history["history_events"]
     );
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -206,8 +208,8 @@ async fn direct_cases() {
         json!([1])
     );
     assert_eq!(
-        client.export_workflow_history(&id, run).await.unwrap(),
-        history
+        client.export_workflow_history(&id, run).await.unwrap()["history_events"],
+        history["history_events"]
     );
 
     let chain = format!("{queue}-continue");
