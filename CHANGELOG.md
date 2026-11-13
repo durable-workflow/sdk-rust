@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.16.0
+
 - Completion payload planning reads the optional advertised
   `limits.max_workflow_task_completion_bytes` separately from ordinary request
   and per-value limits. Individually valid inline batches no longer demand
