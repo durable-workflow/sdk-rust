@@ -36,6 +36,8 @@ mod update_outcome;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
+mod workflow_logging;
+pub use workflow_logging::{WorkflowLogger, WorkflowReplayState};
 
 pub use activity_error::ActivityError;
 pub use activity_retry::{ActivityAttemptLimit, ActivityRetryInfo};
@@ -10242,6 +10244,7 @@ impl Worker {
             self.allow_cancellation_scope_authoring,
             self.allow_cancellation_scope_delivery,
         )?;
+        workflow_state.observation_namespace = Some(self.client.namespace.clone());
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
         if let Some(canonical) = cancellation_history {
@@ -12366,6 +12369,11 @@ fn is_authored_command_open_event(event: &HistoryEvent) -> bool {
 
 #[derive(Debug)]
 struct WorkflowState {
+    observation_namespace: Option<String>,
+    observation_terminal: bool,
+    // A pending recorded call consumes its descriptor before yielding. Cursor
+    // exhaustion alone therefore cannot make the surrounding poll live.
+    observation_pending: bool,
     workflow_id: Option<String>,
     run_id: Option<String>,
     task_queue: String,
@@ -12663,6 +12671,19 @@ impl WorkflowState {
                 })
             });
         Ok(Self {
+            observation_namespace: None,
+            observation_terminal: history.iter().any(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "WorkflowCompleted"
+                        | "WorkflowFailed"
+                        | "WorkflowCancelled"
+                        | "WorkflowTerminated"
+                        | "WorkflowTimedOut"
+                        | "WorkflowContinuedAsNew"
+                )
+            }),
+            observation_pending: false,
             workflow_command_identity: String::new(),
             workflow_stream_command_counter: 0,
             workflow_id,
@@ -14734,6 +14755,7 @@ impl Future for SelectCall {
                 // on, so an otherwise commandless replay remains legitimately
                 // pending instead of failing as an untracked yield.
                 state.matched_recorded_pending = true;
+                state.observation_pending = true;
             }
             marker
         };
@@ -15812,6 +15834,7 @@ impl ActivityCall {
                         return Poll::Ready(outcome.map_err(Error::ActivityFailed));
                     }
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.scheduled = true;
                     return Poll::Pending;
                 }
@@ -16010,6 +16033,7 @@ impl Future for TimerCall {
                         return Poll::Ready(Ok(()));
                     }
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.scheduled = true;
                     self.matched_pending = true;
                     return Poll::Pending;
@@ -16592,6 +16616,7 @@ impl ChildWorkflowCall {
                         return Poll::Ready(outcome.map_err(Error::ChildWorkflowFailed));
                     }
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.scheduled = true;
                     self.matched_pending = true;
                     return Poll::Pending;
@@ -16840,6 +16865,7 @@ impl SignalCall {
                     }
 
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.opened_wait = true;
                     self.matched_pending = true;
                     return Poll::Pending;

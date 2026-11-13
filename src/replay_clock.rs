@@ -54,6 +54,11 @@ impl Drop for Guard {
     }
 }
 
+pub(super) fn observation_mode(context: &WorkflowContext) -> Option<bool> {
+    let active = ACTIVE.with(|active| active.borrow().as_ref().and_then(Weak::upgrade))?;
+    Arc::ptr_eq(&active, &context.state).then(|| QUERY_REPLAY.with(Cell::get))
+}
+
 fn unavailable() -> Error {
     Error::ReplayClockUnavailable
 }
@@ -436,6 +441,7 @@ impl WorkflowState {
         sequence: u64,
         path: &[ParallelGroupMetadata],
     ) {
+        self.observation_pending = false;
         if path.is_empty() {
             self.observe_replay_sequence(sequence);
         } else {
@@ -445,11 +451,13 @@ impl WorkflowState {
     }
 
     pub(super) fn consume_unproven_boundary(&mut self, path: &[ParallelGroupMetadata]) {
+        self.observation_pending = false;
         self.replay_clock.unavailable();
         self.unavailable_cancellation_boundary(path);
     }
 
     pub(super) fn consume_replay_group(&mut self, sequences: &[u64], failed: Option<u64>) {
+        self.observation_pending = false;
         // Core's query group-send branch supplies no aggregate time. Do not
         // transfer executor authority into reconstructed query execution.
         self.replay_clock.time = if QUERY_REPLAY.with(Cell::get) {
@@ -477,16 +485,19 @@ impl WorkflowState {
     }
 
     pub(super) fn consume_replay_selection(&mut self, group: &str) {
+        self.observation_pending = false;
         self.replay_clock.unavailable();
         self.advance_cancellation_selection(group);
     }
 
     pub(super) fn consume_replay_receipt(&mut self, group: &str, sequence: u64) {
+        self.observation_pending = false;
         self.replay_clock.unavailable();
         self.advance_cancellation_receipt(group, sequence);
     }
 
     pub(super) fn consume_replay_handle(&mut self, handle: &DurableOperationHandle, failed: bool) {
+        self.observation_pending = false;
         self.replay_clock.unavailable();
         self.advance_cancellation_handle(handle, failed);
     }
@@ -501,6 +512,7 @@ impl WorkflowState {
     }
 
     pub(super) fn observe_replay_sequence(&mut self, sequence: u64) {
+        self.observation_pending = false;
         self.replay_clock.time = self
             .replay_clock
             .boundaries
