@@ -238,25 +238,28 @@ async fn run_child(mut command: Command) -> (u32, String) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let mut output = Vec::new();
-    child
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .take(OUTPUT_LIMIT + 1)
-        .read_to_end(&mut output)
-        .unwrap();
-    assert!(
-        output.len() as u64 <= OUTPUT_LIMIT,
-        "worker stdout exceeded the fixture bound"
-    );
+    let output = bounded_output(child.0.stdout.take().unwrap(), "stdout");
+    let errors = bounded_output(child.0.stderr.take().unwrap(), "stderr");
     assert!(
         status.success(),
-        "owned logging fixture process exited {status}"
+        "owned logging fixture process exited {status}; stderr: {}",
+        String::from_utf8_lossy(&errors)
     );
     let output = String::from_utf8(output).unwrap();
     (expected_pid, output)
+}
+
+fn bounded_output(output: impl Read, stream: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    output
+        .take(OUTPUT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(
+        bytes.len() as u64 <= OUTPUT_LIMIT,
+        "worker {stream} exceeded the fixture bound"
+    );
+    bytes
 }
 
 fn parse_report(output: &str) -> Value {
@@ -273,6 +276,10 @@ fn parse_report(output: &str) -> Value {
 #[cfg(target_os = "linux")]
 async fn executable_control(mode: &str) {
     use std::os::unix::fs::PermissionsExt;
+    if mode == "diagnostic-failure" {
+        eprintln!("SYNTHETIC_LOGGING_CHILD_FAILURE");
+        std::process::exit(23);
+    }
     if mode == "identity" {
         let image = executable_identity();
         assert_eq!(
@@ -315,6 +322,21 @@ async fn executable_control(mode: &str) {
     assert_eq!(record["pid"], pid);
     assert_eq!(record["executable"], image);
     println!("EXECUTABLE_CONTROL_PASS");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[should_panic(expected = "SYNTHETIC_LOGGING_CHILD_FAILURE")]
+async fn failed_child_retains_bounded_stderr_diagnostics() {
+    let mut command = image_command();
+    command.env(CONTROL, "diagnostic-failure");
+    run_child(command).await;
+}
+
+#[test]
+#[should_panic(expected = "worker stderr exceeded the fixture bound")]
+fn oversized_worker_stderr_is_refused() {
+    bounded_output(std::io::repeat(b'x'), "stderr");
 }
 
 #[cfg(target_os = "linux")]
