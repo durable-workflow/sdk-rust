@@ -281,7 +281,7 @@ jobs:
           php-version: '8.3'
           ini-file: production
           coverage: none
-          tools: composer:2.10.3, phpunit:11.5.57
+          tools: composer:2.10.3,phpunit:11.5.57
       - name: Verify actual Composer dependency trust
         uses: durable-workflow/.github/.github/actions/verify-composer-trust@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
         with:
