@@ -158,26 +158,33 @@ def main():
         before=snapshot(copied)
         for kind,(admission,original) in seed.items():
             retry=dict(admission,input=[document['legacy_readback']['retry_input']])
+            fields = ['command_id', 'run_id'] + (['update_id', 'accepted_at'] if kind == 'update' else [])
+            assert all(original[field] for field in fields)
             with concurrent.futures.ThreadPoolExecutor(max_workers=document['legacy_readback']['concurrency']) as pool:
                 replies=list(pool.map(lambda _:ok(retry),range(document['legacy_readback']['concurrency'])))
             for result in replies:
                 assert result['status']==202,result
                 receipt=result['body']
                 assert receipt['retained'] is True and receipt['intent_verified'] is False,receipt
-                for field in ['command_id','run_id']+(['update_id','accepted_at'] if kind=='update' else []):
+                for field in fields:
                     assert receipt[field]==original[field],field
             pinned=ok(dict(retry,run_id=original['run_id']))['body']
-            assert pinned['command_id']==original['command_id'] and pinned['intent_verified'] is False
+            assert pinned['retained'] is True and pinned['intent_verified'] is False
+            assert all(pinned[field] == original[field] for field in fields)
             for changed in [dict(retry,name='other'),dict(retry,run_id='00000000000000000000000000')]:
                 refusal=invoke(changed)
                 assert refusal['kind']=='ok' and refusal['value']['status']==409,refusal
                 assert refusal['value']['body']['reason']=='request_id_conflict',refusal
+                assert refusal['value']['body']['retained_command_id']==original['command_id']
             high=invoke(dict(retry,op=kind))
             if kind=='signal':
                 assert high['kind']=='ok' and high['value']['intent_verified'] is False,high
+                assert high['value']['retained'] is True
+                assert all(high['value'][field] == original[field] for field in fields)
             else:
                 assert high['kind']=='pending' and high['receipt']['intent_verified'] is False,high
-            fields = ['command_id', 'run_id'] + (['update_id', 'accepted_at'] if kind == 'update' else [])
+                assert high['receipt']['retained'] is True
+                assert all(high['receipt'][field] == original[field] for field in fields)
             print(json.dumps({'stage':'open-readback','command_type':kind,'outcome':'pass',
                 'original':{field:original[field] for field in fields},
                 'returned':{field:replies[0]['body'][field] for field in fields},
