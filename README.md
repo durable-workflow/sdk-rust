@@ -495,6 +495,41 @@ Keep workflow command order deterministic:
 See the runnable [`workflow_testing`](examples/workflow_testing.rs) example and
 [`workflow_testing` tests](tests/workflow_testing.rs).
 
+## Workflow logging
+
+Use `ctx.logger()` for observations written from workflow code. It sends events
+to the application's existing `tracing` subscriber with the target
+`durable_workflow::workflow` and SDK-bound `namespace`, `workflow_instance_id`
+and `workflow_run_id` fields. No global subscriber is installed.
+
+```rust,no_run
+# use durable_workflow::{Client, Worker, json};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "orders");
+worker.register_workflow("order", |ctx, _input| async move {
+    ctx.logger().info("processing order");
+    let result = ctx.activity("charge", json!([])).await?;
+    ctx.logger().info("charge completed");
+    Ok(result)
+});
+# }
+```
+
+Ordinary `tracing` calls execute again when a worker reconstructs a workflow.
+The workflow logger suppresses the committed prefix, query/offline replay and
+completed histories, including after a cold worker replacement. It emits when
+execution reaches new code beyond that prefix. `ctx.replay_state()` exposes
+that live boundary as `WorkflowReplayState`; a retained context outside its
+invocation is `Unavailable`. Use the logger for observations and keep durable
+command order independent of the observation state.
+
+This is process logging. A log from an uncommitted task attempt can repeat if
+that attempt crashes or retries. It is not an exactly-once outbox. Keep host
+handlers bounded and nonblocking, for example with an application-owned logging
+queue, so they do not stall the worker. Unwinding subscriber panics are isolated
+from the workflow result; aborting processes and blocking handlers remain the
+application's responsibility.
+
 ## Inspect a run's activities
 
 Use `Client::get_run_activities(workflow_id, run_id)` next to the selected run's

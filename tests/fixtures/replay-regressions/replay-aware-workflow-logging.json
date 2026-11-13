@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-replay-aware-workflow-logging",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.replay-aware-logging", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "TimerScheduled", "payload": {"sequence": 1, "timer_id": "timer-1", "delay_seconds": 1}},
+    {"event_type": "TimerFired", "payload": {"sequence": 1, "timer_id": "timer-1", "delay_seconds": 1}}
+  ],
+  "command_sequence": [{"type": "complete_workflow", "result": "complete"}],
+  "expected": {"type": "complete_workflow", "result": "complete", "workflow_logs": ["fresh"]}
+}

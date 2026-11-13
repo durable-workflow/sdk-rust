@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Workflow code can use `ctx.logger()` to send new-execution observations to
+  the application's `tracing` subscriber with namespace/workflow/run identity.
+  Committed replay, query reconstruction and discarded invocations stay quiet.
+  `ctx.replay_state()` exposes the live consumed-history boundary. Logs from
+  uncommitted task attempts may repeat on retry; handlers must be nonblocking.
+
 ## 4.16.0
 
 - Completion payload planning reads the optional advertised
