@@ -1,5 +1,5 @@
 {
-  "started_at": "2026-11-13T09:18:49.946228+00:00",
+  "started_at": "2026-11-13T09:39:58.440543+00:00",
   "outcome": "pass",
   "mode": "pre-publication",
   "expected_server": {
@@ -7,7 +7,7 @@
     "revision": "28f084513235f6647e740c4b3d9e3aace7a323b7",
     "release_tag": "3.8.0"
   },
-  "harness_commit": "01d72911078276f7b00cd5efbd145f1c0a5f3df3",
+  "harness_commit": "c349dcbfeede15458ed3852319581a9157085074",
   "server": {
     "index": "ghcr.io/durable-workflow/server@sha256:7988a23525d9e50e997a9f6f02e801300ed4f626de3cf6977033657ae7e9f58e",
     "executed_manifest": "ghcr.io/durable-workflow/server@sha256:98bb2b12e961a78f90fd7e59428327df28e881867a07e619513f7564ee18f3f9",
@@ -54,10 +54,10 @@
     "mode": "pre-publication",
     "package": "durable-workflow",
     "version": "4.15.0",
-    "commit": "01d72911078276f7b00cd5efbd145f1c0a5f3df3",
+    "commit": "c349dcbfeede15458ed3852319581a9157085074",
     "crate_file": "durable-workflow-4.15.0.crate",
-    "crate_sha256": "4d6504e24845a37afaf325ae576570c9446a261430ecfc9ec795db46c8c1b328",
-    "crate_size": 597828,
+    "crate_sha256": "2ddc164f7e98bd172b1ec3fe9d1960411924112c0fe3c5a3c553475a9ca14cb4",
+    "crate_size": 598192,
     "files": [
       ".cargo_vcs_info.json",
       "CHANGELOG.md",
@@ -178,7 +178,7 @@
     "file_list_sha256": "b5a76f06995618904d75415b61d37b4245ec98901ea886d10331b894b02cb556",
     "vcs_info": {
       "git": {
-        "sha1": "01d72911078276f7b00cd5efbd145f1c0a5f3df3"
+        "sha1": "c349dcbfeede15458ed3852319581a9157085074"
       },
       "path_in_vcs": ""
     },
@@ -195,7 +195,7 @@
     "product_train": "4.15.0",
     "verified_source_files": 112,
     "unpacked": "package/durable-workflow-4.15.0",
-    "crate_sha256_after_cells": "4d6504e24845a37afaf325ae576570c9446a261430ecfc9ec795db46c8c1b328"
+    "crate_sha256_after_cells": "2ddc164f7e98bd172b1ec3fe9d1960411924112c0fe3c5a3c553475a9ca14cb4"
   },
   "build": {
     "rust_image": {
@@ -217,11 +217,11 @@
   "crate": {
     "mode": "pre-publication",
     "version": "4.15.0",
-    "sha256": "4d6504e24845a37afaf325ae576570c9446a261430ecfc9ec795db46c8c1b328",
-    "lock_checksum": "4d6504e24845a37afaf325ae576570c9446a261430ecfc9ec795db46c8c1b328",
+    "sha256": "2ddc164f7e98bd172b1ec3fe9d1960411924112c0fe3c5a3c553475a9ca14cb4",
+    "lock_checksum": "2ddc164f7e98bd172b1ec3fe9d1960411924112c0fe3c5a3c553475a9ca14cb4",
     "lock_source": "registry+https://github.com/rust-lang/crates.io-index",
     "registry_published": false,
-    "source_commit": "01d72911078276f7b00cd5efbd145f1c0a5f3df3",
+    "source_commit": "c349dcbfeede15458ed3852319581a9157085074",
     "installed_files": 114,
     "verified_source_files": 112,
     "product_train": "4.15.0",
@@ -251,7 +251,7 @@
   "cells": {
     "lifecycle": {
       "cell": "lifecycle",
-      "deadline_unix": 1794562238,
+      "deadline_unix": 1794563468,
       "kill_after_seconds": 10,
       "cluster_info": {
         "version": "3.8.0",
@@ -266,8 +266,8 @@
       "driver": {
         "cases": {
           "after-timeout": {
-            "final_run_id": "01M7A3B5TJ0E4RM7YED6FJ8SXB",
-            "original_run_id": "01M7A3B5T7TZNRVERH351HRPS5",
+            "final_run_id": "01M7A4GQ8X5TYKWWPTY80Y6VT1",
+            "original_run_id": "01M7A4GQ84JWJ70F4W41WSBAEC",
             "result": {
               "bigint": 9223372036854775807,
               "false": false,
@@ -284,19 +284,19 @@
               "closed_reason": "cancelled",
               "failure": null
             },
-            "final_run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
-            "original_run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+            "final_run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
+            "original_run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
             "status": "cancelled",
             "terminal": {
               "reason": "cancelled",
-              "run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+              "run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
               "sdk_error": "cancelled"
             },
             "workflow_id": "lifecycle-cancel"
           },
           "continue": {
-            "final_run_id": "01M7A3B35FT7AA5Q0TV11K5402",
-            "original_run_id": "01M7A3B34N0N5334DBJWA9X0J3",
+            "final_run_id": "01M7A4GMFESP7S5PV7J6NBPRKX",
+            "original_run_id": "01M7A4GMF359MH89VC9V5N17YZ",
             "result": {
               "bigint": 9223372036854775807,
               "false": false,
@@ -309,8 +309,8 @@
             "workflow_id": "lifecycle-continue"
           },
           "regular": {
-            "final_run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
-            "original_run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+            "final_run_id": "01M7A4GM4H98T7C21K6K654G6Y",
+            "original_run_id": "01M7A4GM4H98T7C21K6K654G6Y",
             "query_before_signal": {
               "approvals": [],
               "input": [
@@ -340,16 +340,16 @@
               "failure": {
                 "activity_failures": [
                   {
-                    "activity_attempt_id": "01M7A3B322CQDG88M2ENW95D20",
+                    "activity_attempt_id": "01M7A4GMBJA1B0JMY0BTW3P9MA",
                     "activity_class": "qualification.reject",
-                    "activity_execution_id": "01M7A3B3209165D1QP0Z263V47",
+                    "activity_execution_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                     "activity_type": "qualification.reject",
                     "event_sequence": 5,
                     "event_type": "ActivityFailed",
                     "exception_class": "RuntimeException",
                     "exception_type": "QualificationRejected",
                     "failure_category": "activity",
-                    "failure_id": "01M7A3B32DY375A8FCRTX84NTV",
+                    "failure_id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                     "message": "rejected bob",
                     "non_retryable": true
                   }
@@ -376,11 +376,11 @@
                     "failure_category": "activity",
                     "handled": false,
                     "history_authority": "typed_history",
-                    "id": "01M7A3B32DY375A8FCRTX84NTV",
+                    "id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                     "message": "rejected bob",
                     "non_retryable": true,
                     "propagation_kind": "activity",
-                    "source_id": "01M7A3B3209165D1QP0Z263V47",
+                    "source_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                     "source_kind": "activity_execution"
                   },
                   {
@@ -395,17 +395,17 @@
                     "failure_category": "application",
                     "handled": false,
                     "history_authority": "typed_history",
-                    "id": "01M7A3B32PHZ4J7HKG3EZGVDNJ",
+                    "id": "01M7A4GMD1V92Z85QED57ZHT82",
                     "message": "activity failed (activity): rejected bob",
                     "non_retryable": true,
                     "propagation_kind": "terminal",
-                    "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                    "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                     "source_kind": "workflow_run"
                   }
                 ],
                 "message": "activity failed (activity): rejected bob",
                 "non_retryable": true,
-                "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                 "source_kind": "workflow_run"
               },
               "failures": [
@@ -421,11 +421,11 @@
                   "failure_category": "activity",
                   "handled": false,
                   "history_authority": "typed_history",
-                  "id": "01M7A3B32DY375A8FCRTX84NTV",
+                  "id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                   "message": "rejected bob",
                   "non_retryable": true,
                   "propagation_kind": "activity",
-                  "source_id": "01M7A3B3209165D1QP0Z263V47",
+                  "source_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                   "source_kind": "activity_execution"
                 },
                 {
@@ -440,18 +440,18 @@
                   "failure_category": "application",
                   "handled": false,
                   "history_authority": "typed_history",
-                  "id": "01M7A3B32PHZ4J7HKG3EZGVDNJ",
+                  "id": "01M7A4GMD1V92Z85QED57ZHT82",
                   "message": "activity failed (activity): rejected bob",
                   "non_retryable": true,
                   "propagation_kind": "terminal",
-                  "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                  "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                   "source_kind": "workflow_run"
                 }
               ]
             },
             "exception_detail_surfaced": true,
-            "final_run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
-            "original_run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+            "final_run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
+            "original_run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
             "status": "failed",
             "terminal": {
               "exception": {
@@ -474,7 +474,7 @@
                 "event_sequence": 5,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
                 },
                 "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                 "failure_category": "timeout",
@@ -484,33 +484,33 @@
                     "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                     "exception_payload": {
                       "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                      "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                      "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
                     },
                     "failure_category": "timeout",
                     "handled": false,
                     "history_authority": "typed_history",
-                    "id": "01M7A3B5QEM8PW3RCZZS3Q61DE",
-                    "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                    "id": "01M7A4GQ3E7V9RNNKP2P2KRXJZ",
+                    "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                     "non_retryable": false,
                     "propagation_kind": "timeout",
                     "reason": "run_timeout",
-                    "source_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                    "source_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                     "source_kind": "workflow_run"
                   }
                 ],
-                "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                 "non_retryable": false,
                 "reason": "run_timeout",
-                "source_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                "source_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                 "source_kind": "workflow_run"
               }
             },
-            "final_run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
-            "original_run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+            "final_run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
+            "original_run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
             "status": "failed",
             "terminal": {
               "reason": "run_timeout",
-              "run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+              "run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
               "sdk_error": "timed_out"
             },
             "workflow_id": "lifecycle-timeout"
@@ -526,12 +526,12 @@
         "cases": {
           "after-timeout": {
             "event_types": {
-              "01M7A3B5T7TZNRVERH351HRPS5": [
+              "01M7A4GQ84JWJ70F4W41WSBAEC": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "WorkflowContinuedAsNew"
               ],
-              "01M7A3B5TJ0E4RM7YED6FJ8SXB": [
+              "01M7A4GQ8X5TYKWWPTY80Y6VT1": [
                 "WorkflowStarted",
                 "WorkflowCompleted"
               ]
@@ -542,7 +542,7 @@
               {
                 "sequence": 2,
                 "event_type": "WorkflowCompleted",
-                "timestamp": "2026-11-13T09:20:44.380000Z",
+                "timestamp": "2026-11-13T09:41:14.680000Z",
                 "principal": {
                   "type": "auth:token",
                   "id": "legacy-token",
@@ -555,18 +555,18 @@
                   },
                   "payload_codec": "avro",
                   "task": {
-                    "id": "01M7A3B5TK9X4BFY1MF2D30V6J",
+                    "id": "01M7A4GQ8ZQTBFJQBCHSFWBWK0",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 0,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:44.371000Z",
-                    "leased_at": "2026-11-13T09:20:44.373000Z",
-                    "lease_expires_at": "2026-11-13T09:21:44.373000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:44.371000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:44.371000Z",
+                    "available_at": "2026-11-13T09:41:14.655000Z",
+                    "leased_at": "2026-11-13T09:41:14.661000Z",
+                    "lease_expires_at": "2026-11-13T09:42:14.661000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:14.655000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:14.655000Z",
                     "lease_owner": "qualification-installed"
                   },
                   "command": {
@@ -581,7 +581,7 @@
             ],
             "describe": {
               "workflow_id": "lifecycle-after-timeout",
-              "run_id": "01M7A3B5TJ0E4RM7YED6FJ8SXB",
+              "run_id": "01M7A4GQ8X5TYKWWPTY80Y6VT1",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -594,7 +594,7 @@
               "is_terminal": true,
               "closed_reason": "completed",
               "run_number": 2,
-              "continued_from_run_id": "01M7A3B5T7TZNRVERH351HRPS5",
+              "continued_from_run_id": "01M7A4GQ84JWJ70F4W41WSBAEC",
               "payload_codec": "avro",
               "input": [
                 "continue",
@@ -617,12 +617,12 @@
                 "codec": "avro",
                 "blob": "wwHioz3/VYAiNw4MDGJpZ2ludAT+//////////8BCmZhbHNlAgAGbmlsAAhzdGVwBAIOdW5pY29kZQoM6Zuq4piDCHplcm8EAAA="
               },
-              "started_at": "2026-11-13T09:20:44.370000Z",
-              "closed_at": "2026-11-13T09:20:44.380000Z",
+              "started_at": "2026-11-13T09:41:14.653000Z",
+              "closed_at": "2026-11-13T09:41:14.680000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 30,
-              "execution_deadline_at": "2026-11-13T09:21:44+00:00",
-              "run_deadline_at": "2026-11-13T09:21:14+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:14+00:00",
+              "run_deadline_at": "2026-11-13T09:41:44+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -659,7 +659,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:44+00:00",
+              "last_progress_at": "2026-11-13T09:41:14+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -710,7 +710,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3B5TJ0E4RM7YED6FJ8SXB",
+                "run_id": "01M7A4GQ8X5TYKWWPTY80Y6VT1",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -722,9 +722,9 @@
                 "run_count": 2,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:44.370000Z",
-                "closed_at": "2026-11-13T09:20:44.380000Z",
-                "last_progress_at": "2026-11-13T09:20:44+00:00",
+                "started_at": "2026-11-13T09:41:14.653000Z",
+                "closed_at": "2026-11-13T09:41:14.680000Z",
+                "last_progress_at": "2026-11-13T09:41:14+00:00",
                 "wait_kind": null,
                 "wait_reason": null
               }
@@ -732,7 +732,7 @@
           },
           "cancel": {
             "event_types": {
-              "01M7A3B5RTY7MRMDKPK1B58WZ3": [
+              "01M7A4GQ5PJP7206G2KF6BDY5J": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "TimerScheduled",
@@ -747,28 +747,28 @@
               {
                 "sequence": 6,
                 "event_type": "WorkflowCancelled",
-                "timestamp": "2026-11-13T09:20:44.346000Z",
+                "timestamp": "2026-11-13T09:41:14.591000Z",
                 "principal": {
                   "type": "auth:token",
                   "id": "legacy-token",
                   "label": "Admin"
                 },
                 "payload": {
-                  "workflow_command_id": "01M7A3B5SSB8Q644X41E5PHFM6",
+                  "workflow_command_id": "01M7A4GQ6XRNVWXTC81KNVV6TV",
                   "workflow_instance_id": "lifecycle-cancel",
-                  "workflow_run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+                  "workflow_run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
                   "reason": "qualification cancellation",
-                  "failure_id": "01M7A3B5ST1NJH8M8R447PPPD0",
+                  "failure_id": "01M7A4GQ6YZRE3Y61XWNSPQS8M",
                   "failure_category": "cancelled",
                   "closed_reason": "cancelled",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowCancelledException",
                   "message": "Workflow cancelled: qualification cancellation",
                   "command": {
-                    "id": "01M7A3B5SSB8Q644X41E5PHFM6",
+                    "id": "01M7A4GQ6XRNVWXTC81KNVV6TV",
                     "sequence": 2,
                     "type": "cancel",
                     "target_scope": "instance",
-                    "resolved_run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+                    "resolved_run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
                     "payload_codec": "avro",
                     "payload": {
                       "codec": "avro",
@@ -793,15 +793,15 @@
                     "request_fingerprint": "sha256:43abc4a86c550263e85264d3af36057404b47a37e2fdd8a32bffecee9b8f8068",
                     "status": "accepted",
                     "outcome": "cancelled",
-                    "accepted_at": "2026-11-13T09:20:44.345000Z",
-                    "applied_at": "2026-11-13T09:20:44.345000Z"
+                    "accepted_at": "2026-11-13T09:41:14.589000Z",
+                    "applied_at": "2026-11-13T09:41:14.589000Z"
                   }
                 }
               }
             ],
             "describe": {
               "workflow_id": "lifecycle-cancel",
-              "run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+              "run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -809,19 +809,19 @@
               "commands_scope": "selected_run",
               "commands": [
                 {
-                  "id": "01M7A3B5RTY7MRMDKPK1B58WZ4",
+                  "id": "01M7A4GQ5PJP7206G2KF6BDY5K",
                   "sequence": 1,
                   "type": "start",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+                  "resolved_run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
                   "source": "control_plane",
                   "status": "accepted",
                   "outcome": "started_new",
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:44.314Z",
-                  "applied_at": "2026-11-13T09:20:44.314Z",
+                  "accepted_at": "2026-11-13T09:41:14.550Z",
+                  "applied_at": "2026-11-13T09:41:14.550Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -854,11 +854,11 @@
                   "request_fingerprint": "sha256:c35e43d1c82d2b9155efaeb40382075ce459a93607c1031d847dce248f0590eb"
                 },
                 {
-                  "id": "01M7A3B5SSB8Q644X41E5PHFM6",
+                  "id": "01M7A4GQ6XRNVWXTC81KNVV6TV",
                   "sequence": 2,
                   "type": "cancel",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+                  "resolved_run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
                   "source": "control_plane",
                   "status": "accepted",
                   "outcome": "cancelled",
@@ -866,8 +866,8 @@
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:44.345Z",
-                  "applied_at": "2026-11-13T09:20:44.345Z",
+                  "accepted_at": "2026-11-13T09:41:14.589Z",
+                  "applied_at": "2026-11-13T09:41:14.589Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -919,12 +919,12 @@
                 "blob": "wwHioz3/VYAiNwwECgxjYW5jZWwEAAA="
               },
               "output_envelope": null,
-              "started_at": "2026-11-13T09:20:44.314000Z",
-              "closed_at": "2026-11-13T09:20:44.345000Z",
+              "started_at": "2026-11-13T09:41:14.550000Z",
+              "closed_at": "2026-11-13T09:41:14.589000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 30,
-              "execution_deadline_at": "2026-11-13T09:21:44+00:00",
-              "run_deadline_at": "2026-11-13T09:21:14+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:14+00:00",
+              "run_deadline_at": "2026-11-13T09:41:44+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -961,7 +961,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:44+00:00",
+              "last_progress_at": "2026-11-13T09:41:14+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -1012,7 +1012,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+                "run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -1024,9 +1024,9 @@
                 "run_count": 1,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:44.314000Z",
-                "closed_at": "2026-11-13T09:20:44.345000Z",
-                "last_progress_at": "2026-11-13T09:20:44+00:00",
+                "started_at": "2026-11-13T09:41:14.550000Z",
+                "closed_at": "2026-11-13T09:41:14.589000Z",
+                "last_progress_at": "2026-11-13T09:41:14+00:00",
                 "wait_kind": null,
                 "wait_reason": null
               }
@@ -1034,12 +1034,12 @@
           },
           "continue": {
             "event_types": {
-              "01M7A3B34N0N5334DBJWA9X0J3": [
+              "01M7A4GMF359MH89VC9V5N17YZ": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "WorkflowContinuedAsNew"
               ],
-              "01M7A3B35FT7AA5Q0TV11K5402": [
+              "01M7A4GMFESP7S5PV7J6NBPRKX": [
                 "WorkflowStarted",
                 "WorkflowCompleted"
               ]
@@ -1050,7 +1050,7 @@
               {
                 "sequence": 2,
                 "event_type": "WorkflowCompleted",
-                "timestamp": "2026-11-13T09:20:41.677000Z",
+                "timestamp": "2026-11-13T09:41:11.801000Z",
                 "principal": {
                   "type": "auth:token",
                   "id": "legacy-token",
@@ -1063,18 +1063,18 @@
                   },
                   "payload_codec": "avro",
                   "task": {
-                    "id": "01M7A3B35K7CG7M9HAPX4MYTCN",
+                    "id": "01M7A4GMFFRX0Z46SM9TWPP9M8",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 0,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:41.652000Z",
-                    "leased_at": "2026-11-13T09:20:41.659000Z",
-                    "lease_expires_at": "2026-11-13T09:21:41.659000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:41.652000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:41.652000Z",
+                    "available_at": "2026-11-13T09:41:11.791000Z",
+                    "leased_at": "2026-11-13T09:41:11.793000Z",
+                    "lease_expires_at": "2026-11-13T09:42:11.793000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:11.791000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:11.791000Z",
                     "lease_owner": "qualification-installed"
                   },
                   "command": {
@@ -1089,7 +1089,7 @@
             ],
             "describe": {
               "workflow_id": "lifecycle-continue",
-              "run_id": "01M7A3B35FT7AA5Q0TV11K5402",
+              "run_id": "01M7A4GMFESP7S5PV7J6NBPRKX",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -1102,7 +1102,7 @@
               "is_terminal": true,
               "closed_reason": "completed",
               "run_number": 2,
-              "continued_from_run_id": "01M7A3B34N0N5334DBJWA9X0J3",
+              "continued_from_run_id": "01M7A4GMF359MH89VC9V5N17YZ",
               "payload_codec": "avro",
               "input": [
                 "continue",
@@ -1125,12 +1125,12 @@
                 "codec": "avro",
                 "blob": "wwHioz3/VYAiNw4MDGJpZ2ludAT+//////////8BCmZhbHNlAgAGbmlsAAhzdGVwBAIOdW5pY29kZQoM6Zuq4piDCHplcm8EAAA="
               },
-              "started_at": "2026-11-13T09:20:41.647000Z",
-              "closed_at": "2026-11-13T09:20:41.677000Z",
+              "started_at": "2026-11-13T09:41:11.790000Z",
+              "closed_at": "2026-11-13T09:41:11.801000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 30,
-              "execution_deadline_at": "2026-11-13T09:21:41+00:00",
-              "run_deadline_at": "2026-11-13T09:21:11+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:11+00:00",
+              "run_deadline_at": "2026-11-13T09:41:41+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -1167,7 +1167,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:41+00:00",
+              "last_progress_at": "2026-11-13T09:41:11+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -1218,7 +1218,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3B35FT7AA5Q0TV11K5402",
+                "run_id": "01M7A4GMFESP7S5PV7J6NBPRKX",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -1230,9 +1230,9 @@
                 "run_count": 2,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:41.647000Z",
-                "closed_at": "2026-11-13T09:20:41.677000Z",
-                "last_progress_at": "2026-11-13T09:20:41+00:00",
+                "started_at": "2026-11-13T09:41:11.790000Z",
+                "closed_at": "2026-11-13T09:41:11.801000Z",
+                "last_progress_at": "2026-11-13T09:41:11+00:00",
                 "wait_kind": null,
                 "wait_reason": null
               }
@@ -1240,7 +1240,7 @@
           },
           "regular": {
             "event_types": {
-              "01M7A3B2TQGJ0ASEZCGXA5J2QH": [
+              "01M7A4GM4H98T7C21K6K654G6Y": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "ActivityScheduled",
@@ -1259,7 +1259,7 @@
               {
                 "sequence": 10,
                 "event_type": "WorkflowCompleted",
-                "timestamp": "2026-11-13T09:20:41.479000Z",
+                "timestamp": "2026-11-13T09:41:11.591000Z",
                 "principal": {
                   "type": "auth:token",
                   "id": "legacy-token",
@@ -1272,18 +1272,18 @@
                   },
                   "payload_codec": "avro",
                   "task": {
-                    "id": "01M7A3B2ZGSEC4HSP2AAXW0MEK",
+                    "id": "01M7A4GM8GKJXDM4N8E5949C60",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 0,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:41.456000Z",
-                    "leased_at": "2026-11-13T09:20:41.459000Z",
-                    "lease_expires_at": "2026-11-13T09:21:41.459000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:41.456000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:41.456000Z",
+                    "available_at": "2026-11-13T09:41:11.568000Z",
+                    "leased_at": "2026-11-13T09:41:11.574000Z",
+                    "lease_expires_at": "2026-11-13T09:42:11.574000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:11.568000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:11.568000Z",
                     "lease_owner": "qualification-installed"
                   },
                   "command": {
@@ -1298,7 +1298,7 @@
             ],
             "describe": {
               "workflow_id": "lifecycle-regular",
-              "run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+              "run_id": "01M7A4GM4H98T7C21K6K654G6Y",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -1306,19 +1306,19 @@
               "commands_scope": "selected_run",
               "commands": [
                 {
-                  "id": "01M7A3B2TQGJ0ASEZCGXA5J2QJ",
+                  "id": "01M7A4GM4H98T7C21K6K654G6Z",
                   "sequence": 1,
                   "type": "start",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+                  "resolved_run_id": "01M7A4GM4H98T7C21K6K654G6Y",
                   "source": "control_plane",
                   "status": "accepted",
                   "outcome": "started_new",
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:41.303Z",
-                  "applied_at": "2026-11-13T09:20:41.303Z",
+                  "accepted_at": "2026-11-13T09:41:11.441Z",
+                  "applied_at": "2026-11-13T09:41:11.441Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -1351,11 +1351,11 @@
                   "request_fingerprint": "sha256:2c0ddd30972708412cab5793db1f3f8c2d803c60a3369fc0133e732024a9b66c"
                 },
                 {
-                  "id": "01M7A3B2ZF49ABM5SM8J57W91J",
+                  "id": "01M7A4GM8ESZM217V0BBMN8GYY",
                   "sequence": 2,
                   "type": "signal",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+                  "resolved_run_id": "01M7A4GM4H98T7C21K6K654G6Y",
                   "target_name": "approve",
                   "source": "control_plane",
                   "status": "accepted",
@@ -1363,8 +1363,8 @@
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:41.455Z",
-                  "applied_at": "2026-11-13T09:20:41.476Z",
+                  "accepted_at": "2026-11-13T09:41:11.566Z",
+                  "applied_at": "2026-11-13T09:41:11.590Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -1394,8 +1394,8 @@
                   "auth_method": "token",
                   "request_method": "POST",
                   "request_path": "/api/workflows/lifecycle-regular/signal/approve",
-                  "request_fingerprint": "sha256:00f397b67d53c8a44d91a080898b7060dc7edc77dca44b9c0ecdf52f4d61f01a",
-                  "request_id": "sdk-rust-signal-4b3384c2ffcf433081b995cb660e0f48"
+                  "request_fingerprint": "sha256:5ac182420057f072e4d7c6ff1b683755728e07ad554f7f92474f41e0edf43656",
+                  "request_id": "sdk-rust-signal-b817eb69ebf74db7be580adf96d21713"
                 }
               ],
               "status_bucket": "completed",
@@ -1425,12 +1425,12 @@
                 "codec": "avro",
                 "blob": "wwHioz3/VYAiNw4GFmFwcHJvdmVkX2J5ChBvcGVyYXRvcgxiaWdpbnQE/v//////////ARBncmVldGluZwoSaGVsbG8gYWRhAA=="
               },
-              "started_at": "2026-11-13T09:20:41.303000Z",
-              "closed_at": "2026-11-13T09:20:41.479000Z",
+              "started_at": "2026-11-13T09:41:11.441000Z",
+              "closed_at": "2026-11-13T09:41:11.591000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 30,
-              "execution_deadline_at": "2026-11-13T09:21:41+00:00",
-              "run_deadline_at": "2026-11-13T09:21:11+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:11+00:00",
+              "run_deadline_at": "2026-11-13T09:41:41+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -1467,7 +1467,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:41+00:00",
+              "last_progress_at": "2026-11-13T09:41:11+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -1518,7 +1518,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+                "run_id": "01M7A4GM4H98T7C21K6K654G6Y",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -1530,9 +1530,9 @@
                 "run_count": 1,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:41.303000Z",
-                "closed_at": "2026-11-13T09:20:41.479000Z",
-                "last_progress_at": "2026-11-13T09:20:41+00:00",
+                "started_at": "2026-11-13T09:41:11.441000Z",
+                "closed_at": "2026-11-13T09:41:11.591000Z",
+                "last_progress_at": "2026-11-13T09:41:11+00:00",
                 "wait_kind": null,
                 "wait_reason": null
               }
@@ -1540,7 +1540,7 @@
           },
           "reject": {
             "event_types": {
-              "01M7A3B31P36CR0YXDG5D0TEWN": [
+              "01M7A4GMAZ1ZE3K99SKRM7QGA7": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "ActivityScheduled",
@@ -1554,16 +1554,16 @@
               {
                 "sequence": 6,
                 "event_type": "WorkflowFailed",
-                "timestamp": "2026-11-13T09:20:41.559000Z",
+                "timestamp": "2026-11-13T09:41:11.713000Z",
                 "principal": {
                   "type": "auth:token",
                   "id": "legacy-token",
                   "label": "Admin"
                 },
                 "payload": {
-                  "failure_id": "01M7A3B32PHZ4J7HKG3EZGVDNJ",
+                  "failure_id": "01M7A4GMD1V92Z85QED57ZHT82",
                   "source_kind": "workflow_run",
-                  "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                  "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                   "failure_category": "application",
                   "non_retryable": true,
                   "exception_type": "ActivityFailed",
@@ -1578,7 +1578,7 @@
                     "line": 0,
                     "trace": [],
                     "properties": {
-                      "activity_attempt_id": "01M7A3B322CQDG88M2ENW95D20",
+                      "activity_attempt_id": "01M7A4GMBJA1B0JMY0BTW3P9MA",
                       "activity_class": "qualification.reject",
                       "activity_code": 0,
                       "activity_exception": {
@@ -1589,29 +1589,29 @@
                       },
                       "activity_exception_class": "RuntimeException",
                       "activity_exception_type": "QualificationRejected",
-                      "activity_execution_id": "01M7A3B3209165D1QP0Z263V47",
+                      "activity_execution_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                       "activity_non_retryable": true,
                       "activity_type": "qualification.reject",
                       "attempt_number": 1,
                       "failure_category": "activity",
-                      "failure_id": "01M7A3B32DY375A8FCRTX84NTV",
+                      "failure_id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                       "reason": "activity",
                       "timeout_kind": null
                     }
                   },
                   "task": {
-                    "id": "01M7A3B32DY375A8FCRTX84NTX",
+                    "id": "01M7A4GMC6FKA07VRPDPFRZ3ZH",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 0,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:41.549000Z",
-                    "leased_at": "2026-11-13T09:20:41.551000Z",
-                    "lease_expires_at": "2026-11-13T09:21:41.551000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:41.549000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:41.549000Z",
+                    "available_at": "2026-11-13T09:41:11.686000Z",
+                    "leased_at": "2026-11-13T09:41:11.691000Z",
+                    "lease_expires_at": "2026-11-13T09:42:11.691000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:11.686000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:11.686000Z",
                     "lease_owner": "qualification-installed"
                   },
                   "failed_step_sequence": 1,
@@ -1630,16 +1630,16 @@
               {
                 "sequence": 6,
                 "event_type": "WorkflowFailed",
-                "timestamp": "2026-11-13T09:20:41.559000Z",
+                "timestamp": "2026-11-13T09:41:11.713000Z",
                 "principal": {
                   "type": "auth:token",
                   "id": "legacy-token",
                   "label": "Admin"
                 },
                 "payload": {
-                  "failure_id": "01M7A3B32PHZ4J7HKG3EZGVDNJ",
+                  "failure_id": "01M7A4GMD1V92Z85QED57ZHT82",
                   "source_kind": "workflow_run",
-                  "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                  "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                   "failure_category": "application",
                   "non_retryable": true,
                   "exception_type": "ActivityFailed",
@@ -1654,7 +1654,7 @@
                     "line": 0,
                     "trace": [],
                     "properties": {
-                      "activity_attempt_id": "01M7A3B322CQDG88M2ENW95D20",
+                      "activity_attempt_id": "01M7A4GMBJA1B0JMY0BTW3P9MA",
                       "activity_class": "qualification.reject",
                       "activity_code": 0,
                       "activity_exception": {
@@ -1665,29 +1665,29 @@
                       },
                       "activity_exception_class": "RuntimeException",
                       "activity_exception_type": "QualificationRejected",
-                      "activity_execution_id": "01M7A3B3209165D1QP0Z263V47",
+                      "activity_execution_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                       "activity_non_retryable": true,
                       "activity_type": "qualification.reject",
                       "attempt_number": 1,
                       "failure_category": "activity",
-                      "failure_id": "01M7A3B32DY375A8FCRTX84NTV",
+                      "failure_id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                       "reason": "activity",
                       "timeout_kind": null
                     }
                   },
                   "task": {
-                    "id": "01M7A3B32DY375A8FCRTX84NTX",
+                    "id": "01M7A4GMC6FKA07VRPDPFRZ3ZH",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 0,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:41.549000Z",
-                    "leased_at": "2026-11-13T09:20:41.551000Z",
-                    "lease_expires_at": "2026-11-13T09:21:41.551000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:41.549000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:41.549000Z",
+                    "available_at": "2026-11-13T09:41:11.686000Z",
+                    "leased_at": "2026-11-13T09:41:11.691000Z",
+                    "lease_expires_at": "2026-11-13T09:42:11.691000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:11.686000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:11.686000Z",
                     "lease_owner": "qualification-installed"
                   },
                   "failed_step_sequence": 1,
@@ -1704,7 +1704,7 @@
             ],
             "describe": {
               "workflow_id": "lifecycle-reject",
-              "run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+              "run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -1712,19 +1712,19 @@
               "commands_scope": "selected_run",
               "commands": [
                 {
-                  "id": "01M7A3B31P36CR0YXDG5D0TEWP",
+                  "id": "01M7A4GMAZ1ZE3K99SKRM7QGA8",
                   "sequence": 1,
                   "type": "start",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                  "resolved_run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                   "source": "control_plane",
                   "status": "accepted",
                   "outcome": "started_new",
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:41.526Z",
-                  "applied_at": "2026-11-13T09:20:41.526Z",
+                  "accepted_at": "2026-11-13T09:41:11.647Z",
+                  "applied_at": "2026-11-13T09:41:11.647Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -1777,12 +1777,12 @@
                 "blob": "wwHioz3/VYAiNwwGCgxyZWplY3QEAAoGYm9iAA=="
               },
               "output_envelope": null,
-              "started_at": "2026-11-13T09:20:41.526000Z",
-              "closed_at": "2026-11-13T09:20:41.558000Z",
+              "started_at": "2026-11-13T09:41:11.647000Z",
+              "closed_at": "2026-11-13T09:41:11.713000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 30,
-              "execution_deadline_at": "2026-11-13T09:21:41+00:00",
-              "run_deadline_at": "2026-11-13T09:21:11+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:11+00:00",
+              "run_deadline_at": "2026-11-13T09:41:41+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -1819,7 +1819,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:41+00:00",
+              "last_progress_at": "2026-11-13T09:41:11+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -1844,7 +1844,7 @@
                 "failure_category": "application",
                 "non_retryable": true,
                 "source_kind": "workflow_run",
-                "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                 "event_sequence": 6,
                 "exception": {
                   "type": "ActivityFailed",
@@ -1857,9 +1857,9 @@
                     "event_type": "ActivityFailed",
                     "activity_type": "qualification.reject",
                     "activity_class": "qualification.reject",
-                    "activity_execution_id": "01M7A3B3209165D1QP0Z263V47",
-                    "activity_attempt_id": "01M7A3B322CQDG88M2ENW95D20",
-                    "failure_id": "01M7A3B32DY375A8FCRTX84NTV",
+                    "activity_execution_id": "01M7A4GMBDTSSR50Q1N5G382SP",
+                    "activity_attempt_id": "01M7A4GMBJA1B0JMY0BTW3P9MA",
+                    "failure_id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                     "failure_category": "activity",
                     "exception_type": "QualificationRejected",
                     "exception_class": "RuntimeException",
@@ -1869,9 +1869,9 @@
                 ],
                 "failures": [
                   {
-                    "id": "01M7A3B32DY375A8FCRTX84NTV",
+                    "id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                     "source_kind": "activity_execution",
-                    "source_id": "01M7A3B3209165D1QP0Z263V47",
+                    "source_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                     "propagation_kind": "activity",
                     "failure_category": "activity",
                     "non_retryable": true,
@@ -1888,9 +1888,9 @@
                     "history_authority": "typed_history"
                   },
                   {
-                    "id": "01M7A3B32PHZ4J7HKG3EZGVDNJ",
+                    "id": "01M7A4GMD1V92Z85QED57ZHT82",
                     "source_kind": "workflow_run",
-                    "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                    "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                     "propagation_kind": "terminal",
                     "failure_category": "application",
                     "non_retryable": true,
@@ -1915,9 +1915,9 @@
               },
               "failures": [
                 {
-                  "id": "01M7A3B32DY375A8FCRTX84NTV",
+                  "id": "01M7A4GMC4CYN4PDAGTDBJMNV1",
                   "source_kind": "activity_execution",
-                  "source_id": "01M7A3B3209165D1QP0Z263V47",
+                  "source_id": "01M7A4GMBDTSSR50Q1N5G382SP",
                   "propagation_kind": "activity",
                   "failure_category": "activity",
                   "non_retryable": true,
@@ -1934,9 +1934,9 @@
                   "history_authority": "typed_history"
                 },
                 {
-                  "id": "01M7A3B32PHZ4J7HKG3EZGVDNJ",
+                  "id": "01M7A4GMD1V92Z85QED57ZHT82",
                   "source_kind": "workflow_run",
-                  "source_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                  "source_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                   "propagation_kind": "terminal",
                   "failure_category": "application",
                   "non_retryable": true,
@@ -1987,7 +1987,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+                "run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -1999,9 +1999,9 @@
                 "run_count": 1,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:41.526000Z",
-                "closed_at": "2026-11-13T09:20:41.558000Z",
-                "last_progress_at": "2026-11-13T09:20:41+00:00",
+                "started_at": "2026-11-13T09:41:11.647000Z",
+                "closed_at": "2026-11-13T09:41:11.713000Z",
+                "last_progress_at": "2026-11-13T09:41:11+00:00",
                 "wait_kind": null,
                 "wait_reason": null,
                 "exception": {
@@ -2014,7 +2014,7 @@
           },
           "timeout": {
             "event_types": {
-              "01M7A3B38QYG73P4X7V4Y1K6YY": [
+              "01M7A4GMGDPMAH1J6RD78S25N3": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "TimerScheduled",
@@ -2026,29 +2026,29 @@
               {
                 "sequence": 5,
                 "event_type": "WorkflowTimedOut",
-                "timestamp": "2026-11-13T09:20:44.270000Z",
+                "timestamp": "2026-11-13T09:41:14.478000Z",
                 "principal": null,
                 "payload": {
-                  "failure_id": "01M7A3B5QEM8PW3RCZZS3Q61DE",
+                  "failure_id": "01M7A4GQ3E7V9RNNKP2P2KRXJZ",
                   "timeout_kind": "run_timeout",
                   "failure_category": "timeout",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "execution_deadline_at": "2026-11-13T09:21:41+00:00",
-                  "run_deadline_at": "2026-11-13T09:20:43+00:00",
+                  "execution_deadline_at": "2026-11-13T09:42:11+00:00",
+                  "run_deadline_at": "2026-11-13T09:41:13+00:00",
                   "task": {
-                    "id": "01M7A3B5Q30JGHHASZ72N8NF1Q",
+                    "id": "01M7A4GQ2FKV4N2RSKAY5MGPZH",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 1,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:44.259000Z",
-                    "leased_at": "2026-11-13T09:20:44.261000Z",
-                    "lease_expires_at": "2026-11-13T09:21:44.261000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:44.260000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:44.260000Z",
+                    "available_at": "2026-11-13T09:41:14.447000Z",
+                    "leased_at": "2026-11-13T09:41:14.454000Z",
+                    "lease_expires_at": "2026-11-13T09:42:14.453000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:14.449000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:14.449000Z",
                     "lease_owner": "qualification-installed"
                   }
                 }
@@ -2059,29 +2059,29 @@
               {
                 "sequence": 5,
                 "event_type": "WorkflowTimedOut",
-                "timestamp": "2026-11-13T09:20:44.270000Z",
+                "timestamp": "2026-11-13T09:41:14.478000Z",
                 "principal": null,
                 "payload": {
-                  "failure_id": "01M7A3B5QEM8PW3RCZZS3Q61DE",
+                  "failure_id": "01M7A4GQ3E7V9RNNKP2P2KRXJZ",
                   "timeout_kind": "run_timeout",
                   "failure_category": "timeout",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "execution_deadline_at": "2026-11-13T09:21:41+00:00",
-                  "run_deadline_at": "2026-11-13T09:20:43+00:00",
+                  "execution_deadline_at": "2026-11-13T09:42:11+00:00",
+                  "run_deadline_at": "2026-11-13T09:41:13+00:00",
                   "task": {
-                    "id": "01M7A3B5Q30JGHHASZ72N8NF1Q",
+                    "id": "01M7A4GQ2FKV4N2RSKAY5MGPZH",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 1,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:44.259000Z",
-                    "leased_at": "2026-11-13T09:20:44.261000Z",
-                    "lease_expires_at": "2026-11-13T09:21:44.261000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:44.260000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:44.260000Z",
+                    "available_at": "2026-11-13T09:41:14.447000Z",
+                    "leased_at": "2026-11-13T09:41:14.454000Z",
+                    "lease_expires_at": "2026-11-13T09:42:14.453000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:14.449000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:14.449000Z",
                     "lease_owner": "qualification-installed"
                   }
                 }
@@ -2089,7 +2089,7 @@
             ],
             "describe": {
               "workflow_id": "lifecycle-timeout",
-              "run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+              "run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -2097,19 +2097,19 @@
               "commands_scope": "selected_run",
               "commands": [
                 {
-                  "id": "01M7A3B38QYG73P4X7V4Y1K6YZ",
+                  "id": "01M7A4GMGDPMAH1J6RD78S25N4",
                   "sequence": 1,
                   "type": "start",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                  "resolved_run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                   "source": "control_plane",
                   "status": "accepted",
                   "outcome": "started_new",
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:41.751Z",
-                  "applied_at": "2026-11-13T09:20:41.751Z",
+                  "accepted_at": "2026-11-13T09:41:11.821Z",
+                  "applied_at": "2026-11-13T09:41:11.821Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -2161,12 +2161,12 @@
                 "blob": "wwHioz3/VYAiNwwECg50aW1lb3V0BAAA"
               },
               "output_envelope": null,
-              "started_at": "2026-11-13T09:20:41.751000Z",
-              "closed_at": "2026-11-13T09:20:44.269000Z",
+              "started_at": "2026-11-13T09:41:11.821000Z",
+              "closed_at": "2026-11-13T09:41:14.477000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 2,
-              "execution_deadline_at": "2026-11-13T09:21:41+00:00",
-              "run_deadline_at": "2026-11-13T09:20:43+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:11+00:00",
+              "run_deadline_at": "2026-11-13T09:41:13+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -2203,7 +2203,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:44+00:00",
+              "last_progress_at": "2026-11-13T09:41:14+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -2220,35 +2220,35 @@
               },
               "updates_scope": "selected_run",
               "updates": [],
-              "error": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+              "error": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
               "failure": {
-                "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                 "reason": "run_timeout",
                 "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                 "failure_category": "timeout",
                 "non_retryable": false,
                 "source_kind": "workflow_run",
-                "source_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                "source_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                 "event_sequence": 5,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
                 },
                 "failures": [
                   {
-                    "id": "01M7A3B5QEM8PW3RCZZS3Q61DE",
+                    "id": "01M7A4GQ3E7V9RNNKP2P2KRXJZ",
                     "source_kind": "workflow_run",
-                    "source_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                    "source_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                     "propagation_kind": "timeout",
                     "reason": "run_timeout",
                     "failure_category": "timeout",
                     "non_retryable": false,
                     "handled": false,
                     "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                    "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                    "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                     "exception_payload": {
                       "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                      "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                      "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
                     },
                     "event_sequence": 5,
                     "history_authority": "typed_history"
@@ -2257,23 +2257,23 @@
               },
               "exception": {
                 "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
               },
               "failures": [
                 {
-                  "id": "01M7A3B5QEM8PW3RCZZS3Q61DE",
+                  "id": "01M7A4GQ3E7V9RNNKP2P2KRXJZ",
                   "source_kind": "workflow_run",
-                  "source_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                  "source_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                   "propagation_kind": "timeout",
                   "reason": "run_timeout",
                   "failure_category": "timeout",
                   "non_retryable": false,
                   "handled": false,
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00.",
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00.",
                   "exception_payload": {
                     "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                    "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                    "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
                   },
                   "event_sequence": 5,
                   "history_authority": "typed_history"
@@ -2313,7 +2313,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+                "run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -2325,14 +2325,14 @@
                 "run_count": 1,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:41.751000Z",
-                "closed_at": "2026-11-13T09:20:44.269000Z",
-                "last_progress_at": "2026-11-13T09:20:44+00:00",
+                "started_at": "2026-11-13T09:41:11.821000Z",
+                "closed_at": "2026-11-13T09:41:14.477000Z",
+                "last_progress_at": "2026-11-13T09:41:14+00:00",
                 "wait_kind": null,
                 "wait_reason": null,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:43+00:00."
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:13+00:00."
                 }
               }
             }
@@ -2341,36 +2341,36 @@
       },
       "acknowledgements": [
         {
-          "time": 1794561641.3602574,
-          "path": "/api/worker/workflow-tasks/01M7A3B2TTD9FQHQC7PRWYSX70/complete",
+          "time": 1794562871.461474,
+          "path": "/api/worker/workflow-tasks/01M7A4GM4JJXCH9KXD6DGPE9JT/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B2TTD9FQHQC7PRWYSX70",
-            "run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+            "task_id": "01M7A4GM4JJXCH9KXD6DGPE9JT",
+            "run_id": "01M7A4GM4H98T7C21K6K654G6Y",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3B2W9ESVQ4FXFK8E4W79A"
+              "01M7A4GM53HQDD8VYBC4DZXAZ6"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561641.4211128,
-          "path": "/api/worker/workflow-tasks/01M7A3B2XCZ2VQNBY78MTKJP7E/complete",
+          "time": 1794562871.4810789,
+          "path": "/api/worker/workflow-tasks/01M7A4GM5EZNH35NS60YSHR66M/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B2XCZ2VQNBY78MTKJP7E",
-            "run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+            "task_id": "01M7A4GM5EZNH35NS60YSHR66M",
+            "run_id": "01M7A4GM4H98T7C21K6K654G6Y",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -2381,15 +2381,15 @@
           }
         },
         {
-          "time": 1794561641.4841983,
-          "path": "/api/worker/workflow-tasks/01M7A3B2ZGSEC4HSP2AAXW0MEK/complete",
+          "time": 1794562871.593243,
+          "path": "/api/worker/workflow-tasks/01M7A4GM8GKJXDM4N8E5949C60/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B2ZGSEC4HSP2AAXW0MEK",
-            "run_id": "01M7A3B2TQGJ0ASEZCGXA5J2QH",
+            "task_id": "01M7A4GM8GKJXDM4N8E5949C60",
+            "run_id": "01M7A4GM4H98T7C21K6K654G6Y",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -2400,36 +2400,36 @@
           }
         },
         {
-          "time": 1794561641.5384543,
-          "path": "/api/worker/workflow-tasks/01M7A3B31Q92P2BV63FJZZBTJV/complete",
+          "time": 1794562871.6657891,
+          "path": "/api/worker/workflow-tasks/01M7A4GMB03NHXKWAZABGV54AW/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B31Q92P2BV63FJZZBTJV",
-            "run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+            "task_id": "01M7A4GMB03NHXKWAZABGV54AW",
+            "run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3B3209165D1QP0Z263V49"
+              "01M7A4GMBEFW27HX6Y97KAR2DQ"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561641.5610526,
-          "path": "/api/worker/workflow-tasks/01M7A3B32DY375A8FCRTX84NTX/complete",
+          "time": 1794562871.7163727,
+          "path": "/api/worker/workflow-tasks/01M7A4GMC6FKA07VRPDPFRZ3ZH/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B32DY375A8FCRTX84NTX",
-            "run_id": "01M7A3B31P36CR0YXDG5D0TEWN",
+            "task_id": "01M7A4GMC6FKA07VRPDPFRZ3ZH",
+            "run_id": "01M7A4GMAZ1ZE3K99SKRM7QGA7",
             "run_status": "failed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -2440,36 +2440,36 @@
           }
         },
         {
-          "time": 1794561641.6592965,
-          "path": "/api/worker/workflow-tasks/01M7A3B34QBKQ5G5FY5JY7YQEG/complete",
+          "time": 1794562871.7940106,
+          "path": "/api/worker/workflow-tasks/01M7A4GMF44K7KKG28SN1GABEK/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B34QBKQ5G5FY5JY7YQEG",
-            "run_id": "01M7A3B34N0N5334DBJWA9X0J3",
+            "task_id": "01M7A4GMF44K7KKG28SN1GABEK",
+            "run_id": "01M7A4GMF359MH89VC9V5N17YZ",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3B35K7CG7M9HAPX4MYTCN"
+              "01M7A4GMFFRX0Z46SM9TWPP9M8"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561641.6828787,
-          "path": "/api/worker/workflow-tasks/01M7A3B35K7CG7M9HAPX4MYTCN/complete",
+          "time": 1794562871.8029618,
+          "path": "/api/worker/workflow-tasks/01M7A4GMFFRX0Z46SM9TWPP9M8/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B35K7CG7M9HAPX4MYTCN",
-            "run_id": "01M7A3B35FT7AA5Q0TV11K5402",
+            "task_id": "01M7A4GMFFRX0Z46SM9TWPP9M8",
+            "run_id": "01M7A4GMFESP7S5PV7J6NBPRKX",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -2480,39 +2480,39 @@
           }
         },
         {
-          "time": 1794561641.783199,
-          "path": "/api/worker/workflow-tasks/01M7A3B38SNH1VD4Q5EKDY3GBC/complete",
+          "time": 1794562871.8340476,
+          "path": "/api/worker/workflow-tasks/01M7A4GMGEF3ZM9TXP3AH5XVR7/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B38SNH1VD4Q5EKDY3GBC",
-            "run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+            "task_id": "01M7A4GMGEF3ZM9TXP3AH5XVR7",
+            "run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3B39HQYGR02DXDAPG5E5K"
+              "01M7A4GMGR82E780CNC13HR627"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561644.2722435,
-          "path": "/api/worker/workflow-tasks/01M7A3B5Q30JGHHASZ72N8NF1Q/fail",
+          "time": 1794562874.4821513,
+          "path": "/api/worker/workflow-tasks/01M7A4GQ2FKV4N2RSKAY5MGPZH/fail",
           "status": 409,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": "WorkflowTaskWaitingForHistory",
           "response": {
-            "task_id": "01M7A3B5Q30JGHHASZ72N8NF1Q",
+            "task_id": "01M7A4GQ2FKV4N2RSKAY5MGPZH",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": false,
-            "run_id": "01M7A3B38QYG73P4X7V4Y1K6YY",
+            "run_id": "01M7A4GMGDPMAH1J6RD78S25N3",
             "run_status": "failed",
             "created_task_ids": [],
             "reason": "run_timed_out",
@@ -2520,57 +2520,57 @@
           }
         },
         {
-          "time": 1794561644.3245375,
-          "path": "/api/worker/workflow-tasks/01M7A3B5RVPM37ZANRM2TV0717/complete",
+          "time": 1794562874.578795,
+          "path": "/api/worker/workflow-tasks/01M7A4GQ5S7RJ7T460VG0JZZKF/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B5RVPM37ZANRM2TV0717",
-            "run_id": "01M7A3B5RTY7MRMDKPK1B58WZ3",
+            "task_id": "01M7A4GQ5S7RJ7T460VG0JZZKF",
+            "run_id": "01M7A4GQ5PJP7206G2KF6BDY5J",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3B5S3KKHGGE19GYZT3F7K"
+              "01M7A4GQ6F1QNFJXGEZGVZVTJK"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561644.3733654,
-          "path": "/api/worker/workflow-tasks/01M7A3B5T88X0YES5TX15RN5J7/complete",
+          "time": 1794562874.66016,
+          "path": "/api/worker/workflow-tasks/01M7A4GQ86698MHN5TDSMMPKCK/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B5T88X0YES5TX15RN5J7",
-            "run_id": "01M7A3B5T7TZNRVERH351HRPS5",
+            "task_id": "01M7A4GQ86698MHN5TDSMMPKCK",
+            "run_id": "01M7A4GQ84JWJ70F4W41WSBAEC",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3B5TK9X4BFY1MF2D30V6J"
+              "01M7A4GQ8ZQTBFJQBCHSFWBWK0"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561644.38212,
-          "path": "/api/worker/workflow-tasks/01M7A3B5TK9X4BFY1MF2D30V6J/complete",
+          "time": 1794562874.6821094,
+          "path": "/api/worker/workflow-tasks/01M7A4GQ8ZQTBFJQBCHSFWBWK0/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3B5TK9X4BFY1MF2D30V6J",
-            "run_id": "01M7A3B5TJ0E4RM7YED6FJ8SXB",
+            "task_id": "01M7A4GQ8ZQTBFJQBCHSFWBWK0",
+            "run_id": "01M7A4GQ8X5TYKWWPTY80Y6VT1",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -2585,7 +2585,7 @@
     },
     "deadline": {
       "cell": "deadline",
-      "deadline_unix": 1794562246,
+      "deadline_unix": 1794563477,
       "kill_after_seconds": 10,
       "cluster_info": {
         "version": "3.8.0",
@@ -2606,7 +2606,7 @@
                 "event_sequence": 5,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                  "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
                 },
                 "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                 "failure_category": "timeout",
@@ -2616,31 +2616,31 @@
                     "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                     "exception_payload": {
                       "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                      "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                      "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
                     },
                     "failure_category": "timeout",
                     "handled": false,
                     "history_authority": "typed_history",
-                    "id": "01M7A3BTNZRERSYHW6RHWY2JFR",
-                    "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                    "id": "01M7A4HCGZ6Q7CFZ1A2E6T9GP4",
+                    "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                     "non_retryable": false,
                     "propagation_kind": "timeout",
                     "reason": "execution_timeout",
-                    "source_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                    "source_id": "01M7A4H552JPGTY3PKM0W2KASV",
                     "source_kind": "workflow_run"
                   }
                 ],
-                "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                 "non_retryable": false,
                 "reason": "execution_timeout",
-                "source_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                "source_id": "01M7A4H552JPGTY3PKM0W2KASV",
                 "source_kind": "workflow_run"
               }
             },
-            "final_run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+            "final_run_id": "01M7A4H552JPGTY3PKM0W2KASV",
             "next": {
-              "final_run_id": "01M7A3BTQM1GVPCSDB527SKZNE",
-              "original_run_id": "01M7A3BTQ9RAKJVZCJEJBXEH5T",
+              "final_run_id": "01M7A4HCJ9Y6TYNNJG09MVWE0V",
+              "original_run_id": "01M7A4HCHVKQAZXCX34KHJSTTM",
               "result": {
                 "bigint": 9223372036854775807,
                 "false": false,
@@ -2652,11 +2652,11 @@
               "status": "completed",
               "workflow_id": "after-execution"
             },
-            "original_run_id": "01M7A3BGXEP67EFNAPE699H73M",
+            "original_run_id": "01M7A4H2XQKCTR09664D2025GX",
             "receipt": {
               "delay_seconds": 3.0,
               "failure_type": "WorkflowTaskWaitingForHistory",
-              "path": "/api/worker/workflow-tasks/01M7A3BQQC1J5VNCKRM42E052A/fail",
+              "path": "/api/worker/workflow-tasks/01M7A4H9JEM9J3R4TAFKE3DJ0D/fail",
               "request_attempt": 1,
               "response": {
                 "created_task_ids": [],
@@ -2664,18 +2664,18 @@
                 "protocol_version": "1.20",
                 "reason": "run_timed_out",
                 "recorded": false,
-                "run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                "run_id": "01M7A4H552JPGTY3PKM0W2KASV",
                 "run_status": "failed",
-                "task_id": "01M7A3BQQC1J5VNCKRM42E052A",
+                "task_id": "01M7A4H9JEM9J3R4TAFKE3DJ0D",
                 "workflow_task_attempt": 1
               },
               "status": 409,
-              "time": 1794561665.7334175
+              "time": 1794562896.419158
             },
             "status": "failed",
             "terminal": {
               "reason": "execution_timeout",
-              "run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+              "run_id": "01M7A4H552JPGTY3PKM0W2KASV",
               "sdk_error": "timed_out"
             },
             "workflow_id": "deadline-execution"
@@ -2687,7 +2687,7 @@
                 "event_sequence": 6,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
                 },
                 "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                 "failure_category": "timeout",
@@ -2697,31 +2697,31 @@
                     "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                     "exception_payload": {
                       "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                      "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                      "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
                     },
                     "failure_category": "timeout",
                     "handled": false,
                     "history_authority": "typed_history",
-                    "id": "01M7A3BGTGW10WRGK4C01FCM9G",
-                    "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                    "id": "01M7A4H2P0J16M8R33R6YT4MB5",
+                    "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                     "non_retryable": false,
                     "propagation_kind": "timeout",
                     "reason": "run_timeout",
-                    "source_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                    "source_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                     "source_kind": "workflow_run"
                   }
                 ],
-                "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                 "non_retryable": false,
                 "reason": "run_timeout",
-                "source_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                "source_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                 "source_kind": "workflow_run"
               }
             },
-            "final_run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+            "final_run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
             "next": {
-              "final_run_id": "01M7A3BGVRCFRX59Z7XRBJN545",
-              "original_run_id": "01M7A3BGV43F0DFKR8HY00X4NB",
+              "final_run_id": "01M7A4H2SRR3V3MG5YMEGH49RM",
+              "original_run_id": "01M7A4H2RAJHWMWQ459DVGMW9Y",
               "result": {
                 "bigint": 9223372036854775807,
                 "false": false,
@@ -2733,11 +2733,11 @@
               "status": "completed",
               "workflow_id": "after-run"
             },
-            "original_run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+            "original_run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
             "receipt": {
               "delay_seconds": 3.0,
               "failure_type": "WorkflowTaskWaitingForHistory",
-              "path": "/api/worker/workflow-tasks/01M7A3BDWF3YESG2Y9QPWAZNMW/fail",
+              "path": "/api/worker/workflow-tasks/01M7A4GZQ7FAV96K55SZG6MBS1/fail",
               "request_attempt": 1,
               "response": {
                 "created_task_ids": [],
@@ -2745,18 +2745,18 @@
                 "protocol_version": "1.20",
                 "reason": "run_timed_out",
                 "recorded": false,
-                "run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                "run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                 "run_status": "failed",
-                "task_id": "01M7A3BDWF3YESG2Y9QPWAZNMW",
+                "task_id": "01M7A4GZQ7FAV96K55SZG6MBS1",
                 "workflow_task_attempt": 1
               },
               "status": 409,
-              "time": 1794561655.6351006
+              "time": 1794562886.343846
             },
             "status": "failed",
             "terminal": {
               "reason": "run_timeout",
-              "run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+              "run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
               "sdk_error": "timed_out"
             },
             "workflow_id": "deadline-run"
@@ -2771,14 +2771,14 @@
         "cases": {
           "execution": {
             "event_types": {
-              "01M7A3BGXEP67EFNAPE699H73M": [
+              "01M7A4H2XQKCTR09664D2025GX": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "TimerScheduled",
                 "TimerFired",
                 "WorkflowContinuedAsNew"
               ],
-              "01M7A3BK2BM4H2FQQ25830A5KT": [
+              "01M7A4H552JPGTY3PKM0W2KASV": [
                 "WorkflowStarted",
                 "TimerScheduled",
                 "SignalReceived",
@@ -2786,7 +2786,7 @@
                 "WorkflowTimedOut",
                 "SignalRejected"
               ],
-              "next:01M7A3BTQM1GVPCSDB527SKZNE": [
+              "next:01M7A4HCJ9Y6TYNNJG09MVWE0V": [
                 "WorkflowStarted",
                 "WorkflowCompleted"
               ]
@@ -2795,29 +2795,29 @@
               {
                 "sequence": 5,
                 "event_type": "WorkflowTimedOut",
-                "timestamp": "2026-11-13T09:21:05.727000Z",
+                "timestamp": "2026-11-13T09:41:36.415000Z",
                 "principal": null,
                 "payload": {
-                  "failure_id": "01M7A3BTNZRERSYHW6RHWY2JFR",
+                  "failure_id": "01M7A4HCGZ6Q7CFZ1A2E6T9GP4",
                   "timeout_kind": "execution_timeout",
                   "failure_category": "timeout",
-                  "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                  "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "execution_deadline_at": "2026-11-13T09:21:00+00:00",
-                  "run_deadline_at": "2026-11-13T09:21:01+00:00",
+                  "execution_deadline_at": "2026-11-13T09:41:31+00:00",
+                  "run_deadline_at": "2026-11-13T09:41:32+00:00",
                   "task": {
-                    "id": "01M7A3BQQC1J5VNCKRM42E052A",
+                    "id": "01M7A4H9JEM9J3R4TAFKE3DJ0D",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 1,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:21:02.700000Z",
-                    "leased_at": "2026-11-13T09:21:02.706000Z",
-                    "lease_expires_at": "2026-11-13T09:22:02.706000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:21:02.702000Z",
-                    "last_dispatched_at": "2026-11-13T09:21:02.702000Z",
+                    "available_at": "2026-11-13T09:41:33.390000Z",
+                    "leased_at": "2026-11-13T09:41:33.395000Z",
+                    "lease_expires_at": "2026-11-13T09:42:33.395000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:33.392000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:33.392000Z",
                     "lease_owner": "qualification-installed"
                   }
                 }
@@ -2828,29 +2828,29 @@
               {
                 "sequence": 5,
                 "event_type": "WorkflowTimedOut",
-                "timestamp": "2026-11-13T09:21:05.727000Z",
+                "timestamp": "2026-11-13T09:41:36.415000Z",
                 "principal": null,
                 "payload": {
-                  "failure_id": "01M7A3BTNZRERSYHW6RHWY2JFR",
+                  "failure_id": "01M7A4HCGZ6Q7CFZ1A2E6T9GP4",
                   "timeout_kind": "execution_timeout",
                   "failure_category": "timeout",
-                  "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                  "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "execution_deadline_at": "2026-11-13T09:21:00+00:00",
-                  "run_deadline_at": "2026-11-13T09:21:01+00:00",
+                  "execution_deadline_at": "2026-11-13T09:41:31+00:00",
+                  "run_deadline_at": "2026-11-13T09:41:32+00:00",
                   "task": {
-                    "id": "01M7A3BQQC1J5VNCKRM42E052A",
+                    "id": "01M7A4H9JEM9J3R4TAFKE3DJ0D",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 1,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:21:02.700000Z",
-                    "leased_at": "2026-11-13T09:21:02.706000Z",
-                    "lease_expires_at": "2026-11-13T09:22:02.706000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:21:02.702000Z",
-                    "last_dispatched_at": "2026-11-13T09:21:02.702000Z",
+                    "available_at": "2026-11-13T09:41:33.390000Z",
+                    "leased_at": "2026-11-13T09:41:33.395000Z",
+                    "lease_expires_at": "2026-11-13T09:42:33.395000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:33.392000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:33.392000Z",
                     "lease_owner": "qualification-installed"
                   }
                 }
@@ -2858,7 +2858,7 @@
             ],
             "describe": {
               "workflow_id": "deadline-execution",
-              "run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+              "run_id": "01M7A4H552JPGTY3PKM0W2KASV",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -2866,11 +2866,11 @@
               "commands_scope": "selected_run",
               "commands": [
                 {
-                  "id": "01M7A3BK3RWK9X7KWPPWANQM9V",
+                  "id": "01M7A4H55RDJ4BA0N39M2MQ73W",
                   "sequence": 1,
                   "type": "signal",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                  "resolved_run_id": "01M7A4H552JPGTY3PKM0W2KASV",
                   "target_name": "__durable_workflow_message_stream",
                   "source": "control_plane",
                   "status": "accepted",
@@ -2878,7 +2878,7 @@
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:57.977Z",
+                  "accepted_at": "2026-11-13T09:41:28.888Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -2917,7 +2917,7 @@
               "is_terminal": true,
               "closed_reason": "timed_out",
               "run_number": 2,
-              "continued_from_run_id": "01M7A3BGXEP67EFNAPE699H73M",
+              "continued_from_run_id": "01M7A4H2XQKCTR09664D2025GX",
               "payload_codec": "avro",
               "input": [
                 "exec-timeout",
@@ -2930,12 +2930,12 @@
                 "blob": "wwHioz3/VYAiNwwEChhleGVjLXRpbWVvdXQEAgA="
               },
               "output_envelope": null,
-              "started_at": "2026-11-13T09:20:57.931000Z",
-              "closed_at": "2026-11-13T09:21:05.725000Z",
+              "started_at": "2026-11-13T09:41:28.866000Z",
+              "closed_at": "2026-11-13T09:41:36.414000Z",
               "execution_timeout_seconds": 5,
               "run_timeout_seconds": 4,
-              "execution_deadline_at": "2026-11-13T09:21:00+00:00",
-              "run_deadline_at": "2026-11-13T09:21:01+00:00",
+              "execution_deadline_at": "2026-11-13T09:41:31+00:00",
+              "run_deadline_at": "2026-11-13T09:41:32+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -2972,7 +2972,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:21:05+00:00",
+              "last_progress_at": "2026-11-13T09:41:36+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -2989,35 +2989,35 @@
               },
               "updates_scope": "selected_run",
               "updates": [],
-              "error": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+              "error": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
               "failure": {
-                "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                 "reason": "execution_timeout",
                 "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                 "failure_category": "timeout",
                 "non_retryable": false,
                 "source_kind": "workflow_run",
-                "source_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                "source_id": "01M7A4H552JPGTY3PKM0W2KASV",
                 "event_sequence": 5,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                  "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
                 },
                 "failures": [
                   {
-                    "id": "01M7A3BTNZRERSYHW6RHWY2JFR",
+                    "id": "01M7A4HCGZ6Q7CFZ1A2E6T9GP4",
                     "source_kind": "workflow_run",
-                    "source_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                    "source_id": "01M7A4H552JPGTY3PKM0W2KASV",
                     "propagation_kind": "timeout",
                     "reason": "execution_timeout",
                     "failure_category": "timeout",
                     "non_retryable": false,
                     "handled": false,
                     "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                    "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                    "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                     "exception_payload": {
                       "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                      "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                      "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
                     },
                     "event_sequence": 5,
                     "history_authority": "typed_history"
@@ -3026,23 +3026,23 @@
               },
               "exception": {
                 "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
               },
               "failures": [
                 {
-                  "id": "01M7A3BTNZRERSYHW6RHWY2JFR",
+                  "id": "01M7A4HCGZ6Q7CFZ1A2E6T9GP4",
                   "source_kind": "workflow_run",
-                  "source_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                  "source_id": "01M7A4H552JPGTY3PKM0W2KASV",
                   "propagation_kind": "timeout",
                   "reason": "execution_timeout",
                   "failure_category": "timeout",
                   "non_retryable": false,
                   "handled": false,
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00.",
+                  "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00.",
                   "exception_payload": {
                     "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                    "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                    "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
                   },
                   "event_sequence": 5,
                   "history_authority": "typed_history"
@@ -3082,7 +3082,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+                "run_id": "01M7A4H552JPGTY3PKM0W2KASV",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -3094,21 +3094,21 @@
                 "run_count": 2,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:57.931000Z",
-                "closed_at": "2026-11-13T09:21:05.725000Z",
-                "last_progress_at": "2026-11-13T09:21:05+00:00",
+                "started_at": "2026-11-13T09:41:28.866000Z",
+                "closed_at": "2026-11-13T09:41:36.414000Z",
+                "last_progress_at": "2026-11-13T09:41:36+00:00",
                 "wait_kind": null,
                 "wait_reason": null,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow execution deadline expired at 2026-11-13T09:21:00+00:00."
+                  "message": "Workflow execution deadline expired at 2026-11-13T09:41:31+00:00."
                 }
               }
             }
           },
           "run": {
             "event_types": {
-              "01M7A3BAV7N0GXCCKX46NK8FXV": [
+              "01M7A4GWQ1WYGM7V681HCHFSNY": [
                 "StartAccepted",
                 "WorkflowStarted",
                 "TimerScheduled",
@@ -3117,7 +3117,7 @@
                 "WorkflowTimedOut",
                 "SignalRejected"
               ],
-              "next:01M7A3BGVRCFRX59Z7XRBJN545": [
+              "next:01M7A4H2SRR3V3MG5YMEGH49RM": [
                 "WorkflowStarted",
                 "WorkflowCompleted"
               ]
@@ -3126,29 +3126,29 @@
               {
                 "sequence": 6,
                 "event_type": "WorkflowTimedOut",
-                "timestamp": "2026-11-13T09:20:55.632000Z",
+                "timestamp": "2026-11-13T09:41:26.336000Z",
                 "principal": null,
                 "payload": {
-                  "failure_id": "01M7A3BGTGW10WRGK4C01FCM9G",
+                  "failure_id": "01M7A4H2P0J16M8R33R6YT4MB5",
                   "timeout_kind": "run_timeout",
                   "failure_category": "timeout",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "execution_deadline_at": "2026-11-13T09:21:49+00:00",
-                  "run_deadline_at": "2026-11-13T09:20:51+00:00",
+                  "execution_deadline_at": "2026-11-13T09:42:20+00:00",
+                  "run_deadline_at": "2026-11-13T09:41:22+00:00",
                   "task": {
-                    "id": "01M7A3BDWF3YESG2Y9QPWAZNMW",
+                    "id": "01M7A4GZQ7FAV96K55SZG6MBS1",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 1,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:52.623000Z",
-                    "leased_at": "2026-11-13T09:20:52.625000Z",
-                    "lease_expires_at": "2026-11-13T09:21:52.625000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:52.623000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:52.623000Z",
+                    "available_at": "2026-11-13T09:41:23.304000Z",
+                    "leased_at": "2026-11-13T09:41:23.311000Z",
+                    "lease_expires_at": "2026-11-13T09:42:23.311000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:23.306000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:23.306000Z",
                     "lease_owner": "qualification-installed"
                   }
                 }
@@ -3159,29 +3159,29 @@
               {
                 "sequence": 6,
                 "event_type": "WorkflowTimedOut",
-                "timestamp": "2026-11-13T09:20:55.632000Z",
+                "timestamp": "2026-11-13T09:41:26.336000Z",
                 "principal": null,
                 "payload": {
-                  "failure_id": "01M7A3BGTGW10WRGK4C01FCM9G",
+                  "failure_id": "01M7A4H2P0J16M8R33R6YT4MB5",
                   "timeout_kind": "run_timeout",
                   "failure_category": "timeout",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "execution_deadline_at": "2026-11-13T09:21:49+00:00",
-                  "run_deadline_at": "2026-11-13T09:20:51+00:00",
+                  "execution_deadline_at": "2026-11-13T09:42:20+00:00",
+                  "run_deadline_at": "2026-11-13T09:41:22+00:00",
                   "task": {
-                    "id": "01M7A3BDWF3YESG2Y9QPWAZNMW",
+                    "id": "01M7A4GZQ7FAV96K55SZG6MBS1",
                     "type": "workflow",
                     "status": "leased",
                     "attempt_count": 1,
                     "repair_count": 1,
                     "queue": "qualification-sdk",
                     "connection": "sqlite",
-                    "available_at": "2026-11-13T09:20:52.623000Z",
-                    "leased_at": "2026-11-13T09:20:52.625000Z",
-                    "lease_expires_at": "2026-11-13T09:21:52.625000Z",
-                    "last_dispatch_attempt_at": "2026-11-13T09:20:52.623000Z",
-                    "last_dispatched_at": "2026-11-13T09:20:52.623000Z",
+                    "available_at": "2026-11-13T09:41:23.304000Z",
+                    "leased_at": "2026-11-13T09:41:23.311000Z",
+                    "lease_expires_at": "2026-11-13T09:42:23.311000Z",
+                    "last_dispatch_attempt_at": "2026-11-13T09:41:23.306000Z",
+                    "last_dispatched_at": "2026-11-13T09:41:23.306000Z",
                     "lease_owner": "qualification-installed"
                   }
                 }
@@ -3189,7 +3189,7 @@
             ],
             "describe": {
               "workflow_id": "deadline-run",
-              "run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+              "run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
               "workflow_type": "qualification.lifecycle",
               "namespace": "default",
               "task_queue": "qualification-sdk",
@@ -3197,19 +3197,19 @@
               "commands_scope": "selected_run",
               "commands": [
                 {
-                  "id": "01M7A3BAV7N0GXCCKX46NK8FXW",
+                  "id": "01M7A4GWQ1WYGM7V681HCHFSNZ",
                   "sequence": 1,
                   "type": "start",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                  "resolved_run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                   "source": "control_plane",
                   "status": "accepted",
                   "outcome": "started_new",
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:49.511Z",
-                  "applied_at": "2026-11-13T09:20:49.511Z",
+                  "accepted_at": "2026-11-13T09:41:20.225Z",
+                  "applied_at": "2026-11-13T09:41:20.225Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -3242,11 +3242,11 @@
                   "request_fingerprint": "sha256:9bae3c9ca7e53cf27ba9b5672ff888d1dbc6df3e8d08daabf678d805736333f6"
                 },
                 {
-                  "id": "01M7A3BAWGE5MDC97N5CWB51Y2",
+                  "id": "01M7A4GWR6B8WXSCJZR6RQTE37",
                   "sequence": 2,
                   "type": "signal",
                   "target_scope": "instance",
-                  "resolved_run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                  "resolved_run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                   "target_name": "__durable_workflow_message_stream",
                   "source": "control_plane",
                   "status": "accepted",
@@ -3254,7 +3254,7 @@
                   "workflow_type": "qualification.lifecycle",
                   "workflow_class": "qualification.lifecycle",
                   "payload_preview_omitted": false,
-                  "accepted_at": "2026-11-13T09:20:49.552Z",
+                  "accepted_at": "2026-11-13T09:41:20.262Z",
                   "context": {
                     "caller": {
                       "type": "server",
@@ -3306,12 +3306,12 @@
                 "blob": "wwHioz3/VYAiNwwECg50aW1lb3V0BAAA"
               },
               "output_envelope": null,
-              "started_at": "2026-11-13T09:20:49.511000Z",
-              "closed_at": "2026-11-13T09:20:55.631000Z",
+              "started_at": "2026-11-13T09:41:20.225000Z",
+              "closed_at": "2026-11-13T09:41:26.334000Z",
               "execution_timeout_seconds": 60,
               "run_timeout_seconds": 2,
-              "execution_deadline_at": "2026-11-13T09:21:49+00:00",
-              "run_deadline_at": "2026-11-13T09:20:51+00:00",
+              "execution_deadline_at": "2026-11-13T09:42:20+00:00",
+              "run_deadline_at": "2026-11-13T09:41:22+00:00",
               "business_key": null,
               "resume_step_sequence": null,
               "recovery_kind": null,
@@ -3348,7 +3348,7 @@
                 "output_omitted": false,
                 "max_encoded_bytes": 2097152
               },
-              "last_progress_at": "2026-11-13T09:20:55+00:00",
+              "last_progress_at": "2026-11-13T09:41:26+00:00",
               "wait_kind": null,
               "wait_reason": null,
               "search_attributes": [],
@@ -3365,35 +3365,35 @@
               },
               "updates_scope": "selected_run",
               "updates": [],
-              "error": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+              "error": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
               "failure": {
-                "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                 "reason": "run_timeout",
                 "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
                 "failure_category": "timeout",
                 "non_retryable": false,
                 "source_kind": "workflow_run",
-                "source_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                "source_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                 "event_sequence": 6,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
                 },
                 "failures": [
                   {
-                    "id": "01M7A3BGTGW10WRGK4C01FCM9G",
+                    "id": "01M7A4H2P0J16M8R33R6YT4MB5",
                     "source_kind": "workflow_run",
-                    "source_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                    "source_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                     "propagation_kind": "timeout",
                     "reason": "run_timeout",
                     "failure_category": "timeout",
                     "non_retryable": false,
                     "handled": false,
                     "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                    "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                    "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                     "exception_payload": {
                       "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                      "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                      "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
                     },
                     "event_sequence": 6,
                     "history_authority": "typed_history"
@@ -3402,23 +3402,23 @@
               },
               "exception": {
                 "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
               },
               "failures": [
                 {
-                  "id": "01M7A3BGTGW10WRGK4C01FCM9G",
+                  "id": "01M7A4H2P0J16M8R33R6YT4MB5",
                   "source_kind": "workflow_run",
-                  "source_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                  "source_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                   "propagation_kind": "timeout",
                   "reason": "run_timeout",
                   "failure_category": "timeout",
                   "non_retryable": false,
                   "handled": false,
                   "exception_class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00.",
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00.",
                   "exception_payload": {
                     "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                    "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                    "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
                   },
                   "event_sequence": 6,
                   "history_authority": "typed_history"
@@ -3458,7 +3458,7 @@
                     "control_plane_internal_error"
                   ]
                 },
-                "run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+                "run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
                 "workflow_type": "qualification.lifecycle",
                 "namespace": "default",
                 "business_key": null,
@@ -3470,14 +3470,14 @@
                 "run_count": 1,
                 "is_current_run": true,
                 "compatibility": null,
-                "started_at": "2026-11-13T09:20:49.511000Z",
-                "closed_at": "2026-11-13T09:20:55.631000Z",
-                "last_progress_at": "2026-11-13T09:20:55+00:00",
+                "started_at": "2026-11-13T09:41:20.225000Z",
+                "closed_at": "2026-11-13T09:41:26.334000Z",
+                "last_progress_at": "2026-11-13T09:41:26+00:00",
                 "wait_kind": null,
                 "wait_reason": null,
                 "exception": {
                   "class": "Workflow\\V2\\Exceptions\\WorkflowTimeoutException",
-                  "message": "Workflow run deadline expired at 2026-11-13T09:20:51+00:00."
+                  "message": "Workflow run deadline expired at 2026-11-13T09:41:22+00:00."
                 }
               }
             }
@@ -3486,39 +3486,39 @@
       },
       "acknowledgements": [
         {
-          "time": 1794561649.5233839,
-          "path": "/api/worker/workflow-tasks/01M7A3BAV873AT6VH7CFN2R4PH/complete",
+          "time": 1794562880.2391632,
+          "path": "/api/worker/workflow-tasks/01M7A4GWQ2WV9DR1YNJTZ1RHCP/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BAV873AT6VH7CFN2R4PH",
-            "run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+            "task_id": "01M7A4GWQ2WV9DR1YNJTZ1RHCP",
+            "run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3BAVHS2S0F9MQYXXYW8VH"
+              "01M7A4GWQDJN7XCFN2Z326BD1R"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561655.6351006,
-          "path": "/api/worker/workflow-tasks/01M7A3BDWF3YESG2Y9QPWAZNMW/fail",
+          "time": 1794562886.343846,
+          "path": "/api/worker/workflow-tasks/01M7A4GZQ7FAV96K55SZG6MBS1/fail",
           "status": 409,
           "delay_seconds": 3.0,
           "request_attempt": 1,
           "failure_type": "WorkflowTaskWaitingForHistory",
           "response": {
-            "task_id": "01M7A3BDWF3YESG2Y9QPWAZNMW",
+            "task_id": "01M7A4GZQ7FAV96K55SZG6MBS1",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": false,
-            "run_id": "01M7A3BAV7N0GXCCKX46NK8FXV",
+            "run_id": "01M7A4GWQ1WYGM7V681HCHFSNY",
             "run_status": "failed",
             "created_task_ids": [],
             "reason": "run_timed_out",
@@ -3526,36 +3526,36 @@
           }
         },
         {
-          "time": 1794561655.6761827,
-          "path": "/api/worker/workflow-tasks/01M7A3BGV58SEND3X4KQ614K09/complete",
+          "time": 1794562886.4633822,
+          "path": "/api/worker/workflow-tasks/01M7A4H2RDBX9X428FBS2K7A3X/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BGV58SEND3X4KQ614K09",
-            "run_id": "01M7A3BGV43F0DFKR8HY00X4NB",
+            "task_id": "01M7A4H2RDBX9X428FBS2K7A3X",
+            "run_id": "01M7A4H2RAJHWMWQ459DVGMW9Y",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3BGVT6DVMAK42P3QWXPK6"
+              "01M7A4H2SVH56J8J9EV9R3GKKY"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561655.6864107,
-          "path": "/api/worker/workflow-tasks/01M7A3BGVT6DVMAK42P3QWXPK6/complete",
+          "time": 1794562886.4900818,
+          "path": "/api/worker/workflow-tasks/01M7A4H2SVH56J8J9EV9R3GKKY/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BGVT6DVMAK42P3QWXPK6",
-            "run_id": "01M7A3BGVRCFRX59Z7XRBJN545",
+            "task_id": "01M7A4H2SVH56J8J9EV9R3GKKY",
+            "run_id": "01M7A4H2SRR3V3MG5YMEGH49RM",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -3566,81 +3566,81 @@
           }
         },
         {
-          "time": 1794561655.7401283,
-          "path": "/api/worker/workflow-tasks/01M7A3BGXFGKBBK4ADR9HYYT4P/complete",
+          "time": 1794562886.6200793,
+          "path": "/api/worker/workflow-tasks/01M7A4H2XTJHYYMYW135ZX6KJP/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BGXFGKBBK4ADR9HYYT4P",
-            "run_id": "01M7A3BGXEP67EFNAPE699H73M",
+            "task_id": "01M7A4H2XTJHYYMYW135ZX6KJP",
+            "run_id": "01M7A4H2XQKCTR09664D2025GX",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3BGXSBXKJRZPQTZREWX1M"
+              "01M7A4H2YMB006ZAEQW7B5QGET"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561657.935983,
-          "path": "/api/worker/workflow-tasks/01M7A3BK1RAD71WP59GTRKXZWG/complete",
+          "time": 1794562888.8697906,
+          "path": "/api/worker/workflow-tasks/01M7A4H54R4HQQK3RY4VRRZ2AV/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BK1RAD71WP59GTRKXZWG",
-            "run_id": "01M7A3BGXEP67EFNAPE699H73M",
+            "task_id": "01M7A4H54R4HQQK3RY4VRRZ2AV",
+            "run_id": "01M7A4H2XQKCTR09664D2025GX",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3BK2DXRNT3GCYQJR7FJ6K"
+              "01M7A4H55308H46C3A0J03WDXM"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561657.9461446,
-          "path": "/api/worker/workflow-tasks/01M7A3BK2DXRNT3GCYQJR7FJ6K/complete",
+          "time": 1794562888.8787615,
+          "path": "/api/worker/workflow-tasks/01M7A4H55308H46C3A0J03WDXM/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BK2DXRNT3GCYQJR7FJ6K",
-            "run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+            "task_id": "01M7A4H55308H46C3A0J03WDXM",
+            "run_id": "01M7A4H552JPGTY3PKM0W2KASV",
             "run_status": "waiting",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3BK2RD2WJ9DTYCXFACNM5"
+              "01M7A4H55CTWSFMEM2ZK8AZ2B5"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561665.7334175,
-          "path": "/api/worker/workflow-tasks/01M7A3BQQC1J5VNCKRM42E052A/fail",
+          "time": 1794562896.419158,
+          "path": "/api/worker/workflow-tasks/01M7A4H9JEM9J3R4TAFKE3DJ0D/fail",
           "status": 409,
           "delay_seconds": 3.0,
           "request_attempt": 1,
           "failure_type": "WorkflowTaskWaitingForHistory",
           "response": {
-            "task_id": "01M7A3BQQC1J5VNCKRM42E052A",
+            "task_id": "01M7A4H9JEM9J3R4TAFKE3DJ0D",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": false,
-            "run_id": "01M7A3BK2BM4H2FQQ25830A5KT",
+            "run_id": "01M7A4H552JPGTY3PKM0W2KASV",
             "run_status": "failed",
             "created_task_ids": [],
             "reason": "run_timed_out",
@@ -3648,36 +3648,36 @@
           }
         },
         {
-          "time": 1794561665.783542,
-          "path": "/api/worker/workflow-tasks/01M7A3BTQA95W4683MBGDFJ3XF/complete",
+          "time": 1794562896.4601681,
+          "path": "/api/worker/workflow-tasks/01M7A4HCHWE7TWZ5J535XWJDCD/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BTQA95W4683MBGDFJ3XF",
-            "run_id": "01M7A3BTQ9RAKJVZCJEJBXEH5T",
+            "task_id": "01M7A4HCHWE7TWZ5J535XWJDCD",
+            "run_id": "01M7A4HCHVKQAZXCX34KHJSTTM",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
             "recorded": true,
             "reason": null,
             "created_task_ids": [
-              "01M7A3BTQNZG4KKBKE83M7VFM9"
+              "01M7A4HCJA4DRY4VRSR035J8FJ"
             ],
             "protocol_version": "1.20"
           }
         },
         {
-          "time": 1794561665.793545,
-          "path": "/api/worker/workflow-tasks/01M7A3BTQNZG4KKBKE83M7VFM9/complete",
+          "time": 1794562896.4695847,
+          "path": "/api/worker/workflow-tasks/01M7A4HCJA4DRY4VRSR035J8FJ/complete",
           "status": 200,
           "delay_seconds": 0,
           "request_attempt": 1,
           "failure_type": null,
           "response": {
-            "task_id": "01M7A3BTQNZG4KKBKE83M7VFM9",
-            "run_id": "01M7A3BTQM1GVPCSDB527SKZNE",
+            "task_id": "01M7A4HCJA4DRY4VRSR035J8FJ",
+            "run_id": "01M7A4HCJ9Y6TYNNJG09MVWE0V",
             "run_status": "completed",
             "workflow_task_attempt": 1,
             "outcome": "completed",
@@ -3699,5 +3699,5 @@
     "leftover_containers": [],
     "leftover_networks": []
   },
-  "finished_at": "2026-11-13T09:21:08.229711+00:00"
+  "finished_at": "2026-11-13T09:41:38.487435+00:00"
 }
