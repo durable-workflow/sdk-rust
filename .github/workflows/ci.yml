@@ -231,11 +231,7 @@ jobs:
       - run: cargo test --locked --all-targets --all-features
       - name: Qualify ready-age metrics against the published native Server
         if: ${{ matrix.rust == '1.86.0' }}
-        run: >-
-          python3 scripts/ci/qualify-worker-metrics.py
-          --server-image ghcr.io/durable-workflow/server@sha256:7988a23525d9e50e997a9f6f02e801300ed4f626de3cf6977033657ae7e9f58e
-          --expect-version 3.8.0
-          --expect-revision 28f084513235f6647e740c4b3d9e3aace7a323b7
+        run: python3 scripts/ci/qualify-worker-metrics.py
       - name: Save trusted Rust test dependencies
         if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
