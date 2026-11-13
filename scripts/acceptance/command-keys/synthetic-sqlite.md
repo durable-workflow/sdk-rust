@@ -59,3 +59,49 @@ installed SDK result, a physical old-image rehearsal or evidence of response
 loss. An actual synthetic cell still needs real current-producer API admissions,
 the exact published SDK/Server tuple, restart/readback/zero-write evidence and
 owned cleanup. Physical upgrade and post-commit loss remain separate cells.
+
+## Reproduce the open-state installed cell
+
+`run_open.py` is a one-shot Linux amd64/SQLite control. Prepare the
+[registry consumer](consumer/README.md), verify its archive/source identity with
+the existing release verifier, and record its build command plus source hash.
+Use a registry-only Cargo lock without patch, vendor or configuration overrides.
+The runner verifies the lock's official source, version and checksum; the owner
+still binds the compiled binary to the unchanged reviewed adapter source.
+
+Select an already qualified exact Server index/source/version and ensure the
+image is present locally. Check current machine capacity and announce the run
+before launching it. The runner owns at most one Server at a time, capped at
+1 CPU, 1 GiB and 256 PIDs, with an init process, read-only root, private SQLite
+bind, tmpfs for image-declared volumes, loopback ephemeral HTTP port and fresh
+synthetic credentials. It verifies image labels, architecture, live version
+and the command-key capability. It performs no build or package installation.
+
+Supply the selected exact identities and an absolute, nonexistent owned output
+directory:
+
+```sh
+python3 scripts/acceptance/command-keys/run_open.py \
+  --work-dir "$LEGACY_WORK_DIR" \
+  --consumer-binary "$CONSUMER_BINARY" \
+  --consumer-lock "$CONSUMER_LOCK" \
+  --sdk-version "$SDK_VERSION" --sdk-sha256 "$SDK_SHA256" --sdk-source "$SDK_SOURCE" \
+  --server-index "$SERVER_INDEX" --server-version "$SERVER_VERSION" \
+  --server-source "$SERVER_SOURCE"
+```
+
+The control admits real signal/update commands through the installed SDK,
+stops its exact owned Server, reads the actual `command_type` catalog, copies
+and transforms only the selected admissions, then restarts the same image on
+the copy. Four concurrent retries retain unverified legacy identities;
+explicit-original-run readback and name/run conflicts preserve them. Both raw
+receipt status and high-level SDK pending/signal behavior are checked. Complete
+logical database rows/schema must match before and after those calls.
+
+The original and copied databases, runtime and generated environment file are
+removed in cleanup. The terminal sanitized receipt and data-free catalog DDL
+remain in the output directory; keep diagnostic output for at most seven days
+and publish the lasting receipt in #216. This runner covers **open state only**.
+Completed/continued readbacks, ambiguity and case controls, actual physical
+upgrade and post-commit loss require their own named results. Python
+optimization is refused because it would disable conformance assertions.

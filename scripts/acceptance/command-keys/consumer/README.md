@@ -29,6 +29,8 @@ Operations use `op` plus the applicable `workflow_id`, `run_id`, `name`,
   `PayloadEnvelope::avro` encoder. An optional `run_id` explicitly pins the
   original run through its `/runs/{run_id}/...` route. `update_run_raw` is an
   alias. These receipt checks complement the high-level signal/update checks.
+  The raw surface preserves non-success HTTP statuses in `value.status` and
+  `value.body`; a 409 there is not a `kind: http` high-level error.
 - `create_namespace` creates a synthetic namespace through the public raw
   control-plane surface for the namespace fence control.
 
