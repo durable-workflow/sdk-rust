@@ -6,7 +6,9 @@
 
 use serde_json::Value;
 
-use crate::{percent_encode_path_segment, Client, RequestProtocol, WorkflowDescription};
+use crate::{
+    path_segment, percent_encode_path_segment, Client, RequestProtocol, WorkflowDescription,
+};
 
 /// History pages read to find a terminal event when a description lacks detail.
 const TERMINAL_HISTORY_PAGE_LIMIT: usize = 20;
@@ -101,8 +103,8 @@ impl Client {
     ) -> Option<Value> {
         let base = format!(
             "/workflows/{}/runs/{}/history",
-            percent_encode_path_segment(workflow_id),
-            percent_encode_path_segment(run_id),
+            path_segment("workflow_id", workflow_id).ok()?,
+            path_segment("run_id", run_id).ok()?,
         );
         let mut next_page_token: Option<String> = None;
         let mut payload = None;

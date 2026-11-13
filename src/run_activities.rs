@@ -1,6 +1,6 @@
 //! Read-only activity visibility for one explicit workflow run.
 
-use crate::{percent_encode_path_segment, Client, RequestProtocol, Result, Value, WorkflowHandle};
+use crate::{path_segment, Client, RequestProtocol, Result, Value, WorkflowHandle};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -136,8 +136,8 @@ impl Client {
     ) -> Result<WorkflowActivityList> {
         let path = format!(
             "/workflows/{}/runs/{}/activities",
-            percent_encode_path_segment(workflow_id),
-            percent_encode_path_segment(run_id),
+            path_segment("workflow_id", workflow_id)?,
+            path_segment("run_id", run_id)?,
         );
         let document: Value = self
             .request_json(

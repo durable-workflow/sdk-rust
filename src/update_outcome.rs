@@ -13,7 +13,7 @@ use std::{fmt, sync::atomic::Ordering, time::Duration};
 use serde_json::Value;
 
 use crate::{
-    decode_wire_avro_value, decode_wire_value, AvroValue, Client, Error, RawRequest,
+    decode_wire_avro_value, decode_wire_value, path_segment, AvroValue, Client, Error,
     RequestProtocol, Result, WorkflowHandle, DEFAULT_CODEC,
 };
 
@@ -261,20 +261,16 @@ impl Client {
         wait_for: UpdateWaitStage,
         wait_timeout_seconds: Option<u64>,
     ) -> Result<Value> {
+        let mut path = format!(
+            "/workflows/{}/updates/{}",
+            path_segment("workflow_id", workflow_id)?,
+            path_segment("update_id", update_id)?,
+        );
         if update_id.trim().is_empty() {
             return Err(Error::Codec(
                 "an update outcome read needs the update id".to_string(),
             ));
         }
-        // Each id must stay one path segment: "." or ".." would collapse the
-        // read onto another route, such as the workflow description.
-        let mut path = RawRequest::get(["workflows", workflow_id, "updates", update_id])
-            .path()
-            .map_err(|_| {
-                Error::Codec(
-                    "an update outcome read needs a workflow id and update id that are each one path segment: not empty, \".\" or \"..\"".to_string(),
-                )
-            })?;
         self.require_update_outcome_reads().await?;
 
         let mut query = Vec::new();
