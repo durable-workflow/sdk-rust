@@ -441,7 +441,6 @@ impl WorkflowState {
         sequence: u64,
         path: &[ParallelGroupMetadata],
     ) {
-        self.observation_pending = false;
         if path.is_empty() {
             self.observe_replay_sequence(sequence);
         } else {
@@ -451,7 +450,9 @@ impl WorkflowState {
     }
 
     pub(super) fn consume_unproven_boundary(&mut self, path: &[ParallelGroupMetadata]) {
-        self.observation_pending = false;
+        if path.is_empty() {
+            self.observation_pending = false;
+        }
         self.replay_clock.unavailable();
         self.unavailable_cancellation_boundary(path);
     }

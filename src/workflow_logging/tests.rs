@@ -23,6 +23,7 @@ struct Record {
 struct Log {
     records: Mutex<Vec<Record>>,
     panic: bool,
+    on_event: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 struct Fields(BTreeMap<String, String>);
@@ -49,6 +50,9 @@ impl tracing::Subscriber for Log {
             return;
         }
         assert!(!self.panic, "application logger failed");
+        if let Some(callback) = &self.on_event {
+            callback();
+        }
         let mut fields = Fields(BTreeMap::new());
         event.record(&mut fields);
         self.records.lock().unwrap().push(Record {
@@ -379,4 +383,304 @@ fn logging_does_not_turn_application_failure_into_success() {
     assert_eq!(messages(&log), ["failed"]);
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0]["type"], "fail_workflow");
+}
+
+#[test]
+fn synchronous_recorded_side_effect_and_version_markers_use_the_live_cursor() {
+    let ctx = context(vec![
+        event(
+            "SideEffectRecorded",
+            json!({"sequence":1,"result":encode_value_envelope(&json!(7),DEFAULT_CODEC).unwrap()}),
+        ),
+        event(
+            "VersionMarkerRecorded",
+            json!({"sequence":2,"change_id":"shipping","version":1,"min_supported":-1,"max_supported":1}),
+        ),
+    ]);
+    let log = Arc::new(Log::default());
+    tracing::subscriber::with_default(log.clone(), || {
+        let _live = replay_clock::Guard::enter(&ctx);
+        ctx.logger().info("committed prefix");
+        let value: i32 = ctx
+            .side_effect(|| panic!("recorded callback must not run"))
+            .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(ctx.replay_state(), WorkflowReplayState::Replaying);
+        assert_eq!(ctx.get_version("shipping", -1, 1).unwrap(), 1);
+        assert_eq!(ctx.replay_state(), WorkflowReplayState::Executing);
+        ctx.logger().info("after markers");
+    });
+    assert_eq!(messages(&log), ["after markers"]);
+    assert!(ctx.take_commands().unwrap().is_empty());
+
+    let ctx = context(timers(1));
+    let _live = replay_clock::Guard::enter(&ctx);
+    assert_eq!(ctx.get_version("added-later", -1, 1).unwrap(), -1);
+    assert_eq!(ctx.replay_state(), WorkflowReplayState::Replaying);
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn nested_parallel_completion_releases_the_observation_boundary() {
+    use crate::ParallelOperation;
+    let operations = || {
+        vec![
+            ParallelOperation::timer(Duration::from_secs(1)),
+            ParallelOperation::group(vec![ParallelOperation::timer(Duration::from_secs(1))]),
+        ]
+    };
+    let mut history = vec![];
+    for (index, descriptor) in crate::parallel_descriptors(operations(), 1)
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let sequence = index as u64 + 1;
+        let mut payload =
+            json!({"sequence":sequence,"timer_id":format!("timer-{sequence}"),"delay_seconds":1});
+        crate::apply_parallel_group_path(payload.as_object_mut().unwrap(), &descriptor.group_path);
+        history.extend([
+            event("TimerScheduled", payload.clone()),
+            event("TimerFired", payload),
+        ]);
+    }
+    let ctx = context(history);
+    let inner = ctx.clone();
+    let mut future: WorkflowFuture = Box::pin(async move {
+        assert_eq!(inner.replay_state(), WorkflowReplayState::Replaying);
+        inner.parallel(operations()).await?;
+        assert_eq!(inner.replay_state(), WorkflowReplayState::Executing);
+        Ok(AvroValue::Null)
+    });
+    assert!(matches!(poll(&ctx, &mut future), Poll::Ready(Ok(_))));
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn a_completed_parallel_member_does_not_release_a_pending_aggregate_boundary() {
+    use crate::ParallelOperation;
+    let operations = || {
+        vec![
+            ParallelOperation::timer(Duration::from_secs(1)),
+            ParallelOperation::timer(Duration::from_secs(1)),
+        ]
+    };
+    let mut history = vec![];
+    for (index, descriptor) in crate::parallel_descriptors(operations(), 1)
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let sequence = index as u64 + 1;
+        let mut payload =
+            json!({"sequence":sequence,"timer_id":format!("timer-{sequence}"),"delay_seconds":1});
+        crate::apply_parallel_group_path(payload.as_object_mut().unwrap(), &descriptor.group_path);
+        history.push(event("TimerScheduled", payload.clone()));
+        if index == 1 {
+            history.push(event("TimerFired", payload));
+        }
+    }
+    let ctx = context(history);
+    let inner = ctx.clone();
+    let mut future: WorkflowFuture = Box::pin(async move {
+        let mut call = Box::pin(inner.parallel(operations()));
+        futures_util::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            assert_eq!(inner.replay_state(), WorkflowReplayState::Replaying);
+            inner.logger().info("pending aggregate");
+            Poll::Pending
+        })
+        .await
+    });
+    let log = Arc::new(Log::default());
+    tracing::subscriber::with_default(
+        log.clone(),
+        || assert!(poll(&ctx, &mut future).is_pending()),
+    );
+    assert!(messages(&log).is_empty());
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+fn selection(ctx: &WorkflowContext) -> crate::SelectCall {
+    use crate::{ActivityOptions, ParallelOperation};
+    ctx.select_keyed(vec![
+        (
+            "slow",
+            ParallelOperation::activity_with_options(
+                "slow-activity",
+                ActivityOptions::new().task_queue("default"),
+                json!([]),
+            ),
+        ),
+        (
+            "fast",
+            ParallelOperation::activity_with_options(
+                "fast-activity",
+                ActivityOptions::new().task_queue("default"),
+                json!([]),
+            ),
+        ),
+    ])
+}
+
+#[test]
+fn selection_marker_releases_live_logging_even_with_an_unfinished_loser() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/durable_selection_runtime_history.json"
+    ))
+    .unwrap();
+    let mut history: Vec<HistoryEvent> =
+        serde_json::from_value(fixture["history"].clone()).unwrap();
+    history.retain(|e| !(e.event_type == "ActivityCompleted" && e.payload["sequence"] == 1));
+    let ctx = context(history);
+    let inner = ctx.clone();
+    let mut future: WorkflowFuture = Box::pin(async move {
+        inner.logger().info("before selection");
+        selection(&inner).await?;
+        assert_eq!(inner.replay_state(), WorkflowReplayState::Executing);
+        inner.logger().info("selected");
+        Ok(AvroValue::Null)
+    });
+    let log = Arc::new(Log::default());
+    tracing::subscriber::with_default(log.clone(), || {
+        assert!(matches!(poll(&ctx, &mut future), Poll::Ready(Ok(_))))
+    });
+    assert_eq!(messages(&log), ["selected"]);
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn terminal_members_without_a_committed_selection_marker_remain_replay() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/durable_selection_runtime_history.json"
+    ))
+    .unwrap();
+    let mut history: Vec<HistoryEvent> =
+        serde_json::from_value(fixture["history"].clone()).unwrap();
+    history.retain(|e| e.event_type != "SelectionResolved");
+    let ctx = context(history);
+    let inner = ctx.clone();
+    let mut future: WorkflowFuture = Box::pin(async move {
+        let mut call = Box::pin(selection(&inner));
+        futures_util::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            assert_eq!(inner.replay_state(), WorkflowReplayState::Replaying);
+            inner.logger().info("awaiting marker");
+            Poll::Pending
+        })
+        .await
+    });
+    let log = Arc::new(Log::default());
+    tracing::subscriber::with_default(
+        log.clone(),
+        || assert!(poll(&ctx, &mut future).is_pending()),
+    );
+    assert!(messages(&log).is_empty());
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_cancellation_is_replayed_until_its_authored_delivery_is_consumed() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/replay-regressions/cooperative-cold-activity-delivery.json"
+    ))
+    .unwrap();
+    let state = WorkflowState::new_with_identity(
+        serde_json::from_value(fixture["history"].clone()).unwrap(),
+        Some("order".into()),
+        Some("regression-corpus-run".into()),
+        "tests".into(),
+        DEFAULT_CODEC.into(),
+        None,
+    )
+    .unwrap();
+    let ctx = WorkflowContext {
+        state: Arc::new(Mutex::new(state)),
+        cancellation_scope_id: "root".into(),
+    };
+    let inner = ctx.clone();
+    let mut future: WorkflowFuture = Box::pin(async move {
+        assert_eq!(inner.replay_state(), WorkflowReplayState::Replaying);
+        assert!(inner.activity("prepare", json!([])).await.is_err());
+        assert_eq!(inner.replay_state(), WorkflowReplayState::Executing);
+        Ok(AvroValue::Null)
+    });
+    assert!(matches!(poll(&ctx, &mut future), Poll::Ready(Ok(_))));
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn continued_history_stays_quiet_after_its_continuation_is_consumed() {
+    let ctx = context(vec![event(
+        "WorkflowContinuedAsNew",
+        json!({"sequence":1,"continued_to_run_id":"run-2"}),
+    )]);
+    let _live = replay_clock::Guard::enter(&ctx);
+    assert!(ctx.continue_as_new(json!([])).is_err());
+    assert_eq!(ctx.replay_state(), WorkflowReplayState::Replaying);
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn actual_instance_state_query_reconstruction_never_emits_live_workflow_logs() {
+    let mut worker = worker(false);
+    worker.register_replayed_workflow(
+        "stateful",
+        || 0_u8,
+        |ctx, _, state| async move {
+            ctx.logger().info("entry");
+            ctx.sleep(Duration::from_secs(1)).await?;
+            state.update(|n| *n = 1)?;
+            ctx.logger().info("after last history boundary");
+            Ok(Value::Null)
+        },
+    );
+    worker.register_replayed_query::<u8, _, _>("stateful", "current", |_, state, _| async move {
+        Ok(json!(*state))
+    });
+    let query: crate::QueryTask = serde_json::from_value(json!({
+        "query_task_id":"query-1","workflow_type":"stateful","query_name":"current",
+        "workflow_id":"order","run_id":"run-1","payload_codec":DEFAULT_CODEC,
+        "workflow_arguments":encode_value_envelope(&json!([]),DEFAULT_CODEC).unwrap(),
+        "query_arguments":encode_value_envelope(&json!([]),DEFAULT_CODEC).unwrap(),
+        "history_events":timers(1),"run_status":"running"
+    }))
+    .unwrap();
+    let log = Arc::new(Log::default());
+    let _subscriber = tracing::subscriber::set_default(log.clone());
+    for _ in 0..2 {
+        assert_eq!(
+            worker
+                .execute_query_task(query.clone())
+                .await
+                .unwrap()
+                .into_json()
+                .unwrap(),
+            json!(1)
+        );
+    }
+    assert!(messages(&log).is_empty());
+}
+
+#[test]
+fn subscriber_runs_without_a_workflow_lock_and_recursive_workflow_logs_are_silent() {
+    let ctx = context(vec![]);
+    let callback_ctx = ctx.clone();
+    let log = Arc::new(Log {
+        on_event: Some(Box::new(move || {
+            assert!(callback_ctx.state.try_lock().is_ok());
+            assert_eq!(
+                callback_ctx.replay_state(),
+                WorkflowReplayState::Unavailable
+            );
+            callback_ctx.logger().warn("recursive");
+        })),
+        ..Log::default()
+    });
+    tracing::subscriber::with_default(log.clone(), || {
+        let _live = replay_clock::Guard::enter(&ctx);
+        ctx.logger().info("outer");
+        assert_eq!(ctx.replay_state(), WorkflowReplayState::Executing);
+    });
+    assert_eq!(messages(&log), ["outer"]);
 }

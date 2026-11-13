@@ -30,6 +30,9 @@ mod business_clock;
 #[path = "replay_regression_corpus/redrive_successor_strictness.rs"]
 mod redrive_successor_strictness;
 
+#[path = "replay_regression_corpus/workflow_logging.rs"]
+mod workflow_logging;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TypedReplayContract {
     message: String,
@@ -528,6 +531,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
             | "corpus.business-replay-clock"
+            | "corpus.replay-aware-logging"
             | "corpus.business-replay-clock-child"
             | "corpus.business-replay-clock-signal"
             | "corpus.business-replay-clock-condition"
@@ -670,6 +674,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.replay-aware-logging" => workflow_logging::register(&mut worker, workflow_type),
         "corpus.business-replay-clock" => business_clock::register(&mut worker, workflow_type),
         "corpus.business-replay-clock-signal" => {
             business_clock::register_signal(&mut worker, workflow_type)
@@ -1357,7 +1362,13 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     } else {
         None
     };
-    let replay = worker.run_once().await;
+    let logs = Arc::new(workflow_logging::Capture::default());
+    let replay = if workflow_type == "corpus.replay-aware-logging" {
+        use tracing::instrument::WithSubscriber;
+        worker.run_once().with_subscriber(logs.clone()).await
+    } else {
+        worker.run_once().await
+    };
     if fixture["worker_task"]["hydration_authority_refused"] == true {
         let requests = server.requests.lock().unwrap();
         if requests.iter().any(|request| {
@@ -1494,6 +1505,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             json!({"history_page_size": poll_history_page_size}),
         ),
     ]);
+    if workflow_type == "corpus.replay-aware-logging" {
+        observed.insert("workflow_logs".into(), logs.messages());
+    }
     if let Some(worker_registration) = worker_registration {
         observed.insert("worker_registration".to_string(), worker_registration);
     }

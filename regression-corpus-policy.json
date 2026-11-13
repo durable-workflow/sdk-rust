@@ -73,6 +73,9 @@
           "glob": "src/replay_clock.rs"
         },
         {
+          "glob": "src/workflow_logging.rs"
+        },
+        {
           "glob": "src/replay_clock/condition.rs"
         },
         {
