@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- A `request_id_conflict` refusal from native Server 3.9.0 (server#934,
+  server#1191) now names the key that was sent. Native doesn't echo the key, so
+  `Error::request_id()` returned `None` and `RequestIdConflict::request_id` was
+  empty. The SDK now adds the sent key to the refusal body when the Server
+  doesn't echo it. The error is still `Error::Http` with status 409, it is sent
+  once and never resent, and `RequestIdConflict` documents native's `conflict`
+  parts (`name`, `arguments`, `target_or_arguments`). The README describes
+  request IDs and the `command_request_keys` capability. Older Servers are
+  unaffected.
+
 ## 4.14.0
 
 - Workers with a sticky cache advertise `sticky_history_suffix` (#234,

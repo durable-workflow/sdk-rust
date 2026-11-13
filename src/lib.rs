@@ -429,8 +429,10 @@ impl Error {
     /// The caller command key echoed by the Server in a refusal body.
     ///
     /// Signals and updates send their key as the `request_id` body field, and a
-    /// Server refusal such as `request_id_conflict` echoes it. Transport failures
-    /// and refusals without an echoed key return `None`: keep the key you passed
+    /// Server refusal can echo it. A `request_id_conflict` refusal always
+    /// carries it: when the Server does not echo it (native Server 3.9.0 does
+    /// not), the SDK adds the key it sent. Transport failures and other
+    /// refusals without an echoed key return `None`: keep the key you passed
     /// to a `*_with_request_id` method, or obtained from
     /// [`Client::generate_signal_request_id`] or
     /// [`Client::generate_update_request_id`], to retry the same logical command
@@ -446,6 +448,10 @@ impl Error {
     /// Whether the Server refused a signal or update because its caller command
     /// key is retained for a command with a different intent
     /// (HTTP 409, `reason: "request_id_conflict"`).
+    ///
+    /// The SDK never resends this refusal, and the caller should not retry it
+    /// unchanged: send the original input to recover the retained receipt, or
+    /// use a new key for new input.
     pub fn is_request_id_conflict(&self) -> bool {
         self.request_id_conflict().is_some()
     }
@@ -458,6 +464,38 @@ impl Error {
             _ => return None,
         };
         request_id_conflict(status, self.refusal_body()?)
+    }
+
+    /// Record the sent caller command key on a `request_id_conflict` refusal
+    /// whose body does not echo it, so [`Error::request_id`] and
+    /// [`RequestIdConflict::request_id`] name the key. Every other error, and a
+    /// body that already echoes a key, is returned unchanged.
+    fn with_sent_request_id(self, request_id: &str) -> Self {
+        let Self::Http { status, body } = self else {
+            return self;
+        };
+        let echoed = |map: &serde_json::Map<String, Value>| {
+            map.get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|echoed| !echoed.is_empty())
+        };
+        match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Object(mut map))
+                if map.get("reason").and_then(Value::as_str)
+                    == Some(REQUEST_ID_CONFLICT_REASON)
+                    && !echoed(&map) =>
+            {
+                map.insert(
+                    "request_id".to_string(),
+                    Value::String(request_id.to_string()),
+                );
+                Self::Http {
+                    status,
+                    body: Value::Object(map).to_string(),
+                }
+            }
+            _ => Self::Http { status, body },
+        }
     }
 
     fn refusal_body(&self) -> Option<Value> {
@@ -475,7 +513,18 @@ impl Error {
 /// Nothing was admitted or recorded, and the key stays bound to the retained
 /// command. Send a new key for a different command, or repeat the retained
 /// command's exact intent to receive its receipt. `conflict` lists the
-/// mismatched intent parts among `name`, `arguments` and `target`.
+/// mismatched intent parts: `name`, `arguments` or `target_or_arguments`
+/// (native Server 3.9.0). `retained_command_id` names the retained command.
+/// `request_id` is the key that was sent. `retained_command_type` is `None`
+/// when the Server does not report it, as native Server 3.9.0 does not; the
+/// full answer, including `outcome: "rejected_request_id_conflict"`, is in
+/// `body`.
+///
+/// A Server that advertises `capabilities.command_request_keys` in
+/// [`Client::cluster_info`] compares every keyed signal and update this way.
+/// Older Servers (PHP Server 2.x and native up to 3.8) do not: a repeated
+/// signal key can record a second signal there, and an update retried with
+/// changed arguments returns the original receipt.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct RequestIdConflict {
@@ -3332,7 +3381,8 @@ impl Client {
                 RequestProtocol::ControlPlane,
                 Some(&body),
             )
-            .await?;
+            .await
+            .map_err(|error| error.with_sent_request_id(request_id))?;
         Ok(with_request_id(receipt, request_id))
     }
 
@@ -3708,7 +3758,8 @@ impl Client {
                 RequestProtocol::ControlPlane,
                 Some(&body),
             )
-            .await?;
+            .await
+            .map_err(|error| error.with_sent_request_id(&request_id))?;
         Ok(with_request_id(receipt, &request_id))
     }
 
@@ -29488,6 +29539,66 @@ mod tests {
         ))
     }
 
+    /// A native Server 3.9.0 (server#934): the original intent is `["ok"]` on
+    /// the instance. Its retry gets the retained receipt, and any other input or
+    /// run target is refused exactly as native refuses it, without echoing the key.
+    fn native_command_key_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let original = encode_typed_envelope(
+            &normalize_avro_arguments(AvroValue::from_serialize(&json!(["ok"])).expect("input")),
+            DEFAULT_CODEC,
+        )
+        .expect("envelope");
+        let command_type = if path == KEYED_UPDATE_PATH {
+            "update"
+        } else {
+            "signal"
+        };
+        if path == KEYED_RUN_SIGNAL_PATH || request["input"] != original {
+            let part = if path == KEYED_RUN_SIGNAL_PATH {
+                "target_or_arguments"
+            } else {
+                "arguments"
+            };
+            return Some((
+                "409 Conflict",
+                json!({
+                    "workflow_id": "keyed-1",
+                    "reason": "request_id_conflict",
+                    "outcome": "rejected_request_id_conflict",
+                    "command_status": "rejected",
+                    "rejection_reason": "request_id_conflict",
+                    "message": format!("The request_id was already used for a different {command_type} command on workflow [keyed-1]. Use a new request_id for a different command."),
+                    "intent_verified": true,
+                    "retained": true,
+                    "retained_command_id": "cmd-native-1",
+                    "retained_outcome": "signal_received",
+                    "conflict": [part],
+                })
+                .to_string(),
+            ));
+        }
+        let mut receipt = json!({
+            "workflow_id": "keyed-1",
+            "run_id": "run-keyed-1",
+            "command_id": "cmd-native-1",
+            "command_status": "accepted",
+            "outcome": "signal_received",
+            "retained": true,
+            "intent_verified": true,
+        });
+        if path == KEYED_UPDATE_PATH {
+            receipt["update_id"] = json!("upd-native-1");
+            receipt["result_envelope"] =
+                encode_typed_envelope(&AvroValue::Long(7), DEFAULT_CODEC).expect("result");
+        }
+        Some(("200 OK", receipt.to_string()))
+    }
+
     fn closed_run_command_server(
         path: &str,
         body: &str,
@@ -29813,6 +29924,152 @@ mod tests {
                 .as_deref(),
             Some("update")
         );
+    }
+
+    #[tokio::test]
+    async fn native_request_id_conflict_is_typed_carries_the_sent_key_and_is_sent_once() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(native_command_key_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let error = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["changed"]), "approve-1")
+            .await
+            .expect_err("changed arguments under a retained key");
+        assert!(
+            matches!(error, Error::Http { status, .. } if status == reqwest::StatusCode::CONFLICT),
+            "{error:?}"
+        );
+        assert!(error.is_request_id_conflict());
+        assert_eq!(error.request_id().as_deref(), Some("approve-1"));
+        let conflict = error.request_id_conflict().expect("conflict details");
+        assert_eq!(conflict.status, 409);
+        assert_eq!(conflict.request_id, "approve-1");
+        assert_eq!(
+            conflict.retained_command_id.as_deref(),
+            Some("cmd-native-1")
+        );
+        assert_eq!(conflict.retained_command_type, None);
+        assert_eq!(
+            conflict.retained_outcome.as_deref(),
+            Some("signal_received")
+        );
+        assert_eq!(conflict.conflict, ["arguments"]);
+        assert_eq!(conflict.body["outcome"], "rejected_request_id_conflict");
+        assert_eq!(
+            server.request_bodies(KEYED_SIGNAL_PATH).len(),
+            1,
+            "never resent"
+        );
+
+        let error = client
+            .signal_workflow_run_with_request_id(
+                "keyed-1",
+                "run-keyed-1",
+                "approve",
+                json!(["ok"]),
+                "approve-1",
+            )
+            .await
+            .expect_err("another run target under a retained key");
+        let conflict = error.request_id_conflict().expect("conflict details");
+        assert_eq!(conflict.conflict, ["target_or_arguments"]);
+        assert_eq!(conflict.request_id, "approve-1");
+        assert_eq!(server.request_bodies(KEYED_RUN_SIGNAL_PATH).len(), 1);
+
+        let error = client
+            .update_workflow("keyed-1", "adjust", json!(["changed"]), None)
+            .await
+            .expect_err("changed update under a retained generated key");
+        let sent = server.request_body(KEYED_UPDATE_PATH);
+        let conflict = error.request_id_conflict().expect("conflict details");
+        assert_eq!(
+            Some(conflict.request_id.as_str()),
+            sent["request_id"].as_str()
+        );
+        assert_eq!(error.request_id().as_deref(), sent["request_id"].as_str());
+        assert_eq!(conflict.conflict, ["arguments"]);
+        assert_eq!(
+            server.request_bodies(KEYED_UPDATE_PATH).len(),
+            1,
+            "never resent"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_identical_retry_returns_the_original_receipt() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(native_command_key_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let receipt = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), "approve-1")
+            .await
+            .expect("retained signal receipt");
+        assert_eq!(receipt["command_id"], "cmd-native-1");
+        assert_eq!(receipt["retained"], true);
+        assert_eq!(receipt["intent_verified"], true);
+        assert_eq!(receipt["request_id"], "approve-1");
+
+        let result = client
+            .update_workflow("keyed-1", "adjust", json!(["ok"]), Some("adjust-1"))
+            .await
+            .expect("retained update result");
+        assert_eq!(result, json!(7));
+    }
+
+    #[tokio::test]
+    async fn older_server_without_command_keys_is_unchanged() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(legacy_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        // Before native 3.9.0 the same key with other input is admitted again.
+        for input in [json!(["ok"]), json!(["changed"])] {
+            let receipt = client
+                .signal_workflow_with_request_id("keyed-1", "approve", input, "approve-1")
+                .await
+                .expect("legacy receipt");
+            assert_eq!(receipt["request_id"], "approve-1");
+            assert_eq!(receipt.get("retained"), None);
+        }
+        assert_eq!(server.request_bodies(KEYED_SIGNAL_PATH).len(), 2);
+    }
+
+    #[test]
+    fn a_sent_key_is_added_only_to_conflicts_that_do_not_echo_one() {
+        let conflict = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_conflict","retained_command_id":"cmd-1","conflict":["name"]}"#
+                .to_string(),
+        }
+        .with_sent_request_id("sent");
+        assert_eq!(conflict.request_id().as_deref(), Some("sent"));
+
+        let echoed = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_conflict","request_id":"echoed"}"#.to_string(),
+        }
+        .with_sent_request_id("sent");
+        assert_eq!(echoed.request_id().as_deref(), Some("echoed"));
+
+        let other = r#"{"reason":"run_not_active"}"#;
+        let refused = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: other.to_string(),
+        }
+        .with_sent_request_id("sent");
+        assert!(matches!(refused, Error::Http { ref body, .. } if body == other));
+        assert!(matches!(
+            Error::Timeout.with_sent_request_id("sent"),
+            Error::Timeout
+        ));
     }
 
     #[tokio::test]
