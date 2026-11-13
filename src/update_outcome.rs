@@ -13,8 +13,8 @@ use std::{fmt, sync::atomic::Ordering, time::Duration};
 use serde_json::Value;
 
 use crate::{
-    decode_wire_avro_value, decode_wire_value, percent_encode_path_segment, AvroValue, Client,
-    Error, RequestProtocol, Result, WorkflowHandle, DEFAULT_CODEC,
+    decode_wire_avro_value, decode_wire_value, AvroValue, Client, Error, RawRequest,
+    RequestProtocol, Result, WorkflowHandle, DEFAULT_CODEC,
 };
 
 /// The cluster capability that advertises `GET /workflows/{id}/updates/{update_id}`.
@@ -164,6 +164,24 @@ pub(crate) fn reject_pending_update(
     Ok(receipt)
 }
 
+/// Whether a successful answer is the Server's receipt for the update that was read.
+fn is_receipt_for(receipt: &Value, workflow_id: &str, update_id: &str) -> bool {
+    receipt.get("update_id").and_then(Value::as_str) == Some(update_id)
+        && receipt.get("update_status").is_some_and(Value::is_string)
+        && receipt
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .is_none_or(|echoed| echoed == workflow_id)
+}
+
+fn unrecognized(workflow_id: &str, update_id: &str, receipt: Value) -> Error {
+    Error::UnrecognizedUpdateOutcome {
+        workflow_id: workflow_id.to_string(),
+        update_id: update_id.to_string(),
+        receipt,
+    }
+}
+
 fn completed_update_avro_value(receipt: &Value) -> Result<AvroValue> {
     let envelope = receipt
         .get("result_envelope")
@@ -248,13 +266,17 @@ impl Client {
                 "an update outcome read needs the update id".to_string(),
             ));
         }
+        // Each id must stay one path segment: "." or ".." would collapse the
+        // read onto another route, such as the workflow description.
+        let mut path = RawRequest::get(["workflows", workflow_id, "updates", update_id])
+            .path()
+            .map_err(|_| {
+                Error::Codec(
+                    "an update outcome read needs a workflow id and update id that are each one path segment: not empty, \".\" or \"..\"".to_string(),
+                )
+            })?;
         self.require_update_outcome_reads().await?;
 
-        let mut path = format!(
-            "/workflows/{}/updates/{}",
-            percent_encode_path_segment(workflow_id),
-            percent_encode_path_segment(update_id)
-        );
         let mut query = Vec::new();
         if wait_for == UpdateWaitStage::Completed {
             query.push(format!("wait_for={}", wait_for.as_str()));
@@ -270,14 +292,19 @@ impl Client {
             .map(|seconds| Duration::from_secs(seconds).saturating_add(WAIT_TRANSPORT_MARGIN))
             .unwrap_or(Duration::ZERO)
             .max(Duration::from_secs(60));
-        self.request_json_with_timeout(
-            reqwest::Method::GET,
-            &path,
-            RequestProtocol::ControlPlane,
-            Option::<&Value>::None,
-            timeout,
-        )
-        .await
+        let receipt: Value = self
+            .request_json_with_timeout(
+                reqwest::Method::GET,
+                &path,
+                RequestProtocol::ControlPlane,
+                Option::<&Value>::None,
+                timeout,
+            )
+            .await?;
+        if !is_receipt_for(&receipt, workflow_id, update_id) {
+            return Err(unrecognized(workflow_id, update_id, receipt));
+        }
+        Ok(receipt)
     }
 
     async fn completed_update_outcome(
@@ -294,7 +321,15 @@ impl Client {
                 wait_timeout_seconds,
             )
             .await?;
-        reject_pending_update(workflow_id, receipt, true)
+        let receipt = reject_pending_update(workflow_id, receipt, true)?;
+        // Only a completed receipt carries an outcome; never read one into
+        // any other successful answer.
+        let completed = receipt.get("result_envelope").is_some_and(Value::is_object)
+            || receipt.get("update_status").and_then(Value::as_str) == Some("completed");
+        if !completed {
+            return Err(unrecognized(workflow_id, update_id, receipt));
+        }
+        Ok(receipt)
     }
 
     /// Refuse a Server that does not advertise `update_outcome_reads`.

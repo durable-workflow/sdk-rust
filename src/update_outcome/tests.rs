@@ -381,3 +381,101 @@ async fn a_submitted_update_that_returned_null_is_a_null_result() {
         Value::Null
     );
 }
+
+#[tokio::test]
+async fn dot_segment_and_empty_ids_are_refused_before_any_request() {
+    let (client, requests) = server(vec![]).await;
+    for (workflow_id, update_id) in [
+        ("order-1", "."),
+        ("order-1", ".."),
+        (".", "upd-1"),
+        ("..", "upd-1"),
+        ("", "upd-1"),
+    ] {
+        let error = client
+            .update_outcome(workflow_id, update_id, None)
+            .await
+            .expect_err("a dot segment would read another route");
+        assert!(
+            matches!(error, Error::Codec(_)),
+            "{workflow_id:?}/{update_id:?}: {error:?}"
+        );
+        let error = client
+            .update_outcome_receipt(workflow_id, update_id, UpdateWaitStage::Accepted, None)
+            .await
+            .expect_err("a dot segment would read another route");
+        assert!(matches!(error, Error::Codec(_)), "{error:?}");
+    }
+    assert!(
+        requests.await.unwrap().is_empty(),
+        "nothing was sent, not even discovery"
+    );
+}
+
+#[tokio::test]
+async fn a_success_that_is_not_a_receipt_for_the_update_is_never_an_outcome() {
+    let describe = json!({"workflow_id": "order-1", "run_id": "run-9", "status": "completed",
+        "result": "the workflow's own result"});
+    let other_update = json!({"workflow_id": "order-1", "update_id": "upd-2",
+        "update_status": "completed", "result_envelope": envelope(AvroValue::Long(7))});
+    let other_workflow = json!({"workflow_id": "order-2", "update_id": "upd-1",
+        "update_status": "completed", "result_envelope": envelope(AvroValue::Long(7))});
+    let (client, _requests) = server(vec![
+        cluster(),
+        (200, describe.clone()),
+        (200, json!({})),
+        (200, other_update),
+        (200, other_workflow),
+        (200, describe.clone()),
+    ])
+    .await;
+
+    for _ in 0..4 {
+        let error = client
+            .update_outcome("order-1", "upd-1", None)
+            .await
+            .expect_err("only a receipt for upd-1 carries its outcome");
+        let Error::UnrecognizedUpdateOutcome {
+            workflow_id,
+            update_id,
+            ..
+        } = &error
+        else {
+            panic!("expected UnrecognizedUpdateOutcome, got {error:?}");
+        };
+        assert_eq!(
+            (workflow_id.as_str(), update_id.as_str()),
+            ("order-1", "upd-1")
+        );
+    }
+    let error = client
+        .update_outcome_receipt("order-1", "upd-1", UpdateWaitStage::Accepted, None)
+        .await
+        .expect_err("a describe body is not a receipt");
+    let Error::UnrecognizedUpdateOutcome { receipt, .. } = error else {
+        panic!("expected UnrecognizedUpdateOutcome");
+    };
+    assert_eq!(receipt, describe);
+}
+
+#[tokio::test]
+async fn a_successful_receipt_that_is_not_completed_is_never_an_outcome() {
+    let (client, _requests) = server(vec![
+        cluster(),
+        (
+            200,
+            json!({"workflow_id": "order-1", "update_id": "upd-1", "update_status": "failed",
+                "wait_timed_out": false, "result": null, "result_envelope": null}),
+        ),
+    ])
+    .await;
+
+    let error = client
+        .update_outcome("order-1", "upd-1", None)
+        .await
+        .expect_err("a failed status is not a null result");
+    assert!(
+        matches!(error, Error::UnrecognizedUpdateOutcome { .. }),
+        "{error:?}"
+    );
+}

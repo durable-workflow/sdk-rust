@@ -156,7 +156,9 @@ while the update is still running. A failed update is `Error::Http` with status
 422, and an unknown or pruned update id is 404 `update_not_found`
 (`Error::is_update_not_found()`), which does not prove the update was never
 admitted. `update_outcome_receipt` returns the raw receipt and can answer at
-once with `UpdateWaitStage::Accepted`.
+once with `UpdateWaitStage::Accepted`. Workflow and update ids must each be one
+path segment (not empty, `.` or `..`), and an answer that is not a receipt for
+the requested update is `Error::UnrecognizedUpdateOutcome`, never a result.
 
 On any other Server, `update_outcome` returns
 `Error::UpdateOutcomeReadsUnavailable` before reading anything; the SDK never

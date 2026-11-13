@@ -420,6 +420,18 @@ pub enum Error {
         "update_outcome_reads_unavailable: the connected Server does not advertise update_outcome_reads, so an update outcome cannot be read by update id; call update_workflow() again with the same request_id instead"
     )]
     UpdateOutcomeReadsUnavailable,
+    /// A successful update outcome read did not answer with a receipt for the
+    /// requested update: it lacked a matching `update_id` and `update_status`,
+    /// or claimed a finished outcome without being completed. No outcome is
+    /// returned for it.
+    #[error(
+        "update_outcome_unrecognized: the Server's answer is not an outcome receipt for update {update_id:?} on workflow {workflow_id:?}; no outcome was read"
+    )]
+    UnrecognizedUpdateOutcome {
+        workflow_id: String,
+        update_id: String,
+        receipt: Value,
+    },
     #[error("cooperative cancellation is unavailable: {0}")]
     CooperativeCancellationUnavailable(String),
     #[error("cancellation_scope_execution_not_supported: Rust worker cannot replay scoped cancellation history")]

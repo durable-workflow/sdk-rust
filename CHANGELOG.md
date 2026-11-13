@@ -19,7 +19,12 @@
   `Error::UpdateOutcomeReadsUnavailable` otherwise, before reading anything. A
   still-running update returns `Error::UpdateStillPending` with a hint to read
   again by update id. A failed update is `Error::Http` 422, and
-  `Error::is_update_not_found()` detects 404 `update_not_found`.
+  `Error::is_update_not_found()` detects 404 `update_not_found`. An empty, `.`
+  or `..` workflow id or update id is refused before any request, so a read
+  can't collapse onto another route. A successful answer that isn't a receipt
+  for the requested update (matching `update_id` and an `update_status`), or a
+  non-completed receipt where an outcome was expected, returns
+  `Error::UnrecognizedUpdateOutcome` instead of a value.
 
 - A `request_id_conflict` refusal from native Server 3.9.0 (server#934,
   server#1191) now names the key that was sent. Native doesn't echo the key, so
