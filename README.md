@@ -140,6 +140,50 @@ Older Servers (PHP Server 2.x and native up to 3.8) don't compare input under
 a key: a repeated signal key records a second signal, and an update retried
 with changed arguments returns the original receipt.
 
+### Pending updates and reading an outcome later
+
+`update_workflow` waits for the update to complete. If the Server's wait ends
+first, it answers HTTP 202 with no result, and the SDK returns
+`Error::UpdateStillPending` with the `update_id`, `request_id`, current
+`run_id` and full receipt. A handler that returned null is still `Ok(Null)`.
+
+On a Server that advertises `capabilities.update_outcome_reads` in
+`Client::cluster_info()` (native 3.6.0 and later),
+`Client::update_outcome(workflow_id, update_id, wait_timeout_seconds)` reads
+the same update by its id without submitting it again. It waits for the
+outcome and returns the decoded result, or `Error::UpdateStillPending` again
+while the update is still running. A failed update is `Error::Http` with status
+422, and an unknown or pruned update id is 404 `update_not_found`
+(`Error::is_update_not_found()`), which does not prove the update was never
+admitted. `update_outcome_receipt` returns the raw receipt and can answer at
+once with `UpdateWaitStage::Accepted`. Workflow and update ids must each be one
+path segment (not empty, `.` or `..`), and an answer that is not a receipt for
+the requested update is `Error::UnrecognizedUpdateOutcome`, never a result.
+
+On any other Server, `update_outcome` returns
+`Error::UpdateOutcomeReadsUnavailable` before reading anything; the SDK never
+resubmits an update in place of reading it. There, call `update_workflow` again
+with the same `request_id` to keep waiting.
+
+```rust,no_run
+# async fn rename(client: &durable_workflow::Client) -> durable_workflow::Result<()> {
+use durable_workflow::Error;
+
+let result = match client
+    .update_workflow("order-1", "rename", ["Grace"], Some("rename-order-1"))
+    .await
+{
+    Err(Error::UpdateStillPending(pending)) => {
+        let update_id = pending.update_id.expect("Server receipt names the update");
+        client.update_outcome("order-1", &update_id, Some(30)).await?
+    }
+    other => other?,
+};
+# let _ = result;
+# Ok(())
+# }
+```
+
 ### Condition predicate identities
 
 `wait_condition!` derives the recorded predicate identity from the call site's

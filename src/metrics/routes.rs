@@ -73,6 +73,7 @@ const ROUTES: &[&str] = &[
     "/workflows/{workflow_id}/signal/{name}",
     "/workflows/{workflow_id}/query/{name}",
     "/workflows/{workflow_id}/update/{name}",
+    "/workflows/{workflow_id}/updates/{update_id}",
     "/workflows/{workflow_id}/message-streams/{name}/messages",
     "/workflows/{workflow_id}/runs/{run_id}",
     "/workflows/{workflow_id}/runs/{run_id}/history",
