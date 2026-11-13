@@ -54,3 +54,6 @@ Report each cell separately:
 The full cohort also retains the published producer's Unicode-key limitation
 until its separately qualified correction. The direct API control in
 `tests/command_keys_server.rs` and this adapter do not close #216 by themselves.
+
+The common offline [SQLite copy helper](../synthetic-sqlite.md) is independent
+of this Rust API adapter and can be reused by the other language consumers.
