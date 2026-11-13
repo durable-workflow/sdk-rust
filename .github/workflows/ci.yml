@@ -245,7 +245,7 @@ jobs:
 
   protocol:
     name: Avro protocol
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency:
       group: ${{ github.workflow }}-protocol-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -276,10 +276,12 @@ jobs:
       - name: Disable APT download retries (CVE-2026-109518)
         run: echo 'Acquire::Retries "0";' | sudo tee /etc/apt/apt.conf.d/99-no-retries >/dev/null
       - name: Set up the fixed Composer client
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240  # v2
+        uses: durable-workflow/.github/.github/actions/setup-php-linux@411a14ac07d32073eed6ab4977f2825eba4739a7  # reviewed Ubuntu24 PHP profile
         with:
           php-version: '8.3'
-          tools: composer:2.10.3
+          ini-file: production
+          coverage: none
+          tools: composer:2.10.3, phpunit:11.5.57
       - name: Verify actual Composer dependency trust
         uses: durable-workflow/.github/.github/actions/verify-composer-trust@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
         with:
