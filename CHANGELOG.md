@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.15.0
+
 - A workflow-task completion that native Server 3.6.0 refuses as too large
   (HTTP 413, `limit_kind: workflow_task_completion_bytes`, server#1152,
   durable-workflow/.github#228) is now a typed, non-retryable outcome.
