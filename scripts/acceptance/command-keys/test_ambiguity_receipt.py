@@ -16,6 +16,12 @@ class AmbiguityReceiptTest(unittest.TestCase):
     def test_exact_unverified_nonretryable_refusal_accepts(self):
         self.assertEqual(self.result['value']['body'], run_open.ambiguity_receipt(
             self.result, 'synthetic-key', self.expected))
+        # The frozen ambiguity contract does not require an echoed caller key.
+        # Error::request_id() likewise reads only a key actually echoed by HTTP.
+        absent = deepcopy(self.result)
+        del absent['value']['body']['request_id']
+        self.assertEqual(absent['value']['body'], run_open.ambiguity_receipt(
+            absent, 'synthetic-key', self.expected))
 
     def test_selected_original_or_alternative_receipt_refuses(self):
         for field in ('command_id','run_id','update_id','accepted_at','retained_command_id','receipt'):

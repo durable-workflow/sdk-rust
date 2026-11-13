@@ -32,7 +32,9 @@ def capture(*args):
 def ambiguity_receipt(result, request_id, expected):
     assert result['kind'] == 'ok' and result['value']['status'] == expected['status'], result
     body = result['value']['body']
-    assert body['reason'] == expected['reason'] and body['request_id'] == request_id, body
+    assert body['reason'] == expected['reason'], body
+    if 'request_id' in body:
+        assert body['request_id'] == request_id, body
     for field in ('retained', 'intent_verified', 'retryable'):
         assert body[field] is expected[field], body
     for field in ('command_id', 'run_id', 'update_id', 'accepted_at', 'retained_command_id', 'receipt'):
@@ -258,7 +260,7 @@ def main():
                     ambiguity_receipt(reply, retry['request_id'], document['ambiguity_expected'])
                 high = invoke(dict(retry,op=kind))
                 assert high['kind'] == 'http' and high['status'] == 409, high
-                assert high['request_id'] == retry['request_id'], high
+                assert high['request_id'] == high['body'].get('request_id'), high
                 ambiguity_receipt({'kind':'ok','value':{'status':high['status'],'body':high['body']}},
                                   retry['request_id'], document['ambiguity_expected'])
                 print(json.dumps({'stage':'ambiguity-readback','shape':options.scenario,
