@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One synthetic open-state legacy cell; no physical upgrade or response-loss authority."""
+"""One synthetic legacy state cell; no physical upgrade or response-loss authority."""
 import argparse
 import re
 import tomllib
@@ -30,6 +30,7 @@ def capture(*args):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--state', choices=['open', 'completed', 'continued'], default='open')
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--consumer-binary',type=Path,required=True)
     parser.add_argument('--consumer-lock',type=Path,required=True)
@@ -76,9 +77,10 @@ def main():
     key = 'base64:' + base64.b64encode(secrets.token_bytes(32)).decode()
     with open(os.open(envfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w') as file:
         file.write('DW_AUTH_TOKEN='+token+'\nDW_SERVER_KEY='+key+'\n')
-    name = 'sdk-rust-216-legacy-open-' + secrets.token_hex(5)
+    name = 'sdk-rust-216-legacy-' + options.state + '-' + secrets.token_hex(5)
     owned_id = None
     binary = None
+    worker_pool = None
     origin = None
 
     def start(filename):
@@ -134,9 +136,10 @@ def main():
     try:
         binary = guards.BoundExecutable(options.consumer_binary, build['binary'])
         start('source.sqlite')
-        queue='legacy-open-'+secrets.token_hex(5)
+        queue='legacy-'+options.state+'-'+secrets.token_hex(5)
         ok({'op':'register','queue':queue,'null_update':True})
-        created=ok({'op':'start','workflow_type':'keys.wait','workflow_id':queue,'queue':queue,'input':[0]})
+        workflow_type = 'keys.continue' if options.state == 'continued' else 'keys.wait'
+        created=ok({'op':'start','workflow_type':workflow_type,'workflow_id':queue,'queue':queue,'input':[0]})
         seed={};selections=[]
         for kind,operation in [('signal','touch'),('update','mutate')]:
             admission={'op':kind+'_raw','workflow_id':queue,'name':operation,'input':[document['legacy_readback']['original_input']],'request_id':document['keys']['original']}
@@ -146,6 +149,34 @@ def main():
             selections.append({'command_id':body['command_id'],'command_type':kind,
                 'workflow_instance_id':queue,'workflow_run_id':body['run_id'],
                 'caller_key':document['keys']['original'],'legacy_request_id':document['keys']['original']})
+        successor_run_id = None
+        if options.state != 'open':
+            # Use the same held descriptor and pre/post checks for the worker.
+            # Its adapter lifetime and the outer invocation timeout are bounded.
+            worker_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            worker = worker_pool.submit(ok, {'op':'worker', 'queue':queue,
+                                            'null_update':True, 'lifetime':8})
+            end=time.monotonic()+20
+            while True:
+                outcome=ok({'op':'outcome','workflow_id':queue,'update_id':seed['update'][1]['update_id']})
+                if outcome['update_status']=='completed':break
+                if time.monotonic()>end:raise AssertionError('update did not complete before close')
+                time.sleep(.05)
+            assert ok(dict(seed['update'][0],op='update')) is None
+            ok({'op':'signal','workflow_id':queue,'name':'finish','input':[],'request_id':'close-setup'})
+            end=time.monotonic()+20
+            while True:
+                current=ok({'op':'describe','workflow_id':queue})
+                if options.state=='completed' and current['status']=='completed':break
+                if options.state=='continued' and current['run_id']!=created['run_id']:break
+                if time.monotonic()>end:raise AssertionError('workflow did not close or continue')
+                time.sleep(.05)
+            assert worker.result(timeout=20)['stopped'] is True
+            worker_pool.shutdown(wait=True); worker_pool=None
+            if options.state == 'continued':
+                successor_run_id = current['run_id']
+                assert isinstance(successor_run_id,str) and successor_run_id
+                assert successor_run_id != created['run_id']
         stop()
         source=database/'source.sqlite'; copied=database/'legacy.sqlite'
         with closing(sqlite3.connect(source)) as connection:
@@ -167,11 +198,13 @@ def main():
             with concurrent.futures.ThreadPoolExecutor(max_workers=document['legacy_readback']['concurrency']) as pool:
                 replies=list(pool.map(lambda _:ok(retry),range(document['legacy_readback']['concurrency'])))
             for result in replies:
-                assert result['status']==202,result
+                assert result['status'] in document['legacy_readback']['expected']['success_statuses'][kind],result
                 receipt=result['body']
                 assert receipt['retained'] is True and receipt['intent_verified'] is False,receipt
                 for field in fields:
                     assert receipt[field]==original[field],field
+                if kind == 'update' and options.state != 'open':
+                    assert receipt['update_status'] == 'completed'
             pinned=ok(dict(retry,run_id=original['run_id']))['body']
             assert pinned['retained'] is True and pinned['intent_verified'] is False
             assert all(pinned[field] == original[field] for field in fields)
@@ -185,11 +218,13 @@ def main():
                 assert high['kind']=='ok' and high['value']['intent_verified'] is False,high
                 assert high['value']['retained'] is True
                 assert all(high['value'][field] == original[field] for field in fields)
-            else:
+            elif options.state == 'open':
                 assert high['kind']=='pending' and high['receipt']['intent_verified'] is False,high
                 assert high['receipt']['retained'] is True
                 assert all(high['receipt'][field] == original[field] for field in fields)
-            print(json.dumps({'stage':'open-readback','command_type':kind,'outcome':'pass',
+            else:
+                assert high['kind']=='ok' and high['value'] is None,high
+            print(json.dumps({'stage':options.state+'-readback','command_type':kind,'outcome':'pass',
                 'original':{field:original[field] for field in fields},
                 'returned':{field:replies[0]['body'][field] for field in fields},
                 'retained':True,'intent_verified':False,
@@ -201,7 +236,8 @@ def main():
                 json.dump(value, file, sort_keys=True)
         stop()
         binary.check()
-        print(json.dumps({'cell':'synthetic-legacy-open-only','outcome':'pass',
+        print(json.dumps({'cell':'synthetic-legacy-'+options.state+'-only','outcome':'pass',
+            'state':options.state,'successor_run_id':successor_run_id,
             'started_at':started_at,'finished_at':datetime.now(timezone.utc).isoformat(),
             'zero_write_sha256':legacy.fingerprint(before),'server_source':options.server_source,
             'server_index':options.server_index,'server_version':options.server_version,
@@ -213,6 +249,8 @@ def main():
             'helper_sha256':hashlib.sha256((SOURCE/'sqlite_legacy.py').read_bytes()).hexdigest()}),flush=True)
     finally:
         try:
+            if worker_pool is not None:
+                worker_pool.shutdown(wait=True, cancel_futures=True)
             if owned_id is not None:
                 subprocess.run(['docker','rm','-fv',owned_id],check=True,stdout=subprocess.DEVNULL)
             envfile.unlink(missing_ok=True)
