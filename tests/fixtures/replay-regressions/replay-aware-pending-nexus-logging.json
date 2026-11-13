@@ -11,6 +11,9 @@
       "operation_name": "charge", "operation_mode": "sync", "wait_for": "completed", "status": "started"
     }}
   ],
-  "command_sequence": [],
-  "expected": {"waiting_for_history": true, "workflow_logs": []}
+  "expected": {
+    "waiting_for_history": true,
+    "workflow_logs": [],
+    "task_failure": {"failure": {"type": "WorkflowTaskWaitingForHistory", "message": "Workflow task waiting for scheduled history."}}
+  }
 }
