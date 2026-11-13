@@ -177,10 +177,17 @@ def main():
                 assert high['kind']=='ok' and high['value']['intent_verified'] is False,high
             else:
                 assert high['kind']=='pending' and high['receipt']['intent_verified'] is False,high
+            fields = ['command_id', 'run_id'] + (['update_id', 'accepted_at'] if kind == 'update' else [])
             print(json.dumps({'stage':'open-readback','command_type':kind,'outcome':'pass',
-                              'command_id':original['command_id'],'run_id':original['run_id']}),flush=True)
+                'original':{field:original[field] for field in fields},
+                'returned':{field:replies[0]['body'][field] for field in fields},
+                'retained':True,'intent_verified':False,
+                'concurrency':document['legacy_readback']['concurrency']}),flush=True)
         after=snapshot(copied)
         assert after==before,'readbacks or conflicts changed complete logical database rows/schema'
+        for filename, value in [('before-snapshot.json', before), ('after-snapshot.json', after)]:
+            with open(os.open(work / filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w') as file:
+                json.dump(value, file, sort_keys=True)
         stop()
         print(json.dumps({'cell':'synthetic-legacy-open-only','outcome':'pass',
             'started_at':started_at,'finished_at':datetime.now(timezone.utc).isoformat(),
@@ -196,7 +203,7 @@ def main():
         envfile.unlink(missing_ok=True)
         for path in database.iterdir():path.unlink()
         database.rmdir()
-        print(json.dumps({'cleanup':'pass','scope':'owned container/volumes/database/env removed; sanitized receipt/catalog retained'}),flush=True)
+        print(json.dumps({'cleanup':'pass','scope':'owned container/volumes/database/env removed; private snapshots and sanitized receipt/catalog retained for seven days'}),flush=True)
 
 
 if __name__=='__main__':main()

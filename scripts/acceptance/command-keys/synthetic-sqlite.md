@@ -99,9 +99,10 @@ receipt status and high-level SDK pending/signal behavior are checked. Complete
 logical database rows/schema must match before and after those calls.
 
 The original and copied databases, runtime and generated environment file are
-removed in cleanup. The terminal sanitized receipt and data-free catalog DDL
-remain in the output directory; keep diagnostic output for at most seven days
-and publish the lasting receipt in #216. This runner covers **open state only**.
+removed in cleanup. The terminal sanitized receipt, data-free catalog DDL and
+private complete before/after logical snapshots (mode 0600) remain in the output
+directory. Keep this output for at most seven days and publish the lasting
+sanitized receipt in #216. This runner covers **open state only**.
 Completed/continued readbacks, ambiguity and case controls, actual physical
 upgrade and post-commit loss require their own named results. Python
 optimization is refused because it would disable conformance assertions.
