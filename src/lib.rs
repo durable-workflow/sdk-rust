@@ -32,6 +32,7 @@ pub use pagination::{
 };
 mod terminal_failure_detail;
 mod tls;
+mod update_outcome;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
@@ -91,6 +92,7 @@ pub use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 pub use sticky_workflow_cache::{StickyCacheMetrics, StickyCacheOptions};
 use thiserror::Error;
+pub use update_outcome::{UpdatePending, UpdateWaitStage};
 pub use uuid::Uuid;
 pub use worker_session::{WorkerSession, WorkerSessionOptions};
 
@@ -184,6 +186,19 @@ fn validate_request_id(request_id: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Encode one identifier as exactly one control-plane path segment.
+///
+/// The value is percent-encoded like [`RawRequest`] segments, so `/`, `?` or
+/// `#` in an id stays inside its segment. An empty, `.` or `..` value is
+/// refused before any request: it would address another route, such as
+/// `/workflows` instead of one workflow.
+fn path_segment(field: &'static str, value: &str) -> Result<String> {
+    if value.is_empty() || value == "." || value == ".." {
+        return Err(Error::InvalidPathSegment { field });
+    }
+    Ok(percent_encode_path_segment(value))
 }
 
 fn generated_request_id(command: &str) -> String {
@@ -293,6 +308,10 @@ pub enum Error {
     InvalidRootCertificates(String),
     #[error("invalid raw request: {0}")]
     InvalidRawRequest(String),
+    /// An identifier placed in a request path was empty, `.` or `..`, so it
+    /// cannot stay one path segment. Nothing was sent.
+    #[error("invalid path segment for {field}: must not be empty, \".\" or \"..\"")]
+    InvalidPathSegment { field: &'static str },
     #[error(transparent)]
     FailureReporting(#[from] FailureReportError),
     #[error(transparent)]
@@ -413,6 +432,28 @@ pub enum Error {
         "workflow_memo_updates_unavailable: the connected runtime did not advertise workflow memo update support"
     )]
     WorkflowMemoUpdatesUnavailable,
+    /// An accepted update had not completed when the wait ended; it has no
+    /// result yet. See [`UpdatePending`].
+    #[error(transparent)]
+    UpdateStillPending(UpdatePending),
+    /// The connected Server does not advertise `update_outcome_reads`, so an
+    /// update outcome cannot be read by update id. Nothing was read or sent.
+    #[error(
+        "update_outcome_reads_unavailable: the connected Server does not advertise update_outcome_reads, so an update outcome cannot be read by update id; call update_workflow() again with the same request_id instead"
+    )]
+    UpdateOutcomeReadsUnavailable,
+    /// A successful update outcome read did not answer with a receipt for the
+    /// requested update: it lacked a matching `update_id` and `update_status`,
+    /// or claimed a finished outcome without being completed. No outcome is
+    /// returned for it.
+    #[error(
+        "update_outcome_unrecognized: the Server's answer is not an outcome receipt for update {update_id:?} on workflow {workflow_id:?}; no outcome was read"
+    )]
+    UnrecognizedUpdateOutcome {
+        workflow_id: String,
+        update_id: String,
+        receipt: Value,
+    },
     #[error("cooperative cancellation is unavailable: {0}")]
     CooperativeCancellationUnavailable(String),
     #[error("cancellation_scope_execution_not_supported: Rust worker cannot replay scoped cancellation history")]
@@ -501,6 +542,24 @@ impl Error {
             }
             _ => Self::Http { status, body },
         }
+    }
+
+    /// Whether an update outcome read found no retained update with that id
+    /// for the workflow (HTTP 404, `reason: "update_not_found"`).
+    ///
+    /// That includes an update pruned with its run, so it does not prove the
+    /// update was never admitted.
+    pub fn is_update_not_found(&self) -> bool {
+        matches!(self, Self::Http { status, .. } if status.as_u16() == 404)
+            && self
+                .refusal_body()
+                .and_then(|body| {
+                    body.get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("update_not_found")
     }
 
     fn refusal_body(&self) -> Option<Value> {
@@ -3147,6 +3206,8 @@ pub struct Client {
     activity_lease_renewal_supported: Arc<AtomicBool>,
     /// Server #1017: the Server sends sticky hits only the history after the cached sequence.
     sticky_history_suffix_supported: Arc<AtomicBool>,
+    /// Server #1131: the Server advertised `update_outcome_reads`.
+    update_outcome_reads_supported: Arc<AtomicBool>,
     activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
@@ -3740,6 +3801,12 @@ impl Client {
     /// key for the same update intent returns the original update's receipt and
     /// result instead of admitting a second update; a different intent is
     /// refused with [`Error::is_request_id_conflict`].
+    ///
+    /// The Server waits for the update to complete. When its wait ends first,
+    /// this returns [`Error::UpdateStillPending`], never `Null`: read the
+    /// outcome later with [`Client::update_outcome`] and the pending update's
+    /// id, or send the update again with the same `request_id`. A handler that
+    /// returned null is `Ok(Value::Null)`.
     pub async fn update_workflow<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -3750,13 +3817,7 @@ impl Client {
         let response = self
             .update_workflow_response(workflow_id, update_name, input, request_id)
             .await?;
-        if let Some(envelope) = response
-            .get("result_envelope")
-            .filter(|envelope| !envelope.is_null())
-        {
-            return decode_wire_value(envelope, DEFAULT_CODEC);
-        }
-        Ok(response.get("result").cloned().unwrap_or(response))
+        Self::submitted_update_value(workflow_id, response)
     }
 
     /// Send a synchronous update and retain a bytes-capable Avro result.
@@ -3770,16 +3831,7 @@ impl Client {
         let response = self
             .update_workflow_response(workflow_id, update_name, input, request_id)
             .await?;
-        let envelope = response
-            .get("result_envelope")
-            .filter(|envelope| !envelope.is_null())
-            .ok_or_else(|| {
-                Error::Codec(
-                    "missing_payload_envelope: typed update result requires result_envelope"
-                        .to_string(),
-                )
-            })?;
-        decode_wire_avro_value(envelope, DEFAULT_CODEC)
+        Self::submitted_update_avro_value(workflow_id, response)
     }
 
     async fn update_workflow_response<T: Serialize>(
@@ -3789,6 +3841,11 @@ impl Client {
         input: T,
         request_id: Option<&str>,
     ) -> Result<Value> {
+        let path = format!(
+            "/workflows/{}/update/{}",
+            path_segment("workflow_id", workflow_id)?,
+            path_segment("update_name", update_name)?
+        );
         let request_id = match request_id {
             Some(request_id) => {
                 validate_request_id(request_id)?;
@@ -3805,7 +3862,7 @@ impl Client {
         let receipt = self
             .request_json(
                 reqwest::Method::POST,
-                &format!("/workflows/{workflow_id}/update/{update_name}"),
+                &path,
                 RequestProtocol::ControlPlane,
                 Some(&body),
             )
@@ -3815,7 +3872,7 @@ impl Client {
     }
 
     pub async fn describe_workflow(&self, workflow_id: &str) -> Result<WorkflowDescription> {
-        let path = format!("/workflows/{workflow_id}");
+        let path = format!("/workflows/{}", path_segment("workflow_id", workflow_id)?);
         let mut data: WorkflowDescription = self
             .request_json(
                 reqwest::Method::GET,
@@ -6221,6 +6278,7 @@ impl ClientBuilder {
             failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
             sticky_history_suffix_supported: Arc::new(AtomicBool::new(false)),
+            update_outcome_reads_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
@@ -29955,6 +30013,109 @@ mod tests {
         assert_ne!(bodies[0]["request_id"], bodies[1]["request_id"]);
         assert_ne!(bodies[1]["request_id"], bodies[2]["request_id"]);
         assert_key_sent_only_in_body(&server, KEYED_UPDATE_PATH);
+    }
+
+    fn segment_server(path: &str, _: &str, _: usize) -> Option<(&'static str, String)> {
+        if path.contains("/update/") {
+            return Some((
+                "200 OK",
+                json!({"update_id": "upd-1", "update_status": "completed",
+                    "result_envelope": encode_typed_envelope(&AvroValue::Long(1), DEFAULT_CODEC).ok()})
+                .to_string(),
+            ));
+        }
+        path.starts_with("/api/workflows/").then(|| {
+            (
+                "200 OK",
+                json!({"workflow_id": "x", "run_id": "run-1", "status": "running"}).to_string(),
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn describe_and_update_keep_each_identifier_in_one_encoded_segment() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(segment_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        client
+            .describe_workflow("orders/2026?x#y")
+            .await
+            .expect("describe");
+        assert_eq!(
+            server.method_for("/api/workflows/orders%2F2026%3Fx%23y"),
+            Some("GET".to_string()),
+            "the workflow id stays one segment: {:?}",
+            server.captured_paths()
+        );
+        client
+            .update_workflow("order 1/a", "re/name", json!([1]), Some("key-1"))
+            .await
+            .expect("update");
+        assert_eq!(
+            server.request_body("/api/workflows/order%201%2Fa/update/re%2Fname")["request_id"],
+            "key-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_segment_and_empty_identifiers_are_refused_before_any_request() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(segment_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        for workflow_id in ["", ".", ".."] {
+            let error = client
+                .describe_workflow(workflow_id)
+                .await
+                .expect_err("a dot segment would describe another route");
+            assert!(
+                matches!(
+                    error,
+                    Error::InvalidPathSegment {
+                        field: "workflow_id"
+                    }
+                ),
+                "{workflow_id:?}: {error:?}"
+            );
+            let error = client
+                .update_workflow(workflow_id, "adjust", json!([1]), None)
+                .await
+                .expect_err("a dot segment would update another route");
+            assert!(
+                matches!(
+                    error,
+                    Error::InvalidPathSegment {
+                        field: "workflow_id"
+                    }
+                ),
+                "{workflow_id:?}: {error:?}"
+            );
+        }
+        for update_name in ["", ".", ".."] {
+            let error = client
+                .update_workflow("order-1", update_name, json!([1]), None)
+                .await
+                .expect_err("a dot segment update name is refused");
+            assert!(
+                matches!(
+                    error,
+                    Error::InvalidPathSegment {
+                        field: "update_name"
+                    }
+                ),
+                "{update_name:?}: {error:?}"
+            );
+        }
+        assert!(
+            server.captured_paths().is_empty(),
+            "nothing was sent: {:?}",
+            server.captured_paths()
+        );
     }
 
     #[tokio::test]
