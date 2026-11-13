@@ -47,12 +47,14 @@ the top-level `cause: "timeout"`. It arrives as
 `Error::CooperativeCancellationRequested`, so cancellation handlers such as saga
 compensation run for it unchanged, and the run still ends timed out.
 `request.cause` (and `CancellationContext::cause()`) is the discriminator:
-`CancellationCause::Requested` for an ordinary request, or
-`CancellationCause::Timeout { timeout_kind, work_deadline_at, cleanup_deadline_at }`.
-`timeout_kind` and `work_deadline_at` are `None` when the context does not carry
-them. A context with any other `cause` value, or with timeout fields but no
-timeout cause, is refused. Descendants cancelled under the request carry no
-`cause`, so they are ordinary cancellations.
+`CancellationCause::Requested` for an ordinary request or
+`CancellationCause::Timeout`. The cleanup deadline is the request's existing
+`cleanup_deadline_at`; the timeout kind and work deadline are recorded on the
+`WorkflowTimeoutCleanupStarted` event, not in the context. A context with any
+other `cause` value is refused. The cause is never inherited: descendants
+cancelled under the request, scoped or not, carry no `cause`, so they are
+ordinary cancellations, even when a scoped child's origin root context carries
+`cause: "timeout"`.
 
 A scoped child context preserves its complete immutable `scope_origin` alongside
 the local run lineage. `ScopedCancellationContext::root_context()` retains the

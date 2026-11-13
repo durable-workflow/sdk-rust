@@ -41,7 +41,7 @@ pub use activity_error::ActivityError;
 pub use activity_retry::{ActivityAttemptLimit, ActivityRetryInfo};
 pub use cancellation_context::{
     CancellationCause, CancellationContext, CancellationLineage, ScopedCancellationContext,
-    ScopedCancellationLineage, TimeoutKind,
+    ScopedCancellationLineage,
 };
 pub use cancellation_scope::CancellationScopeOpenReceipt;
 #[doc(hidden)]

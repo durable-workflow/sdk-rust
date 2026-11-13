@@ -5617,11 +5617,16 @@ fn core_cause_snapshot() -> Value {
     })
 }
 
-fn with_fields(mut snapshot: Value, fields: Value) -> Value {
-    for (key, value) in fields.as_object().unwrap() {
-        snapshot[key] = value.clone();
-    }
+fn with_cause(mut snapshot: Value, cause: Value) -> Value {
+    snapshot["cause"] = cause;
     snapshot
+}
+
+fn same_bytes(left: &Value, right: &Value) {
+    assert_eq!(
+        serde_json::to_string(left).unwrap(),
+        serde_json::to_string(right).unwrap()
+    );
 }
 
 #[test]
@@ -5630,110 +5635,62 @@ fn cancellation_cause_ordinary_context_is_unchanged_and_stays_a_cancellation() {
     let context = CancellationContext::from_value(&snapshot).unwrap();
     assert!(!context.is_timeout());
     assert_eq!(context.cause(), CancellationCause::Requested);
-    assert_eq!(
-        serde_json::to_string(&context.to_value()).unwrap(),
-        serde_json::to_string(&snapshot).unwrap()
-    );
+    same_bytes(&context.to_value(), &snapshot);
     assert!(context.to_value().get("cause").is_none());
-    for cause in [json!("cancellation"), Value::Null] {
-        let explicit = with_fields(snapshot.clone(), json!({ "cause": cause }));
-        let context = CancellationContext::from_value(&explicit).unwrap();
-        assert_eq!(context.cause(), CancellationCause::Requested);
-        assert!(!context.is_timeout());
-    }
-    let explicit = with_fields(snapshot.clone(), json!({"cause": "cancellation"}));
+    // An explicit cancellation cause round-trips with exactly its own keys.
+    let explicit = with_cause(snapshot.clone(), json!("cancellation"));
     let context = CancellationContext::from_value(&explicit).unwrap();
-    assert_eq!(context.to_value(), explicit);
-    assert_ne!(
-        context,
-        CancellationContext::from_value(&snapshot).unwrap(),
-        "an explicit cause is preserved, not normalized away"
-    );
+    assert!(!context.is_timeout());
+    assert_eq!(context.cause(), CancellationCause::Requested);
+    same_bytes(&context.to_value(), &explicit);
+    let null = CancellationContext::from_value(&with_cause(snapshot, Value::Null)).unwrap();
+    assert_eq!(null.cause(), CancellationCause::Requested);
 }
 
 #[test]
-fn cancellation_cause_timeout_round_trips_with_and_without_deadline_fields() {
-    let timeout = with_fields(core_cause_snapshot(), json!({"cause": "timeout"}));
+fn cancellation_cause_timeout_round_trips() {
+    let timeout = with_cause(core_cause_snapshot(), json!("timeout"));
     let context = CancellationContext::from_value(&timeout).unwrap();
     assert!(context.is_timeout());
-    assert_eq!(
-        context.cause(),
-        CancellationCause::Timeout {
-            timeout_kind: None,
-            work_deadline_at: None,
-            cleanup_deadline_at: "2026-11-13T00:01:10.000000Z".into(),
-        }
-    );
-    assert_eq!(context.to_value()["cause"], "timeout");
-    assert_eq!(
-        serde_json::to_string(&context.to_value()).unwrap(),
-        serde_json::to_string(&timeout).unwrap()
-    );
-
-    let full = with_fields(
-        timeout,
-        json!({"timeout_kind": "execution", "work_deadline_at": "2026-11-13T00:01:00.000000Z"}),
-    );
-    let context = CancellationContext::from_value(&full).unwrap();
-    assert_eq!(
-        context.cause(),
-        CancellationCause::Timeout {
-            timeout_kind: Some(TimeoutKind::Execution),
-            work_deadline_at: Some("2026-11-13T00:01:00.000000Z".into()),
-            cleanup_deadline_at: "2026-11-13T00:01:10.000000Z".into(),
-        }
-    );
+    assert_eq!(context.cause(), CancellationCause::Timeout);
     assert!(context.cause().is_timeout());
-    assert_eq!(
-        serde_json::to_string(&context.to_value()).unwrap(),
-        serde_json::to_string(&full).unwrap()
-    );
+    assert_eq!(context.to_value()["cause"], "timeout");
+    same_bytes(&context.to_value(), &timeout);
     assert_eq!(
         CancellationContext::from_value(&context.to_value()).unwrap(),
         context
     );
-    let run = with_fields(full, json!({"timeout_kind": "run"}));
-    assert!(matches!(
-        CancellationContext::from_value(&run).unwrap().cause(),
-        CancellationCause::Timeout {
-            timeout_kind: Some(TimeoutKind::Run),
-            ..
-        }
-    ));
+    // The timeout kind and work deadline live on WorkflowTimeoutCleanupStarted,
+    // not in the context; like any other unknown key, they are not interpreted.
+    let mut extra = timeout.clone();
+    extra["timeout_kind"] = json!("bogus");
+    extra["work_deadline_at"] = json!(1);
+    assert_eq!(CancellationContext::from_value(&extra).unwrap(), context);
 }
 
 #[test]
-fn cancellation_cause_unknown_or_inconsistent_values_are_refused() {
-    let base = core_cause_snapshot();
-    for fields in [
-        json!({"cause": "deadline"}),
-        json!({"cause": "Timeout"}),
-        json!({"cause": ""}),
-        json!({"cause": true}),
-        json!({"cause": 1}),
-        json!({"cause": {"kind": "timeout"}}),
-        json!({"timeout_kind": "execution"}),
-        json!({"work_deadline_at": "2026-11-13T00:01:00.000000Z"}),
-        json!({"cause": "cancellation", "timeout_kind": "run"}),
-        json!({"cause": "timeout", "timeout_kind": "activity"}),
-        json!({"cause": "timeout", "timeout_kind": 1}),
-        json!({"cause": "timeout", "work_deadline_at": "not a time"}),
-        json!({"cause": "timeout", "work_deadline_at": "2026-11-13T00:01:10.000000Z"}),
-        json!({"cause": "timeout", "work_deadline_at": "2026-11-13T00:02:00.000000Z"}),
+fn cancellation_cause_unknown_values_are_refused() {
+    for cause in [
+        json!("deadline"),
+        json!("Timeout"),
+        json!(""),
+        json!(true),
+        json!(1),
+        json!({"kind": "timeout"}),
     ] {
         assert!(
             matches!(
-                CancellationContext::from_value(&with_fields(base.clone(), fields.clone())),
+                CancellationContext::from_value(&with_cause(core_cause_snapshot(), cause.clone())),
                 Err(Error::InvalidCooperativeCancellation(_))
             ),
-            "{fields} must be refused"
+            "{cause} must be refused"
         );
     }
 }
 
 #[test]
 fn cancellation_cause_descendant_is_cancelled_not_timed_out() {
-    let parent = with_fields(core_cause_snapshot(), json!({"cause": "timeout"}));
+    let parent = with_cause(core_cause_snapshot(), json!("timeout"));
     assert!(CancellationContext::from_value(&parent)
         .unwrap()
         .is_timeout());
@@ -5750,16 +5707,51 @@ fn cancellation_cause_descendant_is_cancelled_not_timed_out() {
     assert_eq!(child.cause(), CancellationCause::Requested);
 }
 
+/// Core's `scopedDescendantSnapshot` for a child run of a run-level root scope.
+fn scoped_child_of(root: &CancellationContext) -> Value {
+    let origin = ScopedCancellationContext::from_run_context(root).unwrap();
+    let mut child = origin.root_context().to_value();
+    // A descendant is cancelled because its ancestor was (Core strips the cause).
+    child.as_object_mut().unwrap().remove("cause");
+    let deadline = origin
+        .deadline()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    child["schema"] = json!("durable-workflow.cancellation-context/v2");
+    child["request_id"] = json!("req-child");
+    child["parent_request_id"] = json!(origin.request_id());
+    child["cleanup_deadline_at"] = json!(deadline);
+    child["lineage"] = json!([
+        child["lineage"][0].clone(),
+        {"request_id": "req-child", "workflow_instance_id": "child-instance", "workflow_run_id": "child-run"},
+    ]);
+    child["scope_origin"] = origin.to_value();
+    child["scope_authority_deadline_at"] = json!(deadline);
+    child
+}
+
 #[test]
-fn cancellation_cause_scoped_root_from_a_timeout_run_keeps_its_cause() {
-    let timeout = with_fields(context_snapshot(), json!({"cause": "timeout"}));
-    let context = CancellationContext::from_value(&timeout).unwrap();
-    let scoped = ScopedCancellationContext::from_run_context(&context).unwrap();
-    assert!(scoped.root_context().is_timeout());
+fn cancellation_cause_scoped_descendant_of_a_timeout_is_cancelled_not_timed_out() {
+    let root =
+        CancellationContext::from_value(&with_cause(core_cause_snapshot(), json!("timeout")))
+            .unwrap();
+    let origin = ScopedCancellationContext::from_run_context(&root).unwrap();
+    // fromRunContext keeps the run's own cause on the scope root.
+    assert!(origin.root_context().is_timeout());
     assert_eq!(
-        ScopedCancellationContext::from_value(&scoped.to_value()).unwrap(),
-        scoped
+        ScopedCancellationContext::from_value(&origin.to_value()).unwrap(),
+        origin
     );
+    let snapshot = scoped_child_of(&root);
+    assert_eq!(snapshot["scope_origin"]["root_context"]["cause"], "timeout");
+    let child = CancellationContext::from_value(&snapshot).unwrap();
+    assert!(!child.is_timeout());
+    assert_eq!(child.cause(), CancellationCause::Requested);
+    assert!(child.scope_origin().unwrap().root_context().is_timeout());
+    assert!(child.to_value().get("cause").is_none());
+    same_bytes(&child.to_value(), &snapshot);
+    assert!(!CancellationContext::from_value(&child.to_value())
+        .unwrap()
+        .is_timeout());
 }
 
 fn timeout_request_event(snapshot: &Value) -> HistoryEvent {
@@ -5786,10 +5778,7 @@ fn timeout_delivery_event(snapshot: &Value) -> HistoryEvent {
 
 #[test]
 fn cancellation_cause_timeout_reaches_an_existing_cooperative_cancellation_arm() {
-    let snapshot = with_fields(
-        context_snapshot(),
-        json!({"cause": "timeout", "timeout_kind": "run", "work_deadline_at": "2026-10-01T00:00:20.123456Z"}),
-    );
+    let snapshot = with_cause(context_snapshot(), json!("timeout"));
     let mut worker = cancellation_worker();
     worker.register_workflow("cancel", |ctx, _input| async move {
         let Err(Error::CooperativeCancellationRequested(cancelled)) =
@@ -5797,20 +5786,11 @@ fn cancellation_cause_timeout_reaches_an_existing_cooperative_cancellation_arm()
         else {
             panic!("a timeout cleanup request is a cooperative cancellation request");
         };
-        let CancellationCause::Timeout {
-            timeout_kind,
-            work_deadline_at,
-            cleanup_deadline_at,
-        } = cancelled.request.cause.clone()
-        else {
-            panic!("expected the timeout cause");
-        };
-        assert_eq!(timeout_kind, Some(TimeoutKind::Run));
+        assert_eq!(cancelled.request.cause, CancellationCause::Timeout);
         assert_eq!(
-            work_deadline_at.as_deref(),
-            Some("2026-10-01T00:00:20.123456Z")
+            cancelled.request.cleanup_deadline_at,
+            "2026-10-01T00:00:30.123456Z"
         );
-        assert_eq!(cleanup_deadline_at, "2026-10-01T00:00:30.123456Z");
         let context = cancelled.request.context.unwrap();
         assert_eq!(context.cause(), cancelled.request.cause);
         assert!(ctx.cancellation_context()?.unwrap().is_timeout());
@@ -5849,7 +5829,7 @@ fn cancellation_cause_ordinary_delivery_and_observation_stay_requested() {
 
 #[test]
 fn cancellation_cause_delivery_cannot_add_or_drop_the_timeout_cause() {
-    let timeout = with_fields(context_snapshot(), json!({"cause": "timeout"}));
+    let timeout = with_cause(context_snapshot(), json!("timeout"));
     for (request, delivery) in [
         (context_snapshot(), timeout.clone()),
         (timeout.clone(), context_snapshot()),

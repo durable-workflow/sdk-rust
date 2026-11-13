@@ -10,18 +10,16 @@
   `Error::CooperativeCancellationRequested(_)` arms, such as saga
   compensation, run for it unchanged. There is no new `Error` variant. Tell
   the two apart with the new `#[non_exhaustive]` `CancellationCause`:
-  `Requested` for an ordinary request (`cause` absent or `"cancellation"`), or
-  `Timeout { timeout_kind, work_deadline_at, cleanup_deadline_at }`, with the
-  new `#[non_exhaustive]` `TimeoutKind` (`Execution` or `Run`).
-  `timeout_kind` and `work_deadline_at` are `None` when the context doesn't
-  carry them. `CancellationContext::cause()` and `is_timeout()` read it from
-  the context. A context with any other `cause`, with a timeout field but no
-  timeout cause, with an unknown `timeout_kind`, or with a `work_deadline_at`
-  that doesn't precede its cleanup deadline is refused as
-  `Error::InvalidCooperativeCancellation`. A descendant cancelled under the
-  request carries no `cause`, so it is an ordinary cancellation.
-  `CancellationContext::to_value()` writes `cause` and the timeout fields back
-  exactly as read, and an ordinary context's output is unchanged.
+  `Requested` for an ordinary request (`cause` absent or `"cancellation"`) or
+  `Timeout`. The request's cleanup deadline is its existing
+  `cleanup_deadline_at`. `CancellationContext::cause()` and `is_timeout()`
+  read it from the context. A context with any other `cause` is refused as
+  `Error::InvalidCooperativeCancellation`. The cause is never inherited: a
+  descendant cancelled under the request, scoped or not, carries no `cause`
+  and is an ordinary cancellation, even when its scope origin's root context
+  carries `cause: "timeout"`. `CancellationContext::to_value()` writes `cause`
+  back exactly as read, including an explicit `"cancellation"`, and an
+  ordinary context's output is unchanged.
 
   **Minor-release note:** `CancellationRequest` gains a public
   `cause: CancellationCause` field. Code that builds a `CancellationRequest`

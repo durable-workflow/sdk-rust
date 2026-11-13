@@ -32,55 +32,28 @@ impl CancellationLineage {
     }
 }
 
-/// Which hard timeout passed its work deadline in a timeout-cleanup request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum TimeoutKind {
-    /// The execution timeout, which spans continue-as-new.
-    Execution,
-    /// The run timeout of the current run.
-    Run,
-}
-
-impl TimeoutKind {
-    /// The portable wire value: `execution` or `run`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Execution => "execution",
-            Self::Run => "run",
-        }
-    }
-}
-
 /// Why a cooperative cancellation request was delivered to this run.
 ///
 /// Read from the optional top-level `cause` of the portable cancellation
 /// context. `Requested` is an ordinary cancellation request (`cause` absent or
 /// `cancellation`). `Timeout` is a deadline-triggered cleanup request: the run
-/// passed its work deadline and has until `cleanup_deadline_at` to clean up,
-/// and it still ends timed out. A descendant cancelled under that request is an
-/// ordinary cancellation; it does not inherit the cause.
-///
-/// `timeout_kind` and `work_deadline_at` are `None` when the context does not
-/// carry them; the embedded engine's first implementation records only
-/// `cause`. `cleanup_deadline_at` is the context's own cleanup deadline.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// passed its work deadline and has until the request's cleanup deadline to
+/// clean up, and it still ends timed out. The cause is never inherited: a
+/// descendant cancelled under the request, scoped or not, is an ordinary
+/// cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CancellationCause {
     /// An ordinary cooperative cancellation request.
     Requested,
     /// A timeout-cleanup request after the run's work deadline passed.
-    Timeout {
-        timeout_kind: Option<TimeoutKind>,
-        work_deadline_at: Option<String>,
-        cleanup_deadline_at: String,
-    },
+    Timeout,
 }
 
 impl CancellationCause {
     /// Whether this is a timeout-cleanup request.
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Timeout { .. })
+    pub fn is_timeout(self) -> bool {
+        self == Self::Timeout
     }
 }
 
@@ -109,8 +82,6 @@ pub struct CancellationContext {
     cleanup_deadline_at: DateTime<Utc>,
     lineage: Vec<CancellationLineage>,
     cause: Option<RecordedCause>,
-    timeout_kind: Option<TimeoutKind>,
-    work_deadline_at: Option<DateTime<Utc>>,
     scope_origin: Option<Box<ScopedCancellationContext>>,
     replay: Option<Weak<Mutex<WorkflowState>>>,
 }
@@ -129,8 +100,6 @@ impl PartialEq for CancellationContext {
             && self.cleanup_deadline_at == other.cleanup_deadline_at
             && self.lineage == other.lineage
             && self.cause == other.cause
-            && self.timeout_kind == other.timeout_kind
-            && self.work_deadline_at == other.work_deadline_at
             && self.scope_origin == other.scope_origin
     }
 }
@@ -158,66 +127,18 @@ fn nullable_text(value: &Value, key: &str, allow_empty: bool) -> Result<Option<S
     }
 }
 
-fn present<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    value.get(key).filter(|field| !field.is_null())
-}
-
-/// A recorded cause with the timeout kind and work deadline only it may carry.
-type RecordedCauseFields = (
-    Option<RecordedCause>,
-    Option<TimeoutKind>,
-    Option<DateTime<Utc>>,
-);
-
-/// Read the optional `cause` and the timeout fields only it may carry.
-fn read_cause(value: &Value, cleanup_deadline_at: DateTime<Utc>) -> Result<RecordedCauseFields> {
-    let cause = match present(value, "cause") {
-        None => None,
-        Some(Value::String(cause)) if cause == "cancellation" => Some(RecordedCause::Cancellation),
-        Some(Value::String(cause)) if cause == "timeout" => Some(RecordedCause::Timeout),
-        Some(_) => {
-            return Err(invalid_context(
-                "cancellation cause must be cancellation or timeout",
-            ))
+/// Read the optional `cause`. Other keys, as in Core, are not interpreted.
+fn read_cause(value: &Value) -> Result<Option<RecordedCause>> {
+    match value.get("cause") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cause)) if cause == "cancellation" => {
+            Ok(Some(RecordedCause::Cancellation))
         }
-    };
-    let kind = present(value, "timeout_kind");
-    let work = present(value, "work_deadline_at");
-    if cause != Some(RecordedCause::Timeout) {
-        if kind.is_some() || work.is_some() {
-            return Err(invalid_context(
-                "cancellation timeout fields require the timeout cause",
-            ));
-        }
-        return Ok((cause, None, None));
+        Some(Value::String(cause)) if cause == "timeout" => Ok(Some(RecordedCause::Timeout)),
+        Some(_) => Err(invalid_context(
+            "cancellation cause must be cancellation or timeout",
+        )),
     }
-    let timeout_kind = match kind {
-        None => None,
-        Some(Value::String(kind)) if kind == "execution" => Some(TimeoutKind::Execution),
-        Some(Value::String(kind)) if kind == "run" => Some(TimeoutKind::Run),
-        Some(_) => {
-            return Err(invalid_context(
-                "cancellation timeout kind must be execution or run",
-            ))
-        }
-    };
-    let work_deadline_at = match work {
-        None => None,
-        Some(work) => {
-            let work = work
-                .as_str()
-                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-                .ok_or_else(|| invalid_context("cancellation work deadline timestamp is invalid"))?
-                .with_timezone(&Utc);
-            if work >= cleanup_deadline_at {
-                return Err(invalid_context(
-                    "cancellation work deadline must precede its cleanup deadline",
-                ));
-            }
-            Some(work)
-        }
-    };
-    Ok((cause, timeout_kind, work_deadline_at))
 }
 
 impl CancellationContext {
@@ -314,7 +235,7 @@ impl CancellationContext {
                 "cancellation deadline must follow the original request",
             ));
         }
-        let (cause, timeout_kind, work_deadline_at) = read_cause(value, cleanup_deadline_at)?;
+        let cause = read_cause(value)?;
         let context = Self {
             request_id,
             root_request_id,
@@ -328,8 +249,6 @@ impl CancellationContext {
             cleanup_deadline_at,
             lineage: normalized,
             cause,
-            timeout_kind,
-            work_deadline_at,
             scope_origin,
             replay: None,
         };
@@ -427,15 +346,7 @@ impl CancellationContext {
     /// Why this request was delivered: an ordinary request or timeout cleanup.
     pub fn cause(&self) -> CancellationCause {
         match self.cause {
-            Some(RecordedCause::Timeout) => CancellationCause::Timeout {
-                timeout_kind: self.timeout_kind,
-                work_deadline_at: self
-                    .work_deadline_at
-                    .map(|work| work.to_rfc3339_opts(SecondsFormat::Micros, true)),
-                cleanup_deadline_at: self
-                    .cleanup_deadline_at
-                    .to_rfc3339_opts(SecondsFormat::Micros, true),
-            },
+            Some(RecordedCause::Timeout) => CancellationCause::Timeout,
             _ => CancellationCause::Requested,
         }
     }
@@ -493,12 +404,6 @@ impl CancellationContext {
             Some(RecordedCause::Cancellation) => value["cause"] = json!("cancellation"),
             Some(RecordedCause::Timeout) => value["cause"] = json!("timeout"),
             None => {}
-        }
-        if let Some(kind) = self.timeout_kind {
-            value["timeout_kind"] = json!(kind.as_str());
-        }
-        if let Some(work) = self.work_deadline_at {
-            value["work_deadline_at"] = json!(work.to_rfc3339_opts(SecondsFormat::Micros, true));
         }
         if let Some(origin) = &self.scope_origin {
             value["scope_origin"] = origin.to_value();
