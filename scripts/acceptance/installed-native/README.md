@@ -66,6 +66,33 @@ Record the package checksum, Server digest, runner commit and cleanup alongside
 the result. Compiling the ignored test or using source dependencies is not
 published-artifact acceptance.
 
+### Replay-aware logging feature acceptance
+
+`tests/workflow_logging_server.rs` checks the logging feature separately from
+the lifecycle/deadline cells. Copy it into the exact-package consumer with
+`tracing`, `serde_json`, and Tokio's `macros`, `rt-multi-thread`, and `time`
+features available. Preserve the caller's package checksum/source/lock proof;
+compiling this test against checkout source is preparation only.
+
+Select an isolated published Server through the same loopback fixture
+environment used above, with `DURABLE_WORKFLOW_EXPECT_SERVER_VERSION` set to
+that tuple's version. Run only the parent test:
+
+```sh
+cargo test --locked --test workflow_logging_server -- \
+  --ignored --exact published_logging_emits_once_per_committed_step_across_cold_worker_processes --nocapture
+```
+
+The parent registers one workflow, then executes four committed regions in
+four distinct worker processes. Public history proves each signal wait or
+completion before the next activation. Each process must emit exactly one new
+workflow log with the original namespace/workflow/run identity; the final
+result and all three signal deliveries must match. The worker entrypoint is
+invoked by the parent and is not a separate acceptance command. Each child has
+a 30-second bound and owned-process cleanup. The caller owns the Server and
+its state cleanup. This proof covers committed-prefix suppression across cold
+workers; uncommitted task retries may still repeat process logs.
+
 ## Run
 
 Fetch tags first (`git fetch --tags origin`), then run:
