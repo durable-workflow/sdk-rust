@@ -549,6 +549,9 @@ impl QueryContext {
 
 pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<DateTime<Utc>> {
     let event = history.last()?;
+    if super::settled_at_run_close(event) {
+        return None;
+    }
     if event.event_type == "WorkflowStarted" {
         return start_time(history);
     }

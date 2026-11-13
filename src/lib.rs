@@ -12141,6 +12141,33 @@ struct WorkflowState {
     message_stream_waits: HashMap<String, u64>,
 }
 
+/// `cancellation_reason` of an `ActivityCancelled` that the run's own close
+/// recorded for an activity it never awaited, such as a `select()` loser
+/// (workflow#1117, server#1193).
+const RUN_CLOSED_CANCELLATION_REASON: &str = "run_closed";
+
+/// Whether this history event is an activity cancellation recorded by its
+/// run's close rather than an outcome the workflow could have observed.
+///
+/// The close appends it in the closing transaction, after the workflow had
+/// already moved past the operation, so replay never treats it as a
+/// selection winner, an `all()` member failure or an awaited outcome.
+fn settled_at_run_close(event: &HistoryEvent) -> bool {
+    event.event_type == "ActivityCancelled"
+        && event
+            .payload
+            .get("cancellation_reason")
+            .and_then(Value::as_str)
+            == Some(RUN_CLOSED_CANCELLATION_REASON)
+}
+
+/// History as the workflow observed it: run-close cancellations are left
+/// out, so each such activity replays as still open.
+fn history_observed_by_workflow(mut history: Vec<HistoryEvent>) -> Vec<HistoryEvent> {
+    history.retain(|event| !settled_at_run_close(event));
+    history
+}
+
 impl WorkflowState {
     #[cfg(test)]
     fn new(
@@ -12209,6 +12236,10 @@ impl WorkflowState {
         allow_cancellation_scope_authoring: bool,
         allow_cancellation_scope_delivery: bool,
     ) -> Result<Self> {
+        // The history budget counts every committed event, including any
+        // the run's close recorded.
+        let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
+        let history = history_observed_by_workflow(history);
         cooperative_cancellation::assert_cancellation_scope_replay_supported(
             &history,
             allow_cancellation_scope_authoring,
@@ -12345,7 +12376,6 @@ impl WorkflowState {
                 .or_insert(0);
             *cursor = (*cursor).max(through_position);
         }
-        let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
         let cancel_requested = history.iter().any(|event| {
             matches!(
                 event.event_type.as_str(),
@@ -19458,6 +19488,7 @@ mod tests {
     mod cooperative_cancellation;
     mod local_activity;
     mod nexus;
+    mod run_closed_settlement;
     mod runtime_payloads;
     mod runtime_uploads;
     mod static_credentials;

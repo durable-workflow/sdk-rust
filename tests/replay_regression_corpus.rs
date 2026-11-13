@@ -537,6 +537,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.business-replay-clock-parallel-child"
             | "corpus.nexus-result"
             | "corpus.nexus-cancellation"
+            | "corpus.run-closed-selection"
+            | "corpus.run-closed-all-failure"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -1287,6 +1289,52 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 }))
             });
         }
+        "corpus.run-closed-selection" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let selected = ctx
+                    .select_keyed(vec![
+                        (
+                            "first",
+                            ParallelOperation::activity("greeting", json!(["first"])),
+                        ),
+                        (
+                            "second",
+                            ParallelOperation::activity("greeting", json!(["second"])),
+                        ),
+                    ])
+                    .await?;
+                let winner = match &selected.key {
+                    SelectionKey::Name(key) => key.clone(),
+                    SelectionKey::Index(index) => index.to_string(),
+                };
+                let ParallelResult::Activity(value) = selected.into_result()? else {
+                    return Err(Error::WorkerLoop(
+                        "run-closed selection replay returned a non-activity winner".to_string(),
+                    ));
+                };
+                Ok(json!({"winner": winner, "value": value}))
+            });
+        }
+        "corpus.run-closed-all-failure" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let outcome = ctx
+                    .parallel(vec![
+                        ParallelOperation::activity("greeting", json!(["still-running"])),
+                        ParallelOperation::activity("failing", json!([])),
+                    ])
+                    .await;
+                match outcome {
+                    Ok(_) => Ok(json!("no failure")),
+                    Err(Error::ParallelFailed(failure)) => match *failure.cause {
+                        Error::ActivityFailed(cause) => {
+                            Ok(json!(format!("caught: {}", cause.message)))
+                        }
+                        other => Ok(json!(format!("caught other: {other}"))),
+                    },
+                    Err(error) => Err(error),
+                }
+            });
+        }
         _ => unreachable!("workflow type was validated above"),
     }
     let worker_registration = if let Some(expected) = fixture.get("worker_registration") {
@@ -1856,6 +1904,87 @@ async fn durable_selection_winner_is_deterministic_across_cold_workers() {
         .expect("cold selection replay fixture must execute");
 
     assert_eq!(first, restarted);
+}
+
+#[tokio::test]
+async fn run_close_cancellations_never_resolve_a_member_on_cold_replay() {
+    // The selection fixture already replayed before run-close settlement was
+    // recognized (Rust never awaits a select() loser), so it is kept beside
+    // the guarded corpus as compatibility evidence; the all() fixture failed
+    // before it and lives in the corpus.
+    for name in [
+        "run-closed-selection-loser.json",
+        "replay-regressions/run-closed-all-handled-failure.json",
+    ] {
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        let fixture: Value = serde_json::from_str(
+            &fs::read_to_string(&fixture_path).expect("read run-closed replay fixture"),
+        )
+        .expect("parse run-closed replay fixture");
+        let history = fixture["history"].as_array().expect("history");
+        assert!(
+            history
+                .iter()
+                .any(|event| event["event_type"] == "ActivityCancelled"
+                    && event["payload"]["cancellation_reason"] == "run_closed"),
+            "{name} must record the close's cancellation"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| event["payload"]["abandoned_activities"].is_array()),
+            "{name} must carry the terminal abandoned_activities key"
+        );
+        let first = execute_fixture_delivery(&fixture, "delivery-a")
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let restarted = execute_fixture_delivery(&fixture, "delivery-b")
+            .await
+            .unwrap_or_else(|error| panic!("{name} cold: {error}"));
+        assert_eq!(first, restarted, "{name}");
+
+        // Keys a later Server adds to these events are tolerated, and an
+        // abandoned activity listed at close changes nothing on replay.
+        let mut extended = fixture.clone();
+        for event in extended["history"].as_array_mut().expect("history") {
+            event["payload"]["future_close_detail"] = json!({"kept": true});
+            if event["event_type"] == "WorkflowCompleted" {
+                event["payload"]["abandoned_activities"] = json!([{
+                    "activity_execution_id": "01run-closed-abandoned",
+                    "sequence": 99
+                }]);
+            }
+        }
+        extended["id"] = json!(format!("{}-extended", fixture["id"].as_str().unwrap()));
+        assert_eq!(
+            execute_fixture_delivery(&extended, "delivery-extended")
+                .await
+                .unwrap_or_else(|error| panic!("{name} extended: {error}")),
+            first,
+            "{name} extended"
+        );
+
+        if name != "replay-regressions/run-closed-all-handled-failure.json" {
+            continue;
+        }
+        // Without the run_closed reason the same event is an outcome the
+        // workflow observed, so the recorded close no longer replays.
+        let mut observed = fixture.clone();
+        for event in observed["history"].as_array_mut().expect("history") {
+            if let Some(payload) = event["payload"].as_object_mut() {
+                payload.remove("cancellation_reason");
+            }
+        }
+        observed["id"] = json!(format!("{}-observed", fixture["id"].as_str().unwrap()));
+        assert!(
+            execute_fixture_delivery(&observed, "delivery-observed")
+                .await
+                .is_err(),
+            "{name}: a cancellation without run_closed must stay an observed outcome"
+        );
+    }
 }
 
 #[tokio::test]
