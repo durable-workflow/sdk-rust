@@ -730,7 +730,15 @@ each command's arguments must still fit the per-payload limit. A larger
 completion, usually a very large fan-out, is refused with HTTP 413,
 `reason: "payload_too_large"` and `limit_kind: "workflow_task_completion_bytes"`.
 
-The SDK treats that refusal as a structural limit, not a transient error. It
+Automatic structural failure requires the HTTP 413 to reach the worker. A
+current native Server transport defect can close an over-limit request before
+that response is read. In that case the SDK reports a transport error, and the
+run is not yet guaranteed to fail structurally. Follow the
+[aggregate transport correction](https://github.com/durable-workflow/server/issues/1136)
+and [published fan-out acceptance](https://github.com/durable-workflow/.github/issues/228)
+before relying on automatic recovery from an over-limit completion.
+
+When the typed refusal reaches the SDK, it is a structural limit. It
 never resends the oversized completion. `Client::complete_workflow_task` returns
 `Error::WorkflowTaskCompletionTooLarge`, which carries the Server's `limit`, the
 encoded request `size` the SDK sent, and the Server's message. A `Worker`
