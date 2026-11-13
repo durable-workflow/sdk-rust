@@ -19147,7 +19147,6 @@ fn workflow_failure_command(
                 "structural_limit_kind": refusal.limit_kind,
                 "structural_limit_value": refusal.size,
                 "structural_limit_configured": refusal.limit,
-                "server_message": refusal.message,
             }),
         ),
         _ => ("RustWorkflowError", "durable_workflow::Error", Value::Null),
@@ -31501,6 +31500,8 @@ mod tests {
         );
         assert_eq!(properties["structural_limit_value"], size);
         assert_eq!(properties["structural_limit_configured"], 33_554_432);
+        // The Server's free-text message is not recorded with the failure.
+        assert!(properties.get("server_message").is_none(), "{properties}");
         assert_eq!(
             server.request_count("/api/worker/workflow-tasks/typed-413/fail"),
             0,

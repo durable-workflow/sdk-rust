@@ -696,7 +696,8 @@ and names both sizes, so the run fails with failure category
 `structural_limit` instead of retrying the task forever or parking the run. The
 failure's exception properties record `structural_limit_kind`,
 `structural_limit_value` (the request size) and `structural_limit_configured`
-(the limit). Other 413 responses and 5xx responses are unchanged.
+(the limit); the Server's message is not copied into workflow history.
+Other 413 responses and 5xx responses are unchanged.
 
 To stay under the limit, split the fan-out into smaller batches across workflow
 tasks, move groups of work into child workflows, or continue as new; offload
