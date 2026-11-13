@@ -32,6 +32,7 @@ pub use pagination::{
 };
 mod terminal_failure_detail;
 mod tls;
+mod update_outcome;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
@@ -91,6 +92,7 @@ pub use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 pub use sticky_workflow_cache::{StickyCacheMetrics, StickyCacheOptions};
 use thiserror::Error;
+pub use update_outcome::{UpdatePending, UpdateWaitStage};
 pub use uuid::Uuid;
 pub use worker_session::{WorkerSession, WorkerSessionOptions};
 
@@ -408,6 +410,16 @@ pub enum Error {
         "workflow_memo_updates_unavailable: the connected runtime did not advertise workflow memo update support"
     )]
     WorkflowMemoUpdatesUnavailable,
+    /// An accepted update had not completed when the wait ended; it has no
+    /// result yet. See [`UpdatePending`].
+    #[error(transparent)]
+    UpdateStillPending(UpdatePending),
+    /// The connected Server does not advertise `update_outcome_reads`, so an
+    /// update outcome cannot be read by update id. Nothing was read or sent.
+    #[error(
+        "update_outcome_reads_unavailable: the connected Server does not advertise update_outcome_reads, so an update outcome cannot be read by update id; call update_workflow() again with the same request_id instead"
+    )]
+    UpdateOutcomeReadsUnavailable,
     #[error("cooperative cancellation is unavailable: {0}")]
     CooperativeCancellationUnavailable(String),
     #[error("cancellation_scope_execution_not_supported: Rust worker cannot replay scoped cancellation history")]
@@ -496,6 +508,24 @@ impl Error {
             }
             _ => Self::Http { status, body },
         }
+    }
+
+    /// Whether an update outcome read found no retained update with that id
+    /// for the workflow (HTTP 404, `reason: "update_not_found"`).
+    ///
+    /// That includes an update pruned with its run, so it does not prove the
+    /// update was never admitted.
+    pub fn is_update_not_found(&self) -> bool {
+        matches!(self, Self::Http { status, .. } if status.as_u16() == 404)
+            && self
+                .refusal_body()
+                .and_then(|body| {
+                    body.get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("update_not_found")
     }
 
     fn refusal_body(&self) -> Option<Value> {
@@ -3096,6 +3126,8 @@ pub struct Client {
     activity_lease_renewal_supported: Arc<AtomicBool>,
     /// Server #1017: the Server sends sticky hits only the history after the cached sequence.
     sticky_history_suffix_supported: Arc<AtomicBool>,
+    /// Server #1131: the Server advertised `update_outcome_reads`.
+    update_outcome_reads_supported: Arc<AtomicBool>,
     activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
@@ -3689,6 +3721,12 @@ impl Client {
     /// key for the same update intent returns the original update's receipt and
     /// result instead of admitting a second update; a different intent is
     /// refused with [`Error::is_request_id_conflict`].
+    ///
+    /// The Server waits for the update to complete. When its wait ends first,
+    /// this returns [`Error::UpdateStillPending`], never `Null`: read the
+    /// outcome later with [`Client::update_outcome`] and the pending update's
+    /// id, or send the update again with the same `request_id`. A handler that
+    /// returned null is `Ok(Value::Null)`.
     pub async fn update_workflow<T: Serialize>(
         &self,
         workflow_id: &str,
@@ -3699,13 +3737,7 @@ impl Client {
         let response = self
             .update_workflow_response(workflow_id, update_name, input, request_id)
             .await?;
-        if let Some(envelope) = response
-            .get("result_envelope")
-            .filter(|envelope| !envelope.is_null())
-        {
-            return decode_wire_value(envelope, DEFAULT_CODEC);
-        }
-        Ok(response.get("result").cloned().unwrap_or(response))
+        Self::submitted_update_value(workflow_id, response)
     }
 
     /// Send a synchronous update and retain a bytes-capable Avro result.
@@ -3719,16 +3751,7 @@ impl Client {
         let response = self
             .update_workflow_response(workflow_id, update_name, input, request_id)
             .await?;
-        let envelope = response
-            .get("result_envelope")
-            .filter(|envelope| !envelope.is_null())
-            .ok_or_else(|| {
-                Error::Codec(
-                    "missing_payload_envelope: typed update result requires result_envelope"
-                        .to_string(),
-                )
-            })?;
-        decode_wire_avro_value(envelope, DEFAULT_CODEC)
+        Self::submitted_update_avro_value(workflow_id, response)
     }
 
     async fn update_workflow_response<T: Serialize>(
@@ -6131,6 +6154,7 @@ impl ClientBuilder {
             failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
             sticky_history_suffix_supported: Arc::new(AtomicBool::new(false)),
+            update_outcome_reads_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]

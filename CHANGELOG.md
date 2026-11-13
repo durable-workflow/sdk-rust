@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- An update whose wait ends before its handler finishes now returns
+  `Error::UpdateStillPending` instead of `Ok(Null)` (durable-workflow/.github#212).
+  `update_workflow` used to return the Server's `result: null` for a 202
+  `wait_timed_out` receipt, so a pending update looked like a handler that
+  returned null. The error carries the `update_id`, `request_id`, current
+  `run_id`, `update_status` and full receipt; a real null result is still
+  `Ok(Null)`. `update_workflow_avro_value` returns the same error instead of a
+  `missing_payload_envelope` codec error.
+
+- `Client::update_outcome`, `Client::update_outcome_avro_value` and
+  `Client::update_outcome_receipt` (and `WorkflowHandle::update_outcome`) read an
+  accepted update's outcome later by its update id, without submitting it
+  again (server#1131). They need a Server that advertises
+  `update_outcome_reads` (native 3.6.0 and later) and return
+  `Error::UpdateOutcomeReadsUnavailable` otherwise, before reading anything. A
+  still-running update returns `Error::UpdateStillPending` with a hint to read
+  again by update id. A failed update is `Error::Http` 422, and
+  `Error::is_update_not_found()` detects 404 `update_not_found`.
+
 - A `request_id_conflict` refusal from native Server 3.9.0 (server#934,
   server#1191) now names the key that was sent. Native doesn't echo the key, so
   `Error::request_id()` returned `None` and `RequestIdConflict::request_id` was
