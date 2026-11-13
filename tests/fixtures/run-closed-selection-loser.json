@@ -1,0 +1,271 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-run-closed-selection-loser",
+  "protocol_version": "1.0",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.run-closed-selection",
+    "payload_codec": "avro",
+    "input": []
+  },
+  "run_closed_settlement": {
+    "issues": [
+      "durable-workflow/workflow#1117",
+      "durable-workflow/workflow#1121",
+      "durable-workflow/server#1193"
+    ],
+    "note": "The select() loser was still open when the run completed, so the close recorded ActivityCancelled with cancellation_reason=run_closed before WorkflowCompleted. Replay leaves the loser open and resolves to the recorded winner."
+  },
+  "history": [
+    {
+      "id": "evt-01",
+      "sequence": 1,
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_execution_id": "01run-closed-first",
+        "activity_type": "greeting",
+        "parallel_group_id": "select-calls:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_mode": "select",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 0,
+        "selection_member_key": "first",
+        "selection_member_index": 0,
+        "selection_member_base_sequence": 1,
+        "selection_member_size": 1,
+        "selection_member_kind": "activity",
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "select-calls:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_mode": "select",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 0,
+            "selection_member_key": "first",
+            "selection_member_index": 0,
+            "selection_member_base_sequence": 1,
+            "selection_member_size": 1,
+            "selection_member_kind": "activity"
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.100000Z"
+    },
+    {
+      "id": "evt-02",
+      "sequence": 2,
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 2,
+        "activity_execution_id": "01run-closed-second",
+        "activity_type": "greeting",
+        "parallel_group_id": "select-calls:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_mode": "select",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1,
+        "selection_member_key": "second",
+        "selection_member_index": 1,
+        "selection_member_base_sequence": 2,
+        "selection_member_size": 1,
+        "selection_member_kind": "activity",
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "select-calls:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_mode": "select",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 1,
+            "selection_member_key": "second",
+            "selection_member_index": 1,
+            "selection_member_base_sequence": 2,
+            "selection_member_size": 1,
+            "selection_member_kind": "activity"
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.100000Z"
+    },
+    {
+      "id": "evt-03",
+      "sequence": 3,
+      "event_type": "ActivityCompleted",
+      "payload": {
+        "sequence": 1,
+        "activity_execution_id": "01run-closed-first",
+        "activity_attempt_id": "01run-closed-first-a1",
+        "activity_type": "greeting",
+        "attempt_number": 1,
+        "result": "wwHioz3/VYAiNwoKZmlyc3Q=",
+        "payload_codec": "avro",
+        "parallel_group_id": "select-calls:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_mode": "select",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 0,
+        "selection_member_key": "first",
+        "selection_member_index": 0,
+        "selection_member_base_sequence": 1,
+        "selection_member_size": 1,
+        "selection_member_kind": "activity",
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "select-calls:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_mode": "select",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 0,
+            "selection_member_key": "first",
+            "selection_member_index": 0,
+            "selection_member_base_sequence": 1,
+            "selection_member_size": 1,
+            "selection_member_kind": "activity"
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.200000Z"
+    },
+    {
+      "id": "evt-04",
+      "sequence": 4,
+      "event_type": "SelectionResolved",
+      "payload": {
+        "selection_group_id": "select-calls:1:2",
+        "selection_group_base_sequence": 1,
+        "selection_group_size": 2,
+        "member_key": "first",
+        "member_index": 0,
+        "member_base_sequence": 1,
+        "member_size": 1,
+        "operation_kind": "activity",
+        "operation_identity": "01run-closed-first",
+        "outcome": "completed",
+        "resolution_event_id": "evt-03",
+        "resolution_event_type": "ActivityCompleted"
+      },
+      "recorded_at": "2026-11-13T00:39:42.200000Z"
+    },
+    {
+      "id": "evt-05",
+      "sequence": 5,
+      "event_type": "ActivityCancelled",
+      "payload": {
+        "workflow_command_id": null,
+        "activity_execution_id": "01run-closed-second",
+        "activity_attempt_id": "01run-closed-second-a1",
+        "activity_class": "greeting",
+        "activity_type": "greeting",
+        "sequence": 2,
+        "attempt_number": 1,
+        "cancelled_at": "2026-11-13T00:39:42.300000Z",
+        "activity": {
+          "id": "01run-closed-second",
+          "idempotency_key": "01run-closed-second",
+          "sequence": 2,
+          "type": "greeting",
+          "class": "greeting",
+          "local_activity": false,
+          "status": "cancelled",
+          "payload_codec": "avro",
+          "attempt_count": 1,
+          "parallel_group_id": "select-calls:1:2",
+          "parallel_group_kind": "activity",
+          "parallel_group_mode": "select",
+          "parallel_group_base_sequence": 1,
+          "parallel_group_size": 2,
+          "parallel_group_index": 1,
+          "selection_member_key": "second",
+          "selection_member_index": 1,
+          "selection_member_base_sequence": 2,
+          "selection_member_size": 1,
+          "selection_member_kind": "activity",
+          "parallel_group_path": [
+            {
+              "parallel_group_id": "select-calls:1:2",
+              "parallel_group_kind": "activity",
+              "parallel_group_mode": "select",
+              "parallel_group_base_sequence": 1,
+              "parallel_group_size": 2,
+              "parallel_group_index": 1,
+              "selection_member_key": "second",
+              "selection_member_index": 1,
+              "selection_member_base_sequence": 2,
+              "selection_member_size": 1,
+              "selection_member_kind": "activity"
+            }
+          ]
+        },
+        "activity_attempt": {
+          "id": "01run-closed-second-a1",
+          "attempt_number": 1,
+          "status": "cancelled"
+        },
+        "cancellation_reason": "run_closed",
+        "parallel_group_id": "select-calls:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_mode": "select",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1,
+        "selection_member_key": "second",
+        "selection_member_index": 1,
+        "selection_member_base_sequence": 2,
+        "selection_member_size": 1,
+        "selection_member_kind": "activity",
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "select-calls:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_mode": "select",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 1,
+            "selection_member_key": "second",
+            "selection_member_index": 1,
+            "selection_member_base_sequence": 2,
+            "selection_member_size": 1,
+            "selection_member_kind": "activity"
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.300000Z"
+    },
+    {
+      "id": "evt-06",
+      "sequence": 6,
+      "event_type": "WorkflowCompleted",
+      "payload": {
+        "output": null,
+        "payload_codec": "avro",
+        "abandoned_activities": []
+      },
+      "recorded_at": "2026-11-13T00:39:42.300000Z"
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "winner": "first",
+        "value": "first"
+      }
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "winner": "first",
+      "value": "first"
+    }
+  }
+}

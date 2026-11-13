@@ -1,0 +1,190 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-run-closed-all-handled-failure",
+  "protocol_version": "1.0",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.run-closed-all-failure",
+    "payload_codec": "avro",
+    "input": []
+  },
+  "run_closed_settlement": {
+    "issues": [
+      "durable-workflow/workflow#1117",
+      "durable-workflow/workflow#1121",
+      "durable-workflow/server#1193"
+    ],
+    "note": "The all() failure (boom) was handled and the workflow completed while member 0 was still open. The close cancelled member 0 with cancellation_reason=run_closed at the same recorded time as the failure. Replay keeps the handled failure instead of the close's cancellation."
+  },
+  "history": [
+    {
+      "id": "evt-01",
+      "sequence": 1,
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_execution_id": "01run-closed-still-running",
+        "activity_type": "greeting",
+        "parallel_group_id": "parallel-activities:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 0,
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "parallel-activities:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 0
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.100000Z"
+    },
+    {
+      "id": "evt-02",
+      "sequence": 2,
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 2,
+        "activity_execution_id": "01run-closed-failing",
+        "activity_type": "failing",
+        "parallel_group_id": "parallel-activities:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1,
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "parallel-activities:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 1
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.100000Z"
+    },
+    {
+      "id": "evt-03",
+      "sequence": 3,
+      "event_type": "ActivityFailed",
+      "payload": {
+        "sequence": 2,
+        "activity_execution_id": "01run-closed-failing",
+        "activity_attempt_id": "01run-closed-failing-a1",
+        "activity_type": "failing",
+        "attempt_number": 1,
+        "failure_id": "01run-closed-failing-f1",
+        "failure_category": "application",
+        "non_retryable": true,
+        "exception_type": "RuntimeException",
+        "exception_class": "RuntimeException",
+        "message": "boom",
+        "code": 0,
+        "parallel_group_id": "parallel-activities:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 1,
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "parallel-activities:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 1
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.200000Z"
+    },
+    {
+      "id": "evt-04",
+      "sequence": 4,
+      "event_type": "ActivityCancelled",
+      "payload": {
+        "workflow_command_id": null,
+        "activity_execution_id": "01run-closed-still-running",
+        "activity_attempt_id": "01run-closed-still-running-a1",
+        "activity_class": "greeting",
+        "activity_type": "greeting",
+        "sequence": 1,
+        "attempt_number": 1,
+        "cancelled_at": "2026-11-13T00:39:42.200000Z",
+        "activity": {
+          "id": "01run-closed-still-running",
+          "idempotency_key": "01run-closed-still-running",
+          "sequence": 1,
+          "type": "greeting",
+          "class": "greeting",
+          "local_activity": false,
+          "status": "cancelled",
+          "payload_codec": "avro",
+          "attempt_count": 1,
+          "parallel_group_id": "parallel-activities:1:2",
+          "parallel_group_kind": "activity",
+          "parallel_group_base_sequence": 1,
+          "parallel_group_size": 2,
+          "parallel_group_index": 0,
+          "parallel_group_path": [
+            {
+              "parallel_group_id": "parallel-activities:1:2",
+              "parallel_group_kind": "activity",
+              "parallel_group_base_sequence": 1,
+              "parallel_group_size": 2,
+              "parallel_group_index": 0
+            }
+          ]
+        },
+        "activity_attempt": {
+          "id": "01run-closed-still-running-a1",
+          "attempt_number": 1,
+          "status": "cancelled"
+        },
+        "cancellation_reason": "run_closed",
+        "parallel_group_id": "parallel-activities:1:2",
+        "parallel_group_kind": "activity",
+        "parallel_group_base_sequence": 1,
+        "parallel_group_size": 2,
+        "parallel_group_index": 0,
+        "parallel_group_path": [
+          {
+            "parallel_group_id": "parallel-activities:1:2",
+            "parallel_group_kind": "activity",
+            "parallel_group_base_sequence": 1,
+            "parallel_group_size": 2,
+            "parallel_group_index": 0
+          }
+        ]
+      },
+      "recorded_at": "2026-11-13T00:39:42.200000Z"
+    },
+    {
+      "id": "evt-05",
+      "sequence": 5,
+      "event_type": "WorkflowCompleted",
+      "payload": {
+        "output": null,
+        "payload_codec": "avro",
+        "abandoned_activities": []
+      },
+      "recorded_at": "2026-11-13T00:39:42.200000Z"
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": "caught: boom"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": "caught: boom"
+  }
+}

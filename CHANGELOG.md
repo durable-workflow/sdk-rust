@@ -12,6 +12,19 @@
   request IDs and the `command_request_keys` capability. Older Servers are
   unaffected.
 
+- Replay ignores the activity cancellations a run's own close records
+  (durable-workflow/server#1193, durable-workflow/workflow#1117). When a run
+  completes, fails or continues as new, Workflow 2.28.0 (and Server with
+  server#1193) records `ActivityCancelled` with `cancellation_reason: run_closed`
+  for each activity it never awaited, such as a `select()` loser. Replay now
+  leaves that activity open instead of treating the cancellation as an outcome:
+  a handled `all()` failure is no longer replaced by a lower-index member
+  cancelled at close. The new `abandoned_activities` key on `WorkflowCompleted`,
+  `WorkflowFailed` and `WorkflowContinuedAsNew` is accepted. Activity workers
+  already treat a `run_closed` heartbeat or late outcome (`recorded: false`) as
+  final; new tests cover it, including an abandon-policy activity that keeps
+  running after close.
+
 ## 4.14.0
 
 - Workers with a sticky cache advertise `sticky_history_suffix` (#234,
