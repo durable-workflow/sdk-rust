@@ -3426,7 +3426,11 @@ impl Client {
         });
         self.request_json(
             reqwest::Method::POST,
-            &format!("/workflows/{workflow_id}/message-streams/{stream_name}/messages"),
+            &format!(
+                "/workflows/{}/message-streams/{}/messages",
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("stream_name", stream_name)?,
+            ),
             RequestProtocol::ControlPlane,
             Some(&body),
         )
@@ -3482,9 +3486,18 @@ impl Client {
         }));
         let path = match run_id {
             Some(run_id) => {
-                format!("/workflows/{workflow_id}/runs/{run_id}/signal/{signal_name}")
+                format!(
+                    "/workflows/{}/runs/{}/signal/{}",
+                    path_segment("workflow_id", workflow_id)?,
+                    path_segment("run_id", run_id)?,
+                    path_segment("signal_name", signal_name)?,
+                )
             }
-            None => format!("/workflows/{workflow_id}/signal/{signal_name}"),
+            None => format!(
+                "/workflows/{}/signal/{}",
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("signal_name", signal_name)?,
+            ),
         };
         let receipt = self
             .request_json(
@@ -3567,7 +3580,11 @@ impl Client {
         let data: Value = self
             .request_json(
                 reqwest::Method::POST,
-                &format!("/workflows/{workflow_id}/runs/{failed_run_id}/redrive"),
+                &format!(
+                    "/workflows/{}/runs/{}/redrive",
+                    path_segment("workflow_id", workflow_id)?,
+                    path_segment("run_id", failed_run_id)?,
+                ),
                 RequestProtocol::ControlPlane,
                 Some(&body),
             )
@@ -3626,10 +3643,16 @@ impl Client {
         let body = &options;
         let path = match run_id {
             Some(run_id) => format!(
-                "/workflows/{workflow_id}/runs/{run_id}/{}",
+                "/workflows/{}/runs/{}/{}",
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("run_id", run_id)?,
                 command.as_str()
             ),
-            None => format!("/workflows/{workflow_id}/{}", command.as_str()),
+            None => format!(
+                "/workflows/{}/{}",
+                path_segment("workflow_id", workflow_id)?,
+                command.as_str(),
+            ),
         };
         let data = match self
             .request_json(
@@ -3717,9 +3740,18 @@ impl Client {
         let body = json!({"input": encode_typed_envelope(&input, DEFAULT_CODEC)?});
         let path = match run_id {
             Some(run_id) => {
-                format!("/workflows/{workflow_id}/runs/{run_id}/query/{query_name}")
+                format!(
+                    "/workflows/{}/runs/{}/query/{}",
+                    path_segment("workflow_id", workflow_id)?,
+                    path_segment("run_id", run_id)?,
+                    path_segment("query_name", query_name)?,
+                )
             }
-            None => format!("/workflows/{workflow_id}/query/{query_name}"),
+            None => format!(
+                "/workflows/{}/query/{}",
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("query_name", query_name)?,
+            ),
         };
         let response: Value = match self
             .request_json(
@@ -3763,9 +3795,18 @@ impl Client {
         });
         let path = match run_id {
             Some(run_id) => {
-                format!("/workflows/{workflow_id}/runs/{run_id}/query/{query_name}")
+                format!(
+                    "/workflows/{}/runs/{}/query/{}",
+                    path_segment("workflow_id", workflow_id)?,
+                    path_segment("run_id", run_id)?,
+                    path_segment("query_name", query_name)?,
+                )
             }
-            None => format!("/workflows/{workflow_id}/query/{query_name}"),
+            None => format!(
+                "/workflows/{}/query/{}",
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("query_name", query_name)?,
+            ),
         };
         let response: Value = match self
             .request_json(
@@ -3891,7 +3932,11 @@ impl Client {
         workflow_id: &str,
         run_id: &str,
     ) -> Result<WorkflowDescription> {
-        let path = format!("/workflows/{workflow_id}/runs/{run_id}");
+        let path = format!(
+            "/workflows/{}/runs/{}",
+            path_segment("workflow_id", workflow_id)?,
+            path_segment("run_id", run_id)?,
+        );
         let mut data: WorkflowDescription = self
             .request_json(
                 reqwest::Method::GET,
@@ -3904,17 +3949,21 @@ impl Client {
         Ok(data)
     }
 
-    fn workflow_stream_path(workflow_id: &str, run_id: &str, stream_name: Option<&str>) -> String {
+    fn workflow_stream_path(
+        workflow_id: &str,
+        run_id: &str,
+        stream_name: Option<&str>,
+    ) -> Result<String> {
         let mut path = format!(
             "/workflows/{}/runs/{}/streams",
-            percent_encode_path_segment(workflow_id),
-            percent_encode_path_segment(run_id),
+            path_segment("workflow_id", workflow_id)?,
+            path_segment("run_id", run_id)?,
         );
         if let Some(stream_name) = stream_name {
             path.push('/');
-            path.push_str(&percent_encode_path_segment(stream_name));
+            path.push_str(&path_segment("stream_name", stream_name)?);
         }
-        path
+        Ok(path)
     }
 
     /// List the run-scoped output streams already opened by a workflow.
@@ -3926,7 +3975,7 @@ impl Client {
         let response: WorkflowStreamListResponse = self
             .request_json(
                 reqwest::Method::GET,
-                &Self::workflow_stream_path(workflow_id, run_id, None),
+                &Self::workflow_stream_path(workflow_id, run_id, None)?,
                 RequestProtocol::ControlPlane,
                 Option::<&Value>::None,
             )
@@ -3944,7 +3993,7 @@ impl Client {
         let response: WorkflowStreamDescriptionResponse = self
             .request_json(
                 reqwest::Method::GET,
-                &Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+                &Self::workflow_stream_path(workflow_id, run_id, Some(stream_name))?,
                 RequestProtocol::ControlPlane,
                 Option::<&Value>::None,
             )
@@ -3971,7 +4020,7 @@ impl Client {
         let wait_seconds = wait.as_secs().min(MAX_LONG_POLL_TIMEOUT_SECONDS);
         let path = format!(
             "{}/items?from={from_offset}&max_items={max_items}&wait_seconds={wait_seconds}",
-            Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+            Self::workflow_stream_path(workflow_id, run_id, Some(stream_name))?,
         );
         let response: WorkflowStreamPageResponse = self
             .request_json_with_timeout(
@@ -4078,7 +4127,7 @@ impl Client {
                 reqwest::Method::POST,
                 &format!(
                     "{}/items",
-                    Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+                    Self::workflow_stream_path(workflow_id, run_id, Some(stream_name))?,
                 ),
                 RequestProtocol::ControlPlane,
                 Some(&body),
@@ -4119,7 +4168,7 @@ impl Client {
                 reqwest::Method::POST,
                 &format!(
                     "{}/close",
-                    Self::workflow_stream_path(workflow_id, run_id, Some(stream_name)),
+                    Self::workflow_stream_path(workflow_id, run_id, Some(stream_name))?,
                 ),
                 RequestProtocol::ControlPlane,
                 Some(&body),
@@ -19719,6 +19768,7 @@ mod tests {
     mod cooperative_cancellation;
     mod local_activity;
     mod nexus;
+    mod path_segments;
     mod run_closed_settlement;
     mod runtime_payloads;
     mod runtime_uploads;
