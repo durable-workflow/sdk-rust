@@ -856,7 +856,7 @@ async fn runtime_upload_low_level_references_are_strict_and_never_reuploaded() {
         .await
         .unwrap();
     assert_eq!(server.request_count(UPLOAD), 0);
-    assert_eq!(server.request_count(DISCOVERY), 0);
+    assert_eq!(server.request_count(DISCOVERY), 1);
     for (path, bad) in [
         ("/codec", json!("json")),
         ("/external_payload/reference_id", json!("../../other")),
@@ -875,4 +875,6 @@ async fn runtime_upload_low_level_references_are_strict_and_never_reuploaded() {
             .is_err());
     }
     assert_eq!(server.request_count(&format!("/api{COMPLETE}")), 1);
+    assert_eq!(server.request_count(DISCOVERY), 1);
+    assert_eq!(server.request_count(UPLOAD), 0);
 }
