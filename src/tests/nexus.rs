@@ -157,6 +157,7 @@ fn root_request_selects_original_service_boundary_without_readmission() {
         cleanup_deadline_at: "2026-10-12T14:00:30Z".into(),
         history_refresh_page_token: Some("original-page".into()),
         context: None,
+        cause: CancellationCause::Requested,
     };
     let decision = worker()
         .execute_workflow_task_decision_with_cancellation(task, Some(&observation))

@@ -39,6 +39,21 @@ time, original deadline and ordered lineage. Requester fields are limited to
 caller type, ID and label. Timestamp helpers return immutable UTC dates.
 `to_value()` produces a detached portable snapshot.
 
+## Timeout cleanup cause
+
+A run that opted in to deadline-triggered cleanup receives its timeout-cleanup
+interruption as an ordinary cooperative cancellation request whose context has
+the top-level `cause: "timeout"`. It arrives as
+`Error::CooperativeCancellationRequested`, so cancellation handlers such as saga
+compensation run for it unchanged, and the run still ends timed out.
+`request.cause` (and `CancellationContext::cause()`) is the discriminator:
+`CancellationCause::Requested` for an ordinary request, or
+`CancellationCause::Timeout { timeout_kind, work_deadline_at, cleanup_deadline_at }`.
+`timeout_kind` and `work_deadline_at` are `None` when the context does not carry
+them. A context with any other `cause` value, or with timeout fields but no
+timeout cause, is refused. Descendants cancelled under the request carry no
+`cause`, so they are ordinary cancellations.
+
 A scoped child context preserves its complete immutable `scope_origin` alongside
 the local run lineage. `ScopedCancellationContext::root_context()` retains the
 original root deadline. Its scoped lineage records each run, instance, scope,

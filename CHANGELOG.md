@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Cooperative cancellation now reads the optional top-level `cause` of the
+  portable cancellation context (workflow#863, workflow#1129). A
+  timeout-cleanup request (`cause: "timeout"`: the run passed its work
+  deadline and is now in cleanup) arrives through the existing
+  `Error::CooperativeCancellationRequested`, so existing
+  `Error::CooperativeCancellationRequested(_)` arms, such as saga
+  compensation, run for it unchanged. There is no new `Error` variant. Tell
+  the two apart with the new `#[non_exhaustive]` `CancellationCause`:
+  `Requested` for an ordinary request (`cause` absent or `"cancellation"`), or
+  `Timeout { timeout_kind, work_deadline_at, cleanup_deadline_at }`, with the
+  new `#[non_exhaustive]` `TimeoutKind` (`Execution` or `Run`).
+  `timeout_kind` and `work_deadline_at` are `None` when the context doesn't
+  carry them. `CancellationContext::cause()` and `is_timeout()` read it from
+  the context. A context with any other `cause`, with a timeout field but no
+  timeout cause, with an unknown `timeout_kind`, or with a `work_deadline_at`
+  that doesn't precede its cleanup deadline is refused as
+  `Error::InvalidCooperativeCancellation`. A descendant cancelled under the
+  request carries no `cause`, so it is an ordinary cancellation.
+  `CancellationContext::to_value()` writes `cause` and the timeout fields back
+  exactly as read, and an ordinary context's output is unchanged.
+
+  **Minor-release note:** `CancellationRequest` gains a public
+  `cause: CancellationCause` field. Code that builds a `CancellationRequest`
+  with a struct literal or destructures it exhaustively must add the field
+  (`cause: CancellationCause::Requested` for an ordinary request). Requests
+  the SDK produces already set it. `CancellationRequest` will become
+  `#[non_exhaustive]` in the next major release.
+
 - A workflow-task completion that native Server 3.6.0 refuses as too large
   (HTTP 413, `limit_kind: workflow_task_completion_bytes`, server#1152,
   durable-workflow/.github#228) is now a typed, non-retryable outcome.

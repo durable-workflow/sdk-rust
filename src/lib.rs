@@ -40,7 +40,8 @@ mod workflow_hydration;
 pub use activity_error::ActivityError;
 pub use activity_retry::{ActivityAttemptLimit, ActivityRetryInfo};
 pub use cancellation_context::{
-    CancellationContext, CancellationLineage, ScopedCancellationContext, ScopedCancellationLineage,
+    CancellationCause, CancellationContext, CancellationLineage, ScopedCancellationContext,
+    ScopedCancellationLineage, TimeoutKind,
 };
 pub use cancellation_scope::CancellationScopeOpenReceipt;
 #[doc(hidden)]
