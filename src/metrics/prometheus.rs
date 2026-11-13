@@ -1,6 +1,7 @@
 use super::{
     MetricTags, MetricsRecorder, CLIENT_REQUESTS, CLIENT_REQUEST_DURATION_SECONDS, WORKER_POLLS,
     WORKER_POLL_DURATION_SECONDS, WORKER_TASKS, WORKER_TASK_DURATION_SECONDS,
+    WORKER_TASK_SCHEDULE_TO_START_SECONDS,
 };
 use ::prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
@@ -44,6 +45,15 @@ impl PrometheusMetrics {
             registry.register(Box::new(metric.clone()))?;
             histograms.insert(histogram, metric);
         }
+        let metric = HistogramVec::new(
+            HistogramOpts::new(
+                WORKER_TASK_SCHEDULE_TO_START_SECONDS,
+                WORKER_TASK_SCHEDULE_TO_START_SECONDS,
+            ),
+            &["task_kind", "task_queue"],
+        )?;
+        registry.register(Box::new(metric.clone()))?;
+        histograms.insert(WORKER_TASK_SCHEDULE_TO_START_SECONDS, metric);
         Ok(Self {
             registry,
             counters,
@@ -67,6 +77,8 @@ impl PrometheusMetrics {
 fn values<'a>(name: &str, tags: &'a MetricTags) -> Option<Vec<&'a str>> {
     let labels = if matches!(name, CLIENT_REQUESTS | CLIENT_REQUEST_DURATION_SECONDS) {
         CLIENT_LABELS
+    } else if name == WORKER_TASK_SCHEDULE_TO_START_SECONDS {
+        &["task_kind", "task_queue"]
     } else {
         WORKER_LABELS
     };

@@ -88,6 +88,8 @@ async fn published_worker_emits_the_pinned_contract_and_prometheus_exposition() 
                 .unwrap(),
         ));
     }
+    // Both starts have committed before the worker begins claiming ready work.
+    tokio::time::sleep(Duration::from_millis(40)).await;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let running = tokio::spawn(async move {
         worker
@@ -140,14 +142,16 @@ async fn published_worker_emits_the_pinned_contract_and_prometheus_exposition() 
             expected
         );
         assert!(value.is_finite() && *value >= 0.0);
-        let counts = paired
-            .entry((entry["scope"].as_str().unwrap().into(), tags.clone()))
-            .or_default();
-        if *method == "increment" {
-            assert_eq!(*value, 1.0);
-            counts.0 += 1;
-        } else {
-            counts.1 += 1;
+        if entry["scope"] != "worker_task_dispatch" {
+            let counts = paired
+                .entry((entry["scope"].as_str().unwrap().into(), tags.clone()))
+                .or_default();
+            if *method == "increment" {
+                assert_eq!(*value, 1.0);
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
         }
         *observed.entry(name.clone()).or_default() += 1;
         for (key, value) in tags {
@@ -158,7 +162,17 @@ async fn published_worker_emits_the_pinned_contract_and_prometheus_exposition() 
             }
         }
     }
-    assert_eq!(observed.len(), 6, "all shared metrics must actually emit");
+    for kind in ["workflow", "activity"] {
+        assert!(
+            samples.iter().any(|(name, method, value, tags)| name
+                == "durable_workflow_worker_task_schedule_to_start_seconds"
+                && *method == "record"
+                && tags.get("task_kind").map(String::as_str) == Some(kind)
+                && (kind != "workflow" || *value > 0.0)),
+            "actual ready-age sample for {kind}"
+        );
+    }
+    assert_eq!(observed.len(), 7, "all shared metrics must actually emit");
     assert!(paired
         .values()
         .all(|(counter, histogram)| counter == histogram));
@@ -187,5 +201,5 @@ async fn published_worker_emits_the_pinned_contract_and_prometheus_exposition() 
         )));
     }
     assert!(!text.contains("synthetic failure") && !text.contains("metrics-missing-synthetic"));
-    println!("actual published Server metrics passed: six shared names, paired counts/durations, activity success/failure, HTTP error, official Prometheus exposition");
+    println!("actual published Server metrics passed: seven shared names, real workflow/activity ready ages, paired counts/durations, activity success/failure, HTTP error, official Prometheus exposition");
 }

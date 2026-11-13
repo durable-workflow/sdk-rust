@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Worker metrics emit the revision-2 schedule-to-start histogram in seconds
+  for workflow and activity claims when the Server advertises
+  `claimed_task_ready_age`. Missing or invalid producer values are omitted.
+  Prometheus export uses only the task kind and task queue labels.
+
 ## 4.15.0
 
 - All workflow and run routes encode each identifier or name as one path

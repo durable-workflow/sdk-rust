@@ -901,7 +901,7 @@ option. Keep a process supervisor for startup failures and process crashes.
 
 ### Client and worker metrics
 
-Rust SDK 4.7.0 adds the [shared SDK recorder contract](https://github.com/durable-workflow/.github/blob/73e8fc323e4f46322945a007e54a546395904f79/sdk-metrics/README.md).
+The SDK implements the [shared SDK recorder contract](https://github.com/durable-workflow/.github/blob/7a91906ece5cd599175a2e08ebcc9c8bc667a6f6/sdk-metrics/README.md).
 The default is a no-op. Supply an `Arc<dyn metrics::MetricsRecorder>` with
 `increment(name, count, tags)` and `record(name, seconds, tags)` methods; the
 client, its clones and newly constructed workers inherit the recorder.
@@ -912,7 +912,7 @@ SDK results; process aborts and blocking exporters cannot be repaired by a hook.
 
 Every observed client request, worker poll and claimed-task dispatch increments
 its counter by one and records one nonnegative monotonic duration in seconds.
-The six stable recorder names are:
+The paired recorder names are:
 
 | Counter | Duration histogram |
 | --- | --- |
@@ -920,12 +920,20 @@ The six stable recorder names are:
 | `durable_workflow_worker_polls` | `durable_workflow_worker_poll_duration_seconds` |
 | `durable_workflow_worker_tasks` | `durable_workflow_worker_task_duration_seconds` |
 
+Revision 2 also records `durable_workflow_worker_task_schedule_to_start_seconds`
+for workflow and activity claims when the Server advertises
+`claimed_task_ready_age`. It converts the Server's integer `ready_age_ms` to
+seconds and uses only `task_kind` and `task_queue`, without a paired counter or
+outcome label. A real zero is retained; missing, malformed or out-of-range
+producer values are omitted. This measures Server eligibility-to-claim time,
+without estimating missing values from the worker's clock.
+
 Client tags are exactly `method`, `route`, `plane`, `status_code`, `outcome`.
 Worker tags are exactly `task_kind`, `task_queue`, `outcome`. Reviewed route
 placeholders exclude IDs, query strings, payloads and credentials; unknown paths
 use `unknown`. Queue names are application-controlled: use bounded names rather
-than a queue per run. The SDK's tests consume the exact shared JSON at the pinned
-commit above (SHA256 `c456f4f434c601fa26f0caba07ef0fd29f548ca8f5fc29ba2f6430f01e32c0f0`).
+than a queue per run. The SDK's tests verify the exact vendored revision-2 JSON
+from the pinned shared contract above.
 
 One client observation includes its internal transport/storage-admission retries
 and response/payload handling. Separate application/worker-managed calls remain

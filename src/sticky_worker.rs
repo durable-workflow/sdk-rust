@@ -127,6 +127,13 @@ impl Worker {
             Ok((response, snapshot))
         })
         .await?;
+        if loaded.0.task.is_some() {
+            self.metrics.ready_age(
+                "workflow",
+                &self.task_queue,
+                metrics::ready_age_from_poll(&wire),
+            );
+        }
         Ok(loaded)
     }
 
