@@ -1,7 +1,7 @@
 use super::TestingError;
 use crate::{
     decode_wire_avro_value, encode_typed_envelope, enrich_query_history_from_export,
-    hydrate_query_history_from_export, json, normalize_avro_arguments, percent_encode_path_segment,
+    hydrate_query_history_from_export, json, normalize_avro_arguments, path_segment,
     validate_query_task_payloads, AvroValue, Client, HistoryEvent, QueryTask, RequestProtocol,
     Result, Value, WorkflowTask, DEFAULT_CODEC,
 };
@@ -198,8 +198,8 @@ impl Client {
             reqwest::Method::GET,
             &format!(
                 "/workflows/{}/runs/{}/history/export",
-                percent_encode_path_segment(workflow_id),
-                percent_encode_path_segment(run_id)
+                path_segment("workflow_id", workflow_id)?,
+                path_segment("run_id", run_id)?
             ),
             RequestProtocol::ControlPlane,
             Option::<&Value>::None,

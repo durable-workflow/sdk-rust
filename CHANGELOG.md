@@ -4,6 +4,11 @@
 
 ## 4.15.0
 
+- All workflow and run routes encode each identifier or name as one path
+  segment. Empty identifiers and `.` or `..` segments return
+  `Error::InvalidPathSegment` before any HTTP request, including capability
+  discovery for cooperative cancellation.
+
 - A workflow-task completion that native Server 3.6.0 refuses as too large
   (HTTP 413, `limit_kind: workflow_task_completion_bytes`, server#1152,
   durable-workflow/.github#228) is now a typed, non-retryable outcome.
