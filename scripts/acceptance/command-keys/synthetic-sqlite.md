@@ -63,11 +63,30 @@ owned cleanup. Physical upgrade and post-commit loss remain separate cells.
 ## Reproduce the open-state installed cell
 
 `run_open.py` is a one-shot Linux amd64/SQLite control. Prepare the
-[registry consumer](consumer/README.md), verify its archive/source identity with
-the existing release verifier, and record its build command plus source hash.
-Use a registry-only Cargo lock without patch, vendor or configuration overrides.
-The runner verifies the lock's official source, version and checksum; the owner
-still binds the compiled binary to the unchanged reviewed adapter source.
+[registry consumer](consumer/README.md) using the explicit builder below, from
+a committed reviewed tree. The builder copies only the committed Cargo manifest,
+lock and adapter into a private directory, checks their hashes before and after
+building, and downloads the official SDK archive into a fresh Cargo home. It
+verifies that archive's lock checksum and VCS source identity. No host Cargo or
+Docker configuration, registry credentials or dependency cache is mounted.
+
+Check machine capacity and select an already present official Linux amd64 Rust
+image by immutable local image ID. The single build container uses two CPUs,
+3 GiB, 512 PIDs, a read-only root and source, private writable Cargo/target
+directories, and a fifteen-minute timeout. Cargo runs with two jobs.
+
+```sh
+python3 scripts/acceptance/command-keys/build_consumer.py \
+  --work-dir "$CONSUMER_BUILD_DIR" --rust-image "$RUST_IMAGE_ID"
+```
+
+This writes `consumer` and a private `build-receipt.json`. The receipt binds
+the exact Git input tree, build recipe, image, toolchain, lock, SDK archive/source
+and executable hash plus filesystem identity. The runner requires that receipt,
+checks its input hashes against the committed source, opens the owned single-link
+executable once, and executes its held descriptor. It rechecks the descriptor and
+original path before and after every call and before admitting the final receipt.
+Replacing even an identically hashed executable inode refuses qualification.
 
 Select an already qualified exact Server index/source/version and ensure the
 image is present locally. Check current machine capacity and announce the run
@@ -85,10 +104,20 @@ python3 scripts/acceptance/command-keys/run_open.py \
   --work-dir "$LEGACY_WORK_DIR" \
   --consumer-binary "$CONSUMER_BINARY" \
   --consumer-lock "$CONSUMER_LOCK" \
+  --build-receipt "$CONSUMER_BUILD_RECEIPT" \
   --sdk-version "$SDK_VERSION" --sdk-sha256 "$SDK_SHA256" --sdk-source "$SDK_SOURCE" \
   --server-index "$SERVER_INDEX" --server-version "$SERVER_VERSION" \
   --server-source "$SERVER_SOURCE"
 ```
+
+Use `$CONSUMER_BUILD_DIR/consumer` and
+`$CONSUMER_BUILD_DIR/build-receipt.json` for the binary and receipt, and the
+committed `consumer/Cargo.lock` for the lock. These are local absolute paths.
+Publish their hashes and the build command, without publishing private paths or
+the complete build receipt. Readiness and cluster probes connect directly to the
+exact numeric loopback peer, ignore proxy variables, refuse redirects and require
+HTTP 200 with a bounded complete JSON object. The inert controls cover proxy,
+redirect, peer, framing, executable replacement and source/lock substitutions.
 
 The control admits real signal/update commands through the installed SDK,
 stops its exact owned Server, reads the actual `command_type` catalog, copies
@@ -97,6 +126,8 @@ the copy. Four concurrent retries retain unverified legacy identities;
 explicit-original-run readback and name/run conflicts preserve them. Both raw
 receipt status and high-level SDK pending/signal behavior are checked. Complete
 logical database rows/schema must match before and after those calls.
+Before the first readback, the restarted baseline fingerprint must equal the
+copy helper's transformed fingerprint. A startup rewrite refuses qualification.
 
 The original and copied databases, runtime and generated environment file are
 removed in cleanup. The terminal sanitized receipt, data-free catalog DDL and

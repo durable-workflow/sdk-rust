@@ -16,11 +16,11 @@ import sqlite3
 import subprocess
 import sys
 import time
-import urllib.request
 
 SOURCE = Path(__file__).resolve().parent
 sys.path.insert(0, str(SOURCE))
 import sqlite_legacy as legacy
+import execution_guards as guards
 
 
 
@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--consumer-binary',type=Path,required=True)
     parser.add_argument('--consumer-lock',type=Path,required=True)
+    parser.add_argument('--build-receipt',type=Path,required=True)
     parser.add_argument('--sdk-version',required=True)
     parser.add_argument('--sdk-sha256',required=True)
     parser.add_argument('--sdk-source',required=True)
@@ -49,12 +50,16 @@ def main():
         parser.error('exact immutable artifact identities are required')
     if not options.work_dir.is_absolute() or options.work_dir.exists():
         parser.error('work directory must be a new absolute owned path')
-    options.consumer_binary = options.consumer_binary.resolve(strict=True)
+    if not options.consumer_binary.is_absolute():
+        parser.error('consumer executable path must be absolute')
     lock=tomllib.loads(options.consumer_lock.read_text())
     packages=[p for p in lock['package'] if p['name']=='durable-workflow']
     assert len(packages)==1 and packages[0]['version']==options.sdk_version
     assert packages[0]['checksum']==options.sdk_sha256
     assert packages[0]['source']=='registry+https://github.com/rust-lang/crates.io-index'
+    build, build_receipt_sha = guards.verify_build_receipt(
+        options.build_receipt, SOURCE, options.consumer_binary, options.consumer_lock,
+        sdk_version=options.sdk_version, sdk_sha256=options.sdk_sha256, sdk_source=options.sdk_source)
     image='ghcr.io/durable-workflow/server@'+options.server_index
     info=json.loads(capture('docker','image','inspect',image))[0]
     assert info['Config']['Labels']['org.opencontainers.image.revision']==options.server_source
@@ -73,6 +78,7 @@ def main():
         file.write('DW_AUTH_TOKEN='+token+'\nDW_SERVER_KEY='+key+'\n')
     name = 'sdk-rust-216-legacy-open-' + secrets.token_hex(5)
     owned_id = None
+    binary = None
     origin = None
 
     def start(filename):
@@ -93,11 +99,8 @@ def main():
         end=time.monotonic()+60
         while True:
             try:
-                request=urllib.request.Request(origin+'/api/ready',headers={'Authorization':'Bearer '+token})
-                with urllib.request.urlopen(request,timeout=2) as response: response.read(4096)
-                request=urllib.request.Request(origin+'/api/cluster/info',headers={'Authorization':'Bearer '+token})
-                with urllib.request.urlopen(request,timeout=2) as response:
-                    info=json.loads(response.read(1024*1024))
+                guards.probe_json(origin, '/api/ready', token)
+                info = guards.probe_json(origin, '/api/cluster/info', token)
                 assert info['version']==options.server_version
                 assert info['capabilities']['command_request_keys'] is True
                 break
@@ -116,8 +119,7 @@ def main():
         env={'PATH':os.environ['PATH'],'TMPDIR':str(work),
              'DURABLE_WORKFLOW_LOCAL_ISOLATED':'1','DURABLE_WORKFLOW_SERVER_URL':origin,
              'DURABLE_WORKFLOW_AUTH_TOKEN':token}
-        result=subprocess.run([str(options.consumer_binary)],input=json.dumps(args),text=True,capture_output=True,
-                              env=env,timeout=20,check=True)
+        result=binary.run(input=json.dumps(args), env=env, timeout=20)
         return json.loads(result.stdout)
 
     def ok(args):
@@ -130,6 +132,7 @@ def main():
             return legacy.snapshot(connection)
 
     try:
+        binary = guards.BoundExecutable(options.consumer_binary, build['binary'])
         start('source.sqlite')
         queue='legacy-open-'+secrets.token_hex(5)
         ok({'op':'register','queue':queue,'null_update':True})
@@ -156,6 +159,7 @@ def main():
                           'transform':transform}),flush=True)
         start('legacy.sqlite')
         before=snapshot(copied)
+        guards.verify_restart_baseline(before, transform['after_sha256'])
         for kind,(admission,original) in seed.items():
             retry=dict(admission,input=[document['legacy_readback']['retry_input']])
             fields = ['command_id', 'run_id'] + (['update_id', 'accepted_at'] if kind == 'update' else [])
@@ -196,6 +200,7 @@ def main():
             with open(os.open(work / filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w') as file:
                 json.dump(value, file, sort_keys=True)
         stop()
+        binary.check()
         print(json.dumps({'cell':'synthetic-legacy-open-only','outcome':'pass',
             'started_at':started_at,'finished_at':datetime.now(timezone.utc).isoformat(),
             'zero_write_sha256':legacy.fingerprint(before),'server_source':options.server_source,
@@ -203,14 +208,20 @@ def main():
             'server_platform':'linux/amd64',
             'sdk_version':options.sdk_version,'sdk_sha256':options.sdk_sha256,'sdk_source':options.sdk_source,'manifest_sha256':legacy.MANIFEST_SHA256,
             'runner_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            'binary_sha256':binary.record['sha256'],'build_receipt_sha256':build_receipt_sha,
+            'build_subject':build['subject'],'build_command':build['build_command'],
             'helper_sha256':hashlib.sha256((SOURCE/'sqlite_legacy.py').read_bytes()).hexdigest()}),flush=True)
     finally:
-        if owned_id is not None:
-            subprocess.run(['docker','rm','-fv',owned_id],check=True,stdout=subprocess.DEVNULL)
-        envfile.unlink(missing_ok=True)
-        for path in database.iterdir():path.unlink()
-        database.rmdir()
-        print(json.dumps({'cleanup':'pass','scope':'owned container/volumes/database/env removed; private snapshots and sanitized receipt/catalog retained for seven days'}),flush=True)
+        try:
+            if owned_id is not None:
+                subprocess.run(['docker','rm','-fv',owned_id],check=True,stdout=subprocess.DEVNULL)
+            envfile.unlink(missing_ok=True)
+            for path in database.iterdir():path.unlink()
+            database.rmdir()
+            print(json.dumps({'cleanup':'pass','scope':'owned container/volumes/database/env removed; private snapshots and sanitized receipt/catalog retained for seven days'}),flush=True)
+        finally:
+            if binary is not None:
+                binary.close()
 
 
 if __name__=='__main__':main()
