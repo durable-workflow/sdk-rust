@@ -684,3 +684,111 @@ fn subscriber_runs_without_a_workflow_lock_and_recursive_workflow_logs_are_silen
     });
     assert_eq!(messages(&log), ["outer"]);
 }
+
+fn nexus_history(wait_for: &str, completed: bool) -> Vec<HistoryEvent> {
+    let payload = json!({"sequence":1,"service_call_id":"call-1","endpoint_name":"billing",
+        "service_name":"payments","operation_name":"charge","operation_mode":"sync","wait_for":wait_for});
+    let mut history = vec![event("ServiceCallStarted", payload.clone())];
+    if completed {
+        let mut terminal = payload;
+        terminal["response_payload"] =
+            encode_value_envelope(&json!("paid"), DEFAULT_CODEC).unwrap();
+        history.push(event("ServiceCallCompleted", terminal));
+    }
+    history
+}
+
+#[test]
+fn recorded_nexus_without_outcome_stays_quiet_across_pending_polls() {
+    let ctx = context(nexus_history("completed", false));
+    let inner = ctx.clone();
+    let states = Arc::new(Mutex::new(vec![]));
+    let observed = states.clone();
+    let mut future: WorkflowFuture = Box::pin(async move {
+        let mut call =
+            Box::pin(inner.call_nexus_service("billing", "payments", "charge", json!([])));
+        futures_util::future::poll_fn(|cx| {
+            for _ in 0..2 {
+                assert!(call.as_mut().poll(cx).is_pending());
+                observed.lock().unwrap().push(inner.replay_state());
+                inner.logger().info("pending Nexus replay");
+            }
+            Poll::Pending
+        })
+        .await
+    });
+    let log = Arc::new(Log::default());
+    tracing::subscriber::with_default(
+        log.clone(),
+        || assert!(poll(&ctx, &mut future).is_pending()),
+    );
+    assert_eq!(*states.lock().unwrap(), [WorkflowReplayState::Replaying; 2]);
+    assert!(messages(&log).is_empty());
+    assert!(ctx.take_commands().unwrap().is_empty());
+}
+
+#[test]
+fn nexus_terminal_result_and_accepted_only_admission_release_the_correct_boundary() {
+    use crate::{NexusServiceOptions, NexusWaitFor};
+    let log = Arc::new(Log::default());
+    tracing::subscriber::with_default(log.clone(), || {
+        for accepted_only in [false, true] {
+            let ctx = context(nexus_history(
+                if accepted_only {
+                    "accepted"
+                } else {
+                    "completed"
+                },
+                !accepted_only,
+            ));
+            let inner = ctx.clone();
+            let mut future: WorkflowFuture = Box::pin(async move {
+                assert_eq!(inner.replay_state(), WorkflowReplayState::Replaying);
+                inner.logger().info("recorded Nexus prefix");
+                let result = inner
+                    .call_nexus_service_with_options(
+                        "billing",
+                        "payments",
+                        "charge",
+                        NexusServiceOptions {
+                            wait_for: if accepted_only {
+                                NexusWaitFor::Accepted
+                            } else {
+                                NexusWaitFor::Completed
+                            },
+                            ..Default::default()
+                        },
+                        json!([]),
+                    )
+                    .await?;
+                assert_eq!(result.service_call_id, "call-1");
+                assert_eq!(
+                    result.status,
+                    if accepted_only {
+                        "started"
+                    } else {
+                        "completed"
+                    }
+                );
+                assert_eq!(
+                    result.result,
+                    if accepted_only {
+                        AvroValue::Null
+                    } else {
+                        AvroValue::String("paid".into())
+                    }
+                );
+                assert_eq!(inner.replay_state(), WorkflowReplayState::Executing);
+                inner.logger().info(if accepted_only {
+                    "admitted"
+                } else {
+                    "completed"
+                });
+                Ok(AvroValue::Null)
+            });
+            assert!(matches!(poll(&ctx, &mut future), Poll::Ready(Ok(_))));
+            assert!(ctx.take_commands().unwrap().is_empty());
+        }
+    });
+    assert_eq!(messages(&log), ["completed", "admitted"]);
+}

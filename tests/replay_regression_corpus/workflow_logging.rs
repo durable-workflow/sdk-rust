@@ -29,6 +29,26 @@ pub(super) fn register(worker: &mut Worker, workflow_type: &str) {
     });
 }
 
+pub(super) fn is_fixture(workflow_type: &str) -> bool {
+    matches!(
+        workflow_type,
+        "corpus.replay-aware-logging" | "corpus.replay-aware-nexus-pending"
+    )
+}
+
+pub(super) fn register_nexus_pending(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        ctx.logger().info("committed");
+        let mut call = Box::pin(ctx.call_nexus_service("billing", "payments", "charge", json!([])));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            ctx.logger().info("pending Nexus replay");
+            std::task::Poll::Pending
+        })
+        .await
+    });
+}
+
 #[derive(Default)]
 pub(super) struct Capture(Mutex<Vec<String>>);
 struct Message(Option<String>);
