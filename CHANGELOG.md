@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- A workflow-task completion that native Server 3.6.0 refuses as too large
+  (HTTP 413, `limit_kind: workflow_task_completion_bytes`, server#1152,
+  durable-workflow/.github#228) is now a typed, non-retryable outcome.
+  `Client::complete_workflow_task` returns the new
+  `Error::WorkflowTaskCompletionTooLarge` with the Server's limit, the encoded
+  request size and the Server's message, and the request is never resent. A
+  `Worker` no longer leaves the task to be redelivered into the same refusal:
+  it completes the task once with a non-retryable `fail_workflow` command whose
+  message starts with `Structural limit exceeded:`, so the run fails with
+  failure category `structural_limit` and guidance to split the fan-out, use
+  child workflows or continue as new. Other 413 and 5xx responses are
+  unchanged. The README documents the completion size limit.
+
 - An update whose wait ends before its handler finishes now returns
   `Error::UpdateStillPending` instead of `Ok(Null)` (durable-workflow/.github#212).
   `update_workflow` used to return the Server's `result: null` for a 202
