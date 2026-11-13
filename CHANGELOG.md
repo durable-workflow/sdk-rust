@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 4.15.0
+
+- All workflow and run routes encode each identifier or name as one path
+  segment. Empty identifiers and `.` or `..` segments return
+  `Error::InvalidPathSegment` before any HTTP request, including capability
+  discovery for cooperative cancellation.
+
+- Cooperative cancellation now reads the optional top-level `cause` of the
+  portable cancellation context (workflow#863, workflow#1129). A
+  timeout-cleanup request (`cause: "timeout"`: the run passed its work
+  deadline and is now in cleanup) arrives through the existing
+  `Error::CooperativeCancellationRequested`, so existing
+  `Error::CooperativeCancellationRequested(_)` arms, such as saga
+  compensation, run for it unchanged. There is no new `Error` variant. Tell
+  the two apart with the new `#[non_exhaustive]` `CancellationCause`:
+  `Requested` for an ordinary request (`cause` absent or `"cancellation"`) or
+  `Timeout`. The request's cleanup deadline is its existing
+  `cleanup_deadline_at`. `CancellationRequest::cause()`, `CancellationContext::cause()` and `is_timeout()`
+  read it from the context. A context with any other `cause` is refused as
+  `Error::InvalidCooperativeCancellation`. The cause is never inherited: a
+  descendant cancelled under the request, scoped or not, carries no `cause`
+  and is an ordinary cancellation, even when its scope origin's root context
+  carries `cause: "timeout"`. `CancellationContext::to_value()` writes `cause`
+  back exactly as read, including an explicit `"cancellation"`, and an
+  ordinary context's output is unchanged.
+
+  `CancellationRequest::cause()` derives the discriminator from the existing
+  context, preserving stable 4.x struct literals and exhaustive destructuring.
+  This parser support is experimental. Service-mode timeout-cleanup admission
+  and execution require the upstream Core/native implementation and separate
+  published-artifact qualification.
+
 - A workflow-task completion that native Server 3.6.0 refuses as too large
   (HTTP 413, `limit_kind: workflow_task_completion_bytes`, server#1152,
   durable-workflow/.github#228) is now a typed, non-retryable outcome.

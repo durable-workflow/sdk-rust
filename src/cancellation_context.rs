@@ -32,6 +32,38 @@ impl CancellationLineage {
     }
 }
 
+/// Why a cooperative cancellation request was delivered to this run.
+///
+/// Read from the optional top-level `cause` of the portable cancellation
+/// context. `Requested` is an ordinary cancellation request (`cause` absent or
+/// `cancellation`). `Timeout` is a deadline-triggered cleanup request: the run
+/// passed its work deadline and has until the request's cleanup deadline to
+/// clean up, and it still ends timed out. The cause is never inherited: a
+/// descendant cancelled under the request, scoped or not, is an ordinary
+/// cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CancellationCause {
+    /// An ordinary cooperative cancellation request.
+    Requested,
+    /// A timeout-cleanup request after the run's work deadline passed.
+    Timeout,
+}
+
+impl CancellationCause {
+    /// Whether this is a timeout-cleanup request.
+    pub fn is_timeout(self) -> bool {
+        self == Self::Timeout
+    }
+}
+
+/// The context's `cause` exactly as recorded, so it round-trips unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedCause {
+    Cancellation,
+    Timeout,
+}
+
 /// Original cancellation metadata restored from canonical request history.
 ///
 /// Fields and nested metadata have read-only accessors. Descendants retain
@@ -49,6 +81,7 @@ pub struct CancellationContext {
     requested_at: DateTime<Utc>,
     cleanup_deadline_at: DateTime<Utc>,
     lineage: Vec<CancellationLineage>,
+    cause: Option<RecordedCause>,
     scope_origin: Option<Box<ScopedCancellationContext>>,
     replay: Option<Weak<Mutex<WorkflowState>>>,
 }
@@ -66,6 +99,7 @@ impl PartialEq for CancellationContext {
             && self.requested_at == other.requested_at
             && self.cleanup_deadline_at == other.cleanup_deadline_at
             && self.lineage == other.lineage
+            && self.cause == other.cause
             && self.scope_origin == other.scope_origin
     }
 }
@@ -89,6 +123,20 @@ fn nullable_text(value: &Value, key: &str, allow_empty: bool) -> Result<Option<S
         Some(Value::String(text)) if allow_empty || !text.is_empty() => Ok(Some(text.clone())),
         _ => Err(invalid_context(
             "cancellation parent identity or reason is invalid",
+        )),
+    }
+}
+
+/// Read the optional `cause`. Other keys, as in Core, are not interpreted.
+fn read_cause(value: &Value) -> Result<Option<RecordedCause>> {
+    match value.get("cause") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cause)) if cause == "cancellation" => {
+            Ok(Some(RecordedCause::Cancellation))
+        }
+        Some(Value::String(cause)) if cause == "timeout" => Ok(Some(RecordedCause::Timeout)),
+        Some(_) => Err(invalid_context(
+            "cancellation cause must be cancellation or timeout",
         )),
     }
 }
@@ -187,6 +235,7 @@ impl CancellationContext {
                 "cancellation deadline must follow the original request",
             ));
         }
+        let cause = read_cause(value)?;
         let context = Self {
             request_id,
             root_request_id,
@@ -199,6 +248,7 @@ impl CancellationContext {
             requested_at,
             cleanup_deadline_at,
             lineage: normalized,
+            cause,
             scope_origin,
             replay: None,
         };
@@ -293,6 +343,19 @@ impl CancellationContext {
         self.scope_origin.as_deref()
     }
 
+    /// Why this request was delivered: an ordinary request or timeout cleanup.
+    pub fn cause(&self) -> CancellationCause {
+        match self.cause {
+            Some(RecordedCause::Timeout) => CancellationCause::Timeout,
+            _ => CancellationCause::Requested,
+        }
+    }
+
+    /// Whether this is a timeout-cleanup request (`cause: "timeout"`).
+    pub fn is_timeout(&self) -> bool {
+        self.cause == Some(RecordedCause::Timeout)
+    }
+
     /// Remaining cleanup budget at the last blocking result consumed by this replay.
     ///
     /// Never reads host time. Detached metadata, an ended replay, and a missing or
@@ -337,6 +400,11 @@ impl CancellationContext {
             "cleanup_deadline_at": self.cleanup_deadline_at.to_rfc3339_opts(SecondsFormat::Micros, true),
             "lineage": self.lineage.iter().map(CancellationLineage::to_value).collect::<Vec<_>>(),
         });
+        match self.cause {
+            Some(RecordedCause::Cancellation) => value["cause"] = json!("cancellation"),
+            Some(RecordedCause::Timeout) => value["cause"] = json!("timeout"),
+            None => {}
+        }
         if let Some(origin) = &self.scope_origin {
             value["scope_origin"] = origin.to_value();
             value["scope_authority_deadline_at"] = value["cleanup_deadline_at"].clone();

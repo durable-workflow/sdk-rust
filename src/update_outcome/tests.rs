@@ -397,14 +397,17 @@ async fn dot_segment_and_empty_ids_are_refused_before_any_request() {
             .await
             .expect_err("a dot segment would read another route");
         assert!(
-            matches!(error, Error::Codec(_)),
+            matches!(error, Error::InvalidPathSegment { .. }),
             "{workflow_id:?}/{update_id:?}: {error:?}"
         );
         let error = client
             .update_outcome_receipt(workflow_id, update_id, UpdateWaitStage::Accepted, None)
             .await
             .expect_err("a dot segment would read another route");
-        assert!(matches!(error, Error::Codec(_)), "{error:?}");
+        assert!(
+            matches!(error, Error::InvalidPathSegment { .. }),
+            "{error:?}"
+        );
     }
     assert!(
         requests.await.unwrap().is_empty(),
