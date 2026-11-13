@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 4.17.0
 
 - Workflow code can use `ctx.logger()` to send new-execution observations to
   the application's `tracing` subscriber with namespace/workflow/run identity.
