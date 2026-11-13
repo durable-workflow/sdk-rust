@@ -89,6 +89,10 @@ async fn direct_cases() {
         .signal_workflow_with_request_id(&id, "touch", json!([1]), "signal-key")
         .await
         .unwrap();
+    assert!(signal["command_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(signal["run_id"], run);
     let mut retries = tokio::task::JoinSet::new();
     for _ in 0..4 {
         let client = client.clone();
@@ -130,6 +134,7 @@ async fn direct_cases() {
         error => panic!("expected a typed pending receipt: {error:?}"),
     };
     let update_id = pending.update_id.as_deref().unwrap();
+    assert_eq!(pending.run_id.as_deref(), Some(run));
     let mut retries = tokio::task::JoinSet::new();
     for _ in 0..4 {
         let client = client.clone();
@@ -222,6 +227,10 @@ async fn direct_cases() {
         .signal_workflow_with_request_id(&chain, "touch", json!([1]), "continue-key")
         .await
         .unwrap();
+    assert!(signal["command_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(signal["run_id"], first_run);
     client
         .signal_workflow_with_request_id(&chain, "finish", json!([]), "continue-now")
         .await
@@ -251,6 +260,8 @@ async fn direct_cases() {
             .await
             .unwrap(),
     );
+    assert_eq!(old_commands.len(), 2);
+    assert!(new_commands.is_empty());
     let retained = client
         .signal_workflow_with_request_id(&chain, "touch", json!([1]), "continue-key")
         .await
@@ -316,6 +327,10 @@ async fn direct_cases() {
         .signal_workflow_with_request_id(&other, "touch", json!([1]), "continue-key")
         .await
         .unwrap();
+    assert!(local["command_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(local["run_id"], other_workflow.run_id.as_deref().unwrap());
     assert_ne!(local["command_id"], signal["command_id"]);
     let history = foreign
         .export_workflow_history(&other, other_workflow.run_id.as_deref().unwrap())
