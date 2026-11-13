@@ -38,7 +38,7 @@ class PhysicalUpgradeTest(unittest.TestCase):
         self.validate(self.after)
 
     def test_another_well_formed_handoff_sha_refuses_before_input_or_runtime_effects(self):
-        self.assertEqual(self.profile,physical.require_handoff(self.profile['producer_manifest_commit']))
+        self.assertEqual(self.profile,physical.require_handoff(self.profile['producer_contract_commit']))
         with self.assertRaisesRegex(ValueError,'handoff commit'):
             physical.require_handoff('0'*40)
 
@@ -57,6 +57,16 @@ class PhysicalUpgradeTest(unittest.TestCase):
             result=subprocess.run(command,text=True,capture_output=True,timeout=10)
             self.assertNotEqual(0,result.returncode)
             self.assertIn('producer handoff commit differs',result.stderr)
+            self.assertEqual([],list(root.iterdir()))
+
+    def test_another_artifact_cannot_inherit_the_frozen_seed_execution_provenance(self):
+        seed=self.profile['baseline_seed_execution']
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for backup_sha,packet_sha in (('0'*64,seed['receipts_sha256']),
+                                           (seed['backup_sha256'],'0'*64)):
+                with self.assertRaisesRegex(ValueError,'baseline provenance'):
+                    physical.prepare(root/'absent-backup',backup_sha,root/'absent-packet',packet_sha)
             self.assertEqual([],list(root.iterdir()))
 
     def test_original_business_row_or_catalog_change_refuses(self):

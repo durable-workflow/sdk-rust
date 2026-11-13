@@ -1,5 +1,13 @@
 {
   "baseline_index": "sha256:7988a23525d9e50e997a9f6f02e801300ed4f626de3cf6977033657ae7e9f58e",
+  "baseline_seed_execution": {
+    "backup_sha256": "7d1826f7681342bb3a5974509648e2e8d75e7a21d262f65f3ec1f58727ccbc0c",
+    "driver_git_blob": "96f3950e5113ac8484d72e64677ea2fbfab2facc",
+    "driver_path": "scripts/ci/command_key_upgrade_seed.py",
+    "driver_sha256": "01c0fa1251ac3c809723e58d71817881fe2c5c9498579bc4c2e6097324a3618b",
+    "receipts_sha256": "8c728ce827df3a11621dfb0e82cdd404bbab48784182a5e92c8d632d49047fc5",
+    "source_commit": "09a4ccda3da11853606af031a8970bbde4b2d6ec"
+  },
   "baseline_source": "28f084513235f6647e740c4b3d9e3aace7a323b7",
   "baseline_version": "3.8.0",
   "journal_checksum_sha384": "53b752529a1f7addaefe62ab61160dd42b3990f805cfdc4ecd1b48927a6c2f7ce42526fc04522ac887a37208f343fc73",
@@ -9,7 +17,7 @@
     "dw_command_intents_namespace",
     "sqlite_autoindex_dw_command_intents_1"
   ],
-  "producer_manifest_commit": "c542ae7928a73215e5dc9d1d67085e1a4191ba57",
+  "producer_contract_commit": "c542ae7928a73215e5dc9d1d67085e1a4191ba57",
   "producer_manifest_sha256": "ceb4695643e48c7bfe3f81eea380c6ab9aa0b973da830cb552d070344047319f",
   "schema": "durable-workflow.physical-sqlite-upgrade-profile.v1",
   "schema_after": 13,

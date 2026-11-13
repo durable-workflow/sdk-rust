@@ -53,7 +53,7 @@ def main():
     parser.add_argument('--physical-backup-sha256')
     parser.add_argument('--physical-receipts',type=Path)
     parser.add_argument('--physical-receipts-sha256')
-    parser.add_argument('--physical-source-commit',help='accepted producer seed-source commit from its owner handoff')
+    parser.add_argument('--physical-source-commit',help='accepted fixture-contract commit from its owner handoff')
     parser.add_argument('--work-dir',type=Path,required=True)
     parser.add_argument('--consumer-binary',type=Path,required=True)
     parser.add_argument('--consumer-lock',type=Path,required=True)
@@ -217,7 +217,8 @@ def main():
             binary.check()
             cell.update(started_at=started_at,finished_at=datetime.now(timezone.utc).isoformat(),
                 baseline_sha256=options.physical_backup_sha256,seed_receipts_sha256=options.physical_receipts_sha256,
-                producer_seed_source=options.physical_source_commit,
+                accepted_contract_source=options.physical_source_commit,
+                baseline_seed_execution=physical_profile['baseline_seed_execution'],
                 profile_sha256=physical_upgrade.PROFILE_SHA256,
                 server_source=options.server_source,server_index=options.server_index,
                 server_version=options.server_version,server_platform='linux/amd64',

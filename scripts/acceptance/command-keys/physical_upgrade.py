@@ -14,7 +14,7 @@ import sqlite_legacy
 
 
 PROFILE = Path(__file__).with_name('physical-sqlite-profile.json')
-PROFILE_SHA256 = '9ab24b2c8fe8fd2ae6976fe70770093ad0cf677b5a0c7855e5741b25918af3e9'
+PROFILE_SHA256 = '8c29c63a8fefa04c0d090924550202437a812925d4e3230be09e119f0f850c03'
 
 
 def profile():
@@ -26,7 +26,7 @@ def profile():
 
 def require_handoff(commit):
     selected = profile()
-    if commit != selected['producer_manifest_commit']:
+    if commit != selected['producer_contract_commit']:
         raise ValueError('producer handoff commit differs from the reviewed physical profile')
     return selected
 
@@ -54,6 +54,9 @@ def read_owned(path, digest, limit):
 
 def prepare(backup, backup_sha, receipts, receipts_sha):
     selected = profile()
+    seed = selected['baseline_seed_execution']
+    if backup_sha != seed['backup_sha256'] or receipts_sha != seed['receipts_sha256']:
+        raise ValueError('physical baseline provenance differs from the frozen seed execution')
     raw, original = read_owned(backup, backup_sha, sqlite_legacy.MAX_DATABASE_BYTES)
     for suffix in ('-wal', '-journal'):
         sidecar = Path(str(backup) + suffix)
