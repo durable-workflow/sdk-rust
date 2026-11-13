@@ -26,6 +26,14 @@
   non-completed receipt where an outcome was expected, returns
   `Error::UnrecognizedUpdateOutcome` instead of a value.
 
+- `describe_workflow` and `update_workflow` (and `update_workflow_avro_value`)
+  percent-encode the workflow id, and the update name, as one path segment.
+  Before, they were put into the path raw, so an id containing `/`, `?` or `#`
+  addressed a different route. An empty, `.` or `..` id or update name now
+  returns `Error::InvalidPathSegment` before any request; `..` would otherwise
+  have described or updated another route. Found in the security review of
+  sdk-rust#243 (durable-workflow/.github#212).
+
 - A `request_id_conflict` refusal from native Server 3.9.0 (server#934,
   server#1191) now names the key that was sent. Native doesn't echo the key, so
   `Error::request_id()` returned `None` and `RequestIdConflict::request_id` was

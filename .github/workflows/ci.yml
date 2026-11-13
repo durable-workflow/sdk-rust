@@ -135,6 +135,8 @@ jobs:
         run: python scripts/ci/test-rust-ci-cache.py
       - name: Check CI concurrency and final gate
         run: python scripts/ci/test-ci-concurrency.py
+      - name: Check APT retries are off before networked APT (CVE-2026-109518)
+        run: python scripts/ci/test-apt-no-retries.py
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
@@ -271,6 +273,8 @@ jobs:
         run: |
           python3 -m venv --without-pip "${RUNNER_TEMP}/official-avro-python"
           python3 -I -m pip --python "${RUNNER_TEMP}/official-avro-python/bin/python" install --requirement scripts/ci/official-avro-consumers/requirements.txt
+      - name: Disable APT download retries (CVE-2026-109518)
+        run: echo 'Acquire::Retries "0";' | sudo tee /etc/apt/apt.conf.d/99-no-retries >/dev/null
       - name: Set up the fixed Composer client
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240  # v2
         with:
