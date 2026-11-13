@@ -73,7 +73,9 @@ def main():
                           or not re.fullmatch('[0-9a-f]{40}',options.physical_source_commit)):
         parser.error('physical upgrade needs all exact input identities and its own cell')
     if physical_mode:
-        physical_upgrade.require_handoff(options.physical_source_commit)
+        selected_contract=physical_upgrade.require_handoff(options.physical_source_commit)
+        physical_attribution=physical_upgrade.attribution(options.physical_source_commit,
+                                                         selected_contract['baseline_seed_execution'])
     if options.state != 'open' and options.scenario != 'readback':
         parser.error('ambiguity/case scenarios require their own open-state cell')
     if options.response_loss_fixture is not None and (options.state != 'open' or options.scenario != 'readback'):
@@ -215,10 +217,8 @@ def main():
                                                        legacy.MAX_DATABASE_BYTES)
             assert rechecked == physical_original, 'original baseline changed during the owned-copy experiment'
             binary.check()
-            cell.update(started_at=started_at,finished_at=datetime.now(timezone.utc).isoformat(),
+            cell.update(**physical_attribution,started_at=started_at,finished_at=datetime.now(timezone.utc).isoformat(),
                 baseline_sha256=options.physical_backup_sha256,seed_receipts_sha256=options.physical_receipts_sha256,
-                accepted_contract_source=options.physical_source_commit,
-                baseline_seed_execution=physical_profile['baseline_seed_execution'],
                 profile_sha256=physical_upgrade.PROFILE_SHA256,
                 server_source=options.server_source,server_index=options.server_index,
                 server_version=options.server_version,server_platform='linux/amd64',

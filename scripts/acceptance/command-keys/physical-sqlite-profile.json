@@ -17,7 +17,7 @@
     "dw_command_intents_namespace",
     "sqlite_autoindex_dw_command_intents_1"
   ],
-  "producer_contract_commit": "c542ae7928a73215e5dc9d1d67085e1a4191ba57",
+  "producer_contract_commit": "a09f156399416216d2f097c257a2164f83c7eda7",
   "producer_manifest_sha256": "ceb4695643e48c7bfe3f81eea380c6ab9aa0b973da830cb552d070344047319f",
   "schema": "durable-workflow.physical-sqlite-upgrade-profile.v1",
   "schema_after": 13,

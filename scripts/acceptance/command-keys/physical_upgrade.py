@@ -14,7 +14,7 @@ import sqlite_legacy
 
 
 PROFILE = Path(__file__).with_name('physical-sqlite-profile.json')
-PROFILE_SHA256 = '8c29c63a8fefa04c0d090924550202437a812925d4e3230be09e119f0f850c03'
+PROFILE_SHA256 = '8f9c4695b814a6c3f923885e51d1900506906138b7e0d27dc87b8df592a36e9e'
 
 
 def profile():
@@ -29,6 +29,14 @@ def require_handoff(commit):
     if commit != selected['producer_contract_commit']:
         raise ValueError('producer handoff commit differs from the reviewed physical profile')
     return selected
+
+
+def attribution(commit, declared_execution):
+    selected = require_handoff(commit)
+    if declared_execution != selected['baseline_seed_execution']:
+        raise ValueError('historical seed source/driver identity differs from the frozen execution')
+    return {'accepted_contract_source':commit,
+            'baseline_seed_execution':deepcopy(selected['baseline_seed_execution'])}
 
 
 def read_owned(path, digest, limit):

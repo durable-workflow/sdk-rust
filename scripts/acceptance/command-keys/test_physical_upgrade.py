@@ -1,7 +1,11 @@
 """Inert physical-upgrade guards; no seed, SDK, Docker or schema CLI executes."""
 from copy import deepcopy
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+import hashlib
+import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -39,8 +43,10 @@ class PhysicalUpgradeTest(unittest.TestCase):
 
     def test_another_well_formed_handoff_sha_refuses_before_input_or_runtime_effects(self):
         self.assertEqual(self.profile,physical.require_handoff(self.profile['producer_contract_commit']))
-        with self.assertRaisesRegex(ValueError,'handoff commit'):
-            physical.require_handoff('0'*40)
+        for wrong in ('0'*40,'c542ae7928a73215e5dc9d1d67085e1a4191ba57',
+                      self.profile['baseline_seed_execution']['source_commit']):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(ValueError,'handoff commit'):
+                physical.require_handoff(wrong)
 
     def test_cli_wrong_handoff_refuses_before_any_file_or_container_input(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -68,6 +74,46 @@ class PhysicalUpgradeTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'baseline provenance'):
                     physical.prepare(root/'absent-backup',backup_sha,root/'absent-packet',packet_sha)
             self.assertEqual([],list(root.iterdir()))
+
+    def test_historical_source_and_driver_are_not_relabelled_as_contract_acceptance(self):
+        seed=deepcopy(self.profile['baseline_seed_execution'])
+        result=physical.attribution(self.profile['producer_contract_commit'],seed)
+        self.assertEqual(self.profile['producer_contract_commit'],result['accepted_contract_source'])
+        self.assertEqual(seed,result['baseline_seed_execution'])
+        self.assertNotIn('producer_seed_source',result)
+        for field,value in (('source_commit',self.profile['producer_contract_commit']),
+                            ('driver_git_blob','0'*40),('driver_sha256','0'*64)):
+            changed=dict(seed,**{field:value})
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError,'historical seed'):
+                physical.attribution(self.profile['producer_contract_commit'],changed)
+
+    def test_a_different_coherent_self_hashed_artifact_pair_refuses_at_preflight(self):
+        # This inert data models the preflight shape only; it is not an API seed
+        # or physical-upgrade proof. Neither schema CLI nor SDK is invoked.
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);backup=root/'alternate.sqlite';packet_path=root/'alternate.json'
+            packet={'schema':'durable-workflow.command-key-physical-seed.v1',
+                'manifest_sha256':self.profile['producer_manifest_sha256'],
+                'expected_external_baseline':{'tag':self.profile['baseline_version'],
+                    'source_commit':self.profile['baseline_source'],'index_digest':self.profile['baseline_index']},
+                'cases':[]}
+            with closing(sqlite3.connect(backup)) as connection:
+                connection.execute('CREATE TABLE workflow_commands (id TEXT,command_type TEXT,workflow_instance_id TEXT,workflow_run_id TEXT,request_id TEXT)')
+                for kind in ('signal','update'):
+                    for state in ('open','completed','continued'):
+                        identity=kind+'-'+state
+                        receipt={'workflow_id':identity,'command_id':'command-'+identity,'run_id':'run-'+identity}
+                        if kind=='update':receipt.update(update_id='update-'+identity,accepted_at='2026-01-01T00:00:00Z',update_name='set')
+                        packet['cases'].append({'kind':kind,'state':state,'workflow_id':identity,
+                                                'receipt':receipt,'original_body':{'request_id':'key-'+identity}})
+                        connection.execute('INSERT INTO workflow_commands VALUES (?,?,?,?,?)',
+                            (receipt['command_id'],kind,identity,receipt['run_id'],None if kind=='signal' else 'key-'+identity))
+                connection.commit()
+            backup.chmod(0o600);packet_path.write_text(json.dumps(packet));packet_path.chmod(0o600)
+            backup_sha=hashlib.sha256(backup.read_bytes()).hexdigest()
+            packet_sha=hashlib.sha256(packet_path.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError,'baseline provenance'):
+                physical.prepare(backup,backup_sha,packet_path,packet_sha)
 
     def test_original_business_row_or_catalog_change_refuses(self):
         changed=deepcopy(self.after);changed['tables']['business']['rows'][0][0]=['text','changed']
