@@ -19745,6 +19745,7 @@ mod tests {
     mod cancellation_scope_opening;
     mod cancellation_scope_replay;
     mod child_workflow_policies;
+    mod completion_limits;
     mod condition_fingerprint;
     mod cooperative_cancellation;
     mod local_activity;

@@ -724,10 +724,21 @@ payloads; if those fixed inputs cannot fit, reporting refuses explicitly.
 ### Workflow task completion size
 
 A workflow task's commands travel to the Server in one completion request.
-Native Server 3.6.0 and later accept a completion up to 16 times the
-per-payload limit (`DW_MAX_PAYLOAD_BYTES`, 2 MiB by default, so 32 MiB), while
-each command's arguments must still fit the per-payload limit. A larger
-completion, usually a very large fan-out, is refused with HTTP 413,
+The SDK reads the optional `limits.max_workflow_task_completion_bytes` from
+Server discovery for the completion's encoded JSON request size. Each command's
+arguments still obey the per-payload limit. An explicit positive aggregate cap
+allows individually valid values to remain in one inline batch when namespace
+payload storage is unconfigured, disabled or unsupported. Configured storage
+retains its upload and lease checks.
+
+Without that discovery field, the planner conservatively uses the ordinary
+request cap. It can require external storage for an aggregate above that cap
+even if the Server would accept the batch inline. The field's publication and
+installed fan-out qualification are tracked in
+[Server #1136](https://github.com/durable-workflow/server/issues/1136) and
+[SDK #254](https://github.com/durable-workflow/sdk-rust/issues/254).
+
+A completion above the Server's aggregate allowance is refused with HTTP 413,
 `reason: "payload_too_large"` and `limit_kind: "workflow_task_completion_bytes"`.
 
 Automatic structural failure requires the HTTP 413 to reach the worker. A

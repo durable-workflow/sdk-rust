@@ -10,6 +10,8 @@ pub(super) struct Policy {
     threshold: usize,
     max_bytes: usize,
     request_bytes: usize,
+    completion_request_bytes: std::result::Result<Option<usize>, ()>,
+    inline_completion: bool,
     timeout: Duration,
     available: bool,
     completion_context: bool,
@@ -32,13 +34,23 @@ impl Policy {
         } else {
             2 * 1024 * 1024
         };
+        let completion_request_bytes = info
+            .pointer("/limits/max_workflow_task_completion_bytes")
+            .map(|limit| positive(limit).ok_or(()))
+            .transpose();
         let storage = &info["namespace"]["external_payload_storage"];
+        let inline_completion = matches!(
+            storage["status"].as_str(),
+            Some("unconfigured" | "disabled" | "unsupported")
+        );
         let manifest = &storage["transport"];
         if manifest.is_null() {
             return Ok(Self {
                 threshold: request_bytes,
                 max_bytes: request_bytes,
                 request_bytes,
+                completion_request_bytes,
+                inline_completion,
                 timeout: Duration::from_secs(30),
                 available: false,
                 completion_context: false,
@@ -66,6 +78,8 @@ impl Policy {
             threshold,
             max_bytes,
             request_bytes,
+            completion_request_bytes,
+            inline_completion,
             timeout: Duration::from_secs(timeout as u64),
             available: storage["status"] == "available",
             completion_context: manifest["upload"]["completion_context"]["schema"]
@@ -158,6 +172,14 @@ impl Client {
             return Ok(());
         }
         let policy = self.runtime_upload_policy(protocol).await?;
+        let completion_bytes = if is_command_completion(path, protocol) {
+            policy
+                .completion_request_bytes
+                .map_err(|()| unsupported("invalid workflow completion request limit"))?
+        } else {
+            None
+        };
+        let request_bytes = completion_bytes.unwrap_or(policy.request_bytes);
         // Plan every replacement before any upload. Aggregate JSON size matters,
         // even when each individual value is below the namespace threshold.
         payloads.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
@@ -166,6 +188,18 @@ impl Client {
                 "external_payload_oversized: encoded payload exceeds runtime upload limit".into(),
             ));
         }
+        // A producer-advertised aggregate cap does not require a payload store.
+        // Preserve one inline batch when every value already meets admission.
+        // The Server owns an over-cap refusal, including its actual HTTP status.
+        if completion_bytes.is_some()
+            && policy.inline_completion
+            && !policy.available
+            && payloads
+                .iter()
+                .all(|(_, size)| *size <= policy.threshold && *size <= policy.request_bytes)
+        {
+            return Ok(());
+        }
         let mut uploads = Vec::new();
         for (path, size) in &payloads {
             if *size > policy.threshold {
@@ -173,15 +207,15 @@ impl Client {
             }
         }
         for (path, _) in &payloads {
-            if serde_json::to_vec(body)?.len() <= policy.request_bytes {
+            if serde_json::to_vec(body)?.len() <= request_bytes {
                 break;
             }
             if !uploads.iter().any(|upload| upload.path == *path) {
                 uploads.push(select(body, path)?);
             }
         }
-        if serde_json::to_vec(body)?.len() > policy.request_bytes {
-            return Err(Error::Codec("payload_too_large: request metadata exceeds ordinary API limit with payloads externalized".into()));
+        if serde_json::to_vec(body)?.len() > request_bytes {
+            return Err(Error::Codec("payload_too_large: request metadata exceeds advertised request limit with payloads externalized".into()));
         }
         if !uploads.is_empty() && !policy.available {
             return Err(Error::Codec(
@@ -507,6 +541,20 @@ fn replace(body: &mut Value, path: &str, reference: Value) -> Result<()> {
     Ok(())
 }
 
+fn is_command_completion(path: &str, protocol: RequestProtocol) -> bool {
+    if !matches!(
+        protocol,
+        RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+    ) {
+        return false;
+    }
+    let path = path.split('?').next().unwrap_or(path);
+    let parts: Vec<_> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
+    matches!(parts.as_slice(),
+        ["worker", "workflow-tasks", task, "complete"]
+        | ["worker", "activity-tasks", task, "continuation", "complete"] if !task.is_empty())
+}
+
 // Only protocol-owned slots are eligible; arbitrary application maps are not envelopes.
 fn payload_paths(body: &Value, path: &str, protocol: RequestProtocol) -> Vec<String> {
     let path = path.split('?').next().unwrap_or(path);
@@ -517,7 +565,8 @@ fn payload_paths(body: &Value, path: &str, protocol: RequestProtocol) -> Vec<Str
         RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
     ) {
         match parts.as_slice() {
-            ["worker", "workflow-tasks", _, "complete"] => {
+            ["worker", "workflow-tasks", _, "complete"]
+            | ["worker", "activity-tasks", _, "continuation", "complete"] => {
                 for (index, command) in body["commands"]
                     .as_array()
                     .into_iter()

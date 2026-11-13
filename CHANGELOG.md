@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Completion payload planning reads the optional advertised
+  `limits.max_workflow_task_completion_bytes` separately from ordinary request
+  and per-value limits. Individually valid inline batches no longer demand
+  unavailable external storage when the Server advertises this allowance and
+  storage is explicitly unconfigured, disabled or unsupported. Missing fields
+  retain the conservative ordinary cap; malformed fields refuse completion
+  planning before uploads. Server #1136 publication and installed fan-out and
+  over-limit qualification remain required for delivery of SDK #254.
+
 ## 4.15.0
 
 - All workflow and run routes encode each identifier or name as one path
