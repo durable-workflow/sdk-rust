@@ -51,7 +51,9 @@ async fn published_worker_completes_inline_fanout_and_fails_an_oversized_batch()
     );
 
     let queue = format!("completion-limits-{}", durable_workflow::Uuid::new_v4());
-    let mut worker = Worker::new(client.clone(), &queue).max_concurrent_activity_tasks(16);
+    let mut worker = Worker::new(client.clone(), &queue)
+        .poll_timeout(Duration::from_millis(10))
+        .max_concurrent_activity_tasks(16);
     worker.register_activity("limits.bytes", |_, args| async move {
         Ok(json!(args[0].as_str().unwrap().len()))
     });
