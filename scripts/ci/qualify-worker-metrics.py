@@ -20,6 +20,15 @@ SERVER_VERSION = '3.8.0'
 SERVER_REVISION = '28f084513235f6647e740c4b3d9e3aace7a323b7'
 
 
+def loopback_origin(address):
+    host, separator, port = address.partition(':')
+    if host != '127.0.0.1' or not separator or not port.isascii() or not port.isdecimal():
+        raise ValueError('the fixture must have exactly one IPv4 loopback binding')
+    if not 1 <= int(port) <= 65535:
+        raise ValueError('the fixture port must be valid')
+    return f'http://127.0.0.1:{int(port)}'
+
+
 def main():
     subprocess.run(['docker', 'pull', SERVER_IMAGE], check=True)
     image = json.loads(capture('docker', 'image', 'inspect', SERVER_IMAGE))[0]
@@ -50,7 +59,7 @@ def main():
             address = capture('docker', 'port', name, '8080/tcp')
             # This address is a disposable loopback-only fixture, never a remote
             # endpoint or production credential. Native Server speaks HTTP here.
-            origin = 'http://' + address
+            origin = loopback_origin(address)
 
             def get(path):
                 request = urllib.request.Request(origin + '/api' + path, headers={
