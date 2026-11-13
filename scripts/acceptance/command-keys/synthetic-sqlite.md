@@ -60,7 +60,7 @@ loss. An actual synthetic cell still needs real current-producer API admissions,
 the exact published SDK/Server tuple, restart/readback/zero-write evidence and
 owned cleanup. Physical upgrade and post-commit loss remain separate cells.
 
-## Reproduce the open-state installed cell
+## Reproduce an installed state cell
 
 `run_open.py` is a one-shot Linux amd64/SQLite control. Prepare the
 [registry consumer](consumer/README.md) using the explicit builder below, from
@@ -102,6 +102,7 @@ directory:
 ```sh
 python3 scripts/acceptance/command-keys/run_open.py \
   --work-dir "$LEGACY_WORK_DIR" \
+  --state "$LEGACY_STATE" \
   --consumer-binary "$CONSUMER_BINARY" \
   --consumer-lock "$CONSUMER_LOCK" \
   --build-receipt "$CONSUMER_BUILD_RECEIPT" \
@@ -133,7 +134,20 @@ The original and copied databases, runtime and generated environment file are
 removed in cleanup. The terminal sanitized receipt, data-free catalog DDL and
 private complete before/after logical snapshots (mode 0600) remain in the output
 directory. Keep this output for at most seven days and publish the lasting
-sanitized receipt in #216. This runner covers **open state only**.
-Completed/continued readbacks, ambiguity and case controls, actual physical
-upgrade and post-commit loss require their own named results. Python
+sanitized receipt in #216. Run one state at a time: `open` (the default),
+`completed`, or `continued`. Every state uses a fresh owned runtime/database and
+has its own named receipt and fingerprints.
+
+The completed and continued setups run the same installed worker through the
+held executable descriptor, bounded to eight seconds. The admitted update must
+complete with null before the finish signal closes or continues the original
+run. The worker must stop cleanly before the Server is stopped and copied.
+After restart, closed update readbacks remain completed null with the original
+receipt identities. Continuation records a distinct nonempty successor run ID,
+while retries and explicit original-run reads retain the original command/run.
+The complete database comparison includes the successor, so these readbacks
+cannot add executions or durable rows there.
+
+Ambiguity and case controls, actual physical upgrade and post-commit loss still
+require their own named results. Python
 optimization is refused because it would disable conformance assertions.

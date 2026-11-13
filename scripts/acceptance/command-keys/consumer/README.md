@@ -3,7 +3,7 @@
 This fixture reads one JSON operation from stdin, calls the official SDK and
 writes one JSON result. Its dependency is pinned in `Cargo.toml`; there is no
 local SDK patch. The adjacent lock pins the registry dependency graph. Use the
-explicit [bounded builder](../synthetic-sqlite.md#reproduce-the-open-state-installed-cell)
+explicit [bounded builder](../synthetic-sqlite.md#reproduce-an-installed-state-cell)
 to bind the executed binary to the reviewed inputs and build recipe. Record the
 resolved registry checksum, unchanged adapter hash and executed binary hash in
 the owning [#216 receipt](https://github.com/durable-workflow/.github/issues/216).
