@@ -148,6 +148,20 @@ while retries and explicit original-run reads retain the original command/run.
 The complete database comparison includes the successor, so these readbacks
 cannot add executions or durable rows there.
 
-Ambiguity and case controls, actual physical upgrade and post-commit loss still
-require their own named results. Python
+For a separate open-state ambiguity or case cell, add `--scenario` with one
+of these accepted manifest shapes. Other states refuse these scenarios before
+any runtime effect.
+
+| Scenario | Setup and required result |
+| --- | --- |
+| `two-rows` | Admit both original and second keys through the API. Transform only the second command to the original raw key. Both command types refuse four concurrent retries and the high-level call with409 `request_id_ambiguous`, retained/unverified/nonretryable markers and no selected receipt. |
+| `legacy-token` | Transform the original command to the manifest's literal stored-token string and remove its intent. The original caller key has the same ambiguity refusal. |
+| `modern-raw` | Keep the modern original admission unchanged, stop/restart its owned database without a transform, and retry the literal stored-token string. The receipt explicitly reports zero transforms. |
+| `case-only` | Transform the exact case-sensitive key, prove exact-byte readbacks and conflicts are zero-write, then submit the differently cased key. SQLite admits a distinct new command for each type. Its admissions are separately recorded and explicitly excluded from the zero-write scope. Other backends are not inferred. |
+
+Ambiguity cells compare all logical rows/schema across the raw and high-level retries.
+The case-only cell retains a third private snapshot after distinct admissions
+and requires every preexisting command row to remain present unchanged.
+Actual physical upgrade and post-commit loss still require their own named
+results. Python
 optimization is refused because it would disable conformance assertions.
