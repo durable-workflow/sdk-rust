@@ -20,6 +20,7 @@ from typing import Callable
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LOCKS = (
     "Cargo.lock",
+    "scripts/acceptance/command-keys/consumer/Cargo.lock",
     "tests/fixtures/grouped-condition-worker-consumer/Cargo.lock",
     "tests/nexus/Cargo.lock",
 )
