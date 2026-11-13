@@ -47,6 +47,13 @@
   child workflows or continue as new. Other 413 and 5xx responses are
   unchanged. The README documents the completion size limit.
 
+  **Known transport limitation:** this typed failure requires the Server's
+  HTTP 413 to reach the worker. An aggregate over-limit request can currently
+  lose that response and return a transport error instead. Automatic
+  structural failure for that path is not yet qualified. The Server response
+  correction and published-artifact controls remain open in
+  [the fan-out issue](https://github.com/durable-workflow/.github/issues/228).
+
 - An update whose wait ends before its handler finishes now returns
   `Error::UpdateStillPending` instead of `Ok(Null)` (durable-workflow/.github#212).
   `update_workflow` used to return the Server's `result: null` for a 202
