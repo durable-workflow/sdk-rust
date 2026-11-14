@@ -1843,6 +1843,9 @@ impl ActivityRetryPolicy {
     /// Generate durable retry intervals from `initial_interval` and `coefficient`.
     /// Each interval is capped by `maximum_interval`, when present, then rounded
     /// up to whole seconds. A 100 ms interval or cap therefore encodes one second.
+    /// Passing `None` selects no interval cap. The generated list still has a
+    /// finite attempt budget. Arithmetic or protocol overflow returns
+    /// [`ActivityOptionsErrorKind::BackoffOverflow`] during validation.
     /// Zero stays zero. This policy is separate from HTTP transport retries.
     pub fn exponential_backoff(
         mut self,
@@ -23974,6 +23977,56 @@ mod tests {
         assert_eq!(commands[0]["schedule_to_start_timeout"], 10);
         assert_eq!(commands[0]["schedule_to_close_timeout"], 300);
         assert_eq!(commands[0]["heartbeat_timeout"], 15);
+    }
+
+    #[test]
+    fn exponential_backoff_without_maximum_keeps_growing_and_replays() {
+        let mut options = retry_activity_options();
+        options.retry_policy = Some(
+            ActivityRetryPolicy::new(9)
+                .exponential_backoff(Duration::from_secs(1), 2, None)
+                .non_retryable_error_type("PermanentError"),
+        );
+        let expected = json!([1, 2, 4, 8, 16, 32, 64, 128]);
+        let ctx = workflow_context(Vec::new());
+        let mut call = Box::pin(ctx.activity_with_options("flaky", options.clone(), json!([])));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        let commands = ctx.take_commands().expect("one new schedule");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["retry_policy"]["max_attempts"], 9);
+        assert_eq!(commands[0]["retry_policy"]["backoff_seconds"], expected);
+
+        let mut history = completed_retry_activity_history();
+        history[0].payload["activity"]["retry_policy"]["max_attempts"] = json!(9);
+        history[0].payload["activity"]["retry_policy"]["backoff_seconds"] = expected;
+        history[2].payload["retry_backoff_seconds"] = json!(1);
+        let replay = workflow_context(history.clone());
+        let mut replay_call =
+            Box::pin(replay.activity_with_options("flaky", options.clone(), json!([])));
+        assert!(matches!(
+            replay_call.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(value)) if value == json!({"status":"recovered"})
+        ));
+        assert!(replay.take_commands().unwrap().is_empty());
+        replay
+            .ensure_history_consumed()
+            .expect("recorded history consumed");
+
+        options.retry_policy.as_mut().unwrap().backoff = Some(ActivityBackoff::Exponential {
+            initial_interval: Duration::from_secs(1),
+            coefficient: 2,
+            maximum_interval: Some(Duration::from_secs(60)),
+        });
+        let changed = workflow_context(history);
+        let mut changed_call = Box::pin(changed.activity_with_options("flaky", options, json!([])));
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            changed_call.as_mut().poll(&mut cx)
+        else {
+            panic!("adding a cap must not reinterpret a recorded uncapped policy");
+        };
+        assert_eq!(failure.reason, "activity_retry_policy_mismatch");
+        assert!(changed.take_commands().unwrap().is_empty());
     }
 
     fn completed_worker_session_history(session: &WorkerSessionOptions) -> Vec<HistoryEvent> {
