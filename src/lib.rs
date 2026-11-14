@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod activity_checkpoint;
 mod activity_error;
 mod activity_hydration;
 mod activity_lease;
@@ -39,6 +40,7 @@ mod workflow_hydration;
 mod workflow_logging;
 pub use workflow_logging::{WorkflowLogger, WorkflowReplayState};
 
+pub use activity_checkpoint::{ActivityHeartbeatCheckpoint, ActivityHeartbeatResumeUnavailable};
 pub use activity_error::ActivityError;
 pub use activity_retry::{ActivityAttemptLimit, ActivityRetryInfo};
 pub use cancellation_context::{
@@ -5006,7 +5008,13 @@ impl Client {
                     .authority
                     .refresh_delivery_session(&mut wire["task"])?;
             }
-            Ok(serde_json::from_value(wire)?)
+            let heartbeat_resume =
+                activity_checkpoint::HeartbeatResume::from_poll(&wire, &self.namespace)?;
+            let mut data: worker_session::SessionPollResponse = serde_json::from_value(wire)?;
+            if let Some(task) = data.task.as_mut() {
+                task.heartbeat_resume = heartbeat_resume;
+            }
+            Ok(data)
         };
         let mut data: worker_session::SessionPollResponse = match lease.as_ref() {
             Some(lease) => lease.authority.protect(loading).await?,
@@ -8811,6 +8819,7 @@ impl Worker {
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
+                    Some(activity_checkpoint::CAPABILITY.to_string()),
                     self.client
                         .local_activities_enabled
                         .then(|| "local_activities".to_string()),
@@ -10564,6 +10573,7 @@ impl Worker {
             worker_session,
             hydration_claim,
             retry_info,
+            heartbeat_resume,
         } = invocation;
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
@@ -10611,6 +10621,7 @@ impl Worker {
             activity_type: task.activity_type,
             attempt_number: task.attempt_number,
             retry_info,
+            heartbeat_resume,
             activity_execution_id: task.activity_execution_id,
             workflow_id: task.workflow_id,
             run_id: task.run_id,
@@ -16950,6 +16961,7 @@ pub struct ActivityContext {
     pub activity_type: String,
     pub attempt_number: u64,
     retry_info: ActivityRetryInfo,
+    heartbeat_resume: activity_checkpoint::HeartbeatResume,
     activity_execution_id: Option<String>,
     workflow_id: Option<String>,
     run_id: Option<String>,
@@ -16961,6 +16973,45 @@ pub struct ActivityContext {
 }
 
 impl ActivityContext {
+    /// Negotiated resume contract version for this claim; unavailable is `None`.
+    /// This is not a checkpoint write sequence.
+    pub fn heartbeat_resume_version(&self) -> Option<u64> {
+        self.heartbeat_resume.version()
+    }
+
+    /// The read-only acknowledged checkpoint supplied by this claim.
+    ///
+    /// `Ok(None)` means the supported claim explicitly has no checkpoint.
+    /// `Err(ActivityHeartbeatResumeUnavailable)` means the v1 contract was not
+    /// supplied. Inline local activities and Server-free tests are unavailable.
+    /// Heartbeat writes never change this received snapshot. Acknowledgement
+    /// does not atomically commit an external business effect.
+    pub fn last_heartbeat_checkpoint(
+        &self,
+    ) -> std::result::Result<Option<&ActivityHeartbeatCheckpoint>, ActivityHeartbeatResumeUnavailable>
+    {
+        self.heartbeat_resume.checkpoint()
+    }
+
+    /// Last acknowledged details, with unavailable distinct from no checkpoint.
+    pub fn last_heartbeat_details(
+        &self,
+    ) -> std::result::Result<Option<&Value>, ActivityHeartbeatResumeUnavailable> {
+        Ok(self
+            .last_heartbeat_checkpoint()?
+            .map(|value| value.details()))
+    }
+
+    /// Producer acknowledgement time, with full fractional precision.
+    pub fn last_heartbeat_at(
+        &self,
+    ) -> std::result::Result<Option<&DateTime<chrono::Utc>>, ActivityHeartbeatResumeUnavailable>
+    {
+        Ok(self
+            .last_heartbeat_checkpoint()?
+            .map(|value| value.acknowledged_at()))
+    }
+
     /// Logical Server activity execution ID, stable across that activity's retries.
     ///
     /// This is the received claim identity, including for worker-session activities.

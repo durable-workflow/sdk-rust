@@ -461,6 +461,7 @@ impl Worker {
                 activity_type: activity_type.clone(),
                 attempt_number: number,
                 retry_info: crate::ActivityRetryInfo::new(number, None),
+                heartbeat_resume: Default::default(),
                 activity_execution_id: None,
                 workflow_id: task.workflow_id.clone(),
                 run_id: task.run_id.clone(),
