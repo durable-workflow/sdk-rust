@@ -223,7 +223,10 @@ async fn published_local_retries_repeat_last_and_replay_committed_results() {
                 .unwrap();
             let replacement = worker(&client, &id, &kind, intervals, observations.clone(), true);
             replacement.register().await.unwrap();
-            handle.signal_selected_run("finish", json!([])).await.unwrap();
+            handle
+                .signal_selected_run("finish", json!([]))
+                .await
+                .unwrap();
             let mut terminal = false;
             for _ in 0..20 {
                 replacement.run_once().await.unwrap();
