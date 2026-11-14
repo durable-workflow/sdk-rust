@@ -223,11 +223,11 @@ async fn published_local_retries_repeat_last_and_replay_committed_results() {
                 .unwrap();
             let replacement = worker(&client, &id, &kind, intervals, observations.clone(), true);
             replacement.register().await.unwrap();
-            handle.signal("finish", json!([])).await.unwrap();
+            handle.signal_selected_run("finish", json!([])).await.unwrap();
             let mut terminal = false;
             for _ in 0..20 {
                 replacement.run_once().await.unwrap();
-                let description = handle.describe().await.unwrap();
+                let description = handle.describe_selected_run().await.unwrap();
                 if description.is_terminal() {
                     assert_eq!(description.status.as_deref(), Some("completed"));
                     terminal = true;
@@ -240,7 +240,7 @@ async fn published_local_retries_repeat_last_and_replay_committed_results() {
             );
             assert_eq!(
                 handle
-                    .result(WorkflowResultOptions::default())
+                    .result_selected_run(WorkflowResultOptions::default())
                     .await
                     .unwrap(),
                 json!([5])
