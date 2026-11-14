@@ -153,6 +153,9 @@ fn worker(
             let ack = ctx.heartbeat(json!({"cursor":8})).await?;
             assert!(ack.heartbeat_recorded && !ack.should_stop());
             assert_eq!(ctx.last_heartbeat_checkpoint()?.cloned(), received);
+            emit(json!({"event":"acknowledged","pid":std::process::id(),"phase":phase,
+                "execution":ctx.activity_execution_id(),"attempt":ctx.activity_attempt_id,
+                "at":ack.last_heartbeat_at.unwrap()}));
             Ok(json!({"resumed":received.as_ref().map(|v|v.details()),"completed_through":8}))
         }
     });
@@ -395,6 +398,65 @@ fn assert_stale_refusal(
     }
 }
 
+fn assert_heartbeat_record(
+    event: &Value,
+    attempt: &Value,
+    expected_details: &Value,
+    acknowledged_at: &Value,
+) {
+    assert_eq!(event["type"], "ActivityHeartbeatRecorded");
+    let payload = &event["payload"];
+    assert_eq!(payload["activity_execution_id"], attempt["execution"]);
+    assert_eq!(payload["activity_attempt_id"], attempt["attempt"]);
+    assert_eq!(payload["attempt_number"], attempt["phase"]);
+    assert_eq!(payload["activity_attempt"]["id"], attempt["attempt"]);
+    assert_eq!(payload["activity_attempt"]["task_id"], attempt["task"]);
+    assert_eq!(payload["activity_attempt"]["lease_owner"], attempt["owner"]);
+    assert_eq!(payload["progress"]["details"], *expected_details);
+    assert_eq!(instant(&payload["heartbeat_at"]), instant(acknowledged_at));
+    assert_eq!(
+        instant(&payload["activity_attempt"]["last_heartbeat_at"]),
+        instant(acknowledged_at)
+    );
+}
+
+#[test]
+fn heartbeat_observer_binds_nested_progress_identity_and_full_clock() {
+    let at = json!("2026-11-14T11:00:00.123456Z");
+    let attempt = json!({"execution":"execution","attempt":"attempt-1","phase":1,"task":"task-1","owner":"worker"});
+    // Tagged native 3.10 activity_heartbeats.rs retains progress.details and
+    // heartbeat_at; history export preserves that complete payload nesting.
+    let event = json!({"type":"ActivityHeartbeatRecorded","payload":{
+        "activity_execution_id":"execution","activity_attempt_id":"attempt-1","attempt_number":1,
+        "progress":{"details":details()},"heartbeat_at":at,
+        "activity_attempt":{"id":"attempt-1","task_id":"task-1","lease_owner":"worker","last_heartbeat_at":at}}});
+    assert_heartbeat_record(&event, &attempt, &details(), &at);
+    let predecessor = || assert_eq!(event["payload"]["details"], details());
+    assert!(
+        std::panic::catch_unwind(predecessor).is_err(),
+        "old top-level-only lookup must fail on producer-shaped data"
+    );
+    for (pointer, value) in [
+        ("/payload/activity_execution_id", json!("foreign")),
+        ("/payload/activity_attempt_id", json!("other-attempt")),
+        ("/payload/progress/details/cursor", json!(99)),
+        (
+            "/payload/heartbeat_at",
+            json!("2026-11-14T11:00:00.123457Z"),
+        ),
+    ] {
+        let mut changed = event.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(std::panic::catch_unwind(|| assert_heartbeat_record(
+            &changed,
+            &attempt,
+            &details(),
+            &at
+        ))
+        .is_err());
+    }
+}
+
 #[test]
 fn child_stream_reader_refuses_oversized_output_during_reads() {
     let (send, received) = mpsc::channel();
@@ -485,6 +547,9 @@ async fn published_cold_replacement_preserves_acknowledged_activity_checkpoint()
                 assert_eq!(replacement["details"],details());
                 assert_eq!(instant(&replacement["at"]),instant(&original["acknowledged_at"]));
             } else {assert!(replacement["details"].is_null() && replacement["at"].is_null());}
+            let completed_ack=third.event("acknowledged").await;
+            assert_eq!(completed_ack["execution"],retained["execution"]);
+            assert_eq!(completed_ack["attempt"],retained["attempt"]);
             third.finish().await;
             assert_eq!(handle.describe_selected_run().await.unwrap().status.as_deref(),Some("completed"));
             assert_eq!(handle.result_selected_run(WorkflowResultOptions::default()).await.unwrap(),
@@ -499,8 +564,11 @@ async fn published_cold_replacement_preserves_acknowledged_activity_checkpoint()
             assert_eq!(count("ActivityRetryScheduled"),2);assert_eq!(count("ActivityCompleted"),1);
             assert_eq!(count("WorkflowCompleted"),1);
             let recorded:Vec<_>=events.iter().filter(|e|e["type"]=="ActivityHeartbeatRecorded").collect();
-            assert!(recorded.iter().all(|e|e["payload"]["details"]["cursor"]!=99));
-            if case=="acknowledged" {assert!(recorded.iter().any(|e|e["payload"]["details"]==details()));}
+            assert_eq!(recorded.len(),if case=="acknowledged" {2}else{1});
+            if case=="acknowledged" {
+                assert_heartbeat_record(recorded[0],&original,&details(),&original["acknowledged_at"]);
+            }
+            assert_heartbeat_record(recorded.last().unwrap(),&retained,&json!({"cursor":8}),&completed_ack["at"]);
             client.deregister_worker_registration(&format!("{queue}-0")).await.unwrap();
             client.deregister_worker_registration(&format!("{queue}-1")).await.unwrap();
             let report=json!({"case":case,"original":original,"replacement":replacement,"retained":retained,
