@@ -44,6 +44,7 @@ fn worker(
             Ok(value)
         }
     });
+    worker.declare_workflow_signals(kind, &["finish"]).unwrap();
     worker.register_activity("retry-probe", move |ctx, _| {
         observations
             .lock()
