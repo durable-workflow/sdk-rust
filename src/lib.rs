@@ -34389,6 +34389,7 @@ mod tests {
                 DURABLE_SELECTION_CAPABILITY,
                 MEMO_UPSERTS_CAPABILITY,
                 TYPED_SEARCH_ATTRIBUTES_CAPABILITY,
+                activity_checkpoint::CAPABILITY,
                 QUERY_TASKS_CAPABILITY,
                 WORKFLOW_UPDATES_CAPABILITY,
                 MESSAGE_STREAMS_CAPABILITY
