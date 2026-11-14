@@ -341,6 +341,34 @@ async fn malformed_negotiated_checkpoints_refuse_before_the_handler() {
         wire["task"].as_object_mut().unwrap().remove(field);
         cases.push(wire);
     }
+    let empty = claim(1, "execution", Value::Null, Value::Null);
+    for (field, value) in [
+        ("activity_execution_id", json!("")),
+        ("activity_attempt_id", json!("")),
+        ("workflow_id", json!("")),
+        ("run_id", json!("")),
+        ("namespace", json!("foreign")),
+        ("attempt_number", json!(0)),
+        ("attempt_number", json!(-1)),
+        ("attempt_number", json!("1")),
+    ] {
+        let mut wire = empty.clone();
+        wire["task"][field] = value;
+        cases.push(wire);
+    }
+    for field in [
+        "activity_execution_id",
+        "activity_attempt_id",
+        "workflow_id",
+        "run_id",
+        "namespace",
+        "attempt_number",
+    ] {
+        let mut wire = empty.clone();
+        wire["task"].as_object_mut().unwrap().remove(field);
+        cases.push(wire);
+    }
+    let refused = cases.len();
     let server = Server::start(cases, vec![]).await;
     let mut worker = server.worker(false);
     worker.register_activity("inspect", |_, _| async {
@@ -349,7 +377,7 @@ async fn malformed_negotiated_checkpoints_refuse_before_the_handler() {
         Ok(Value::Null)
     });
     worker.register().await.unwrap();
-    for _ in 0..12 {
+    for _ in 0..refused {
         assert!(worker.run_once().await.is_err());
     }
 }
