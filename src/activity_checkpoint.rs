@@ -93,18 +93,21 @@ impl HeartbeatResume {
         if details.is_none() && at.is_none() {
             return Ok(Self::Unavailable);
         }
+        let identity = |field: &str| task[field].as_str().is_some_and(|value| !value.is_empty());
+        let attempt = task["attempt_number"].as_u64().filter(|number| *number > 0);
+        if !identity("activity_execution_id")
+            || !identity("activity_attempt_id")
+            || !identity("workflow_id")
+            || !identity("run_id")
+            || task["namespace"].as_str() != Some(namespace)
+            || attempt.is_none()
+        {
+            return Err(invalid());
+        }
         match (details, at) {
             (Some(Value::Null), Some(Value::Null)) => Ok(Self::Available(None)),
             (Some(details), Some(Value::String(at))) if !details.is_null() => {
-                let identity =
-                    |field: &str| task[field].as_str().is_some_and(|value| !value.is_empty());
-                if !identity("activity_execution_id")
-                    || !identity("activity_attempt_id")
-                    || !identity("workflow_id")
-                    || !identity("run_id")
-                    || task["namespace"].as_str() != Some(namespace)
-                    || !task["attempt_number"].as_u64().is_some_and(|n| n > 1)
-                {
+                if attempt == Some(1) {
                     return Err(invalid());
                 }
                 let acknowledged_at = DateTime::parse_from_rfc3339(at)
