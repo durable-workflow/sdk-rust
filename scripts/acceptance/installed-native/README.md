@@ -66,6 +66,26 @@ Record the package checksum, Server digest, runner commit and cleanup alongside
 the result. Compiling the ignored test or using source dependencies is not
 published-artifact acceptance.
 
+### Local retry-delay observation
+
+`tests/local_retry_timing_server.rs` covers shared #219 through the ordinary
+published SDK Worker path. Copy it into a fresh exact-registry consumer with
+Tokio and serde_json. Bind the selected qualified native tuple and set
+`DURABLE_WORKFLOW_EXPECT_SERVER_VERSION` alongside the existing isolated
+numeric-loopback URL and synthetic-token variables. Run only
+`published_local_retries_repeat_last_and_replay_committed_results` with
+`--ignored --exact --nocapture`.
+
+Five local attempts with `[1, 2]` must record four retry delays `[1, 2, 2, 2]`
+and independently measured callback gaps no shorter than those delays. The
+empty-list case records four explicit zeros. Each case binds the run, logical
+activity and five attempts through public local ActivityRetryScheduled events.
+A replacement Worker instance then replays the committed local result after a
+signal, without another callback or changed history prefix. Empty-list gap
+measurements are retained without promising zero execution or queue latency.
+The caller owns exact package/build/producer/resource and cleanup evidence;
+compilation or the ordinary synthetic observer control is not installed proof.
+
 ### Replay-aware logging feature acceptance
 
 `tests/workflow_logging_server.rs` checks the logging feature separately from
