@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Service activity contexts expose negotiated, immutable acknowledged-heartbeat
+  checkpoint details and a typed acknowledgement time. Unsupported claims stay
+  unavailable, separately from a supported claim with no checkpoint. Heartbeat
+  writes do not optimistically advance the received snapshot.
+
 ## 4.17.0
 
 - Workflow code can use `ctx.logger()` to send new-execution observations to
