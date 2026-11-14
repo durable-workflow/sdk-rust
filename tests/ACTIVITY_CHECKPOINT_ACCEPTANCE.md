@@ -1,7 +1,7 @@
 # Activity checkpoint replacement acceptance
 
 `activity_checkpoint_server.rs` is an ignored integration qualifier for the
-`activity_heartbeat_resume` v1 accessor. Compilation and its two inert observer
+`activity_heartbeat_resume` v1 accessor. Compilation and its inert observer
 tests do not establish an installed result. Run the ignored parent only after
 the exact test, package, producer, compiled executable and isolated caller have
 passed their required reviews.
