@@ -11,7 +11,7 @@ cargo check --manifest-path "$composition_manifest"
 
 # Re-enabling the legacy compiler pin must retain the real resolver refusal.
 if cargo metadata --format-version 1 --manifest-path "$composition_manifest" \
-    --features sdk-msrv-pin >"$composition_log" 2>&1; then
+    --features durable-workflow/msrv-1-86 >"$composition_log" 2>&1; then
     printf 'native composition unexpectedly accepted the incompatible MSRV pin\n' >&2
     exit 1
 fi
