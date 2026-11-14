@@ -756,6 +756,11 @@ commit an external business effect. Continue using stable application idempotenc
 keys, provider reconciliation and external fencing when effects can repeat.
 Original retry policies and timeout budgets remain unchanged.
 
+The [bounded batch example](examples/CHECKPOINTED_BATCH.md) uses these accessors
+and a synthetic provider receipt store to explain failures around external commit
+and checkpoint acknowledgement. Its source tests are separate from published
+worker-loss qualification.
+
 Activity handlers can return an application-defined failure type with
 `ActivityError`. The same type, message and retry marker are reported for remote
 and local activities, including cooperative workers:
