@@ -449,4 +449,42 @@ mod tests {
             .commit_or_reconcile("batch", 0, "first")
             .is_err());
     }
+
+    async fn assert_changed_business_input_refuses(changed_items: Vec<String>) {
+        let fixture = Fixture::new();
+        let original = batch(FailurePoint::AfterCommit);
+        process_batch(&fixture.store, &original, None, 2, |_| std::future::ready(Ok(()))).await.unwrap();
+        let inventory = || {
+            let mut files = std::fs::read_dir(&fixture.store.0).unwrap().map(|entry| {
+                let path = entry.unwrap().path();
+                (path.file_name().unwrap().to_owned(), std::fs::read(&path).unwrap())
+            }).collect::<Vec<_>>();
+            files.sort(); files
+        };
+        let before = inventory();
+        let mut changed = original;
+        changed.items = changed_items;
+        let acknowledged = std::cell::Cell::new(false);
+        let result = process_batch(&fixture.store, &changed, None, 2, |_| {
+            acknowledged.set(true); std::future::ready(Ok(()))
+        }).await;
+        assert!(result.is_err(), "changed business input must refuse without a checkpoint");
+        assert!(!acknowledged.get());
+        assert_eq!(inventory(), before, "refusal must preserve all provider receipts");
+    }
+
+    #[tokio::test]
+    async fn appended_business_input_without_checkpoint_is_refused() {
+        assert_changed_business_input_refuses(vec!["first".into(),"second".into(),"third".into(),"fourth".into()]).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_business_input_without_checkpoint_is_refused() {
+        assert_changed_business_input_refuses(vec!["first".into(),"second".into()]).await;
+    }
+
+    #[tokio::test]
+    async fn reordered_business_input_without_checkpoint_is_refused() {
+        assert_changed_business_input_refuses(vec!["second".into(),"first".into(),"third".into()]).await;
+    }
 }
