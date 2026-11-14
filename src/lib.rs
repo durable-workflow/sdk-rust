@@ -1843,7 +1843,7 @@ impl ActivityRetryPolicy {
     /// Generate durable retry intervals from `initial_interval` and `coefficient`.
     /// Each interval is capped by `maximum_interval`, when present, then rounded
     /// up to whole seconds. A 100 ms interval or cap therefore encodes one second.
-    /// Passing `None` selects no interval cap: intervals keep growing within the
+    /// Passing `None` selects no interval cap. The generated list still has a
     /// finite attempt budget. Arithmetic or protocol overflow returns
     /// [`ActivityOptionsErrorKind::BackoffOverflow`] during validation.
     /// Zero stays zero. This policy is separate from HTTP transport retries.

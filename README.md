@@ -658,8 +658,8 @@ coefficient two encode `1, 2, 4, 8, 16, 32, 64, 128` seconds. Pass `Some(maximum
 to cap the intervals explicitly. The attempt budget and original schedule-to-close
 deadline still bound retries; omission does not select a 60-second cap. Arithmetic
 or protocol overflow returns `ActivityOptionsErrorKind::BackoffOverflow` during
-validation. Replay preserves the recorded delay list, so adding a cap is a policy
-change.
+validation. Replay preserves the recorded delay list. A cap that changes that
+list also changes the policy compared during replay.
 
 Activity handlers can use `ctx.activity_execution_id()` as the logical Server
 activity key, stable across retries, and read its `workflow_id()` and `run_id()`.
