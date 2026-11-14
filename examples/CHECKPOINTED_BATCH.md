@@ -38,7 +38,9 @@ batch or outside this batch is refused.
 
 The receipt directory models a provider's durable operation lookup. Each item
 uses the same application business ID and item index across retries, rather
-than the attempt ID. A repeated key must contain the identical receipt. Changed
+than the attempt ID. Every receipt binds the complete batch fingerprint as well as the item. A repeated
+key must contain the identical receipt, even when no checkpoint was received.
+Appending, truncating or reordering input under that business ID refuses. Changed
 input or a partial receipt refuses and requires reconciliation; the example
 never overwrites it or assumes an uncertain effect failed. Files and directory
 entries are synchronized before a new receipt is considered committed. This is

@@ -77,12 +77,19 @@ impl Batch {
 struct ReceiptStore(PathBuf);
 
 impl ReceiptStore {
-    fn commit_or_reconcile(&self, business_id: &str, index: usize, item: &str) -> Result<bool> {
+    fn commit_or_reconcile(&self, batch: &Batch, index: usize) -> Result<bool> {
         // A business key survives activity retries and workflow restarts. An attempt
         // ID would create a different operation instead of reconciling the old one.
-        let key = serde_json::to_vec(&(business_id, index))?;
+        let fingerprint = batch.fingerprint()?;
+        let item = batch
+            .items
+            .get(index)
+            .ok_or_else(|| invalid("item index is outside the batch"))?;
+        let key = serde_json::to_vec(&(&batch.business_id, index))?;
         let path = self.0.join(format!("{:x}.json", Sha256::digest(&key)));
-        let receipt = serde_json::to_vec(&json!({"key":[business_id,index],"item":item}))?;
+        let receipt = serde_json::to_vec(
+            &json!({"key":[batch.business_id,index],"batch_sha256":fingerprint,"item":item}),
+        )?;
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 file.write_all(&receipt).map_err(provider_io)?;
@@ -148,7 +155,11 @@ where
         if fail(FailurePoint::BeforeCommit) {
             return Err(planned_failure());
         }
-        store.commit_or_reconcile(&batch.business_id, index, &batch.items[index])?;
+        let provider = store.clone();
+        let request = Batch::clone(batch);
+        tokio::task::spawn_blocking(move || provider.commit_or_reconcile(&request, index))
+            .await
+            .map_err(|_| invalid("provider outcome is uncertain after its task stopped"))??;
         if fail(FailurePoint::AfterCommit) {
             return Err(planned_failure());
         }
@@ -186,7 +197,11 @@ async fn main() -> Result<()> {
         ));
     }
     // Refuse an existing directory so this demo cannot mix with application data.
-    std::fs::create_dir(&directory).map_err(provider_io)?;
+    let new_directory = directory.clone();
+    tokio::task::spawn_blocking(move || std::fs::create_dir(new_directory))
+        .await
+        .map_err(|_| invalid("provider directory initialization stopped"))?
+        .map_err(provider_io)?;
     let store = ReceiptStore(PathBuf::from(directory));
     let client = Client::builder(
         std::env::var("DURABLE_WORKFLOW_SERVER_URL")
@@ -354,11 +369,8 @@ mod tests {
             );
             assert_eq!(result["completed"], 3);
             assert_eq!(std::fs::read_dir(&fixture.store.0).unwrap().count(), 3);
-            for (index, item) in batch.items.iter().enumerate() {
-                assert!(!fixture
-                    .store
-                    .commit_or_reconcile(&batch.business_id, index, item)
-                    .unwrap());
+            for index in 0..batch.items.len() {
+                assert!(!fixture.store.commit_or_reconcile(&batch, index).unwrap());
             }
         }
     }
@@ -429,14 +441,11 @@ mod tests {
     #[test]
     fn provider_refuses_conflicting_or_partial_receipts() {
         let fixture = Fixture::new();
-        assert!(fixture
-            .store
-            .commit_or_reconcile("batch", 0, "first")
-            .unwrap());
-        assert!(fixture
-            .store
-            .commit_or_reconcile("batch", 0, "changed")
-            .is_err());
+        let batch = batch(FailurePoint::AfterCommit);
+        assert!(fixture.store.commit_or_reconcile(&batch, 0).unwrap());
+        let mut changed = batch.clone();
+        changed.items[0] = "changed".into();
+        assert!(fixture.store.commit_or_reconcile(&changed, 0).is_err());
         let path = std::fs::read_dir(&fixture.store.0)
             .unwrap()
             .next()
@@ -444,9 +453,75 @@ mod tests {
             .unwrap()
             .path();
         std::fs::write(path, b"").unwrap();
-        assert!(fixture
-            .store
-            .commit_or_reconcile("batch", 0, "first")
-            .is_err());
+        assert!(fixture.store.commit_or_reconcile(&batch, 0).is_err());
+    }
+
+    async fn assert_changed_business_input_refuses(changed_items: Vec<String>) {
+        let fixture = Fixture::new();
+        let original = batch(FailurePoint::AfterCommit);
+        process_batch(&fixture.store, &original, None, 2, |_| {
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        let inventory = || {
+            let mut files = std::fs::read_dir(&fixture.store.0)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        };
+        let before = inventory();
+        let mut changed = original;
+        changed.items = changed_items;
+        let acknowledged = std::cell::Cell::new(false);
+        let result = process_batch(&fixture.store, &changed, None, 2, |_| {
+            acknowledged.set(true);
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "changed business input must refuse without a checkpoint"
+        );
+        assert!(!acknowledged.get());
+        assert_eq!(
+            inventory(),
+            before,
+            "refusal must preserve all provider receipts"
+        );
+    }
+
+    #[tokio::test]
+    async fn appended_business_input_without_checkpoint_is_refused() {
+        assert_changed_business_input_refuses(vec![
+            "first".into(),
+            "second".into(),
+            "third".into(),
+            "fourth".into(),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn truncated_business_input_without_checkpoint_is_refused() {
+        assert_changed_business_input_refuses(vec!["first".into(), "second".into()]).await;
+    }
+
+    #[tokio::test]
+    async fn reordered_business_input_without_checkpoint_is_refused() {
+        assert_changed_business_input_refuses(vec![
+            "second".into(),
+            "first".into(),
+            "third".into(),
+        ])
+        .await;
     }
 }
