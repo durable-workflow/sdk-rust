@@ -98,6 +98,45 @@ marker, without SDK/Server inputs. This proof covers committed-prefix
 suppression across cold workers; uncommitted task retries may still repeat
 process logs.
 
+### Fired-timer redrive clock qualification
+
+`tests/replay_clock_redrive_server.rs` is an ignored Linux qualifier for the
+published-package Server #980 cohort. Copy it into a fresh exact-registry
+consumer with `chrono`, `sha2`, `serde_json` and Tokio available. The caller
+must bind the package/source/lock/build/executable and qualified native 3.11
+index/platform/source identities before selecting the runtime. Use the same
+isolated numeric-loopback environment and synthetic authentication as above.
+Run only the parent:
+
+```sh
+cargo test --locked --test replay_clock_redrive_server -- \
+  --ignored --exact published_timer_clock_survives_first_and_repeated_cold_redrive --nocapture
+```
+
+Three fresh processes execute the unchanged workflow definition: a successful
+activity, a real five-second timer, then the deliberately failing activity;
+the first redrive fails at that activity again and the repeated redrive
+succeeds. The test requires an actual nonzero-fraction source TimerFired,
+compares parsed full-precision UTC instants, preserves original histories,
+checks the new shared timer-pair identities and immediate-predecessor reuse,
+and rejects timer tasks or waits across all stored statuses in each successor
+export. Only the failed activity may execute again. Rust ordinary entry-clock
+authority remains unavailable; redrive entry is checked against the original
+persisted run start. The caller receives the exact CLOCK_COHORT history and
+callback packet before cleanup.
+
+The export's timers list is rebuilt from history and cannot prove physical
+timer-row absence. A complete installed receipt additionally needs a separately
+reviewed, consistent read-only observation of the actual owned synthetic DB,
+bound to these run IDs, collector source/hash, declared stage and immutable
+tuple. Count all statuses in workflow_run_timers, timer workflow_tasks and timer
+workflow_run_waits. Expected successor counts are zero; retain the original
+source inventory and history too. Do not substitute an open-waits view or a
+main-file-only copy of a live SQLite/WAL database. The caller owns this collector,
+its stopped/live snapshot method, resource/lifecycle review and exact cleanup;
+compiling the test or its public-history result alone is not full acceptance.
+The Security-owned stopped-copy helper is not part of this qualifier.
+
 ## Run
 
 Fetch tags first (`git fetch --tags origin`), then run:
