@@ -137,30 +137,97 @@ def _private_paths(source, destination):
     return source, destination
 
 
-def _file_identity(path):
-    value = path.stat()
+def _stat_identity(value):
     return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_nlink,
             value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def transform_copy(source, destination, selections, *, stopped=False):
+def _file_identity(path):
+    return _stat_identity(path.stat())
+
+
+def _read_fd(descriptor, expected):
+    if _stat_identity(os.fstat(descriptor)) != expected:
+        raise ValueError("stopped source descriptor changed")
+    chunks, offset = [], 0
+    while offset < expected[5]:
+        chunk = os.pread(descriptor, min(1024 * 1024, expected[5] - offset), offset)
+        if not chunk:
+            raise ValueError("stopped source descriptor was truncated")
+        chunks.append(chunk)
+        offset += len(chunk)
+    if _stat_identity(os.fstat(descriptor)) != expected:
+        raise ValueError("stopped source descriptor changed during read")
+    return b"".join(chunks)
+
+
+def _memory_image(data):
+    # sqlite3_deserialize requires rollback format, even for a checkpointed
+    # WAL main file. This documented change affects only the private memory
+    # image. The held original and its byte-for-byte checks stay unchanged.
+    # https://www.sqlite.org/c3ref/deserialize.html
+    if data.startswith(b"SQLite format 3\0") and data[18:20] == b"\x02\x02":
+        return data[:18] + b"\x01\x01" + data[20:]
+    return data
+
+
+def _write_fd(descriptor, destination, identity, data):
+    if not 0 < len(data) <= MAX_DATABASE_BYTES:
+        raise ValueError("serialized database byte bound exceeded")
+    if (_stat_identity(os.fstat(descriptor))[:5] != identity[:5]
+            or _file_identity(destination)[:5] != identity[:5]):
+        raise ValueError("created destination identity changed")
+    offset = 0
+    while offset < len(data):
+        written = os.pwrite(descriptor, data[offset:offset + 1024 * 1024], offset)
+        if written <= 0:
+            raise ValueError("created destination write made no progress")
+        offset += written
+    os.ftruncate(descriptor, len(data))
+    os.fsync(descriptor)
+    if (_stat_identity(os.fstat(descriptor))[:5] != identity[:5]
+            or _file_identity(destination) != _stat_identity(os.fstat(descriptor))):
+        raise ValueError("created destination changed during write")
+
+
+def transform_copy(source, destination, selections, *, stopped=False,
+                   source_fd=None, on_destination_created=None):
     """Copy and transform current-producer API admissions, never a physical seed.
 
     `stopped=True` is the outer runner's explicit attestation. It must check its
     exact owned Server/process state first. No source database is modified.
+    An optional source_fd is duplicated, never consumed or repositioned. The
+    creation callback borrows the new O_RDWR FD before any database copy/use;
+    callers must dup it if they retain it beyond this call. SQLite connections
+    use private memory images, because even /proc/self/fd URIs are resolved and
+    reopened by pathname in the native Unix VFS.
     """
     if stopped is not True:
         raise ValueError("outer runner must attest the owned Server is stopped")
+    if ((source_fd is not None and (type(source_fd) is not int or source_fd < 0))
+            or (on_destination_created is not None and not callable(on_destination_created))):
+        raise ValueError("invalid descriptor or destination callback")
+    if not hasattr(sqlite3.Connection, "deserialize") or not hasattr(os, "pread"):
+        raise ValueError("held-copy support requires SQLite deserialize and positional file IO")
     document = manifest()
     selected = _selections(selections)
     source, destination = _private_paths(source, destination)
-    descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    identity = os.fstat(descriptor)
-    os.close(descriptor)
+    source_descriptor = (os.dup(source_fd) if source_fd is not None else
+                         os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)))
+    descriptor, identity = None, None
     try:
-        source_identity = _file_identity(source)
-        with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=2)) as original:
-            with closing(sqlite3.connect(destination, timeout=2, isolation_level=None)) as copied:
+        source_identity = _stat_identity(os.fstat(source_descriptor))
+        if source_identity != _file_identity(source):
+            raise ValueError("source descriptor does not match the stopped database")
+        os.pread(source_descriptor, 0, 0)  # Refuse unreadable/O_PATH descriptors before creation.
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        identity = _stat_identity(os.fstat(descriptor))
+        if on_destination_created is not None:
+            on_destination_created(descriptor)
+        source_data = _read_fd(source_descriptor, source_identity)
+        with closing(sqlite3.connect(":memory:", timeout=2)) as original:
+            original.deserialize(_memory_image(source_data))
+            with closing(sqlite3.connect(":memory:", timeout=2, isolation_level=None)) as copied:
                 before = snapshot(original)
                 deadline = time.monotonic() + 5
 
@@ -171,8 +238,10 @@ def transform_copy(source, destination, selections, *, stopped=False):
                 original.backup(copied, pages=128, progress=progress, sleep=0.05)
                 if snapshot(copied) != before or snapshot(original) != before:
                     raise ValueError("source changed or the complete copy differs")
-                if _file_identity(source) != source_identity:
+                if (_read_fd(source_descriptor, source_identity) != source_data
+                        or _file_identity(source) != source_identity):
                     raise ValueError("stopped source file changed during the copy")
+                _write_fd(descriptor, destination, identity, copied.serialize())
                 copied.execute("PRAGMA foreign_keys=ON")
                 copied.execute("PRAGMA trusted_schema=OFF")
                 copied.execute("BEGIN IMMEDIATE")
@@ -208,13 +277,23 @@ def transform_copy(source, destination, selections, *, stopped=False):
                 except BaseException:
                     copied.execute("ROLLBACK")
                     raise
+                _write_fd(descriptor, destination, identity, copied.serialize())
+        if _read_fd(source_descriptor, source_identity) != source_data:
+            raise ValueError("stopped source changed during transform")
         return {"cell": "synthetic-legacy-shape", "manifest_sha256": MANIFEST_SHA256,
                 "transformed": len(selected), "before_sha256": fingerprint(before),
                 "after_sha256": fingerprint(after)}
     except BaseException:
         # Remove only the new inode this invocation created, never an existing
         # or replaced path. The source and its snapshot remain untouched.
-        current = destination.lstat()
-        if (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
+        try:
+            current = destination.lstat()
+        except FileNotFoundError:
+            current = None
+        if identity is not None and current is not None and (current.st_dev, current.st_ino) == identity[:2]:
             destination.unlink()
         raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(source_descriptor)

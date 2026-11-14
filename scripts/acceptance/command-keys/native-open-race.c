@@ -5,13 +5,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int intercept(const char *path, int flags, mode_t mode, int large) {
     int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, large ? "open64" : "open");
     const char *target = getenv("SQLITE_PROBE_TARGET");
     const char *armed = getenv("SQLITE_PROBE_ARMED");
-    if (target && armed && strcmp(armed, "1") == 0 && strcmp(path, target) == 0) {
+    struct stat existing;
+    if (target && armed && strcmp(armed, "1") == 0 && strcmp(path, target) == 0 &&
+        lstat(target, &existing) == 0) {
         char saved[4096], replacement[4096];
         if (snprintf(saved, sizeof(saved), "%s.saved", target) >= (int) sizeof(saved) ||
             snprintf(replacement, sizeof(replacement), "%s.replacement", target) >= (int) sizeof(replacement)) _exit(70);

@@ -2,6 +2,7 @@
 from contextlib import closing
 from copy import deepcopy
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -180,6 +181,82 @@ class StoppedCopyTest(unittest.TestCase):
         with patch.object(legacy, "MAX_SNAPSHOT_BYTES", 1), self.assertRaises(ValueError):
             self.run_transform()
         self.assertFalse(self.destination.exists())
+
+    def test_held_source_and_created_destination_descriptors_keep_their_owners(self):
+        source_fd = os.open(self.source, os.O_RDONLY)
+        self.addCleanup(os.close, source_fd)
+        os.lseek(source_fd, 7, os.SEEK_SET)
+        retained = []
+
+        def created(fd):
+            self.assertEqual(0, os.fstat(fd).st_size)
+            self.assertEqual(self.destination.stat().st_ino, os.fstat(fd).st_ino)
+            retained.append(os.dup(fd))
+
+        connect = sqlite3.connect
+
+        def memory_only(name, *args, **kwargs):
+            self.assertEqual(":memory:", name, "SQLite must not reopen a pathname or FD URI")
+            return connect(name, *args, **kwargs)
+
+        try:
+            with patch.object(legacy.sqlite3, "connect", memory_only):
+                self.run_transform(source_fd=source_fd, on_destination_created=created)
+            self.assertEqual(7, os.lseek(source_fd, 0, os.SEEK_CUR))
+            self.assertEqual(self.original, os.pread(source_fd, len(self.original), 0))
+            self.assertEqual(self.destination.stat().st_ino, os.fstat(retained[0]).st_ino)
+            with closing(connect(":memory:")) as result:
+                result.deserialize(os.pread(retained[0], os.fstat(retained[0]).st_size, 0))
+                self.assertEqual(("token-key",), result.execute("SELECT request_id FROM workflow_commands").fetchone())
+        finally:
+            for fd in retained:
+                os.close(fd)
+
+    def test_wrong_or_unreadable_source_descriptors_refuse_before_creation(self):
+        foreign = self.root / "foreign"
+        foreign.write_bytes(b"foreign")
+        for mode in (os.O_RDONLY, os.O_WRONLY):
+            fd = os.open(foreign if mode == os.O_RDONLY else self.source, mode)
+            try:
+                with self.subTest(mode=mode), self.assertRaises((ValueError, OSError)):
+                    self.run_transform(source_fd=fd)
+                self.assertFalse(self.destination.exists())
+            finally:
+                os.close(fd)
+        for value in (True, "1", -1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.run_transform(source_fd=value)
+            self.assertFalse(self.destination.exists())
+
+    def test_creation_callback_failure_removes_only_its_new_file(self):
+        def fail(_fd):
+            raise RuntimeError("callback refusal")
+
+        with self.assertRaisesRegex(RuntimeError, "callback refusal"):
+            self.run_transform(on_destination_created=fail)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.original, self.source.read_bytes())
+
+    def test_replaced_destination_is_preserved_without_any_sqlite_path_open(self):
+        moved = self.root / "created.sqlite"
+
+        def replace(_fd):
+            self.destination.rename(moved)
+            self.destination.write_bytes(b"foreign replacement")
+
+        with self.assertRaisesRegex(ValueError, "destination identity changed"):
+            self.run_transform(on_destination_created=replace)
+        self.assertEqual(b"foreign replacement", self.destination.read_bytes())
+        self.assertEqual(self.original, self.source.read_bytes())
+
+    def test_fully_checkpointed_wal_header_uses_the_same_logical_transform(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = self.source.read_bytes()
+        self.assertEqual(b"\x02\x02", before[18:20])
+        self.run_transform()
+        self.assertEqual(before, self.source.read_bytes())
 
 
 if __name__ == "__main__":
