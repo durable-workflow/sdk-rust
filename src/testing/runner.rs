@@ -424,6 +424,7 @@ async fn activity_attempt(
         activity_type: name.into(),
         attempt_number: attempt,
         retry_info,
+        heartbeat_resume: Default::default(),
         activity_execution_id: None,
         workflow_id: None,
         run_id: None,

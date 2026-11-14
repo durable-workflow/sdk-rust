@@ -711,6 +711,51 @@ deadlines can end execution earlier. Local activities and direct `run_activity`
 tests have no received Server snapshot and report unknown policy; fresh
 `run_workflow` tests expose the modeled snapshot recorded in their history.
 
+### Acknowledged activity checkpoints
+
+A service activity claim can carry a read-only checkpoint from an earlier attempt
+of the same logical execution. The Worker advertises `activity_heartbeat_resume`
+and accepts its version-1 Server contract. `ctx.last_heartbeat_checkpoint()` returns
+`Ok(Some(checkpoint))` for received details, `Ok(None)` when the supported claim
+explicitly has no checkpoint, and `Err(ActivityHeartbeatResumeUnavailable)` when
+support or the participating claim fields are unavailable. Older Servers, unknown
+contract versions, inline local activities and Server-free tests are unavailable;
+they do not invent an empty checkpoint.
+
+`last_heartbeat_details()` and `last_heartbeat_at()` expose the same snapshot.
+`checkpoint.details_as::<T>()` deserializes application JSON, while
+`checkpoint.acknowledged_at()` retains a typed UTC timestamp and its fractional
+precision. `heartbeat_resume_version()` and `checkpoint.contract_version()` refer
+to the negotiated protocol; v1 supplies no checkpoint write-sequence number.
+
+```rust
+# use durable_workflow::{json, ActivityError, Client, Worker};
+# use serde::Deserialize;
+# #[derive(Deserialize)]
+# struct Progress { next_item: u64 }
+# let mut worker = Worker::new(Client::new("http://localhost:8080")?, "batch");
+worker.register_activity("batch", |ctx, _| async move {
+    let next_item = match ctx.last_heartbeat_checkpoint() {
+        Ok(Some(checkpoint)) => checkpoint.details_as::<Progress>()?.next_item,
+        Ok(None) => 0,
+        Err(_) => return Err(ActivityError::new(
+            "CheckpointUnavailable", "this activity requires acknowledged resume support"
+        ).non_retryable(true).into()),
+    };
+    Ok(json!({"next_item": next_item}))
+});
+# Ok::<(), durable_workflow::Error>(())
+```
+
+The received snapshot stays immutable throughout the invocation. Calling
+`heartbeat(...)` does not advance it, whether the write is acknowledged, rejected,
+stale, or its response is uncertain. A later attempt receives whatever checkpoint
+the Server retained; a lost response may follow a durable commit. Server v1
+resumes only recorded non-null details. Receipt of a checkpoint does not atomically
+commit an external business effect. Continue using stable application idempotency
+keys, provider reconciliation and external fencing when effects can repeat.
+Original retry policies and timeout budgets remain unchanged.
+
 Activity handlers can return an application-defined failure type with
 `ActivityError`. The same type, message and retry marker are reported for remote
 and local activities, including cooperative workers:
