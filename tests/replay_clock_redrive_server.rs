@@ -140,6 +140,9 @@ fn worker(
         }
     });
     worker
+        .set_workflow_definition_sources(kind, &[include_str!("replay_clock_redrive_server.rs")])
+        .unwrap();
+    worker
 }
 
 #[tokio::test]
@@ -277,6 +280,46 @@ fn zero_timer_tasks_and_waits(history: &Value) {
     );
 }
 
+fn assert_reused_timer_payload(original: &Value, successor: &Value) {
+    let mut expected = original.as_object().unwrap().clone();
+    for field in ["task", "command", "timer_id"] {
+        expected.remove(field);
+    }
+    let mut actual = successor.as_object().unwrap().clone();
+    for field in ["task", "command"] {
+        assert!(
+            !actual.contains_key(field),
+            "reused timer must not carry {field}"
+        );
+    }
+    for field in ["timer_id", "reused_from_run_id", "reused_recorded_at"] {
+        actual.remove(field);
+    }
+    assert_eq!(actual, expected, "complete reused timer payload");
+}
+
+#[test]
+fn reused_timer_payload_allows_only_producer_rewrites() {
+    let original = json!({"sequence":2,"delay_seconds":5,"timer_id":"source",
+        "fire_at":"2026-11-14T00:00:00.123456Z","task":{},"command":{}});
+    let accepted = json!({"sequence":2,"delay_seconds":5,"timer_id":"successor",
+        "fire_at":"2026-11-14T00:00:00.123456Z",
+        "reused_from_run_id":"predecessor","reused_recorded_at":"2026-11-14T00:00:01.123456Z"});
+    assert_reused_timer_payload(&original, &accepted);
+    for (key, value) in [
+        ("fire_at", json!("2026-11-14T00:00:00.123457Z")),
+        ("unexpected", json!(true)),
+        ("task", json!({})),
+        ("command", json!({})),
+    ] {
+        let mut changed = accepted.clone();
+        changed[key] = value;
+        assert!(
+            std::panic::catch_unwind(|| assert_reused_timer_payload(&original, &changed)).is_err()
+        );
+    }
+}
+
 #[test]
 fn clock_comparison_preserves_fraction_and_normalizes_utc_offset() {
     let precise = instant(&json!("2026-11-14T00:00:00.123456Z"));
@@ -308,6 +351,7 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     let mut original_timer = None;
     let mut original_activity = None;
     let mut original_start = None;
+    let mut original_fingerprint = None;
     for phase in 0..=2 {
         let previous_run = run.clone();
         if phase > 0 {
@@ -345,6 +389,11 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
         assert_eq!(callback["stable_timer"], true);
         let history = client.export_workflow_history(&id, &run).await.unwrap();
         validate_export(&history, &id, &run, &kind);
+        let started = one(&history, "WorkflowStarted");
+        let fingerprint = started["payload"]["workflow_definition_fingerprint"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .expect("recorded workflow definition fingerprint");
         assert_eq!(
             events(&history, "WorkflowFailed").len(),
             usize::from(phase < 2)
@@ -364,6 +413,7 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
             .find(|event| event["payload"]["sequence"] == 1)
             .unwrap();
         if phase == 0 {
+            original_fingerprint = Some(fingerprint.to_owned());
             let timer = instant(&fired["recorded_at"]);
             assert_ne!(
                 timer.timestamp_subsec_nanos(),
@@ -378,6 +428,7 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
                 "ordinary Rust entry clock is not advertised"
             );
         } else {
+            assert_eq!(Some(fingerprint), original_fingerprint.as_deref());
             let previous = &runs[phase - 1]["history"];
             let start = one(&history, "WorkflowStarted");
             assert_eq!(start["payload"]["recovery_kind"], "redrive");
@@ -420,6 +471,12 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
             let prior_fired = one(previous, "TimerFired");
             for key in ["delay_seconds", "fire_at", "fired_at"] {
                 assert_eq!(fired["payload"][key], prior_fired["payload"][key]);
+            }
+            for (event_kind, current) in [("TimerScheduled", scheduled), ("TimerFired", fired)] {
+                assert_reused_timer_payload(
+                    &one(&runs[0]["history"], event_kind)["payload"],
+                    &current["payload"],
+                );
             }
             zero_timer_tasks_and_waits(&history);
             assert!(

@@ -117,8 +117,10 @@ Three fresh processes execute the unchanged workflow definition: a successful
 activity, a real five-second timer, then the deliberately failing activity;
 the first redrive fails at that activity again and the repeated redrive
 succeeds. The test requires an actual nonzero-fraction source TimerFired,
-compares parsed full-precision UTC instants, preserves original histories,
-checks the new shared timer-pair identities and immediate-predecessor reuse,
+compares parsed full-precision UTC instants, preserves original histories and
+the recorded nonempty source-definition fingerprint, checks both complete
+timer payloads under the producer's closed rewrite rules, and checks the new
+shared timer-pair identities and immediate-predecessor reuse,
 and rejects timer tasks or waits across all stored statuses in each successor
 export. Only the failed activity may execute again. Rust ordinary entry-clock
 authority remains unavailable; redrive entry is checked against the original
