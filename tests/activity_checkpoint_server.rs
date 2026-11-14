@@ -454,7 +454,11 @@ async fn published_cold_replacement_preserves_acknowledged_activity_checkpoint()
             let mut first=OwnedChild::spawn(&queue,1,case,&image);
             let original=first.event("claimed").await;
             assert_eq!(original["workflow"],queue);assert_eq!(original["run"],run);
-            first.child.kill().unwrap();let killed=first.child.wait().unwrap();assert!(!killed.success());
+            tokio::task::spawn_blocking(move || {
+                first.child.kill().unwrap();
+                let killed=first.child.wait().unwrap();
+                assert!(!killed.success());
+            }).await.unwrap();
             let mut second=OwnedChild::spawn(&queue,2,case,&image);
             let replacement=second.event("claimed").await;
             assert_ne!(original["pid"],replacement["pid"]);
