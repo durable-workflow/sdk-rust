@@ -339,8 +339,8 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     // Registration is distinct from polling. Keep this process's exact compiled
     // definition available while each cold execution worker exits and deregisters.
     let admission_id = format!("{id}-admission");
-    let admission = worker(client.clone(), &id, &kind, 0, Arc::default())
-        .worker_id(admission_id.clone());
+    let admission =
+        worker(client.clone(), &id, &kind, 0, Arc::default()).worker_id(admission_id.clone());
     let registered = admission.register().await.unwrap();
     assert!(registered.registered);
     assert_eq!(registered.worker_id, admission_id);
@@ -375,7 +375,10 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
             };
             assert_eq!(status.as_u16(), 409);
             let refusal: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(refusal["reason"], "workflow_definition_unavailable_or_changed");
+            assert_eq!(
+                refusal["reason"],
+                "workflow_definition_unavailable_or_changed"
+            );
             assert_eq!(refusal["accepted"], false);
             assert_eq!(refusal["workflow_id"], id);
             assert_eq!(refusal["continued_from_run_id"], run);
