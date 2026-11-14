@@ -127,6 +127,13 @@ authority remains unavailable; redrive entry is checked against the original
 persisted run start. The caller receives the exact CLOCK_COHORT history and
 callback packet before cleanup.
 
+A distinct registration-only Worker in the parent keeps the same compiled
+workflow definition available during redrive admission. It never polls or runs
+a task. Before each redrive, the qualifier removes that registration, verifies
+the producer rejects admission with no successor/task or history change, then
+registers the exact definition again before the fresh child executes the run.
+The three execution Workers retain separate process and registration identities.
+
 The export's timers list is rebuilt from history and cannot prove physical
 timer-row absence. A complete installed receipt additionally needs a separately
 reviewed, consistent read-only observation of the actual owned synthetic DB,
