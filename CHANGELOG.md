@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.18.0
+
+- The default `msrv-1-86` feature retains the existing compiler-compatibility
+  dependency pin. Modern hosts can disable it to compose the SDK with native
+  Server's newer official Avro dependency. Rust 1.86 consumers that disable
+  default features must explicitly enable `msrv-1-86`; an unpinned fresh graph
+  can require a newer compiler.
+
+- Service activity contexts expose negotiated, immutable acknowledged-heartbeat
+  checkpoint details and a typed acknowledgement time. Unsupported claims stay
+  unavailable, separately from a supported claim with no checkpoint. Heartbeat
+  writes do not optimistically advance the received snapshot.
+
 ## 4.17.0
 
 - Workflow code can use `ctx.logger()` to send new-execution observations to

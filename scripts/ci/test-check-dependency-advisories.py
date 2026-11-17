@@ -140,6 +140,29 @@ class AdvisoryCheckTest(unittest.TestCase):
         with self.assertRaises(urllib.error.URLError):
             CHECKER.check({"Cargo.lock": CLEAN_LOCK}, post)
 
+    def test_accepted_informational_advisory_warns_without_failing(self) -> None:
+        warnings: list[str] = []
+        locks = {"Cargo.lock": lock(("chrono", "0.4.45"))}
+        failures = CHECKER.check(locks, osv({("chrono", "0.4.45"): ["RUSTSEC-2026-0543"]}), warnings)
+        self.assertEqual([], failures)
+        self.assertEqual(1, len(warnings))
+        self.assertIn("RUSTSEC-2026-0543", warnings[0])
+
+    def test_acceptance_is_bound_to_the_exact_crate_and_advisory(self) -> None:
+        locks = {"Cargo.lock": lock(("chrono", "0.4.45"), ("other", "1.0.0"))}
+        failures = CHECKER.check(
+            locks,
+            osv({("chrono", "0.4.45"): ["RUSTSEC-2026-0543", ADVISORY], ("other", "1.0.0"): ["RUSTSEC-2026-0543"]}),
+            [],
+        )
+        self.assertEqual(
+            [
+                f"Cargo.lock: chrono 0.4.45 is affected by {ADVISORY}",
+                "Cargo.lock: other 1.0.0 is affected by RUSTSEC-2026-0543",
+            ],
+            failures,
+        )
+
     def test_checks_every_committed_lock(self) -> None:
         root = Path(__file__).resolve().parents[2]
         committed = {

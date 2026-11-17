@@ -269,12 +269,15 @@ pub(super) struct SessionActivityTask {
     pub(super) hydration_claim: Option<crate::activity_hydration::HydrationClaim>,
     #[serde(skip)]
     pub(super) activity_lease: Option<Arc<crate::activity_lease::authority::Lease>>,
+    #[serde(skip)]
+    pub(super) heartbeat_resume: crate::activity_checkpoint::HeartbeatResume,
 }
 
 pub(super) struct ActivityInvocation {
     pub(super) worker_session: Option<WorkerSession>,
     pub(super) hydration_claim: Option<crate::activity_hydration::HydrationClaim>,
     pub(super) retry_info: crate::ActivityRetryInfo,
+    pub(super) heartbeat_resume: crate::activity_checkpoint::HeartbeatResume,
 }
 
 #[cfg(test)]
@@ -284,6 +287,7 @@ impl ActivityInvocation {
             worker_session: None,
             hydration_claim: None,
             retry_info: crate::ActivityRetryInfo::new(attempt_number, None),
+            heartbeat_resume: Default::default(),
         }
     }
 }
@@ -297,6 +301,7 @@ impl SessionActivityTask {
                 self.task.attempt_number,
                 self.retry_policy.clone(),
             ),
+            heartbeat_resume: self.heartbeat_resume.clone(),
         }
     }
 }

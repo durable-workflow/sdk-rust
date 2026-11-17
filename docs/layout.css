@@ -27,7 +27,8 @@ body.dw-landing { margin: 0; background: var(--dw-paper); color: var(--dw-ink); 
 .dw-primary-nav > a, .dw-sdk-switcher summary { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; color: var(--dw-ink-2); text-decoration: none; }
 .dw-primary-nav > a:hover, .dw-site-footer a:hover { color: var(--dw-action); }
 .dw-sdk-switcher { position: relative; }
-.dw-sdk-switcher summary { cursor: pointer; list-style: none; }
+.dw-sdk-switcher summary { cursor: pointer; list-style: none; font-weight: 400; }
+.dw-sdk-indicator { font-size: .8em; line-height: 1; vertical-align: middle; }
 .dw-sdk-switcher summary::-webkit-details-marker { display: none; }
 .dw-sdk-menu { position: absolute; top: calc(100% + 6px); left: -16px; z-index: 110; display: grid; min-width: 180px; padding: 8px; border: 1px solid var(--dw-line); border-radius: 8px; background: var(--dw-surface); }
 .dw-sdk-menu a { display: flex; justify-content: space-between; min-height: 44px; align-items: center; padding: 8px 12px; border-radius: 6px; color: var(--dw-ink-2); text-decoration: none; }
