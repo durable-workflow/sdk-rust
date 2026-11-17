@@ -107,7 +107,11 @@ name = "durable_workflow"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["msrv-1-86"]
+# Keep the legacy compiler dependency pin for default SDK builds. A host
+# already using a newer Rust toolchain may disable default features to
+# compose with libraries that require a newer builder macro.
+msrv-1-86 = ["dep:bon"]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 metrics-prometheus = ["dep:prometheus"]
 
@@ -120,7 +124,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
 # Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
-bon = { version = "=3.8.1", default-features = false }
+bon = { version = "=3.8.1", default-features = false, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures-util = "0.3"
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.

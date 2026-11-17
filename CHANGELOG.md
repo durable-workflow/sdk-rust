@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The default `msrv-1-86` feature retains the existing compiler-compatibility
+  dependency pin. Modern hosts can disable it to compose the SDK with native
+  Server's newer official Avro dependency. Rust 1.86 consumers that disable
+  default features must explicitly enable `msrv-1-86`; an unpinned fresh graph
+  can require a newer compiler.
+
 - Service activity contexts expose negotiated, immutable acknowledged-heartbeat
   checkpoint details and a typed acknowledgement time. Unsupported claims stay
   unavailable, separately from a supported claim with no checkpoint. Heartbeat
