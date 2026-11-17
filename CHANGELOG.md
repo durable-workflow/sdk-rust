@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 4.18.0
 
 - The default `msrv-1-86` feature retains the existing compiler-compatibility
   dependency pin. Modern hosts can disable it to compose the SDK with native

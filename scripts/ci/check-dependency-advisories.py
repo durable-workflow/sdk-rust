@@ -28,6 +28,12 @@ LOCKS = (
 # with this source in lock files for both the git and sparse index protocols.
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 OSV = "https://api.osv.dev/v1/querybatch"
+# Reviewed exceptions: (crate, advisory ID) -> reason. Each entry must be
+# informational with no patched release, and must name the issue that removes it.
+# Matching hits are reported as warnings; any other advisory still fails.
+ACCEPTED = {
+    ("chrono", "RUSTSEC-2026-0543"): "informational unmaintained notice with no patched release; replacement tracked in #283",
+}
 BATCH = 500
 
 Package = tuple[str, str]
@@ -107,8 +113,11 @@ def post_osv(body: dict) -> object:
         return json.load(response)
 
 
-def check(locks: dict[str, str], post: Post) -> list[str]:
-    """Return one failure line per affected package or unusable lock."""
+def check(locks: dict[str, str], post: Post, warnings: list[str] | None = None) -> list[str]:
+    """Return one failure line per affected package or unusable lock.
+
+    Advisories listed in ACCEPTED for that exact crate are appended to warnings instead.
+    """
     failures = []
     for path, text in locks.items():
         try:
@@ -117,7 +126,14 @@ def check(locks: dict[str, str], post: Post) -> list[str]:
             failures.append(f"{path}: {error}")
             continue
         for (name, version), ids in sorted(affected.items()):
-            failures.append(f"{path}: {name} {version} is affected by {', '.join(ids)}")
+            accepted = [i for i in ids if (name, i) in ACCEPTED]
+            remaining = [i for i in ids if (name, i) not in ACCEPTED]
+            if remaining:
+                failures.append(f"{path}: {name} {version} is affected by {', '.join(remaining)}")
+            if accepted and warnings is not None:
+                warnings.extend(
+                    f"{path}: {name} {version} has accepted {i} ({ACCEPTED[(name, i)]})" for i in accepted
+                )
     return failures
 
 
@@ -128,7 +144,10 @@ def main() -> int:
 
     locks = {path: (ROOT / path).read_text() for path in arguments.locks}
     # HTTP and OSV response errors propagate and fail the job.
-    failures = check(locks, post_osv)
+    warnings: list[str] = []
+    failures = check(locks, post_osv, warnings)
+    for warning in warnings:
+        print(f"::warning::{warning}")
     for failure in failures:
         print(f"::error::{failure}")
     if failures:
