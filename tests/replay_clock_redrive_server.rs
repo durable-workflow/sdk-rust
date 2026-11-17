@@ -3,7 +3,7 @@
 //! producer/package/build receipt, read-only physical-row counts and cleanup.
 use chrono::{DateTime, SecondsFormat, Utc};
 use durable_workflow::{
-    json, ActivityError, ActivityOptions, ActivityRetryPolicy, Client, Value, Worker,
+    json, ActivityError, ActivityOptions, ActivityRetryPolicy, Client, Error, Value, Worker,
     WorkerRetryPolicy,
 };
 #[cfg(target_os = "linux")]
@@ -336,10 +336,14 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     assert_eq!(client.cluster_info().await.unwrap()["version"], "3.11.0");
     let id = format!("rust-clock-{}", durable_workflow::Uuid::new_v4());
     let kind = format!("qualification.clock.{id}");
-    worker(client.clone(), &id, &kind, 0, Arc::default())
-        .register()
-        .await
-        .unwrap();
+    // Registration is distinct from polling. Keep this process's exact compiled
+    // definition available while each cold execution worker exits and deregisters.
+    let admission_id = format!("{id}-admission");
+    let admission =
+        worker(client.clone(), &id, &kind, 0, Arc::default()).worker_id(admission_id.clone());
+    let registered = admission.register().await.unwrap();
+    assert!(registered.registered);
+    assert_eq!(registered.worker_id, admission_id);
     let handle = client
         .start_workflow(&kind, &id, &id, json!([]))
         .await
@@ -352,9 +356,44 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     let mut original_activity = None;
     let mut original_start = None;
     let mut original_fingerprint = None;
+    let mut registration_refusals = Vec::new();
     for phase in 0..=2 {
         let previous_run = run.clone();
         if phase > 0 {
+            client
+                .deregister_worker_registration(&admission_id)
+                .await
+                .unwrap();
+            let before = client.export_workflow_history(&id, &run).await.unwrap();
+            let rejected_request = format!("{id}-without-registration-{phase}");
+            let rejected = client
+                .redrive_workflow_run(&id, &run, Some(&rejected_request))
+                .await
+                .expect_err("redrive must refuse while no matching definition is registered");
+            let Error::Http { status, body } = rejected else {
+                panic!("expected the producer's definition-registration refusal");
+            };
+            assert_eq!(status.as_u16(), 409);
+            let refusal: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                refusal["reason"],
+                "workflow_definition_unavailable_or_changed"
+            );
+            assert_eq!(refusal["accepted"], false);
+            assert_eq!(refusal["workflow_id"], id);
+            assert_eq!(refusal["continued_from_run_id"], run);
+            assert_eq!(refusal.get("workflow_run_id"), Some(&Value::Null));
+            assert_eq!(refusal.get("task_id"), Some(&Value::Null));
+            let after = client.export_workflow_history(&id, &run).await.unwrap();
+            assert_eq!(before["history_events"], after["history_events"]);
+            registration_refusals.push(json!({"phase":phase,"source_run_id":run,
+                "reason":refusal["reason"],"accepted":false}));
+
+            // This Worker only registers. Only the fresh child below polls or
+            // executes the successor, using the same source-bound fingerprint.
+            let registered = admission.register().await.unwrap();
+            assert!(registered.registered);
+            assert_eq!(registered.worker_id, admission_id);
             let request = format!("{id}-redrive-{phase}");
             let redrive = client
                 .redrive_workflow_run(&id, &run, Some(&request))
@@ -503,6 +542,11 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     }
     assert_eq!(pids.len(), 3);
     assert_eq!(timer_ids.len(), 3);
+    assert_eq!(registration_refusals.len(), 2);
+    client
+        .deregister_worker_registration(&admission_id)
+        .await
+        .unwrap();
     let final_run = client.describe_workflow_run(&id, &run).await.unwrap();
     assert_eq!(final_run.status.as_deref(), Some("completed"));
     assert_eq!(
@@ -514,7 +558,8 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     println!(
         "CLOCK_COHORT {}",
         json!({"workflow_id":id,"workflow_type":kind,
-        "executable":image,"runs":runs,"physical_timer_counts":"caller-required"})
+        "executable":image,"runs":runs,"registration_refusals":registration_refusals,
+        "physical_timer_counts":"caller-required"})
     );
 }
 
