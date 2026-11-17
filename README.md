@@ -1214,6 +1214,16 @@ negotiation remain required for individual features.
 
 ## Development
 
+Default builds enable `msrv-1-86`, which keeps the builder-macro dependency pin
+needed by fresh Rust 1.86 consumers. If you disable default features and still
+require Rust 1.86, explicitly enable `msrv-1-86`.
+
+A host on a newer compiler can omit that feature to compose the SDK with the
+native Server library and its newer official Avro dependency. Without the pin,
+fresh dependency resolution can require a newer compiler. The native composition
+check uses Rust 1.88 or later; this opt-out does not change SDK runtime APIs or
+protocol negotiation.
+
 ```sh
 cargo fmt --all --check
 cargo test --locked --all-targets --all-features
