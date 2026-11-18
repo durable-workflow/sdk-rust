@@ -1513,6 +1513,53 @@ pub struct WorkflowIdentity {
     pub run_id: Option<String>,
 }
 
+/// The schedule fire that started a run, read from the run's own
+/// `ScheduleTriggered` history event.
+///
+/// `occurrence_time` is the time the scheduler evaluated, as recorded (RFC
+/// 3339): the jittered fire time for a tick, or the enumerated time for a
+/// backfill. It is not the run's actual start time. It is `None` for a fire
+/// recorded without an occurrence, such as a manual trigger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ScheduleOrigin {
+    pub schedule_id: String,
+    pub occurrence_time: Option<String>,
+    pub trigger_number: Option<u64>,
+}
+
+impl ScheduleOrigin {
+    /// The run's schedule origin from recorded history, or `None` when no
+    /// schedule started it.
+    fn from_history(history: &[HistoryEvent]) -> Option<Self> {
+        let event = history
+            .iter()
+            .find(|event| event.event_type == "ScheduleTriggered")?;
+        let schedule_id = event
+            .payload
+            .get("schedule_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?
+            .to_string();
+        let occurrence_time = event
+            .payload
+            .get("occurrence_time")
+            .and_then(Value::as_str)
+            .filter(|time| DateTime::parse_from_rfc3339(time).is_ok())
+            .map(str::to_string);
+        let trigger_number = event
+            .payload
+            .get("trigger_number")
+            .and_then(Value::as_u64)
+            .filter(|number| *number > 0);
+        Some(Self {
+            schedule_id,
+            occurrence_time,
+            trigger_number,
+        })
+    }
+}
+
 /// A successful child result together with its durable parent-child identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildWorkflowResult {
@@ -11188,6 +11235,18 @@ impl WorkflowContext {
                 .collect(),
         ))
     }
+    /// The schedule fire that started this run, or `None` if no schedule did.
+    ///
+    /// It comes from the run's recorded `ScheduleTriggered` history event, so
+    /// it is available on the first workflow task and identical on replay.
+    pub fn schedule_origin(&self) -> Result<Option<ScheduleOrigin>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(ScheduleOrigin::from_history(&state.history_events))
+    }
+
     /// Identity of the parent workflow currently being replayed.
     pub fn workflow_identity(&self) -> Result<WorkflowIdentity> {
         let state = self

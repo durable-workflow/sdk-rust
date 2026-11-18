@@ -1,0 +1,66 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-schedule-origin-backfill-cold-replay",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.schedule-origin-window",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "StartAccepted",
+      "recorded_at": "2026-11-18T14:27:10.120000Z",
+      "payload": {
+        "workflow_type": "corpus.schedule-origin-window",
+        "outcome": "started_new"
+      }
+    },
+    {
+      "sequence": 2,
+      "event_type": "WorkflowStarted",
+      "recorded_at": "2026-11-18T14:27:10.120000Z",
+      "payload": {
+        "workflow_type": "corpus.schedule-origin-window",
+        "declared_entry_method": "handle"
+      }
+    },
+    {
+      "sequence": 3,
+      "event_type": "ScheduleTriggered",
+      "recorded_at": "2026-11-18T14:27:10.121000Z",
+      "payload": {
+        "schedule_id": "daily-report",
+        "schedule_ulid": "01M7QGVVBM0CFHKK6WDZ1X9W3Q",
+        "overlap_policy": "allow_all",
+        "trigger_number": 2,
+        "cron_expression": "0 0 * * *",
+        "timezone": "UTC",
+        "occurrence_time": "2026-11-02T00:00:00.000000+00:00"
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "schedule_id": "daily-report",
+        "window_end": "2026-11-02T00:00:00.000000+00:00",
+        "trigger_number": 2
+      }
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "schedule_id": "daily-report",
+      "window_end": "2026-11-02T00:00:00.000000+00:00",
+      "trigger_number": 2
+    }
+  }
+}

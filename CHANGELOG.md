@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `WorkflowContext::schedule_origin()` returns the schedule fire that started
+  the run as a `ScheduleOrigin` (`schedule_id`, `occurrence_time`,
+  `trigger_number`), or `None` for a run no schedule started
+  (durable-workflow/.github#243). It reads the run's `ScheduleTriggered`
+  history event, so it is available on the first workflow task and identical
+  on replay. `occurrence_time` is the time the scheduler evaluated (the
+  jittered fire time for a tick, the enumerated time for a backfill), not the
+  run's start time, and is `None` for a manual trigger. Histories without the
+  event read `None`, so existing runs replay unchanged.
+
 ## 4.18.0
 
 - The default `msrv-1-86` feature retains the existing compiler-compatibility
