@@ -541,6 +541,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.business-replay-clock-parallel-timer"
             | "corpus.business-replay-clock-parallel-child"
             | "corpus.nexus-result"
+            | "corpus.schedule-origin-window"
             | "corpus.nexus-cancellation"
             | "corpus.run-closed-selection"
             | "corpus.run-closed-all-failure"
@@ -700,6 +701,19 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         }
         "corpus.business-replay-clock-child" => {
             business_clock::register_child(&mut worker, workflow_type)
+        }
+        "corpus.schedule-origin-window" => {
+            // .github#243: the window comes from the recorded occurrence.
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                Ok(match ctx.schedule_origin()? {
+                    Some(origin) => json!({
+                        "schedule_id": origin.schedule_id,
+                        "window_end": origin.occurrence_time,
+                        "trigger_number": origin.trigger_number,
+                    }),
+                    None => Value::Null,
+                })
+            });
         }
         "corpus.nexus-result" => {
             worker.register_workflow(workflow_type, |ctx, _| async move {
