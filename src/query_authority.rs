@@ -8,34 +8,20 @@ pub(super) struct Lost;
 pub(super) struct Authority {
     identity: Value,
     timing: Value,
-    bound: chrono::DateTime<chrono::Utc>,
+    bound: wire_time::Timestamp,
     until: Mutex<tokio::time::Instant>,
     observed: bool,
     observing: AtomicBool,
 }
 
-fn wall_now() -> std::result::Result<chrono::DateTime<chrono::Utc>, Lost> {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Lost)?;
-    DateTime::from_timestamp(
-        elapsed.as_secs().try_into().map_err(|_| Lost)?,
-        elapsed.subsec_nanos(),
-    )
-    .ok_or(Lost)
+fn wall_now() -> std::result::Result<wire_time::Timestamp, Lost> {
+    wire_time::now().ok_or(Lost)
 }
 
-fn timestamp(
-    value: &Value,
-    canonical: bool,
-) -> std::result::Result<chrono::DateTime<chrono::Utc>, Lost> {
+fn timestamp(value: &Value, canonical: bool) -> std::result::Result<wire_time::Timestamp, Lost> {
     let text = value.as_str().ok_or(Lost)?;
-    let parsed = DateTime::parse_from_rfc3339(text)
-        .map_err(|_| Lost)?
-        .to_utc();
-    if canonical
-        && (text.len() != 27 || parsed.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string() != text)
-    {
+    let parsed = wire_time::parse_instant(text).ok_or(Lost)?;
+    if canonical && (text.len() != 27 || wire_time::format_micros(parsed) != text) {
         return Err(Lost);
     }
     Ok(parsed)
@@ -99,7 +85,7 @@ impl Authority {
         } else {
             wall_now()?
         };
-        let remaining = (bound - reference).to_std().map_err(|_| Lost)?;
+        let remaining = wire_time::until(bound, reference).ok_or(Lost)?;
         let until = tokio::time::Instant::now()
             .checked_add(remaining)
             .ok_or(Lost)?;
@@ -183,7 +169,7 @@ impl Authority {
             return Err(Lost);
         }
         let reference = timestamp(&reply["server_time"], true)?;
-        let remaining = (self.bound - reference).to_std().map_err(|_| Lost)?;
+        let remaining = wire_time::until(self.bound, reference).ok_or(Lost)?;
         // Charge the entire round trip, including server wait and response read.
         // A later observation can only shorten the original monotonic ceiling.
         let observed_until = started.checked_add(remaining).ok_or(Lost)?;
@@ -252,9 +238,10 @@ mod tests {
 
     fn task(budget: Duration) -> Value {
         let now = wall_now().unwrap();
-        let deadline = now + chrono::Duration::from_std(budget).unwrap();
-        let stamp =
-            |time: chrono::DateTime<chrono::Utc>| time.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        let deadline = now
+            .checked_add(jiff::SignedDuration::try_from(budget).unwrap())
+            .unwrap();
+        let stamp = wire_time::format_micros;
         let envelope =
             serde_json::to_value(encode_payload(&json!([]), DEFAULT_CODEC).unwrap()).unwrap();
         json!({"query_task_id":"query-1","query_task_attempt":1,"lease_owner":"worker-1",
@@ -363,10 +350,7 @@ mod tests {
                     reply["query_task_status"] = json!("leased");
                     reply["can_continue"] = json!(true);
                     reply["reason"] = Value::Null;
-                    reply["server_time"] = json!(wall_now()
-                        .unwrap()
-                        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                        .to_string());
+                    reply["server_time"] = json!(wire_time::format_micros(wall_now().unwrap()));
                     if let Some((key, value)) = &status_change {
                         reply[*key] = value.clone();
                     }

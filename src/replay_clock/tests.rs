@@ -257,7 +257,8 @@ fn replay_now_snapshot_prefix_and_update_handler_are_exact_and_immutable() {
     assert_eq!(
         snapshot_time(&history, DEFAULT_CODEC)
             .unwrap()
-            .timestamp_subsec_micros(),
+            .subsec_nanosecond()
+            / 1000,
         0
     );
     let saved = serde_json::to_value(&history).unwrap();
@@ -278,7 +279,8 @@ fn replay_now_snapshot_prefix_and_update_handler_are_exact_and_immutable() {
     assert_eq!(
         update_time(&[accepted.clone()], "u1")
             .unwrap()
-            .timestamp_subsec_micros(),
+            .subsec_nanosecond()
+            / 1000,
         123456
     );
     assert!(update_time(&[accepted.clone()], "u2").is_none());

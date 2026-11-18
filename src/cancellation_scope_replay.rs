@@ -4,7 +4,7 @@ use super::*;
 use crate::cancellation_scope_history::{
     boundary_scope_states, CommittedCancellationScopeHistory, ScopeBoundary,
 };
-use chrono::Utc;
+use crate::wire_time::Timestamp;
 
 #[doc(hidden)]
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -27,9 +27,8 @@ pub(super) struct ScopeReplay {
     pub tree: cancellation_scope::CancellationScopeHistory,
     pub active_scope: String,
     pub consumed: BTreeSet<u64>,
-    pub contexts: BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>,
-    pub boundary_states:
-        BTreeMap<String, BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>>,
+    pub contexts: BTreeMap<String, (ScopedCancellationContext, Timestamp)>,
+    pub boundary_states: BTreeMap<String, BTreeMap<String, (ScopedCancellationContext, Timestamp)>>,
     pub cleanup_timers: BTreeMap<u64, Value>,
     pub intent: Option<ScopeDeliveryIntent>,
 }

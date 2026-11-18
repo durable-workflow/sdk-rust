@@ -1,6 +1,6 @@
 //! Read-only acknowledged heartbeat snapshots supplied by a negotiated claim.
 
-use crate::{Error, Result, Value};
+use crate::{wire_time, Error, Result, Value};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -110,9 +110,8 @@ impl HeartbeatResume {
                 if attempt == Some(1) {
                     return Err(invalid());
                 }
-                let acknowledged_at = DateTime::parse_from_rfc3339(at)
-                    .map_err(|_| invalid())?
-                    .with_timezone(&Utc);
+                let acknowledged_at =
+                    wire_time::to_chrono(wire_time::parse_instant(at).ok_or_else(invalid)?);
                 Ok(Self::Available(Some(ActivityHeartbeatCheckpoint {
                     details: details.clone(),
                     acknowledged_at,

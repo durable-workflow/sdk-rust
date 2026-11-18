@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Wire timestamps are parsed, compared and printed with `jiff` instead of the
+  unmaintained `chrono` (RUSTSEC-2026-0543). Accepted RFC 3339 text and every
+  timestamp the SDK sends keep identical bytes. Public 4.x accessors such as
+  `replay_now()`, `acknowledged_at()` and cancellation deadlines still return
+  `chrono::DateTime<Utc>`, so `chrono` stays a dependency until a major release.
+  A recorded leap second (`:60`) now reads as the following second, as the PHP
+  Server reads it, instead of chrono's distinct `:60` value.
+
 ## 4.18.0
 
 - The default `msrv-1-86` feature retains the existing compiler-compatibility

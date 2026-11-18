@@ -198,9 +198,7 @@ fn replay_now_signal_time_and_reuse_do_not_borrow_unrelated_authority() {
         json!("2025-12-01T00:00:00.123456Z")
     );
     assert_eq!(
-        snapshot_time(&history, DEFAULT_CODEC)
-            .unwrap()
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        crate::wire_time::format_micros(snapshot_time(&history, DEFAULT_CODEC).unwrap()),
         "2025-12-01T00:00:00.123456Z"
     );
     history[1].payload["reused_recorded_at"] = json!("invalid");
