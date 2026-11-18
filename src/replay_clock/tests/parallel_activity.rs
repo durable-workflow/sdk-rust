@@ -306,15 +306,13 @@ fn replay_now_group_carbon_reference_matches_measured_rounding_and_reconstructio
     ))
     .unwrap();
     for row in reference["vectors"].as_array().unwrap() {
-        let time = DateTime::parse_from_rfc3339(row["input"].as_str().unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        let time = crate::wire_time::parse_instant(row["input"].as_str().unwrap()).unwrap();
         let ms = super::super::parallel::milliseconds(time).unwrap();
         assert_eq!(json!(ms), row["milliseconds"]);
         assert_eq!(
-            DateTime::<Utc>::from_timestamp_millis(ms)
-                .unwrap()
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            crate::wire_time::format_micros(
+                crate::wire_time::Timestamp::from_millisecond(ms).unwrap()
+            ),
             row["reconstructed"].as_str().unwrap()
         );
     }

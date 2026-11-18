@@ -101,9 +101,7 @@ fn replay_now_condition_uses_only_consumed_resolution_not_timer_reuse_or_future_
     assert_eq!(output["result"], json!("TimedOut"));
     assert_eq!(output["time"], json!(RESOLVED));
     assert_eq!(
-        snapshot_time(&history[..4], DEFAULT_CODEC)
-            .unwrap()
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        crate::wire_time::format_micros(snapshot_time(&history[..4], DEFAULT_CODEC).unwrap()),
         RESOLVED
     );
     assert!(snapshot_time(&history[..3], DEFAULT_CODEC).is_none());
