@@ -9,11 +9,10 @@
 //! `to_rfc3339_opts(.., true)` printed, so canonical timestamps the SDK sends
 //! or checks keep identical bytes.
 //!
-//! Two representational limits differ from chrono, neither reachable from
-//! Server-produced time: a leap second is the instant one second after `:59`
-//! (chrono kept it as a distinct `:60` value with the same Unix time), and an
-//! instant must lie within jiff's range, which ends one day early at
-//! `9999-12-30T22:00:00Z`. Syntax validation through [`is_valid`] keeps the
+//! Two representational limits differ from chrono. A leap second `:60.f` is
+//! the instant `f` after the next whole second, as the PHP Server reads it;
+//! chrono kept a distinct `:60` value and printed it back. An instant must
+//! also lie within jiff's range, which ends at `9999-12-30T22:00:00Z`. Syntax validation through [`is_valid`] keeps the
 //! full chrono range.
 //!
 //! The 4.x public API still returns `chrono::DateTime<Utc>` values. Only
