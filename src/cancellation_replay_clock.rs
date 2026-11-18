@@ -1,5 +1,5 @@
 use super::*;
-use chrono::Utc;
+use crate::wire_time::{self, Timestamp};
 use std::{cell::RefCell, sync::Weak};
 
 thread_local! {
@@ -56,7 +56,7 @@ pub(super) struct ReplayClock {
     selections: HashMap<String, usize>,
     cancellations: HashMap<(String, u64), usize>,
     delivery_index: Option<usize>,
-    time: Option<DateTime<Utc>>,
+    time: Option<Timestamp>,
     available: bool,
     started: bool,
 }
@@ -162,8 +162,7 @@ impl ReplayClock {
                 .or_else(|| event.raw.get("timestamp").filter(|value| !value.is_null()))
                 .or_else(|| event.raw.get("recorded_at"))
                 .and_then(Value::as_str)
-                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                .map(|time| time.with_timezone(&Utc))
+                .and_then(wire_time::parse_instant)
         });
         self.available = time.is_some();
         if let Some(time) = time {
@@ -191,7 +190,7 @@ impl WorkflowState {
         }
     }
 
-    pub(super) fn cancellation_time(&self) -> Result<DateTime<Utc>> {
+    pub(super) fn cancellation_time(&self) -> Result<Timestamp> {
         self.cancellation_clock
             .as_ref()
             .filter(|clock| clock.started && clock.available)

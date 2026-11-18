@@ -8,9 +8,9 @@ const HEARTBEAT: &str = "/api/worker/activity-tasks/lease-task/heartbeat";
 
 fn timestamp(after: Duration) -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + after;
-    DateTime::from_timestamp(now.as_secs() as i64, now.subsec_nanos())
-        .unwrap()
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    crate::wire_time::format_micros(
+        crate::wire_time::Timestamp::new(now.as_secs() as i64, now.subsec_nanos() as i32).unwrap(),
+    )
 }
 
 fn delivery() -> Value {
@@ -301,9 +301,12 @@ fn heartbeat_budget(path: &str, body: &str, number: usize) -> Option<(&'static s
         let mut wire = delivery();
         wire["task"]["retry_policy"] = json!({"heartbeat_timeout":1});
         let delivered =
-            DateTime::parse_from_rfc3339(wire["server_time"].as_str().unwrap()).unwrap();
-        wire["task"]["deadlines"]["heartbeat"] = json!((delivered + chrono::TimeDelta::seconds(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+            crate::wire_time::parse_instant(wire["server_time"].as_str().unwrap()).unwrap();
+        wire["task"]["deadlines"]["heartbeat"] = json!(crate::wire_time::format_micros(
+            delivered
+                .checked_add(jiff::SignedDuration::from_secs(1))
+                .unwrap()
+        ));
         return Some(("200 OK", wire.to_string()));
     }
     if path == HEARTBEAT {

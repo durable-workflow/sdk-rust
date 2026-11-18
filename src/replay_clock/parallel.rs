@@ -1,5 +1,5 @@
 //! Portable v1 group time. Legacy Carbon observations remain separate evidence.
-use super::{durable_event_sequence, parse, DateTime, HashMap, HistoryEvent, Utc, Value};
+use super::{durable_event_sequence, parse, HashMap, HistoryEvent, Timestamp, Value};
 use crate::{recorded_parallel_group_path, ParallelGroupMetadata};
 use std::collections::HashSet;
 
@@ -29,18 +29,14 @@ pub(super) fn round_microseconds(micros: i64) -> Option<i64> {
     }
 }
 
-pub(super) fn milliseconds(time: DateTime<Utc>) -> Option<i64> {
-    if time.timestamp_subsec_nanos() % 1000 != 0 {
+pub(super) fn milliseconds(time: Timestamp) -> Option<i64> {
+    if time.subsec_nanosecond() % 1000 != 0 {
         return None;
     }
-    let micros = time
-        .timestamp()
-        .checked_mul(1_000_000)?
-        .checked_add(i64::from(time.timestamp_subsec_micros()))?;
-    round_microseconds(micros)
+    round_microseconds(time.as_microsecond())
 }
 
-pub(super) fn event_time(event: &HistoryEvent) -> Option<DateTime<Utc>> {
+pub(super) fn event_time(event: &HistoryEvent) -> Option<Timestamp> {
     match event.raw.get("recorded_at") {
         None | Some(Value::Null) => parse(event.raw.get("created_at")),
         present => parse(present),
@@ -97,7 +93,7 @@ impl Members {
         history: &[HistoryEvent],
         sequences: &[u64],
         failed: Option<u64>,
-    ) -> Option<DateTime<Utc>> {
+    ) -> Option<Timestamp> {
         let root = self.0.get(sequences.first()?)?.path.first()?;
         if root.parallel_group_base_sequence != *sequences.first()?
             || root.parallel_group_size != sequences.len()
@@ -105,7 +101,7 @@ impl Members {
             return None;
         }
         let mut identities = HashSet::new();
-        let mut success: Option<(i64, DateTime<Utc>)> = None;
+        let mut success: Option<(i64, Timestamp)> = None;
         let mut failure: Option<(i64, u64)> = None;
         for (index, sequence) in sequences.iter().enumerate() {
             let member = self.0.get(sequence)?;
@@ -140,7 +136,7 @@ impl Members {
                 // Keep the legacy exception even when v1 selects a different
                 // failed member. That compatibility gap has no clock authority.
                 (selected == canonical_selected)
-                    .then(|| DateTime::from_timestamp_millis(ms))
+                    .then(|| Timestamp::from_millisecond(ms).ok())
                     .flatten()
             }
             None if failure.is_none() => success.map(|(_, time)| time),

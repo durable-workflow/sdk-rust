@@ -17,6 +17,12 @@
   names the Server's reason for every refusal; nothing was written for any of
   them.
 
+- Wire timestamps are parsed, compared and printed with `jiff` instead of the
+  unmaintained `chrono` (RUSTSEC-2026-0543). Accepted RFC 3339 text and every
+  timestamp the SDK sends keep identical bytes. Public 4.x accessors such as
+  `replay_now()`, `acknowledged_at()` and cancellation deadlines still return
+  `chrono::DateTime<Utc>`, so `chrono` stays a dependency until a major release.
+
 ## 4.20.0
 
 - A signal or update refused with HTTP 409 `request_id_ambiguous` is now typed:

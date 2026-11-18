@@ -5,7 +5,7 @@ use super::{
     recorded_commands, DurableOperationHandle, Error, HistoryEvent, ParallelGroupMetadata,
     QueryContext, RecordedCommand, Result, Value, WorkflowContext, WorkflowIdentity, WorkflowState,
 };
-use chrono::{DateTime, Utc};
+use crate::wire_time::{self, Timestamp};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -63,13 +63,11 @@ fn unavailable() -> Error {
     Error::ReplayClockUnavailable
 }
 
-fn parse(value: Option<&Value>) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value?.as_str()?)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
+fn parse(value: Option<&Value>) -> Option<Timestamp> {
+    wire_time::parse_instant(value?.as_str()?)
 }
 
-fn recorded_time(event: &HistoryEvent, reused: bool) -> Option<DateTime<Utc>> {
+fn recorded_time(event: &HistoryEvent, reused: bool) -> Option<Timestamp> {
     if reused && event.payload.get("reused_recorded_at").is_some() {
         return parse(event.payload.get("reused_recorded_at"));
     }
@@ -82,7 +80,7 @@ fn recorded_time(event: &HistoryEvent, reused: bool) -> Option<DateTime<Utc>> {
     )
 }
 
-fn boundary_time(event: &HistoryEvent, query: bool) -> Option<DateTime<Utc>> {
+fn boundary_time(event: &HistoryEvent, query: bool) -> Option<Timestamp> {
     let internal = event.event_type == "TimerFired" && is_internal_timer_event(event);
     if internal {
         // Core query replay requires the explicit condition resolution. Its
@@ -102,7 +100,7 @@ fn boundary_time(event: &HistoryEvent, query: bool) -> Option<DateTime<Utc>> {
     )
 }
 
-fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
+fn start_time(history: &[HistoryEvent]) -> Option<Timestamp> {
     let mut starts = history
         .iter()
         .filter(|event| event.event_type == "WorkflowStarted");
@@ -117,7 +115,7 @@ fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
 
 #[derive(Debug)]
 pub(super) struct Clock {
-    time: Option<DateTime<Utc>>,
+    time: Option<Timestamp>,
     boundaries: HashMap<u64, usize>,
     parallel_activities: parallel::Members,
     parallel_timers: parallel::Members,
@@ -503,7 +501,7 @@ impl WorkflowState {
         self.advance_cancellation_handle(handle, failed);
     }
 
-    pub(super) fn replay_time(&self) -> Result<DateTime<Utc>> {
+    pub(super) fn replay_time(&self) -> Result<Timestamp> {
         // Cancellation keeps its existing separate semantics. This first
         // cohort does not claim business-clock correlation for its callbacks.
         if self.cancellation_clock.is_some() {
@@ -538,7 +536,7 @@ impl WorkflowContext {
     /// Cancellation's existing budget clock is unchanged.
     /// Migrate business decisions through normal workflow versioning. Event
     /// timestamps do not provide a total order; retain stream/counter identity.
-    pub fn replay_now(&self) -> Result<DateTime<Utc>> {
+    pub fn replay_now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
         let active = ACTIVE.with(|active| active.borrow().as_ref().and_then(Weak::upgrade));
         if !active.is_some_and(|active| Arc::ptr_eq(&active, &self.state)) {
             return Err(unavailable());
@@ -547,6 +545,7 @@ impl WorkflowContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?
             .replay_time()
+            .map(wire_time::to_chrono)
     }
 }
 
@@ -555,12 +554,14 @@ impl QueryContext {
     ///
     /// Missing, invalid or unproved boundary evidence is explicitly unavailable.
     /// Reading this accessor does not change the snapshot or append history.
-    pub fn replay_now(&self) -> Result<DateTime<Utc>> {
-        self.replay_time.ok_or_else(unavailable)
+    pub fn replay_now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+        self.replay_time
+            .map(wire_time::to_chrono)
+            .ok_or_else(unavailable)
     }
 }
 
-pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<DateTime<Utc>> {
+pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Timestamp> {
     let event = history.last()?;
     if super::settled_at_run_close(event) {
         return None;
@@ -601,7 +602,7 @@ pub(super) fn snapshot_time(history: &[HistoryEvent], codec: &str) -> Option<Dat
         .and_then(|event| boundary_time(event, true))
 }
 
-pub(super) fn update_time(history: &[HistoryEvent], update_id: &str) -> Option<DateTime<Utc>> {
+pub(super) fn update_time(history: &[HistoryEvent], update_id: &str) -> Option<Timestamp> {
     let mut events = history.iter().filter(|event| {
         event.event_type == "UpdateAccepted"
             && event.payload["update_id"].as_str() == Some(update_id)

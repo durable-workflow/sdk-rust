@@ -63,15 +63,7 @@ pub(crate) fn retain_poll_observations(
     } else {
         "workflow_task_attempt"
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(
-                i64::try_from(elapsed.as_secs()).ok()?,
-                elapsed.subsec_nanos(),
-            )
-        });
+    let now = crate::wire_time::now();
     let valid = [task_id, "workflow_id", "run_id", "lease_owner"]
         .into_iter()
         .all(|field| task[field].as_str().is_some_and(identity))
@@ -95,7 +87,7 @@ pub(crate) fn retain_poll_observations(
         && task.get("lease_expires_at").is_none_or(|deadline| {
             deadline
                 .as_str()
-                .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).ok())
+                .and_then(crate::wire_time::parse_instant)
                 .is_some_and(|deadline| now.is_some_and(|now| deadline > now))
         });
     if !valid {

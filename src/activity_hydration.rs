@@ -48,12 +48,12 @@ impl HydrationClaim {
             let text = value
                 .as_str()
                 .ok_or_else(|| abandoned("missing or invalid original deadline"))?;
-            let date = DateTime::parse_from_rfc3339(text)
-                .map_err(|_| abandoned("original deadline must include a timezone"))?;
-            let seconds = u64::try_from(date.timestamp())
+            let date = wire_time::parse_instant(text)
+                .ok_or_else(|| abandoned("original deadline must include a timezone"))?;
+            let since_epoch = Duration::try_from(date.as_duration())
                 .map_err(|_| abandoned("original deadline precedes the epoch"))?;
             UNIX_EPOCH
-                .checked_add(Duration::new(seconds, date.timestamp_subsec_nanos()))
+                .checked_add(since_epoch)
                 .ok_or_else(|| abandoned("original deadline is out of range"))
         };
         let mut deadline = parse(&raw["lease_expires_at"])?;

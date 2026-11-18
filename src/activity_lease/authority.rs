@@ -1,10 +1,11 @@
 //! One activity's original identity and acknowledged runtime authority.
 
 use super::MAX_REQUEST_WINDOW;
+use crate::wire_time::{self, Timestamp};
 use crate::{
     percent_encode_path_segment, wait_for_worker_stop, Client, Error, Result, WorkerSession,
 };
-use chrono::{DateTime, FixedOffset, SecondsFormat};
+use jiff::SignedDuration;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::{
@@ -17,8 +18,6 @@ use tokio::time::Instant as Clock;
 
 mod session;
 
-type Timestamp = DateTime<FixedOffset>;
-
 fn lost(message: &str) -> Error {
     Error::ActivityExecutionAbandoned(format!("activity lease: {message}"))
 }
@@ -27,20 +26,17 @@ fn timestamp(value: &Value) -> Result<Timestamp> {
     let text = value
         .as_str()
         .ok_or_else(|| lost("missing original UTC6 timing"))?;
-    let date =
-        DateTime::parse_from_rfc3339(text).map_err(|_| lost("invalid original UTC6 timing"))?;
-    if date.to_rfc3339_opts(SecondsFormat::Micros, true) != text {
+    let date = wire_time::parse(text).ok_or_else(|| lost("invalid original UTC6 timing"))?;
+    if wire_time::format(date.timestamp, date.offset_seconds, 6) != text {
         return Err(lost(
             "original timing must be UTC with six fractional digits",
         ));
     }
-    Ok(date)
+    Ok(date.timestamp)
 }
 
 fn duration(later: Timestamp, earlier: Timestamp) -> Result<Duration> {
-    let value = (later - earlier)
-        .to_std()
-        .map_err(|_| lost("expired timing"))?;
+    let value = wire_time::until(later, earlier).ok_or_else(|| lost("expired timing"))?;
     if value.is_zero() {
         return Err(lost("expired timing"));
     }
@@ -53,8 +49,11 @@ fn until(start: Clock, later: Timestamp, earlier: Timestamp) -> Result<Clock> {
         .ok_or_else(|| lost("timing exceeds the local clock"))
 }
 
-fn interval(seconds: i64) -> Result<chrono::TimeDelta> {
-    chrono::TimeDelta::try_seconds(seconds)
+fn interval(seconds: i64) -> Result<SignedDuration> {
+    // Keep the former millisecond-representable bound on recorded intervals.
+    seconds
+        .checked_mul(1000)
+        .map(|_| SignedDuration::from_secs(seconds))
         .ok_or_else(|| lost("heartbeat interval is out of range"))
 }
 
@@ -103,7 +102,7 @@ impl State {
             .filter(|value| *value > 0);
         if let Some(bound) = bound {
             let interval = interval.ok_or_else(|| lost("missing recorded heartbeat interval"))?;
-            if bound - server > self::interval(interval)? {
+            if bound.duration_since(server) > self::interval(interval)? {
                 return Err(lost("heartbeat bound exceeds its recorded interval"));
             }
         }
@@ -147,7 +146,8 @@ impl State {
                 .zip(heartbeat_interval)
                 .map(|(bound, seconds)| {
                     bound
-                        .checked_sub_signed(interval(seconds)?)
+                        .checked_sub(interval(seconds)?)
+                        .ok()
                         .ok_or_else(|| lost("heartbeat timing underflow"))
                 })
                 .transpose()?,
@@ -174,7 +174,7 @@ impl State {
         };
         if progress > server
             || deadline <= server
-            || deadline - progress != self::interval(interval)?
+            || deadline.duration_since(progress) != self::interval(interval)?
             || self
                 .heartbeat_time
                 .is_some_and(|previous| progress <= previous)
@@ -266,7 +266,8 @@ impl State {
         }
         if let Some(interval) = self.heartbeat_interval {
             let deadline = progress
-                .checked_add_signed(self::interval(interval)?)
+                .checked_add(self::interval(interval)?)
+                .ok()
                 .ok_or_else(|| lost("heartbeat deadline overflow"))?;
             let heartbeat_until = until(started, deadline, progress)?;
             if heartbeat_until <= Clock::now() {
