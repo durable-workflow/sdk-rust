@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 4.19.0
 
 - `WorkflowContext::schedule_origin()` returns the schedule fire that started
   the run as a `ScheduleOrigin` (`schedule_id`, `occurrence_time`,
