@@ -530,6 +530,38 @@ queue, so they do not stall the worker. Unwinding subscriber panics are isolated
 from the workflow result; aborting processes and blocking handlers remain the
 application's responsibility.
 
+## Schedule origin
+
+A run started by a schedule can read the fire that started it with
+`ctx.schedule_origin()`. It returns a `ScheduleOrigin` with the `schedule_id`,
+the `occurrence_time` the scheduler evaluated (RFC 3339, as recorded) and the
+`trigger_number`, or `None` for a run that no schedule started. The value comes
+from the run's `ScheduleTriggered` history event, so it is available on the
+first workflow task and identical on replay.
+
+Use `occurrence_time` to pick the window a scheduled workflow processes. For a
+tick it is the jittered fire time. For a backfill it is the enumerated past
+occurrence. It is not the run's start time, so it does not drift with scheduler
+delay:
+
+```rust,no_run
+# use durable_workflow::{Client, Error, Worker, json};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "reports");
+worker.register_workflow("reports.daily", |ctx, _input| async move {
+    let window_end = ctx
+        .schedule_origin()?
+        .and_then(|origin| origin.occurrence_time)
+        .ok_or_else(|| Error::Codec("start this workflow from a schedule".into()))?;
+    ctx.activity("reports.build", json!([window_end])).await
+});
+# }
+```
+
+`occurrence_time` is `None` for a manual trigger, which records no occurrence.
+A continue-as-new successor keeps its predecessor's origin when the Server
+copies `ScheduleTriggered` into it (native Server 3.5.0 and later).
+
 ## Inspect a run's activities
 
 Use `Client::get_run_activities(workflow_id, run_id)` next to the selected run's
