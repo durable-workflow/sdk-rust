@@ -1,86 +1,10 @@
 //! #222: one signal-with-start request carries the start and the signal, and
 //! every refusal is typed (server#1133).
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{
-    Client, ClosedRunPolicy, Error, OpenRunPolicy, SignalWithStartOptions, WorkflowStartOptions,
-};
-
-/// One captured request: method, path with query, and body.
-#[derive(Debug)]
-struct Captured {
-    method: String,
-    path: String,
-    body: String,
-}
-
-/// Answer each connection with the next scripted reply and capture the requests.
-async fn server(replies: Vec<(u16, Value)>) -> (Client, tokio::task::JoinHandle<Vec<Captured>>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = Client::builder(format!("http://{}", listener.local_addr().unwrap()))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let requests = tokio::spawn(async move {
-        let mut captured = Vec::new();
-        for (status, reply) in replies {
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("the client sent another request")
-                .unwrap();
-            let mut bytes = Vec::new();
-            let (head, offset) = loop {
-                let mut buf = [0; 4096];
-                let count = stream.read(&mut buf).await.unwrap();
-                assert!(count > 0);
-                bytes.extend_from_slice(&buf[..count]);
-                if let Some(offset) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                    break (
-                        String::from_utf8_lossy(&bytes[..offset]).to_string(),
-                        offset + 4,
-                    );
-                }
-            };
-            let length: usize = head
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .unwrap_or(0);
-            while bytes.len() < offset + length {
-                let mut buf = [0; 4096];
-                let count = stream.read(&mut buf).await.unwrap();
-                assert!(count > 0);
-                bytes.extend_from_slice(&buf[..count]);
-            }
-            let mut request_line = head.lines().next().unwrap().split_whitespace();
-            captured.push(Captured {
-                method: request_line.next().unwrap().to_string(),
-                path: request_line.next().unwrap().to_string(),
-                body: String::from_utf8_lossy(&bytes[offset..offset + length]).to_string(),
-            });
-            let body = reply.to_string();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        }
-        captured
-    });
-    (client, requests)
-}
+use crate::update_outcome::tests::server;
+use crate::{ClosedRunPolicy, Error, OpenRunPolicy, SignalWithStartOptions, WorkflowStartOptions};
 
 fn cluster() -> (u16, Value) {
     (
