@@ -557,6 +557,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.nexus-cancellation"
             | "corpus.run-closed-selection"
             | "corpus.run-closed-all-failure"
+            | "corpus.signal-external"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -1368,6 +1369,23 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     },
                     Err(error) => Err(error),
                 }
+            });
+        }
+        // .github#223: an external signal resolves from its recorded outcome;
+        // replay never submits it again.
+        "corpus.signal-external" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                let sent = ctx
+                    .signal_external_workflow("order-42", "approve", json!(["manager"]))
+                    .await?;
+                Ok(json!({
+                    "outcome": sent.outcome.as_str(),
+                    "reason": sent.reason,
+                    "target_run_id": sent.target_run_id,
+                    "target_command_id": sent.target_command_id,
+                    "target_signal_id": sent.target_signal_id,
+                    "retained": sent.retained,
+                }))
             });
         }
         _ => unreachable!("workflow type was validated above"),

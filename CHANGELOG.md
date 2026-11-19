@@ -16,6 +16,24 @@
   receipt, even after the run closed. `Error::signal_with_start_refusal()`
   names the Server's reason for every refusal; nothing was written for any of
   them.
+- Workflow code can signal another workflow durably with
+  `WorkflowContext::signal_external_workflow(workflow_id, signal_name, args)`
+  (add `.run_id(..)` to target one run), the Rust slice of
+  durable-workflow/.github#223. It emits the `signal_external_workflow` command
+  and resolves to an `ExternalSignalResult` read from the sender's own history
+  (`ExternalSignalRequested`, then `ExternalSignalDelivered` or
+  `ExternalSignalFailed` at the same sequence, Server #1134). A failed delivery
+  is a returned value with `outcome` `TargetNotFound`, `TargetClosed` or
+  `Rejected` and a stable `reason`, not an error. Replay never sends the signal
+  again; a different target, run, signal name or arguments at the recorded
+  sequence is `Error::NonDeterministicReplay`. The Worker reads
+  `signal_external_workflow` from each workflow poll's `server_capabilities`;
+  without it the call returns `Error::SignalExternalWorkflowUnavailable` before
+  anything is submitted, and a workflow that returns that error fails its
+  workflow task, not its run. An invalid target or signal name (a blank name,
+  a control character, more than 191 characters or 255 bytes, as the Server
+  refuses) returns `Error::InvalidExternalSignal` in workflow code before any
+  command is emitted.
 
 ## 4.20.0
 

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-external-signal-target-changed",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.signal-external",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ExternalSignalRequested",
+      "payload": {
+        "sequence": 1,
+        "target_workflow_instance_id": "order-41",
+        "target_workflow_run_id": null,
+        "signal_name": "approve",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCg5tYW5hZ2VyAA=="
+        },
+        "payload_codec": "avro",
+        "request_id": "workflow-signal:regression-corpus-run:1"
+      }
+    },
+    {
+      "event_type": "ExternalSignalDelivered",
+      "payload": {
+        "sequence": 1,
+        "target_workflow_instance_id": "order-41",
+        "signal_name": "approve",
+        "request_id": "workflow-signal:regression-corpus-run:1",
+        "target_workflow_run_id": "order-run",
+        "outcome": "delivered",
+        "target_command_id": "command-7",
+        "target_signal_id": "signal-9",
+        "retained": false
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": "unreachable: the recorded external signal names another target"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": "unreachable: the recorded external signal names another target"
+  },
+  "expected_failure": "recorded_command_detail_mismatch"
+}

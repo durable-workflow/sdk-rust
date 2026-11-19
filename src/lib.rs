@@ -11,6 +11,7 @@ mod cancellation_scope;
 mod cancellation_scope_history;
 mod cancellation_scope_replay;
 mod cooperative_cancellation;
+mod external_signal;
 mod failure_reporting;
 mod local_activity;
 pub mod metrics;
@@ -55,6 +56,7 @@ pub use cancellation_scope_history::{
 };
 #[doc(hidden)]
 pub use cancellation_scope_replay::CancellationScopeRequested;
+pub use external_signal::{ExternalSignalCall, ExternalSignalOutcome, ExternalSignalResult};
 pub use failure_reporting::FailureReportError;
 pub use run_activities::{
     WorkflowActivity, WorkflowActivityAttempt, WorkflowActivityList, WorkflowActivityMetadataError,
@@ -445,6 +447,18 @@ pub enum Error {
         "workflow_memo_updates_unavailable: the connected runtime did not advertise workflow memo update support"
     )]
     WorkflowMemoUpdatesUnavailable,
+    /// The connected Server does not advertise the `signal_external_workflow`
+    /// workflow-task command. Nothing was submitted. Returned to workflow code
+    /// from [`WorkflowContext::signal_external_workflow`]; if the workflow
+    /// returns it, the worker fails the workflow task (not the run).
+    #[error(
+        "signal_external_workflow_unavailable: the connected Server does not advertise the signal_external_workflow workflow command; nothing was submitted"
+    )]
+    SignalExternalWorkflowUnavailable,
+    /// [`WorkflowContext::signal_external_workflow`] was given an invalid
+    /// target or signal name. Nothing was submitted.
+    #[error("invalid external signal: {0}")]
+    InvalidExternalSignal(String),
     /// An accepted update had not completed when the wait ended; it has no
     /// result yet. See [`UpdatePending`].
     #[error(transparent)]
@@ -8029,6 +8043,9 @@ pub struct Worker {
     query_authority_confirmed: Arc<AtomicBool>,
     resource_capabilities: Vec<String>,
     sessions: Arc<Mutex<HashMap<String, WorkerSession>>>,
+    /// Whether the latest workflow poll's `server_capabilities` advertised
+    /// the `signal_external_workflow` command.
+    signal_external_workflow_supported: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -8077,7 +8094,17 @@ impl Worker {
             query_authority_confirmed: Arc::new(AtomicBool::new(false)),
             resource_capabilities: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            signal_external_workflow_supported: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record the workflow commands the polling Server advertises, so
+    /// workflow code can refuse an unadvertised command before submitting it.
+    fn observe_workflow_poll_capabilities(&self, capabilities: Option<&Value>) {
+        self.signal_external_workflow_supported.store(
+            external_signal::runtime_supports(capabilities),
+            Ordering::SeqCst,
+        );
     }
 
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
@@ -9515,6 +9542,7 @@ impl Worker {
         }
         let memo_updates_supported =
             runtime_supports_workflow_memo_updates(response.server_capabilities.as_ref());
+        self.observe_workflow_poll_capabilities(response.server_capabilities.as_ref());
         let Some(task) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
@@ -10295,23 +10323,25 @@ impl Worker {
                         "QueryWorkflowStateUnavailable",
                     )
                 })?;
-                let workflow_state = Arc::new(Mutex::new(
-                    WorkflowState::new_with_identity(
-                        history_events.as_ref().clone(),
-                        context.workflow_id.clone(),
-                        context.run_id.clone(),
-                        self.task_queue.clone(),
-                        task.payload_codec,
-                        None,
+                let mut replayed_state = WorkflowState::new_with_identity(
+                    history_events.as_ref().clone(),
+                    context.workflow_id.clone(),
+                    context.run_id.clone(),
+                    self.task_queue.clone(),
+                    task.payload_codec,
+                    None,
+                )
+                .map_err(|error| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        format!("workflow replay failed before query: {error}"),
+                        "QueryWorkflowStateUnavailable",
                     )
-                    .map_err(|error| {
-                        QueryTaskExecutionFailure::new(
-                            "query_workflow_state_unavailable",
-                            format!("workflow replay failed before query: {error}"),
-                            "QueryWorkflowStateUnavailable",
-                        )
-                    })?,
-                ));
+                })?;
+                // Query replay never submits commands, so an external signal
+                // past the recorded history waits like any new command.
+                replayed_state.signal_external_workflow_supported = true;
+                let workflow_state = Arc::new(Mutex::new(replayed_state));
                 let workflow_context = WorkflowContext {
                     state: workflow_state,
                     cancellation_scope_id: "root".into(),
@@ -10556,6 +10586,9 @@ impl Worker {
             },
         )?;
         workflow_state.observation_namespace = Some(self.client.namespace.clone());
+        workflow_state.signal_external_workflow_supported = self
+            .signal_external_workflow_supported
+            .load(Ordering::SeqCst);
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
         if let Some(canonical) = cancellation_history {
@@ -12684,6 +12717,7 @@ fn is_authored_command_open_event(event: &HistoryEvent) -> bool {
             | "SideEffectRecorded"
             | "VersionMarkerRecorded"
             | "MemoUpserted"
+            | "ExternalSignalRequested"
             | "WorkflowContinuedAsNew"
     )
 }
@@ -12739,6 +12773,9 @@ struct WorkflowState {
     message_stream_messages: HashMap<String, Vec<MessageStreamMessage>>,
     message_stream_cursors: HashMap<String, u64>,
     message_stream_waits: HashMap<String, u64>,
+    /// Whether the Server that delivered this task advertises the
+    /// `signal_external_workflow` command.
+    signal_external_workflow_supported: bool,
 }
 
 /// `cancellation_reason` of an `ActivityCancelled` that the run's own close
@@ -13057,6 +13094,7 @@ impl WorkflowState {
             message_stream_messages: HashMap::new(),
             message_stream_cursors,
             message_stream_waits: HashMap::new(),
+            signal_external_workflow_supported: false,
         })
     }
 }
@@ -13200,6 +13238,11 @@ enum RecordedCommand {
     Memo {
         sequence: u64,
         entries: AvroValue,
+    },
+    ExternalSignal {
+        sequence: u64,
+        request: external_signal::RecordedRequest,
+        outcome: Option<ExternalSignalResult>,
     },
 }
 
@@ -13886,7 +13929,8 @@ impl RecordedCommand {
             | Self::SearchAttributes { sequence, .. }
             | Self::SideEffect { sequence, .. }
             | Self::VersionMarker { sequence, .. }
-            | Self::Memo { sequence, .. } => *sequence,
+            | Self::Memo { sequence, .. }
+            | Self::ExternalSignal { sequence, .. } => *sequence,
             Self::ServiceOperation { sequence, .. } => *sequence,
         }
     }
@@ -13906,6 +13950,7 @@ impl RecordedCommand {
             Self::SideEffect { .. } => "side effect",
             Self::VersionMarker { .. } => "version marker",
             Self::Memo { .. } => "memo upsert",
+            Self::ExternalSignal { .. } => "external signal",
             Self::ServiceOperation { .. } => "service operation",
         }
     }
@@ -15589,7 +15634,9 @@ fn recorded_selection_member_is_terminal(
             | RecordedCommand::Memo { .. }
             | RecordedCommand::CancellationBoundary { .. }
             | RecordedCommand::CancellationGroup { .. } => false,
-            RecordedCommand::ServiceOperation { .. } => false,
+            RecordedCommand::ServiceOperation { .. } | RecordedCommand::ExternalSignal { .. } => {
+                false
+            }
         };
         if !terminal {
             all_completed = false;
@@ -17538,7 +17585,9 @@ fn history_payload_fields(event_type: &str) -> &'static [&'static str] {
     match event_type {
         "ActivityCompleted" => &["result"],
         "SignalReceived" | "SignalApplied" => SIGNAL_HISTORY_PAYLOAD_FIELDS,
-        "UpdateAccepted" | "UpdateRejected" | "UpdateApplied" => &["arguments"],
+        "UpdateAccepted" | "UpdateRejected" | "UpdateApplied" | "ExternalSignalRequested" => {
+            &["arguments"]
+        }
         "UpdateCompleted" | "SideEffectRecorded" => &["result"],
         "ChildRunCompleted" => &["result", "output"],
         "WorkflowCompleted" => &["output"],
@@ -17936,6 +17985,7 @@ fn recorded_commands(
         let is_side_effect = event.event_type == "SideEffectRecorded";
         let is_version_marker = event.event_type == "VersionMarkerRecorded";
         let is_memo = event.event_type == "MemoUpserted";
+        let is_external_signal = external_signal::is_event(event);
         let is_service_operation = nexus::is_service_event(event);
         if !is_activity
             && !is_workflow_timer
@@ -17946,6 +17996,7 @@ fn recorded_commands(
             && !is_side_effect
             && !is_version_marker
             && !is_memo
+            && !is_external_signal
             && !is_service_operation
         {
             continue;
@@ -18039,6 +18090,11 @@ fn recorded_commands(
                 .collect();
             let service_events: Vec<_> = sequence_events.iter().copied()
                 .filter(|event| nexus::is_service_event(event)).collect();
+            let external_signal_events: Vec<_> = sequence_events
+                .iter()
+                .copied()
+                .filter(|event| external_signal::is_event(event))
+                .collect();
 
             let command_kind_count = usize::from(!activity_events.is_empty())
                 + usize::from(!timer_events.is_empty())
@@ -18049,7 +18105,8 @@ fn recorded_commands(
                 + usize::from(!side_effect_events.is_empty())
                 + usize::from(!version_marker_events.is_empty())
                 + usize::from(!memo_events.is_empty())
-                + usize::from(!service_events.is_empty());
+                + usize::from(!service_events.is_empty())
+                + usize::from(!external_signal_events.is_empty());
             if command_kind_count > 1 {
                 let actual = [
                     (!activity_events.is_empty()).then_some("activity"),
@@ -18062,6 +18119,7 @@ fn recorded_commands(
                     (!version_marker_events.is_empty()).then_some("version marker"),
                     (!memo_events.is_empty()).then_some("memo upsert"),
                     (!service_events.is_empty()).then_some("service operation"),
+                    (!external_signal_events.is_empty()).then_some("external signal"),
                 ]
                 .into_iter()
                 .flatten()
@@ -18074,6 +18132,10 @@ fn recorded_commands(
                     &actual,
                     "one workflow sequence records more than one durable command kind",
                 ));
+            }
+
+            if !external_signal_events.is_empty() {
+                return external_signal::recorded(&external_signal_events, sequence, fallback_codec);
             }
 
             if !service_events.is_empty() {
@@ -19756,6 +19818,7 @@ fn workflow_task_integrity_error(error: &Error) -> bool {
         Error::NonDeterministicReplay(_)
             | Error::Protocol(_)
             | Error::CancellationScopeExecutionUnavailable
+            | Error::SignalExternalWorkflowUnavailable
             | Error::MissingWorkflowCommandIdentity
             | Error::WorkflowStatePoisoned
     )
@@ -20183,6 +20246,7 @@ mod tests {
     mod completion_limits;
     mod condition_fingerprint;
     mod cooperative_cancellation;
+    mod external_signal;
     mod history_transaction_limit;
     mod local_activity;
     mod nexus;

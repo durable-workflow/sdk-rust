@@ -1,0 +1,71 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-external-signal-delivered-cold-replay",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.signal-external",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ExternalSignalRequested",
+      "payload": {
+        "sequence": 1,
+        "target_workflow_instance_id": "order-42",
+        "target_workflow_run_id": null,
+        "signal_name": "approve",
+        "arguments": {
+          "codec": "avro",
+          "blob": "wwHioz3/VYAiNwwCCg5tYW5hZ2VyAA=="
+        },
+        "payload_codec": "avro",
+        "request_id": "workflow-signal:regression-corpus-run:1"
+      }
+    },
+    {
+      "event_type": "ExternalSignalDelivered",
+      "payload": {
+        "sequence": 1,
+        "target_workflow_instance_id": "order-42",
+        "signal_name": "approve",
+        "request_id": "workflow-signal:regression-corpus-run:1",
+        "target_workflow_run_id": "order-run",
+        "outcome": "delivered",
+        "target_command_id": "command-7",
+        "target_signal_id": "signal-9",
+        "retained": false
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "outcome": "delivered",
+        "reason": null,
+        "target_run_id": "order-run",
+        "target_command_id": "command-7",
+        "target_signal_id": "signal-9",
+        "retained": false
+      }
+    }
+  ],
+  "expected": {
+    "side_effect_callback_calls": 0,
+    "completion_attempts": 1,
+    "type": "complete_workflow",
+    "result": {
+      "outcome": "delivered",
+      "reason": null,
+      "target_run_id": "order-run",
+      "target_command_id": "command-7",
+      "target_signal_id": "signal-9",
+      "retained": false
+    }
+  }
+}
