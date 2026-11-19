@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- `Client::signal_with_start` starts a workflow or reuses its open run and
+  records one signal on it in a single Server transaction, so the run cannot
+  close between a separate start and signal (durable-workflow/.github#222,
+  server#1133). It needs a Server that advertises
+  `capabilities.signal_with_start` (native Server) and returns
+  `Error::SignalWithStartUnavailable` before sending otherwise.
+  `SignalWithStartOptions` carries the start deadlines, `OpenRunPolicy`
+  (`UseExisting` by default, or `Fail`), `ClosedRunPolicy` (`Reject` by
+  default, or `StartNewRun` to start a fresh run after a closed one), the
+  signal's command key (generated as `sdk-rust-signal-with-start-<uuid>` when
+  omitted) and a business key. A retry with the same key returns the original
+  receipt, even after the run closed. `Error::signal_with_start_refusal()`
+  names the Server's reason for every refusal; nothing was written for any of
+  them.
+
 ## 4.20.0
 
 - A signal or update refused with HTTP 409 `request_id_ambiguous` is now typed:
