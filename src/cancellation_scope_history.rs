@@ -1229,8 +1229,8 @@ impl CancellationScopeDeliveryBudget {
     }
 
     /// Narrow the original budget, without granting a new request or lease.
-    pub fn restrict(&mut self, authority_deadline: chrono::DateTime<chrono::Utc>) -> Result<()> {
-        self.restrict_instant(wire_time::from_chrono(authority_deadline))
+    pub fn restrict(&mut self, authority_deadline: jiff::Timestamp) -> Result<()> {
+        self.restrict_instant(authority_deadline)
     }
 
     pub(crate) fn restrict_instant(&mut self, authority_deadline: Timestamp) -> Result<()> {
@@ -1266,8 +1266,8 @@ impl CancellationScopeDeliveryReceipt {
     pub fn boundary(&self) -> &CancellationDelivery {
         &self.preparation.boundary
     }
-    pub fn authority_deadline(&self) -> chrono::DateTime<chrono::Utc> {
-        wire_time::to_chrono(self.preparation.authority_deadline)
+    pub fn authority_deadline(&self) -> jiff::Timestamp {
+        self.preparation.authority_deadline
     }
     pub(crate) fn authority_deadline_instant(&self) -> Timestamp {
         self.preparation.authority_deadline

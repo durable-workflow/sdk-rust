@@ -45,16 +45,26 @@ fn group(base: u64, kinds: [&str; 2], times: [&str; 2], nested: bool) -> Vec<His
 fn observe(history: Vec<HistoryEvent>, nested: bool) -> Value {
     let ctx = context(history);
     let inner = ctx.clone();
-    let output = ready(&ctx, Box::pin(async move {
-        let failed = match inner.parallel(operations(nested)).await {
-            Ok(values) => { assert_eq!(values.len(), 2); None },
-            Err(Error::ParallelFailed(failure)) => Some(failure.member_path),
-            other => panic!("unexpected child group result: {other:?}"),
-        };
-        let time = inner.replay_now().ok();
-        assert_eq!(time,inner.replay_now().ok());
-        AvroValue::from_serialize(&json!({"time":time.map(|time|time.to_rfc3339_opts(chrono::SecondsFormat::Micros,true)),"failed":failed}))
-    })).into_json().unwrap();
+    let output = ready(
+        &ctx,
+        Box::pin(async move {
+            let failed = match inner.parallel(operations(nested)).await {
+                Ok(values) => {
+                    assert_eq!(values.len(), 2);
+                    None
+                }
+                Err(Error::ParallelFailed(failure)) => Some(failure.member_path),
+                other => panic!("unexpected child group result: {other:?}"),
+            };
+            let time = inner.replay_now().ok();
+            assert_eq!(time, inner.replay_now().ok());
+            AvroValue::from_serialize(
+                &json!({"time":time.map(|time|time.to_rfc3339_micros()),"failed":failed}),
+            )
+        }),
+    )
+    .into_json()
+    .unwrap();
     assert!(ctx.take_commands().unwrap().is_empty());
     assert!(ctx.replay_now().is_err());
     output

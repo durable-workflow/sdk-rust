@@ -1,13 +1,23 @@
 use super::*;
-use chrono::{DateTime, SecondsFormat, Utc};
+use durable_workflow::jiff::Timestamp;
+
+/// The canonical micros wire form: six fractional digits and `Z`.
+trait Rfc3339Micros {
+    fn to_rfc3339_micros(&self) -> String;
+}
+impl Rfc3339Micros for Timestamp {
+    fn to_rfc3339_micros(&self) -> String {
+        format!("{self:.6}")
+    }
+}
 
 // The same official consumer must compile against the pre-accessor SDK.
 // Inherent methods win over this explicit unavailable baseline shim.
 trait LegacyReplayClock {
-    fn replay_now(&self) -> Result<DateTime<Utc>, Error>;
+    fn replay_now(&self) -> Result<Timestamp, Error>;
 }
 impl LegacyReplayClock for WorkflowContext {
-    fn replay_now(&self) -> Result<DateTime<Utc>, Error> {
+    fn replay_now(&self) -> Result<Timestamp, Error> {
         Err(Error::WorkerLoop(
             "baseline SDK has no replay_now accessor".into(),
         ))
@@ -23,11 +33,11 @@ pub(super) fn register(worker: &mut Worker, workflow_type: &str) {
         let result = ctx.activity("clock-activity", json!([])).await?;
         let activity = ctx.replay_now().ok();
         Ok(json!({
-            "start":start.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "timer":timer.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "activity":activity.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "start":start.map(|time| time.to_rfc3339_micros()),
+            "timer":timer.map(|time| time.to_rfc3339_micros()),
+            "activity":activity.map(|time| time.to_rfc3339_micros()),
             "unchanged_prefix":activity.is_some() && activity==ctx.replay_now().ok(),
-            "elapsed_seconds":start.zip(activity).map(|(start,end)| (end-start).num_seconds()),
+            "elapsed_seconds":start.zip(activity).map(|(start,end)| end.duration_since(start).as_secs()),
             "result":result,
         }))
     });
@@ -59,8 +69,8 @@ pub(super) fn register_child(worker: &mut Worker, workflow_type: &str) {
         let failed = ctx.replay_now().ok();
         Ok(json!({
             "entry_unavailable":entry_unavailable,
-            "completed":completed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "failed":failed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "completed":completed.map(|time|time.to_rfc3339_micros()),
+            "failed":failed.map(|time|time.to_rfc3339_micros()),
             "unchanged_prefix":failed.is_some() && failed==ctx.replay_now().ok(),
             "result":child.result,
             "failure_reason":failure.reason,
@@ -77,8 +87,8 @@ pub(super) fn register_signal(worker: &mut Worker, workflow_type: &str) {
         let second_time = ctx.replay_now().ok();
         Ok(json!({
             "entry_unavailable":entry_unavailable,
-            "first_time":first_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "second_time":second_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "first_time":first_time.map(|time|time.to_rfc3339_micros()),
+            "second_time":second_time.map(|time|time.to_rfc3339_micros()),
             "unchanged_prefix":second_time.is_some() && second_time==ctx.replay_now().ok(),
             "arguments":[first_arguments,second_arguments],
         }))
@@ -106,8 +116,8 @@ pub(super) fn register_condition(worker: &mut Worker, workflow_type: &str) {
         Ok(json!({
             "entry_unavailable":entry_unavailable,
             "results":[format!("{first:?}"),format!("{second:?}")],
-            "first_time":first_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "second_time":second_time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "first_time":first_time.map(|time|time.to_rfc3339_micros()),
+            "second_time":second_time.map(|time|time.to_rfc3339_micros()),
             "unchanged_prefix":second_time.is_some() && second_time==ctx.replay_now().ok(),
         }))
     });
@@ -132,8 +142,8 @@ pub(super) fn register_parallel_activity(worker: &mut Worker, workflow_type: &st
         let failed = ctx.replay_now().ok();
         Ok(json!({
             "entry_unavailable":entry_unavailable,
-            "success_time":success.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "failure_time":failed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "success_time":success.map(|time|time.to_rfc3339_micros()),
+            "failure_time":failed.map(|time|time.to_rfc3339_micros()),
             "failure_member":failure.member_path,
             "unchanged_prefix":failed.is_some() && failed==ctx.replay_now().ok(),
         }))
@@ -154,7 +164,7 @@ pub(super) fn register_condition_timeout(worker: &mut Worker, workflow_type: &st
         Ok(json!({
             "entry_unavailable":entry_unavailable,
             "result":format!("{result:?}"),
-            "time":time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "time":time.map(|time|time.to_rfc3339_micros()),
             "unchanged_prefix":time.is_some() && time==ctx.replay_now().ok(),
         }))
     });
@@ -165,7 +175,7 @@ pub(super) fn register_parallel_timer(worker: &mut Worker, workflow_type: &str) 
         let entry_unavailable=ctx.replay_now().is_err();
         let values=ctx.parallel(vec![ParallelOperation::timer(Duration::from_secs(1)),ParallelOperation::timer(Duration::from_secs(1))]).await?;
         let time=ctx.replay_now().ok();
-        Ok(json!({"entry_unavailable":entry_unavailable,"members":values.len(),"time":time.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),"unchanged_prefix":time.is_some() && time==ctx.replay_now().ok()}))
+        Ok(json!({"entry_unavailable":entry_unavailable,"members":values.len(),"time":time.map(|time|time.to_rfc3339_micros()),"unchanged_prefix":time.is_some() && time==ctx.replay_now().ok()}))
     });
 }
 
@@ -196,8 +206,8 @@ pub(super) fn register_parallel_child(worker: &mut Worker, workflow_type: &str) 
         let failed = ctx.replay_now().ok();
         Ok(json!({
             "entry_unavailable":entry_unavailable,
-            "success_time":success.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
-            "failure_time":failed.map(|time|time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "success_time":success.map(|time|time.to_rfc3339_micros()),
+            "failure_time":failed.map(|time|time.to_rfc3339_micros()),
             "failure_member":failure.member_path,
             "unchanged_prefix":failed.is_some() && failed==ctx.replay_now().ok(),
         }))

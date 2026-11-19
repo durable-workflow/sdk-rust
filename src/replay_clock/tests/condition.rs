@@ -37,7 +37,7 @@ fn observe(history: Vec<HistoryEvent>, timed_out: bool) -> Value {
     let inner = ctx.clone();
     let result = ready(&ctx, Box::pin(async move {
         let result = inner.wait_condition(options(timed_out), || panic!("persisted outcome must not evaluate a predicate")).await?;
-        Ok(AvroValue::from_serialize(&json!({"result":format!("{result:?}"),"time":inner.replay_now().ok().map(|t|t.to_rfc3339_opts(chrono::SecondsFormat::Micros,true))}))?)
+        Ok(AvroValue::from_serialize(&json!({"result":format!("{result:?}"),"time":inner.replay_now().ok().map(|t|t.to_rfc3339_micros())}))?)
     })).into_json().unwrap();
     assert!(ctx.take_commands().unwrap().is_empty());
     assert!(ctx.replay_now().is_err());
@@ -289,18 +289,12 @@ async fn replay_now_condition_queries_use_the_actual_selected_prefix() {
         },
     );
     worker.register_query("condition-clock", "snapshot", |ctx, _| async move {
-        Ok(json!(ctx
-            .replay_now()?
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
+        Ok(json!(ctx.replay_now()?.to_rfc3339_micros()))
     });
     worker.register_replayed_query::<u64, _, _>(
         "condition-clock",
         "reconstructed",
-        |ctx, _, _| async move {
-            Ok(json!(ctx
-                .replay_now()?
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
-        },
+        |ctx, _, _| async move { Ok(json!(ctx.replay_now()?.to_rfc3339_micros())) },
     );
     let mut history = condition(1, 0, false, RESOLVED);
     for query in ["snapshot", "reconstructed"] {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::wire_time::Rfc3339Micros as _;
 
 mod descendants;
 mod run_scopes;
@@ -480,7 +481,7 @@ fn cleanup_snapshot(value: &Value) -> Value {
         "request_id":context.request_id(), "root_request_id":context.root_context().root_request_id(),
         "delivery_history_event_id":delivery["id"],
         "preparation_history_event_id":delivery["payload"]["preparation_history_event_id"],
-        "cleanup_deadline_at":context.deadline().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        "cleanup_deadline_at":context.deadline().to_rfc3339_micros(),
         "authority_deadline_at":delivery["payload"]["authority_deadline_at"]})
 }
 

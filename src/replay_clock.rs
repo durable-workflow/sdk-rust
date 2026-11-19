@@ -536,7 +536,7 @@ impl WorkflowContext {
     /// Cancellation's existing budget clock is unchanged.
     /// Migrate business decisions through normal workflow versioning. Event
     /// timestamps do not provide a total order; retain stream/counter identity.
-    pub fn replay_now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+    pub fn replay_now(&self) -> Result<jiff::Timestamp> {
         let active = ACTIVE.with(|active| active.borrow().as_ref().and_then(Weak::upgrade));
         if !active.is_some_and(|active| Arc::ptr_eq(&active, &self.state)) {
             return Err(unavailable());
@@ -545,7 +545,6 @@ impl WorkflowContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?
             .replay_time()
-            .map(wire_time::to_chrono)
     }
 }
 
@@ -554,10 +553,8 @@ impl QueryContext {
     ///
     /// Missing, invalid or unproved boundary evidence is explicitly unavailable.
     /// Reading this accessor does not change the snapshot or append history.
-    pub fn replay_now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
-        self.replay_time
-            .map(wire_time::to_chrono)
-            .ok_or_else(unavailable)
+    pub fn replay_now(&self) -> Result<jiff::Timestamp> {
+        self.replay_time.ok_or_else(unavailable)
     }
 }
 

@@ -12,11 +12,12 @@
 //! Two representational limits differ from chrono. A leap second `:60.f` is
 //! the instant `f` after the next whole second, as the PHP Server reads it;
 //! chrono kept a distinct `:60` value and printed it back. An instant must
-//! also lie within jiff's range, which ends at `9999-12-30T22:00:00Z`. Syntax validation through [`is_valid`] keeps the
-//! full chrono range.
+//! also lie within jiff's range, which ends at `9999-12-30T22:00:00Z`. Syntax
+//! validation through [`is_valid`] keeps the full chrono range.
 //!
-//! The 4.x public API still returns `chrono::DateTime<Utc>` values. Only
-//! [`to_chrono`] and [`from_chrono`] cross that boundary.
+//! chrono's accepted text and printed bytes are pinned by
+//! `tests/fixtures/wire-time-chrono-reference.json`, recorded from chrono
+//! 0.4.45 before it was removed. Public accessors return [`jiff::Timestamp`].
 
 use jiff::{civil, tz::Offset, SignedDuration};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -224,34 +225,17 @@ pub(crate) fn until(later: Timestamp, earlier: Timestamp) -> Option<std::time::D
     std::time::Duration::try_from(later.duration_since(earlier)).ok()
 }
 
-/// Convert to the chrono type returned by the 4.x public API.
-pub(crate) fn to_chrono(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    let (mut seconds, mut nanoseconds) = (timestamp.as_second(), timestamp.subsec_nanosecond());
-    if nanoseconds < 0 {
-        seconds -= 1;
-        nanoseconds += 1_000_000_000;
-    }
-    chrono::DateTime::from_timestamp(seconds, nanoseconds as u32)
-        .expect("jiff's timestamp range lies within chrono's")
+/// Test shorthand for the canonical micros wire form.
+#[cfg(test)]
+pub(crate) trait Rfc3339Micros {
+    fn to_rfc3339_micros(&self) -> String;
 }
 
-/// Convert a public-API chrono value, saturating at the ends of jiff's range.
-pub(crate) fn from_chrono(time: chrono::DateTime<chrono::Utc>) -> Timestamp {
-    let seconds = time.timestamp();
-    // A chrono leap second carries its extra second in the nanoseconds.
-    let nanoseconds = i64::from(time.timestamp_subsec_nanos());
-    Timestamp::from_second(seconds)
-        .ok()
-        .and_then(|whole| {
-            whole
-                .checked_add(SignedDuration::from_nanos(nanoseconds))
-                .ok()
-        })
-        .unwrap_or(if seconds < 0 {
-            Timestamp::MIN
-        } else {
-            Timestamp::MAX
-        })
+#[cfg(test)]
+impl Rfc3339Micros for Timestamp {
+    fn to_rfc3339_micros(&self) -> String {
+        format_micros(*self)
+    }
 }
 
 #[cfg(test)]

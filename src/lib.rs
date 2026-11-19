@@ -85,6 +85,10 @@ use std::{
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
+/// The timestamp library behind every public time value, such as
+/// [`WorkflowContext::replay_now`] and cancellation deadlines. Use this
+/// re-export so your `jiff` version always matches the SDK's.
+pub use jiff;
 pub use local_activity::LocalActivityOptions;
 pub use raw_request::{
     worker_protocol_compatible, HttpRefusal, RawMethod, RawRequest, RawResponse,
@@ -17313,10 +17317,7 @@ impl ActivityContext {
     /// Producer acknowledgement time, with full fractional precision.
     pub fn last_heartbeat_at(
         &self,
-    ) -> std::result::Result<
-        Option<&chrono::DateTime<chrono::Utc>>,
-        ActivityHeartbeatResumeUnavailable,
-    > {
+    ) -> std::result::Result<Option<&jiff::Timestamp>, ActivityHeartbeatResumeUnavailable> {
         Ok(self
             .last_heartbeat_checkpoint()?
             .map(|value| value.acknowledged_at()))

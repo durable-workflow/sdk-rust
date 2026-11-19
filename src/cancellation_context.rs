@@ -332,11 +332,11 @@ impl CancellationContext {
     pub fn source(&self) -> &str {
         &self.source
     }
-    pub fn requested_at(&self) -> chrono::DateTime<chrono::Utc> {
-        wire_time::to_chrono(self.requested_at)
+    pub fn requested_at(&self) -> jiff::Timestamp {
+        self.requested_at
     }
-    pub fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
-        wire_time::to_chrono(self.cleanup_deadline_at)
+    pub fn deadline(&self) -> jiff::Timestamp {
+        self.cleanup_deadline_at
     }
     pub(crate) fn requested_instant(&self) -> Timestamp {
         self.requested_at
@@ -439,8 +439,8 @@ impl ScopedCancellationLineage {
     pub fn scope_id(&self) -> &str {
         &self.scope_id
     }
-    pub fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
-        wire_time::to_chrono(self.cleanup_deadline_at)
+    pub fn deadline(&self) -> jiff::Timestamp {
+        self.cleanup_deadline_at
     }
 
     fn to_value(&self) -> Value {
@@ -673,14 +673,14 @@ impl ScopedCancellationContext {
     pub fn root_scope_id(&self) -> &str {
         &self.lineage[0].scope_id
     }
-    pub fn requested_at(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn requested_at(&self) -> jiff::Timestamp {
         self.root_context.requested_at()
     }
-    pub fn root_deadline(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn root_deadline(&self) -> jiff::Timestamp {
         self.root_context.deadline()
     }
-    pub fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
-        wire_time::to_chrono(self.deadline_instant())
+    pub fn deadline(&self) -> jiff::Timestamp {
+        self.deadline_instant()
     }
     pub(crate) fn requested_instant(&self) -> Timestamp {
         self.root_context.requested_at

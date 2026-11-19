@@ -44,9 +44,7 @@ fn observe(history: Vec<HistoryEvent>, nested: bool) -> Value {
             );
             let time = inner.replay_now().ok();
             assert_eq!(time, inner.replay_now().ok());
-            AvroValue::from_serialize(&json!(
-                time.map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-            ))
+            AvroValue::from_serialize(&json!(time.map(|time| time.to_rfc3339_micros())))
         }),
     )
     .into_json()

@@ -1,7 +1,7 @@
 //! Exact-published-package Worker qualification for Server #980.
 //! No Server or database is created here. The caller retains the immutable
 //! producer/package/build receipt, read-only physical-row counts and cleanup.
-use chrono::{DateTime, SecondsFormat, Utc};
+use durable_workflow::jiff::Timestamp;
 use durable_workflow::{
     json, ActivityError, ActivityOptions, ActivityRetryPolicy, Client, Error, Value, Worker,
     WorkerRetryPolicy,
@@ -54,14 +54,16 @@ fn client() -> Client {
         .unwrap()
 }
 
-fn instant(value: &Value) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value.as_str().expect("full UTC clock text"))
+fn instant(value: &Value) -> Timestamp {
+    value
+        .as_str()
+        .expect("full UTC clock text")
+        .parse::<Timestamp>()
         .expect("valid full-precision timestamp")
-        .with_timezone(&Utc)
 }
 
-fn clock(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Nanos, true)
+fn clock(value: Timestamp) -> String {
+    format!("{value:.9}")
 }
 
 #[derive(Default)]
@@ -325,7 +327,7 @@ fn clock_comparison_preserves_fraction_and_normalizes_utc_offset() {
     let precise = instant(&json!("2026-11-14T00:00:00.123456Z"));
     assert_eq!(precise, instant(&json!("2026-11-14T01:00:00.123456+01:00")));
     assert_ne!(precise, instant(&json!("2026-11-14T00:00:00Z")));
-    assert_eq!(precise.timestamp_subsec_nanos(), 123_456_000);
+    assert_eq!(precise.subsec_nanosecond(), 123_456_000);
 }
 
 #[tokio::test]
@@ -455,7 +457,7 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
             original_fingerprint = Some(fingerprint.to_owned());
             let timer = instant(&fired["recorded_at"]);
             assert_ne!(
-                timer.timestamp_subsec_nanos(),
+                timer.subsec_nanosecond(),
                 0,
                 "real nonzero-fraction TimerFired required"
             );
