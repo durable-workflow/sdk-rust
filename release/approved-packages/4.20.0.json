@@ -2,8 +2,8 @@
   "schema": "durable-workflow.rust-sdk.approved-package/v1",
   "package": "durable-workflow",
   "version": "4.20.0",
-  "commit": "ecdd5e3689ac27a1dd92df3d2a57ced3bb042300",
-  "crate_sha256": "d9f7c21d5b9fa9d648c438090e441d977869c15f9a600be422769923a707b67f",
+  "commit": "55bfad898ee4982616bf2cf6066d01d1b75fde63",
+  "crate_sha256": "08baa387065cb53e39a200360eddfaaf32a329276639c0863a9916a6f86a4e38",
   "cargo_version": "1.86.0",
   "files": [
     ".cargo_vcs_info.json",
@@ -131,8 +131,8 @@
   ],
   "file_list_sha256": "ceb00b7ccbf11e64e782098594093ff9ef615b68d40256ae116c518ec49a8486",
   "acceptance": {
-    "summary_sha256": "5df90ab8a4018a845e7389911d7a25e900d59e34fb3f80b7dad3814f464215d6",
-    "harness_commit": "ecdd5e3689ac27a1dd92df3d2a57ced3bb042300",
+    "summary_sha256": "e2558a58b439a1b0adef8b47fa18ceec05e34d71729c862c42fa8dfeb46b8168",
+    "harness_commit": "55bfad898ee4982616bf2cf6066d01d1b75fde63",
     "server_index": "ghcr.io/durable-workflow/server@sha256:30ccaf2cea6810a92915a9eb389f1a63ea870818a74c9cc1a321379b07b2d25c",
     "executed_manifest": "ghcr.io/durable-workflow/server@sha256:6cdcb909b1ca46d10410d7f659fcbd292dbf02be0c337d989b886153c0f3ee56",
     "platform": "linux/amd64",
@@ -146,7 +146,7 @@
       "deadline",
       "lifecycle"
     ],
-    "finished_at": "2026-11-19T06:36:39.053704+00:00",
+    "finished_at": "2026-11-19T06:48:04.445833+00:00",
     "outcome": "pass"
   }
 }
