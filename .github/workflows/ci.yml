@@ -655,10 +655,89 @@ jobs:
         if: ${{ always() }}
         run: docker compose down -v
 
+  history-limit-server:
+    name: Published native Server history-limit qualification
+    needs: [action-policy]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-history-limit-server-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    timeout-minutes: 20
+    env:
+      # durable-workflow/.github#228: published native Server 3.13.0 with a
+      # lowered history-transaction budget, so a fan-out within the completion
+      # size limit is refused with 409 history_transaction_limit_exceeded.
+      SERVER_IMAGE: ghcr.io/durable-workflow/server@sha256:30ccaf2cea6810a92915a9eb389f1a63ea870818a74c9cc1a321379b07b2d25c
+      DURABLE_WORKFLOW_EXPECT_SERVER_VERSION: 3.13.0
+      DURABLE_WORKFLOW_HISTORY_TRANSACTION_BYTES: '65536'
+      DURABLE_WORKFLOW_AUTH_TOKEN: history-limit-test-token
+      DURABLE_WORKFLOW_LOCAL_ISOLATED: '1'
+      DURABLE_WORKFLOW_SERVER_URL: http://127.0.0.1:8080
+      LOCAL_SDK_VERSION: ${{ inputs.local_sdk_version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.12"
+      - name: Bootstrap verified dependency trust
+        uses: durable-workflow/.github/.github/actions/bootstrap-patched-pip@75587fc33ff40c34f32ef777293dad56bb6f48c7  # clean-trust
+        with:
+          clients: pip,python,cargo,curl,git
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: 1.86.0
+      - name: Start the published native Server with a lowered history budget
+        run: |
+          docker pull "$SERVER_IMAGE"
+          docker run --detach --init --name sdk-rust-history-limit-runtime \
+            --cpus 1 --memory 512m --pids-limit 256 \
+            --publish 127.0.0.1:8080:8080 \
+            --env DB_CONNECTION=sqlite --env DW_AUTH_DRIVER=token \
+            --env DW_AUTH_TOKEN="$DURABLE_WORKFLOW_AUTH_TOKEN" \
+            --env DW_V2_LIMIT_HISTORY_TRANSACTION_BYTES="$DURABLE_WORKFLOW_HISTORY_TRANSACTION_BYTES" \
+            "$SERVER_IMAGE"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "$DURABLE_WORKFLOW_SERVER_URL/api/ready" > /dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent "$DURABLE_WORKFLOW_SERVER_URL/api/ready" > /dev/null
+      - name: Prepare an exact published SDK consumer when requested
+        if: ${{ inputs.local_sdk_version != '' }}
+        run: |
+          [[ "$LOCAL_SDK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          mkdir -p .history-consumer/tests .history-consumer/src
+          printf '[package]\nname = "history-limit-consumer"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\ndurable-workflow = "=%s"\nserde_json = "1"\ntokio = { version = "1", features = ["full"] }\n' "$LOCAL_SDK_VERSION" > .history-consumer/Cargo.toml
+          printf 'fn main() {}\n' > .history-consumer/src/main.rs
+          cp tests/history_limit_server.rs .history-consumer/tests/
+      - name: Fail the over-budget fan-out once and complete a follow-up on the same Worker
+        run: |
+          set -euo pipefail
+          arguments=(--locked)
+          if [ -n "$LOCAL_SDK_VERSION" ]; then arguments=(--manifest-path .history-consumer/Cargo.toml); fi
+          cargo test "${arguments[@]}" --test history_limit_server -- --ignored --nocapture --test-threads=1 2>&1 | tee history-limit-results.log
+          grep -F 'PASS: over-budget fan-out failed once' history-limit-results.log >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain bounded scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: history-limit-server-${{ github.sha }}
+          path: history-limit-results.log
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Emit failure diagnostics
+        if: ${{ failure() }}
+        run: docker logs --tail 200 sdk-rust-history-limit-runtime || true
+      - name: Remove the runtime
+        if: ${{ always() }}
+        run: docker rm --force --volumes sdk-rust-history-limit-runtime || true
+
   target-branch-qualification:
     name: Target branch qualification
     if: ${{ always() }}
-    needs: [action-policy, completion-ack-fixture, regression-corpus, test, protocol, docs, package, cooperative-server, local-server]
+    needs: [action-policy, completion-ack-fixture, regression-corpus, test, protocol, docs, package, cooperative-server, local-server, history-limit-server]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -675,6 +754,7 @@ jobs:
           PACKAGE_RESULT: ${{ needs.package.result }}
           PROTOCOL_RESULT: ${{ needs.protocol.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          HISTORY_LIMIT_RESULT: ${{ needs.history-limit-server.result }}
           COOPERATIVE_REQUESTED: ${{ inputs.cooperative_qualification }}
           COOPERATIVE_RESULT: ${{ needs.cooperative-server.result }}
           LOCAL_REQUESTED: ${{ inputs.local_qualification }}
@@ -689,6 +769,7 @@ jobs:
           test "$PACKAGE_RESULT" = success
           test "$PROTOCOL_RESULT" = success
           test "$TEST_RESULT" = success
+          test "$HISTORY_LIMIT_RESULT" = success
           if [ "$COOPERATIVE_REQUESTED" = true ]; then
             test "$COOPERATIVE_RESULT" = success
           fi

@@ -343,6 +343,11 @@ pub enum Error {
     /// [`WorkflowTaskCompletionTooLarge`].
     #[error(transparent)]
     WorkflowTaskCompletionTooLarge(WorkflowTaskCompletionTooLarge),
+    /// The Server refused a workflow-task completion because recording it
+    /// would exceed its history-transaction budget. Never retried; see
+    /// [`WorkflowTaskHistoryLimitExceeded`].
+    #[error(transparent)]
+    WorkflowTaskHistoryLimitExceeded(WorkflowTaskHistoryLimitExceeded),
     #[error(transparent)]
     NonDeterministicReplay(ReplayFailure),
     #[error(transparent)]
@@ -2411,6 +2416,73 @@ impl std::fmt::Display for WorkflowTaskCompletionTooLarge {
         )?;
         if let Some(limit) = self.limit {
             write!(formatter, " of {limit} bytes")?;
+        }
+        formatter.write_str(
+            ". Split the fan-out into smaller batches, move work into child workflows, or continue-as-new; offload large payloads with external payload storage.",
+        )
+    }
+}
+
+/// The refusal reasons a Server returns (HTTP 409) when recording a
+/// workflow-task completion would exceed its history-transaction budget:
+/// `history_transaction_limit_exceeded` from the transaction meter, and
+/// `completion_budget_exceeded` from the early whole-completion count.
+pub const WORKFLOW_TASK_HISTORY_LIMIT_REASONS: [&str; 2] = [
+    "history_transaction_limit_exceeded",
+    "completion_budget_exceeded",
+];
+
+/// A workflow-task completion the Server refused because recording it would
+/// exceed its history-transaction budget (HTTP 409, `reason:
+/// "history_transaction_limit_exceeded"` or `"completion_budget_exceeded"`).
+///
+/// A completion is recorded in one history transaction, bounded by the
+/// Server's `history_transaction_size` (events), `history_transaction_bytes`
+/// and `history_transaction_rows` structural limits. `ActivityScheduled`
+/// events repeat their arguments, so a fan-out within the completion size limit
+/// can still exceed a lowered `DW_V2_LIMIT_HISTORY_TRANSACTION_BYTES`. The
+/// refusal rolls the transaction back, so nothing was recorded. Native Server
+/// 3.13.0 names `limit_kind`, the measured `current_value` and the
+/// `configured_limit`; each field is `None` here when the Server did not report
+/// it, and `limit_kind` is then the refusal reason.
+///
+/// Like [`WorkflowTaskCompletionTooLarge`], the refusal is deterministic: the
+/// same task produces the same completion, so the SDK never resends it. A
+/// [`Worker`] completes the same task once with a non-retryable
+/// `fail_workflow` command whose message starts with `Structural limit
+/// exceeded:`, so the run fails with failure category `structural_limit`
+/// instead of retrying the task forever.
+#[derive(Clone, Debug, Error)]
+pub struct WorkflowTaskHistoryLimitExceeded {
+    pub status: u16,
+    pub reason: String,
+    pub limit_kind: String,
+    pub current_value: Option<u64>,
+    pub configured_limit: Option<u64>,
+    pub message: String,
+    pub body: Value,
+}
+
+impl std::fmt::Display for WorkflowTaskHistoryLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = match self.limit_kind.as_str() {
+            "history_transaction_size" => "history events",
+            "history_transaction_bytes" => "history bytes",
+            "history_transaction_rows" => "rows",
+            _ => "units",
+        };
+        write!(
+            formatter,
+            "Structural limit exceeded: {}: the workflow task completion would write ",
+            self.limit_kind
+        )?;
+        match self.current_value {
+            Some(value) => write!(formatter, "{value} {unit}")?,
+            None => formatter.write_str("more than the limit allows")?,
+        }
+        formatter.write_str(" in one history transaction, over the server limit")?;
+        if let Some(limit) = self.configured_limit {
+            write!(formatter, " of {limit} {unit}")?;
         }
         formatter.write_str(
             ". Split the fan-out into smaller batches, move work into child workflows, or continue-as-new; offload large payloads with external payload storage.",
@@ -5436,6 +5508,10 @@ impl Client {
                 {
                     return Err(Error::WorkflowTaskCompletionTooLarge(refusal));
                 }
+                // So is a completion over the history-transaction budget.
+                if let Some(refusal) = workflow_task_history_limit_exceeded(status, &body, path) {
+                    return Err(Error::WorkflowTaskHistoryLimitExceeded(refusal));
+                }
                 let error = Error::Http { status, body };
                 deferred_workflow_completion |= worker_deferred_workflow_completion_retry_after(
                     &error,
@@ -5920,6 +5996,57 @@ fn workflow_task_completion_too_large(
         limit_kind: WORKFLOW_TASK_COMPLETION_BYTES_LIMIT_KIND.to_string(),
         limit: body.get("limit").and_then(Value::as_u64),
         size,
+        message: body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        body,
+    })
+}
+
+fn workflow_task_history_limit_exceeded(
+    status: reqwest::StatusCode,
+    raw_body: &str,
+    path: &str,
+) -> Option<WorkflowTaskHistoryLimitExceeded> {
+    if status != reqwest::StatusCode::CONFLICT {
+        return None;
+    }
+    let task_id = path
+        .strip_prefix("/worker/workflow-tasks/")?
+        .strip_suffix("/complete")?;
+    if task_id.is_empty() || task_id.contains('/') {
+        return None;
+    }
+    let body: Value = serde_json::from_str(raw_body).ok()?;
+    let reason = body.get("reason").and_then(Value::as_str)?;
+    if !WORKFLOW_TASK_HISTORY_LIMIT_REASONS.contains(&reason)
+        || body.get("recorded").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let limit_kind = body
+        .get("limit_kind")
+        .and_then(Value::as_str)
+        .filter(|kind| {
+            !kind.is_empty()
+                && kind.len() <= 64
+                && kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or(reason)
+        .to_string();
+    Some(WorkflowTaskHistoryLimitExceeded {
+        status: status.as_u16(),
+        reason: reason.to_string(),
+        limit_kind,
+        current_value: body.get("current_value").and_then(Value::as_u64),
+        configured_limit: body
+            .get("configured_limit")
+            .and_then(Value::as_u64)
+            .filter(|limit| *limit > 0),
         message: body
             .get("message")
             .and_then(Value::as_str)
@@ -9204,6 +9331,12 @@ impl Worker {
     /// run fails with failure category `structural_limit`. Direct callers of
     /// [`Client::complete_workflow_task`] receive
     /// [`Error::WorkflowTaskCompletionTooLarge`] for that refusal.
+    ///
+    /// A completion the Server refuses because recording it would exceed its
+    /// history-transaction budget (native Server 3.13.0: HTTP 409
+    /// `history_transaction_limit_exceeded` with `limit_kind`, `current_value`
+    /// and `configured_limit`) is handled the same way, and direct callers
+    /// receive [`Error::WorkflowTaskHistoryLimitExceeded`].
     pub async fn run_once(&self) -> Result<usize> {
         self.validate_registration()?;
         if self.client.worker_sessions_enabled {
@@ -9320,22 +9453,25 @@ impl Worker {
     /// refusal, or park the run. If this small completion is not recorded
     /// either, the original refusal is returned (or the report's settled
     /// receipt), and nothing is resent.
+    ///
+    /// A completion refused over the Server's history-transaction budget
+    /// ([`Error::WorkflowTaskHistoryLimitExceeded`], HTTP 409) takes the same
+    /// path: its transaction rolled back, and replay produces the same commands.
     async fn fail_oversized_workflow_task(
         &self,
         task_id: &str,
         lease_owner: &str,
         attempt: u64,
         run_id: Option<&str>,
-        refusal: WorkflowTaskCompletionTooLarge,
+        error: Error,
     ) -> Result<Value> {
-        let error = Error::WorkflowTaskCompletionTooLarge(refusal);
         tracing::warn!(
             target: "durable_workflow::worker",
             task_id,
             workflow_task_attempt = attempt,
             run_id,
             error = %error,
-            "the Server refused the workflow task completion as too large; failing the run with a structural-limit failure"
+            "the Server refused the workflow task completion over a structural limit; failing the run with a structural-limit failure"
         );
         let command = workflow_failure_command(&error, None);
         match self
@@ -9426,7 +9562,10 @@ impl Worker {
                     )
                     .await
                 {
-                    Err(Error::WorkflowTaskCompletionTooLarge(refusal)) => {
+                    Err(
+                        error @ (Error::WorkflowTaskCompletionTooLarge(_)
+                        | Error::WorkflowTaskHistoryLimitExceeded(_)),
+                    ) => {
                         // The refused commands were never recorded.
                         self.discard_sticky_snapshot(snapshot.as_ref())?;
                         self.fail_oversized_workflow_task(
@@ -9434,7 +9573,7 @@ impl Worker {
                             lease_owner,
                             attempt,
                             run_id,
-                            refusal,
+                            error,
                         )
                         .await
                     }
@@ -19389,6 +19528,15 @@ fn workflow_failure_command(
                 "structural_limit_configured": refusal.limit,
             }),
         ),
+        Error::WorkflowTaskHistoryLimitExceeded(refusal) => (
+            "StructuralLimitExceeded",
+            "durable_workflow::WorkflowTaskHistoryLimitExceeded",
+            json!({
+                "structural_limit_kind": refusal.limit_kind,
+                "structural_limit_value": refusal.current_value,
+                "structural_limit_configured": refusal.configured_limit,
+            }),
+        ),
         _ => ("RustWorkflowError", "durable_workflow::Error", Value::Null),
     };
     let non_retryable = match error {
@@ -19402,7 +19550,9 @@ fn workflow_failure_command(
         | Error::CooperativeCancellationRequested(_)
         | Error::CancellationScopeRequested(_) => true,
         Error::NonDeterministicReplay(_) => true,
-        Error::WorkflowTaskCompletionTooLarge(_) => true,
+        Error::WorkflowTaskCompletionTooLarge(_) | Error::WorkflowTaskHistoryLimitExceeded(_) => {
+            true
+        }
         _ => false,
     };
 
@@ -19900,6 +20050,7 @@ mod tests {
     mod completion_limits;
     mod condition_fingerprint;
     mod cooperative_cancellation;
+    mod history_transaction_limit;
     mod local_activity;
     mod nexus;
     mod path_segments;
