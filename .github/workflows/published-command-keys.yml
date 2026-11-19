@@ -1,0 +1,103 @@
+name: Published Rust command keys
+
+# Installed Rust part of durable-workflow/.github#216: the published crate
+# pinned in scripts/acceptance/command-keys/consumer/Cargo.toml against the
+# exact published native Server image named in run_cohort.sh.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/published-command-keys.yml'
+      - 'scripts/acceptance/command-keys/**'
+      - 'tests/command_keys_server.rs'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/published-command-keys.yml'
+      - 'scripts/acceptance/command-keys/**'
+      - 'tests/command_keys_server.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: published-command-keys-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cohort:
+    name: Installed command-key cohort
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SERVER_IMAGE: ghcr.io/durable-workflow/server@sha256:30ccaf2cea6810a92915a9eb389f1a63ea870818a74c9cc1a321379b07b2d25c
+      RUST_IMAGE_REF: rust@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
+      LOSS_FIXTURE_URL: https://raw.githubusercontent.com/durable-workflow/.github/117118c83093822469b3824ba9587ff4068ed29f/conformance/command-keys/committed_response_loss.py
+      LOSS_FIXTURE_SHA256: bd1e8ccbbf76f63fc2eafa278a023eb181d405b68d9c30016392e395a1eff725
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - name: Pull the exact Server and official Rust images
+        run: |
+          docker pull --quiet "$SERVER_IMAGE"
+          docker pull --quiet "$RUST_IMAGE_REF"
+          echo "RUST_IMAGE=$(docker image inspect --format '{{.Id}}' "$RUST_IMAGE_REF")" >> "$GITHUB_ENV"
+      - name: Prepare a uid 1000 cohort user and private state
+        # The Server image runs as uid 1000 and run_open.py bind-mounts a
+        # private SQLite directory, so the whole cohort runs as uid 1000.
+        run: |
+          user="$(getent passwd 1000 | cut -d: -f1 || true)"
+          if [ -z "$user" ]; then
+            sudo useradd --uid 1000 --create-home --shell /bin/bash cohort
+            user=cohort
+          fi
+          sudo usermod -aG docker "$user"
+          state="$(sudo -u "$user" mktemp -d /tmp/rust-command-keys.XXXXXX)"
+          sudo cp -a "$GITHUB_WORKSPACE" "$state/source"
+          sudo chown -R "$user:$(id -gn "$user")" "$state/source"
+          sudo -u "$user" curl --fail --silent --show-error --proto '=https' --max-time 60 \
+            --max-filesize 65536 "$LOSS_FIXTURE_URL" --output "$state/committed_response_loss.py"
+          echo "$LOSS_FIXTURE_SHA256  $state/committed_response_loss.py" | sha256sum -c -
+          sudo -u "$user" chmod 0600 "$state/committed_response_loss.py"
+          {
+            echo "COHORT_USER=$user"
+            echo "COHORT_STATE=$state"
+          } >> "$GITHUB_ENV"
+      - name: Run the installed cohort
+        run: |
+          # sudo initializes the user's groups, including docker.
+          sudo -u "$COHORT_USER" -H env COHORT_ROOT="$COHORT_STATE/run" \
+            LOSS_FIXTURE="$COHORT_STATE/committed_response_loss.py" CONTAINER_PREFIX=sdk-rust-216-ci \
+            PATH=/usr/bin:/bin RUST_IMAGE="$RUST_IMAGE" \
+            "$COHORT_STATE/source/scripts/acceptance/command-keys/run_cohort.sh"
+      - name: Summarize
+        if: always()
+        run: |
+          results="$COHORT_STATE/run/results"
+          mkdir -p "$RUNNER_TEMP/command-keys"
+          sudo sh -c 'cp "$1"/*.jsonl "$1"/*.txt "$1"/*.log "$1"/*.json "$2"/' copy "$results" "$RUNNER_TEMP/command-keys" || true
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/command-keys"
+          {
+            echo '### Installed Rust command-key cohort'
+            echo '```'
+            cat "$RUNNER_TEMP/command-keys/cells.txt" 2>/dev/null || echo 'no cells completed'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove owned containers
+        if: always()
+        run: |
+          ids="$(docker ps --all --quiet --filter name=sdk-rust-216-ci)"
+          if [ -n "$ids" ]; then docker rm --force --volumes $ids; fi
+          test -z "$(docker ps --all --quiet --filter name=sdk-rust-216-ci)"
+      - name: Retain sanitized cell results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: published-rust-command-keys
+          path: ${{ runner.temp }}/command-keys
+          retention-days: 7
+          if-no-files-found: warn
