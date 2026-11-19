@@ -1,12 +1,12 @@
 # Changelog
 
-## Unreleased
+## 4.21.0
 
 - `Client::signal_with_start` starts a workflow or reuses its open run and
   records one signal on it in a single Server transaction, so the run cannot
   close between a separate start and signal (durable-workflow/.github#222,
-  server#1133). It needs a Server that advertises
-  `capabilities.signal_with_start` (native Server) and returns
+  server#1133). It needs native Server 3.15.0 or later, the first release
+  that advertises `capabilities.signal_with_start`, and returns
   `Error::SignalWithStartUnavailable` before sending otherwise.
   `SignalWithStartOptions` carries the start deadlines, `OpenRunPolicy`
   (`UseExisting` by default, or `Fail`), `ClosedRunPolicy` (`Reject` by
@@ -27,13 +27,14 @@
   `Rejected` and a stable `reason`, not an error. Replay never sends the signal
   again; a different target, run, signal name or arguments at the recorded
   sequence is `Error::NonDeterministicReplay`. The Worker reads
-  `signal_external_workflow` from each workflow poll's `server_capabilities`;
-  without it the call returns `Error::SignalExternalWorkflowUnavailable` before
-  anything is submitted, and a workflow that returns that error fails its
-  workflow task, not its run. An invalid target or signal name (a blank name,
-  a control character, more than 191 characters or 255 bytes, as the Server
-  refuses) returns `Error::InvalidExternalSignal` in workflow code before any
-  command is emitted.
+  `signal_external_workflow` from each workflow poll's `server_capabilities`,
+  which native Server 3.15.0 and later advertise; without it the call returns
+  `Error::SignalExternalWorkflowUnavailable` before anything is submitted, and
+  a workflow that returns that error fails its workflow task, not its run. An
+  invalid target or signal name (a blank name, a control character, more than
+  191 characters or 255 bytes, as the Server refuses) returns
+  `Error::InvalidExternalSignal` in workflow code before any command is
+  emitted.
 
 ## 4.20.0
 

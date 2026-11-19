@@ -624,8 +624,8 @@ different target, run, signal name or arguments at the recorded sequence is
 each workflow poll's `server_capabilities`. Without it the call returns
 `Error::SignalExternalWorkflowUnavailable` before anything is submitted. If the
 workflow returns that error, the Worker fails the workflow task, not the run.
-A native Server that includes Server #1134 advertises the command; published PHP Server
-2.x does not.
+Native Server 3.15.0 and later advertise the command (Server #1134); published
+PHP Server 2.x does not.
 
 ## Inspect a run's activities
 
@@ -1332,6 +1332,12 @@ refuses an unlisted major, a malformed entry or a contradiction with the legacy
 same-major baseline behavior remains. The legacy scalar and the separate 2.x
 qualification identity are preserved for older readers. Protocol and capability
 negotiation remain required for individual features.
+
+`Client::signal_with_start` and `WorkflowContext::signal_external_workflow`
+need native Server 3.15.0 or later, the first release that advertises
+`capabilities.signal_with_start` and the `signal_external_workflow` command.
+Against an older Server they return `Error::SignalWithStartUnavailable` or
+`Error::SignalExternalWorkflowUnavailable` before anything is sent.
 
 ## Development
 
