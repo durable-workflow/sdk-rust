@@ -526,8 +526,9 @@ impl Error {
     /// intent, for example after an upgrade from a Server that stored keys
     /// without making them unique. Nothing was admitted or recorded and no
     /// receipt was selected. The SDK never resends this refusal, and resending
-    /// it unchanged gets the same answer: inspect the workflow history to find
-    /// out what was applied, and use a new key for any new command.
+    /// it unchanged gets the same answer: inspect the workflow's recorded
+    /// signals and updates to find out what was applied, and use a new key
+    /// for any new command.
     pub fn is_request_id_ambiguous(&self) -> bool {
         self.request_id_ambiguous().is_some()
     }
@@ -670,8 +671,8 @@ fn request_id_conflict(status: u16, body: Value) -> Option<RequestIdConflict> {
 /// ambiguous, for example rows written by an older Server that stored keys
 /// without making them unique. Nothing was admitted or recorded, and no
 /// receipt was selected: never treat this as the original command's receipt.
-/// Inspect the workflow history to see what was applied, and use a new key for
-/// any new command. `request_id` is the key that was sent. The full answer,
+/// Inspect the workflow's recorded signals and updates to see what was
+/// applied, and use a new key for any new command. `request_id` is the key that was sent. The full answer,
 /// including `retained: true` and `intent_verified: false`, is in `body`.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
