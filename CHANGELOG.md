@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 4.20.0
 
 - A workflow-task completion the Server refuses because recording it would
   exceed its history-transaction budget (HTTP 409 with reason
