@@ -366,17 +366,19 @@ async fn replay_now_child_snapshot_and_reconstructed_queries_use_their_actual_pr
         },
     );
     worker.register_query("clock-child-parent", "snapshot", |ctx, _args| async move {
-        Ok(json!(ctx.replay_now().ok().map(
-            |time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-        )))
+        Ok(json!(ctx
+            .replay_now()
+            .ok()
+            .map(|time| time.to_rfc3339_micros())))
     });
     worker.register_replayed_query::<u64, _, _>(
         "clock-child-parent",
         "reconstructed",
         |ctx, _state, _args| async move {
-            Ok(json!(ctx.replay_now().ok().map(
-                |time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-            )))
+            Ok(json!(ctx
+                .replay_now()
+                .ok()
+                .map(|time| time.to_rfc3339_micros())))
         },
     );
     let mut history = child(1, "ChildRunCompleted", CHILD_TIME);

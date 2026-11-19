@@ -1,4 +1,5 @@
 use super::*;
+use crate::wire_time::Rfc3339Micros as _;
 use crate::{
     decode_wire_value, encode_typed_envelope, json, AvroValue, Client, ConditionWaitOptions,
     ConditionWaitResult, QueryTask, Worker, WorkflowFuture, WorkflowTask, DEFAULT_CODEC,
@@ -38,10 +39,7 @@ fn context(history: Vec<HistoryEvent>) -> WorkflowContext {
 }
 
 fn read(context: &WorkflowContext) -> String {
-    context
-        .replay_now()
-        .unwrap()
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    context.replay_now().unwrap().to_rfc3339_micros()
 }
 
 fn ready(context: &WorkflowContext, mut future: WorkflowFuture) -> AvroValue {
@@ -61,7 +59,7 @@ fn replay_now_deadline_loop_advances_and_cold_replays_identically() {
         let ctx = context(history.clone());
         let future_ctx = ctx.clone();
         ready(&ctx,Box::pin(async move {
-            let initial=future_ctx.replay_now()?; let deadline=initial+chrono::Duration::seconds(3);
+            let initial=future_ctx.replay_now()?; let deadline=initial+jiff::SignedDuration::from_secs(3);
             let mut times=vec![];
             while future_ctx.replay_now()?<deadline {
                 assert_eq!(future_ctx.replay_now()?,future_ctx.replay_now()?);
@@ -69,7 +67,7 @@ fn replay_now_deadline_loop_advances_and_cold_replays_identically() {
                 times.push(read(&future_ctx));
                 assert!(times.len()<=3);
             }
-            Ok(AvroValue::from_serialize(&json!({"times":times,"elapsed":(future_ctx.replay_now()?-initial).num_seconds()}))?)
+            Ok(AvroValue::from_serialize(&json!({"times":times,"elapsed":future_ctx.replay_now()?.duration_since(initial).as_secs()}))?)
         })).into_json().unwrap()
     };
     let first = execute();
@@ -257,7 +255,8 @@ fn replay_now_snapshot_prefix_and_update_handler_are_exact_and_immutable() {
     assert_eq!(
         snapshot_time(&history, DEFAULT_CODEC)
             .unwrap()
-            .timestamp_subsec_micros(),
+            .subsec_nanosecond()
+            / 1000,
         0
     );
     let saved = serde_json::to_value(&history).unwrap();
@@ -278,7 +277,8 @@ fn replay_now_snapshot_prefix_and_update_handler_are_exact_and_immutable() {
     assert_eq!(
         update_time(&[accepted.clone()], "u1")
             .unwrap()
-            .timestamp_subsec_micros(),
+            .subsec_nanosecond()
+            / 1000,
         123456
     );
     assert!(update_time(&[accepted.clone()], "u2").is_none());
@@ -290,16 +290,10 @@ async fn replay_now_actual_query_and_update_callbacks_use_their_own_prefix() {
     let mut worker = Worker::new(Client::new("http://127.0.0.1:8080").unwrap(), "clock-tests");
     worker.register_workflow("clock", |_ctx, _args| async { Ok(Value::Null) });
     worker.register_query("clock", "inspect", |ctx, _args| async move {
-        Ok(json!(ctx
-            .replay_now()
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-            .ok()))
+        Ok(json!(ctx.replay_now().map(|t| t.to_rfc3339_micros()).ok()))
     });
     worker.register_update("clock", "inspect", |ctx, _args| async move {
-        Ok(json!(ctx
-            .replay_now()
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-            .ok()))
+        Ok(json!(ctx.replay_now().map(|t| t.to_rfc3339_micros()).ok()))
     });
     let mut history = vec![start()];
     history.extend(timer(1, "2026-01-01T00:00:02.456789Z"));
@@ -489,11 +483,7 @@ async fn replay_now_reconstructed_query_uses_consumed_prefix_not_snapshot_tail()
     worker.register_replayed_query::<u64, _, _>(
         "clock",
         "inspect",
-        |ctx, _state, _args| async move {
-            Ok(json!(ctx
-                .replay_now()?
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
-        },
+        |ctx, _state, _args| async move { Ok(json!(ctx.replay_now()?.to_rfc3339_micros())) },
     );
     let mut history = vec![start()];
     history.extend(timer(1, "2026-01-01T00:00:03.765432Z"));

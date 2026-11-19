@@ -122,7 +122,9 @@ process logs.
 
 `tests/replay_clock_redrive_server.rs` is an ignored Linux qualifier for the
 published-package Server #980 cohort. Copy it into a fresh exact-registry
-consumer with `chrono`, `sha2`, `serde_json` and Tokio available. The caller
+consumer with `sha2`, `serde_json` and Tokio available (the qualifier uses the
+SDK's `durable_workflow::jiff` re-export; a 4.x package needs `chrono` and the
+4.x copy of the file). The caller
 must bind the package/source/lock/build/executable and qualified native 3.11
 index/platform/source identities before selecting the runtime. Use the same
 isolated numeric-loopback environment and synthetic authentication as above.

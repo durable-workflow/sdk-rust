@@ -287,7 +287,7 @@ async fn scope_history_pending_stop_keeps_original_budget() {
         .unwrap();
     budget
         .restrict(
-            DateTime::<chrono::Utc>::from_timestamp_millis(
+            jiff::Timestamp::from_millisecond(
                 i64::try_from(
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -554,9 +554,7 @@ async fn scope_history_expired_budget_or_borrowed_claim_perform_no_io() {
     let value = scalar_fixture();
     let (context, boundary) = boundary(&value);
     let mut budget = CancellationScopeDeliveryBudget::new();
-    assert!(budget
-        .restrict(DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap())
-        .is_err());
+    assert!(budget.restrict(jiff::Timestamp::UNIX_EPOCH).is_err());
     assert!(matches!(
         client
             .prepare_cancellation_scope_on_claim(&claim(&value), &context, &boundary, &budget)
@@ -726,7 +724,10 @@ fn scope_history_empty_delivery_and_populated_scalar_policies() {
             delivery.context.request_id(),
             delivery.context.root_context().request_id()
         );
-        assert_eq!(delivery.authority_deadline, delivery.context.deadline());
+        assert_eq!(
+            delivery.authority_deadline,
+            delivery.context.deadline_instant()
+        );
     }
     for variant in [
         "activity-try_cancel",

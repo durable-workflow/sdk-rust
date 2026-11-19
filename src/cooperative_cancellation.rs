@@ -193,10 +193,10 @@ impl CancellationRequest {
         self.validate_observation()?;
         current.validate_observation()?;
         if self.request_id != current.request_id
-            || DateTime::parse_from_rfc3339(&self.requested_at).unwrap()
-                != DateTime::parse_from_rfc3339(&current.requested_at).unwrap()
-            || DateTime::parse_from_rfc3339(&self.cleanup_deadline_at).unwrap()
-                != DateTime::parse_from_rfc3339(&current.cleanup_deadline_at).unwrap()
+            || wire_time::parse_instant(&self.requested_at).unwrap()
+                != wire_time::parse_instant(&current.requested_at).unwrap()
+            || wire_time::parse_instant(&self.cleanup_deadline_at).unwrap()
+                != wire_time::parse_instant(&current.cleanup_deadline_at).unwrap()
         {
             return Err(invalid(
                 "observation changed the original request or cleanup deadline",
@@ -217,10 +217,10 @@ impl CancellationRequest {
     pub(crate) fn from_observation(value: &Value) -> Result<Self> {
         let requested_at = text(value, "requested_at")?;
         let cleanup_deadline_at = text(value, "cleanup_deadline_at")?;
-        let requested = DateTime::parse_from_rfc3339(requested_at)
-            .map_err(|_| invalid("requested_at must be a timestamp with a timezone"))?;
-        let deadline = DateTime::parse_from_rfc3339(cleanup_deadline_at)
-            .map_err(|_| invalid("cleanup_deadline_at must be a timestamp with a timezone"))?;
+        let requested = wire_time::parse_instant(requested_at)
+            .ok_or_else(|| invalid("requested_at must be a timestamp with a timezone"))?;
+        let deadline = wire_time::parse_instant(cleanup_deadline_at)
+            .ok_or_else(|| invalid("cleanup_deadline_at must be a timestamp with a timezone"))?;
         if deadline <= requested {
             return Err(invalid("cleanup deadline must follow the original request"));
         }
@@ -492,10 +492,10 @@ impl CancellationHistory {
         observation: Option<&CancellationRequest>,
     ) -> Result<Self> {
         if let Some(observed) = observation {
-            let requested = DateTime::parse_from_rfc3339(&observed.requested_at)
-                .map_err(|_| invalid("observed request timestamp is invalid"))?;
-            let deadline = DateTime::parse_from_rfc3339(&observed.cleanup_deadline_at)
-                .map_err(|_| invalid("observed cleanup deadline is invalid"))?;
+            let requested = wire_time::parse_instant(&observed.requested_at)
+                .ok_or_else(|| invalid("observed request timestamp is invalid"))?;
+            let deadline = wire_time::parse_instant(&observed.cleanup_deadline_at)
+                .ok_or_else(|| invalid("observed cleanup deadline is invalid"))?;
             if observed.request_id.trim().is_empty()
                 || deadline <= requested
                 || observed
@@ -548,11 +548,11 @@ impl CancellationHistory {
                     .or_else(|| event.raw.get("timestamp"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| invalid("canonical request lacks its recorded timestamp"))?;
-                let requested = DateTime::parse_from_rfc3339(recorded_at)
-                    .map_err(|_| invalid("canonical request timestamp is invalid"))?;
+                let requested = wire_time::parse_instant(recorded_at)
+                    .ok_or_else(|| invalid("canonical request timestamp is invalid"))?;
                 let deadline_text = text(&event.payload, "cleanup_deadline_at")?;
-                let deadline = DateTime::parse_from_rfc3339(deadline_text)
-                    .map_err(|_| invalid("canonical cleanup deadline is invalid"))?;
+                let deadline = wire_time::parse_instant(deadline_text)
+                    .ok_or_else(|| invalid("canonical cleanup deadline is invalid"))?;
                 let context = event
                     .payload
                     .get("cancellation")
@@ -568,8 +568,8 @@ impl CancellationHistory {
                             .is_some_and(|instance| {
                                 instance.as_str() != Some(local.workflow_instance_id())
                             })
-                        || context.deadline() != deadline
-                        || context.requested_at() > requested
+                        || context.deadline_instant() != deadline
+                        || context.requested_instant() > requested
                         || event
                             .payload
                             .get("reason")
@@ -589,9 +589,8 @@ impl CancellationHistory {
                     ));
                 }
                 if let Some(observed) = observation {
-                    let observed_deadline =
-                        DateTime::parse_from_rfc3339(&observed.cleanup_deadline_at)
-                            .map_err(|_| invalid("observed cleanup deadline is invalid"))?;
+                    let observed_deadline = wire_time::parse_instant(&observed.cleanup_deadline_at)
+                        .ok_or_else(|| invalid("observed cleanup deadline is invalid"))?;
                     if observed.request_id != request_id || observed_deadline != deadline {
                         return Err(invalid(
                             "observation changes the original request or cleanup deadline",
@@ -603,11 +602,7 @@ impl CancellationHistory {
                         request_id: request_id.to_owned(),
                         requested_at: context.as_ref().map_or_else(
                             || recorded_at.to_owned(),
-                            |context| {
-                                context
-                                    .requested_at()
-                                    .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-                            },
+                            |context| wire_time::format_micros(context.requested_instant()),
                         ),
                         cleanup_deadline_at: deadline_text.to_owned(),
                         history_refresh_page_token: observation
@@ -1537,7 +1532,9 @@ impl Client {
                 return Err(invalid("workflow heartbeat did not acknowledge the exact leased claim"));
             }
             let expires = text(&response, "lease_expires_at")?;
-            DateTime::parse_from_rfc3339(expires).map_err(|_| invalid("workflow heartbeat lease expiry must include a timezone"))?;
+            if !wire_time::is_valid(expires) {
+                return Err(invalid("workflow heartbeat lease expiry must include a timezone"));
+            }
             let run_status = text(&response, "run_status")?;
             if !matches!(run_status, "pending" | "running" | "waiting") {
                 return Err(invalid("workflow heartbeat did not acknowledge an active run"));
@@ -2062,20 +2059,11 @@ impl Worker {
         ) {
             let mut worker = self.clone();
             let admission = worker.client.worker_storage_admission.as_mut().unwrap();
-            let deadline = DateTime::parse_from_rfc3339(&request.cleanup_deadline_at)
-                .map_err(|_| invalid("invalid original cleanup deadline"))?;
+            let deadline = wire_time::parse_instant(&request.cleanup_deadline_at)
+                .ok_or_else(|| invalid("invalid original cleanup deadline"))?;
             let monotonic_now = tokio::time::Instant::now();
-            let unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| Error::Timeout)?;
-            let now = DateTime::<chrono::Utc>::from_timestamp(
-                i64::try_from(unix.as_secs()).map_err(|_| Error::Timeout)?,
-                unix.subsec_nanos(),
-            )
-            .ok_or(Error::Timeout)?;
-            let remaining = (deadline.with_timezone(&chrono::Utc) - now)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let now = wire_time::now().ok_or(Error::Timeout)?;
+            let remaining = wire_time::until(deadline, now).unwrap_or(Duration::ZERO);
             admission.workflow_completion_retry_deadline = Some(monotonic_now + remaining);
             completion_worker = Some(worker);
         }
@@ -2132,7 +2120,7 @@ impl Worker {
                         return Ok(Some(decision));
                     }
                     let mut budget = CancellationScopeDeliveryBudget::new();
-                    budget.restrict(intent.context.deadline())?;
+                    budget.restrict_instant(intent.context.deadline_instant())?;
                     let prepared = self
                         .client
                         .prepare_cancellation_scope_on_claim(
@@ -2142,7 +2130,7 @@ impl Worker {
                             &budget,
                         )
                         .await?;
-                    budget.restrict(prepared.authority_deadline())?;
+                    budget.restrict_instant(prepared.authority_deadline_instant())?;
                     let delivered = self
                         .client
                         .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
@@ -2199,7 +2187,7 @@ impl Worker {
                     return Ok(Some(decision));
                 }
                 let mut budget = CancellationScopeDeliveryBudget::new();
-                budget.restrict(intent.context.deadline())?;
+                budget.restrict_instant(intent.context.deadline_instant())?;
                 let prepared = self
                     .client
                     .prepare_cancellation_scope_on_claim(
@@ -2209,7 +2197,7 @@ impl Worker {
                         &budget,
                     )
                     .await?;
-                budget.restrict(prepared.authority_deadline())?;
+                budget.restrict_instant(prepared.authority_deadline_instant())?;
                 let delivered = self
                     .client
                     .deliver_cancellation_scope_on_claim(&task, &prepared, &budget)
@@ -2366,7 +2354,7 @@ impl ActivityClaimGuard {
         ]
         .iter()
         .any(|field| text(receipt, field).is_err())
-            || DateTime::parse_from_rfc3339(text(receipt, "cleanup_deadline_at")?).is_err()
+            || !wire_time::is_valid(text(receipt, "cleanup_deadline_at")?)
         {
             return Ok(());
         }
@@ -2461,12 +2449,12 @@ impl ActivityClaimGuard {
                     bounds.push(text(session, "ttl_expires_at")?);
                 }
                 for bound in bounds {
-                    let deadline = DateTime::parse_from_rfc3339(bound)
-                        .map_err(|_| invalid("activity deadline must include a timezone"))?;
+                    let deadline = wire_time::parse_instant(bound)
+                        .ok_or_else(|| invalid("activity deadline must include a timezone"))?;
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_err(|_| invalid("activity observation clock precedes the epoch"))?;
-                    if !u128::try_from(deadline.timestamp_millis())
+                    if !u128::try_from(deadline.as_millisecond())
                         .is_ok_and(|millis| millis > now.as_millis())
                     {
                         return Err(invalid("activity ownership or execution deadline elapsed"));

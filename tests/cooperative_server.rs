@@ -1,6 +1,7 @@
 //! Explicit source qualification against an isolated Server protocol 1.20 stack.
 //! Ordinary cargo tests leave these cases ignored. They require a real runtime.
 
+use durable_workflow::jiff::Timestamp;
 use durable_workflow::{
     json, ActivityContext, ActivityOptions, CancellationPolicy, Client, ConditionWaitOptions,
     CooperativeCancellationOptions, Error, ParallelOperation, ParallelResult,
@@ -1384,9 +1385,11 @@ async fn qualify_scoped_remote_stop(grouped: bool, policy: CancellationPolicy) {
         .find(|row| row["event_type"] == "WorkflowCompleted")
         .unwrap();
     assert!(
-        chrono::DateTime::parse_from_rfc3339(terminal["timestamp"].as_str().unwrap())
+        terminal["timestamp"]
+            .as_str()
             .unwrap()
-            .with_timezone(&chrono::Utc)
+            .parse::<Timestamp>()
+            .unwrap()
             < context.deadline()
     );
     if policy == CancellationPolicy::WaitCancellationCompleted {
@@ -1523,18 +1526,13 @@ async fn server_sigkill_scoped_cleanup_replays_before_root_with_original_30_seco
     );
     let replacement = run_scope_worker(&client, &queue, &format!("{queue}-replacement"));
     replacement.register().await.unwrap();
-    let deadline =
-        chrono::DateTime::parse_from_rfc3339(&accepted.cancellation_request.cleanup_deadline_at)
-            .unwrap();
-    let wall = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let deadline = accepted
+        .cancellation_request
+        .cleanup_deadline_at
+        .parse::<Timestamp>()
         .unwrap();
-    let now =
-        chrono::DateTime::<chrono::Utc>::from_timestamp(wall.as_secs() as i64, wall.subsec_nanos())
-            .unwrap();
-    let remaining = (deadline.with_timezone(&chrono::Utc) - now)
-        .to_std()
-        .unwrap();
+    let remaining =
+        std::time::Duration::try_from(deadline.duration_since(Timestamp::now())).unwrap();
     let final_history = tokio::time::timeout(
         remaining,
         tick_until(&replacement, &handle, "WorkflowCancelled"),
@@ -1570,7 +1568,11 @@ async fn server_sigkill_scoped_cleanup_replays_before_root_with_original_30_seco
         .find(|row| row["event_type"] == "WorkflowCancelled")
         .unwrap();
     assert!(
-        chrono::DateTime::parse_from_rfc3339(terminal["timestamp"].as_str().unwrap()).unwrap()
+        terminal["timestamp"]
+            .as_str()
+            .unwrap()
+            .parse::<Timestamp>()
+            .unwrap()
             < deadline
     );
     println!("Root/scope SIGKILL and original budget: {final_history}");
@@ -1720,27 +1722,29 @@ async fn server_cold_successor_runs_saga_cleanup_before_terminal_cancellation() 
     assert_eq!(completed.load(Ordering::SeqCst), 1);
     let events = snapshot["events"].as_array().unwrap();
     let event_time = |kind| {
-        chrono::DateTime::parse_from_rfc3339(
-            events
-                .iter()
-                .find(|event| event["event_type"] == kind)
-                .unwrap()["timestamp"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap()
+        events
+            .iter()
+            .find(|event| event["event_type"] == kind)
+            .unwrap()["timestamp"]
+            .as_str()
+            .unwrap()
+            .parse::<Timestamp>()
+            .unwrap()
     };
-    let deadline =
-        chrono::DateTime::parse_from_rfc3339(&request.cancellation_request.cleanup_deadline_at)
-            .unwrap();
-    let delivery_budget = (deadline - event_time("CooperativeCancellationDelivered"))
-        .to_std()
-        .unwrap()
-        .as_secs_f64();
-    let completed_budget = (deadline - event_time("ActivityCompleted"))
-        .to_std()
-        .unwrap()
-        .as_secs_f64();
+    let deadline = request
+        .cancellation_request
+        .cleanup_deadline_at
+        .parse::<Timestamp>()
+        .unwrap();
+    let delivery_budget = std::time::Duration::try_from(
+        deadline.duration_since(event_time("CooperativeCancellationDelivered")),
+    )
+    .unwrap()
+    .as_secs_f64();
+    let completed_budget =
+        std::time::Duration::try_from(deadline.duration_since(event_time("ActivityCompleted")))
+            .unwrap()
+            .as_secs_f64();
     let observed = observations.lock().unwrap();
     let deliveries = observed
         .iter()

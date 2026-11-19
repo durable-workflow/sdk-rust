@@ -2,7 +2,7 @@
 //! These facts alone grant no callback, stop, or publication authority.
 
 use super::*;
-use chrono::{SecondsFormat, Utc};
+use crate::wire_time::{self, Timestamp};
 use serde::ser::{SerializeMap, SerializeSeq};
 
 const FIELDS: [&str; 4] = [
@@ -55,18 +55,17 @@ fn positive(value: &Value) -> bool {
         .is_some_and(|value| value > 0 && value <= i64::MAX as u64)
 }
 
-pub(super) fn timestamp(value: &Value) -> Result<DateTime<Utc>> {
+pub(super) fn timestamp(value: &Value) -> Result<Timestamp> {
     value
         .as_str()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc))
+        .and_then(wire_time::parse_instant)
         .ok_or_else(|| invalid("scope authority requires an original timestamp with timezone"))
 }
 
 pub(super) fn boundary_scope_states(
     context: &ScopedCancellationContext,
     preparation: &Value,
-) -> Result<BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>> {
+) -> Result<BTreeMap<String, (ScopedCancellationContext, Timestamp)>> {
     let mut states = BTreeMap::from([(
         context.scope_id().to_owned(),
         (
@@ -98,7 +97,7 @@ pub(super) fn boundary_scope_states(
 fn delivery_scope_states(
     delivery: &HistoryEvent,
     prefix: &[HistoryEvent],
-) -> Result<BTreeMap<String, (ScopedCancellationContext, DateTime<Utc>)>> {
+) -> Result<BTreeMap<String, (ScopedCancellationContext, Timestamp)>> {
     let preparations: Vec<_> = prefix
         .iter()
         .filter(|row| {
@@ -170,7 +169,7 @@ fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> 
         "request_id":ancestor.request_id(), "root_request_id":ancestor.root_context().root_request_id(),
         "delivery_history_event_id":event_id(delivery)?,
         "preparation_history_event_id":original["preparation_history_event_id"],
-        "cleanup_deadline_at":canonical_time(ancestor.deadline()),
+        "cleanup_deadline_at":canonical_time(ancestor.deadline_instant()),
         "authority_deadline_at":canonical_time(*ceiling)});
     let boundary = CancellationDelivery::from_payload(&json!({
         "workflow_command_id":original["request_id"], "sequence":original["sequence"],
@@ -199,7 +198,7 @@ fn cleanup_timer(event: &HistoryEvent, prefix: &[HistoryEvent]) -> Result<bool> 
     Ok(true)
 }
 
-fn event_time(event: &HistoryEvent) -> Result<DateTime<Utc>> {
+fn event_time(event: &HistoryEvent) -> Result<Timestamp> {
     timestamp(
         event
             .raw
@@ -225,8 +224,8 @@ fn event_sequence(event: &HistoryEvent) -> Result<u64> {
         .and_then(Value::as_u64)
         .ok_or_else(|| invalid("scope proof lacks canonical event order"))
 }
-fn canonical_time(time: DateTime<Utc>) -> String {
-    time.to_rfc3339_opts(SecondsFormat::Micros, true)
+fn canonical_time(time: Timestamp) -> String {
+    wire_time::format_micros(time)
 }
 fn policy(value: &Value) -> bool {
     matches!(
@@ -667,7 +666,7 @@ fn descendants_from_prefix(
     prefix: &[HistoryEvent],
     scope: &str,
     run: &str,
-    authority: DateTime<Utc>,
+    authority: Timestamp,
 ) -> Result<Value> {
     let openings: BTreeMap<_, _> = prefix
         .iter()
@@ -727,7 +726,7 @@ fn descendants_from_prefix(
                 let accepted = ScopedCancellationContext::from_value(&p["accepted_cancellation"])?;
                 if incoming.root_context() == parent.root_context()
                     && incoming.lineage()[..incoming.lineage().len() - 1] == *parent.lineage()
-                    && incoming.deadline() == parent.deadline()
+                    && incoming.deadline_instant() == parent.deadline_instant()
                     && incoming.scope_id() == id
                     && incoming.workflow_run_id() == run
                     && incoming.workflow_instance_id() == context.workflow_instance_id()
@@ -746,7 +745,7 @@ fn descendants_from_prefix(
             if let Some(request) = requests.get(ancestor) {
                 deadline = deadline.min(
                     ScopedCancellationContext::from_value(&request.payload["cancellation"])?
-                        .deadline(),
+                        .deadline_instant(),
                 );
             }
             ancestor = text(
@@ -772,7 +771,7 @@ fn descendants_from_prefix(
 #[derive(Clone, Debug)]
 pub(super) struct ScopeRequest {
     pub context: ScopedCancellationContext,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub history_index: usize,
 }
 
@@ -780,7 +779,7 @@ pub(super) struct ScopeRequest {
 pub(super) struct ScopeBoundary {
     pub context: ScopedCancellationContext,
     pub boundary: CancellationDelivery,
-    pub authority_deadline: DateTime<Utc>,
+    pub authority_deadline: Timestamp,
     pub event: HistoryEvent,
 }
 
@@ -937,7 +936,7 @@ impl CommittedCancellationScopeHistory {
                 ));
             }
             let time = event_time(event)?;
-            if time < context.requested_at() {
+            if time < context.requested_instant() {
                 return Err(invalid("scope boundary predates its original request"));
             }
             if kind == "CancellationScopeRequested" {
@@ -975,7 +974,7 @@ impl CommittedCancellationScopeHistory {
                         || parent_id != opening.parent_scope_id
                         || context.root_context() != parent.root_context()
                         || context.lineage()[..context.lineage().len() - 1] != *parent.lineage()
-                        || context.deadline() != parent.deadline()
+                        || context.deadline_instant() != parent.deadline_instant()
                     {
                         return Err(invalid("inherited scope request changes its accepted parent or crosses a shield"));
                     }
@@ -1013,8 +1012,8 @@ impl CommittedCancellationScopeHistory {
             let boundary = CancellationDelivery::from_payload(&payload)?;
             let deadline = timestamp(&p["authority_deadline_at"])?;
             if boundary.sequence <= *opening_sequence
-                || deadline < context.requested_at()
-                || deadline > context.deadline()
+                || deadline < context.requested_instant()
+                || deadline > context.deadline_instant()
                 || time > deadline
             {
                 return Err(invalid(
@@ -1230,18 +1229,13 @@ impl CancellationScopeDeliveryBudget {
     }
 
     /// Narrow the original budget, without granting a new request or lease.
-    pub fn restrict(&mut self, authority_deadline: DateTime<Utc>) -> Result<()> {
-        let unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::Timeout)?;
-        let now = DateTime::<Utc>::from_timestamp(
-            i64::try_from(unix.as_secs()).map_err(|_| Error::Timeout)?,
-            unix.subsec_nanos(),
-        )
-        .ok_or(Error::Timeout)?;
-        let remaining = (authority_deadline - now)
-            .to_std()
-            .unwrap_or(Duration::ZERO);
+    pub fn restrict(&mut self, authority_deadline: jiff::Timestamp) -> Result<()> {
+        self.restrict_instant(authority_deadline)
+    }
+
+    pub(crate) fn restrict_instant(&mut self, authority_deadline: Timestamp) -> Result<()> {
+        let now = wire_time::now().ok_or(Error::Timeout)?;
+        let remaining = wire_time::until(authority_deadline, now).unwrap_or(Duration::ZERO);
         self.expires_at = self.expires_at.min(tokio::time::Instant::now() + remaining);
         self.remaining()
     }
@@ -1272,7 +1266,10 @@ impl CancellationScopeDeliveryReceipt {
     pub fn boundary(&self) -> &CancellationDelivery {
         &self.preparation.boundary
     }
-    pub fn authority_deadline(&self) -> DateTime<Utc> {
+    pub fn authority_deadline(&self) -> jiff::Timestamp {
+        self.preparation.authority_deadline
+    }
+    pub(crate) fn authority_deadline_instant(&self) -> Timestamp {
         self.preparation.authority_deadline
     }
     pub fn history(&self) -> &[HistoryEvent] {
@@ -1318,8 +1315,8 @@ impl CancellationScopeDeliveryReceipt {
             || context.workflow_instance_id() != text(expected, "workflow_instance_id")?
             || context.scope_id() != text(expected, "scope_id")?
             || context.request_id() != text(expected, "request_id")?
-            || authority < context.requested_at()
-            || authority > context.deadline()
+            || authority < context.requested_instant()
+            || authority > context.deadline_instant()
         {
             return Err(invalid(
                 "scope acknowledgement changes its original cancellation authority",

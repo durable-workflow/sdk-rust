@@ -125,8 +125,10 @@ apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
 # Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
 bon = { version = "=3.8.1", default-features = false, optional = true }
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures-util = "0.3"
+# Wire timestamps and the public timestamp type, re-exported as
+# `durable_workflow::jiff` (#283, replacing chrono for RUSTSEC-2026-0543).
+jiff = { version = "1.0", default-features = false, features = ["std"] }
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.
 icu_collections = { version = "=2.2.0", default-features = false }
 icu_locale_core = { version = "=2.2.0", default-features = false }

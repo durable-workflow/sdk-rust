@@ -771,7 +771,7 @@ they do not invent an empty checkpoint.
 
 `last_heartbeat_details()` and `last_heartbeat_at()` expose the same snapshot.
 `checkpoint.details_as::<T>()` deserializes application JSON, while
-`checkpoint.acknowledged_at()` retains a typed UTC timestamp and its fractional
+`checkpoint.acknowledged_at()` retains a typed `jiff::Timestamp` and its fractional
 precision. `heartbeat_resume_version()` and `checkpoint.contract_version()` refer
 to the negotiated protocol; v1 supplies no checkpoint write-sequence number.
 

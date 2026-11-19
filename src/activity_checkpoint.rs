@@ -1,7 +1,6 @@
 //! Read-only acknowledged heartbeat snapshots supplied by a negotiated claim.
 
-use crate::{Error, Result, Value};
-use chrono::{DateTime, Utc};
+use crate::{wire_time, Error, Result, Value};
 use serde::de::DeserializeOwned;
 use std::fmt;
 
@@ -35,7 +34,7 @@ impl From<ActivityHeartbeatResumeUnavailable> for Error {
 #[derive(Clone, PartialEq)]
 pub struct ActivityHeartbeatCheckpoint {
     details: Value,
-    acknowledged_at: DateTime<Utc>,
+    acknowledged_at: jiff::Timestamp,
 }
 
 impl fmt::Debug for ActivityHeartbeatCheckpoint {
@@ -59,7 +58,7 @@ impl ActivityHeartbeatCheckpoint {
     }
 
     /// The producer's acknowledgement time, preserving fractional precision.
-    pub fn acknowledged_at(&self) -> &DateTime<Utc> {
+    pub fn acknowledged_at(&self) -> &jiff::Timestamp {
         &self.acknowledged_at
     }
 
@@ -110,9 +109,7 @@ impl HeartbeatResume {
                 if attempt == Some(1) {
                     return Err(invalid());
                 }
-                let acknowledged_at = DateTime::parse_from_rfc3339(at)
-                    .map_err(|_| invalid())?
-                    .with_timezone(&Utc);
+                let acknowledged_at = wire_time::parse_instant(at).ok_or_else(invalid)?;
                 Ok(Self::Available(Some(ActivityHeartbeatCheckpoint {
                     details: details.clone(),
                     acknowledged_at,

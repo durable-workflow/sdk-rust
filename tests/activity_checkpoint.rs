@@ -213,7 +213,7 @@ async fn ordinary_and_cooperative_handlers_receive_typed_immutable_claims() {
             let checkpoint=ctx.last_heartbeat_checkpoint()?.unwrap().clone();
             assert_eq!(checkpoint.details(),&expected);assert_eq!(checkpoint.contract_version(),1);
             assert_eq!(checkpoint.details_as::<Progress>().unwrap(),Progress{cursor:u64::MAX,flags:vec![Some(true),None,Some(false)]});
-            assert_eq!(checkpoint.acknowledged_at().to_rfc3339_opts(chrono::SecondsFormat::Nanos,true),AT);
+            assert_eq!(format!("{:.9}",checkpoint.acknowledged_at()),AT);
             assert_eq!(ctx.last_heartbeat_at()?.unwrap(),checkpoint.acknowledged_at());
             assert!(!format!("{ctx:?}").contains("private-checkpoint"));
             ctx.attempt_number=99;assert_eq!(ctx.retry_info().attempt_number(),2);

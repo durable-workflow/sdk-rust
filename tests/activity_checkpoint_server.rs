@@ -127,7 +127,7 @@ fn worker(
                 "phase":phase,"execution":ctx.activity_execution_id(),"attempt":ctx.activity_attempt_id,
                 "task":ctx.task_id,"owner":ctx.lease_owner,"workflow":ctx.workflow_id(),"run":ctx.run_id(),
                 "details":received.as_ref().map(|v|v.details()),
-                "at":received.as_ref().map(|v|v.acknowledged_at().to_rfc3339()),
+                "at":received.as_ref().map(|v|v.acknowledged_at().to_string()),
                 "retry_policy":ctx.retry_info().policy()});
             if phase == 1 && checkpoint {
                 let ack = ctx.heartbeat(details()).await?;
@@ -362,8 +362,8 @@ impl OwnedChild {
     }
 }
 
-fn instant(value: &Value) -> chrono::DateTime<chrono::FixedOffset> {
-    chrono::DateTime::parse_from_rfc3339(value.as_str().unwrap()).unwrap()
+fn instant(value: &Value) -> durable_workflow::jiff::Timestamp {
+    value.as_str().unwrap().parse().unwrap()
 }
 
 fn assert_stale_refusal(

@@ -1,4 +1,5 @@
 use super::*;
+use crate::wire_time::Rfc3339Micros as _;
 
 fn context_snapshot() -> Value {
     serde_json::from_str(include_str!(
@@ -48,16 +49,12 @@ fn scoped_run_native_child_and_grandchild_preserve_every_origin_and_original_bud
         assert_eq!(context.source(), "api");
         assert_eq!(context.requester()["id"], "operator-1");
         assert_eq!(
-            context
-                .requested_at()
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            context.requested_at().to_rfc3339_micros(),
             "2026-10-04T00:00:00.123456Z"
         );
         let origin = context.scope_origin().unwrap();
         assert_eq!(
-            origin
-                .root_deadline()
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            origin.root_deadline().to_rfc3339_micros(),
             "2026-10-04T00:00:30.123456Z"
         );
         assert_eq!(origin.requested_at(), context.requested_at());
@@ -83,12 +80,7 @@ fn scoped_run_native_child_and_grandchild_preserve_every_origin_and_original_bud
                 .collect::<Vec<_>>(),
             scopes
         );
-        assert_eq!(
-            context
-                .deadline()
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            deadline
-        );
+        assert_eq!(context.deadline().to_rfc3339_micros(), deadline);
         assert!(matches!(
             context.remaining(),
             Err(Error::InvalidCooperativeCancellation(_))
@@ -795,8 +787,8 @@ fn cooperative_context_retains_original_snapshot_and_detached_copies() {
         "child-instance"
     );
     assert_eq!(
-        context.deadline() - context.requested_at(),
-        chrono::Duration::seconds(30)
+        context.deadline().duration_since(context.requested_at()),
+        jiff::SignedDuration::from_secs(30)
     );
 }
 
@@ -5713,9 +5705,7 @@ fn scoped_child_of(root: &CancellationContext) -> Value {
     let mut child = origin.root_context().to_value();
     // A descendant is cancelled because its ancestor was (Core strips the cause).
     child.as_object_mut().unwrap().remove("cause");
-    let deadline = origin
-        .deadline()
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let deadline = origin.deadline().to_rfc3339_micros();
     child["schema"] = json!("durable-workflow.cancellation-context/v2");
     child["request_id"] = json!("req-child");
     child["parent_request_id"] = json!(origin.request_id());

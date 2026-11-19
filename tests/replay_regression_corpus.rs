@@ -3398,7 +3398,7 @@ fn check_successor_cancellation(
     instance: &str,
     run: &str,
     resume: u64,
-    started_at: chrono::DateTime<chrono::FixedOffset>,
+    started_at: durable_workflow::jiff::Timestamp,
 ) -> Result<(), String> {
     fn require(condition: bool, message: &str) -> Result<(), String> {
         if condition {
@@ -3407,10 +3407,10 @@ fn check_successor_cancellation(
             Err(message.into())
         }
     }
-    fn time(value: &Value, field: &str) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+    fn time(value: &Value, field: &str) -> Result<durable_workflow::jiff::Timestamp, String> {
         value
             .as_str()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .and_then(|value| value.parse().ok())
             .ok_or_else(|| format!("invalid {field}"))
     }
     let requests: Vec<_> = events
@@ -3650,7 +3650,7 @@ fn check_successor_cancellation(
 /// the successor records itself come after that prefix, at or after its start,
 /// and belong to the successor run. Returns the first violated rule.
 fn check_redrive_successor(fixture: &Value) -> Result<(), String> {
-    type Time = chrono::DateTime<chrono::FixedOffset>;
+    type Time = durable_workflow::jiff::Timestamp;
     fn require(condition: bool, message: impl Into<String>) -> Result<(), String> {
         if condition {
             Ok(())
@@ -3661,7 +3661,7 @@ fn check_redrive_successor(fixture: &Value) -> Result<(), String> {
     fn time(value: &Value, message: impl Into<String>) -> Result<Time, String> {
         value
             .as_str()
-            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .and_then(|time| time.parse().ok())
             .ok_or_else(|| message.into())
     }
     fn non_blank(value: &Value) -> Option<&str> {

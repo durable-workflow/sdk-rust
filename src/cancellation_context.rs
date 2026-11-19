@@ -1,5 +1,5 @@
 use super::*;
-use chrono::{SecondsFormat, Utc};
+use crate::wire_time::{self, Timestamp};
 use std::sync::Weak;
 
 /// One immutable local request in the ordered cancellation lineage.
@@ -78,8 +78,8 @@ pub struct CancellationContext {
     reason: Option<String>,
     requester: BTreeMap<String, String>,
     source: String,
-    requested_at: DateTime<Utc>,
-    cleanup_deadline_at: DateTime<Utc>,
+    requested_at: Timestamp,
+    cleanup_deadline_at: Timestamp,
     lineage: Vec<CancellationLineage>,
     cause: Option<RecordedCause>,
     scope_origin: Option<Box<ScopedCancellationContext>>,
@@ -223,13 +223,11 @@ impl CancellationContext {
                 "cancellation lineage does not match its request identities",
             ));
         }
-        let requested_at = DateTime::parse_from_rfc3339(context_text(value, "requested_at")?)
-            .map_err(|_| invalid_context("cancellation request timestamp is invalid"))?
-            .with_timezone(&Utc);
+        let requested_at = wire_time::parse_instant(context_text(value, "requested_at")?)
+            .ok_or_else(|| invalid_context("cancellation request timestamp is invalid"))?;
         let cleanup_deadline_at =
-            DateTime::parse_from_rfc3339(context_text(value, "cleanup_deadline_at")?)
-                .map_err(|_| invalid_context("cancellation deadline timestamp is invalid"))?
-                .with_timezone(&Utc);
+            wire_time::parse_instant(context_text(value, "cleanup_deadline_at")?)
+                .ok_or_else(|| invalid_context("cancellation deadline timestamp is invalid"))?;
         if cleanup_deadline_at <= requested_at {
             return Err(invalid_context(
                 "cancellation deadline must follow the original request",
@@ -263,9 +261,10 @@ impl CancellationContext {
         let root = &origin.root_context;
         let last = self.lineage.last().unwrap();
         let authority =
-            DateTime::parse_from_rfc3339(context_text(value, "scope_authority_deadline_at")?)
-                .map_err(|_| invalid_context("scoped cancellation authority timestamp is invalid"))?
-                .with_timezone(&Utc);
+            wire_time::parse_instant(context_text(value, "scope_authority_deadline_at")?)
+                .ok_or_else(|| {
+                    invalid_context("scoped cancellation authority timestamp is invalid")
+                })?;
         if self.parent_request_id.as_deref() != Some(origin.request_id())
             || self.root_request_id != root.root_request_id
             || self.root_workflow_instance_id != root.root_workflow_instance_id
@@ -275,7 +274,7 @@ impl CancellationContext {
             || self.source != root.source
             || self.requested_at != root.requested_at
             || self.cleanup_deadline_at != authority
-            || self.cleanup_deadline_at > origin.deadline()
+            || self.cleanup_deadline_at > origin.deadline_instant()
             || origin.lineage.iter().any(|entry| {
                 entry.request_id == last.request_id || entry.workflow_run_id == last.workflow_run_id
             })
@@ -333,10 +332,16 @@ impl CancellationContext {
     pub fn source(&self) -> &str {
         &self.source
     }
-    pub fn requested_at(&self) -> DateTime<Utc> {
+    pub fn requested_at(&self) -> jiff::Timestamp {
         self.requested_at
     }
-    pub fn deadline(&self) -> DateTime<Utc> {
+    pub fn deadline(&self) -> jiff::Timestamp {
+        self.cleanup_deadline_at
+    }
+    pub(crate) fn requested_instant(&self) -> Timestamp {
+        self.requested_at
+    }
+    pub(crate) fn deadline_instant(&self) -> Timestamp {
         self.cleanup_deadline_at
     }
     pub fn scope_origin(&self) -> Option<&ScopedCancellationContext> {
@@ -373,9 +378,7 @@ impl CancellationContext {
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?
             .cancellation_time()?;
-        Ok((self.cleanup_deadline_at - time)
-            .to_std()
-            .unwrap_or(Duration::ZERO))
+        Ok(wire_time::until(self.cleanup_deadline_at, time).unwrap_or(Duration::ZERO))
     }
 
     pub(super) fn with_replay(mut self, replay: Option<Weak<Mutex<WorkflowState>>>) -> Self {
@@ -396,8 +399,8 @@ impl CancellationContext {
             "root_workflow_run_id": self.root_workflow_run_id,
             "parent_request_id": self.parent_request_id, "reason": self.reason,
             "requester": self.requester, "source": self.source,
-            "requested_at": self.requested_at.to_rfc3339_opts(SecondsFormat::Micros, true),
-            "cleanup_deadline_at": self.cleanup_deadline_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+            "requested_at": wire_time::format_micros(self.requested_at),
+            "cleanup_deadline_at": wire_time::format_micros(self.cleanup_deadline_at),
             "lineage": self.lineage.iter().map(CancellationLineage::to_value).collect::<Vec<_>>(),
         });
         match self.cause {
@@ -420,7 +423,7 @@ pub struct ScopedCancellationLineage {
     workflow_instance_id: String,
     workflow_run_id: String,
     scope_id: String,
-    cleanup_deadline_at: DateTime<Utc>,
+    cleanup_deadline_at: Timestamp,
 }
 
 impl ScopedCancellationLineage {
@@ -436,7 +439,7 @@ impl ScopedCancellationLineage {
     pub fn scope_id(&self) -> &str {
         &self.scope_id
     }
-    pub fn deadline(&self) -> DateTime<Utc> {
+    pub fn deadline(&self) -> jiff::Timestamp {
         self.cleanup_deadline_at
     }
 
@@ -444,7 +447,7 @@ impl ScopedCancellationLineage {
         json!({
             "request_id": self.request_id, "workflow_instance_id": self.workflow_instance_id,
             "workflow_run_id": self.workflow_run_id, "scope_id": self.scope_id,
-            "cleanup_deadline_at": self.cleanup_deadline_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+            "cleanup_deadline_at": wire_time::format_micros(self.cleanup_deadline_at),
         })
     }
 }
@@ -491,9 +494,11 @@ impl ScopedCancellationContext {
             .ok_or_else(|| {
                 invalid_context("scope remaining() requires its original consumed delivery")
             })?;
-        Ok((self.deadline().min(*ceiling) - state.cancellation_time()?)
-            .to_std()
-            .unwrap_or(Duration::ZERO))
+        Ok(wire_time::until(
+            self.deadline_instant().min(*ceiling),
+            state.cancellation_time()?,
+        )
+        .unwrap_or(Duration::ZERO))
     }
 
     pub(super) fn with_replay(mut self, replay: Option<Weak<Mutex<WorkflowState>>>) -> Self {
@@ -516,7 +521,7 @@ impl ScopedCancellationContext {
             lineage.push(json!({"request_id":context.request_id(),
                 "workflow_instance_id":local.workflow_instance_id(),
                 "workflow_run_id":local.workflow_run_id(), "scope_id":"root",
-                "cleanup_deadline_at":context.deadline().to_rfc3339_opts(SecondsFormat::Micros, true)}));
+                "cleanup_deadline_at":wire_time::format_micros(context.deadline_instant())}));
         } else {
             root["request_id"] = json!(context.root_request_id());
             root["parent_request_id"] = Value::Null;
@@ -524,7 +529,7 @@ impl ScopedCancellationContext {
             lineage.extend(context.lineage().iter().map(|entry| json!({
                 "request_id":entry.request_id(), "workflow_instance_id":entry.workflow_instance_id(),
                 "workflow_run_id":entry.workflow_run_id(), "scope_id":"root",
-                "cleanup_deadline_at":context.deadline().to_rfc3339_opts(SecondsFormat::Micros, true)})));
+                "cleanup_deadline_at":wire_time::format_micros(context.deadline_instant())})));
         }
         Self::from_value(
             &json!({"schema":"durable-workflow.scoped-cancellation-context/v1",
@@ -569,7 +574,7 @@ impl ScopedCancellationContext {
         let mut addresses = BTreeSet::new();
         let mut instances_by_run = BTreeMap::new();
         let mut last_run = String::new();
-        let mut deadline = root.deadline();
+        let mut deadline = root.deadline_instant();
         for (index, entry) in lineage.iter().enumerate() {
             assert_context_keys(
                 entry,
@@ -586,18 +591,19 @@ impl ScopedCancellationContext {
                 workflow_instance_id: context_text(entry, "workflow_instance_id")?.to_owned(),
                 workflow_run_id: context_text(entry, "workflow_run_id")?.to_owned(),
                 scope_id: context_text(entry, "scope_id")?.to_owned(),
-                cleanup_deadline_at: DateTime::parse_from_rfc3339(context_text(
+                cleanup_deadline_at: wire_time::parse_instant(context_text(
                     entry,
                     "cleanup_deadline_at",
                 )?)
-                .map_err(|_| invalid_context("scoped cancellation deadline timestamp is invalid"))?
-                .with_timezone(&Utc),
+                .ok_or_else(|| {
+                    invalid_context("scoped cancellation deadline timestamp is invalid")
+                })?,
             };
             if index == 0
                 && (address.request_id != root.request_id
                     || address.workflow_instance_id != root.root_workflow_instance_id
                     || address.workflow_run_id != root.root_workflow_run_id
-                    || address.cleanup_deadline_at != root.deadline())
+                    || address.cleanup_deadline_at != root.deadline_instant())
             {
                 return Err(invalid_context(
                     "scoped cancellation root address does not match its request",
@@ -667,13 +673,19 @@ impl ScopedCancellationContext {
     pub fn root_scope_id(&self) -> &str {
         &self.lineage[0].scope_id
     }
-    pub fn requested_at(&self) -> DateTime<Utc> {
+    pub fn requested_at(&self) -> jiff::Timestamp {
         self.root_context.requested_at()
     }
-    pub fn root_deadline(&self) -> DateTime<Utc> {
+    pub fn root_deadline(&self) -> jiff::Timestamp {
         self.root_context.deadline()
     }
-    pub fn deadline(&self) -> DateTime<Utc> {
+    pub fn deadline(&self) -> jiff::Timestamp {
+        self.deadline_instant()
+    }
+    pub(crate) fn requested_instant(&self) -> Timestamp {
+        self.root_context.requested_at
+    }
+    pub(crate) fn deadline_instant(&self) -> Timestamp {
         self.lineage.last().unwrap().cleanup_deadline_at
     }
     pub fn to_value(&self) -> Value {

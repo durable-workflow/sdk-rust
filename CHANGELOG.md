@@ -17,6 +17,33 @@
   names the Server's reason for every refusal; nothing was written for any of
   them.
 
+- **Breaking (needs 5.0.0):** `chrono` is no longer a dependency
+  (RUSTSEC-2026-0543, #283). Public time values are `jiff::Timestamp`, and
+  the crate re-exports `jiff` as `durable_workflow::jiff`. Changed signatures:
+  `WorkflowContext::replay_now()` and `QueryContext::replay_now()` return
+  `Result<Timestamp>`; `ActivityHeartbeatCheckpoint::acknowledged_at()`
+  returns `&Timestamp` and `ActivityContext::last_heartbeat_at()` returns
+  `Option<&Timestamp>`; `CancellationContext::requested_at()`/`deadline()`,
+  `ScopedCancellationLineage::deadline()` and
+  `ScopedCancellationContext::requested_at()`/`root_deadline()`/`deadline()`
+  return `Timestamp`; the doc-hidden
+  `CancellationScopeDeliveryBudget::restrict()` takes and
+  `CancellationScopeDeliveryReceipt::authority_deadline()` returns
+  `Timestamp`. To keep using chrono, convert with
+  `chrono::DateTime::from_timestamp(t.as_second(), t.subsec_nanosecond() as u32)`
+  (normalise a negative nanosecond first) or
+  `DateTime::from_timestamp_nanos(t.as_nanosecond() as i64)`.
+- Wire timestamps are parsed, compared and printed with `jiff`. Accepted
+  RFC 3339 text and every timestamp the SDK sends keep identical bytes;
+  `tests/fixtures/wire-time-chrono-reference.json` pins chrono 0.4.45's
+  accept/reject set and printed bytes, and every canonical timestamp in the
+  committed fixtures must print back to itself. Two readings differ only
+  outside Server time: a recorded leap second `:60.f` is the next second plus
+  `f` (as PHP Server reads it), and instants after `9999-12-30T22:00Z` no
+  longer parse as instants.
+  A recorded leap second (`:60`) now reads as the following second, as the PHP
+  Server reads it, instead of chrono's distinct `:60` value.
+
 ## 4.20.0
 
 - A signal or update refused with HTTP 409 `request_id_ambiguous` is now typed:

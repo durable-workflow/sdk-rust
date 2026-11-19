@@ -19,9 +19,7 @@ fn signal(sequence: u64, time: &str) -> Vec<HistoryEvent> {
 }
 
 fn time(ctx: &WorkflowContext) -> Option<String> {
-    ctx.replay_now()
-        .ok()
-        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+    ctx.replay_now().ok().map(|time| time.to_rfc3339_micros())
 }
 
 fn observe(history: Vec<HistoryEvent>) -> Value {
@@ -198,9 +196,7 @@ fn replay_now_signal_time_and_reuse_do_not_borrow_unrelated_authority() {
         json!("2025-12-01T00:00:00.123456Z")
     );
     assert_eq!(
-        snapshot_time(&history, DEFAULT_CODEC)
-            .unwrap()
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        crate::wire_time::format_micros(snapshot_time(&history, DEFAULT_CODEC).unwrap()),
         "2025-12-01T00:00:00.123456Z"
     );
     history[1].payload["reused_recorded_at"] = json!("invalid");
@@ -314,18 +310,12 @@ async fn replay_now_signal_queries_use_the_selected_existing_prefix() {
         },
     );
     worker.register_query("signal-clock", "snapshot", |ctx, _| async move {
-        Ok(json!(ctx
-            .replay_now()?
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
+        Ok(json!(ctx.replay_now()?.to_rfc3339_micros()))
     });
     worker.register_replayed_query::<u64, _, _>(
         "signal-clock",
         "reconstructed",
-        |ctx, _, _| async move {
-            Ok(json!(ctx
-                .replay_now()?
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
-        },
+        |ctx, _, _| async move { Ok(json!(ctx.replay_now()?.to_rfc3339_micros())) },
     );
     let mut history = signal(1, SIGNAL_TIME);
     for query in ["snapshot", "reconstructed"] {

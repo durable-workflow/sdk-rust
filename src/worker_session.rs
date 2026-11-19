@@ -14,7 +14,7 @@ struct SessionState {
     expires: Option<Instant>,
     receipt: Option<Value>,
     close_receipt: Option<Value>,
-    original_ttl: Option<(i64, u32)>,
+    original_ttl: Option<crate::wire_time::Timestamp>,
 }
 
 /// One worker's acknowledged session lease.
@@ -205,10 +205,8 @@ impl WorkerSession {
             ));
         }
         let expires = lease_deadline(affinity)?;
-        let ttl =
-            chrono::DateTime::parse_from_rfc3339(affinity["ttl_expires_at"].as_str().unwrap())
-                .map_err(|_| invalid("invalid session TTL deadline"))?;
-        let ttl = (ttl.timestamp(), ttl.timestamp_subsec_nanos());
+        let ttl = crate::wire_time::parse_instant(affinity["ttl_expires_at"].as_str().unwrap())
+            .ok_or_else(|| invalid("invalid session TTL deadline"))?;
         let mut state = self
             .state
             .lock()
@@ -233,14 +231,11 @@ fn lease_deadline(affinity: &Value) -> Result<Instant> {
     for field in ["lease_expires_at", "ttl_expires_at"] {
         let deadline = affinity[field]
             .as_str()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .and_then(crate::wire_time::parse_instant)
             .ok_or_else(|| invalid("session receipt requires valid lease and TTL deadlines"))?;
-        let timestamp = deadline.timestamp();
-        if timestamp < 0 {
-            return Err(invalid("session lease or TTL already expired"));
-        }
         let deadline = std::time::UNIX_EPOCH
-            + Duration::new(timestamp as u64, deadline.timestamp_subsec_nanos());
+            + Duration::try_from(deadline.as_duration())
+                .map_err(|_| invalid("session lease or TTL already expired"))?;
         let remaining = deadline
             .duration_since(now)
             .map_err(|_| invalid("session lease or TTL already expired"))?;

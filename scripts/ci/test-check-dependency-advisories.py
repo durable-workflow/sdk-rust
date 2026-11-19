@@ -142,14 +142,19 @@ class AdvisoryCheckTest(unittest.TestCase):
 
     def test_accepted_informational_advisory_warns_without_failing(self) -> None:
         warnings: list[str] = []
-        locks = {"Cargo.lock": lock(("chrono", "0.4.45"))}
+        pinned = "tests/nexus/Cargo.lock"
+        locks = {pinned: lock(("chrono", "0.4.45"))}
         failures = CHECKER.check(locks, osv({("chrono", "0.4.45"): ["RUSTSEC-2026-0543"]}), warnings)
         self.assertEqual([], failures)
         self.assertEqual(1, len(warnings))
         self.assertIn("RUSTSEC-2026-0543", warnings[0])
 
-    def test_acceptance_is_bound_to_the_exact_crate_and_advisory(self) -> None:
-        locks = {"Cargo.lock": lock(("chrono", "0.4.45"), ("other", "1.0.0"))}
+    def test_acceptance_is_bound_to_the_exact_lock_crate_and_advisory(self) -> None:
+        pinned = "scripts/acceptance/command-keys/consumer/Cargo.lock"
+        locks = {
+            pinned: lock(("chrono", "0.4.45"), ("other", "1.0.0")),
+            "Cargo.lock": lock(("chrono", "0.4.45")),
+        }
         failures = CHECKER.check(
             locks,
             osv({("chrono", "0.4.45"): ["RUSTSEC-2026-0543", ADVISORY], ("other", "1.0.0"): ["RUSTSEC-2026-0543"]}),
@@ -157,10 +162,21 @@ class AdvisoryCheckTest(unittest.TestCase):
         )
         self.assertEqual(
             [
-                f"Cargo.lock: chrono 0.4.45 is affected by {ADVISORY}",
-                "Cargo.lock: other 1.0.0 is affected by RUSTSEC-2026-0543",
+                f"{pinned}: chrono 0.4.45 is affected by {ADVISORY}",
+                f"{pinned}: other 1.0.0 is affected by RUSTSEC-2026-0543",
+                f"Cargo.lock: chrono 0.4.45 is affected by RUSTSEC-2026-0543, {ADVISORY}",
             ],
             failures,
+        )
+
+    def test_sdk_and_source_consumer_locks_have_no_chrono(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        for path in ("Cargo.lock", "tests/fixtures/grouped-condition-worker-consumer/Cargo.lock"):
+            names = {name for name, _ in CHECKER.crates_io_packages((root / path).read_text())}
+            self.assertNotIn("chrono", names, path)
+        self.assertEqual(
+            {lock for lock, _, _ in CHECKER.ACCEPTED},
+            {"scripts/acceptance/command-keys/consumer/Cargo.lock", "tests/nexus/Cargo.lock"},
         )
 
     def test_checks_every_committed_lock(self) -> None:

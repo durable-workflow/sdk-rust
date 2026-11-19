@@ -35,6 +35,7 @@ pub use pagination::{
 mod terminal_failure_detail;
 mod tls;
 mod update_outcome;
+mod wire_time;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
@@ -83,8 +84,11 @@ use std::{
 
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chrono::DateTime;
 use futures_util::{future::OptionFuture, task::noop_waker_ref};
+/// The timestamp library behind every public time value, such as
+/// [`WorkflowContext::replay_now`] and cancellation deadlines. Use this
+/// re-export so your `jiff` version always matches the SDK's.
+pub use jiff;
 pub use local_activity::LocalActivityOptions;
 pub use raw_request::{
     worker_protocol_compatible, HttpRefusal, RawMethod, RawRequest, RawResponse,
@@ -1030,7 +1034,7 @@ impl SearchAttributeValue {
             Self::DateTime(value) => {
                 let value =
                     normalize_string(value, "datetime", MAX_SEARCH_ATTRIBUTE_STRING_LENGTH)?;
-                if DateTime::parse_from_rfc3339(&value).is_err() {
+                if !wire_time::is_valid(&value) {
                     return Err(SearchAttributeUpdateError::InvalidDateTime(key.to_string()));
                 }
                 Ok(Self::DateTime(value))
@@ -1620,7 +1624,7 @@ impl ScheduleOrigin {
             .payload
             .get("occurrence_time")
             .and_then(Value::as_str)
-            .filter(|time| DateTime::parse_from_rfc3339(time).is_ok())
+            .filter(|time| wire_time::is_valid(time))
             .map(str::to_string);
         let trigger_number = event
             .payload
@@ -7731,7 +7735,7 @@ pub struct QueryContext {
     workflow_input_avro_value: AvroValue,
     history_events: Arc<Vec<HistoryEvent>>,
     signal_events: Arc<Vec<QuerySignal>>,
-    replay_time: Option<DateTime<chrono::Utc>>,
+    replay_time: Option<wire_time::Timestamp>,
 }
 
 impl QueryContext {
@@ -16677,8 +16681,7 @@ fn condition_reopen_timeout(
             .filter(|value| !value.is_null())
             .or_else(|| event.raw.get("recorded_at"))
             .and_then(Value::as_str)
-            .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-            .map(|time| time.with_timezone(&chrono::Utc))
+            .and_then(wire_time::parse_instant)
     };
     let opened_at = history
         .iter()
@@ -16696,7 +16699,7 @@ fn condition_reopen_timeout(
     let (Some(opened_at), Some(latest)) = (opened_at, latest) else {
         return Some(authored);
     };
-    let elapsed_ms = i128::from((latest - opened_at).num_milliseconds().max(0));
+    let elapsed_ms = latest.duration_since(opened_at).as_millis().max(0);
     let remaining_ms = i128::from(authored) * 1000 - elapsed_ms;
     if remaining_ms <= 0 {
         return Some(0);
@@ -17314,8 +17317,7 @@ impl ActivityContext {
     /// Producer acknowledgement time, with full fractional precision.
     pub fn last_heartbeat_at(
         &self,
-    ) -> std::result::Result<Option<&DateTime<chrono::Utc>>, ActivityHeartbeatResumeUnavailable>
-    {
+    ) -> std::result::Result<Option<&jiff::Timestamp>, ActivityHeartbeatResumeUnavailable> {
         Ok(self
             .last_heartbeat_checkpoint()?
             .map(|value| value.acknowledged_at()))
@@ -19622,7 +19624,7 @@ fn workflow_failure_command(
             "WorkflowCancellationRequested",
             "durable_workflow::CancellationScopeRequested",
             json!({"reason":"scope_cancelled", "request_id":cancellation.context.request_id(),
-                "cleanup_deadline_at":cancellation.context.deadline().to_rfc3339(),
+                "cleanup_deadline_at":wire_time::format_utc_auto_si(cancellation.context.deadline_instant()),
                 "cancellation":cancellation.context.to_value()}),
         ),
         Error::NonDeterministicReplay(_) => (

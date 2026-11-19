@@ -7,7 +7,8 @@ UUID decisions, command/history shapes and the cancellation budget clock are
 unchanged. Business decisions adopt the new accessor through ordinary workflow
 versioning.
 
-The accessor returns a recorded UTC `chrono::DateTime`, or
+The accessor returns a recorded `jiff::Timestamp` (re-exported as
+`durable_workflow::jiff`; 4.x returned `chrono::DateTime<Utc>`), or
 `Error::ReplayClockUnavailable` when the current invocation has no supported,
 validated time authority. It never substitutes wall time, a future history row,
 a maximum over all events, a task ID or an observation timestamp. Sequential

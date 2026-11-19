@@ -7,11 +7,9 @@ fn replay_clock_canonical_v1_uses_exact_signed_microseconds_across_epoch_boundar
     ))
     .unwrap();
     for row in table["vectors"].as_array().unwrap() {
-        let time = DateTime::parse_from_rfc3339(row["input"].as_str().unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        let time = crate::wire_time::parse_instant(row["input"].as_str().unwrap()).unwrap();
         assert_eq!(
-            time.timestamp_micros().to_string(),
+            time.as_microsecond().to_string(),
             row["utc_microseconds"].as_str().unwrap()
         );
         let ms = super::super::parallel::milliseconds(time).unwrap();
@@ -22,9 +20,9 @@ fn replay_clock_canonical_v1_uses_exact_signed_microseconds_across_epoch_boundar
             row["id"]
         );
         assert_eq!(
-            DateTime::<Utc>::from_timestamp_millis(ms)
-                .unwrap()
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            crate::wire_time::format_micros(
+                crate::wire_time::Timestamp::from_millisecond(ms).unwrap()
+            ),
             row["reconstructed"].as_str().unwrap()
         );
     }
@@ -45,8 +43,6 @@ fn replay_clock_canonical_v1_handles_signed_integer_limits_without_float_or_abs_
     ] {
         assert_eq!(round_microseconds(micro), Some(ms));
     }
-    let too_precise = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.123456789Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let too_precise = crate::wire_time::parse_instant("2026-01-01T00:00:00.123456789Z").unwrap();
     assert!(super::super::parallel::milliseconds(too_precise).is_none());
 }

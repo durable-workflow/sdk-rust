@@ -21,12 +21,9 @@ fn near_expiry_affinity() -> Value {
         .duration_since(UNIX_EPOCH)
         .unwrap();
     let mut value = affinity();
-    value["lease_expires_at"] = json!(chrono::DateTime::from_timestamp(
-        deadline.as_secs() as i64,
-        deadline.subsec_nanos()
-    )
-    .unwrap()
-    .to_rfc3339());
+    value["lease_expires_at"] = json!(crate::wire_time::format_utc_auto_si(
+        jiff::Timestamp::new(deadline.as_secs() as i64, deadline.subsec_nanos() as i32).unwrap()
+    ));
     value
 }
 
