@@ -37,6 +37,8 @@ checksum. Record the package/source, Server index and executed platform digest,
 runner commit and file hash, timestamps, terminal result and cleanup in #216.
 
 The direct control covers four concurrent explicit signal/update retries,
+four racing first submissions on one key, generated-key recovery, changed
+name and run-target conflicts,
 typed integer-to-boolean intent conflicts with unchanged history, typed pending
 receipts, closed-run receipt recovery, continue-as-new retained identity and
 historical-run refusal, and foreign-namespace refusal with distinct local
@@ -44,19 +46,25 @@ workflow identities. It does not assert a fresh receipt's optional `retained`
 marker. During a running workflow, the fence assertion compares durable command
 events separately from normal worker bookkeeping.
 
-The separate `unicode_255_character_signal_key_is_accepted` test expresses the
-accepted character-count contract. It is expected to fail on native 3.9.1
-under [Server #1207](https://github.com/durable-workflow/server/pull/1207).
-Run it separately and record that outcome as `product-fail`, never as a passed
-command-key cohort:
+The separate `unicode_255_character_signal_key_is_accepted` test retains a
+255-character key (2-byte code points) across four concurrent retries, refuses
+changed input under it, and refuses 256 characters before sending. Native
+3.9.1 failed it; 3.9.2 and later pass.
 
-```sh
-CARGO_BUILD_JOBS=2 cargo test --manifest-path "$COMMAND_KEY_CONSUMER/Cargo.toml" \
-  --locked --test command_keys_server \
-  unicode_255_character_signal_key_is_accepted -- --ignored --exact
-```
+## One installed cohort
 
-Transport-loss coverage waits for the reviewed shared response-loss fixture.
-Legacy upgrade coverage waits for the producer-owned canonical seed. Passing
-the direct test alone does not complete #216 or prove exactly-once activity
-side effects.
+`run_cohort.sh` runs the whole installed Rust cohort against the exact
+published Server and crate it names: the two direct tests above in a fresh
+registry-only consumer (with `run_direct.py` owning one capped Server), then
+the bound adapter cells in `run_open.py`: postcommit response loss through the
+accepted shared proxy, synthetic legacy readback for open, completed and
+continued runs, the `two-rows`, `legacy-token` and `modern-raw` ambiguity
+shapes, and case-only keys. Run it as uid 1000 (the Server image user) with
+`COHORT_ROOT`, `RUST_IMAGE`, `LOSS_FIXTURE` and an owned `CONTAINER_PREFIX`.
+`.github/workflows/published-command-keys.yml` runs it on a hosted runner.
+
+The physical 3.8 upgrade cell (`--physical-*`) is not part of it: it needs the
+producer's frozen backup and seed receipts.
+
+Passing the direct test alone does not complete #216 or prove exactly-once
+activity side effects.

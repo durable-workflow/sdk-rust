@@ -2,6 +2,18 @@
 
 ## 4.20.0
 
+- A signal or update refused with HTTP 409 `request_id_ambiguous` is now typed:
+  `Error::is_request_id_ambiguous()` and `Error::request_id_ambiguous()` return
+  a `RequestIdAmbiguous` with the sent key, even when the Server does not echo
+  it (durable-workflow/.github#216). The Server answers this when a key
+  retained before it compared intent matches more than one command. Nothing
+  was written and no receipt was selected. It is never resent and is not a
+  `request_id_conflict`. `Error::Http` matching is unchanged.
+- `Client::update_workflow_receipt` and `WorkflowHandle::update_receipt` send
+  the same update as `update_workflow` and return the full receipt, including
+  `retained` and `intent_verified`. A legacy readback (`retained: true`,
+  `intent_verified: false`) is not a verified match, and the result-only
+  methods cannot show that. A pending update is returned as its receipt.
 - A workflow-task completion the Server refuses because recording it would
   exceed its history-transaction budget (HTTP 409 with reason
   `history_transaction_limit_exceeded` or `completion_budget_exceeded`) now

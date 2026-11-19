@@ -136,6 +136,21 @@ match client
 # }
 ```
 
+Keys are case-sensitive and 1 to 255 Unicode characters; a longer or empty key
+is refused before anything is sent.
+
+A key retained before the Server compared intent (for example a row written by
+an older Server and kept through an upgrade) reads back as the original receipt
+with `retained: true` and `intent_verified: false`. That is not a verified
+match: the Server could not check that the retry's name and arguments equal the
+original's. Signal receipts carry the flags; for an update, call
+`update_workflow_receipt` (or `WorkflowHandle::update_receipt`) to get the full
+receipt rather than only the result. If such a key matches more than one
+retained command, the Server selects no receipt, writes nothing and answers 409
+`request_id_ambiguous`: `Error::is_request_id_ambiguous()` and
+`Error::request_id_ambiguous()` report it with the key you sent. Inspect the
+workflow history, and use a new key for any new command.
+
 Older Servers (PHP Server 2.x and native up to 3.8) don't compare input under
 a key: a repeated signal key records a second signal, and an update retried
 with changed arguments returns the original receipt.
