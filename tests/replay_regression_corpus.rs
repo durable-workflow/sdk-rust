@@ -141,6 +141,9 @@ impl Drop for FixtureServer {
 
 /// Server-side only: the full history a suffix fixture's history pages serve.
 const AUTHORITATIVE_HISTORY: &str = "_corpus_authoritative_history";
+/// Server-side only: the 409 a history-limit fixture answers its first
+/// workflow-task completion with (.github#228).
+const HISTORY_LIMIT_REFUSAL: &str = "_corpus_history_limit_refusal";
 
 fn handle_request(
     stream: &mut TcpStream,
@@ -202,7 +205,12 @@ fn handle_request(
     let authority_refused = path.starts_with("/api/worker/workflow-tasks/")
         && path.ends_with("/heartbeat")
         && external.is_some_and(|input| input.refuse_claim);
+    let history_limit_refused = path.starts_with("/api/worker/workflow-tasks/")
+        && path.ends_with("/complete")
+        && request_number == 1
+        && task.get(HISTORY_LIMIT_REFUSAL).is_some();
     let body = match path.as_str() {
+        _ if history_limit_refused => task[HISTORY_LIMIT_REFUSAL].to_string(),
         "/api/cluster/info" => json!({"limits": {"max_payload_bytes": 2097152}}).to_string(),
         _ if storage_refused => json!({
             "reason": "storage_pressure",
@@ -259,6 +267,7 @@ fn handle_request(
             let mut delivered = task.clone();
             if let Some(fields) = delivered.as_object_mut() {
                 fields.remove(AUTHORITATIVE_HISTORY);
+                fields.remove(HISTORY_LIMIT_REFUSAL);
             }
             json!({"task": delivered}).to_string()
         }
@@ -291,7 +300,7 @@ fn handle_request(
         }
         _ => json!({"message": "not found"}).to_string(),
     };
-    let status = if authority_refused {
+    let status = if authority_refused || history_limit_refused {
         "409 Conflict"
     } else if storage_refused {
         "503 Service Unavailable"
@@ -491,6 +500,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         .ok_or_else(|| format!("{fixture_id}.workflow.type must be a string"))?;
     if workflow_type == "corpus.expired-query-snapshot" {
         return execute_expired_query_fixture(fixture).await;
+    }
+    if workflow_type == "corpus.history-limit-refusal" {
+        return execute_history_limit_refusal_fixture(fixture).await;
     }
     if !matches!(
         workflow_type,
@@ -1564,6 +1576,111 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         &format!("{fixture_id}.expected"),
     )?;
     Ok(Value::Object(observed))
+}
+
+/// .github#228: the fan-out a lowered history-transaction budget refuses.
+fn register_history_limit_fanout(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _input| async move {
+        let operations = (0..3)
+            .map(|_| ParallelOperation::activity("history.length", json!(["x".repeat(16)])))
+            .collect();
+        let results = ctx.join(operations).await?;
+        Ok(json!(results.len()))
+    });
+}
+
+/// .github#228: native Server 3.13.0 refuses the fan-out's completion with a
+/// typed 409 over its history-transaction budget. The official worker must
+/// fail the run once, on the same fence, with a non-retryable structural-limit
+/// command and never resend the refused completion. Observes every
+/// workflow-task request the worker sends.
+async fn execute_history_limit_refusal_fixture(fixture: &Value) -> Result<Value, String> {
+    let fixture_id = fixture["id"].as_str().unwrap_or("<unnamed>");
+    let refusal = fixture["worker_task"]["history_limit_refusal"].clone();
+    if refusal["reason"] != "history_transaction_limit_exceeded" {
+        return Err(format!(
+            "{fixture_id}.worker_task.history_limit_refusal must be the typed 409"
+        ));
+    }
+    let task_id = format!("regression-corpus-{fixture_id}");
+    let task = json!({
+        "task_id": task_id,
+        "workflow_id": format!("regression-corpus-{fixture_id}"),
+        "run_id": "regression-corpus-run",
+        "workflow_type": "corpus.history-limit-fanout",
+        "payload_codec": DEFAULT_CODEC,
+        "arguments": serde_json::to_value(encode_payload(&json!([]), DEFAULT_CODEC).unwrap()).unwrap(),
+        "history_events": [],
+        "workflow_task_attempt": 1,
+        "lease_owner": "regression-corpus-worker",
+        HISTORY_LIMIT_REFUSAL: refusal,
+    });
+    let server = FixtureServer::start(task, 0, None);
+    let client = Client::builder(server.base_url())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|error| format!("create replay corpus client: {error}"))?;
+    let mut worker = Worker::new(client, "regression-corpus")
+        .worker_id("regression-corpus-worker")
+        .poll_timeout(Duration::from_millis(10));
+    register_history_limit_fanout(&mut worker, "corpus.history-limit-fanout");
+    let handled = worker
+        .run_once()
+        .await
+        .map_err(|error| format!("{fixture_id} worker failed instead of settling: {error}"))?;
+    if handled != 1 {
+        return Err(format!("{fixture_id} handled {handled} tasks"));
+    }
+    let requests = server
+        .requests
+        .lock()
+        .expect("captured replay fixture requests")
+        .clone();
+    let prefix = format!("/api/worker/workflow-tasks/{task_id}/");
+    let mut sequence = Vec::new();
+    for request in requests
+        .iter()
+        .filter(|request| request.path.starts_with(&prefix))
+    {
+        let route = &request.path[prefix.len()..];
+        if route == "heartbeat" {
+            continue;
+        }
+        let body: Value = serde_json::from_str(&request.body)
+            .map_err(|error| format!("{fixture_id} sent invalid JSON: {error}"))?;
+        if body["lease_owner"] != "regression-corpus-worker" || body["workflow_task_attempt"] != 1 {
+            return Err(format!("{fixture_id} changed the original fence"));
+        }
+        let commands = body["commands"].as_array().cloned().unwrap_or_default();
+        let structural_prefix = format!(
+            "Structural limit exceeded: {}: ",
+            fixture["worker_task"]["history_limit_refusal"]["limit_kind"]
+                .as_str()
+                .unwrap_or_default()
+        );
+        sequence.push(json!({
+            "type": "workflow_task_request",
+            "route": route,
+            "command_types": commands.iter().map(|command| command["type"].clone()).collect::<Vec<_>>(),
+            "non_retryable": commands.iter().map(|command| command.get("non_retryable").cloned().unwrap_or(json!(false))).collect::<Vec<_>>(),
+            "structural_limit": commands.iter().map(|command| json!(command["message"].as_str().is_some_and(|message| message.starts_with(&structural_prefix)))).collect::<Vec<_>>(),
+            "exception_types": commands.iter().map(|command| command.get("exception_type").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(),
+        }));
+    }
+    let observed = json!({"command_sequence": sequence});
+    if let Some(expected_commands) = fixture.get("command_sequence") {
+        fixture_matches(
+            expected_commands,
+            &observed["command_sequence"],
+            &format!("{fixture_id}.command_sequence"),
+        )?;
+    }
+    fixture_matches(
+        &fixture["expected"],
+        &observed,
+        &format!("{fixture_id}.expected"),
+    )?;
+    Ok(observed)
 }
 
 async fn execute_expired_query_fixture(fixture: &Value) -> Result<Value, String> {

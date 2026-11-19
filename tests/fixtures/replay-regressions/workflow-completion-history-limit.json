@@ -1,0 +1,59 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-workflow-completion-history-limit",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "issues": ["durable-workflow/.github#228"],
+  "workflow": {"type": "corpus.history-limit-refusal", "payload_codec": "avro", "input": []},
+  "worker_task": {
+    "history_limit_refusal": {
+      "outcome": "completed",
+      "recorded": false,
+      "run_id": null,
+      "run_status": null,
+      "created_task_ids": [],
+      "reason": "history_transaction_limit_exceeded",
+      "limit_kind": "history_transaction_bytes",
+      "current_value": 65,
+      "configured_limit": 64,
+      "message": "Structural limit exceeded: history_transaction_bytes: this workflow task completion would write 65 history bytes in one transaction (limit 64)."
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "workflow_task_request",
+      "route": "complete",
+      "command_types": ["schedule_activity", "schedule_activity", "schedule_activity"],
+      "non_retryable": [false, false, false],
+      "structural_limit": [false, false, false]
+    },
+    {
+      "type": "workflow_task_request",
+      "route": "complete",
+      "command_types": ["fail_workflow"],
+      "non_retryable": [true],
+      "structural_limit": [true],
+      "exception_types": ["StructuralLimitExceeded"]
+    }
+  ],
+  "expected": {
+    "command_sequence": [
+      {
+        "type": "workflow_task_request",
+        "route": "complete",
+        "command_types": ["schedule_activity", "schedule_activity", "schedule_activity"],
+        "non_retryable": [false, false, false],
+        "structural_limit": [false, false, false]
+      },
+      {
+        "type": "workflow_task_request",
+        "route": "complete",
+        "command_types": ["fail_workflow"],
+        "non_retryable": [true],
+        "structural_limit": [true],
+        "exception_types": ["StructuralLimitExceeded"]
+      }
+    ]
+  }
+}
