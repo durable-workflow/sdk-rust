@@ -458,6 +458,8 @@ version markers, memo/search-attribute upserts and ordered parallel commands.
 Parallel callbacks run in command order. Activity timeout simulation, new select
 races, signals, child workflows, services, sessions, continue-as-new and cancellation require
 integration tests; unsupported commands return `Error::Testing` explicitly.
+`signal_external_workflow` is one of those integration-only commands, while
+`replay` resolves a recorded external signal from its history.
 This environment does not simulate queues, leases or deployment behavior.
 `max_steps(n)` bounds durable turns, commands and attempts (default 10,000);
 use `tokio::time::timeout` to bound asynchronous callbacks as well.
@@ -576,6 +578,54 @@ worker.register_workflow("reports.daily", |ctx, _input| async move {
 `occurrence_time` is `None` for a manual trigger, which records no occurrence.
 A continue-as-new successor keeps its predecessor's origin when the Server
 copies `ScheduleTriggered` into it (native Server 3.5.0 and later).
+
+## Signal another workflow
+
+`ctx.signal_external_workflow(workflow_id, signal_name, args)` signals another
+workflow in the same namespace as a durable workflow command. The Server
+records `ExternalSignalRequested` in the sender's history, delivers the signal
+in the same transaction and records the outcome beside it. Awaiting the call
+returns an `ExternalSignalResult`. Replay reads the recorded outcome and never
+sends the signal again. Add `.run_id(run_id)` to signal only one run of the
+target; without it the signal goes to the instance's current run.
+
+```rust,no_run
+# use durable_workflow::{Client, ExternalSignalOutcome, Worker, json};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "orders");
+worker.register_workflow("orders.approve", |ctx, _input| async move {
+    let sent = ctx
+        .signal_external_workflow("order-42", "approve", json!(["manager"]))
+        .await?;
+    match sent.outcome {
+        ExternalSignalOutcome::Delivered => Ok(json!("approved")),
+        // target_not_found, target_closed or rejected, with a stable reason
+        // such as instance_not_found, run_not_active or unknown_signal.
+        _ => Ok(json!({"not_delivered": sent.outcome.as_str(), "reason": sent.reason})),
+    }
+});
+# }
+```
+
+A failed delivery is a returned value, not an error: `outcome` is
+`TargetNotFound`, `TargetClosed` or `Rejected` and `reason` names why, so
+workflow code decides what to do. A delivered result carries the target run,
+the command and signal it recorded, and `retained: true` when the same command
+key had already been delivered. Arguments are encoded like child-workflow
+arguments.
+
+The call returns an error only for an invalid target or signal name
+(`Error::InvalidExternalSignal`, checked in workflow code before any command is
+emitted: a signal name must not be blank or contain a control character, and is
+at most 191 characters and 255 bytes, as the Server requires), for replay that no longer matches history (a
+different target, run, signal name or arguments at the recorded sequence is
+`Error::NonDeterministicReplay`), and for a Server that does not advertise the
+`signal_external_workflow` command. The Worker reads that advertisement from
+each workflow poll's `server_capabilities`. Without it the call returns
+`Error::SignalExternalWorkflowUnavailable` before anything is submitted. If the
+workflow returns that error, the Worker fails the workflow task, not the run.
+A native Server that includes Server #1134 advertises the command; published PHP Server
+2.x does not.
 
 ## Inspect a run's activities
 

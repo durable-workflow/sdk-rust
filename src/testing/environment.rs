@@ -31,7 +31,12 @@ impl WorkflowEnvironment {
 
     /// Reuse an application's complete registered workflow/activity set.
     /// Execution methods on this environment do not use the Worker's transport.
-    pub fn from_worker(worker: Worker) -> Self {
+    pub fn from_worker(mut worker: Worker) -> Self {
+        // Nothing here is submitted to a Server. A new external signal reaches
+        // the offline executor (an explicit unsupported command) or replay's
+        // divergence check instead of the Server capability refusal.
+        worker.signal_external_workflow_supported =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         Self {
             worker,
             last_history: None,
