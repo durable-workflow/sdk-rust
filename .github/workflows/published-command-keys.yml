@@ -61,7 +61,7 @@ jobs:
           sudo chown -R "$user:$(id -gn "$user")" "$state/source"
           sudo -u "$user" curl --fail --silent --show-error --proto '=https' --max-time 60 \
             --max-filesize 65536 "$LOSS_FIXTURE_URL" --output "$state/committed_response_loss.py"
-          echo "$LOSS_FIXTURE_SHA256  $state/committed_response_loss.py" | sha256sum -c -
+          echo "$LOSS_FIXTURE_SHA256  $state/committed_response_loss.py" | sudo -u "$user" sha256sum -c -
           sudo -u "$user" chmod 0600 "$state/committed_response_loss.py"
           {
             echo "COHORT_USER=$user"
