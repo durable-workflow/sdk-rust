@@ -2047,6 +2047,7 @@ impl Worker {
         }
         let memo_updates_supported =
             runtime_supports_workflow_memo_updates(response.server_capabilities.as_ref());
+        self.observe_workflow_poll_capabilities(response.server_capabilities.as_ref());
         let Some(claim) = response.task else {
             return Ok(ManagedPollOutcome::Idle);
         };
