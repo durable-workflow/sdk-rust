@@ -4,6 +4,9 @@ fn checked_predicate() -> Result<bool> {
     Ok(true)
 }
 
+// The predicate source text is the fingerprinted contract input; rewriting it changes the vector.
+// `unknown_lints`: Rust 1.86 Clippy predates `manual_contains`.
+#[allow(unknown_lints, clippy::needless_question_mark, clippy::manual_contains)]
 #[test]
 fn macro_predicate_fingerprints_match_the_v1_contract() {
     let ctx = workflow_context(Vec::new());

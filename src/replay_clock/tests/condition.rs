@@ -37,7 +37,7 @@ fn observe(history: Vec<HistoryEvent>, timed_out: bool) -> Value {
     let inner = ctx.clone();
     let result = ready(&ctx, Box::pin(async move {
         let result = inner.wait_condition(options(timed_out), || panic!("persisted outcome must not evaluate a predicate")).await?;
-        Ok(AvroValue::from_serialize(&json!({"result":format!("{result:?}"),"time":inner.replay_now().ok().map(|t|t.to_rfc3339_opts(chrono::SecondsFormat::Micros,true))}))?)
+        AvroValue::from_serialize(&json!({"result":format!("{result:?}"),"time":inner.replay_now().ok().map(|t|t.to_rfc3339_opts(chrono::SecondsFormat::Micros,true))}))
     })).into_json().unwrap();
     assert!(ctx.take_commands().unwrap().is_empty());
     assert!(ctx.replay_now().is_err());
@@ -75,7 +75,7 @@ fn replay_now_persisted_condition_results_cold_replay_equal_and_backward_times()
                             }
                         );
                         assert_eq!(read(&inner), read(&inner));
-                        Ok(AvroValue::from_serialize(&read(&inner))?)
+                        AvroValue::from_serialize(&read(&inner))
                     }),
                 )
                 .into_json()

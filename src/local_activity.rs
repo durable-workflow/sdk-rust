@@ -474,7 +474,7 @@ impl Worker {
             let callback = self
                 .activities
                 .get(&activity_type)
-                .filter(|_| !total_deadline.is_some_and(|deadline| Instant::now() >= deadline));
+                .filter(|_| total_deadline.is_none_or(|deadline| Instant::now() < deadline));
             let mut future: ActivityFuture = match callback {
                 Some(callback) => {
                     self.activity_callback(callback, ctx, request.arguments.clone(), true)

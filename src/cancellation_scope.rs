@@ -583,7 +583,7 @@ impl Client {
                     || page["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
                 { return Err(invalid()); }
                 let batch = page["history_events"].as_array().ok_or_else(invalid)?;
-                if batch.len() > WORKFLOW_HISTORY_PAGE_SIZE as usize || batch.iter().any(|event| !event.is_object()) {
+                if batch.len() > WORKFLOW_HISTORY_PAGE_SIZE || batch.iter().any(|event| !event.is_object()) {
                     return Err(invalid());
                 }
                 token = match page.get("next_history_page_token") {

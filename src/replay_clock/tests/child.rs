@@ -64,9 +64,7 @@ fn replay_now_child_completion_and_caught_failure_cold_replay_exact_times() {
                     };
                     assert_eq!(failure.kind, ChildWorkflowFailureKind::Failed);
                     assert_eq!(failure.child_workflow_run_id.as_deref(), Some("run-2"));
-                    Ok(AvroValue::from_serialize(
-                        &json!({"completed":completed,"failed":read(&inner)}),
-                    )?)
+                    AvroValue::from_serialize(&json!({"completed":completed,"failed":read(&inner)}))
                 }),
             );
             assert_eq!(ctx.state.lock().unwrap().command_cursor, 2);

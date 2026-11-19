@@ -69,7 +69,7 @@ fn replay_now_deadline_loop_advances_and_cold_replays_identically() {
                 times.push(read(&future_ctx));
                 assert!(times.len()<=3);
             }
-            Ok(AvroValue::from_serialize(&json!({"times":times,"elapsed":(future_ctx.replay_now()?-initial).num_seconds()}))?)
+            AvroValue::from_serialize(&json!({"times":times,"elapsed":(future_ctx.replay_now()?-initial).num_seconds()}))
         })).into_json().unwrap()
     };
     let first = execute();
@@ -90,7 +90,7 @@ fn replay_now_uses_only_consumed_result_and_preserves_precision_and_backward_tim
         Box::pin(async move {
             assert_eq!(read(&inner), START);
             inner.sleep(Duration::from_secs(1)).await?;
-            Ok(AvroValue::from_serialize(&read(&inner))?)
+            AvroValue::from_serialize(&read(&inner))
         }),
     )
     .into_json()
@@ -177,12 +177,12 @@ fn replay_now_nested_contexts_and_error_exit_restore_scope() {
     let _outer = Guard::enter(&a);
     assert_eq!(read(&a), START);
     assert!(b.replay_now().is_err());
-    let result: Result<()> = (|| {
+    let result: Result<()> = {
         let _inner = Guard::enter(&b);
         assert!(a.replay_now().is_err());
         assert_eq!(read(&b), START);
         Err(Error::WorkerLoop("test error".into()))
-    })();
+    };
     assert!(result.is_err());
     assert_eq!(read(&a), START);
     {
@@ -199,7 +199,7 @@ async fn replay_now_concurrent_workflows_have_independent_scopes() {
         let inner = ctx.clone();
         let result = ready(
             &ctx,
-            Box::pin(async move { Ok(AvroValue::from_serialize(&read(&inner))?) }),
+            Box::pin(async move { AvroValue::from_serialize(&read(&inner)) }),
         );
         assert!(ctx.replay_now().is_err());
         result
@@ -211,7 +211,7 @@ async fn replay_now_concurrent_workflows_have_independent_scopes() {
         let inner = ctx.clone();
         ready(
             &ctx,
-            Box::pin(async move { Ok(AvroValue::from_serialize(&read(&inner))?) }),
+            Box::pin(async move { AvroValue::from_serialize(&read(&inner)) }),
         )
     });
     assert_ne!(a.await.unwrap(), b.await.unwrap());
@@ -276,12 +276,12 @@ fn replay_now_snapshot_prefix_and_update_handler_are_exact_and_immutable() {
         START,
     );
     assert_eq!(
-        update_time(&[accepted.clone()], "u1")
+        update_time(std::slice::from_ref(&accepted), "u1")
             .unwrap()
             .timestamp_subsec_micros(),
         123456
     );
-    assert!(update_time(&[accepted.clone()], "u2").is_none());
+    assert!(update_time(std::slice::from_ref(&accepted), "u2").is_none());
     assert!(update_time(&[accepted.clone(), accepted], "u1").is_none());
 }
 

@@ -94,7 +94,7 @@ async fn published_worker_completes_inline_fanout_and_fails_an_oversized_batch()
         .await
         .unwrap();
     let result = tokio::select! {
-        result = normal.result(options.clone()) => result.unwrap(),
+        result = normal.result(options) => result.unwrap(),
         exit = &mut running => panic!("worker stopped during normal fanout: {exit:?}"),
     };
     assert_eq!(result, json!({"count":300,"bytes_each":10_000}));
@@ -117,7 +117,7 @@ async fn published_worker_completes_inline_fanout_and_fails_an_oversized_batch()
         .await
         .unwrap();
     let error = tokio::select! {
-        result = oversized.result(options.clone()) => result.unwrap_err(),
+        result = oversized.result(options) => result.unwrap_err(),
         exit = &mut running => panic!("worker stopped instead of recording structural failure: {exit:?}"),
     };
     let Error::WorkflowFailed(outcome) = error else {

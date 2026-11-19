@@ -1471,7 +1471,7 @@ impl Client {
             let events = value["history_events"]
                 .as_array()
                 .ok_or_else(|| invalid("claim history page must contain an event array"))?;
-            if events.len() > WORKFLOW_HISTORY_PAGE_SIZE as usize {
+            if events.len() > WORKFLOW_HISTORY_PAGE_SIZE {
                 return Err(invalid(
                     "claim history page exceeds its requested event limit",
                 ));
@@ -1730,7 +1730,7 @@ impl Client {
                     return Err(invalid("canonical history page changed the selected task/attempt"));
                 }
                 let events = page["history_events"].as_array().ok_or_else(|| invalid("canonical history page must contain an event array"))?;
-                if events.len() > WORKFLOW_HISTORY_PAGE_SIZE as usize {
+                if events.len() > WORKFLOW_HISTORY_PAGE_SIZE {
                     return Err(invalid("canonical history page exceeds its requested event limit"));
                 }
                 token = match page.get("next_history_page_token") {

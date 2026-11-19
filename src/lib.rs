@@ -4419,6 +4419,8 @@ impl Client {
     }
 
     /// Register a worker and explicitly advertise additive worker capabilities.
+    // Public signature; bundling the arguments would break callers.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_worker_with_capabilities(
         &self,
         worker_id: &str,
@@ -6331,13 +6333,11 @@ fn worker_fenced_completion_retry_after(
         .and_then(|tail| tail.strip_suffix("/complete"))
     {
         ("complete_workflow_task", task_id, "workflow_task_attempt")
-    } else if let Some(task_id) = path
-        .strip_prefix("/worker/activity-tasks/")
-        .and_then(|tail| tail.strip_suffix("/complete"))
-    {
-        ("complete_activity_task", task_id, "activity_attempt_id")
     } else {
-        return None;
+        let task_id = path
+            .strip_prefix("/worker/activity-tasks/")
+            .and_then(|tail| tail.strip_suffix("/complete"))?;
+        ("complete_activity_task", task_id, "activity_attempt_id")
     };
     if task_id.is_empty() || task_id.contains('/') {
         return None;
@@ -10580,8 +10580,10 @@ impl Worker {
             self.task_queue.clone(),
             task.payload_codec.clone(),
             resume_signal,
-            self.allow_cancellation_scope_authoring,
-            self.allow_cancellation_scope_delivery,
+            CancellationScopeAllowance {
+                authoring: self.allow_cancellation_scope_authoring,
+                delivery: self.allow_cancellation_scope_delivery,
+            },
         )?;
         workflow_state.observation_namespace = Some(self.client.namespace.clone());
         workflow_state.signal_external_workflow_supported = self
@@ -10657,7 +10659,7 @@ impl Worker {
                     return Err(error);
                 }
             }
-            return self.message_stream_decision(&ctx, ctx.take_commands()?);
+            return self.message_stream_decision(ctx, ctx.take_commands()?);
         }
 
         match outcome {
@@ -10669,7 +10671,7 @@ impl Worker {
                     "type": "complete_workflow",
                     "result": result
                 }));
-                self.message_stream_decision(&ctx, commands)
+                self.message_stream_decision(ctx, commands)
             }
             Poll::Ready(Err(error)) => {
                 if let Error::ContinueAsNew(request) = error {
@@ -10678,7 +10680,7 @@ impl Worker {
                         commands.push(command);
                     }
                     ctx.ensure_history_consumed()?;
-                    return self.message_stream_decision(&ctx, commands);
+                    return self.message_stream_decision(ctx, commands);
                 }
                 if workflow_task_integrity_error(&error) {
                     // Replay and protocol failures describe the workflow-task
@@ -10693,16 +10695,16 @@ impl Worker {
                 let mut commands = ctx.take_commands()?;
                 commands.push(workflow_failure_command(
                     &error,
-                    recorded_activity_failure_boundary(&ctx, &error),
+                    recorded_activity_failure_boundary(ctx, &error),
                 ));
-                self.message_stream_decision(&ctx, commands)
+                self.message_stream_decision(ctx, commands)
             }
             Poll::Pending => {
                 let commands = ctx.take_commands()?;
                 if commands.is_empty() && !ctx.matched_recorded_pending()? {
                     Err(Error::WorkflowYieldedWithoutCommand)
                 } else {
-                    self.message_stream_decision(&ctx, commands)
+                    self.message_stream_decision(ctx, commands)
                 }
             }
         }
@@ -10768,16 +10770,14 @@ impl Worker {
                 ));
             }
         }
-        if state.cancellation_delivery_intent.is_some()
-            && commands.len() != state.cancellation_delivery_command_count
+        if let Some(intent) = state
+            .cancellation_delivery_intent
+            .as_ref()
+            .filter(|_| commands.len() != state.cancellation_delivery_command_count)
         {
             return Err(invalid_recorded_history(
                 "cooperative_cancellation_pending_call_escaped",
-                state
-                    .cancellation_delivery_intent
-                    .as_ref()
-                    .expect("pending delivery")
-                    .sequence,
+                intent.sequence,
                 "only commands preceding the pending cancellation call",
                 "commands authored after a suspended call",
                 "workflow code cannot publish work beyond an uncommitted cancellation boundary",
@@ -10906,19 +10906,18 @@ impl Worker {
             heartbeat_resume,
         } = invocation;
         validate_activity_task_payloads(&task)?;
-        if worker_session.is_some() {
-            if task.lease_owner.as_deref() != Some(self.worker_id.as_str())
+        if worker_session.is_some()
+            && (task.lease_owner.as_deref() != Some(self.worker_id.as_str())
                 || task
                     .activity_attempt_id
                     .as_deref()
                     .or(task.attempt_id.as_deref())
                     .is_none_or(str::is_empty)
-                || matches!((&task.activity_attempt_id,&task.attempt_id),(Some(a),Some(b)) if a != b)
-            {
-                return Err(Error::ActivityExecutionAbandoned(
-                    "session activity requires this worker's exact immutable claim".into(),
-                ));
-            }
+                || matches!((&task.activity_attempt_id,&task.attempt_id),(Some(a),Some(b)) if a != b))
+        {
+            return Err(Error::ActivityExecutionAbandoned(
+                "session activity requires this worker's exact immutable claim".into(),
+            ));
         }
 
         let handler = self
@@ -11277,7 +11276,7 @@ fn canonical_memo_entries(value: AvroValue, require_entries: bool) -> Result<Avr
     }
 
     for (key, value) in &entries {
-        if !valid_memo_key(&key) {
+        if !valid_memo_key(key) {
             return Err(Error::InvalidMemoUpdate(
                 "keys must match ^(?!-?[0-9]+$)[A-Za-z0-9_.:-]{1,64}$".to_string(),
             ));
@@ -11784,13 +11783,12 @@ impl WorkflowContext {
             .state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?;
-        if self.cancellation_scope_id != "root" && state.scope_delivery.is_some() {
-            return Ok(state
-                .scope_delivery
-                .as_ref()
-                .unwrap()
-                .contexts
-                .contains_key(&self.cancellation_scope_id));
+        if let Some(delivery) = state
+            .scope_delivery
+            .as_ref()
+            .filter(|_| self.cancellation_scope_id != "root")
+        {
+            return Ok(delivery.contexts.contains_key(&self.cancellation_scope_id));
         }
         Ok(state.cancel_requested
             || state
@@ -12724,6 +12722,13 @@ fn is_authored_command_open_event(event: &HistoryEvent) -> bool {
     )
 }
 
+/// Which cancellation-scope features a workflow state may use.
+#[derive(Clone, Copy)]
+struct CancellationScopeAllowance {
+    authoring: bool,
+    delivery: bool,
+}
+
 #[derive(Debug)]
 struct WorkflowState {
     observation_namespace: Option<String>,
@@ -12853,8 +12858,10 @@ impl WorkflowState {
             task_queue,
             payload_codec,
             resume_signal,
-            allow_cancellation_scope_authoring,
-            false,
+            CancellationScopeAllowance {
+                authoring: allow_cancellation_scope_authoring,
+                delivery: false,
+            },
         )
     }
 
@@ -12865,9 +12872,12 @@ impl WorkflowState {
         task_queue: String,
         payload_codec: String,
         resume_signal: Option<ResumeSignal>,
-        allow_cancellation_scope_authoring: bool,
-        allow_cancellation_scope_delivery: bool,
+        scopes: CancellationScopeAllowance,
     ) -> Result<Self> {
+        let CancellationScopeAllowance {
+            authoring: allow_cancellation_scope_authoring,
+            delivery: allow_cancellation_scope_delivery,
+        } = scopes;
         // The history budget counts every committed event, including any
         // the run's close recorded.
         let event_count = u64::try_from(history.len()).unwrap_or(u64::MAX);
@@ -13263,6 +13273,8 @@ struct SelectionCancellation {
     operation_identity: String,
 }
 
+// Left byte-identical in a lint-only change; equivalent to `saturating_add`.
+#[allow(clippy::manual_saturating_arithmetic)]
 fn recorded_selection_markers(events: &[HistoryEvent]) -> Result<Vec<SelectionMarker>> {
     let mut markers: Vec<SelectionMarker> = Vec::new();
     for event in events
@@ -13603,16 +13615,16 @@ fn recorded_child_policy_value<'a>(
     let Some(value) = payload.get(field).filter(|value| !value.is_null()) else {
         return Ok(None);
     };
-    let valid = match (field, value.as_str()) {
+    let valid = matches!(
+        (field, value.as_str()),
         (
             "parent_close_policy",
             Some("abandon" | "request_cancel" | "request_cancellation" | "terminate"),
-        ) => true,
-        ("cancellation_policy", Some("abandon" | "try_cancel" | "wait_cancellation_completed")) => {
-            true
-        }
-        _ => false,
-    };
+        ) | (
+            "cancellation_policy",
+            Some("abandon" | "try_cancel" | "wait_cancellation_completed")
+        )
+    );
     if !valid {
         return Err(invalid_recorded_history(
             "invalid_child_workflow_policy_history",
@@ -14192,9 +14204,7 @@ fn validate_parallel_operations(
             ParallelOperation::Activity {
                 options, arguments, ..
             } => {
-                options
-                    .validate()
-                    .map_err(|error| Error::InvalidActivityOptions(error))?;
+                options.validate().map_err(Error::InvalidActivityOptions)?;
                 if let Err(error) = arguments {
                     return Err(Error::InvalidParallelGroup(ParallelGroupError {
                         reason: "arguments_invalid",
@@ -15416,12 +15426,12 @@ fn validated_selection_resolution_sequence(
             continue;
         }
         if matches!(command, RecordedCommand::ConditionWait { .. }) {
-            if !matches!(
+            if !(matches!(
                 event.event_type.as_str(),
                 "ConditionWaitSatisfied" | "ConditionWaitTimedOut"
-            ) && !(event.event_type == "TimerFired"
+            ) || (event.event_type == "TimerFired"
                 && event.payload.get("timer_kind").and_then(Value::as_str)
-                    == Some("condition_timeout"))
+                    == Some("condition_timeout")))
             {
                 continue;
             }
@@ -16562,11 +16572,13 @@ impl Future for ConditionWaitCall {
                     return Poll::Ready(Err(error));
                 }
                 if let Err(error) = validate_recorded_condition_wait(
-                    sequence,
-                    recorded_occurrence_id,
-                    condition_key.as_deref(),
-                    predicate_identity,
-                    timeout_seconds,
+                    RecordedConditionWait {
+                        sequence,
+                        occurrence_id: recorded_occurrence_id,
+                        key: condition_key.as_deref(),
+                        predicate_identity,
+                        timeout_seconds,
+                    },
                     &occurrence_id,
                     &options,
                     cursor > initial_cursor,
@@ -16837,16 +16849,28 @@ impl ConditionWaitCall {
     }
 }
 
-fn validate_recorded_condition_wait(
+/// The identity recorded for one condition wait.
+struct RecordedConditionWait<'a> {
     sequence: u64,
-    recorded_occurrence_id: &str,
-    recorded_key: Option<&str>,
-    recorded_predicate_identity: &str,
-    recorded_timeout_seconds: Option<u64>,
+    occurrence_id: &'a str,
+    key: Option<&'a str>,
+    predicate_identity: &'a str,
+    timeout_seconds: Option<u64>,
+}
+
+fn validate_recorded_condition_wait(
+    recorded: RecordedConditionWait<'_>,
     current_occurrence_id: &str,
     current: &ValidatedConditionWaitOptions,
     physical_reopen: bool,
 ) -> Result<()> {
+    let RecordedConditionWait {
+        sequence,
+        occurrence_id: recorded_occurrence_id,
+        key: recorded_key,
+        predicate_identity: recorded_predicate_identity,
+        timeout_seconds: recorded_timeout_seconds,
+    } = recorded;
     if recorded_occurrence_id != current_occurrence_id {
         return Err(Error::NonDeterministicReplay(ReplayFailure::new(
             "condition_wait_occurrence_mismatch",
@@ -17796,9 +17820,7 @@ fn recorded_parallel_group_entry(payload: &Value, sequence: u64) -> Result<Paral
                     "selection member range overflowed",
                 )
             })?;
-        let group_end = base_sequence
-            .checked_add(u64::try_from(size).unwrap_or(u64::MAX))
-            .unwrap_or(u64::MAX);
+        let group_end = base_sequence.saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
         if sequence < member_base || sequence >= member_end || member_end > group_end {
             return Err(invalid_recorded_history(
                 "parallel_group_metadata_invalid",
@@ -20641,12 +20663,7 @@ mod tests {
         apply_parallel_group_path(&mut payload, std::slice::from_ref(inner));
         payload.insert("parallel_group_path".to_string(), json!(path));
         if let Some(result) = result {
-            let field = if event_type == "ChildRunCompleted" {
-                "result"
-            } else {
-                "result"
-            };
-            payload.insert(field.to_string(), fixture_envelope(result));
+            payload.insert("result".to_string(), fixture_envelope(result));
             payload.insert("payload_codec".to_string(), json!(DEFAULT_CODEC));
         }
         history_event(event_type, Value::Object(payload))
@@ -22998,7 +23015,6 @@ mod tests {
             "entry.replayed",
             move || {
                 observed.fetch_add(1, Ordering::SeqCst);
-                ()
             },
             |_ctx, _input: i64, _state| async move {
                 panic!("body must not start");
@@ -25848,7 +25864,7 @@ mod tests {
                         ParallelOperation::condition(
                             ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
                                 .timeout(Duration::from_secs(300)),
-                            move || Ok(approvals.signals("approve")?.len() >= 1),
+                            move || Ok(!approvals.signals("approve")?.is_empty()),
                         ),
                     ])
                     .await?;
@@ -25977,7 +25993,7 @@ mod tests {
             ParallelOperation::condition(
                 ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
                     .timeout(Duration::from_secs(300)),
-                move || Ok(approvals.signals("approve")?.len() >= 1),
+                move || Ok(!approvals.signals("approve")?.is_empty()),
             ),
         ]));
         let mut task_context = TaskContext::from_waker(noop_waker_ref());
@@ -26074,7 +26090,7 @@ mod tests {
             ParallelOperation::condition(
                 ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
                     .timeout(Duration::from_secs(300)),
-                move || Ok(approvals.signals("approve")?.len() >= 1),
+                move || Ok(!approvals.signals("approve")?.is_empty()),
             ),
         ]));
         let mut task_context = TaskContext::from_waker(noop_waker_ref());
@@ -35514,10 +35530,11 @@ mod tests {
     }
 
     type RequestOverride = fn(&str, &str, usize) -> Option<(&'static str, String)>;
+    type ResponseOverride = fn(&str) -> Option<(&'static str, String)>;
 
     #[derive(Clone, Copy, Default)]
     struct MockWorkerBehavior {
-        response_override: Option<fn(&str) -> Option<(&'static str, String)>>,
+        response_override: Option<ResponseOverride>,
         request_override: Option<RequestOverride>,
         /// Close the connection after reading the request, without any response.
         drop_request: Option<fn(&str, usize) -> bool>,

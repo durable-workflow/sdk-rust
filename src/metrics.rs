@@ -370,7 +370,7 @@ fn route(path: &str) -> &'static str {
                 let Some(segment) = actual.next() else {
                     return false;
                 };
-                if expected != segment && !(expected.starts_with('{') && !segment.is_empty()) {
+                if expected != segment && (!expected.starts_with('{') || segment.is_empty()) {
                     return false;
                 }
             }

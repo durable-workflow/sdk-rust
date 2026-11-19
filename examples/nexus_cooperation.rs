@@ -157,6 +157,8 @@ async fn run_caller(
     }
 }
 
+// Keeps `..default()` so the example still compiles if the options gain fields.
+#[allow(clippy::needless_update)]
 fn admission_options(
     operation: &str,
     key: Option<&str>,

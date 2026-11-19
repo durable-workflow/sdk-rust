@@ -33,9 +33,7 @@ fn observe(history: Vec<HistoryEvent>) -> Value {
             let arguments = inner.wait_signal("ready").await?;
             let observed = time(&inner);
             assert_eq!(observed, time(&inner));
-            Ok(AvroValue::from_serialize(
-                &json!({"arguments":arguments,"time":observed}),
-            )?)
+            AvroValue::from_serialize(&json!({"arguments":arguments,"time":observed}))
         }),
     )
     .into_json()
@@ -62,7 +60,7 @@ fn replay_now_signal_consumption_cold_replays_backward_and_equal_times() {
                     assert_eq!(read(&inner), SIGNAL_TIME);
                     assert_eq!(read(&inner), read(&inner));
                     assert_eq!(inner.wait_signal("ready").await?, vec![json!("delivery-2")]);
-                    Ok(AvroValue::from_serialize(&time(&inner))?)
+                    AvroValue::from_serialize(&time(&inner))
                 }),
             )
             .into_json()

@@ -1590,7 +1590,7 @@ impl Client {
                     return Err(invalid("scope history page changes its original claim"));
                 }
                 let batch = page["history_events"].as_array().ok_or_else(|| invalid("scope history page lacks canonical events"))?;
-                if batch.len() > WORKFLOW_HISTORY_PAGE_SIZE as usize || batch.iter().any(|event| !event.is_object()) {
+                if batch.len() > WORKFLOW_HISTORY_PAGE_SIZE || batch.iter().any(|event| !event.is_object()) {
                     return Err(invalid("scope history page exceeds its bounded complete shape"));
                 }
                 token = match page.get("next_history_page_token") {

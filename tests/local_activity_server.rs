@@ -301,7 +301,7 @@ async fn published_server_external_payloads_survive_local_completion_and_cold_re
         "isolated namespace external storage setup: {}",
         response.text().await.unwrap()
     );
-    let value = AvroValue::Bytes(vec![0, 255, 7, 128].repeat(2048));
+    let value = AvroValue::Bytes([0, 255, 7, 128].repeat(2048));
     let input = value.clone();
     let mut worker = Worker::new(client.clone(), &queue)
         .worker_id(format!("{queue}-original"))
@@ -316,7 +316,7 @@ async fn published_server_external_payloads_survive_local_completion_and_cold_re
         }
     });
     worker.register_activity_avro_value("external", |ctx, args| async move {
-        ctx.heartbeat(AvroValue::Bytes(vec![1, 254].repeat(2048)))
+        ctx.heartbeat(AvroValue::Bytes([1, 254].repeat(2048)))
             .await?;
         Ok(args)
     });

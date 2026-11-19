@@ -9,9 +9,11 @@ use tokio::{
 };
 
 pub const MIB: usize = 1024 * 1024;
+/// Request paths and bodies the fake server received, in order.
+pub type SentRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 pub struct Server {
     pub url: String,
-    pub sent: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    pub sent: SentRequests,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {

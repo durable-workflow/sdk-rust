@@ -2958,7 +2958,7 @@ fn transport_responses(path: &str, body: &str, number: usize) -> Option<(&'stati
             "oversized-page" => {
                 page["history_events"] = json!(vec![
                     json!({"event_type":"OpaqueUnrelatedEvent"});
-                    WORKFLOW_HISTORY_PAGE_SIZE as usize + 1
+                    WORKFLOW_HISTORY_PAGE_SIZE + 1
                 ])
             }
             "missing-request" => {
