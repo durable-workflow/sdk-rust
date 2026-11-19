@@ -159,6 +159,17 @@ impl WorkflowEnvironment {
                     )
                 }
             };
+        if !decision.commands.is_empty() && recorded_structural_limit_failure(history) {
+            // The worker failed this run because the Server refused the next
+            // completion over a structural limit (completion size or history
+            // budget, .github#228). The refused commands were never recorded,
+            // so replay reproduces them after the recorded command stream; the
+            // recorded failure, not a workflow decision, closed the run.
+            return Ok(ReplayReport {
+                completed: true,
+                commands: decision.commands,
+            });
+        }
         validate_commands(&decision.commands, sequence)?;
         validate_terminal(history, &decision.commands, sequence)?;
         Ok(ReplayReport {
@@ -173,6 +184,21 @@ fn terminal_command(command: &Value) -> bool {
         command["type"].as_str(),
         Some("complete_workflow" | "fail_workflow" | "continue_as_new")
     )
+}
+
+/// Whether the run closed with the structural-limit failure a Worker records
+/// when the Server refuses a completion as too large (413) or over its
+/// history-transaction budget (409). Only the SDK writes that failure, and
+/// only in place of the refused commands.
+fn recorded_structural_limit_failure(history: &WorkflowHistory) -> bool {
+    history.events().last().is_some_and(|event| {
+        event.event_type == "WorkflowFailed"
+            && event.payload["failure_category"] == "structural_limit"
+            && event.payload["exception_type"] == "StructuralLimitExceeded"
+            && event.payload["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Structural limit exceeded: "))
+    })
 }
 
 fn validate_commands(commands: &[Value], sequence: u64) -> Result<()> {

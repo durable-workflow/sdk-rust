@@ -907,6 +907,25 @@ To stay under the limit, split the fan-out into smaller batches across workflow
 tasks, move groups of work into child workflows, or continue as new; offload
 large payloads with external payload storage.
 
+The Server records a completion in one history transaction, bounded by its
+`history_transaction_size` (events), `history_transaction_bytes` and
+`history_transaction_rows` structural limits. `ActivityScheduled` events repeat
+their arguments, so a fan-out within the completion size can still exceed a
+lowered `DW_V2_LIMIT_HISTORY_TRANSACTION_BYTES`. Native Server 3.13.0 defaults
+that budget to four times the completion size limit and refuses a completion
+over it with HTTP 409 `history_transaction_limit_exceeded`, naming `limit_kind`,
+the measured `current_value` and the `configured_limit`; nothing is recorded.
+`Client::complete_workflow_task` returns `Error::WorkflowTaskHistoryLimitExceeded`
+for that refusal (and for `completion_budget_exceeded`), and a `Worker` handles
+it like the 413 above: one non-retryable `fail_workflow` whose message starts
+with `Structural limit exceeded: <limit kind>:`, with the same
+`structural_limit_*` exception properties in the limit's unit. Replaying the
+recorded failure produces the refused commands again; it is not a replay block,
+and `testing::WorkflowEnvironment::replay` reports such a history as completed
+rather than as a divergence.
+`tests/history_limit_server.rs` checks this against published native Server
+3.13.0 with a lowered budget. Other 409 responses are unchanged.
+
 ### Local activities
 
 Enable inline local execution with `Worker::new(client, queue).local_activities(true)`.

@@ -14,6 +14,24 @@
   `retained` and `intent_verified`. A legacy readback (`retained: true`,
   `intent_verified: false`) is not a verified match, and the result-only
   methods cannot show that. A pending update is returned as its receipt.
+- A workflow-task completion the Server refuses because recording it would
+  exceed its history-transaction budget (HTTP 409 with reason
+  `history_transaction_limit_exceeded` or `completion_budget_exceeded`) now
+  returns `Error::WorkflowTaskHistoryLimitExceeded`, carrying the Server's
+  `limit_kind`, measured `current_value` and `configured_limit` (native Server
+  3.13.0 names all three). A `Worker` never resends that completion: it
+  completes the same task once with a non-retryable `fail_workflow` command
+  whose message starts with `Structural limit exceeded: <limit kind>:`, so the
+  run fails with failure category `structural_limit`. Before, the worker loop
+  surfaced the HTTP 409 and the run never progressed. This happens only when a
+  Server's `DW_V2_LIMIT_HISTORY_TRANSACTION_BYTES` (or its event or row budget)
+  is below what a completion records; native Server 3.13.0's default budget is
+  four times the completion size limit (durable-workflow/.github#228).
+- `testing::WorkflowEnvironment::replay` accepts a history that closed with
+  the structural-limit `WorkflowFailed` a Worker records for a refused
+  completion (413 or 409). The refused commands were never recorded, so replay
+  reports them with `completed: true` instead of an `unrecorded_command`
+  divergence. Any other recorded failure is checked as before.
 
 ## 4.19.0
 

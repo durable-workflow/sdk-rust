@@ -411,3 +411,60 @@ async fn metadata_updates_and_ordered_parallel_commands_replay_canonically() {
     );
     assert!(env.replay(env.last_history().unwrap()).unwrap().completed);
 }
+
+fn history_limit_fanout(count: usize) -> WorkflowEnvironment {
+    let mut env = WorkflowEnvironment::new().unwrap();
+    env.register_workflow("history.fanout", move |ctx, args| async move {
+        let size = args[1].as_u64().unwrap() as usize;
+        let payload = "x".repeat(size);
+        let operations = (0..count)
+            .map(|_| ParallelOperation::activity("history.length", json!([payload])))
+            .collect();
+        let results = ctx.join(operations).await?;
+        Ok(json!([results.len(), results.len() * size]))
+    });
+    env
+}
+
+// durable-workflow/.github#228: native Server 3.13.0 with
+// DW_V2_LIMIT_HISTORY_TRANSACTION_BYTES=65536 refused this 40 x 4 KB fan-out's
+// completion with 409 history_transaction_limit_exceeded, and the worker
+// recorded one structural-limit WorkflowFailed in place of the refused
+// commands. Replaying the export reproduces those commands, not a divergence.
+#[tokio::test]
+async fn a_recorded_structural_limit_failure_replays_to_the_refused_commands() {
+    let export: durable_workflow::Value = serde_json::from_str(include_str!(
+        "fixtures/history-transaction-limit-recorded-export.json"
+    ))
+    .unwrap();
+    let types: Vec<_> = export["history_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["StartAccepted", "WorkflowStarted", "WorkflowFailed"]
+    );
+    let history = WorkflowHistory::from_export(export.clone()).unwrap();
+    let report = history_limit_fanout(40).replay(&history).unwrap();
+    assert!(report.completed, "the recorded failure closed the run");
+    assert_eq!(report.commands.len(), 40);
+    assert!(report
+        .commands
+        .iter()
+        .all(|command| command["type"] == "schedule_activity"
+            && command["activity_type"] == "history.length"));
+
+    // Any other recorded failure still requires the workflow's own decision.
+    let mut ordinary = export;
+    let failed = &mut ordinary["history_events"][2]["payload"];
+    failed["failure_category"] = json!("application");
+    failed["exception_type"] = json!("RuntimeException");
+    let history = WorkflowHistory::from_export(ordinary).unwrap();
+    assert!(matches!(
+        history_limit_fanout(40).replay(&history),
+        Err(Error::NonDeterministicReplay(failure)) if failure.reason == "unrecorded_command"
+    ));
+}
