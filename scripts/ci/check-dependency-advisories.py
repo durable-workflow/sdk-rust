@@ -28,11 +28,16 @@ LOCKS = (
 # with this source in lock files for both the git and sparse index protocols.
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 OSV = "https://api.osv.dev/v1/querybatch"
-# Reviewed exceptions: (crate, advisory ID) -> reason. Each entry must be
+# Reviewed exceptions: (lock, crate, advisory ID) -> reason. Each entry must be
 # informational with no patched release, and must name the issue that removes it.
 # Matching hits are reported as warnings; any other advisory still fails.
+# The SDK itself no longer uses chrono (#283). These two locks record published
+# or historical 4.x SDK inputs, which depend on chrono until they are re-pinned
+# to a published 5.x release.
+_CHRONO = "informational unmaintained notice; lock pins a 4.x SDK that still uses chrono; re-pin to 5.x tracked in #283"
 ACCEPTED = {
-    ("chrono", "RUSTSEC-2026-0543"): "informational unmaintained notice with no patched release; replacement tracked in #283",
+    ("scripts/acceptance/command-keys/consumer/Cargo.lock", "chrono", "RUSTSEC-2026-0543"): _CHRONO,
+    ("tests/nexus/Cargo.lock", "chrono", "RUSTSEC-2026-0543"): _CHRONO,
 }
 BATCH = 500
 
@@ -116,7 +121,8 @@ def post_osv(body: dict) -> object:
 def check(locks: dict[str, str], post: Post, warnings: list[str] | None = None) -> list[str]:
     """Return one failure line per affected package or unusable lock.
 
-    Advisories listed in ACCEPTED for that exact crate are appended to warnings instead.
+    Advisories listed in ACCEPTED for that exact lock and crate are appended to
+    warnings instead.
     """
     failures = []
     for path, text in locks.items():
@@ -126,13 +132,14 @@ def check(locks: dict[str, str], post: Post, warnings: list[str] | None = None) 
             failures.append(f"{path}: {error}")
             continue
         for (name, version), ids in sorted(affected.items()):
-            accepted = [i for i in ids if (name, i) in ACCEPTED]
-            remaining = [i for i in ids if (name, i) not in ACCEPTED]
+            accepted = [i for i in ids if (path, name, i) in ACCEPTED]
+            remaining = [i for i in ids if (path, name, i) not in ACCEPTED]
             if remaining:
                 failures.append(f"{path}: {name} {version} is affected by {', '.join(remaining)}")
             if accepted and warnings is not None:
                 warnings.extend(
-                    f"{path}: {name} {version} has accepted {i} ({ACCEPTED[(name, i)]})" for i in accepted
+                    f"{path}: {name} {version} has accepted {i} ({ACCEPTED[(path, name, i)]})"
+                    for i in accepted
                 )
     return failures
 
