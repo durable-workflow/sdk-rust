@@ -12688,7 +12688,7 @@ fn is_authored_command_open_event(event: &HistoryEvent) -> bool {
     )
 }
 
-/// Which cancellation-scope features a replayed workflow state may use.
+/// Which cancellation-scope features a workflow state may use.
 #[derive(Clone, Copy)]
 struct CancellationScopeAllowance {
     authoring: bool,
@@ -13230,6 +13230,8 @@ struct SelectionCancellation {
     operation_identity: String,
 }
 
+// Left byte-identical in a lint-only change; equivalent to `saturating_add`.
+#[allow(clippy::manual_saturating_arithmetic)]
 fn recorded_selection_markers(events: &[HistoryEvent]) -> Result<Vec<SelectionMarker>> {
     let mut markers: Vec<SelectionMarker> = Vec::new();
     for event in events
@@ -13261,9 +13263,12 @@ fn recorded_selection_markers(events: &[HistoryEvent]) -> Result<Vec<SelectionMa
                 "selection winner history contains an incompatible group identity",
             ));
         }
-        let group_end = base_sequence.saturating_add(u64::try_from(group_size).unwrap_or(u64::MAX));
-        let member_end =
-            member_base_sequence.saturating_add(u64::try_from(member_size).unwrap_or(u64::MAX));
+        let group_end = base_sequence
+            .checked_add(u64::try_from(group_size).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
+        let member_end = member_base_sequence
+            .checked_add(u64::try_from(member_size).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
         if member_index >= group_size
             || member_base_sequence < base_sequence
             || member_end > group_end
@@ -16797,7 +16802,7 @@ impl ConditionWaitCall {
     }
 }
 
-/// The identity a history event recorded for one condition wait.
+/// The identity recorded for one condition wait.
 struct RecordedConditionWait<'a> {
     sequence: u64,
     occurrence_id: &'a str,
