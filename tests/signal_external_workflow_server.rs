@@ -33,6 +33,23 @@ fn register(worker: &mut Worker) {
     worker
         .declare_workflow_signals("g223.target", &["approve"])
         .unwrap();
+    // Two signals in separate turns, then later durable commands: each takes
+    // the next authored sequence (Server #1134 counts the request).
+    worker.register_workflow("g223.sequence", |ctx, input| async move {
+        let first = ctx
+            .signal_external_workflow(input[0].as_str().unwrap(), "approve", json!(["first"]))
+            .await?;
+        let second = ctx
+            .signal_external_workflow(input[1].as_str().unwrap(), "approve", json!(["second"]))
+            .await?;
+        let marker = ctx.side_effect(|| "after-signals".to_string())?;
+        ctx.start_timer(Duration::from_secs(1)).await?;
+        Ok(json!([
+            first.outcome.as_str(),
+            second.outcome.as_str(),
+            marker
+        ]))
+    });
     worker.register_workflow("g223.done", |_ctx, _input| async move { Ok(json!("done")) });
     worker.register_workflow("g223.sender", |ctx, input| async move {
         let target = input[0].as_str().unwrap().to_string();
@@ -190,6 +207,33 @@ async fn workflow_code_signals_other_workflows_durably() {
     assert_eq!(result!(release)["outcome"], "delivered");
     assert_eq!(result!(open), json!({"approved_by": ["manager", 7]}));
 
+    // Two signals in a row, then a side effect and a timer.
+    let first_id = format!("{queue}-seq-a");
+    let second_id = format!("{queue}-seq-b");
+    let first = client
+        .start_workflow("g223.target", &queue, &first_id, json!([]))
+        .await
+        .unwrap();
+    let second = client
+        .start_workflow("g223.target", &queue, &second_id, json!([]))
+        .await
+        .unwrap();
+    let sequence = client
+        .start_workflow(
+            "g223.sequence",
+            &queue,
+            &format!("{queue}-sequence"),
+            json!([first_id, second_id]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result!(sequence),
+        json!(["delivered", "delivered", "after-signals"])
+    );
+    assert_eq!(result!(first), json!({"approved_by": ["first"]}));
+    assert_eq!(result!(second), json!({"approved_by": ["second"]}));
+
     stop.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(15), running)
         .await
@@ -208,13 +252,19 @@ async fn workflow_code_signals_other_workflows_durably() {
         (&to_closed, "ExternalSignalFailed"),
         (&rejected, "ExternalSignalFailed"),
         (&release, "ExternalSignalDelivered"),
+        (&sequence, "ExternalSignalDelivered"),
     ] {
         let export = client
             .export_workflow_history(&handle.workflow_id, handle.run_id.as_deref().unwrap())
             .await
             .unwrap();
-        assert_eq!(events(&export, "ExternalSignalRequested").len(), 1);
-        assert_eq!(events(&export, resolution).len(), 1, "{export}");
+        let signals = if handle.workflow_id == sequence.workflow_id {
+            2
+        } else {
+            1
+        };
+        assert_eq!(events(&export, "ExternalSignalRequested").len(), signals);
+        assert_eq!(events(&export, resolution).len(), signals, "{export}");
         assert_eq!(events(&export, "WorkflowTaskFailed").len(), 0, "{export}");
         let report = env
             .replay(&WorkflowHistory::from_export(export).unwrap())
@@ -224,11 +274,28 @@ async fn workflow_code_signals_other_workflows_durably() {
         assert_eq!(report.commands[0]["type"], "complete_workflow");
     }
 
+    // Every authored command took its own sequence.
+    let export = client
+        .export_workflow_history(&sequence.workflow_id, sequence.run_id.as_deref().unwrap())
+        .await
+        .unwrap();
+    let sequence_of = |kind: &str| -> Vec<u64> {
+        events(&export, kind)
+            .iter()
+            .map(|event| event["payload"]["sequence"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(sequence_of("ExternalSignalRequested"), [1, 2], "{export}");
+    assert_eq!(sequence_of("ExternalSignalDelivered"), [1, 2], "{export}");
+    assert_eq!(sequence_of("SideEffectRecorded"), [3], "{export}");
+    assert_eq!(sequence_of("TimerScheduled"), [4], "{export}");
+    assert_eq!(sequence_of("TimerFired"), [4], "{export}");
+
     // The delivered target saw exactly one signal from the sender.
     let target_history = client
         .export_workflow_history(&target_id, target.run_id.as_deref().unwrap())
         .await
         .unwrap();
     assert_eq!(events(&target_history, "SignalReceived").len(), 1);
-    println!("PASS: delivered, target_not_found, target_closed and rejected external signals; cold replay submitted nothing");
+    println!("PASS: delivered, target_not_found, target_closed and rejected external signals; two signals then a side effect and timer at sequences 1-4; cold replay submitted nothing");
 }
