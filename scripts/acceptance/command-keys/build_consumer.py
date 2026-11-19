@@ -22,7 +22,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--rust-image", required=True, help="already present immutable official Rust image ID")
+    parser.add_argument("--container-prefix", default="sdk-rust-command-key-build",
+                        help="owned build container name prefix (letters, digits, dashes)")
     options = parser.parse_args()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", options.container_prefix):
+        parser.error("container prefix must be plain lowercase letters, digits and dashes")
     if (not options.work_dir.is_absolute() or options.work_dir.exists()
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", options.rust_image)):
         parser.error("require a new absolute work directory and immutable local Rust image ID")
@@ -47,7 +51,7 @@ def main():
     target = options.work_dir / "target"; target.mkdir(mode=0o700)
     docker_config = options.work_dir / "docker-config"; docker_config.mkdir(mode=0o700)
     docker = ["docker", "--config", str(docker_config)]
-    name = "sdk-rust-command-key-build-" + os.urandom(6).hex()
+    name = options.container_prefix + "-" + os.urandom(6).hex()
     owned = None
     started = datetime.now(timezone.utc).isoformat()
     try:
