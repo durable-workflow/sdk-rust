@@ -1972,6 +1972,7 @@ impl Worker {
             worker_session,
             hydration_claim,
             retry_info,
+            heartbeat_resume,
         } = invocation;
         validate_activity_task_payloads(task)?;
         let handler = self
@@ -1987,6 +1988,7 @@ impl Worker {
             activity_type: task.activity_type.clone(),
             attempt_number: task.attempt_number,
             retry_info,
+            heartbeat_resume,
             activity_execution_id: task.activity_execution_id.clone(),
             workflow_id: task.workflow_id.clone(),
             run_id: task.run_id.clone(),

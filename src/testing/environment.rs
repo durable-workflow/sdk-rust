@@ -119,6 +119,7 @@ impl WorkflowEnvironment {
     /// Newly emitted durable commands are divergences, including commands added
     /// after the recorded history ended. No activity callbacks are invoked.
     pub fn replay(&self, history: &WorkflowHistory) -> Result<ReplayReport> {
+        let _observations = crate::workflow_logging::ReconstructionGuard::enter();
         self.worker.validate_registration()?;
         let mut worker = self.worker.clone();
         if let Some(queue) = &history.task_queue {

@@ -66,6 +66,106 @@ Record the package checksum, Server digest, runner commit and cleanup alongside
 the result. Compiling the ignored test or using source dependencies is not
 published-artifact acceptance.
 
+### Local retry-delay observation
+
+`tests/local_retry_timing_server.rs` covers shared #219 through the ordinary
+published SDK Worker path. Copy it into a fresh exact-registry consumer with
+Tokio and serde_json. Bind the selected qualified native tuple and set
+`DURABLE_WORKFLOW_EXPECT_SERVER_VERSION` alongside the existing isolated
+numeric-loopback URL and synthetic-token variables. Run only
+`published_local_retries_repeat_last_and_replay_committed_results` with
+`--ignored --exact --nocapture`.
+
+Five local attempts with `[1, 2]` must record four retry delays `[1, 2, 2, 2]`
+and independently measured callback gaps no shorter than those delays. The
+empty-list case records four explicit zeros. Each case binds the run, logical
+activity and five attempts through public local ActivityRetryScheduled events.
+A replacement Worker instance then replays the committed local result after a
+signal, without another callback or changed history prefix. Empty-list gap
+measurements are retained without promising zero execution or queue latency.
+The caller owns exact package/build/producer/resource and cleanup evidence;
+compilation or the ordinary synthetic observer control is not installed proof.
+
+### Replay-aware logging feature acceptance
+
+`tests/workflow_logging_server.rs` checks the logging feature separately from
+the lifecycle/deadline cells. Copy it into the exact-package consumer with
+`tracing`, `sha2`, `serde_json`, and Tokio's `macros`, `rt-multi-thread`, and `time`
+features available. Preserve the caller's package checksum/source/lock proof;
+compiling this test against checkout source is preparation only.
+
+Select an isolated published Server through the same loopback fixture
+environment used above, with `DURABLE_WORKFLOW_EXPECT_SERVER_VERSION` set to
+that tuple's version. Run only the parent test:
+
+```sh
+cargo test --locked --test workflow_logging_server -- \
+  --ignored --exact published_logging_emits_once_per_committed_step_across_cold_worker_processes --nocapture
+```
+
+The parent registers one workflow, then executes four committed regions in
+four distinct worker processes. Public history proves each signal wait or
+completion before the next activation. Each process must emit exactly one new
+workflow log with the original namespace/workflow/run identity; the final
+result and all three signal deliveries must match. The worker entrypoint is
+invoked by the parent and is not a separate acceptance command. Each child has
+a 30-second bound and owned-process cleanup. The caller owns the Server and
+its state cleanup. This Linux qualifier executes the parent's running image
+through `/proc/self/exe`; child image hash, length, device and inode must match
+before SDK client construction and in the returned observation. The ordinary
+path-replacement control uses only a private executable copy and an inert
+marker, without SDK/Server inputs. This proof covers committed-prefix
+suppression across cold workers; uncommitted task retries may still repeat
+process logs.
+
+### Fired-timer redrive clock qualification
+
+`tests/replay_clock_redrive_server.rs` is an ignored Linux qualifier for the
+published-package Server #980 cohort. Copy it into a fresh exact-registry
+consumer with `chrono`, `sha2`, `serde_json` and Tokio available. The caller
+must bind the package/source/lock/build/executable and qualified native 3.11
+index/platform/source identities before selecting the runtime. Use the same
+isolated numeric-loopback environment and synthetic authentication as above.
+Run only the parent:
+
+```sh
+cargo test --locked --test replay_clock_redrive_server -- \
+  --ignored --exact published_timer_clock_survives_first_and_repeated_cold_redrive --nocapture
+```
+
+Three fresh processes execute the unchanged workflow definition: a successful
+activity, a real five-second timer, then the deliberately failing activity;
+the first redrive fails at that activity again and the repeated redrive
+succeeds. The test requires an actual nonzero-fraction source TimerFired,
+compares parsed full-precision UTC instants, preserves original histories and
+the recorded nonempty source-definition fingerprint, checks both complete
+timer payloads under the producer's closed rewrite rules, and checks the new
+shared timer-pair identities and immediate-predecessor reuse,
+and rejects timer tasks or waits across all stored statuses in each successor
+export. Only the failed activity may execute again. Rust ordinary entry-clock
+authority remains unavailable; redrive entry is checked against the original
+persisted run start. The caller receives the exact CLOCK_COHORT history and
+callback packet before cleanup.
+
+A distinct registration-only Worker in the parent keeps the same compiled
+workflow definition available during redrive admission. It never polls or runs
+a task. Before each redrive, the qualifier removes that registration, verifies
+the producer rejects admission with no successor/task or history change, then
+registers the exact definition again before the fresh child executes the run.
+The three execution Workers retain separate process and registration identities.
+
+The export's timers list is rebuilt from history and cannot prove physical
+timer-row absence. A complete installed receipt additionally needs a separately
+reviewed, consistent read-only observation of the actual owned synthetic DB,
+bound to these run IDs, collector source/hash, declared stage and immutable
+tuple. Count all statuses in workflow_run_timers, timer workflow_tasks and timer
+workflow_run_waits. Expected successor counts are zero; retain the original
+source inventory and history too. Do not substitute an open-waits view or a
+main-file-only copy of a live SQLite/WAL database. The caller owns this collector,
+its stopped/live snapshot method, resource/lifecycle review and exact cleanup;
+compiling the test or its public-history result alone is not full acceptance.
+The Security-owned stopped-copy helper is not part of this qualifier.
+
 ## Run
 
 Fetch tags first (`git fetch --tags origin`), then run:

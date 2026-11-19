@@ -495,6 +495,73 @@ Keep workflow command order deterministic:
 See the runnable [`workflow_testing`](examples/workflow_testing.rs) example and
 [`workflow_testing` tests](tests/workflow_testing.rs).
 
+## Workflow logging
+
+Use `ctx.logger()` for observations written from workflow code. It sends events
+to the application's existing `tracing` subscriber with the target
+`durable_workflow::workflow` and SDK-bound `namespace`, `workflow_instance_id`
+and `workflow_run_id` fields. No global subscriber is installed.
+
+```rust,no_run
+# use durable_workflow::{Client, Worker, json};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "orders");
+worker.register_workflow("order", |ctx, _input| async move {
+    ctx.logger().info("processing order");
+    let result = ctx.activity("charge", json!([])).await?;
+    ctx.logger().info("charge completed");
+    Ok(result)
+});
+# }
+```
+
+Ordinary `tracing` calls execute again when a worker reconstructs a workflow.
+The workflow logger suppresses the committed prefix, query/offline replay and
+completed histories, including after a cold worker replacement. It emits when
+execution reaches new code beyond that prefix. `ctx.replay_state()` exposes
+that live boundary as `WorkflowReplayState`; a retained context outside its
+invocation is `Unavailable`. Use the logger for observations and keep durable
+command order independent of the observation state.
+
+This is process logging. A log from an uncommitted task attempt can repeat if
+that attempt crashes or retries. It is not an exactly-once outbox. Keep host
+handlers bounded and nonblocking, for example with an application-owned logging
+queue, so they do not stall the worker. Unwinding subscriber panics are isolated
+from the workflow result; aborting processes and blocking handlers remain the
+application's responsibility.
+
+## Schedule origin
+
+A run started by a schedule can read the fire that started it with
+`ctx.schedule_origin()`. It returns a `ScheduleOrigin` with the `schedule_id`,
+the `occurrence_time` the scheduler evaluated (RFC 3339, as recorded) and the
+`trigger_number`, or `None` for a run that no schedule started. The value comes
+from the run's `ScheduleTriggered` history event, so it is available on the
+first workflow task and identical on replay.
+
+Use `occurrence_time` to pick the window a scheduled workflow processes. For a
+tick it is the jittered fire time. For a backfill it is the enumerated past
+occurrence. It is not the run's start time, so it does not drift with scheduler
+delay:
+
+```rust,no_run
+# use durable_workflow::{Client, Error, Worker, json};
+# fn configure(client: Client) {
+let mut worker = Worker::new(client, "reports");
+worker.register_workflow("reports.daily", |ctx, _input| async move {
+    let window_end = ctx
+        .schedule_origin()?
+        .and_then(|origin| origin.occurrence_time)
+        .ok_or_else(|| Error::Codec("start this workflow from a schedule".into()))?;
+    ctx.activity("reports.build", json!([window_end])).await
+});
+# }
+```
+
+`occurrence_time` is `None` for a manual trigger, which records no occurrence.
+A continue-as-new successor keeps its predecessor's origin when the Server
+copies `ScheduleTriggered` into it (native Server 3.5.0 and later).
+
 ## Inspect a run's activities
 
 Use `Client::get_run_activities(workflow_id, run_id)` next to the selected run's
@@ -617,6 +684,15 @@ compares the complete stored list and the other known policy fields exactly;
 changing an unused entry is also a policy change. The default remains one
 attempt with an empty backoff list.
 
+For generated backoff, `exponential_backoff(initial, coefficient, None)` selects
+no maximum interval. Nine total attempts with an initial one-second delay and
+coefficient two encode `1, 2, 4, 8, 16, 32, 64, 128` seconds. Pass `Some(maximum)`
+to cap the intervals explicitly. The attempt budget and original schedule-to-close
+deadline still bound retries; omission does not select a 60-second cap. Arithmetic
+or protocol overflow returns `ActivityOptionsErrorKind::BackoffOverflow` during
+validation. Replay preserves the recorded delay list. A cap that changes that
+list also changes the policy compared during replay.
+
 Activity handlers can use `ctx.activity_execution_id()` as the logical Server
 activity key, stable across retries, and read its `workflow_id()` and `run_id()`.
 These immutable optional accessors preserve the original claim. An older Server
@@ -666,6 +742,56 @@ promise a retry: non-retryable failures, cancellation, workflow closure and elap
 deadlines can end execution earlier. Local activities and direct `run_activity`
 tests have no received Server snapshot and report unknown policy; fresh
 `run_workflow` tests expose the modeled snapshot recorded in their history.
+
+### Acknowledged activity checkpoints
+
+A service activity claim can carry a read-only checkpoint from an earlier attempt
+of the same logical execution. The Worker advertises `activity_heartbeat_resume`
+and accepts its version-1 Server contract. `ctx.last_heartbeat_checkpoint()` returns
+`Ok(Some(checkpoint))` for received details, `Ok(None)` when the supported claim
+explicitly has no checkpoint, and `Err(ActivityHeartbeatResumeUnavailable)` when
+support or the participating claim fields are unavailable. Older Servers, unknown
+contract versions, inline local activities and Server-free tests are unavailable;
+they do not invent an empty checkpoint.
+
+`last_heartbeat_details()` and `last_heartbeat_at()` expose the same snapshot.
+`checkpoint.details_as::<T>()` deserializes application JSON, while
+`checkpoint.acknowledged_at()` retains a typed UTC timestamp and its fractional
+precision. `heartbeat_resume_version()` and `checkpoint.contract_version()` refer
+to the negotiated protocol; v1 supplies no checkpoint write-sequence number.
+
+```rust
+# use durable_workflow::{json, ActivityError, Client, Worker};
+# use serde::Deserialize;
+# #[derive(Deserialize)]
+# struct Progress { next_item: u64 }
+# let mut worker = Worker::new(Client::new("http://localhost:8080")?, "batch");
+worker.register_activity("batch", |ctx, _| async move {
+    let next_item = match ctx.last_heartbeat_checkpoint() {
+        Ok(Some(checkpoint)) => checkpoint.details_as::<Progress>()?.next_item,
+        Ok(None) => 0,
+        Err(_) => return Err(ActivityError::new(
+            "CheckpointUnavailable", "this activity requires acknowledged resume support"
+        ).non_retryable(true).into()),
+    };
+    Ok(json!({"next_item": next_item}))
+});
+# Ok::<(), durable_workflow::Error>(())
+```
+
+The received snapshot stays immutable throughout the invocation. Calling
+`heartbeat(...)` does not advance it, whether the write is acknowledged, rejected,
+stale, or its response is uncertain. A later attempt receives whatever checkpoint
+the Server retained; a lost response may follow a durable commit. Server v1
+resumes only recorded non-null details. Receipt of a checkpoint does not atomically
+commit an external business effect. Continue using stable application idempotency
+keys, provider reconciliation and external fencing when effects can repeat.
+Original retry policies and timeout budgets remain unchanged.
+
+The [bounded batch example](examples/CHECKPOINTED_BATCH.md) uses these accessors
+and a synthetic provider receipt store to explain failures around external commit
+and checkpoint acknowledgement. Its source tests are separate from published
+worker-loss qualification.
 
 Activity handlers can return an application-defined failure type with
 `ActivityError`. The same type, message and retry marker are reported for remote
@@ -1124,6 +1250,16 @@ qualification identity are preserved for older readers. Protocol and capability
 negotiation remain required for individual features.
 
 ## Development
+
+Default builds enable `msrv-1-86`, which keeps the builder-macro dependency pin
+needed by fresh Rust 1.86 consumers. If you disable default features and still
+require Rust 1.86, explicitly enable `msrv-1-86`.
+
+A host on a newer compiler can omit that feature to compose the SDK with the
+native Server library and its newer official Avro dependency. Without the pin,
+fresh dependency resolution can require a newer compiler. The native composition
+check uses Rust 1.88 or later; this opt-out does not change SDK runtime APIs or
+protocol negotiation.
 
 ```sh
 cargo fmt --all --check

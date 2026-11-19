@@ -30,6 +30,9 @@ mod business_clock;
 #[path = "replay_regression_corpus/redrive_successor_strictness.rs"]
 mod redrive_successor_strictness;
 
+#[path = "replay_regression_corpus/workflow_logging.rs"]
+mod workflow_logging;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TypedReplayContract {
     message: String,
@@ -528,6 +531,8 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.child-policy-author"
             | "corpus.activity-policy-author"
             | "corpus.business-replay-clock"
+            | "corpus.replay-aware-logging"
+            | "corpus.replay-aware-nexus-pending"
             | "corpus.business-replay-clock-child"
             | "corpus.business-replay-clock-signal"
             | "corpus.business-replay-clock-condition"
@@ -536,6 +541,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.business-replay-clock-parallel-timer"
             | "corpus.business-replay-clock-parallel-child"
             | "corpus.nexus-result"
+            | "corpus.schedule-origin-window"
             | "corpus.nexus-cancellation"
             | "corpus.run-closed-selection"
             | "corpus.run-closed-all-failure"
@@ -670,6 +676,10 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.replay-aware-logging" => workflow_logging::register(&mut worker, workflow_type),
+        "corpus.replay-aware-nexus-pending" => {
+            workflow_logging::register_nexus_pending(&mut worker, workflow_type)
+        }
         "corpus.business-replay-clock" => business_clock::register(&mut worker, workflow_type),
         "corpus.business-replay-clock-signal" => {
             business_clock::register_signal(&mut worker, workflow_type)
@@ -691,6 +701,19 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         }
         "corpus.business-replay-clock-child" => {
             business_clock::register_child(&mut worker, workflow_type)
+        }
+        "corpus.schedule-origin-window" => {
+            // .github#243: the window comes from the recorded occurrence.
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                Ok(match ctx.schedule_origin()? {
+                    Some(origin) => json!({
+                        "schedule_id": origin.schedule_id,
+                        "window_end": origin.occurrence_time,
+                        "trigger_number": origin.trigger_number,
+                    }),
+                    None => Value::Null,
+                })
+            });
         }
         "corpus.nexus-result" => {
             worker.register_workflow(workflow_type, |ctx, _| async move {
@@ -1357,7 +1380,13 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     } else {
         None
     };
-    let replay = worker.run_once().await;
+    let logs = Arc::new(workflow_logging::Capture::default());
+    let replay = if workflow_logging::is_fixture(workflow_type) {
+        use tracing::instrument::WithSubscriber;
+        worker.run_once().with_subscriber(logs.clone()).await
+    } else {
+        worker.run_once().await
+    };
     if fixture["worker_task"]["hydration_authority_refused"] == true {
         let requests = server.requests.lock().unwrap();
         if requests.iter().any(|request| {
@@ -1401,11 +1430,14 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 let failure = server.request_body(&failure_path).ok_or_else(|| {
                     format!("{fixture_id} did not acknowledge its pending history")
                 })?;
-                let observed = json!({
+                let mut observed = json!({
                     "command_sequence": [],
                     "waiting_for_history": true,
                     "task_failure": failure,
                 });
+                if workflow_logging::is_fixture(workflow_type) {
+                    observed["workflow_logs"] = logs.messages();
+                }
                 if let Some(expected_commands) = fixture.get("command_sequence") {
                     fixture_matches(
                         expected_commands,
@@ -1494,6 +1526,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             json!({"history_page_size": poll_history_page_size}),
         ),
     ]);
+    if workflow_logging::is_fixture(workflow_type) {
+        observed.insert("workflow_logs".into(), logs.messages());
+    }
     if let Some(worker_registration) = worker_registration {
         observed.insert("worker_registration".to_string(), worker_registration);
     }

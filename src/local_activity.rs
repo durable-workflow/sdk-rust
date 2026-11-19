@@ -461,6 +461,7 @@ impl Worker {
                 activity_type: activity_type.clone(),
                 attempt_number: number,
                 retry_info: crate::ActivityRetryInfo::new(number, None),
+                heartbeat_resume: Default::default(),
                 activity_execution_id: None,
                 workflow_id: task.workflow_id.clone(),
                 run_id: task.run_id.clone(),
@@ -734,8 +735,49 @@ fn local_retry_backoff_seconds(policy: Option<&Value>, number: u64) -> u64 {
 
 #[cfg(test)]
 mod local_retry_backoff_tests {
-    use super::local_retry_backoff_seconds;
+    use super::{local_retry_backoff_seconds, LocalActivityOptions};
+    use crate::ActivityRetryPolicy;
     use serde_json::json;
+    use std::time::Duration;
+
+    fn local_delays(policy: ActivityRetryPolicy) -> (serde_json::Value, Vec<u64>) {
+        let validated = LocalActivityOptions::new()
+            .retry_policy(policy)
+            .into_activity_options()
+            .validate()
+            .expect("valid local policy");
+        let policy = validated.retry_policy.expect("encoded retry policy");
+        let attempts = policy["max_attempts"].as_u64().unwrap();
+        let delays = (1..attempts)
+            .map(|number| local_retry_backoff_seconds(Some(&policy), number))
+            .collect();
+        (policy, delays)
+    }
+
+    #[test]
+    fn capped_exponential_local_policy_keeps_waiting_the_cap() {
+        // Generation stops at the cap; the repeat rule keeps every later
+        // local retry at the cap instead of retrying immediately.
+        let (policy, delays) = local_delays(ActivityRetryPolicy::new(7).exponential_backoff(
+            Duration::from_secs(1),
+            2,
+            Some(Duration::from_secs(4)),
+        ));
+        assert_eq!(policy["backoff_seconds"], json!([1, 2, 4]));
+        assert_eq!(delays, vec![1, 2, 4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn explicit_short_and_empty_local_lists_follow_the_documented_rule() {
+        let (_, short) = local_delays(
+            ActivityRetryPolicy::new(5)
+                .backoff_intervals([Duration::from_secs(1), Duration::from_secs(2)]),
+        );
+        assert_eq!(short, vec![1, 2, 2, 2]);
+        let (policy, empty) = local_delays(ActivityRetryPolicy::new(5).backoff_intervals([]));
+        assert_eq!(policy["backoff_seconds"], json!([]));
+        assert_eq!(empty, vec![0, 0, 0, 0]);
+    }
 
     #[test]
     fn repeats_the_final_entry_once_the_list_runs_out() {

@@ -1,6 +1,6 @@
 [package]
 name = "durable-workflow"
-version = "4.16.0"
+version = "4.19.0"
 edition = "2021"
 description = "Rust client and worker SDK for Durable Workflow Cloud and self-hosted Server"
 license = "MIT"
@@ -14,7 +14,7 @@ categories = ["api-bindings", "asynchronous"]
 include = ["/src/**", "/schema/**", "/examples/**", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/tests/fixtures/replay-regressions/published-php-complete-explicit-backoff.json", "/tests/fixtures/sdk-metrics-contract.json", "/tests/fixtures/workflow-task-completion-limits-v1-vectors.json", "/tests/fixtures/auth-configuration/static-credentials-v1.json"]
 
 [package.metadata.durable-workflow]
-product-train = "4.16.0"
+product-train = "4.19.0"
 compatibility-authority = "protocol-manifests"
 supported-server-versions = "2.0.0"
 supported-server-release-baselines = { "2" = "2.0.0", "3" = "3.0.2" }
@@ -107,7 +107,11 @@ name = "durable_workflow"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["msrv-1-86"]
+# Keep the legacy compiler dependency pin for default SDK builds. A host
+# already using a newer Rust toolchain may disable default features to
+# compose with libraries that require a newer builder macro.
+msrv-1-86 = ["dep:bon"]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 metrics-prometheus = ["dep:prometheus"]
 
@@ -120,7 +124,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 apache-avro = { version = "0.21", default-features = false }
 base64 = "0.22"
 # Keep apache-avro's dependency resolution compatible with the Rust 1.86 MSRV.
-bon = { version = "=3.8.1", default-features = false }
+bon = { version = "=3.8.1", default-features = false, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures-util = "0.3"
 # Keep reqwest's IDNA dependency resolution compatible with the Rust 1.86 MSRV.

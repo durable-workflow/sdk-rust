@@ -1,6 +1,37 @@
 # Changelog
 
-## Unreleased
+## 4.19.0
+
+- `WorkflowContext::schedule_origin()` returns the schedule fire that started
+  the run as a `ScheduleOrigin` (`schedule_id`, `occurrence_time`,
+  `trigger_number`), or `None` for a run no schedule started
+  (durable-workflow/.github#243). It reads the run's `ScheduleTriggered`
+  history event, so it is available on the first workflow task and identical
+  on replay. `occurrence_time` is the time the scheduler evaluated (the
+  jittered fire time for a tick, the enumerated time for a backfill), not the
+  run's start time, and is `None` for a manual trigger. Histories without the
+  event read `None`, so existing runs replay unchanged.
+
+## 4.18.0
+
+- The default `msrv-1-86` feature retains the existing compiler-compatibility
+  dependency pin. Modern hosts can disable it to compose the SDK with native
+  Server's newer official Avro dependency. Rust 1.86 consumers that disable
+  default features must explicitly enable `msrv-1-86`; an unpinned fresh graph
+  can require a newer compiler.
+
+- Service activity contexts expose negotiated, immutable acknowledged-heartbeat
+  checkpoint details and a typed acknowledgement time. Unsupported claims stay
+  unavailable, separately from a supported claim with no checkpoint. Heartbeat
+  writes do not optimistically advance the received snapshot.
+
+## 4.17.0
+
+- Workflow code can use `ctx.logger()` to send new-execution observations to
+  the application's `tracing` subscriber with namespace/workflow/run identity.
+  Committed replay, query reconstruction and discarded invocations stay quiet.
+  `ctx.replay_state()` exposes the live consumed-history boundary. Logs from
+  uncommitted task attempts may repeat on retry; handlers must be nonblocking.
 
 ## 4.16.0
 

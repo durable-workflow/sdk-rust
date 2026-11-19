@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod activity_checkpoint;
 mod activity_error;
 mod activity_hydration;
 mod activity_lease;
@@ -36,7 +37,10 @@ mod update_outcome;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
+mod workflow_logging;
+pub use workflow_logging::{WorkflowLogger, WorkflowReplayState};
 
+pub use activity_checkpoint::{ActivityHeartbeatCheckpoint, ActivityHeartbeatResumeUnavailable};
 pub use activity_error::ActivityError;
 pub use activity_retry::{ActivityAttemptLimit, ActivityRetryInfo};
 pub use cancellation_context::{
@@ -1509,6 +1513,53 @@ pub struct WorkflowIdentity {
     pub run_id: Option<String>,
 }
 
+/// The schedule fire that started a run, read from the run's own
+/// `ScheduleTriggered` history event.
+///
+/// `occurrence_time` is the time the scheduler evaluated, as recorded (RFC
+/// 3339): the jittered fire time for a tick, or the enumerated time for a
+/// backfill. It is not the run's actual start time. It is `None` for a fire
+/// recorded without an occurrence, such as a manual trigger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ScheduleOrigin {
+    pub schedule_id: String,
+    pub occurrence_time: Option<String>,
+    pub trigger_number: Option<u64>,
+}
+
+impl ScheduleOrigin {
+    /// The run's schedule origin from recorded history, or `None` when no
+    /// schedule started it.
+    fn from_history(history: &[HistoryEvent]) -> Option<Self> {
+        let event = history
+            .iter()
+            .find(|event| event.event_type == "ScheduleTriggered")?;
+        let schedule_id = event
+            .payload
+            .get("schedule_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?
+            .to_string();
+        let occurrence_time = event
+            .payload
+            .get("occurrence_time")
+            .and_then(Value::as_str)
+            .filter(|time| DateTime::parse_from_rfc3339(time).is_ok())
+            .map(str::to_string);
+        let trigger_number = event
+            .payload
+            .get("trigger_number")
+            .and_then(Value::as_u64)
+            .filter(|number| *number > 0);
+        Some(Self {
+            schedule_id,
+            occurrence_time,
+            trigger_number,
+        })
+    }
+}
+
 /// A successful child result together with its durable parent-child identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildWorkflowResult {
@@ -1841,6 +1892,9 @@ impl ActivityRetryPolicy {
     /// Generate durable retry intervals from `initial_interval` and `coefficient`.
     /// Each interval is capped by `maximum_interval`, when present, then rounded
     /// up to whole seconds. A 100 ms interval or cap therefore encodes one second.
+    /// Passing `None` selects no interval cap. The generated list still has a
+    /// finite attempt budget. Arithmetic or protocol overflow returns
+    /// [`ActivityOptionsErrorKind::BackoffOverflow`] during validation.
     /// Zero stays zero. This policy is separate from HTTP transport retries.
     pub fn exponential_backoff(
         mut self,
@@ -5001,7 +5055,13 @@ impl Client {
                     .authority
                     .refresh_delivery_session(&mut wire["task"])?;
             }
-            Ok(serde_json::from_value(wire)?)
+            let heartbeat_resume =
+                activity_checkpoint::HeartbeatResume::from_poll(&wire, &self.namespace)?;
+            let mut data: worker_session::SessionPollResponse = serde_json::from_value(wire)?;
+            if let Some(task) = data.task.as_mut() {
+                task.heartbeat_resume = heartbeat_resume;
+            }
+            Ok(data)
         };
         let mut data: worker_session::SessionPollResponse = match lease.as_ref() {
             Some(lease) => lease.authority.protect(loading).await?,
@@ -8806,6 +8866,7 @@ impl Worker {
                     Some(DURABLE_SELECTION_CAPABILITY.to_string()),
                     Some(MEMO_UPSERTS_CAPABILITY.to_string()),
                     Some(TYPED_SEARCH_ATTRIBUTES_CAPABILITY.to_string()),
+                    Some(activity_checkpoint::CAPABILITY.to_string()),
                     self.client
                         .local_activities_enabled
                         .then(|| "local_activities".to_string()),
@@ -10242,6 +10303,7 @@ impl Worker {
             self.allow_cancellation_scope_authoring,
             self.allow_cancellation_scope_delivery,
         )?;
+        workflow_state.observation_namespace = Some(self.client.namespace.clone());
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
         if let Some(canonical) = cancellation_history {
@@ -10558,6 +10620,7 @@ impl Worker {
             worker_session,
             hydration_claim,
             retry_info,
+            heartbeat_resume,
         } = invocation;
         validate_activity_task_payloads(&task)?;
         if worker_session.is_some() {
@@ -10605,6 +10668,7 @@ impl Worker {
             activity_type: task.activity_type,
             attempt_number: task.attempt_number,
             retry_info,
+            heartbeat_resume,
             activity_execution_id: task.activity_execution_id,
             workflow_id: task.workflow_id,
             run_id: task.run_id,
@@ -11171,6 +11235,18 @@ impl WorkflowContext {
                 .collect(),
         ))
     }
+    /// The schedule fire that started this run, or `None` if no schedule did.
+    ///
+    /// It comes from the run's recorded `ScheduleTriggered` history event, so
+    /// it is available on the first workflow task and identical on replay.
+    pub fn schedule_origin(&self) -> Result<Option<ScheduleOrigin>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        Ok(ScheduleOrigin::from_history(&state.history_events))
+    }
+
     /// Identity of the parent workflow currently being replayed.
     pub fn workflow_identity(&self) -> Result<WorkflowIdentity> {
         let state = self
@@ -12366,6 +12442,11 @@ fn is_authored_command_open_event(event: &HistoryEvent) -> bool {
 
 #[derive(Debug)]
 struct WorkflowState {
+    observation_namespace: Option<String>,
+    observation_terminal: bool,
+    // A pending recorded call consumes its descriptor before yielding. Cursor
+    // exhaustion alone therefore cannot make the surrounding poll live.
+    observation_pending: bool,
     workflow_id: Option<String>,
     run_id: Option<String>,
     task_queue: String,
@@ -12663,6 +12744,19 @@ impl WorkflowState {
                 })
             });
         Ok(Self {
+            observation_namespace: None,
+            observation_terminal: history.iter().any(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "WorkflowCompleted"
+                        | "WorkflowFailed"
+                        | "WorkflowCancelled"
+                        | "WorkflowTerminated"
+                        | "WorkflowTimedOut"
+                        | "WorkflowContinuedAsNew"
+                )
+            }),
+            observation_pending: false,
             workflow_command_identity: String::new(),
             workflow_stream_command_counter: 0,
             workflow_id,
@@ -14734,6 +14828,7 @@ impl Future for SelectCall {
                 // on, so an otherwise commandless replay remains legitimately
                 // pending instead of failing as an untracked yield.
                 state.matched_recorded_pending = true;
+                state.observation_pending = true;
             }
             marker
         };
@@ -15812,6 +15907,7 @@ impl ActivityCall {
                         return Poll::Ready(outcome.map_err(Error::ActivityFailed));
                     }
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.scheduled = true;
                     return Poll::Pending;
                 }
@@ -16010,6 +16106,7 @@ impl Future for TimerCall {
                         return Poll::Ready(Ok(()));
                     }
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.scheduled = true;
                     self.matched_pending = true;
                     return Poll::Pending;
@@ -16592,6 +16689,7 @@ impl ChildWorkflowCall {
                         return Poll::Ready(outcome.map_err(Error::ChildWorkflowFailed));
                     }
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.scheduled = true;
                     self.matched_pending = true;
                     return Poll::Pending;
@@ -16840,6 +16938,7 @@ impl SignalCall {
                     }
 
                     state.matched_recorded_pending = true;
+                    state.observation_pending = true;
                     self.opened_wait = true;
                     self.matched_pending = true;
                     return Poll::Pending;
@@ -16921,6 +17020,7 @@ pub struct ActivityContext {
     pub activity_type: String,
     pub attempt_number: u64,
     retry_info: ActivityRetryInfo,
+    heartbeat_resume: activity_checkpoint::HeartbeatResume,
     activity_execution_id: Option<String>,
     workflow_id: Option<String>,
     run_id: Option<String>,
@@ -16932,6 +17032,45 @@ pub struct ActivityContext {
 }
 
 impl ActivityContext {
+    /// Negotiated resume contract version for this claim; unavailable is `None`.
+    /// This is not a checkpoint write sequence.
+    pub fn heartbeat_resume_version(&self) -> Option<u64> {
+        self.heartbeat_resume.version()
+    }
+
+    /// The read-only acknowledged checkpoint supplied by this claim.
+    ///
+    /// `Ok(None)` means the supported claim explicitly has no checkpoint.
+    /// `Err(ActivityHeartbeatResumeUnavailable)` means the v1 contract was not
+    /// supplied. Inline local activities and Server-free tests are unavailable.
+    /// Heartbeat writes never change this received snapshot. Acknowledgement
+    /// does not atomically commit an external business effect.
+    pub fn last_heartbeat_checkpoint(
+        &self,
+    ) -> std::result::Result<Option<&ActivityHeartbeatCheckpoint>, ActivityHeartbeatResumeUnavailable>
+    {
+        self.heartbeat_resume.checkpoint()
+    }
+
+    /// Last acknowledged details, with unavailable distinct from no checkpoint.
+    pub fn last_heartbeat_details(
+        &self,
+    ) -> std::result::Result<Option<&Value>, ActivityHeartbeatResumeUnavailable> {
+        Ok(self
+            .last_heartbeat_checkpoint()?
+            .map(|value| value.details()))
+    }
+
+    /// Producer acknowledgement time, with full fractional precision.
+    pub fn last_heartbeat_at(
+        &self,
+    ) -> std::result::Result<Option<&DateTime<chrono::Utc>>, ActivityHeartbeatResumeUnavailable>
+    {
+        Ok(self
+            .last_heartbeat_checkpoint()?
+            .map(|value| value.acknowledged_at()))
+    }
+
     /// Logical Server activity execution ID, stable across that activity's retries.
     ///
     /// This is the received claim identity, including for worker-session activities.
@@ -23948,6 +24087,56 @@ mod tests {
         assert_eq!(commands[0]["schedule_to_start_timeout"], 10);
         assert_eq!(commands[0]["schedule_to_close_timeout"], 300);
         assert_eq!(commands[0]["heartbeat_timeout"], 15);
+    }
+
+    #[test]
+    fn exponential_backoff_without_maximum_keeps_growing_and_replays() {
+        let mut options = retry_activity_options();
+        options.retry_policy = Some(
+            ActivityRetryPolicy::new(9)
+                .exponential_backoff(Duration::from_secs(1), 2, None)
+                .non_retryable_error_type("PermanentError"),
+        );
+        let expected = json!([1, 2, 4, 8, 16, 32, 64, 128]);
+        let ctx = workflow_context(Vec::new());
+        let mut call = Box::pin(ctx.activity_with_options("flaky", options.clone(), json!([])));
+        let mut cx = TaskContext::from_waker(noop_waker_ref());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        let commands = ctx.take_commands().expect("one new schedule");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["retry_policy"]["max_attempts"], 9);
+        assert_eq!(commands[0]["retry_policy"]["backoff_seconds"], expected);
+
+        let mut history = completed_retry_activity_history();
+        history[0].payload["activity"]["retry_policy"]["max_attempts"] = json!(9);
+        history[0].payload["activity"]["retry_policy"]["backoff_seconds"] = expected;
+        history[2].payload["retry_backoff_seconds"] = json!(1);
+        let replay = workflow_context(history.clone());
+        let mut replay_call =
+            Box::pin(replay.activity_with_options("flaky", options.clone(), json!([])));
+        assert!(matches!(
+            replay_call.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(value)) if value == json!({"status":"recovered"})
+        ));
+        assert!(replay.take_commands().unwrap().is_empty());
+        replay
+            .ensure_history_consumed()
+            .expect("recorded history consumed");
+
+        options.retry_policy.as_mut().unwrap().backoff = Some(ActivityBackoff::Exponential {
+            initial_interval: Duration::from_secs(1),
+            coefficient: 2,
+            maximum_interval: Some(Duration::from_secs(60)),
+        });
+        let changed = workflow_context(history);
+        let mut changed_call = Box::pin(changed.activity_with_options("flaky", options, json!([])));
+        let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
+            changed_call.as_mut().poll(&mut cx)
+        else {
+            panic!("adding a cap must not reinterpret a recorded uncapped policy");
+        };
+        assert_eq!(failure.reason, "activity_retry_policy_mismatch");
+        assert!(changed.take_commands().unwrap().is_empty());
     }
 
     fn completed_worker_session_history(session: &WorkerSessionOptions) -> Vec<HistoryEvent> {
@@ -34259,6 +34448,7 @@ mod tests {
                 DURABLE_SELECTION_CAPABILITY,
                 MEMO_UPSERTS_CAPABILITY,
                 TYPED_SEARCH_ATTRIBUTES_CAPABILITY,
+                activity_checkpoint::CAPABILITY,
                 QUERY_TASKS_CAPABILITY,
                 WORKFLOW_UPDATES_CAPABILITY,
                 MESSAGE_STREAMS_CAPABILITY

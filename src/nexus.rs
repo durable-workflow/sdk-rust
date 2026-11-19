@@ -518,6 +518,7 @@ impl Future for NexusServiceCall {
                 );
             }
             state.matched_recorded_pending = true;
+            state.observation_pending = true;
             self.suspended = true;
             return Poll::Pending;
         }
