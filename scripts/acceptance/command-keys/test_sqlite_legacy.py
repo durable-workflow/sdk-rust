@@ -2,6 +2,7 @@
 from contextlib import closing
 from copy import deepcopy
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -112,17 +113,17 @@ class StoppedCopyTest(unittest.TestCase):
                 BEGIN UPDATE history SET payload=X'01'; END;
             """)
         original = self.source.read_bytes()
-        unlink = Path.unlink
+        discard = legacy._discard_created
         observed = []
 
-        def confirm_rollback(path, *args, **kwargs):
-            if path == self.destination:
-                with closing(sqlite3.connect(self.source)) as source, closing(sqlite3.connect(path)) as copied:
-                    self.assertEqual(legacy.snapshot(source), legacy.snapshot(copied))
-                observed.append(True)
-            return unlink(path, *args, **kwargs)
+        def confirm_nothing_written(directory, name, descriptor):
+            # The rolled-back transform never reaches the created copy.
+            self.assertEqual(self.destination.name, name)
+            self.assertEqual(0, os.fstat(descriptor).st_size)
+            observed.append(True)
+            return discard(directory, name, descriptor)
 
-        with patch.object(Path, "unlink", confirm_rollback):
+        with patch.object(legacy, "_discard_created", confirm_nothing_written):
             with self.assertRaisesRegex(ValueError, "outside the accepted transform"):
                 self.run_transform()
         self.assertEqual([True], observed)
