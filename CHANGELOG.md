@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- A signal or update refused with HTTP 409 `request_id_ambiguous` is now typed:
+  `Error::is_request_id_ambiguous()` and `Error::request_id_ambiguous()` return
+  a `RequestIdAmbiguous` with the sent key, even when the Server does not echo
+  it (durable-workflow/.github#216). The Server answers this when a key
+  retained before it compared intent matches more than one command. Nothing
+  was written and no receipt was selected. It is never resent and is not a
+  `request_id_conflict`. `Error::Http` matching is unchanged.
+- `Client::update_workflow_receipt` and `WorkflowHandle::update_receipt` send
+  the same update as `update_workflow` and return the full receipt, including
+  `retained` and `intent_verified`. A legacy readback (`retained: true`,
+  `intent_verified: false`) is not a verified match, and the result-only
+  methods cannot show that. A pending update is returned as its receipt.
+
 ## 4.19.0
 
 - `WorkflowContext::schedule_origin()` returns the schedule fire that started

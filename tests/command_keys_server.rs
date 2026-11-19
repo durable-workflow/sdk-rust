@@ -1,5 +1,5 @@
-//! Run unchanged in a registry-only consumer. Transport loss and legacy upgrade
-//! require the separately reviewed shared fixture and producer-owned seed.
+//! Run unchanged in a registry-only consumer. Transport loss and legacy
+//! readback run through `scripts/acceptance/command-keys/run_open.py`.
 use durable_workflow::{json, Client, Error, RawRequest, UpdateWaitStage, Value, Worker};
 use std::time::Duration;
 
@@ -35,7 +35,9 @@ fn fixture(client: Client, queue: &str) -> Worker {
         worker
             .declare_workflow_signals(name, &["finish", "touch", "other"])
             .unwrap();
-        worker.register_update(name, "mutate", |_, arguments| async move { Ok(arguments) });
+        for update in ["mutate", "other"] {
+            worker.register_update(name, update, |_, arguments| async move { Ok(arguments) });
+        }
     }
     worker
 }
@@ -118,12 +120,71 @@ async fn direct_cases() {
         .unwrap_err();
     assert!(error.is_request_id_conflict());
     assert_eq!(error.request_id().as_deref(), Some("signal-key"));
+    // A changed name or an explicit run target is a different intent too.
+    let error = client
+        .signal_workflow_with_request_id(&id, "other", json!([1]), "signal-key")
+        .await
+        .unwrap_err();
+    assert!(error.is_request_id_conflict(), "{error:?}");
+    let conflict = error.request_id_conflict().unwrap();
+    assert_eq!(conflict.request_id, "signal-key");
+    assert_eq!(
+        conflict.retained_command_id.as_deref(),
+        signal["command_id"].as_str()
+    );
+    let error = client
+        .signal_workflow_run_with_request_id(&id, run, "touch", json!([1]), "signal-key")
+        .await
+        .unwrap_err();
+    assert!(error.is_request_id_conflict(), "{error:?}");
     // Export metadata contains a fresh exported_at timestamp. Only durable
     // history events are a no-write invariant across two exports.
     assert_eq!(
         client.export_workflow_history(&id, run).await.unwrap()["history_events"],
         history["history_events"]
     );
+
+    // A generated key is returned on the receipt and retries like an explicit one.
+    let generated = client
+        .signal_workflow(&id, "touch", json!([2]))
+        .await
+        .unwrap();
+    let generated_key = generated["request_id"].as_str().unwrap().to_string();
+    assert!(generated_key.starts_with("sdk-rust-signal-"));
+    let retried = client
+        .signal_workflow_with_request_id(&id, "touch", json!([2]), &generated_key)
+        .await
+        .unwrap();
+    assert_eq!(retried["retained"], true);
+    assert_eq!(retried["command_id"], generated["command_id"]);
+
+    // Four first submissions racing on one fresh key admit one signal.
+    let mut racing = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        let id = id.clone();
+        racing.spawn(async move {
+            client
+                .signal_workflow_with_request_id(&id, "touch", json!([3]), "race-key")
+                .await
+                .unwrap()
+        });
+    }
+    let mut raced = Vec::new();
+    while let Some(receipt) = racing.join_next().await {
+        raced.push(receipt.unwrap());
+    }
+    assert!(raced[0]["command_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert!(
+        raced
+            .iter()
+            .all(|receipt| receipt["command_id"] == raced[0]["command_id"]
+                && receipt["run_id"] == run)
+    );
+    let history = client.export_workflow_history(&id, run).await.unwrap();
+    assert_eq!(count(&history, "SignalReceived"), 3);
 
     let pending = match client
         .update_workflow(&id, "mutate", json!([1]), Some("update-key"))
@@ -163,6 +224,16 @@ async fn direct_cases() {
         .unwrap_err();
     assert!(error.is_request_id_conflict());
     assert_eq!(error.request_id().as_deref(), Some("update-key"));
+    let error = client
+        .update_workflow(&id, "other", json!([1]), Some("update-key"))
+        .await
+        .unwrap_err();
+    assert!(error.is_request_id_conflict(), "{error:?}");
+    let retained = error.request_id_conflict().unwrap().retained_command_id;
+    assert!(retained.is_some());
+    if let Some(command_id) = pending.receipt["command_id"].as_str() {
+        assert_eq!(retained.as_deref(), Some(command_id));
+    }
     assert_eq!(
         client.export_workflow_history(&id, run).await.unwrap()["history_events"],
         history["history_events"]
@@ -356,7 +427,7 @@ async fn direct_cases() {
 }
 
 #[tokio::test]
-#[ignore = "published native 3.9.1 fails this accepted contract; Server #1207 owns correction"]
+#[ignore = "requires an isolated published Server advertising command_request_keys"]
 async fn unicode_255_character_signal_key_is_accepted() {
     let client = client("default");
     assert_eq!(
@@ -369,10 +440,41 @@ async fn unicode_255_character_signal_key_is_accepted() {
         .start_workflow("keys.wait", &queue, &queue, json!([0]))
         .await
         .unwrap();
-    client
-        .signal_workflow_with_request_id(&queue, "touch", json!([1]), &"λ".repeat(255))
+    let key = "λ".repeat(255);
+    let original = client
+        .signal_workflow_with_request_id(&queue, "touch", json!([1]), &key)
         .await
         .expect("255 Unicode characters are valid command keys");
+    let mut retries = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        let (queue, key) = (queue.clone(), key.clone());
+        retries.spawn(async move {
+            client
+                .signal_workflow_with_request_id(&queue, "touch", json!([1]), &key)
+                .await
+                .unwrap()
+        });
+    }
+    while let Some(receipt) = retries.join_next().await {
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt["retained"], true);
+        assert_eq!(receipt["command_id"], original["command_id"]);
+        assert_eq!(receipt["request_id"].as_str(), Some(key.as_str()));
+    }
+    let error = client
+        .signal_workflow_with_request_id(&queue, "touch", json!([2]), &key)
+        .await
+        .unwrap_err();
+    assert!(error.is_request_id_conflict(), "{error:?}");
+    let error = client
+        .signal_workflow_with_request_id(&queue, "touch", json!([1]), &"λ".repeat(256))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Codec(_)),
+        "256 characters are refused locally: {error:?}"
+    );
     let history = client
         .export_workflow_history(&queue, workflow.run_id.as_deref().unwrap())
         .await
