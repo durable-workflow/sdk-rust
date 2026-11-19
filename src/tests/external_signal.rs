@@ -262,6 +262,84 @@ fn invalid_targets_are_refused_before_submitting() {
     assert_eq!(commands[0]["type"], "signal_external_workflow");
 }
 
+/// Run one signal name through workflow code: the refusal message, or the
+/// emitted command's signal name.
+fn signal_name_outcome(signal_name: String) -> std::result::Result<Value, String> {
+    let mut worker = Worker::new(
+        Client::builder("http://127.0.0.1:1").build().unwrap(),
+        "queue",
+    );
+    worker.register_workflow(WORKFLOW, move |ctx, _input| {
+        let signal_name = signal_name.clone();
+        async move {
+            match ctx
+                .signal_external_workflow("order-42", signal_name, json!([]))
+                .await
+            {
+                Err(Error::InvalidExternalSignal(message)) => Ok(json!({"refused": message})),
+                other => Ok(json!(format!("unexpected: {other:?}"))),
+            }
+        }
+    });
+    worker.observe_workflow_poll_capabilities(Some(&advertised()));
+    let commands = worker.execute_workflow_task(task(vec![])).unwrap();
+    match commands[0]["type"].as_str() {
+        Some("signal_external_workflow") => Ok(commands[0]["signal_name"].clone()),
+        _ => {
+            // A refusal emits no command: only the workflow's own completion.
+            let result = completed_result(&commands);
+            Err(result["refused"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{result}"))
+                .to_string())
+        }
+    }
+}
+
+#[test]
+fn signal_names_follow_the_server_rule_before_any_command_is_emitted() {
+    for (name, refusal) in [
+        (String::new(), "signal_name must not be empty or blank"),
+        (" \t ".to_string(), "signal_name must not be empty or blank"),
+        (
+            "ap\nprove".to_string(),
+            "signal_name must not contain control characters",
+        ),
+        (
+            "ap\u{0}prove".to_string(),
+            "signal_name must not contain control characters",
+        ),
+        (
+            "ap\u{1f}prove".to_string(),
+            "signal_name must not contain control characters",
+        ),
+        (
+            "ap\u{7f}prove".to_string(),
+            "signal_name must not contain control characters",
+        ),
+        (
+            "s".repeat(192),
+            "signal_name must be at most 191 characters",
+        ),
+        // 128 characters but 256 bytes.
+        ("é".repeat(128), "signal_name must be at most 255 bytes"),
+    ] {
+        assert_eq!(
+            signal_name_outcome(name.clone()),
+            Err(refusal.to_string()),
+            "{name:?}"
+        );
+    }
+    for name in [
+        "s".repeat(191),
+        // 127 characters, 254 bytes.
+        "é".repeat(127),
+        "approve.order-42 v2".to_string(),
+    ] {
+        assert_eq!(signal_name_outcome(name.clone()), Ok(json!(name)));
+    }
+}
+
 #[test]
 fn delivered_replay_resolves_from_history_without_resending() {
     // The capability gate applies only to new commands: replay works even

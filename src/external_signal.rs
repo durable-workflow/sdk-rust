@@ -334,20 +334,37 @@ fn resolution_result(
     })
 }
 
+/// The Server's signal-name rule (server#1251): not blank, no control
+/// character (a byte below 0x20 or 0x7f), at most 191 characters and 255
+/// bytes. Checked in workflow code so a bad name never reaches the Server,
+/// which would refuse the whole completion.
+fn validate_signal_name(signal_name: &str) -> Result<()> {
+    let refusal = if signal_name.trim().is_empty() {
+        Some("must not be empty or blank")
+    } else if signal_name.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        Some("must not contain control characters")
+    } else if signal_name.len() > MAX_SIGNAL_NAME_BYTES {
+        Some("must be at most 255 bytes")
+    } else if signal_name.chars().count() > MAX_SIGNAL_NAME_CHARS {
+        Some("must be at most 191 characters")
+    } else {
+        None
+    };
+    match refusal {
+        Some(refusal) => Err(Error::InvalidExternalSignal(format!(
+            "signal_name {refusal}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn validate(workflow_id: &str, signal_name: &str, run_id: Option<&str>) -> Result<()> {
     if workflow_id.is_empty() || workflow_id.chars().count() > MAX_WORKFLOW_ID_CHARS {
         return Err(Error::InvalidExternalSignal(format!(
             "workflow_id must be 1 to {MAX_WORKFLOW_ID_CHARS} characters"
         )));
     }
-    if signal_name.trim().is_empty()
-        || signal_name.chars().count() > MAX_SIGNAL_NAME_CHARS
-        || signal_name.len() > MAX_SIGNAL_NAME_BYTES
-    {
-        return Err(Error::InvalidExternalSignal(format!(
-            "signal_name must not be blank and at most {MAX_SIGNAL_NAME_CHARS} characters and {MAX_SIGNAL_NAME_BYTES} bytes"
-        )));
-    }
+    validate_signal_name(signal_name)?;
     if run_id.is_some_and(str::is_empty) {
         return Err(Error::InvalidExternalSignal(
             "run_id must not be empty; omit it to signal the current run".to_string(),

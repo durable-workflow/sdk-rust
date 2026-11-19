@@ -615,7 +615,9 @@ key had already been delivered. Arguments are encoded like child-workflow
 arguments.
 
 The call returns an error only for an invalid target or signal name
-(`Error::InvalidExternalSignal`), for replay that no longer matches history (a
+(`Error::InvalidExternalSignal`, checked in workflow code before any command is
+emitted: a signal name must not be blank or contain a control character, and is
+at most 191 characters and 255 bytes, as the Server requires), for replay that no longer matches history (a
 different target, run, signal name or arguments at the recorded sequence is
 `Error::NonDeterministicReplay`), and for a Server that does not advertise the
 `signal_external_workflow` command. The Worker reads that advertisement from

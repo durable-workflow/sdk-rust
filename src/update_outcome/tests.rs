@@ -10,14 +10,16 @@ use crate::{encode_typed_envelope, AvroValue, Client, Error, UpdateWaitStage, DE
 
 /// One captured request: method, path with query, and body.
 #[derive(Debug)]
-struct Captured {
-    method: String,
-    path: String,
-    body: String,
+pub(crate) struct Captured {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) body: String,
 }
 
 /// Answer each connection with the next scripted reply and capture the requests.
-async fn server(replies: Vec<(u16, Value)>) -> (Client, tokio::task::JoinHandle<Vec<Captured>>) {
+pub(crate) async fn server(
+    replies: Vec<(u16, Value)>,
+) -> (Client, tokio::task::JoinHandle<Vec<Captured>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = Client::builder(format!("http://{}", listener.local_addr().unwrap()))
         .timeout(Duration::from_secs(5))

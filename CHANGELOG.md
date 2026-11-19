@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `Client::signal_with_start` starts a workflow or reuses its open run and
+  records one signal on it in a single Server transaction, so the run cannot
+  close between a separate start and signal (durable-workflow/.github#222,
+  server#1133). It needs a Server that advertises
+  `capabilities.signal_with_start` (native Server) and returns
+  `Error::SignalWithStartUnavailable` before sending otherwise.
+  `SignalWithStartOptions` carries the start deadlines, `OpenRunPolicy`
+  (`UseExisting` by default, or `Fail`), `ClosedRunPolicy` (`Reject` by
+  default, or `StartNewRun` to start a fresh run after a closed one), the
+  signal's command key (generated as `sdk-rust-signal-with-start-<uuid>` when
+  omitted) and a business key. A retry with the same key returns the original
+  receipt, even after the run closed. `Error::signal_with_start_refusal()`
+  names the Server's reason for every refusal; nothing was written for any of
+  them.
 - Workflow code can signal another workflow durably with
   `WorkflowContext::signal_external_workflow(workflow_id, signal_name, args)`
   (add `.run_id(..)` to target one run), the Rust slice of
@@ -16,8 +30,10 @@
   `signal_external_workflow` from each workflow poll's `server_capabilities`;
   without it the call returns `Error::SignalExternalWorkflowUnavailable` before
   anything is submitted, and a workflow that returns that error fails its
-  workflow task, not its run. Invalid targets return
-  `Error::InvalidExternalSignal`.
+  workflow task, not its run. An invalid target or signal name (a blank name,
+  a control character, more than 191 characters or 255 bytes, as the Server
+  refuses) returns `Error::InvalidExternalSignal` in workflow code before any
+  command is emitted.
 
 ## 4.20.0
 

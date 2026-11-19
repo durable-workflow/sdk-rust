@@ -23,6 +23,7 @@ mod replay_clock;
 mod run_activities;
 mod runtime_payloads;
 mod runtime_uploads;
+mod signal_with_start;
 mod sticky_worker;
 mod sticky_workflow_cache;
 #[cfg(feature = "telemetry")]
@@ -97,6 +98,7 @@ use serde::{
 };
 pub use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+pub use signal_with_start::{ClosedRunPolicy, OpenRunPolicy, SignalWithStartOptions};
 pub use sticky_workflow_cache::{StickyCacheMetrics, StickyCacheOptions};
 use thiserror::Error;
 pub use update_outcome::{UpdatePending, UpdateWaitStage};
@@ -467,6 +469,12 @@ pub enum Error {
         "update_outcome_reads_unavailable: the connected Server does not advertise update_outcome_reads, so an update outcome cannot be read by update id; call update_workflow() again with the same request_id instead"
     )]
     UpdateOutcomeReadsUnavailable,
+    /// The connected Server does not advertise `signal_with_start`, so the
+    /// atomic intake is unavailable. Nothing was sent.
+    #[error(
+        "signal_with_start_unavailable: the connected Server does not advertise signal_with_start; separate start_workflow() and signal_workflow() calls are not atomic, because the run can close between them"
+    )]
+    SignalWithStartUnavailable,
     /// A successful update outcome read did not answer with a receipt for the
     /// requested update: it lacked a matching `update_id` and `update_status`,
     /// or claimed a finished outcome without being completed. No outcome is
@@ -3413,6 +3421,8 @@ pub struct Client {
     sticky_history_suffix_supported: Arc<AtomicBool>,
     /// Server #1131: the Server advertised `update_outcome_reads`.
     update_outcome_reads_supported: Arc<AtomicBool>,
+    /// Server #1133: the Server advertised `signal_with_start`.
+    signal_with_start_supported: Arc<AtomicBool>,
     activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
     #[cfg(feature = "telemetry")]
@@ -6608,6 +6618,7 @@ impl ClientBuilder {
             activity_lease_renewal_supported: Arc::new(AtomicBool::new(false)),
             sticky_history_suffix_supported: Arc::new(AtomicBool::new(false)),
             update_outcome_reads_supported: Arc::new(AtomicBool::new(false)),
+            signal_with_start_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
