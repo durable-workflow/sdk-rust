@@ -214,7 +214,8 @@ fn replay_now_group_requires_all_success_times_and_never_substitutes_other_autho
         observe(history, false)["time"],
         json!("2026-01-01T00:00:10.123456Z")
     );
-    for time in ["2026-01-01T00:00:00.123456789Z"] {
+    {
+        let time = "2026-01-01T00:00:00.123456789Z";
         assert!(
             observe(group(1, ["ActivityCompleted"; 2], [time; 2], false), false)["time"].is_null()
         );

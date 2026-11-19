@@ -10,6 +10,8 @@ use durable_workflow::{
 };
 
 // Shortest-form doubles that the default serde_json parser rounds incorrectly.
+// The third is a recorded wire value, not an approximation of 1/sqrt(2).
+#[allow(clippy::approx_constant)]
 const CASES: [(&str, f64); 3] = [
     ("1.4820142857142857", 1.482_014_285_714_285_7),
     ("124435.71428571429", 124_435.714_285_714_29),

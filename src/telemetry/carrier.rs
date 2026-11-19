@@ -338,11 +338,11 @@ fn link_entry(value: &Value) -> Option<(Value, Option<Diagnostic>)> {
             continue;
         };
         if *key == "sequence" {
-            if !field.as_i64().is_some_and(|sequence| sequence > 0) {
+            if field.as_i64().is_none_or(|sequence| sequence <= 0) {
                 return None;
             }
-        } else if !(*key == "child_task_id" && field.is_null())
-            && !field.as_str().is_some_and(identity)
+        } else if !((*key == "child_task_id" && field.is_null())
+            || field.as_str().is_some_and(identity))
         {
             return None;
         }

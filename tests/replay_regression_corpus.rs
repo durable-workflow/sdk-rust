@@ -910,7 +910,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     ParallelOperation::condition(
                         ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
                             .timeout(Duration::from_secs(300)),
-                        move || Ok(approvals.signals("approve")?.len() >= 1),
+                        move || Ok(!approvals.signals("approve")?.is_empty()),
                     ),
                 ])
                 .await?;
@@ -930,7 +930,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     ParallelOperation::condition(
                         ConditionWaitOptions::new("approvals", "sha256:approvals-v1")
                             .timeout(Duration::from_secs(300)),
-                        move || Ok(approvals.signals("approve")?.len() >= 1),
+                        move || Ok(!approvals.signals("approve")?.is_empty()),
                     ),
                 ])
                 .await?;
@@ -3318,10 +3318,10 @@ fn redrive_terminal_event(event: &Value) -> bool {
 }
 
 fn redrive_terminal_matches(opened: &Value, terminal: &Value) -> bool {
-    if !opened["sequence"]
+    if opened["sequence"]
         .as_u64()
         .zip(terminal["sequence"].as_u64())
-        .is_some_and(|(opened, terminal)| opened < terminal)
+        .is_none_or(|(opened, terminal)| opened >= terminal)
         || opened["payload"]["sequence"] != terminal["payload"]["sequence"]
     {
         return false;

@@ -563,6 +563,8 @@ async fn published_timer_clock_survives_first_and_repeated_cold_redrive() {
     );
 }
 
+// A runtime platform guard; a const assert would stop the test crate building off Linux.
+#[allow(clippy::assertions_on_constants)]
 fn image_command() -> Command {
     assert!(
         cfg!(target_os = "linux"),

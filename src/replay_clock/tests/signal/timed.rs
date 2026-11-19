@@ -36,7 +36,7 @@ fn replay_now_timed_signal_success_cold_replays_equal_and_backward_times() {
                         assert_eq!(read(&inner), SIGNAL_TIME);
                         assert_eq!(inner.wait_signal("ready").await?, vec![json!("delivery-2")]);
                         assert_eq!(read(&inner), read(&inner));
-                        Ok(AvroValue::from_serialize(&time(&inner))?)
+                        AvroValue::from_serialize(&time(&inner))
                     }),
                 )
                 .into_json()

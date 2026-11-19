@@ -229,7 +229,7 @@ async fn completion_limits_preserve_inline_atomic_batches_without_storage() {
         send(&client, path, true, &body).await.unwrap();
         assert_eq!(
             server.request_bodies(&format!("/{profile}/api{path}")),
-            [body.clone()]
+            std::slice::from_ref(&body)
         );
         assert_eq!(
             server.request_count(&format!("/{profile}/api/external-payloads/v1")),

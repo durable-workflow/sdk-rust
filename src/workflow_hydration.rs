@@ -15,6 +15,143 @@ pub(super) struct HydrationClaim {
     cooperative: bool,
 }
 
+fn invalid(detail: &str) -> Error {
+    Error::WorkerLoop(format!(
+        "workflow_hydration_authority_unconfirmed: {detail}"
+    ))
+}
+
+impl HydrationClaim {
+    pub(super) fn from_poll(
+        wire: &Value,
+        worker_id: &str,
+        namespace: &str,
+    ) -> Result<Option<Self>> {
+        let Some(task) = wire.get("task").filter(|task| !task.is_null()) else {
+            return Ok(None);
+        };
+        // Inline-only tasks need no transport observation. Paged tasks can
+        // contain external references that are not visible in the first page.
+        if task
+            .get("next_history_page_token")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            && !matches!(
+                task["sticky_replay_mode"].as_str(),
+                Some("sticky_hit_expected" | "forced_cold_replay")
+            )
+            && !runtime_payloads::has_unresolved_payload(
+                wire,
+                "/worker/workflow-tasks/poll",
+                RequestProtocol::DefaultWorker,
+            )
+        {
+            return Ok(None);
+        }
+        let mut task: WorkflowTask = serde_json::from_value(task.clone())?;
+        if wire["task"]
+            .get("namespace")
+            .is_some_and(|value| value.as_str() != Some(namespace))
+            || task.lease_owner.as_deref() != Some(worker_id)
+            || wire["task"]["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
+        {
+            return Err(invalid(
+                "poll must identify this namespace, owner and its actual attempt",
+            ));
+        }
+        cooperative_cancellation::cancellation_claim(&task)?;
+        // Keep only authority, not another copy of application/history data.
+        task.arguments = None;
+        task.signal_arguments = None;
+        task.history_events.clear();
+        let pending = match wire["task"].get("cancellation_request") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(CancellationRequest::from_observation(value)?),
+        };
+        // Published poll envelopes omit namespace. Bind the claim to the
+        // authenticated request namespace, and reject any contradictory echo.
+        Ok(Some(Self {
+            task,
+            pending,
+            namespace: namespace.to_owned(),
+            cooperative: false,
+        }))
+    }
+
+    pub(super) fn cooperative(mut self) -> Self {
+        self.cooperative = true;
+        self
+    }
+
+    async fn confirm(&mut self, client: &Client) -> Result<()> {
+        if self.namespace != client.namespace {
+            return Err(invalid("hydration changed its authenticated namespace"));
+        }
+        let receipt = client
+            .heartbeat_workflow_task_with_protocol(
+                &self.task,
+                self.pending.as_ref(),
+                client.worker_protocol_version.as_str(),
+            )
+            .await?;
+        self.pending = receipt.cancellation_request;
+        if self.pending.is_some() && !self.cooperative && !client.cooperative_worker_protocol {
+            return Err(invalid(
+                "pending cancellation requires a cooperative Worker",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn protect<T>(
+        mut claim: Option<Self>,
+        client: &Client,
+        loading: impl Future<Output = Result<T>>,
+    ) -> Result<(T, Option<CancellationRequest>)> {
+        let Some(claim) = claim.as_mut() else {
+            return Ok((loading.await?, None));
+        };
+        let stop = client
+            .worker_storage_admission
+            .as_ref()
+            .map(|value| &*value.stop);
+        let stopped = async {
+            match stop {
+                Some(stop) => wait_for_worker_stop(stop).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(stopped);
+        // One original total hydration budget includes confirmation, every
+        // payload body and all remaining history pages. Renewals cannot reset it.
+        let protected = async {
+            claim.confirm(client).await?;
+            tokio::pin!(loading);
+            let mut renew = tokio::time::interval(Duration::from_secs(5));
+            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            renew.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = renew.tick() => claim.confirm(client).await?,
+                    result = &mut loading => {
+                        let result = result?;
+                        claim.confirm(client).await?;
+                        return Ok((result, claim.pending.clone()));
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut stopped => Err(Error::WorkerLoop(STOPPED.to_owned())),
+            result = tokio::time::timeout(client.hydration_timeout, protected) => {
+                result.map_err(|_| Error::Timeout)?
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,143 +435,6 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("x-durable-workflow-protocol-version: 1.19\r\n"));
-        }
-    }
-}
-
-fn invalid(detail: &str) -> Error {
-    Error::WorkerLoop(format!(
-        "workflow_hydration_authority_unconfirmed: {detail}"
-    ))
-}
-
-impl HydrationClaim {
-    pub(super) fn from_poll(
-        wire: &Value,
-        worker_id: &str,
-        namespace: &str,
-    ) -> Result<Option<Self>> {
-        let Some(task) = wire.get("task").filter(|task| !task.is_null()) else {
-            return Ok(None);
-        };
-        // Inline-only tasks need no transport observation. Paged tasks can
-        // contain external references that are not visible in the first page.
-        if !task
-            .get("next_history_page_token")
-            .and_then(Value::as_str)
-            .is_some_and(|token| !token.is_empty())
-            && !matches!(
-                task["sticky_replay_mode"].as_str(),
-                Some("sticky_hit_expected" | "forced_cold_replay")
-            )
-            && !runtime_payloads::has_unresolved_payload(
-                wire,
-                "/worker/workflow-tasks/poll",
-                RequestProtocol::DefaultWorker,
-            )
-        {
-            return Ok(None);
-        }
-        let mut task: WorkflowTask = serde_json::from_value(task.clone())?;
-        if wire["task"]
-            .get("namespace")
-            .is_some_and(|value| value.as_str() != Some(namespace))
-            || task.lease_owner.as_deref() != Some(worker_id)
-            || wire["task"]["workflow_task_attempt"].as_u64() != Some(task.workflow_task_attempt)
-        {
-            return Err(invalid(
-                "poll must identify this namespace, owner and its actual attempt",
-            ));
-        }
-        cooperative_cancellation::cancellation_claim(&task)?;
-        // Keep only authority, not another copy of application/history data.
-        task.arguments = None;
-        task.signal_arguments = None;
-        task.history_events.clear();
-        let pending = match wire["task"].get("cancellation_request") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(CancellationRequest::from_observation(value)?),
-        };
-        // Published poll envelopes omit namespace. Bind the claim to the
-        // authenticated request namespace, and reject any contradictory echo.
-        Ok(Some(Self {
-            task,
-            pending,
-            namespace: namespace.to_owned(),
-            cooperative: false,
-        }))
-    }
-
-    pub(super) fn cooperative(mut self) -> Self {
-        self.cooperative = true;
-        self
-    }
-
-    async fn confirm(&mut self, client: &Client) -> Result<()> {
-        if self.namespace != client.namespace {
-            return Err(invalid("hydration changed its authenticated namespace"));
-        }
-        let receipt = client
-            .heartbeat_workflow_task_with_protocol(
-                &self.task,
-                self.pending.as_ref(),
-                client.worker_protocol_version.as_str(),
-            )
-            .await?;
-        self.pending = receipt.cancellation_request;
-        if self.pending.is_some() && !self.cooperative && !client.cooperative_worker_protocol {
-            return Err(invalid(
-                "pending cancellation requires a cooperative Worker",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) async fn protect<T>(
-        mut claim: Option<Self>,
-        client: &Client,
-        loading: impl Future<Output = Result<T>>,
-    ) -> Result<(T, Option<CancellationRequest>)> {
-        let Some(claim) = claim.as_mut() else {
-            return Ok((loading.await?, None));
-        };
-        let stop = client
-            .worker_storage_admission
-            .as_ref()
-            .map(|value| &*value.stop);
-        let stopped = async {
-            match stop {
-                Some(stop) => wait_for_worker_stop(stop).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(stopped);
-        // One original total hydration budget includes confirmation, every
-        // payload body and all remaining history pages. Renewals cannot reset it.
-        let protected = async {
-            claim.confirm(client).await?;
-            tokio::pin!(loading);
-            let mut renew = tokio::time::interval(Duration::from_secs(5));
-            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            renew.tick().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = renew.tick() => claim.confirm(client).await?,
-                    result = &mut loading => {
-                        let result = result?;
-                        claim.confirm(client).await?;
-                        return Ok((result, claim.pending.clone()));
-                    }
-                }
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = &mut stopped => Err(Error::WorkerLoop(STOPPED.to_owned())),
-            result = tokio::time::timeout(client.hydration_timeout, protected) => {
-                result.map_err(|_| Error::Timeout)?
-            }
         }
     }
 }

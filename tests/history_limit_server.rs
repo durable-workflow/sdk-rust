@@ -104,7 +104,7 @@ async fn published_worker_fails_an_over_budget_fanout_once_and_keeps_working() {
         .await
         .unwrap();
     let error = tokio::select! {
-        result = over.result(options.clone()) => result.unwrap_err(),
+        result = over.result(options) => result.unwrap_err(),
         exit = &mut running => panic!("worker stopped instead of recording a structural failure: {exit:?}"),
     };
     let Error::WorkflowFailed(outcome) = error else {

@@ -185,20 +185,19 @@ async fn checkpoint_worker_entrypoint() {
         for _ in 0..100 {
             worker.run_once().await.unwrap();
             let callbacks = observations.lock().unwrap().len();
-            if callbacks > 0 {
-                if phase == 2
+            if callbacks > 0
+                && (phase == 2
                     || client
                         .describe_workflow(&queue)
                         .await
                         .unwrap()
-                        .is_terminal()
-                {
-                    emit(
-                        json!({"event":"finished","pid":std::process::id(),"phase":phase,
+                        .is_terminal())
+            {
+                emit(
+                    json!({"event":"finished","pid":std::process::id(),"phase":phase,
                         "callbacks":callbacks}),
-                    );
-                    return;
-                }
+                );
+                return;
             }
         }
         panic!("bounded worker polling did not finish");
@@ -262,6 +261,8 @@ fn read_stream(mut stream: impl Read, events: mpsc::Sender<Result<Vec<u8>, &'sta
 }
 
 impl OwnedChild {
+    // A runtime platform guard; a const assert would stop the test crate building off Linux.
+    #[allow(clippy::assertions_on_constants)]
     fn spawn(queue: &str, phase: u64, case: &str, image: &Value) -> Self {
         assert!(cfg!(target_os = "linux"));
         let mut command = Command::new("/proc/self/exe");

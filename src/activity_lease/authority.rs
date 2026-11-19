@@ -320,9 +320,9 @@ impl Authority {
             || task
                 .get("namespace")
                 .is_some_and(|value| value.as_str() != Some(client.namespace.as_str()))
-            || !task["attempt_number"]
+            || task["attempt_number"]
                 .as_u64()
-                .is_some_and(|value| value > 0)
+                .is_none_or(|value| value == 0)
             || task
                 .get("attempt_id")
                 .is_some_and(|alias| !alias.is_null() && *alias != task["activity_attempt_id"])

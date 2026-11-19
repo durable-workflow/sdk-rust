@@ -157,6 +157,11 @@ serde_bytes = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
+[lints.clippy]
+# The public `Error` enum carries its failure structs by value; boxing them to
+# shrink `Result` would be a breaking change to the public API.
+result_large_err = "allow"
+
 [[example]]
 name = "metrics_prometheus"
 required-features = ["metrics-prometheus"]
