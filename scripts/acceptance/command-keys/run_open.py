@@ -64,7 +64,11 @@ def main():
     parser.add_argument('--server-index',required=True)
     parser.add_argument('--server-version',required=True)
     parser.add_argument('--server-source',required=True)
+    parser.add_argument('--container-prefix',default='sdk-rust-216',
+                        help='owned Server container name prefix (letters, digits, dashes)')
     options=parser.parse_args()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,40}',options.container_prefix):
+        parser.error('container prefix must be plain lowercase letters, digits and dashes')
     physical_args = (options.physical_backup, options.physical_backup_sha256, options.physical_receipts,
                      options.physical_receipts_sha256, options.physical_source_commit)
     physical_mode = any(value is not None for value in physical_args)
@@ -125,7 +129,7 @@ def main():
     key = 'base64:' + base64.b64encode(secrets.token_bytes(32)).decode()
     with open(os.open(envfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w') as file:
         file.write('DW_AUTH_TOKEN='+token+'\nDW_SERVER_KEY='+key+'\n')
-    name = ('sdk-rust-216-physical-' if physical_mode else 'sdk-rust-216-legacy-'+options.state+'-') + secrets.token_hex(5)
+    name = options.container_prefix + ('-physical-' if physical_mode else '-legacy-'+options.state+'-') + secrets.token_hex(5)
     owned_id = None
     binary = None
     worker_pool = None

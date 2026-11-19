@@ -181,6 +181,7 @@ fn validate_user_signal_name(signal_name: &str) -> Result<()> {
 }
 
 const REQUEST_ID_CONFLICT_REASON: &str = "request_id_conflict";
+const REQUEST_ID_AMBIGUOUS_REASON: &str = "request_id_ambiguous";
 const MAX_REQUEST_ID_CHARACTERS: usize = 255;
 
 /// The caller command key is a case-sensitive body field of 1 to 255 Unicode characters.
@@ -522,10 +523,36 @@ impl Error {
         request_id_conflict(status, self.refusal_body()?)
     }
 
-    /// Record the sent caller command key on a `request_id_conflict` refusal
-    /// whose body does not echo it, so [`Error::request_id`] and
-    /// [`RequestIdConflict::request_id`] name the key. Every other error, and a
-    /// body that already echoes a key, is returned unchanged.
+    /// Whether the Server refused a signal or update because its caller command
+    /// key matches more than one retained command, so it cannot select one
+    /// receipt (HTTP 409, `reason: "request_id_ambiguous"`).
+    ///
+    /// This happens only for keys retained before the Server compared command
+    /// intent, for example after an upgrade from a Server that stored keys
+    /// without making them unique. Nothing was admitted or recorded and no
+    /// receipt was selected. The SDK never resends this refusal, and resending
+    /// it unchanged gets the same answer: inspect the workflow's recorded
+    /// signals and updates to find out what was applied, and use a new key
+    /// for any new command.
+    pub fn is_request_id_ambiguous(&self) -> bool {
+        self.request_id_ambiguous().is_some()
+    }
+
+    /// The details of a `request_id_ambiguous` refusal.
+    pub fn request_id_ambiguous(&self) -> Option<RequestIdAmbiguous> {
+        let status = match self {
+            Self::Http { status, .. } => status.as_u16(),
+            Self::WorkflowCommandRejected(rejection) => rejection.status,
+            _ => return None,
+        };
+        request_id_ambiguous(status, self.refusal_body()?)
+    }
+
+    /// Record the sent caller command key on a `request_id_conflict` or
+    /// `request_id_ambiguous` refusal whose body does not echo it, so
+    /// [`Error::request_id`], [`RequestIdConflict::request_id`] and
+    /// [`RequestIdAmbiguous::request_id`] name the key. Every other error, and
+    /// a body that already echoes a key, is returned unchanged.
     fn with_sent_request_id(self, request_id: &str) -> Self {
         let Self::Http { status, body } = self else {
             return self;
@@ -537,9 +564,10 @@ impl Error {
         };
         match serde_json::from_str::<Value>(&body) {
             Ok(Value::Object(mut map))
-                if map.get("reason").and_then(Value::as_str)
-                    == Some(REQUEST_ID_CONFLICT_REASON)
-                    && !echoed(&map) =>
+                if matches!(
+                    map.get("reason").and_then(Value::as_str),
+                    Some(REQUEST_ID_CONFLICT_REASON | REQUEST_ID_AMBIGUOUS_REASON)
+                ) && !echoed(&map) =>
             {
                 map.insert(
                     "request_id".to_string(),
@@ -637,6 +665,40 @@ fn request_id_conflict(status: u16, body: Value) -> Option<RequestIdConflict> {
                     .collect()
             })
             .unwrap_or_default(),
+        body,
+    })
+}
+
+/// A refused signal or update whose caller command key matches more than one
+/// retained command, so the Server could not select a receipt.
+///
+/// Only keys retained before the Server compared command intent can be
+/// ambiguous, for example rows written by an older Server that stored keys
+/// without making them unique. Nothing was admitted or recorded, and no
+/// receipt was selected: never treat this as the original command's receipt.
+/// Inspect the workflow's recorded signals and updates to see what was
+/// applied, and use a new key for any new command. `request_id` is the key that was sent. The full answer,
+/// including `retained: true` and `intent_verified: false`, is in `body`.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RequestIdAmbiguous {
+    pub status: u16,
+    pub request_id: String,
+    pub message: String,
+    pub body: Value,
+}
+
+fn request_id_ambiguous(status: u16, body: Value) -> Option<RequestIdAmbiguous> {
+    if body.get("reason").and_then(Value::as_str) != Some(REQUEST_ID_AMBIGUOUS_REASON) {
+        return None;
+    }
+    let string = |name: &str| body.get(name).and_then(Value::as_str).map(str::to_string);
+    Some(RequestIdAmbiguous {
+        status,
+        request_id: string("request_id").unwrap_or_default(),
+        message: string("message")
+            .or_else(|| string("error"))
+            .unwrap_or_else(|| "request id matches more than one retained command".to_string()),
         body,
     })
 }
@@ -3970,6 +4032,31 @@ impl Client {
         Self::submitted_update_value(workflow_id, response)
     }
 
+    /// Send a synchronous update and return the Server's full receipt instead
+    /// of only its result.
+    ///
+    /// The request is the one [`Client::update_workflow`] sends, with the same
+    /// caller command key rules, and it is sent once. The receipt carries the
+    /// `request_id`, `update_id`, `run_id`, `update_status` and, on a Server
+    /// that advertises `capabilities.command_request_keys`, the `retained` and
+    /// `intent_verified` flags. Use it when the caller must tell a verified
+    /// retry from a legacy readback: a receipt with `retained: true` and
+    /// `intent_verified: false` is the original update for a key retained
+    /// before the Server compared intent, so its result is not proof that this
+    /// call's name and arguments match the original. A pending update is
+    /// returned as its receipt (`update_status` is not `completed`), never as
+    /// an error.
+    pub async fn update_workflow_receipt<T: Serialize>(
+        &self,
+        workflow_id: &str,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<Value> {
+        self.update_workflow_response(workflow_id, update_name, input, request_id)
+            .await
+    }
+
     /// Send a synchronous update and retain a bytes-capable Avro result.
     pub async fn update_workflow_avro_value<T: Serialize>(
         &self,
@@ -6698,6 +6785,19 @@ impl WorkflowHandle {
     ) -> Result<AvroValue> {
         self.client
             .update_workflow_avro_value(&self.workflow_id, update_name, input, request_id)
+            .await
+    }
+
+    /// Send an update and return the full receipt; see
+    /// [`Client::update_workflow_receipt`].
+    pub async fn update_receipt<T: Serialize>(
+        &self,
+        update_name: &str,
+        input: T,
+        request_id: Option<&str>,
+    ) -> Result<Value> {
+        self.client
+            .update_workflow_receipt(&self.workflow_id, update_name, input, request_id)
             .await
     }
 
@@ -30246,6 +30346,54 @@ mod tests {
         Some(("200 OK", receipt.to_string()))
     }
 
+    /// A native Server 3.13.0 answer for a key that matches more than one
+    /// legacy row: no receipt is selected and nothing is written. Native does
+    /// not always echo the key.
+    fn ambiguous_command_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let mut refusal = json!({
+            "reason": "request_id_ambiguous",
+            "message": "The request_id matches more than one retained command on workflow [keyed-1].",
+            "retained": true,
+            "intent_verified": false,
+            "retryable": false,
+        });
+        if path == KEYED_SIGNAL_PATH {
+            refusal["request_id"] = request["request_id"].clone();
+        }
+        Some(("409 Conflict", refusal.to_string()))
+    }
+
+    /// A native Server 3.13.0 readback of a key retained before intent was
+    /// compared: the original identities with `intent_verified: false`.
+    fn legacy_unverified_command_server(
+        path: &str,
+        body: &str,
+        _: usize,
+    ) -> Option<(&'static str, String)> {
+        let request = keyed_command_request(path, body)?;
+        let mut receipt = json!({
+            "workflow_id": "keyed-1",
+            "run_id": "run-keyed-1",
+            "command_id": "cmd-legacy-1",
+            "command_status": "accepted",
+            "request_id": request["request_id"],
+            "retained": true,
+            "intent_verified": false,
+        });
+        if path == KEYED_UPDATE_PATH {
+            receipt["update_id"] = json!("upd-legacy-1");
+            receipt["update_status"] = json!("completed");
+            receipt["result_envelope"] =
+                encode_typed_envelope(&AvroValue::Long(5), DEFAULT_CODEC).expect("result");
+        }
+        Some(("200 OK", receipt.to_string()))
+    }
+
     fn closed_run_command_server(
         path: &str,
         body: &str,
@@ -30819,6 +30967,167 @@ mod tests {
         assert!(matches!(
             Error::Timeout.with_sent_request_id("sent"),
             Error::Timeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_id_ambiguous_is_typed_carries_the_sent_key_and_is_sent_once() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(ambiguous_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+
+        let error = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["ok"]), "legacy-key")
+            .await
+            .expect_err("ambiguous legacy key");
+        assert!(
+            matches!(error, Error::Http { status, .. } if status == reqwest::StatusCode::CONFLICT),
+            "existing Error::Http matching keeps working: {error:?}"
+        );
+        assert!(error.is_request_id_ambiguous());
+        assert!(
+            !error.is_request_id_conflict(),
+            "ambiguity is not a conflict"
+        );
+        let ambiguous = error.request_id_ambiguous().expect("ambiguity details");
+        assert_eq!(ambiguous.status, 409);
+        assert_eq!(ambiguous.request_id, "legacy-key");
+        assert!(ambiguous.message.contains("more than one retained command"));
+        assert_eq!(ambiguous.body["intent_verified"], false);
+        assert_eq!(
+            ambiguous.body.get("command_id"),
+            None,
+            "no receipt selected"
+        );
+        assert_eq!(
+            server.request_bodies(KEYED_SIGNAL_PATH).len(),
+            1,
+            "never resent"
+        );
+
+        // The update refusal does not echo the key; the SDK names the one it sent.
+        let error = client
+            .update_workflow("keyed-1", "adjust", json!([1]), None)
+            .await
+            .expect_err("ambiguous generated update key");
+        let sent = server.request_body(KEYED_UPDATE_PATH);
+        let ambiguous = error.request_id_ambiguous().expect("ambiguity details");
+        assert_eq!(
+            Some(ambiguous.request_id.as_str()),
+            sent["request_id"].as_str()
+        );
+        assert_eq!(error.request_id().as_deref(), sent["request_id"].as_str());
+        assert!(!matches!(error, Error::UpdateStillPending(_)));
+        let error = client
+            .update_workflow_receipt("keyed-1", "adjust", json!([1]), Some("legacy-key"))
+            .await
+            .expect_err("the receipt form refuses ambiguity too");
+        assert!(error.is_request_id_ambiguous());
+        assert_eq!(
+            server.request_bodies(KEYED_UPDATE_PATH).len(),
+            2,
+            "one send per call"
+        );
+    }
+
+    #[test]
+    fn ambiguity_and_conflict_classifiers_do_not_overlap() {
+        let conflict = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_conflict"}"#.to_string(),
+        };
+        assert!(conflict.is_request_id_conflict() && !conflict.is_request_id_ambiguous());
+        let ambiguous = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_ambiguous"}"#.to_string(),
+        }
+        .with_sent_request_id("sent");
+        assert!(ambiguous.is_request_id_ambiguous() && !ambiguous.is_request_id_conflict());
+        assert_eq!(ambiguous.request_id().as_deref(), Some("sent"));
+        let echoed = Error::Http {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"reason":"request_id_ambiguous","request_id":"echoed"}"#.to_string(),
+        }
+        .with_sent_request_id("sent");
+        assert_eq!(echoed.request_id().as_deref(), Some("echoed"));
+        assert!(!Error::Timeout.is_request_id_ambiguous());
+    }
+
+    #[tokio::test]
+    async fn legacy_unverified_readback_is_returned_with_its_flags_not_as_a_verified_match() {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(legacy_unverified_command_server),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+        let handle = keyed_handle(&client);
+
+        let receipt = client
+            .signal_workflow_with_request_id("keyed-1", "approve", json!(["changed"]), "old-key")
+            .await
+            .expect("legacy readback is a receipt, not an error");
+        assert_eq!(receipt["retained"], true);
+        assert_eq!(receipt["intent_verified"], false);
+        assert_eq!(receipt["command_id"], "cmd-legacy-1");
+
+        let receipt = client
+            .update_workflow_receipt("keyed-1", "adjust", json!(["changed"]), Some("old-key"))
+            .await
+            .expect("update receipt");
+        assert_eq!(receipt["retained"], true);
+        assert_eq!(receipt["intent_verified"], false);
+        assert_eq!(receipt["update_id"], "upd-legacy-1");
+        assert_eq!(receipt["request_id"], "old-key");
+        let receipt = handle
+            .update_receipt("adjust", json!(["changed"]), Some("old-key"))
+            .await
+            .expect("handle update receipt");
+        assert_eq!(receipt["intent_verified"], false);
+        assert_eq!(
+            client
+                .update_workflow("keyed-1", "adjust", json!(["changed"]), Some("old-key"))
+                .await
+                .expect("result form"),
+            json!(5)
+        );
+        let bodies = server.request_bodies(KEYED_UPDATE_PATH);
+        assert_eq!(bodies.len(), 3, "one send per call");
+        assert!(bodies.iter().all(|body| body["request_id"] == "old-key"));
+    }
+
+    #[tokio::test]
+    async fn update_receipt_returns_a_pending_receipt_instead_of_an_error() {
+        fn pending(path: &str, body: &str, _: usize) -> Option<(&'static str, String)> {
+            let request = keyed_command_request(path, body)?;
+            Some((
+                "202 Accepted",
+                json!({"workflow_id":"keyed-1","run_id":"run-keyed-1","update_id":"upd-1",
+                    "update_status":"accepted","wait_timed_out":true,
+                    "request_id":request["request_id"],"retained":false,"intent_verified":true})
+                .to_string(),
+            ))
+        }
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(pending),
+            ..MockWorkerBehavior::default()
+        });
+        let client = keyed_client(&server);
+        let receipt = client
+            .update_workflow_receipt("keyed-1", "adjust", json!([1]), None)
+            .await
+            .expect("pending receipt");
+        assert_eq!(receipt["update_status"], "accepted");
+        assert_generated_request_id(
+            receipt["request_id"].as_str().expect("key"),
+            "sdk-rust-update-",
+        );
+        assert!(matches!(
+            client
+                .update_workflow("keyed-1", "adjust", json!([1]), None)
+                .await,
+            Err(Error::UpdateStillPending(_))
         ));
     }
 
