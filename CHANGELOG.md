@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 4.20.0
 
 - A signal or update refused with HTTP 409 `request_id_ambiguous` is now typed:
   `Error::is_request_id_ambiguous()` and `Error::request_id_ambiguous()` return
