@@ -12,8 +12,39 @@ checkpointed SQLite files, then call `transform_copy` with `stopped=True`.
 Source and destination must be distinct sibling paths in that owned directory
 with mode 0700. The destination must not exist. The source must be an owned
 regular single-link file; nonempty WAL/journal files and sidecar symlinks refuse.
-The source is opened read-only and immutable only after those preconditions.
 The original database is never a mutation target.
+
+SQLite never opens either pathname. A `file:/proc/self/fd/N` URI is not a
+substitute: SQLite resolves it to a pathname and reopens that path
+(`sqlite_fd_uri_probe.py` with `native-open-race.c` reproduces this). Instead:
+
+- The stopped source is read through one held descriptor. A caller that already
+  holds the source passes `source_fd=`; it must be a readable regular-file
+  descriptor (not `O_PATH`) for the same owned single-link inode the source path
+  names, or the call refuses before creating anything. The descriptor stays open
+  and caller-owned, and its offset is not moved. Without `source_fd`, the helper
+  opens the source once with `O_NOFOLLOW` and checks the same identity.
+- The bytes are bounded-read through that descriptor and loaded with SQLite's
+  in-memory `deserialize`. A WAL-format image is marked rollback-journal only
+  in the private in-memory copy, and the written copy keeps the source's
+  file-format bytes.
+- The destination is created with `O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW` relative
+  to the held private directory. `on_destination_created(descriptor)` is called
+  immediately, before any copy, so the caller can verify or `os.dup` that
+  inode. The transformed image is written, fsynced and read back through the
+  same descriptor.
+- On any failure the helper removes the destination name only if it still
+  names the inode it created and holds. A foreign replacement is preserved.
+  A destination name that no longer holds the created copy at the end refuses.
+
+```python
+source_fd = os.open(stopped_source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+retained = []
+receipt = sqlite_legacy.transform_copy(
+    stopped_source, disposable_copy, [selection], stopped=True,
+    source_fd=source_fd, on_destination_created=lambda fd: retained.append(os.dup(fd)),
+)
+```
 
 Each selection contains exactly these nonempty string fields, from the real API
 admission and the producer manifest:
@@ -32,15 +63,16 @@ receipt = sqlite_legacy.transform_copy(
 )
 ```
 
-The copy uses SQLite's backup API with a five-second bound. Every selection's
+Every selection's
 command/type/workflow/run identity, modern stored token and exactly one intent
 row must match before either statement executes. One transaction applies the
 manifest DELETE and UPDATE, requiring one affected row from each. A complete
 typed logical snapshot of every table row and schema proves that only the
 selected request key and intent row changed. An unexpected trigger side effect
-or failed precondition rolls back and removes only the newly created copy.
-An existing destination is never overwritten. The retained original's file
-identity and logical contents must stay unchanged during copying.
+or failed precondition rolls back before any byte reaches the destination and
+removes only the newly created copy. An existing destination is never
+overwritten. The held source's file identity, its path's inode and its bytes
+must be unchanged at the end, so a swap of the source path refuses.
 
 The limits are 64 MiB source files, 20,000 total rows, 32 MiB encoded snapshots
 and at most 32 distinct selections. The default receipt contains the synthetic
@@ -48,7 +80,9 @@ cell label, manifest digest, transformation count and before/after snapshot
 digests. `snapshot` returns complete private logical values for the outer
 runner's zero-write checks; publish only sanitized identities and outcomes.
 
-Run the inert controls without a Server, Docker or a toolchain:
+Run the inert controls without a Server or Docker. The native-open interposer
+controls in `test_sqlite_held_fd.py` compile `native-open-race.c` and run only
+on Linux with a C compiler; they are skipped elsewhere:
 
 ```sh
 python3 -B -m unittest discover -s scripts/acceptance/command-keys -p 'test_*.py' -v
