@@ -1620,7 +1620,7 @@ impl ScheduleOrigin {
             .payload
             .get("occurrence_time")
             .and_then(Value::as_str)
-            .filter(|time| DateTime::parse_from_rfc3339(time).is_ok())
+            .filter(|time| wire_time::is_valid(time))
             .map(str::to_string);
         let trigger_number = event
             .payload
