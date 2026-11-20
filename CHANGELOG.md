@@ -53,8 +53,16 @@
   deep, before anything reads it. A tagged copy is stripped of `digest` and
   used for later requests, so overlapping requests across a rolling deploy each
   restore their own capabilities. A digest string that matches neither the
-  request's digest nor a tagged copy in the same answer is
-  `Error::Protocol` with reason `server_capabilities_digest_unknown`. Older
+  request's digest nor a tagged copy in the same answer makes the Client
+  forget its held digest and resend that same request once with `none`; a
+  resent report the Server already committed comes back as its usual
+  non-recorded receipt (for an activity completion, `409 stale_attempt`), which
+  the worker settles as before. Only an unknown digest on the resend is
+  `Error::Protocol` with reason `server_capabilities_digest_unknown`.
+  Decoded response bodies are capped at 128 MiB by default
+  (`ClientBuilder::max_response_bytes`); a larger body stops being read and
+  fails with the new `Error::ResponseBodyTooLarge`, so a small gzip answer
+  cannot expand without bound. Older
   Servers ignore both headers and answer in full. In a lab run of one
   start, one 1 KiB activity and one result per workflow against native Server
   main (43ad8d8f), response bytes per workflow fell from about 159 KB to 8.8 KB

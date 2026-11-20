@@ -308,9 +308,16 @@ digest and object when it sends each request and restores that request's
 answer before anything reads it, so readers always see the full object, even
 when requests overlap a rolling deploy. Clones share what they learned. An
 answer naming a digest that request did not send, and that the answer itself
-does not carry, is `Error::Protocol` with reason
+does not carry, makes the Client forget its digest and resend that request once
+asking for full capabilities. A resent report the Server already committed
+gets its usual non-recorded receipt, which the worker settles. Only a second
+unknown digest is `Error::Protocol` with reason
 `server_capabilities_digest_unknown`. Older Servers ignore both headers and
 answer in full.
+
+A decoded response body is capped at 128 MiB by default. Set
+`ClientBuilder::max_response_bytes` to change it; a larger body fails with
+`Error::ResponseBodyTooLarge` without being read to the end.
 
 ### Query execution authority
 

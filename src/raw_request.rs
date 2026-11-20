@@ -397,10 +397,11 @@ impl Client {
         let response = builder.send().await?;
         let status = response.status();
         observation.status(status);
+        let headers = response.headers().clone();
         let response = RawResponse {
             status: status.as_u16(),
-            headers: response.headers().clone(),
-            body: response.bytes().await?.to_vec(),
+            headers,
+            body: crate::read_capped_body(response, self.max_response_bytes).await?,
         };
 
         if matches!(protocol, RequestProtocol::ControlPlane) || !response.is_success() {

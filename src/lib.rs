@@ -422,6 +422,10 @@ pub enum Error {
     InvalidSearchAttributeUpdate(#[from] SearchAttributeUpdateError),
     #[error("operation timed out")]
     Timeout,
+    /// A response body, after decoding (for example gzip), exceeded
+    /// [`ClientBuilder::max_response_bytes`]. The rest was not read.
+    #[error("response body exceeded {limit_bytes} bytes after decoding")]
+    ResponseBodyTooLarge { limit_bytes: usize },
     #[error(
         "missing {role}-plane credentials: configure ClientBuilder::{role}_token or ClientBuilder::token; a {opposite_role}-plane token cannot authorize this request"
     )]
@@ -3472,6 +3476,8 @@ pub struct Client {
     worker_token: Option<String>,
     namespace: String,
     max_external_payload_bytes: usize,
+    /// Cap on one decoded response body (`ClientBuilder::max_response_bytes`).
+    max_response_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
     worker_task_slot: Option<Arc<worker_capacity::TaskSlotMarker>>,
     cooperative_worker_protocol: bool,
@@ -3542,6 +3548,7 @@ impl Client {
             namespace: "default".to_string(),
             timeout: Duration::from_secs(60),
             max_external_payload_bytes: 64 * 1024 * 1024,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             worker_protocol_version: WorkerProtocolVersion::default(),
             additional_root_certificates: Vec::new(),
             danger_accept_invalid_certs: false,
@@ -5598,8 +5605,9 @@ impl Client {
         }
         // server#1262: a worker request names the capabilities it holds, and
         // its answer is restored against exactly that pair (captured here).
-        let capabilities = (!matches!(protocol, RequestProtocol::ControlPlane))
+        let mut capabilities = (!matches!(protocol, RequestProtocol::ControlPlane))
             .then(|| self.capabilities_digest.capture());
+        let mut digest_resent = false;
         if let Some(captured) = &capabilities {
             request = request.header(
                 server_capabilities_digest::HEADER,
@@ -5642,7 +5650,7 @@ impl Client {
             }
         }
 
-        let request = request.build()?;
+        let mut request = request.build()?;
         let request_body = request
             .body()
             .and_then(reqwest::Body::as_bytes)
@@ -5672,7 +5680,8 @@ impl Client {
                     .await?;
                 let status = response.status();
                 observation.status(status);
-                Ok::<_, Error>((status, response.bytes().await?))
+                let body = read_capped_body(response, self.max_response_bytes).await?;
+                Ok::<_, Error>((status, body))
             };
             let retry_deadline = self
                 .worker_storage_admission
@@ -5704,10 +5713,32 @@ impl Client {
                 Some(captured) => {
                     match self
                         .capabilities_digest
-                        .restore(status.as_u16(), &bytes, captured)?
+                        .restore(status.as_u16(), &bytes, captured)
                     {
-                        Some(restored) => restored.into(),
-                        None => bytes,
+                        Ok(Some(restored)) => restored,
+                        Ok(None) => bytes,
+                        // An answer naming a digest this request did not send
+                        // is recoverable once: forget the held pair and resend
+                        // this same request asking for full capabilities. A
+                        // resent report the Server already committed comes
+                        // back as its usual non-recorded receipt.
+                        Err(error) if !digest_resent => {
+                            tracing::warn!(
+                                target: "durable_workflow::worker",
+                                path,
+                                error = %error,
+                                "unknown server capabilities digest; resending without it"
+                            );
+                            self.capabilities_digest.forget();
+                            request.headers_mut().insert(
+                                server_capabilities_digest::HEADER,
+                                reqwest::header::HeaderValue::from_static("none"),
+                            );
+                            capabilities = Some(None);
+                            digest_resent = true;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 None => bytes,
@@ -6571,6 +6602,25 @@ fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
         .min(policy.max_backoff)
 }
 
+/// Default cap on one decoded response body.
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Read a response body, decoding as it streams, and stop once it exceeds
+/// `limit` bytes, so a small compressed answer cannot expand without bound.
+pub(crate) async fn read_capped_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(Error::ResponseBodyTooLarge { limit_bytes: limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[derive(Debug)]
 pub struct ClientBuilder {
     metrics: metrics::Metrics,
@@ -6581,6 +6631,7 @@ pub struct ClientBuilder {
     namespace: String,
     timeout: Duration,
     max_external_payload_bytes: usize,
+    max_response_bytes: usize,
     worker_protocol_version: WorkerProtocolVersion,
     additional_root_certificates: Vec<reqwest::Certificate>,
     danger_accept_invalid_certs: bool,
@@ -6669,6 +6720,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Maximum bytes of one decoded (for example gunzipped) response body
+    /// (default 128 MiB). A larger body stops being read and fails with
+    /// [`Error::ResponseBodyTooLarge`], so a small compressed answer cannot
+    /// expand without bound.
+    pub fn max_response_bytes(mut self, bytes: usize) -> Self {
+        self.max_response_bytes = bytes;
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         validate_static_credential("token", self.token.as_deref())?;
         validate_static_credential("control_token", self.control_token.as_deref())?;
@@ -6707,6 +6767,7 @@ impl ClientBuilder {
             worker_token: self.worker_token,
             namespace: self.namespace,
             max_external_payload_bytes: self.max_external_payload_bytes,
+            max_response_bytes: self.max_response_bytes,
             worker_storage_admission: None,
             worker_task_slot: None,
             cooperative_worker_protocol: false,

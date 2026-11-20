@@ -42,6 +42,13 @@ impl Digest {
         self.0.lock().ok().and_then(|pair| pair.clone())
     }
 
+    /// Forget the held pair, so the next request asks for full capabilities.
+    pub(crate) fn forget(&self) {
+        if let Ok(mut pair) = self.0.lock() {
+            *pair = None;
+        }
+    }
+
     pub(crate) fn header(captured: &Captured) -> &str {
         captured
             .as_ref()

@@ -140,9 +140,23 @@ async fn worker_answers_are_restored_from_the_digest_each_request_sent() {
             json!({"task": null, "server_capabilities": tagged(d1)}),
         ),
         json_reply(200, json!({"task": null, "server_capabilities": d1})),
+        // A garbled answer: the poll is resent once without the held digest.
         json_reply(
             200,
             json!({"task": null, "server_capabilities": "sha256:unknown"}),
+        ),
+        json_reply(
+            200,
+            json!({"task": null, "server_capabilities": tagged(d1)}),
+        ),
+        // Unknown on the resend too: then it is a protocol failure.
+        json_reply(
+            200,
+            json!({"task": null, "server_capabilities": "sha256:unknown"}),
+        ),
+        json_reply(
+            200,
+            json!({"task": null, "server_capabilities": "sha256:other"}),
         ),
     ])
     .await;
@@ -162,8 +176,14 @@ async fn worker_answers_are_restored_from_the_digest_each_request_sent() {
         Some(capabilities()),
         "digest string restored"
     );
+    let third = poll().await.unwrap();
+    assert_eq!(
+        third.server_capabilities,
+        Some(capabilities()),
+        "recovered by resending"
+    );
     let Err(Error::Protocol(failure)) = poll().await else {
-        panic!("an unknown digest must be a protocol failure");
+        panic!("an unknown digest on the resend must be a protocol failure");
     };
     assert_eq!(failure.reason, "server_capabilities_digest_unknown");
 
@@ -172,5 +192,91 @@ async fn worker_answers_are_restored_from_the_digest_each_request_sent() {
         .iter()
         .map(|head| header(head, "x-durable-workflow-server-capabilities-digest"))
         .collect();
-    assert_eq!(sent, [Some("none"), Some(d1), Some(d1)]);
+    assert_eq!(
+        sent,
+        [
+            Some("none"),
+            Some(d1),
+            Some(d1),
+            Some("none"),
+            Some(d1),
+            Some("none")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_completion_resent_after_a_garbled_answer_gets_its_committed_receipt() {
+    let d1 = "sha256:d1";
+    let (url, requests) = server(vec![
+        json_reply(200, json!({"task": null, "server_capabilities": tagged(d1)})),
+        // The first completion discovers the inline payload policy.
+        json_reply(200, json!({})),
+        // The Server committed the completion, but its answer is garbled.
+        json_reply(200, json!({"recorded": true, "server_capabilities": "sha256:unknown"})),
+        // Native Server 3.17's answer to the resent copy.
+        json_reply(
+            409,
+            json!({"task_id":"task-1","activity_attempt_id":"attempt-1","outcome":"completed",
+                "recorded":false,"reason":"stale_attempt","lease_owner":"worker",
+                "activity_status":"completed","attempt_status":"completed","task_status":"completed",
+                "server_capabilities": tagged(d1)}),
+        ),
+    ])
+    .await;
+    let client = client(&url);
+    client
+        .poll_workflow_task_response("worker", "queue", Duration::from_secs(1))
+        .await
+        .unwrap();
+    let Err(Error::ActivityTaskRejected(receipt)) = client
+        .complete_activity_task("task-1", "attempt-1", "worker", json!("done"), "avro")
+        .await
+    else {
+        panic!("the resent completion must return the Server's receipt");
+    };
+    // The worker settles this non-recorded receipt like any stale attempt.
+    assert_eq!(receipt.status, 409);
+    assert_eq!(receipt.reason, "stale_attempt");
+    assert_eq!(receipt.body["server_capabilities"], capabilities());
+
+    let heads = requests.await.unwrap();
+    let sent: Vec<_> = heads
+        .iter()
+        .map(|head| header(head, "x-durable-workflow-server-capabilities-digest"))
+        .collect();
+    assert!(
+        heads[1].starts_with("get /api/cluster/info"),
+        "{}",
+        heads[1]
+    );
+    assert!(heads[2].starts_with("post /api/worker/activity-tasks/task-1/complete"));
+    assert!(heads[3].starts_with("post /api/worker/activity-tasks/task-1/complete"));
+    assert_eq!(sent, [Some("none"), None, Some(d1), Some("none")]);
+}
+
+#[tokio::test]
+async fn decoded_response_bodies_are_capped() {
+    let (url, requests) = server(vec![Reply {
+        status: 200,
+        headers: vec![
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+        ],
+        body: GZIP_DESCRIPTION.to_vec(),
+    }])
+    .await;
+    let client = Client::builder(&url)
+        .namespace("default")
+        .token(Some("token".into()))
+        .max_response_bytes(1_000)
+        .build()
+        .unwrap();
+    // 91 compressed bytes decode to 1574, over the 1000-byte cap.
+    let error = client.describe_workflow("wf-gzip").await.unwrap_err();
+    assert!(
+        matches!(error, Error::ResponseBodyTooLarge { limit_bytes: 1_000 }),
+        "{error:?}"
+    );
+    requests.await.unwrap();
 }
