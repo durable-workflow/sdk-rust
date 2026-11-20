@@ -1842,6 +1842,7 @@ impl Worker {
         task_metrics: &mut crate::metrics::WorkerObservation,
     ) -> Result<ManagedPollOutcome> {
         let session = self.track_session_task(task.worker_session.as_ref())?;
+        let lease_deadline = task.lease_deadline;
         let metadata = task.invocation(session);
         let task = task.task;
         let guard = ActivityClaimGuard::new(&self.client, &task, &self.worker_id)?;
@@ -1896,36 +1897,52 @@ impl Worker {
         } else {
             "failed"
         };
-        let settlement = match result {
+        let settled = match result {
             Ok(value) => {
-                self.client
-                    .complete_activity_task(
-                        &guard.task_id,
-                        &guard.attempt_id,
-                        &guard.owner,
-                        value,
-                        &task.payload_codec,
-                    )
-                    .await
+                self.settle_activity_report(
+                    crate::ActivityReport::Completed,
+                    &guard.task_id,
+                    &guard.attempt_id,
+                    &guard.owner,
+                    lease_deadline,
+                    || {
+                        self.client.complete_activity_task(
+                            &guard.task_id,
+                            &guard.attempt_id,
+                            &guard.owner,
+                            value.clone(),
+                            &task.payload_codec,
+                        )
+                    },
+                )
+                .await?
             }
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Err(error) => {
-                self.client
-                    .fail_activity_task_with_error(
-                        &guard.task_id,
-                        &guard.attempt_id,
-                        &guard.owner,
-                        &crate::ActivityError::from_error(&error, "RustActivityFailure"),
-                    )
-                    .await
+                let failure = crate::ActivityError::from_error(&error, "RustActivityFailure");
+                self.settle_activity_report(
+                    crate::ActivityReport::Failed,
+                    &guard.task_id,
+                    &guard.attempt_id,
+                    &guard.owner,
+                    lease_deadline,
+                    || {
+                        self.client.fail_activity_task_with_error(
+                            &guard.task_id,
+                            &guard.attempt_id,
+                            &guard.owner,
+                            &failure,
+                        )
+                    },
+                )
+                .await?
             }
         };
-        if let Err(error) = settlement {
-            if !activity_task_rejection_is_final(&error) {
-                return Err(error);
-            }
-        }
-        task_metrics.outcome(task_outcome);
+        task_metrics.outcome(match settled {
+            crate::ActivitySettlement::Recorded => task_outcome,
+            crate::ActivitySettlement::Closed if task_outcome == "failed" => task_outcome,
+            _ => "expired",
+        });
         Ok(ManagedPollOutcome::Handled)
     }
 

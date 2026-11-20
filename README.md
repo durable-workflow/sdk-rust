@@ -1141,17 +1141,45 @@ ranges remain replay errors.
 
 ### Recovering from Server outages
 
-For a long-running service worker, enable `.recover_transient_outages(true)`
-on `Worker`. Retryable poll and worker-heartbeat failures then keep retrying
-with capped exponential backoff. A retried poll keeps its original request ID.
-`run_until` interrupts retry waits when shutdown arrives and settles any poll
-response already in flight.
+`run` and `run_until` outlive transient Server outages by default. A transient
+failure is a connection refused, reset or timed out; an upstream 502, 503 or
+504 without a protocol body; a 503 whose reason is `storage_unavailable` or
+`backend_unavailable` (for example while native Server warms up its storage);
+or any 5xx or 429 that says `retryable: true`. Poll and worker-heartbeat
+retries keep going past `WorkerRetryPolicy.max_retries` for these, and a
+retried poll keeps its original request ID. Within the budget they use the
+policy's delays; beyond it every worker draws from the shared full-jitter
+schedule below, so a fleet does not retry in step when the Server comes back.
+An outage that has lasted 60 s is logged as a `tracing` error, then again
+every 5 minutes while it continues; a success resets it. A transient that still escapes a
+poll lane, a task settlement or registration is logged as a `tracing` warning
+and retried after a wait drawn uniformly from `[0, min(4 s, 0.25 s * 2^(n-1))]`
+for the n-th consecutive failure, the schedule shared by every Durable Workflow
+SDK. Shutdown interrupts every wait and settles any poll response already in
+flight.
 
-The default preserves bounded retries. `run_once` remains bounded in either
-mode, and `WorkerRetryPolicy.max_retries = 0` disables ordinary retries.
-Authentication, protocol, codec, handler and task settlement failures still
-return an error. Registration and deregistration are outside this recovery
-option. Keep a process supervisor for startup failures and process crashes.
+An activity completion, failure or `worker_lost` release that hits a
+transient failure is resent unchanged with the same backoff while the
+activity's lease lasts (a maintained lease keeps being renewed meanwhile). If
+the Server had already committed the first copy, native Server 3.17 answers the
+resend with `409 {"reason":"stale_attempt","recorded":false}` naming this
+task, attempt and owner with every status `completed` (or `attempt_status`
+`failed` for a failure); the worker counts that as its own recorded outcome. A
+`stale_attempt` in any other state means the attempt was closed by something
+else. When the lease runs out first, the worker logs a `tracing` error and the
+Server settles the attempt.
+
+An explicit `retryable: false`, 401, 403 and other protocol refusals, codec
+and handler failures stop the worker: it emits a `tracing` error event and
+returns the error. `.recover_transient_outages(false)` restores bounded retries,
+`run_once` remains bounded in either mode, and
+`WorkerRetryPolicy.max_retries = 0` disables retries. Keep a process supervisor
+for crashes.
+
+Credential refusals differ between SDKs. The Rust and PHP workers stop on a
+401 or 403 after logging it as an error, so a supervisor restarts them with new
+credentials. The Python SDK's pollers keep retrying 401 and 403, logging an
+error on every refusal, so credentials can rotate under a running worker.
 
 ### Runnable examples
 

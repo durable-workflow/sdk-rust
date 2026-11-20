@@ -420,6 +420,17 @@ impl Authority {
             .map_err(|error| self.invalidate(&error.to_string()))
     }
 
+    /// Time left on the acknowledged lease while this claim is still held.
+    pub(crate) fn lease_left(&self) -> Option<Duration> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Some(Duration::ZERO);
+        }
+        self.state
+            .lock()
+            .ok()
+            .map(|state| state.lease_until.saturating_duration_since(Clock::now()))
+    }
+
     pub(crate) fn attach_session(&self, handle: Option<&WorkerSession>) -> Result<()> {
         let mut state = self
             .state
@@ -802,7 +813,6 @@ impl Authority {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
         }
-        let budget = lease_left;
         let failure = json!({
             "type": WORKER_LOST_TYPE,
             "class": WORKER_LOST_CLASS,
@@ -813,24 +823,59 @@ impl Authority {
             ),
         });
         // `self.client` carries no lease authority, so this report is not
-        // fenced by the claim it releases.
-        let reported = tokio::time::timeout(
-            budget,
-            self.client.fail_activity_task_with_failure(
+        // fenced by the claim it releases. The same report is resent after a
+        // transient failure while more than the margin of the lease is left;
+        // the Server answers a copy it already recorded as this attempt's own
+        // failure.
+        let mut failures = 0_u32;
+        loop {
+            let left = self
+                .state
+                .lock()
+                .map(|state| state.lease_until.saturating_duration_since(Clock::now()))
+                .unwrap_or_default();
+            let reported = tokio::time::timeout(
+                left,
+                self.client.fail_activity_task_with_failure(
+                    &self.task_id,
+                    &self.attempt_id,
+                    &self.owner,
+                    failure.clone(),
+                ),
+            )
+            .await;
+            let error = match reported {
+                Ok(Ok(_)) => return,
+                Ok(Err(error)) => error,
+                Err(_) => Error::Timeout,
+            };
+            if crate::activity_report_already_recorded(
+                &error,
+                crate::ActivityReport::Failed,
                 &self.task_id,
                 &self.attempt_id,
                 &self.owner,
-                failure,
-            ),
-        )
-        .await;
-        if !matches!(reported, Ok(Ok(_))) {
-            tracing::warn!(
-                target: "durable_workflow::activity_lease",
-                task_id = %self.task_id,
-                activity_attempt_id = %self.attempt_id,
-                "could not release an unrenewable activity claim; the Server settles it at lease expiry"
-            );
+            ) {
+                return;
+            }
+            failures = failures.saturating_add(1);
+            let delay = crate::worker_outage_delay(failures);
+            let left = self
+                .state
+                .lock()
+                .map(|state| state.lease_until.saturating_duration_since(Clock::now()))
+                .unwrap_or_default();
+            if !crate::worker_error_is_transient(&error) || left <= margin + delay {
+                tracing::warn!(
+                    target: "durable_workflow::activity_lease",
+                    task_id = %self.task_id,
+                    activity_attempt_id = %self.attempt_id,
+                    error = %error,
+                    "could not release an unrenewable activity claim; the Server settles it at lease expiry"
+                );
+                return;
+            }
+            tokio::time::sleep(delay).await;
         }
     }
 }

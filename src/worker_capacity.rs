@@ -157,7 +157,13 @@ impl Worker {
     }
 
     fn stop_on_terminal_poll(&self, result: &Result<ManagedPollOutcome>) {
-        if matches!(result, Err(_) | Ok(ManagedPollOutcome::Stop)) {
+        let terminal = match result {
+            Ok(ManagedPollOutcome::Stop) => true,
+            // A transient the running worker outlives is not terminal.
+            Err(error) => !self.outlives(error),
+            Ok(_) => false,
+        };
+        if terminal {
             if let Some(stop) = &self.run_stop {
                 // Stop queued pollers before this reservation's drop wakes one.
                 stop.store(true, Ordering::SeqCst);
@@ -183,6 +189,7 @@ impl Worker {
             let worker = self.clone();
             let stop = stop.clone();
             lanes.push(async move {
+                let mut outage = crate::Outage::default();
                 while !stop.load(Ordering::SeqCst) {
                     let outcome = match family {
                         TaskFamily::Workflow => worker.poll_workflow_once().await,
@@ -194,10 +201,15 @@ impl Worker {
                             break;
                         }
                         Err(error) => {
-                            stop.store(true, Ordering::SeqCst);
-                            return Err(error);
+                            // A transient that escaped this tick (a poll past
+                            // its retries, or a settlement) does not stop a
+                            // running worker; anything else does.
+                            if !worker.outlive_transient(&error, &mut outage, &stop).await {
+                                stop.store(true, Ordering::SeqCst);
+                                return Err(error);
+                            }
                         }
-                        _ => {}
+                        _ => outage.reset(),
                     }
                 }
                 Ok(())

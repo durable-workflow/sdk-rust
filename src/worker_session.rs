@@ -271,6 +271,10 @@ pub(super) struct SessionActivityTask {
     pub(super) activity_lease: Option<Arc<crate::activity_lease::authority::Lease>>,
     #[serde(skip)]
     pub(super) heartbeat_resume: crate::activity_checkpoint::HeartbeatResume,
+    /// When the delivered lease ends, measured from the poll's start. Bounds
+    /// settlement retries when no maintained lease authority does.
+    #[serde(skip)]
+    pub(super) lease_deadline: Option<tokio::time::Instant>,
 }
 
 pub(super) struct ActivityInvocation {

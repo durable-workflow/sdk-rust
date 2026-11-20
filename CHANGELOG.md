@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **BEHAVIOUR CHANGE: `Worker::recover_transient_outages` now defaults to
+  `true`.** `run` and `run_until` keep running through transient Server
+  outages instead of returning the error once `WorkerRetryPolicy.max_retries`
+  is spent. Call `.recover_transient_outages(false)` to restore the previous
+  bounded behavior.
+- A running worker no longer exits on a transient Server outage (the Rust
+  side of sdk-php#448). Native Server answers any storage failure, including
+  warm-up, with `503 {"reason":"storage_unavailable"}`; after the default five
+  retries `run` and `run_until` used to return that error. Transient failures
+  are now a connection refused, reset or timed out; an upstream 502/503/504
+  without a protocol body; a 503 with reason `storage_unavailable` or
+  `backend_unavailable`; or any 5xx or 429 with `retryable: true`.
+  `Worker::recover_transient_outages` is now on by default: poll and heartbeat
+  retries continue past the retry budget for transients (a poll keeps its
+  request identity) with the same fully jittered schedule rather than the
+  fixed `max_backoff` delay, so workers do not retry in step; an outage that
+  lasts 60 s is logged as a `tracing` error, then every 5 minutes, and a transient that escapes a poll lane, a task
+  settlement or registration is logged with `tracing` and retried after a
+  jittered wait, uniform in `[0, min(4 s, 0.25 s * 2^(n-1))]`. With the option
+  on, only transients retry past the budget; an untyped 500 or a 429 without
+  `retryable: true` is now returned once the budget is spent. An explicit
+  `retryable: false`, 401, 403 and other refusals stop the worker with a
+  `tracing` error event. `.recover_transient_outages(false)` restores the
+  previous bounded behavior. 401 and 403 stop the worker, as in the PHP SDK;
+  the Python SDK's pollers instead retry them so credentials can rotate.
+- An activity completion, failure or `worker_lost` release that hits a
+  transient failure is no longer lost. The worker resends the identical report
+  with the same jittered backoff while the lease lasts, then logs a `tracing`
+  error and leaves the attempt to the Server. A resend after the Server had
+  already committed the first copy is answered by native Server 3.17 with
+  `409 {"reason":"stale_attempt","recorded":false}` for this task, attempt and
+  owner with every status `completed` (or `attempt_status` `failed`); the
+  worker counts that as its own recorded outcome. Verified against the
+  published `durableworkflow/server:3.17.0` image: the run completed with
+  exactly one `ActivityCompleted`.
+
 - A timeout, transport error, 429 or 5xx on the activity lease renewal made
   before the callback starts no longer drops the claimed task (#302, the Rust
   side of sdk-php#445). Previously the Worker gave up on the claim without

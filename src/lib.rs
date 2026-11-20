@@ -5296,6 +5296,7 @@ impl Client {
             )
             .await?;
         let ready_age = metrics::ready_age_from_poll(&wire);
+        let lease_deadline = poll_lease_deadline(&wire, requested);
         let lease = activity_lease::authority::Lease::confirm(
             self, &wire, worker_id, task_queue, requested,
         )
@@ -5344,6 +5345,7 @@ impl Client {
         if let Some(task) = data.task.as_mut() {
             task.hydration_claim = claim;
             task.activity_lease = lease;
+            task.lease_deadline = lease_deadline;
             self.worker_dispatch_metrics
                 .ready_age("activity", task_queue, ready_age);
         }
@@ -6168,6 +6170,56 @@ fn activity_task_rejection_is_final(error: &Error) -> bool {
     )
 }
 
+/// Which activity outcome a settlement reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityReport {
+    Completed,
+    Failed,
+}
+
+/// How an activity settlement ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivitySettlement {
+    /// The Server recorded this report, possibly on an earlier copy.
+    Recorded,
+    /// The attempt was already closed by something else; nothing recorded.
+    Closed,
+    /// Transient failures outlasted the lease; the Server settles it.
+    LeaseEnded,
+}
+
+/// The Server's answer to a resent settlement whose first copy it already
+/// recorded. Native Server 3.17 answers a duplicate completion with
+/// `409 {"reason":"stale_attempt","recorded":false}` naming this task,
+/// attempt and owner with `activity_status`, `attempt_status` and
+/// `task_status` all `completed` (a failure: `attempt_status` `failed`). A
+/// `stale_attempt` in any other state is someone else's outcome.
+pub(crate) fn activity_report_already_recorded(
+    error: &Error,
+    report: ActivityReport,
+    task_id: &str,
+    attempt_id: &str,
+    owner: &str,
+) -> bool {
+    let Error::ActivityTaskRejected(rejection) = error else {
+        return false;
+    };
+    let body = &rejection.body;
+    let field = |name: &str| body.get(name).and_then(Value::as_str);
+    let own = rejection.status == 409
+        && rejection.reason == "stale_attempt"
+        && body.get("recorded").and_then(Value::as_bool) == Some(false)
+        && field("task_id") == Some(task_id)
+        && field("activity_attempt_id") == Some(attempt_id)
+        && field("lease_owner") == Some(owner);
+    own && match report {
+        ActivityReport::Completed => ["activity_status", "attempt_status", "task_status"]
+            .iter()
+            .all(|name| field(name) == Some("completed")),
+        ActivityReport::Failed => field("attempt_status") == Some("failed"),
+    }
+}
+
 /// A workflow-task report the server answered with a non-recorded receipt
 /// for exactly this task, attempt and run, which settles the managed tick:
 /// the run's terminal timeout (`run_timed_out` with `run_status=failed`), a
@@ -6365,6 +6417,111 @@ fn worker_operation_is_retryable(error: &Error) -> bool {
         }
         _ => false,
     }
+}
+
+/// A failure a running worker outlives (sdk-php#448): a connection refused,
+/// reset or timed out; an upstream 502/503/504 without a protocol body; a 503
+/// whose reason is `storage_unavailable` or `backend_unavailable`; or any 5xx
+/// or 429 that says `retryable: true`. An explicit `retryable: false`, 401,
+/// 403 and every other protocol refusal stay fatal.
+pub(crate) fn worker_error_is_transient(error: &Error) -> bool {
+    let (status, body) = match error {
+        Error::Timeout => return true,
+        Error::Transport(error) => {
+            return error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+        }
+        Error::Http { status, body } => (status.as_u16(), serde_json::from_str::<Value>(body).ok()),
+        Error::ActivityTaskRejected(rejection) => (rejection.status, Some(rejection.body.clone())),
+        _ => return false,
+    };
+    let body = body.filter(Value::is_object);
+    let field = |name: &str| body.as_ref().and_then(|body| body.get(name));
+    match field("retryable").and_then(Value::as_bool) {
+        Some(false) => return false,
+        Some(true) if status >= 500 || status == 429 => return true,
+        _ => {}
+    }
+    matches!(
+        (status, field("reason").and_then(Value::as_str)),
+        (503, Some("storage_unavailable" | "backend_unavailable")) | (502..=504, None)
+    )
+}
+
+/// The shared outage backoff: uniform in `[0, min(4 s, 0.25 s * 2^(n-1))]`
+/// for the n-th consecutive transient failure (n from 1).
+pub(crate) fn worker_outage_delay(failures: u32) -> Duration {
+    let ceiling = Duration::from_millis(250 << failures.saturating_sub(1).min(4));
+    let (bits, _) = Uuid::new_v4().as_u64_pair();
+    ceiling.mul_f64((bits >> 11) as f64 / (1_u64 << 53) as f64)
+}
+
+/// Escalates a continuing outage to an ERROR log: once it has lasted 60 s,
+/// then every 5 minutes while it continues. Callers reset it on success.
+#[derive(Debug, Default)]
+pub(crate) struct OutageLog {
+    started: Option<std::time::Instant>,
+    reported: Option<std::time::Instant>,
+}
+
+impl OutageLog {
+    const FIRST_ERROR: Duration = Duration::from_secs(60);
+    const REPEAT_ERROR: Duration = Duration::from_secs(300);
+
+    /// Record a failure at `now`; returns how long the outage has lasted
+    /// when an ERROR line is due.
+    pub(crate) fn failed(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let started = *self.started.get_or_insert(now);
+        let lasted = now.saturating_duration_since(started);
+        let due = match self.reported {
+            None => lasted >= Self::FIRST_ERROR,
+            Some(last) => now.saturating_duration_since(last) >= Self::REPEAT_ERROR,
+        };
+        due.then(|| {
+            self.reported = Some(now);
+            lasted
+        })
+    }
+
+    pub(crate) fn report(&mut self, worker_id: &str, task_queue: &str, error: &Error) {
+        if let Some(lasted) = self.failed(std::time::Instant::now()) {
+            tracing::error!(
+                target: "durable_workflow::worker",
+                worker_id,
+                task_queue,
+                error = %error,
+                outage_seconds = lasted.as_secs(),
+                "Server outage continues; the worker is still retrying"
+            );
+        }
+    }
+}
+
+/// Consecutive transient failures in one loop and their escalation state.
+#[derive(Debug, Default)]
+pub(crate) struct Outage {
+    pub(crate) failures: u32,
+    log: OutageLog,
+}
+
+impl Outage {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The delivered activity lease's end on the local clock, measured from when
+/// the poll was sent (`lease_expires_at - server_time`).
+fn poll_lease_deadline(
+    wire: &Value,
+    requested: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let parse = |value: &Value| DateTime::parse_from_rfc3339(value.as_str()?).ok();
+    let expires = parse(&wire["task"]["lease_expires_at"])?;
+    let server = parse(&wire["server_time"])?;
+    requested.checked_add((expires - server).to_std().ok()?)
 }
 
 fn worker_storage_admission_body(error: &Error) -> Option<Value> {
@@ -6592,6 +6749,19 @@ fn worker_poll_capacity_retry_after(error: &Error) -> Option<Duration> {
             .and_then(Value::as_u64)
             .unwrap_or_default(),
     ))
+}
+
+/// Delay before poll or heartbeat retry `retry` (from 1): the policy's capped
+/// exponential delay within its budget, then the shared full-jitter outage
+/// schedule, restarting at its first step, so recovering workers spread out.
+fn worker_poll_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
+    if retry <= policy.max_retries {
+        worker_retry_delay(policy, retry)
+    } else {
+        let beyond = retry - policy.max_retries;
+        worker_outage_delay(u32::try_from(beyond).unwrap_or(u32::MAX))
+    }
+    .max(Duration::from_millis(1))
 }
 
 fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
@@ -8118,9 +8288,10 @@ pub struct WorkerHeartbeatObservation {
 /// capped by `max_backoff`, except an explicit completion deferral must honor
 /// the Server's minimum delay. Shutdown interrupts storage waits; cooperative
 /// completion retries remain bounded by the original cleanup deadline.
-/// [`Worker::recover_transient_outages`] can keep a long-running worker retrying
-/// poll acquisition and heartbeats beyond this budget. `run_once` stays bounded,
-/// and `max_retries = 0` disables ordinary retries in either mode.
+/// [`Worker::recover_transient_outages`] (on by default) keeps a long-running
+/// worker retrying transient poll, heartbeat and registration failures beyond
+/// this budget. `run_once` stays bounded, and `max_retries = 0` disables
+/// ordinary retries in either mode.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerRetryPolicy {
     /// Number of retries after the initial request fails.
@@ -8243,7 +8414,7 @@ impl Worker {
             poll_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
             retry_policy: WorkerRetryPolicy::default(),
-            recover_transient_outages: false,
+            recover_transient_outages: true,
             run_stop: None,
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
@@ -8380,17 +8551,31 @@ impl Worker {
         self
     }
 
-    /// Keep `run` and `run_until` alive during retryable poll and heartbeat outages.
+    /// Keep `run` and `run_until` alive through transient Server outages.
     ///
-    /// Retries preserve the poll request identity and use capped exponential
-    /// backoff from [`WorkerRetryPolicy`]. Shutdown interrupts a retry wait.
-    /// An in-flight poll is allowed to finish so leased work is not discarded.
-    /// Authentication, protocol, codec, handler and task settlement failures
-    /// remain errors. Registration and deregistration are not retried here.
+    /// Enabled by default. A transient failure is a connection refused, reset
+    /// or timed out; an upstream 502/503/504 without a protocol body; a 503
+    /// whose reason is `storage_unavailable` or `backend_unavailable`; or any
+    /// 5xx or 429 that says `retryable: true`. Poll and heartbeat retries keep
+    /// going past the [`WorkerRetryPolicy`] budget for these, and a poll keeps
+    /// its request identity. A transient that still escapes a poll lane or
+    /// registration (for example a task settlement) is logged with `tracing`
+    /// and retried after a jittered wait, uniform in
+    /// `[0, min(4 s, 0.25 s * 2^(n-1))]` for the n-th consecutive failure.
+    /// Shutdown interrupts every wait. An explicit `retryable: false`, 401,
+    /// 403, other protocol refusals, codec and handler failures stop the worker
+    /// with a `tracing` error event and are returned.
     ///
-    /// The default is disabled, preserving the bounded retry contract.
-    /// `run_once` always remains bounded. `max_retries = 0` disables retries,
-    /// even when this option is enabled.
+    /// Activity completions, failures and `worker_lost` releases that hit a
+    /// transient are resent unchanged while the lease lasts; the Server's
+    /// answer to a copy it already recorded counts as recorded.
+    ///
+    /// Unlike the Python SDK, whose pollers retry 401 and 403 so credentials
+    /// can rotate, this worker (like PHP's) stops on them after logging.
+    ///
+    /// Pass `false` to restore the bounded contract: the worker returns the
+    /// error once the retry budget is spent. `run_once` always remains bounded.
+    /// `max_retries = 0` disables retries, even when this option is enabled.
     pub fn recover_transient_outages(mut self, enabled: bool) -> Self {
         self.recover_transient_outages = enabled;
         self
@@ -9373,10 +9558,10 @@ impl Worker {
     /// Run until shutdown or a terminal worker error occurs.
     ///
     /// Empty long-poll expirations do not stop the worker. Retryable poll and
-    /// heartbeat failures use [`WorkerRetryPolicy`] independently, while
-    /// authentication, protocol, and other non-retryable failures are returned.
-    /// Enable [`Worker::recover_transient_outages`] to keep retrying transient
-    /// poll and heartbeat outages beyond the ordinary retry budget.
+    /// heartbeat failures use [`WorkerRetryPolicy`] independently. Transient
+    /// Server outages never stop it while [`Worker::recover_transient_outages`]
+    /// is on (the default); authentication, protocol and other non-retryable
+    /// failures are logged and returned.
     pub async fn run(&self) -> Result<()> {
         self.run_until(std::future::pending::<()>()).await
     }
@@ -9417,7 +9602,19 @@ impl Worker {
     }
 
     async fn run_with_storage_admission(&self, stop: Arc<AtomicBool>) -> Result<()> {
-        let registration = self.register().await?;
+        let mut outage = Outage::default();
+        let registration = loop {
+            match self.register().await {
+                Ok(registration) => break registration,
+                Err(error) => {
+                    // Shutdown during the wait still reports the refusal: the
+                    // worker was never registered.
+                    if !self.outlive_transient(&error, &mut outage, &stop).await {
+                        return Err(error);
+                    }
+                }
+            }
+        };
         if !registration.registered {
             return Err(Error::WorkerLoop(format!(
                 "worker registration for {:?} was not accepted",
@@ -9538,6 +9735,13 @@ impl Worker {
                         }
                         Ok(None) => break,
                         Err(error) => {
+                            tracing::error!(
+                                target: "durable_workflow::worker",
+                                worker_id = %self.worker_id,
+                                task_queue = %self.task_queue,
+                                error = %error,
+                                "worker stopping: heartbeat failed with a non-retryable failure"
+                            );
                             stop.store(true, Ordering::SeqCst);
                             join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await?;
                             return Err(error);
@@ -10014,6 +10218,7 @@ impl Worker {
             return self.settle_cooperative_activity(task, task_metrics).await;
         }
         let session = self.track_session_task(task.worker_session.as_ref())?;
+        let lease_deadline = task.lease_deadline;
         let invocation = task.invocation(session);
         let task = task.task;
 
@@ -10029,48 +10234,158 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
         let result = self.execute_session_activity_task(task, invocation).await;
-        let task_outcome = if result.is_ok() {
+        let mut task_outcome = if result.is_ok() {
             "completed"
         } else if matches!(result, Err(Error::ActivityExecutionAbandoned(_))) {
             "expired"
         } else {
             "failed"
         };
-        match result {
-            Err(Error::ActivityExecutionAbandoned(_)) => {}
-            Err(error) if activity_hydration::stopped(&error) => {}
+        let settled = match result {
+            Err(Error::ActivityExecutionAbandoned(_)) => ActivitySettlement::Recorded,
+            Err(error) if activity_hydration::stopped(&error) => ActivitySettlement::Recorded,
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
-                let completion = self
-                    .client
-                    .complete_activity_task(&task_id, &attempt_id, &lease_owner, value, &codec)
-                    .await;
-                if let Err(error) = completion {
-                    if !activity_task_rejection_is_final(&error) {
-                        return Err(error);
-                    }
-                }
+                self.settle_activity_report(
+                    ActivityReport::Completed,
+                    &task_id,
+                    &attempt_id,
+                    &lease_owner,
+                    lease_deadline,
+                    || {
+                        self.client.complete_activity_task(
+                            &task_id,
+                            &attempt_id,
+                            &lease_owner,
+                            value.clone(),
+                            &codec,
+                        )
+                    },
+                )
+                .await?
             }
             Err(error) => {
-                let failure = self
-                    .client
-                    .fail_activity_task_with_error(
-                        &task_id,
-                        &attempt_id,
-                        &lease_owner,
-                        &ActivityError::from_error(&error, "RustActivityFailure"),
-                    )
-                    .await;
-                if let Err(error) = failure {
-                    if !activity_task_rejection_is_final(&error) {
-                        return Err(error);
-                    }
-                }
+                let failure = ActivityError::from_error(&error, "RustActivityFailure");
+                self.settle_activity_report(
+                    ActivityReport::Failed,
+                    &task_id,
+                    &attempt_id,
+                    &lease_owner,
+                    lease_deadline,
+                    || {
+                        self.client.fail_activity_task_with_error(
+                            &task_id,
+                            &attempt_id,
+                            &lease_owner,
+                            &failure,
+                        )
+                    },
+                )
+                .await?
             }
+        };
+        match settled {
+            ActivitySettlement::Recorded => {}
+            // A stale attempt someone else closed is not this worker's outcome.
+            ActivitySettlement::Closed if task_outcome == "completed" => task_outcome = "expired",
+            ActivitySettlement::Closed => {}
+            ActivitySettlement::LeaseEnded => task_outcome = "expired",
         }
 
         task_metrics.outcome(task_outcome);
         Ok(ManagedPollOutcome::Handled)
+    }
+
+    /// Send one activity settlement (complete or fail), resending the same
+    /// report after a transient failure with the shared jittered backoff while
+    /// the lease lasts. A maintained lease authority bounds this too: it ends
+    /// the publication when the claim is lost. The resend is idempotent: the
+    /// Server's answer to a copy it already recorded counts as recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn settle_activity_report<F, Fut>(
+        &self,
+        report: ActivityReport,
+        task_id: &str,
+        attempt_id: &str,
+        owner: &str,
+        lease_deadline: Option<tokio::time::Instant>,
+        mut send: F,
+    ) -> Result<ActivitySettlement>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        let mut failures = 0_u32;
+        let mut outage = OutageLog::default();
+        loop {
+            let error = match send().await {
+                Ok(_) => return Ok(ActivitySettlement::Recorded),
+                Err(error)
+                    if activity_report_already_recorded(
+                        &error, report, task_id, attempt_id, owner,
+                    ) =>
+                {
+                    return Ok(ActivitySettlement::Recorded)
+                }
+                Err(error) if activity_task_rejection_is_final(&error) => {
+                    return Ok(ActivitySettlement::Closed)
+                }
+                Err(error) => error,
+            };
+            let stopping = self
+                .run_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst));
+            if !worker_error_is_transient(&error) || self.retry_policy.max_retries == 0 || stopping
+            {
+                return Err(error);
+            }
+            failures = failures.saturating_add(1);
+            outage.report(&self.worker_id, &self.task_queue, &error);
+            let delay = worker_outage_delay(failures);
+            let lease_left = self
+                .client
+                .activity_lease_authority
+                .as_ref()
+                .and_then(|authority| authority.lease_left())
+                .or_else(|| {
+                    lease_deadline.map(|deadline| {
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    })
+                });
+            let out_of_time = match lease_left {
+                Some(left) => delay >= left,
+                // No known lease: keep the ordinary bounded budget.
+                None => failures as usize > self.retry_policy.max_retries,
+            };
+            if out_of_time {
+                tracing::error!(
+                    target: "durable_workflow::worker",
+                    worker_id = %self.worker_id,
+                    task_id,
+                    error = %error,
+                    "activity outcome not delivered before its lease ended; the Server settles the attempt"
+                );
+                return Ok(ActivitySettlement::LeaseEnded);
+            }
+            tracing::warn!(
+                target: "durable_workflow::worker",
+                worker_id = %self.worker_id,
+                task_id,
+                error = %error,
+                retry_in_ms = delay.as_millis() as u64,
+                "transient failure reporting an activity outcome; resending it"
+            );
+            match &self.run_stop {
+                Some(stop) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = wait_for_worker_stop(stop) => return Err(error),
+                    }
+                }
+                None => tokio::time::sleep(delay).await,
+            }
+        }
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {
@@ -10239,6 +10554,7 @@ impl Worker {
     }
 
     async fn poll_queries_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
+        let mut outage = Outage::default();
         while !stop.load(Ordering::SeqCst) {
             match self.poll_query_once().await {
                 Ok(ManagedPollOutcome::Stop) => {
@@ -10246,14 +10562,65 @@ impl Worker {
                     break;
                 }
                 Err(error) => {
-                    stop.store(true, Ordering::SeqCst);
-                    return Err(error);
+                    if !self.outlive_transient(&error, &mut outage, &stop).await {
+                        stop.store(true, Ordering::SeqCst);
+                        return Err(error);
+                    }
                 }
-                _ => {}
+                _ => outage.reset(),
             }
         }
 
         Ok(())
+    }
+
+    /// A running worker (not `run_once`) outlives transient failures unless
+    /// recovery or retries are disabled.
+    pub(crate) fn outlives(&self, error: &Error) -> bool {
+        self.run_stop.is_some()
+            && self.recover_transient_outages
+            && self.retry_policy.max_retries > 0
+            && worker_error_is_transient(error)
+    }
+
+    /// Whether a running worker keeps going after `error`, which escaped a
+    /// poll lane: a transient waits out the shared jittered backoff; anything
+    /// else is logged as fatal. Shutdown before or during the wait returns the
+    /// error as before, so a refused operation never looks acknowledged.
+    pub(crate) async fn outlive_transient(
+        &self,
+        error: &Error,
+        outage: &mut Outage,
+        stop: &AtomicBool,
+    ) -> bool {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        if !self.outlives(error) {
+            tracing::error!(
+                target: "durable_workflow::worker",
+                worker_id = %self.worker_id,
+                task_queue = %self.task_queue,
+                error = %error,
+                "worker stopping on a non-retryable failure"
+            );
+            return false;
+        }
+        outage.failures = outage.failures.saturating_add(1);
+        outage.log.report(&self.worker_id, &self.task_queue, error);
+        let delay = worker_outage_delay(outage.failures);
+        tracing::warn!(
+            target: "durable_workflow::worker",
+            worker_id = %self.worker_id,
+            task_queue = %self.task_queue,
+            error = %error,
+            retry_in_ms = delay.as_millis() as u64,
+            "transient Server failure; the worker keeps running"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = wait_for_worker_stop(stop) => false,
+        }
     }
 
     async fn retry_worker_operation<T, F, Fut>(&self, mut operation: F) -> Result<Option<T>>
@@ -10262,6 +10629,7 @@ impl Worker {
         Fut: Future<Output = Result<T>>,
     {
         let mut retries = 0;
+        let mut outage = OutageLog::default();
 
         loop {
             if self
@@ -10287,11 +10655,16 @@ impl Worker {
                         && (retries < self.retry_policy.max_retries
                             || (self.recover_transient_outages
                                 && self.run_stop.is_some()
-                                && self.retry_policy.max_retries > 0)) =>
+                                && self.retry_policy.max_retries > 0
+                                && worker_error_is_transient(&error))) =>
                 {
                     retries = retries.saturating_add(1);
-                    let delay = worker_retry_delay(self.retry_policy, retries)
-                        .max(Duration::from_millis(1));
+                    outage.report(&self.worker_id, &self.task_queue, &error);
+                    // Within the budget the policy's capped exponential delay
+                    // applies. Beyond it, every worker draws from the shared
+                    // full-jitter schedule so a fleet does not retry in step
+                    // when the Server comes back.
+                    let delay = worker_poll_retry_delay(self.retry_policy, retries);
                     if let Some(stop) = &self.run_stop {
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
@@ -20447,6 +20820,7 @@ mod tests {
     mod version_marker_contract;
     mod worker_capacity;
     mod worker_session;
+    mod worker_transient_outage;
     use std::{
         fs,
         io::{Read, Write},
@@ -35379,8 +35753,8 @@ mod tests {
     #[tokio::test]
     async fn worker_recovers_all_poll_families_and_heartbeat_beyond_retry_budget() {
         let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-            poll_failures_per_path: 8,
-            heartbeat_failures: 8,
+            poll_failures_per_path: 4,
+            heartbeat_failures: 4,
             ..MockWorkerBehavior::default()
         });
         let client = Client::builder(server.base_url())
@@ -35411,28 +35785,43 @@ mod tests {
             Ok(Value::Null)
         });
 
-        worker
-            .run_until(tokio::time::sleep(Duration::from_millis(500)))
+        let recovered = async {
+            while server.request_count("/api/worker/heartbeat") < 5
+                || [
+                    "/api/worker/workflow-tasks/poll",
+                    "/api/worker/activity-tasks/poll",
+                    "/api/worker/query-tasks/poll",
+                ]
+                .iter()
+                .any(|path| server.request_count(path) < 6)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), worker.run_until(recovered))
             .await
+            .expect("every family must recover")
             .expect("a recoverable outage must not stop the service worker");
 
         assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
-        assert_eq!(server.request_count("/api/worker/heartbeat"), 9);
+        assert_eq!(server.request_count("/api/worker/heartbeat"), 5);
         for path in [
             "/api/worker/workflow-tasks/poll",
             "/api/worker/activity-tasks/poll",
             "/api/worker/query-tasks/poll",
         ] {
             let bodies = server.request_bodies(path);
-            assert!(bodies.len() >= 10, "{path} must resume after recovery");
+            assert!(bodies.len() >= 6, "{path} must resume after recovery");
             let first = &bodies[0]["poll_request_id"];
             assert!(first.as_str().is_some_and(|id| !id.is_empty()));
-            for body in &bodies[..9] {
+            for body in &bodies[..5] {
                 assert_eq!(&body["poll_request_id"], first, "{path} retry identity");
             }
-            assert_ne!(&bodies[9]["poll_request_id"], first);
+            assert_ne!(&bodies[5]["poll_request_id"], first);
             let times = server.request_times(path);
-            for pair in times[..9].windows(2) {
+            // Within the budget the policy delay applies; beyond it the
+            // shared jittered schedule, at most 0.25 s then 0.5 s here.
+            for pair in times[..3].windows(2) {
                 assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(2));
             }
         }
@@ -35548,6 +35937,8 @@ mod tests {
             .max_concurrent_workflow_tasks(1)
             .max_concurrent_activity_tasks(1)
             .worker_id("bounded-retry-worker")
+            // Opting out restores the bounded contract.
+            .recover_transient_outages(false)
             .poll_timeout(Duration::from_millis(10))
             .retry_policy(WorkerRetryPolicy {
                 max_retries: 2,
