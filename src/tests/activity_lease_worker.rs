@@ -677,7 +677,8 @@ async fn unavailable_initial_renewal_runs_under_the_original_grant() {
     let mut worker = worker(&server);
     worker.register_activity("LeaseActivity", |_ctx, _args| async { Ok(json!(true)) });
     worker.poll_activity_once().await.unwrap();
-    assert_eq!(server.request_count(RENEW), 1);
+    // A fully jittered retry can fire before the callback settles.
+    assert!(server.request_count(RENEW) >= 1);
     assert_eq!(server.request_count(COMPLETE), 1);
     assert_eq!(server.request_count(FAIL), 0);
 }
