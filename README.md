@@ -1124,7 +1124,11 @@ failure is a connection refused, reset or timed out; an upstream 502, 503 or
 `backend_unavailable` (for example while native Server warms up its storage);
 or any 5xx or 429 that says `retryable: true`. Poll and worker-heartbeat
 retries keep going past `WorkerRetryPolicy.max_retries` for these, and a
-retried poll keeps its original request ID. A transient that still escapes a
+retried poll keeps its original request ID. Within the budget they use the
+policy's delays; beyond it every worker draws from the shared full-jitter
+schedule below, so a fleet does not retry in step when the Server comes back.
+An outage that has lasted 60 s is logged as a `tracing` error, then again
+every 5 minutes while it continues; a success resets it. A transient that still escapes a
 poll lane, a task settlement or registration is logged as a `tracing` warning
 and retried after a wait drawn uniformly from `[0, min(4 s, 0.25 s * 2^(n-1))]`
 for the n-th consecutive failure, the schedule shared by every Durable Workflow

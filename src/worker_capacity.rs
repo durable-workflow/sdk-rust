@@ -189,7 +189,7 @@ impl Worker {
             let worker = self.clone();
             let stop = stop.clone();
             lanes.push(async move {
-                let mut failures = 0;
+                let mut outage = crate::Outage::default();
                 while !stop.load(Ordering::SeqCst) {
                     let outcome = match family {
                         TaskFamily::Workflow => worker.poll_workflow_once().await,
@@ -204,12 +204,12 @@ impl Worker {
                             // A transient that escaped this tick (a poll past
                             // its retries, or a settlement) does not stop a
                             // running worker; anything else does.
-                            if !worker.outlive_transient(&error, &mut failures, &stop).await {
+                            if !worker.outlive_transient(&error, &mut outage, &stop).await {
                                 stop.store(true, Ordering::SeqCst);
                                 return Err(error);
                             }
                         }
-                        _ => failures = 0,
+                        _ => outage.reset(),
                     }
                 }
                 Ok(())

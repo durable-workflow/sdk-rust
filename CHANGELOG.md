@@ -16,7 +16,9 @@
   `backend_unavailable`; or any 5xx or 429 with `retryable: true`.
   `Worker::recover_transient_outages` is now on by default: poll and heartbeat
   retries continue past the retry budget for transients (a poll keeps its
-  request identity), and a transient that escapes a poll lane, a task
+  request identity) with the same fully jittered schedule rather than the
+  fixed `max_backoff` delay, so workers do not retry in step; an outage that
+  lasts 60 s is logged as a `tracing` error, then every 5 minutes, and a transient that escapes a poll lane, a task
   settlement or registration is logged with `tracing` and retried after a
   jittered wait, uniform in `[0, min(4 s, 0.25 s * 2^(n-1))]`. With the option
   on, only transients retry past the budget; an untyped 500 or a 429 without

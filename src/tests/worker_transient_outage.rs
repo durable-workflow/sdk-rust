@@ -347,3 +347,72 @@ fn only_this_attempts_own_recorded_outcome_counts_as_a_duplicate() {
     failed["outcome"] = json!("failed");
     assert!(check(&failed, ActivityReport::Failed));
 }
+
+#[test]
+fn retries_beyond_the_budget_use_the_shared_jittered_schedule() {
+    let policy = WorkerRetryPolicy {
+        max_retries: 2,
+        initial_backoff: Duration::from_millis(100),
+        max_backoff: Duration::from_secs(5),
+    };
+    // Within the budget: the policy's own capped exponential delay.
+    assert_eq!(
+        worker_poll_retry_delay(policy, 1),
+        Duration::from_millis(100)
+    );
+    assert_eq!(
+        worker_poll_retry_delay(policy, 2),
+        Duration::from_millis(200)
+    );
+    // Beyond it: uniform(0, min(4 s, 0.25 s * 2^(n-1))) for the n-th retry
+    // past the budget, never the fixed policy cap.
+    for (retry, ceiling) in [
+        (3, 250),
+        (4, 500),
+        (5, 1_000),
+        (6, 2_000),
+        (7, 4_000),
+        (40, 4_000),
+    ] {
+        let samples: Vec<_> = (0..200)
+            .map(|_| worker_poll_retry_delay(policy, retry))
+            .collect();
+        assert!(samples
+            .iter()
+            .all(|delay| *delay <= Duration::from_millis(ceiling)));
+        assert!(
+            samples
+                .iter()
+                .any(|delay| *delay < Duration::from_millis(ceiling / 2)),
+            "retry {retry} must be jittered"
+        );
+        let distinct: std::collections::HashSet<_> = samples.iter().collect();
+        assert!(
+            distinct.len() > 100,
+            "retry {retry} delays must not be in step"
+        );
+    }
+}
+
+#[test]
+fn a_continuing_outage_escalates_to_error_at_one_minute_then_every_five() {
+    let start = std::time::Instant::now();
+    let at = |seconds: u64| start + Duration::from_secs(seconds);
+    let mut log = OutageLog::default();
+    assert_eq!(log.failed(at(0)), None);
+    assert_eq!(log.failed(at(30)), None);
+    assert_eq!(log.failed(at(59)), None);
+    assert_eq!(log.failed(at(60)), Some(Duration::from_secs(60)));
+    assert_eq!(log.failed(at(61)), None);
+    assert_eq!(log.failed(at(359)), None);
+    assert_eq!(log.failed(at(360)), Some(Duration::from_secs(360)));
+    assert_eq!(log.failed(at(600)), None);
+    assert_eq!(log.failed(at(660)), Some(Duration::from_secs(660)));
+    // A success resets it: the next outage waits a full minute again.
+    let mut outage = Outage { failures: 7, log };
+    outage.reset();
+    assert_eq!(outage.failures, 0);
+    assert_eq!(outage.log.failed(at(700)), None);
+    assert_eq!(outage.log.failed(at(759)), None);
+    assert_eq!(outage.log.failed(at(760)), Some(Duration::from_secs(60)));
+}

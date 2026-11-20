@@ -6400,6 +6400,60 @@ pub(crate) fn worker_outage_delay(failures: u32) -> Duration {
     ceiling.mul_f64((bits >> 11) as f64 / (1_u64 << 53) as f64)
 }
 
+/// Escalates a continuing outage to an ERROR log: once it has lasted 60 s,
+/// then every 5 minutes while it continues. Callers reset it on success.
+#[derive(Debug, Default)]
+pub(crate) struct OutageLog {
+    started: Option<std::time::Instant>,
+    reported: Option<std::time::Instant>,
+}
+
+impl OutageLog {
+    const FIRST_ERROR: Duration = Duration::from_secs(60);
+    const REPEAT_ERROR: Duration = Duration::from_secs(300);
+
+    /// Record a failure at `now`; returns how long the outage has lasted
+    /// when an ERROR line is due.
+    pub(crate) fn failed(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let started = *self.started.get_or_insert(now);
+        let lasted = now.saturating_duration_since(started);
+        let due = match self.reported {
+            None => lasted >= Self::FIRST_ERROR,
+            Some(last) => now.saturating_duration_since(last) >= Self::REPEAT_ERROR,
+        };
+        due.then(|| {
+            self.reported = Some(now);
+            lasted
+        })
+    }
+
+    pub(crate) fn report(&mut self, worker_id: &str, task_queue: &str, error: &Error) {
+        if let Some(lasted) = self.failed(std::time::Instant::now()) {
+            tracing::error!(
+                target: "durable_workflow::worker",
+                worker_id,
+                task_queue,
+                error = %error,
+                outage_seconds = lasted.as_secs(),
+                "Server outage continues; the worker is still retrying"
+            );
+        }
+    }
+}
+
+/// Consecutive transient failures in one loop and their escalation state.
+#[derive(Debug, Default)]
+pub(crate) struct Outage {
+    pub(crate) failures: u32,
+    log: OutageLog,
+}
+
+impl Outage {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// The delivered activity lease's end on the local clock, measured from when
 /// the poll was sent (`lease_expires_at - server_time`).
 fn poll_lease_deadline(
@@ -6637,6 +6691,19 @@ fn worker_poll_capacity_retry_after(error: &Error) -> Option<Duration> {
             .and_then(Value::as_u64)
             .unwrap_or_default(),
     ))
+}
+
+/// Delay before poll or heartbeat retry `retry` (from 1): the policy's capped
+/// exponential delay within its budget, then the shared full-jitter outage
+/// schedule, restarting at its first step, so recovering workers spread out.
+fn worker_poll_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
+    if retry <= policy.max_retries {
+        worker_retry_delay(policy, retry)
+    } else {
+        let beyond = retry - policy.max_retries;
+        worker_outage_delay(u32::try_from(beyond).unwrap_or(u32::MAX))
+    }
+    .max(Duration::from_millis(1))
 }
 
 fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
@@ -9446,14 +9513,14 @@ impl Worker {
     }
 
     async fn run_with_storage_admission(&self, stop: Arc<AtomicBool>) -> Result<()> {
-        let mut failures = 0;
+        let mut outage = Outage::default();
         let registration = loop {
             match self.register().await {
                 Ok(registration) => break registration,
                 Err(error) => {
                     // Shutdown during the wait still reports the refusal: the
                     // worker was never registered.
-                    if !self.outlive_transient(&error, &mut failures, &stop).await {
+                    if !self.outlive_transient(&error, &mut outage, &stop).await {
                         return Err(error);
                     }
                 }
@@ -10160,6 +10227,7 @@ impl Worker {
         Fut: Future<Output = Result<Value>>,
     {
         let mut failures = 0_u32;
+        let mut outage = OutageLog::default();
         loop {
             let error = match send().await {
                 Ok(_) => return Ok(ActivitySettlement::Recorded),
@@ -10184,6 +10252,7 @@ impl Worker {
                 return Err(error);
             }
             failures = failures.saturating_add(1);
+            outage.report(&self.worker_id, &self.task_queue, &error);
             let delay = worker_outage_delay(failures);
             let lease_left = self
                 .client
@@ -10396,7 +10465,7 @@ impl Worker {
     }
 
     async fn poll_queries_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
-        let mut failures = 0;
+        let mut outage = Outage::default();
         while !stop.load(Ordering::SeqCst) {
             match self.poll_query_once().await {
                 Ok(ManagedPollOutcome::Stop) => {
@@ -10404,12 +10473,12 @@ impl Worker {
                     break;
                 }
                 Err(error) => {
-                    if !self.outlive_transient(&error, &mut failures, &stop).await {
+                    if !self.outlive_transient(&error, &mut outage, &stop).await {
                         stop.store(true, Ordering::SeqCst);
                         return Err(error);
                     }
                 }
-                _ => failures = 0,
+                _ => outage.reset(),
             }
         }
 
@@ -10432,7 +10501,7 @@ impl Worker {
     pub(crate) async fn outlive_transient(
         &self,
         error: &Error,
-        failures: &mut u32,
+        outage: &mut Outage,
         stop: &AtomicBool,
     ) -> bool {
         if stop.load(Ordering::SeqCst) {
@@ -10448,8 +10517,9 @@ impl Worker {
             );
             return false;
         }
-        *failures = failures.saturating_add(1);
-        let delay = worker_outage_delay(*failures);
+        outage.failures = outage.failures.saturating_add(1);
+        outage.log.report(&self.worker_id, &self.task_queue, error);
+        let delay = worker_outage_delay(outage.failures);
         tracing::warn!(
             target: "durable_workflow::worker",
             worker_id = %self.worker_id,
@@ -10470,6 +10540,7 @@ impl Worker {
         Fut: Future<Output = Result<T>>,
     {
         let mut retries = 0;
+        let mut outage = OutageLog::default();
 
         loop {
             if self
@@ -10499,8 +10570,12 @@ impl Worker {
                                 && worker_error_is_transient(&error))) =>
                 {
                     retries = retries.saturating_add(1);
-                    let delay = worker_retry_delay(self.retry_policy, retries)
-                        .max(Duration::from_millis(1));
+                    outage.report(&self.worker_id, &self.task_queue, &error);
+                    // Within the budget the policy's capped exponential delay
+                    // applies. Beyond it, every worker draws from the shared
+                    // full-jitter schedule so a fleet does not retry in step
+                    // when the Server comes back.
+                    let delay = worker_poll_retry_delay(self.retry_policy, retries);
                     if let Some(stop) = &self.run_stop {
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
@@ -35589,8 +35664,8 @@ mod tests {
     #[tokio::test]
     async fn worker_recovers_all_poll_families_and_heartbeat_beyond_retry_budget() {
         let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
-            poll_failures_per_path: 8,
-            heartbeat_failures: 8,
+            poll_failures_per_path: 4,
+            heartbeat_failures: 4,
             ..MockWorkerBehavior::default()
         });
         let client = Client::builder(server.base_url())
@@ -35621,28 +35696,43 @@ mod tests {
             Ok(Value::Null)
         });
 
-        worker
-            .run_until(tokio::time::sleep(Duration::from_millis(500)))
+        let recovered = async {
+            while server.request_count("/api/worker/heartbeat") < 5
+                || [
+                    "/api/worker/workflow-tasks/poll",
+                    "/api/worker/activity-tasks/poll",
+                    "/api/worker/query-tasks/poll",
+                ]
+                .iter()
+                .any(|path| server.request_count(path) < 6)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), worker.run_until(recovered))
             .await
+            .expect("every family must recover")
             .expect("a recoverable outage must not stop the service worker");
 
         assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
-        assert_eq!(server.request_count("/api/worker/heartbeat"), 9);
+        assert_eq!(server.request_count("/api/worker/heartbeat"), 5);
         for path in [
             "/api/worker/workflow-tasks/poll",
             "/api/worker/activity-tasks/poll",
             "/api/worker/query-tasks/poll",
         ] {
             let bodies = server.request_bodies(path);
-            assert!(bodies.len() >= 10, "{path} must resume after recovery");
+            assert!(bodies.len() >= 6, "{path} must resume after recovery");
             let first = &bodies[0]["poll_request_id"];
             assert!(first.as_str().is_some_and(|id| !id.is_empty()));
-            for body in &bodies[..9] {
+            for body in &bodies[..5] {
                 assert_eq!(&body["poll_request_id"], first, "{path} retry identity");
             }
-            assert_ne!(&bodies[9]["poll_request_id"], first);
+            assert_ne!(&bodies[5]["poll_request_id"], first);
             let times = server.request_times(path);
-            for pair in times[..9].windows(2) {
+            // Within the budget the policy delay applies; beyond it the
+            // shared jittered schedule, at most 0.25 s then 0.5 s here.
+            for pair in times[..3].windows(2) {
                 assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(2));
             }
         }
