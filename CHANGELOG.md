@@ -8,11 +8,27 @@
   completing, failing or releasing it, so the Server held the lease until it
   expired and, with one attempt, failed the workflow. The callback now starts
   under the poll's original grant, and lease maintenance retries the renewal
-  with exponential backoff (250 ms to 4 s, never more than a third of the
-  remaining grant). Each attempt spends at most half of the remaining grant,
-  so one stalled request leaves time to retry. A refusal or a changed claim
-  identity still ends the claim before the callback starts. Recorded history
-  and replay are unchanged.
+  with exponential backoff (250 ms to 4 s). Each attempt spends at most half
+  of the remaining grant, so one stalled request leaves time to retry. A
+  refusal or a changed claim identity still ends the claim before the callback
+  starts. Recorded history and replay are unchanged.
+- A claim whose renewal does not recover is now released explicitly instead of
+  held silently until the lease expires. The Worker keeps a reserve at the end
+  of the lease (at most 10 s and at most a fifth of the grant). Once renewal
+  has failed and only that reserve is left, at start or later, it stops the
+  callback and fails the attempt with `failure.type` `worker_lost`,
+  `failure.class` `ActivityWorkerLost`, `non_retryable: false` and a message
+  naming the local cause. The Server's retry policy then acts at once, and
+  `worker_lost` can be listed in `non_retryable_error_types`. A Server refusal
+  such as `lease_expired`, as well as expiry and Worker shutdown, still ends
+  the claim without a report. The default retry policy is unchanged.
+- `ActivityFailure::lease_loss_reason()` returns a `LeaseLossReason`
+  (`LeaseExpired`, `WorkerDeregistered` or `WorkerLost`, with `as_str()` giving
+  `lease_expired`, `worker_deregistered` or `worker_lost`) when an attempt lost
+  its worker, and `None` otherwise. `WorkerLost` is a Worker release; the other
+  two come from the Server's recorded `failure_reason` for an
+  `ActivityLeaseExpiredException`, kept in the new
+  `ActivityFailure::failure_reason` field.
 
 ## 4.21.0
 

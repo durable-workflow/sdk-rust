@@ -366,8 +366,28 @@ async fn repeated_transient_renewal_failures_grant_no_additional_execution_time(
     });
     worker.poll_activity_once().await.unwrap();
     assert!(server.request_count(RENEW) >= 2);
+    // Still no execution past the acknowledged grant, but the claim is now
+    // released explicitly instead of held silently until the lease expires.
     assert_eq!(server.request_count(COMPLETE), 0);
-    assert_eq!(server.request_count(FAIL), 0);
+    assert_worker_lost_release(&server);
+}
+
+/// The single release report a Worker sends for a claim it could not keep.
+fn assert_worker_lost_release(server: &MockWorkerServer) {
+    let bodies = server.request_bodies(FAIL);
+    assert_eq!(bodies.len(), 1, "exactly one release report");
+    let body = &bodies[0];
+    assert_eq!(body["activity_attempt_id"], "lease-attempt");
+    assert_eq!(body["lease_owner"], "lease-worker");
+    let failure = &body["failure"];
+    assert_eq!(failure["type"], "worker_lost");
+    assert_eq!(failure["class"], "ActivityWorkerLost");
+    assert_eq!(failure["non_retryable"], false);
+    let message = failure["message"].as_str().unwrap();
+    assert!(
+        message.contains("renew-lease"),
+        "names the local cause: {message}"
+    );
 }
 
 #[tokio::test]
@@ -588,7 +608,7 @@ async fn cooperative_worker_uses_the_same_renewal_and_callback_scope() {
 // Lease grants are long enough here that one stalled renewal (at most half of
 // the remaining grant) still leaves room to retry inside the original lease.
 fn long_lease(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
-    let grant = Duration::from_secs(2);
+    let grant = Duration::from_secs(4);
     match path {
         POLL => {
             let mut wire = delivery();
@@ -605,18 +625,9 @@ fn long_lease(path: &str, body: &str, number: usize) -> Option<(&'static str, St
 }
 
 fn flaky_start(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
-    if path == RENEW {
-        match number {
-            // Stalls past the whole original grant: the attempt times out.
-            1 => std::thread::sleep(Duration::from_millis(2_500)),
-            2 => {
-                return Some((
-                    "503 Service Unavailable",
-                    json!({"reason":"backend_lock_pressure"}).to_string(),
-                ))
-            }
-            _ => {}
-        }
+    if path == RENEW && number == 1 {
+        // Stalls past the whole original grant: the attempt times out.
+        std::thread::sleep(Duration::from_millis(4_500));
     }
     long_lease(path, body, number)
 }
@@ -625,8 +636,8 @@ fn flaky_start(path: &str, body: &str, number: usize) -> Option<(&'static str, S
 async fn slow_and_flaky_initial_renewal_keeps_the_claim_and_completes() {
     let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
         request_override: Some(flaky_start),
-        // The third renewal loses its connection without a reply.
-        drop_request: Some(|path, number| path == RENEW && number == 3),
+        // The second renewal loses its connection without a reply.
+        drop_request: Some(|path, number| path == RENEW && number == 2),
         concurrent_requests: true,
         ..MockWorkerBehavior::default()
     });
@@ -635,9 +646,9 @@ async fn slow_and_flaky_initial_renewal_keeps_the_claim_and_completes() {
     let mut worker = worker(&server);
     worker.register_activity("LeaseActivity", move |_ctx, _args| {
         seen.store(true, Ordering::SeqCst);
-        // Outlives the poll's original 2 s grant; only a later renewal keeps it.
+        // Outlives the poll's original 4 s grant; only a later renewal keeps it.
         async {
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
             Ok(json!(true))
         }
     });
@@ -646,7 +657,7 @@ async fn slow_and_flaky_initial_renewal_keeps_the_claim_and_completes() {
         entered.load(Ordering::SeqCst),
         "the claim must not be dropped"
     );
-    assert!(server.request_count(RENEW) >= 4, "renewal must be retried");
+    assert!(server.request_count(RENEW) >= 3, "renewal must be retried");
     assert_eq!(server.request_count(COMPLETE), 1);
     assert_eq!(server.request_count(FAIL), 0);
 }
@@ -699,9 +710,98 @@ async fn initial_renewal_that_never_recovers_retries_until_the_grant_is_gone() {
     worker.poll_activity_once().await.unwrap();
     assert!(entered.load(Ordering::SeqCst));
     assert!(!completed.load(Ordering::SeqCst));
-    assert!(server.request_count(RENEW) >= 3, "renewal must be retried");
-    // The Server's own lease expiry settles the attempt; a late publication
-    // would be refused as lease_expired.
+    assert!(server.request_count(RENEW) >= 2, "renewal must be retried");
+    assert_eq!(server.request_count(COMPLETE), 0);
+    assert_worker_lost_release(&server);
+}
+
+#[tokio::test]
+async fn refused_renewal_ends_the_claim_without_a_release() {
+    fn refused(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+        if path == RENEW && number > 1 {
+            return Some((
+                "409 Conflict",
+                json!({"reason":"lease_expired","can_continue":false}).to_string(),
+            ));
+        }
+        replies(path, body, number)
+    }
+    let server = server(refused);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        Ok(json!(true))
+    });
+    worker.poll_activity_once().await.unwrap();
+    assert!(server.request_count(RENEW) >= 2);
     assert_eq!(server.request_count(COMPLETE), 0);
     assert_eq!(server.request_count(FAIL), 0);
+}
+
+fn failure_from(payload: Value) -> ActivityFailure {
+    let event = HistoryEvent {
+        event_type: "ActivityFailed".into(),
+        payload,
+        raw: HashMap::new(),
+    };
+    activity_outcome(&event, DEFAULT_CODEC, None)
+        .unwrap()
+        .unwrap_err()
+}
+
+#[test]
+fn lease_loss_reason_names_released_and_server_settled_attempts() {
+    let lease_class = "Workflow\\V2\\Exceptions\\ActivityLeaseExpiredException";
+    let released = failure_from(json!({"exception_type":"worker_lost",
+        "exception_class":"ActivityWorkerLost","non_retryable":false,"message":"released"}));
+    assert_eq!(
+        released.lease_loss_reason(),
+        Some(LeaseLossReason::WorkerLost)
+    );
+    assert_eq!(LeaseLossReason::WorkerLost.as_str(), "worker_lost");
+
+    let expired =
+        failure_from(json!({"exception_class":lease_class,"failure_reason":"lease_expired"}));
+    assert_eq!(expired.failure_reason.as_deref(), Some("lease_expired"));
+    assert_eq!(
+        expired.lease_loss_reason(),
+        Some(LeaseLossReason::LeaseExpired)
+    );
+
+    let revoked =
+        failure_from(json!({"exception_class":lease_class,"failure_reason":"worker_deregistered"}));
+    assert_eq!(
+        revoked.lease_loss_reason(),
+        Some(LeaseLossReason::WorkerDeregistered)
+    );
+    assert_eq!(
+        revoked.lease_loss_reason().unwrap().to_string(),
+        "worker_deregistered"
+    );
+
+    let bare = failure_from(json!({"exception":{"class":lease_class,"message":"lost"}}));
+    assert_eq!(
+        bare.lease_loss_reason(),
+        Some(LeaseLossReason::LeaseExpired)
+    );
+    assert_eq!(LeaseLossReason::LeaseExpired.as_str(), "lease_expired");
+}
+
+#[test]
+fn other_activity_failures_have_no_lease_loss_reason() {
+    let application = failure_from(json!({"exception_type":"PaymentDeclined",
+        "exception_class":"payments.PaymentDeclined","message":"declined"}));
+    assert_eq!(application.lease_loss_reason(), None);
+    // A failure_reason alone does not make an application failure a lease loss.
+    let stray = failure_from(json!({"exception_type":"Custom","failure_reason":"lease_expired"}));
+    assert_eq!(stray.lease_loss_reason(), None);
+    let event = HistoryEvent {
+        event_type: "ActivityTimedOut".into(),
+        payload: json!({"timeout_kind":"start_to_close"}),
+        raw: HashMap::new(),
+    };
+    let timed_out = activity_outcome(&event, DEFAULT_CODEC, None)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(timed_out.lease_loss_reason(), None);
 }

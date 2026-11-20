@@ -1560,6 +1560,64 @@ pub struct ActivityFailure {
     pub exception_class: Option<String>,
     pub code: Option<Value>,
     pub exception: Option<Value>,
+    /// The Server's recorded reason for a lost lease (`lease_expired` or
+    /// `worker_deregistered`), when it settled the attempt itself.
+    pub failure_reason: Option<String>,
+}
+
+/// Why an activity attempt lost its worker. See [`ActivityFailure::lease_loss_reason`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LeaseLossReason {
+    /// The Server settled the attempt because its lease expired.
+    LeaseExpired,
+    /// The Server settled the attempt because its worker deregistered.
+    WorkerDeregistered,
+    /// The worker released the attempt because it could not renew the lease.
+    WorkerLost,
+}
+
+impl LeaseLossReason {
+    /// The stable wire name: `lease_expired`, `worker_deregistered` or `worker_lost`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseExpired => "lease_expired",
+            Self::WorkerDeregistered => "worker_deregistered",
+            Self::WorkerLost => "worker_lost",
+        }
+    }
+}
+
+impl std::fmt::Display for LeaseLossReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `exception_class` the Server records when it settles a lost activity lease.
+const ACTIVITY_LEASE_EXPIRED_CLASS: &str =
+    "Workflow\\V2\\Exceptions\\ActivityLeaseExpiredException";
+
+impl ActivityFailure {
+    /// Why the attempt lost its worker, or `None` when it failed for another
+    /// reason.
+    ///
+    /// `WorkerLost` means a worker released the attempt (`exception_type`
+    /// `worker_lost`) because it could not keep the lease. For a lease the
+    /// Server settled, this is its recorded `failure_reason`, `LeaseExpired`
+    /// by default. The callback may not have finished, so whether to retry
+    /// is the retry policy's choice; the default policy is unchanged.
+    pub fn lease_loss_reason(&self) -> Option<LeaseLossReason> {
+        if self.exception_type.as_deref() == Some(activity_lease::authority::WORKER_LOST_TYPE) {
+            return Some(LeaseLossReason::WorkerLost);
+        }
+        if self.exception_class.as_deref() != Some(ACTIVITY_LEASE_EXPIRED_CLASS) {
+            return None;
+        }
+        Some(match self.failure_reason.as_deref() {
+            Some("worker_deregistered") => LeaseLossReason::WorkerDeregistered,
+            _ => LeaseLossReason::LeaseExpired,
+        })
+    }
 }
 
 /// Stable terminal categories returned when an awaited child does not succeed.
@@ -5249,7 +5307,13 @@ impl Client {
             Ok(data)
         };
         let mut data: worker_session::SessionPollResponse = match lease.as_ref() {
-            Some(lease) => lease.authority.protect(loading).await?,
+            Some(lease) => match lease.authority.protect(loading).await {
+                Ok(data) => data,
+                Err(error) => {
+                    lease.settle_release().await;
+                    return Err(error);
+                }
+            },
             None => {
                 activity_hydration::HydrationClaim::protect(claim.as_ref(), self, loading).await?
             }
@@ -9830,6 +9894,9 @@ impl Worker {
         };
         match result {
             Err(Error::ActivityExecutionAbandoned(_)) => {
+                if let Some(lease) = &lease {
+                    lease.settle_release().await;
+                }
                 task_metrics.outcome("expired");
                 Ok(ManagedPollOutcome::Handled)
             }
@@ -13163,6 +13230,10 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
     })))
 }
 
+// Private replay state built once per recorded command. The activity variant
+// carries a full `ActivityFailure`; boxing it would touch every replay match
+// for a few bytes per command.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum RecordedCommand {
     ServiceOperation {
@@ -19463,6 +19534,7 @@ fn activity_outcome(
             .filter(|value| !value.is_null())
             .cloned(),
         exception,
+        failure_reason: payload_string(payload, "failure_reason"),
     }))
 }
 

@@ -70,6 +70,8 @@ struct State {
     heartbeat_deadline: Option<Timestamp>,
     server_time: Timestamp,
     lease_expiry: Timestamp,
+    /// Length of the latest acknowledged lease grant; sizes the release reserve.
+    grant: Duration,
     last_renewal: Option<(Timestamp, Timestamp, Clock)>,
     session: Option<session::Session>,
 }
@@ -86,6 +88,19 @@ impl State {
             .checked_duration_since(Clock::now())
             .filter(|value| !value.is_zero())
             .ok_or_else(|| lost("original execution budget expired"))
+    }
+
+    /// Time kept back at the end of the lease to release an unrenewed claim:
+    /// at most 10 s and at most a fifth of the latest grant.
+    fn reserve(&self) -> Duration {
+        RELEASE_RESERVE.min(self.grant / 5)
+    }
+
+    /// Lease time still usable for renewal attempts before the reserve.
+    fn renewal_window(&self) -> Duration {
+        self.lease_until
+            .saturating_duration_since(Clock::now())
+            .saturating_sub(self.reserve())
     }
 
     fn heartbeat_terms(
@@ -114,7 +129,8 @@ impl State {
         let captured = Clock::now();
         let server_time = timestamp(server_time)?;
         let lease_expiry = timestamp(&task["lease_expires_at"])?;
-        if duration(lease_expiry, server_time)? > Duration::from_secs(86_400) {
+        let grant = duration(lease_expiry, server_time)?;
+        if grant > Duration::from_secs(86_400) {
             return Err(lost("invalid original lease duration"));
         }
         let empty = json!({});
@@ -155,6 +171,7 @@ impl State {
             heartbeat_deadline,
             server_time,
             lease_expiry,
+            grant,
             last_renewal: None,
             session: session::Session::delivery(task, server_time, captured, worker, namespace)?,
         };
@@ -239,6 +256,7 @@ impl State {
         self.lease_until = self.lease_until.max(bound);
         self.server_time = server;
         self.lease_expiry = expiry;
+        self.grant = grant;
         self.last_renewal = Some((server, expiry, started));
         self.remaining().map(|_| ())
     }
@@ -279,6 +297,9 @@ impl State {
             self.heartbeat_deadline = Some(deadline);
         }
         self.heartbeat_time = Some(progress);
+        if expiry > self.lease_expiry {
+            self.grant = grant;
+        }
         self.lease_expiry = self.lease_expiry.max(expiry);
         self.lease_until = self.lease_until.max(bound);
         Ok(())
@@ -295,6 +316,11 @@ pub(crate) struct Authority {
     state: Mutex<State>,
     active: AtomicBool,
     changed: Notify,
+    /// Latest transient renewal failure, named in a release report.
+    last_failure: Mutex<Option<String>>,
+    /// Set when the Worker gave the claim up because renewal did not recover.
+    release: Mutex<Option<String>>,
+    released: AtomicBool,
 }
 
 impl Authority {
@@ -349,6 +375,9 @@ impl Authority {
             )?),
             active: AtomicBool::new(true),
             changed: Notify::new(),
+            last_failure: Mutex::new(None),
+            release: Mutex::new(None),
+            released: AtomicBool::new(false),
         })
     }
 
@@ -481,36 +510,53 @@ impl Authority {
     async fn renew(&self) -> Result<bool> {
         let started = Clock::now();
         let remaining = self.remaining()?;
+        let window = self.window()?;
+        if window.is_zero() {
+            self.remaining()?;
+            return Ok(false);
+        }
         // Spend at most half of the remaining grant on one attempt, so a
-        // stalled request still leaves time to retry before the lease is gone.
+        // stalled request still leaves time to retry, and never the release
+        // reserve at the end of the lease.
         let budget = if remaining > RETRY_FLOOR {
             remaining / 2
         } else {
             remaining
         }
+        .min(window)
         .min(MAX_REQUEST_WINDOW);
         let reply = self
             .client
             .renew_activity_task_lease(&self.task_id, &self.attempt_id, &self.owner, budget)
             .await;
-        let reply = match reply {
-            Ok(value) => value,
-            Err(Error::Timeout | Error::Transport(_)) => {
-                self.remaining()?;
-                return Ok(false);
+        let transient = match &reply {
+            Err(Error::Timeout) => Some("renew-lease timed out".to_owned()),
+            Err(Error::Transport(error)) if error.is_timeout() => {
+                Some("renew-lease timed out".to_owned())
             }
-            Err(Error::ActivityTaskRejected(ref rejection))
+            Err(Error::Transport(error)) => Some(format!("renew-lease transport error: {error}")),
+            Err(Error::ActivityTaskRejected(rejection))
                 if rejection.status >= 500 || rejection.status == 429 =>
             {
-                self.remaining()?;
-                return Ok(false);
+                Some(format!("renew-lease returned HTTP {}", rejection.status))
             }
-            Err(Error::Http { ref status, .. })
+            Err(Error::Http { status, .. })
                 if status.is_server_error() || status.as_u16() == 429 =>
             {
-                self.remaining()?;
-                return Ok(false);
+                Some(format!("renew-lease returned HTTP {}", status.as_u16()))
             }
+            _ => None,
+        };
+        if let Some(cause) = transient {
+            self.remaining()?;
+            *self
+                .last_failure
+                .lock()
+                .map_err(|_| lost("claim state poisoned"))? = Some(cause);
+            return Ok(false);
+        }
+        let reply = match reply {
+            Ok(value) => value,
             Err(error) => return Err(self.invalidate(&error.to_string())),
         };
         self.remaining()?;
@@ -538,10 +584,47 @@ impl Authority {
         Ok(true)
     }
 
+    fn window(&self) -> Result<Duration> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| lost("claim state poisoned"))?
+            .renewal_window())
+    }
+
+    /// Renewal has failed and only the release reserve of the lease is left.
+    fn release_due(&self, failures: u32) -> Result<bool> {
+        Ok(failures > 0 && self.window()?.is_zero())
+    }
+
+    /// Stop holding a claim whose renewal did not recover. Publication and the
+    /// callback end at once; [`Lease::settle_release`] reports it to the Server.
+    fn give_up(&self) -> Error {
+        let cause = self
+            .last_failure
+            .lock()
+            .ok()
+            .and_then(|cause| cause.clone())
+            .unwrap_or_else(|| "renew-lease did not succeed".to_owned());
+        if let Ok(mut release) = self.release.lock() {
+            release.get_or_insert(cause);
+        }
+        self.invalidate("renewal did not recover before the release reserve; releasing the claim")
+    }
+
     async fn maintain(&self, confirmed: bool) -> Result<()> {
         let mut failures: u32 = u32::from(!confirmed);
         loop {
-            let mut delay = (self.remaining()? / 3).min(retry_delay(failures));
+            if self.release_due(failures)? {
+                return Err(self.give_up());
+            }
+            let mut delay = if failures == 0 {
+                (self.remaining()? / 3).min(retry_delay(failures))
+            } else {
+                // Retry at the backoff cadence, and wake when the reserve
+                // starts so the release still fits inside the lease.
+                retry_delay(failures).min(self.window()?)
+            };
             if let Some(interval) = self
                 .state
                 .lock()
@@ -563,9 +646,18 @@ impl Authority {
 /// Smallest remaining grant that is still split between attempts.
 const RETRY_FLOOR: Duration = Duration::from_millis(2);
 
+/// Upper bound of the lease time kept back to release an unrenewed claim.
+const RELEASE_RESERVE: Duration = Duration::from_secs(10);
+
+/// `failure.type` of a released claim. The Server records it as the attempt's
+/// `exception_type`, so retry policies can match it.
+pub(crate) const WORKER_LOST_TYPE: &str = "worker_lost";
+/// `failure.class` of a released claim, recorded as `exception_class`.
+pub(crate) const WORKER_LOST_CLASS: &str = "ActivityWorkerLost";
+
 /// Renewal cadence: steady state after an acknowledged grant, otherwise
-/// exponential backoff from 250 ms to 4 s. The caller also caps every wait at
-/// a third of the remaining grant, so retries always fit inside the lease.
+/// exponential backoff from 250 ms to 4 s. The caller also caps every wait so
+/// retries and the release fit inside the lease.
 fn retry_delay(failures: u32) -> Duration {
     match failures {
         0 => Duration::from_secs(30),
@@ -609,6 +701,11 @@ impl Lease {
         // Dropping the claim here would leave the Server holding a lease that
         // nobody settles until it expires (sdk-php#445).
         let confirmed = authority.renew().await?;
+        if authority.release_due(u32::from(!confirmed))? {
+            let error = authority.give_up();
+            authority.send_release().await;
+            return Err(error);
+        }
         let maintained = Arc::clone(&authority);
         let (started_tx, started_rx) = oneshot::channel();
         let maintenance = tokio::spawn(async move {
@@ -632,6 +729,60 @@ impl Lease {
         })?;
         lease.authority.remaining()?;
         Ok(Some(lease))
+    }
+
+    /// After the claim ended, release it through the Server if the Worker gave
+    /// it up because renewal did not recover. Server refusals, expiry and
+    /// worker shutdown send nothing.
+    pub(crate) async fn settle_release(&self) {
+        self.authority.send_release().await;
+    }
+}
+
+impl Authority {
+    /// Fail the attempt as retryable `worker_lost`, once, within the reserve.
+    async fn send_release(&self) {
+        let Some(cause) = self.release.lock().ok().and_then(|cause| cause.clone()) else {
+            return;
+        };
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let budget = self
+            .state
+            .lock()
+            .map(|state| state.lease_until.saturating_duration_since(Clock::now()))
+            .unwrap_or_default()
+            .clamp(Duration::from_secs(1), RELEASE_RESERVE);
+        let failure = json!({
+            "type": WORKER_LOST_TYPE,
+            "class": WORKER_LOST_CLASS,
+            "non_retryable": false,
+            "message": format!(
+                "worker released activity attempt {} because its lease could not be renewed: {cause}",
+                self.attempt_id
+            ),
+        });
+        // `self.client` carries no lease authority, so this report is not
+        // fenced by the claim it releases.
+        let reported = tokio::time::timeout(
+            budget,
+            self.client.fail_activity_task_with_failure(
+                &self.task_id,
+                &self.attempt_id,
+                &self.owner,
+                failure,
+            ),
+        )
+        .await;
+        if !matches!(reported, Ok(Ok(_))) {
+            tracing::warn!(
+                target: "durable_workflow::activity_lease",
+                task_id = %self.task_id,
+                activity_attempt_id = %self.attempt_id,
+                "could not release an unrenewable activity claim; the Server settles it at lease expiry"
+            );
+        }
     }
 }
 
