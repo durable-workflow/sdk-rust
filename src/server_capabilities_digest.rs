@@ -65,6 +65,19 @@ impl Digest {
         bytes: &[u8],
         captured: &Captured,
     ) -> Result<Option<Vec<u8>>, Error> {
+        self.restore_with(status, bytes, captured, None)
+    }
+
+    /// Like [`Digest::restore`], but a digest string that matches nothing is
+    /// replaced by `fallback`: full capabilities read separately (from
+    /// cluster info) for an answer that must not be requested again.
+    pub(crate) fn restore_with(
+        &self,
+        status: u16,
+        bytes: &[u8],
+        captured: &Captured,
+        fallback: Option<&Map<String, Value>>,
+    ) -> Result<Option<Vec<u8>>, Error> {
         if !contains(bytes, FIELD.as_bytes()) {
             return Ok(None);
         }
@@ -75,7 +88,7 @@ impl Digest {
         let mut learned = None;
         collect_tagged(&mut answer, 1, &mut learned);
         let mut changed = learned.is_some();
-        if let Err(digest) = replace(&mut answer, 1, captured, &learned, &mut changed) {
+        if let Err(digest) = replace(&mut answer, 1, captured, &learned, fallback, &mut changed) {
             return Err(Error::Protocol(ProtocolFailure {
                 status,
                 reason: "server_capabilities_digest_unknown".to_owned(),
@@ -141,6 +154,7 @@ fn replace(
     depth: usize,
     captured: &Captured,
     learned: &Option<Pair>,
+    fallback: Option<&Map<String, Value>>,
     changed: &mut bool,
 ) -> Result<(), String> {
     for (key, value) in answer.iter_mut() {
@@ -151,16 +165,18 @@ fn replace(
             if !digest.starts_with(PREFIX) {
                 continue;
             }
-            let pair = [captured.as_ref(), learned.as_ref()]
+            let capabilities = [captured.as_ref(), learned.as_ref()]
                 .into_iter()
                 .flatten()
                 .find(|pair| pair.digest == *digest)
+                .map(|pair| &*pair.capabilities)
+                .or(fallback)
                 .ok_or_else(|| digest.clone())?;
-            *value = Value::Object((*pair.capabilities).clone());
+            *value = Value::Object(capabilities.clone());
             *changed = true;
         } else if depth < MAX_DEPTH {
             if let Value::Object(nested) = value {
-                replace(nested, depth + 1, captured, learned, changed)?;
+                replace(nested, depth + 1, captured, learned, fallback, changed)?;
             }
         }
     }

@@ -5720,16 +5720,18 @@ impl Client {
                         Ok(Some(restored)) => restored,
                         Ok(None) => bytes,
                         // An answer naming a digest this request did not send
-                        // is recoverable once: forget the held pair and resend
-                        // this same request asking for full capabilities. A
-                        // resent report the Server already committed comes
-                        // back as its usual non-recorded receipt.
-                        Err(error) if !digest_resent => {
+                        // is recoverable. Only a task poll, which is
+                        // idempotent by its poll request ID, is resent asking
+                        // for full capabilities. Any other request may have
+                        // committed (a completion's answer can carry the next
+                        // leased task), so its answer is kept as received and
+                        // the capabilities are read from cluster info.
+                        Err(error) if !digest_resent && is_task_poll(path) => {
                             tracing::warn!(
                                 target: "durable_workflow::worker",
                                 path,
                                 error = %error,
-                                "unknown server capabilities digest; resending without it"
+                                "unknown server capabilities digest; resending the poll without it"
                             );
                             self.capabilities_digest.forget();
                             request.headers_mut().insert(
@@ -5739,6 +5741,40 @@ impl Client {
                             capabilities = Some(None);
                             digest_resent = true;
                             continue;
+                        }
+                        Err(error) if !is_task_poll(path) && path != "/cluster/info" => {
+                            tracing::warn!(
+                                target: "durable_workflow::worker",
+                                path,
+                                error = %error,
+                                "unknown server capabilities digest; reading capabilities from cluster info"
+                            );
+                            self.capabilities_digest.forget();
+                            let info: Value = Box::pin(
+                                self.request_json_unresolved_with_timeout::<Value, Value>(
+                                    reqwest::Method::GET,
+                                    "/cluster/info",
+                                    RequestProtocol::DefaultWorker,
+                                    None,
+                                    timeout,
+                                ),
+                            )
+                            .await?;
+                            let Some(full) = info["worker_protocol"]["server_capabilities"]
+                                .as_object()
+                                .filter(|full| !full.contains_key("digest"))
+                            else {
+                                return Err(error);
+                            };
+                            let restored = self.capabilities_digest.restore_with(
+                                status.as_u16(),
+                                &bytes,
+                                captured,
+                                Some(full),
+                            )?;
+                            // Later requests start again from `none`.
+                            self.capabilities_digest.forget();
+                            restored.unwrap_or(bytes)
                         }
                         Err(error) => return Err(error),
                     }
@@ -6770,6 +6806,15 @@ fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
         .initial_backoff
         .saturating_mul(1_u32 << exponent)
         .min(policy.max_backoff)
+}
+
+/// A worker task poll: idempotent by its poll request ID, so the only
+/// request that may be resent to recover elided capabilities.
+fn is_task_poll(path: &str) -> bool {
+    matches!(
+        path,
+        "/worker/workflow-tasks/poll" | "/worker/activity-tasks/poll" | "/worker/query-tasks/poll"
+    )
 }
 
 /// Default cap on one decoded response body.

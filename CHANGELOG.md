@@ -90,10 +90,13 @@
   used for later requests, so overlapping requests across a rolling deploy each
   restore their own capabilities. A digest string that matches neither the
   request's digest nor a tagged copy in the same answer makes the Client
-  forget its held digest and resend that same request once with `none`; a
-  resent report the Server already committed comes back as its usual
-  non-recorded receipt (for an activity completion, `409 stale_attempt`), which
-  the worker settles as before. Only an unknown digest on the resend is
+  forget its held digest. Only a task poll, idempotent by its poll request ID,
+  is resent once with `none`. Any other request (a completion, failure,
+  heartbeat, start or signal) is never resent: its answer is kept as received,
+  because a completion's answer can carry the next leased task, and the full
+  capabilities are read with `GET /api/cluster/info`
+  (`worker_protocol.server_capabilities`) and put in place of the unknown
+  digest. Only an unknown digest that cannot be recovered this way is
   `Error::Protocol` with reason `server_capabilities_digest_unknown`.
   Decoded response bodies are capped at 128 MiB by default
   (`ClientBuilder::max_response_bytes`); a larger body stops being read and
