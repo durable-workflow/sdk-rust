@@ -729,9 +729,9 @@ async fn callback_that_stops_after_the_lease_is_not_released() {
     let server = server(always_unavailable);
     let mut worker = worker(&server);
     worker.register_activity("LeaseActivity", |_ctx, _args| async {
-        // Blocks its thread past the 450 ms lease, so the dropped callback is
-        // confirmed stopped only after the deadline.
-        std::thread::sleep(Duration::from_millis(700));
+        // Holds its task without yielding past the 450 ms lease, so the
+        // callback can be dropped (confirmed stopped) only after the deadline.
+        tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(700)));
         Ok(json!(true))
     });
     tokio::spawn(async move { worker.poll_activity_once().await })
