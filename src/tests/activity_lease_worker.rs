@@ -762,14 +762,23 @@ fn lease_loss_reason_names_released_and_server_settled_attempts() {
 
     let expired =
         failure_from(json!({"exception_class":lease_class,"failure_reason":"lease_expired"}));
-    assert_eq!(expired.failure_reason.as_deref(), Some("lease_expired"));
     assert_eq!(
         expired.lease_loss_reason(),
         Some(LeaseLossReason::LeaseExpired)
     );
+    assert_eq!(LeaseLossReason::LeaseExpired.as_str(), "lease_expired");
 
-    let revoked =
+    // Servers record failure_reason beside the exception; without a new
+    // ActivityFailure field it is not retained, so this falls back.
+    let revoked_beside =
         failure_from(json!({"exception_class":lease_class,"failure_reason":"worker_deregistered"}));
+    assert_eq!(
+        revoked_beside.lease_loss_reason(),
+        Some(LeaseLossReason::LeaseExpired)
+    );
+
+    let revoked = failure_from(json!({"exception":{"class":lease_class,
+        "properties":{"failure_reason":"worker_deregistered"}}}));
     assert_eq!(
         revoked.lease_loss_reason(),
         Some(LeaseLossReason::WorkerDeregistered)
@@ -784,7 +793,6 @@ fn lease_loss_reason_names_released_and_server_settled_attempts() {
         bare.lease_loss_reason(),
         Some(LeaseLossReason::LeaseExpired)
     );
-    assert_eq!(LeaseLossReason::LeaseExpired.as_str(), "lease_expired");
 }
 
 #[test]

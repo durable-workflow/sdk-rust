@@ -27,8 +27,8 @@
         "activity_execution_id": "activity-lease-loss-1",
         "exception_class": "Workflow\\V2\\Exceptions\\ActivityLeaseExpiredException",
         "failure_category": "internal",
-        "failure_reason": "worker_deregistered",
-        "lease_owner": "deregistered-worker",
+        "failure_reason": "lease_expired",
+        "lease_owner": "expired-worker",
         "non_retryable": false,
         "message": "Activity corpus.lease-loss.activity lost its original task lease before the attempt settled."
       }
@@ -37,11 +37,11 @@
   "command_sequence": [
     {
       "type": "complete_workflow",
-      "result": "worker_deregistered"
+      "result": "lease_expired"
     }
   ],
   "expected": {
     "type": "complete_workflow",
-    "result": "worker_deregistered"
+    "result": "lease_expired"
   }
 }

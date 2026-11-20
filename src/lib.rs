@@ -1560,9 +1560,6 @@ pub struct ActivityFailure {
     pub exception_class: Option<String>,
     pub code: Option<Value>,
     pub exception: Option<Value>,
-    /// The Server's recorded reason for a lost lease (`lease_expired` or
-    /// `worker_deregistered`), when it settled the attempt itself.
-    pub failure_reason: Option<String>,
 }
 
 /// Why an activity attempt lost its worker. See [`ActivityFailure::lease_loss_reason`].
@@ -1570,7 +1567,8 @@ pub struct ActivityFailure {
 pub enum LeaseLossReason {
     /// The Server settled the attempt because its lease expired.
     LeaseExpired,
-    /// The Server settled the attempt because its worker deregistered.
+    /// The Server settled the attempt because its worker deregistered. Only
+    /// reported when the recorded exception carries that `failure_reason`.
     WorkerDeregistered,
     /// The worker released the attempt because it could not renew the lease.
     WorkerLost,
@@ -1602,10 +1600,13 @@ impl ActivityFailure {
     /// reason.
     ///
     /// `WorkerLost` means a worker released the attempt (`exception_type`
-    /// `worker_lost`) because it could not keep the lease. For a lease the
-    /// Server settled, this is its recorded `failure_reason`, `LeaseExpired`
-    /// by default. The callback may not have finished, so whether to retry
-    /// is the retry policy's choice; the default policy is unchanged.
+    /// `worker_lost`) because it could not keep the lease. A lease the Server
+    /// settled (`ActivityLeaseExpiredException`) is `LeaseExpired`, or
+    /// `WorkerDeregistered` when the recorded exception names that
+    /// `failure_reason`. Servers record that reason beside the exception, not
+    /// in it, so a deregistered worker usually reports `LeaseExpired` here.
+    /// The callback may not have finished, so whether to retry is the retry
+    /// policy's choice; the default policy is unchanged.
     pub fn lease_loss_reason(&self) -> Option<LeaseLossReason> {
         if self.exception_type.as_deref() == Some(activity_lease::authority::WORKER_LOST_TYPE) {
             return Some(LeaseLossReason::WorkerLost);
@@ -1613,7 +1614,13 @@ impl ActivityFailure {
         if self.exception_class.as_deref() != Some(ACTIVITY_LEASE_EXPIRED_CLASS) {
             return None;
         }
-        Some(match self.failure_reason.as_deref() {
+        let recorded = self.exception.as_ref().and_then(|exception| {
+            exception
+                .get("failure_reason")
+                .or_else(|| exception.get("properties")?.get("failure_reason"))
+                .and_then(Value::as_str)
+        });
+        Some(match recorded {
             Some("worker_deregistered") => LeaseLossReason::WorkerDeregistered,
             _ => LeaseLossReason::LeaseExpired,
         })
@@ -13230,10 +13237,6 @@ fn decode_message_stream_delivery(arguments: Vec<Value>) -> Result<Option<Messag
     })))
 }
 
-// Private replay state built once per recorded command. The activity variant
-// carries a full `ActivityFailure`; boxing it would touch every replay match
-// for a few bytes per command.
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum RecordedCommand {
     ServiceOperation {
@@ -19534,7 +19537,6 @@ fn activity_outcome(
             .filter(|value| !value.is_null())
             .cloned(),
         exception,
-        failure_reason: payload_string(payload, "failure_reason"),
     }))
 }
 

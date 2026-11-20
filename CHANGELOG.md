@@ -25,10 +25,13 @@
 - `ActivityFailure::lease_loss_reason()` returns a `LeaseLossReason`
   (`LeaseExpired`, `WorkerDeregistered` or `WorkerLost`, with `as_str()` giving
   `lease_expired`, `worker_deregistered` or `worker_lost`) when an attempt lost
-  its worker, and `None` otherwise. `WorkerLost` is a Worker release; the other
-  two come from the Server's recorded `failure_reason` for an
-  `ActivityLeaseExpiredException`, kept in the new
-  `ActivityFailure::failure_reason` field.
+  its worker, and `None` otherwise. `WorkerLost` is a Worker release
+  (`exception_type` `worker_lost`). A lease the Server settled
+  (`ActivityLeaseExpiredException`) reports `LeaseExpired`, or
+  `WorkerDeregistered` only when the recorded exception names that
+  `failure_reason`. Servers record it beside the exception, and
+  `ActivityFailure` gains no field in 4.x, so a deregistered worker usually
+  reports `LeaseExpired`. The change is additive: no existing type changes.
 
 ## 4.21.0
 
