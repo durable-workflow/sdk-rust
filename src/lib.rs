@@ -6309,6 +6309,45 @@ fn worker_operation_is_retryable(error: &Error) -> bool {
     }
 }
 
+/// A failure a running worker outlives (sdk-php#448): a connection refused,
+/// reset or timed out; an upstream 502/503/504 without a protocol body; a 503
+/// whose reason is `storage_unavailable` or `backend_unavailable`; or any 5xx
+/// or 429 that says `retryable: true`. An explicit `retryable: false`, 401,
+/// 403 and every other protocol refusal stay fatal.
+fn worker_error_is_transient(error: &Error) -> bool {
+    let (status, body) = match error {
+        Error::Timeout => return true,
+        Error::Transport(error) => {
+            return error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+        }
+        Error::Http { status, body } => (status.as_u16(), serde_json::from_str::<Value>(body).ok()),
+        Error::ActivityTaskRejected(rejection) => (rejection.status, Some(rejection.body.clone())),
+        _ => return false,
+    };
+    let body = body.filter(Value::is_object);
+    let field = |name: &str| body.as_ref().and_then(|body| body.get(name));
+    match field("retryable").and_then(Value::as_bool) {
+        Some(false) => return false,
+        Some(true) if status >= 500 || status == 429 => return true,
+        _ => {}
+    }
+    matches!(
+        (status, field("reason").and_then(Value::as_str)),
+        (503, Some("storage_unavailable" | "backend_unavailable")) | (502..=504, None)
+    )
+}
+
+/// The shared outage backoff: uniform in `[0, min(4 s, 0.25 s * 2^(n-1))]`
+/// for the n-th consecutive transient failure (n from 1).
+fn worker_outage_delay(failures: u32) -> Duration {
+    let ceiling = Duration::from_millis(250 << failures.saturating_sub(1).min(4));
+    let (bits, _) = Uuid::new_v4().as_u64_pair();
+    ceiling.mul_f64((bits >> 11) as f64 / (1_u64 << 53) as f64)
+}
+
 fn worker_storage_admission_body(error: &Error) -> Option<Value> {
     let body: Value = match error {
         Error::Http { body, .. } => serde_json::from_str(body).ok()?,
@@ -8029,9 +8068,10 @@ pub struct WorkerHeartbeatObservation {
 /// capped by `max_backoff`, except an explicit completion deferral must honor
 /// the Server's minimum delay. Shutdown interrupts storage waits; cooperative
 /// completion retries remain bounded by the original cleanup deadline.
-/// [`Worker::recover_transient_outages`] can keep a long-running worker retrying
-/// poll acquisition and heartbeats beyond this budget. `run_once` stays bounded,
-/// and `max_retries = 0` disables ordinary retries in either mode.
+/// [`Worker::recover_transient_outages`] (on by default) keeps a long-running
+/// worker retrying transient poll, heartbeat and registration failures beyond
+/// this budget. `run_once` stays bounded, and `max_retries = 0` disables
+/// ordinary retries in either mode.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerRetryPolicy {
     /// Number of retries after the initial request fails.
@@ -8154,7 +8194,7 @@ impl Worker {
             poll_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
             retry_policy: WorkerRetryPolicy::default(),
-            recover_transient_outages: false,
+            recover_transient_outages: true,
             run_stop: None,
             heartbeat_observer: None,
             cooperative_cancellation_enabled: false,
@@ -8291,17 +8331,24 @@ impl Worker {
         self
     }
 
-    /// Keep `run` and `run_until` alive during retryable poll and heartbeat outages.
+    /// Keep `run` and `run_until` alive through transient Server outages.
     ///
-    /// Retries preserve the poll request identity and use capped exponential
-    /// backoff from [`WorkerRetryPolicy`]. Shutdown interrupts a retry wait.
-    /// An in-flight poll is allowed to finish so leased work is not discarded.
-    /// Authentication, protocol, codec, handler and task settlement failures
-    /// remain errors. Registration and deregistration are not retried here.
+    /// Enabled by default. A transient failure is a connection refused, reset
+    /// or timed out; an upstream 502/503/504 without a protocol body; a 503
+    /// whose reason is `storage_unavailable` or `backend_unavailable`; or any
+    /// 5xx or 429 that says `retryable: true`. Poll and heartbeat retries keep
+    /// going past the [`WorkerRetryPolicy`] budget for these, and a poll keeps
+    /// its request identity. A transient that still escapes a poll lane or
+    /// registration (for example a task settlement) is logged with `tracing`
+    /// and retried after a jittered wait, uniform in
+    /// `[0, min(4 s, 0.25 s * 2^(n-1))]` for the n-th consecutive failure.
+    /// Shutdown interrupts every wait. An explicit `retryable: false`, 401,
+    /// 403, other protocol refusals, codec and handler failures stop the worker
+    /// with a `tracing` error event and are returned.
     ///
-    /// The default is disabled, preserving the bounded retry contract.
-    /// `run_once` always remains bounded. `max_retries = 0` disables retries,
-    /// even when this option is enabled.
+    /// Pass `false` to restore the bounded contract: the worker returns the
+    /// error once the retry budget is spent. `run_once` always remains bounded.
+    /// `max_retries = 0` disables retries, even when this option is enabled.
     pub fn recover_transient_outages(mut self, enabled: bool) -> Self {
         self.recover_transient_outages = enabled;
         self
@@ -9284,10 +9331,10 @@ impl Worker {
     /// Run until shutdown or a terminal worker error occurs.
     ///
     /// Empty long-poll expirations do not stop the worker. Retryable poll and
-    /// heartbeat failures use [`WorkerRetryPolicy`] independently, while
-    /// authentication, protocol, and other non-retryable failures are returned.
-    /// Enable [`Worker::recover_transient_outages`] to keep retrying transient
-    /// poll and heartbeat outages beyond the ordinary retry budget.
+    /// heartbeat failures use [`WorkerRetryPolicy`] independently. Transient
+    /// Server outages never stop it while [`Worker::recover_transient_outages`]
+    /// is on (the default); authentication, protocol and other non-retryable
+    /// failures are logged and returned.
     pub async fn run(&self) -> Result<()> {
         self.run_until(std::future::pending::<()>()).await
     }
@@ -9328,7 +9375,19 @@ impl Worker {
     }
 
     async fn run_with_storage_admission(&self, stop: Arc<AtomicBool>) -> Result<()> {
-        let registration = self.register().await?;
+        let mut failures = 0;
+        let registration = loop {
+            match self.register().await {
+                Ok(registration) => break registration,
+                Err(error) => {
+                    // Shutdown during the wait still reports the refusal: the
+                    // worker was never registered.
+                    if !self.outlive_transient(&error, &mut failures, &stop).await {
+                        return Err(error);
+                    }
+                }
+            }
+        };
         if !registration.registered {
             return Err(Error::WorkerLoop(format!(
                 "worker registration for {:?} was not accepted",
@@ -9449,6 +9508,13 @@ impl Worker {
                         }
                         Ok(None) => break,
                         Err(error) => {
+                            tracing::error!(
+                                target: "durable_workflow::worker",
+                                worker_id = %self.worker_id,
+                                task_queue = %self.task_queue,
+                                error = %error,
+                                "worker stopping: heartbeat failed with a non-retryable failure"
+                            );
                             stop.store(true, Ordering::SeqCst);
                             join_pollers(workflow_poller.take(), activity_poller.take(), query_poller.take()).await?;
                             return Err(error);
@@ -10150,6 +10216,7 @@ impl Worker {
     }
 
     async fn poll_queries_until_stopped(self, stop: Arc<AtomicBool>) -> Result<()> {
+        let mut failures = 0;
         while !stop.load(Ordering::SeqCst) {
             match self.poll_query_once().await {
                 Ok(ManagedPollOutcome::Stop) => {
@@ -10157,14 +10224,64 @@ impl Worker {
                     break;
                 }
                 Err(error) => {
-                    stop.store(true, Ordering::SeqCst);
-                    return Err(error);
+                    if !self.outlive_transient(&error, &mut failures, &stop).await {
+                        stop.store(true, Ordering::SeqCst);
+                        return Err(error);
+                    }
                 }
-                _ => {}
+                _ => failures = 0,
             }
         }
 
         Ok(())
+    }
+
+    /// A running worker (not `run_once`) outlives transient failures unless
+    /// recovery or retries are disabled.
+    pub(crate) fn outlives(&self, error: &Error) -> bool {
+        self.run_stop.is_some()
+            && self.recover_transient_outages
+            && self.retry_policy.max_retries > 0
+            && worker_error_is_transient(error)
+    }
+
+    /// Whether a running worker keeps going after `error`, which escaped a
+    /// poll lane: a transient waits out the shared jittered backoff; anything
+    /// else is logged as fatal. Shutdown before or during the wait returns the
+    /// error as before, so a refused operation never looks acknowledged.
+    pub(crate) async fn outlive_transient(
+        &self,
+        error: &Error,
+        failures: &mut u32,
+        stop: &AtomicBool,
+    ) -> bool {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        if !self.outlives(error) {
+            tracing::error!(
+                target: "durable_workflow::worker",
+                worker_id = %self.worker_id,
+                task_queue = %self.task_queue,
+                error = %error,
+                "worker stopping on a non-retryable failure"
+            );
+            return false;
+        }
+        *failures = failures.saturating_add(1);
+        let delay = worker_outage_delay(*failures);
+        tracing::warn!(
+            target: "durable_workflow::worker",
+            worker_id = %self.worker_id,
+            task_queue = %self.task_queue,
+            error = %error,
+            retry_in_ms = delay.as_millis() as u64,
+            "transient Server failure; the worker keeps running"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = wait_for_worker_stop(stop) => false,
+        }
     }
 
     async fn retry_worker_operation<T, F, Fut>(&self, mut operation: F) -> Result<Option<T>>
@@ -10198,7 +10315,8 @@ impl Worker {
                         && (retries < self.retry_policy.max_retries
                             || (self.recover_transient_outages
                                 && self.run_stop.is_some()
-                                && self.retry_policy.max_retries > 0)) =>
+                                && self.retry_policy.max_retries > 0
+                                && worker_error_is_transient(&error))) =>
                 {
                     retries = retries.saturating_add(1);
                     let delay = worker_retry_delay(self.retry_policy, retries)
@@ -20358,6 +20476,7 @@ mod tests {
     mod version_marker_contract;
     mod worker_capacity;
     mod worker_session;
+    mod worker_transient_outage;
     use std::{
         fs,
         io::{Read, Write},
@@ -35459,6 +35578,8 @@ mod tests {
             .max_concurrent_workflow_tasks(1)
             .max_concurrent_activity_tasks(1)
             .worker_id("bounded-retry-worker")
+            // Opting out restores the bounded contract.
+            .recover_transient_outages(false)
             .poll_timeout(Duration::from_millis(10))
             .retry_policy(WorkerRetryPolicy {
                 max_retries: 2,
