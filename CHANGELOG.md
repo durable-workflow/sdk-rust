@@ -76,6 +76,34 @@
   `{class, failure_reason}` descriptor when the event recorded no exception.
   No existing type changes.
 
+- Worker egress is much smaller against a Server that supports it (#302).
+  Requests now send `Accept-Encoding: gzip` and decode compressed answers
+  (reqwest's `gzip` feature; native Server compresses JSON answers of 1 KiB or
+  more, server#1261). Worker-plane requests also send
+  `X-Durable-Workflow-Server-Capabilities-Digest` with the digest of the
+  capabilities this Client holds, or `none` (server#1262). The Server then
+  replaces each repeated ~17 KB `server_capabilities` copy with that digest,
+  or tags a full copy with a `digest` member when the digest changed. The SDK
+  captures the digest and object when it sends each request and restores that
+  request's answer, success or error, at the top level and up to two objects
+  deep, before anything reads it. A tagged copy is stripped of `digest` and
+  used for later requests, so overlapping requests across a rolling deploy each
+  restore their own capabilities. A digest string that matches neither the
+  request's digest nor a tagged copy in the same answer makes the Client
+  forget its held digest and resend that same request once with `none`; a
+  resent report the Server already committed comes back as its usual
+  non-recorded receipt (for an activity completion, `409 stale_attempt`), which
+  the worker settles as before. Only an unknown digest on the resend is
+  `Error::Protocol` with reason `server_capabilities_digest_unknown`.
+  Decoded response bodies are capped at 128 MiB by default
+  (`ClientBuilder::max_response_bytes`); a larger body stops being read and
+  fails with the new `Error::ResponseBodyTooLarge`, so a small gzip answer
+  cannot expand without bound. Older
+  Servers ignore both headers and answer in full. In a lab run of one
+  start, one 1 KiB activity and one result per workflow against native Server
+  main (43ad8d8f), response bytes per workflow fell from about 159 KB to 8.8 KB
+  for the worker and from 19 KB to 4.7 KB for the caller.
+
 ## 4.21.0
 
 - `Client::signal_with_start` starts a workflow or reuses its open run and
