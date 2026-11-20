@@ -475,9 +475,20 @@ impl Authority {
         Ok(())
     }
 
+    /// Ask the Server to extend this claim once. `Ok(false)` reports a
+    /// transient failure: the claim stays valid under its last acknowledged
+    /// grant and the caller retries within that window.
     async fn renew(&self) -> Result<bool> {
         let started = Clock::now();
-        let budget = self.remaining()?.min(MAX_REQUEST_WINDOW);
+        let remaining = self.remaining()?;
+        // Spend at most half of the remaining grant on one attempt, so a
+        // stalled request still leaves time to retry before the lease is gone.
+        let budget = if remaining > RETRY_FLOOR {
+            remaining / 2
+        } else {
+            remaining
+        }
+        .min(MAX_REQUEST_WINDOW);
         let reply = self
             .client
             .renew_activity_task_lease(&self.task_id, &self.attempt_id, &self.owner, budget)
@@ -527,14 +538,10 @@ impl Authority {
         Ok(true)
     }
 
-    async fn maintain(&self) -> Result<()> {
-        let mut confirmed = true;
+    async fn maintain(&self, confirmed: bool) -> Result<()> {
+        let mut failures: u32 = u32::from(!confirmed);
         loop {
-            let mut delay = (self.remaining()? / 3).min(if confirmed {
-                Duration::from_secs(30)
-            } else {
-                Duration::from_secs(1)
-            });
+            let mut delay = (self.remaining()? / 3).min(retry_delay(failures));
             if let Some(interval) = self
                 .state
                 .lock()
@@ -544,8 +551,25 @@ impl Authority {
                 delay = delay.min(Duration::from_secs(interval as u64) / 3);
             }
             tokio::time::sleep(delay).await;
-            confirmed = self.renew().await?;
+            failures = if self.renew().await? {
+                0
+            } else {
+                failures.saturating_add(1)
+            };
         }
+    }
+}
+
+/// Smallest remaining grant that is still split between attempts.
+const RETRY_FLOOR: Duration = Duration::from_millis(2);
+
+/// Renewal cadence: steady state after an acknowledged grant, otherwise
+/// exponential backoff from 250 ms to 4 s. The caller also caps every wait at
+/// a third of the remaining grant, so retries always fit inside the lease.
+fn retry_delay(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::from_secs(30),
+        failures => Duration::from_millis(250 << (failures - 1).min(4)),
     }
 }
 
@@ -578,15 +602,19 @@ impl Lease {
             return Ok(None);
         }
         let authority = Arc::new(Authority::delivery(client, wire, worker, queue)?);
-        if !authority.renew().await? {
-            return Err(authority.invalidate("initial lease confirmation unavailable"));
-        }
+        // A refusal or a changed identity still ends the claim before the
+        // callback starts. A timeout, transport error, 429 or 5xx does not:
+        // the poll's own grant stays valid, so the callback starts under it and
+        // maintenance retries the renewal with backoff inside that grant.
+        // Dropping the claim here would leave the Server holding a lease that
+        // nobody settles until it expires (sdk-php#445).
+        let confirmed = authority.renew().await?;
         let maintained = Arc::clone(&authority);
         let (started_tx, started_rx) = oneshot::channel();
         let maintenance = tokio::spawn(async move {
             let _exit = MaintenanceExit(Arc::clone(&maintained));
             let _ = started_tx.send(());
-            if let Err(error) = maintained.maintain().await {
+            if let Err(error) = maintained.maintain(confirmed).await {
                 maintained.invalidate(&error.to_string());
             }
         });

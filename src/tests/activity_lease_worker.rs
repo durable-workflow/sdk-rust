@@ -583,3 +583,125 @@ async fn cooperative_worker_uses_the_same_renewal_and_callback_scope() {
     assert_eq!(server.request_count(COMPLETE), 1);
     assert_eq!(server.request_count(FAIL), 0);
 }
+
+// sdk-php#445: a slow or flaky link at activity start must not drop the claim.
+// Lease grants are long enough here that one stalled renewal (at most half of
+// the remaining grant) still leaves room to retry inside the original lease.
+fn long_lease(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    let grant = Duration::from_secs(2);
+    match path {
+        POLL => {
+            let mut wire = delivery();
+            wire["task"]["lease_expires_at"] = json!(timestamp(grant));
+            Some(("200 OK", wire.to_string()))
+        }
+        RENEW => {
+            let mut reply = renewal();
+            reply["lease_expires_at"] = json!(timestamp(grant));
+            Some(("200 OK", reply.to_string()))
+        }
+        _ => replies(path, body, number),
+    }
+}
+
+fn flaky_start(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    if path == RENEW {
+        match number {
+            // Stalls past the whole original grant: the attempt times out.
+            1 => std::thread::sleep(Duration::from_millis(2_500)),
+            2 => {
+                return Some((
+                    "503 Service Unavailable",
+                    json!({"reason":"backend_lock_pressure"}).to_string(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    long_lease(path, body, number)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_and_flaky_initial_renewal_keeps_the_claim_and_completes() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(flaky_start),
+        // The third renewal loses its connection without a reply.
+        drop_request: Some(|path, number| path == RENEW && number == 3),
+        concurrent_requests: true,
+        ..MockWorkerBehavior::default()
+    });
+    let entered = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&entered);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", move |_ctx, _args| {
+        seen.store(true, Ordering::SeqCst);
+        // Outlives the poll's original 2 s grant; only a later renewal keeps it.
+        async {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            Ok(json!(true))
+        }
+    });
+    worker.poll_activity_once().await.unwrap();
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "the claim must not be dropped"
+    );
+    assert!(server.request_count(RENEW) >= 4, "renewal must be retried");
+    assert_eq!(server.request_count(COMPLETE), 1);
+    assert_eq!(server.request_count(FAIL), 0);
+}
+
+#[tokio::test]
+async fn unavailable_initial_renewal_runs_under_the_original_grant() {
+    fn first_unavailable(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+        if path == RENEW && number == 1 {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_lock_pressure"}).to_string(),
+            ));
+        }
+        long_lease(path, body, number)
+    }
+    let server = server(first_unavailable);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async { Ok(json!(true)) });
+    worker.poll_activity_once().await.unwrap();
+    assert_eq!(server.request_count(RENEW), 1);
+    assert_eq!(server.request_count(COMPLETE), 1);
+    assert_eq!(server.request_count(FAIL), 0);
+}
+
+#[tokio::test]
+async fn initial_renewal_that_never_recovers_retries_until_the_grant_is_gone() {
+    fn always_unavailable(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+        if path == RENEW {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_lock_pressure"}).to_string(),
+            ));
+        }
+        replies(path, body, number)
+    }
+    let server = server(always_unavailable);
+    let entered = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicBool::new(false));
+    let (entered_seen, completed_seen) = (Arc::clone(&entered), Arc::clone(&completed));
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", move |_ctx, _args| {
+        entered_seen.store(true, Ordering::SeqCst);
+        let completed_seen = Arc::clone(&completed_seen);
+        async move {
+            tokio::time::sleep(Duration::from_millis(850)).await;
+            completed_seen.store(true, Ordering::SeqCst);
+            Ok(json!(true))
+        }
+    });
+    worker.poll_activity_once().await.unwrap();
+    assert!(entered.load(Ordering::SeqCst));
+    assert!(!completed.load(Ordering::SeqCst));
+    assert!(server.request_count(RENEW) >= 3, "renewal must be retried");
+    // The Server's own lease expiry settles the attempt; a late publication
+    // would be refused as lease_expired.
+    assert_eq!(server.request_count(COMPLETE), 0);
+    assert_eq!(server.request_count(FAIL), 0);
+}

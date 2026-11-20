@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- A timeout, transport error, 429 or 5xx on the activity lease renewal made
+  before the callback starts no longer drops the claimed task (#302, the Rust
+  side of sdk-php#445). Previously the Worker gave up on the claim without
+  completing, failing or releasing it, so the Server held the lease until it
+  expired and, with one attempt, failed the workflow. The callback now starts
+  under the poll's original grant, and lease maintenance retries the renewal
+  with exponential backoff (250 ms to 4 s, never more than a third of the
+  remaining grant). Each attempt spends at most half of the remaining grant,
+  so one stalled request leaves time to retry. A refusal or a changed claim
+  identity still ends the claim before the callback starts. Recorded history
+  and replay are unchanged.
+
 ## 4.21.0
 
 - `Client::signal_with_start` starts a workflow or reuses its open run and
