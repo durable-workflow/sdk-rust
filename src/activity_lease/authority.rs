@@ -125,8 +125,17 @@ impl State {
         Ok((bound, interval))
     }
 
-    fn delivery(task: &Value, server_time: &Value, worker: &str, namespace: &str) -> Result<Self> {
-        let captured = Clock::now();
+    /// `requested` is when the poll request was sent. The Server granted the
+    /// lease at some point after that, so measuring from it never overstates
+    /// the time left.
+    fn delivery(
+        task: &Value,
+        server_time: &Value,
+        worker: &str,
+        namespace: &str,
+        requested: Clock,
+    ) -> Result<Self> {
+        let captured = requested;
         let server_time = timestamp(server_time)?;
         let lease_expiry = timestamp(&task["lease_expires_at"])?;
         let grant = duration(lease_expiry, server_time)?;
@@ -324,7 +333,13 @@ pub(crate) struct Authority {
 }
 
 impl Authority {
-    fn delivery(client: &Client, wire: &Value, worker: &str, queue: &str) -> Result<Self> {
+    fn delivery(
+        client: &Client,
+        wire: &Value,
+        worker: &str,
+        queue: &str,
+        requested: Clock,
+    ) -> Result<Self> {
         let task = &wire["task"];
         for name in [
             "task_id",
@@ -372,6 +387,7 @@ impl Authority {
                 &wire["server_time"],
                 worker,
                 &client.namespace,
+                requested,
             )?),
             active: AtomicBool::new(true),
             changed: Notify::new(),
@@ -648,6 +664,8 @@ const RETRY_FLOOR: Duration = Duration::from_millis(2);
 
 /// Upper bound of the lease time kept back to release an unrenewed claim.
 const RELEASE_RESERVE: Duration = Duration::from_secs(10);
+/// Upper bound of the lease time that must remain when a release is sent.
+const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 
 /// `failure.type` of a released claim. The Server records it as the attempt's
 /// `exception_type`, so retry policies can match it.
@@ -655,14 +673,25 @@ pub(crate) const WORKER_LOST_TYPE: &str = "worker_lost";
 /// `failure.class` of a released claim, recorded as `exception_class`.
 pub(crate) const WORKER_LOST_CLASS: &str = "ActivityWorkerLost";
 
-/// Renewal cadence: steady state after an acknowledged grant, otherwise
-/// exponential backoff from 250 ms to 4 s. The caller also caps every wait so
-/// retries and the release fit inside the lease.
+/// Renewal cadence: steady state after an acknowledged grant. After the
+/// n-th consecutive failure (n from 0) the wait is drawn uniformly from
+/// `[0, min(4 s, 250 ms * 2^n)]` (full jitter), the same in every SDK. The
+/// caller also caps every wait so retries and the release fit in the lease.
 fn retry_delay(failures: u32) -> Duration {
     match failures {
         0 => Duration::from_secs(30),
-        failures => Duration::from_millis(250 << (failures - 1).min(4)),
+        failures => backoff_ceiling(failures).mul_f64(unit_random()),
     }
+}
+
+fn backoff_ceiling(failures: u32) -> Duration {
+    Duration::from_millis(250 << failures.saturating_sub(1).min(4))
+}
+
+/// A uniform sample from `[0, 1)` from the OS random source behind UUID v4.
+fn unit_random() -> f64 {
+    let (bits, _) = uuid::Uuid::new_v4().as_u64_pair();
+    (bits >> 11) as f64 / (1_u64 << 53) as f64
 }
 
 #[derive(Debug)]
@@ -684,6 +713,7 @@ impl Lease {
         wire: &Value,
         worker: &str,
         queue: &str,
+        requested: Clock,
     ) -> Result<Option<Arc<Self>>> {
         client.observe_worker_activity_lease_capabilities(&wire["server_capabilities"]);
         if wire["task"].is_null()
@@ -693,7 +723,7 @@ impl Lease {
         {
             return Ok(None);
         }
-        let authority = Arc::new(Authority::delivery(client, wire, worker, queue)?);
+        let authority = Arc::new(Authority::delivery(client, wire, worker, queue, requested)?);
         // A refusal or a changed identity still ends the claim before the
         // callback starts. A timeout, transport error, 429 or 5xx does not:
         // the poll's own grant stays valid, so the callback starts under it and
@@ -740,20 +770,39 @@ impl Lease {
 }
 
 impl Authority {
-    /// Fail the attempt as retryable `worker_lost`, once, within the reserve.
+    /// Fail the attempt as retryable `worker_lost`, once.
+    ///
+    /// Callers invoke this only after the callback has confirmed stopped: it
+    /// never started, or its future was dropped (activity callbacks run
+    /// inline in the poll task, never spawned). A blocking callback can delay
+    /// that drop, so the report is sent only while more than a margin of the
+    /// lease is left. Otherwise nothing is sent and the Server records
+    /// `lease_expired`; two executions of one attempt are never possible.
     async fn send_release(&self) {
         let Some(cause) = self.release.lock().ok().and_then(|cause| cause.clone()) else {
             return;
         };
+        let Ok((lease_left, margin)) = self.state.lock().map(|state| {
+            (
+                state.lease_until.saturating_duration_since(Clock::now()),
+                RELEASE_MARGIN.min(state.reserve() / 2),
+            )
+        }) else {
+            return;
+        };
+        if lease_left <= margin {
+            tracing::warn!(
+                target: "durable_workflow::activity_lease",
+                task_id = %self.task_id,
+                activity_attempt_id = %self.attempt_id,
+                "activity callback stopped too late to release its claim; the Server settles it at lease expiry"
+            );
+            return;
+        }
         if self.released.swap(true, Ordering::SeqCst) {
             return;
         }
-        let budget = self
-            .state
-            .lock()
-            .map(|state| state.lease_until.saturating_duration_since(Clock::now()))
-            .unwrap_or_default()
-            .clamp(Duration::from_secs(1), RELEASE_RESERVE);
+        let budget = lease_left;
         let failure = json!({
             "type": WORKER_LOST_TYPE,
             "class": WORKER_LOST_CLASS,
@@ -791,5 +840,28 @@ impl Drop for Lease {
         self.authority
             .invalidate("activity claim settled or abandoned");
         self.maintenance.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renewal_backoff_uses_full_jitter_up_to_a_four_second_cap() {
+        assert_eq!(retry_delay(0), Duration::from_secs(30));
+        let ceilings = [250, 500, 1_000, 2_000, 4_000, 4_000, 4_000];
+        for (failures, ceiling) in (1..).zip(ceilings) {
+            assert_eq!(backoff_ceiling(failures), Duration::from_millis(ceiling));
+            let samples: Vec<_> = (0..200).map(|_| retry_delay(failures)).collect();
+            assert!(samples
+                .iter()
+                .all(|delay| *delay <= Duration::from_millis(ceiling)));
+            // Full jitter spreads over the whole range, not just near the cap.
+            assert!(samples
+                .iter()
+                .any(|delay| *delay < Duration::from_millis(ceiling / 2)));
+        }
+        assert_eq!(backoff_ceiling(u32::MAX), Duration::from_secs(4));
     }
 }

@@ -395,6 +395,29 @@ future and fence retained callback Clients against late completion, failure,
 heartbeat or result upload. Retryable renewal errors grant no additional time.
 Older runtimes keep their existing path.
 
+A delivered lease is measured from when the poll request was sent, so local
+time never overstates the Server's grant. A timeout, transport error, 429 or 5xx
+on a renewal, including the first one before the callback, keeps the claim under
+its last acknowledged grant. The renewal is retried after a wait drawn uniformly
+from `[0, min(4 s, 0.25 s * 2^n)]` after the n-th consecutive failure (n from 0,
+full jitter), the same schedule in every Durable Workflow SDK. A single attempt
+spends at most half of the remaining grant, capped at five seconds.
+
+The Worker keeps a reserve at the end of the lease: at most 10 s and at most a
+fifth of the grant. If renewal still has not succeeded when only the reserve is
+left, the Worker drops the callback future and, once it has confirmed the
+callback stopped, releases the claim with a retryable failure whose
+`failure.type` is `worker_lost` (`failure.class` `ActivityWorkerLost`). The
+Server's retry policy then acts at once, and `worker_lost` can be listed in
+`non_retryable_error_types`. Callbacks run inline in the poll task, so dropping
+the future stops them; a callback that blocks its thread stops only when it
+yields. If the callback is not confirmed stopped while more than a small margin
+of the lease is left (at most 1 s), nothing is sent and the Server records
+`lease_expired`, so one attempt never runs twice. A Server refusal such as
+`lease_expired` ends the claim without a release. In workflow code,
+`ActivityFailure::lease_loss_reason()` reports `WorkerLost`, `LeaseExpired` or
+`WorkerDeregistered`.
+
 Runtime lease pings do not record application progress or satisfy a configured
 heartbeat timeout. Continue calling `ctx.heartbeat(...)` for real progress; only
 acknowledged same-attempt progress advances that recorded interval. Session-bound

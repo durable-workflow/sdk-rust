@@ -1564,6 +1564,7 @@ pub struct ActivityFailure {
 
 /// Why an activity attempt lost its worker. See [`ActivityFailure::lease_loss_reason`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LeaseLossReason {
     /// The Server settled the attempt because its lease expired.
     LeaseExpired,
@@ -1601,12 +1602,12 @@ impl ActivityFailure {
     ///
     /// `WorkerLost` means a worker released the attempt (`exception_type`
     /// `worker_lost`) because it could not keep the lease. A lease the Server
-    /// settled (`ActivityLeaseExpiredException`) is `LeaseExpired`, or
-    /// `WorkerDeregistered` when the recorded exception names that
-    /// `failure_reason`. Servers record that reason beside the exception, not
-    /// in it, so a deregistered worker usually reports `LeaseExpired` here.
-    /// The callback may not have finished, so whether to retry is the retry
-    /// policy's choice; the default policy is unchanged.
+    /// settled (`ActivityLeaseExpiredException`) reports the Server's recorded
+    /// `failure_reason`: `WorkerDeregistered`, or `LeaseExpired` by default.
+    /// The Server records that reason beside the exception in the history
+    /// payload; replay copies it into `exception.failure_reason`, so this
+    /// works without a new field. Whether to retry is the retry policy's
+    /// choice; the default policy is unchanged.
     pub fn lease_loss_reason(&self) -> Option<LeaseLossReason> {
         if self.exception_type.as_deref() == Some(activity_lease::authority::WORKER_LOST_TYPE) {
             return Some(LeaseLossReason::WorkerLost);
@@ -5272,6 +5273,8 @@ impl Client {
             "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
+        // A delivered lease is measured from the poll's start, not its reply.
+        let requested = tokio::time::Instant::now();
         let mut wire: Value = self
             .poll_request_json_unresolved(
                 "/worker/activity-tasks/poll",
@@ -5282,8 +5285,10 @@ impl Client {
             )
             .await?;
         let ready_age = metrics::ready_age_from_poll(&wire);
-        let lease =
-            activity_lease::authority::Lease::confirm(self, &wire, worker_id, task_queue).await?;
+        let lease = activity_lease::authority::Lease::confirm(
+            self, &wire, worker_id, task_queue, requested,
+        )
+        .await?;
         let observed = self.with_activity_lease_authority(
             lease.as_ref().map(|lease| Arc::clone(&lease.authority)),
         );
@@ -19481,10 +19486,31 @@ fn activity_outcome(
         ),
         _ => unreachable!("activity_outcome is called only for terminal activity events"),
     };
-    let exception = payload
+    let mut exception = payload
         .get("exception")
         .filter(|value| !value.is_null())
         .cloned();
+    // A Server-settled lease loss records `failure_reason` beside the
+    // exception. Carry it in the exception descriptor so that
+    // `ActivityFailure::lease_loss_reason` can read it without a new field.
+    if payload_string(payload, "exception_class").as_deref() == Some(ACTIVITY_LEASE_EXPIRED_CLASS) {
+        if let Some(reason) = payload_string(payload, "failure_reason") {
+            match &mut exception {
+                Some(Value::Object(fields)) => {
+                    fields
+                        .entry("failure_reason")
+                        .or_insert_with(|| json!(reason));
+                }
+                None => {
+                    exception = Some(json!({
+                        "class": ACTIVITY_LEASE_EXPIRED_CLASS,
+                        "failure_reason": reason,
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+    }
     let failure_category = payload_string(payload, "failure_category");
     let timeout_kind = payload_string(payload, "timeout_kind");
     let reason = payload_string(payload, "reason").unwrap_or_else(|| match kind {

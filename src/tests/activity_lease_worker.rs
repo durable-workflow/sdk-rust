@@ -715,6 +715,74 @@ async fn initial_renewal_that_never_recovers_retries_until_the_grant_is_gone() {
     assert_worker_lost_release(&server);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callback_that_stops_after_the_lease_is_not_released() {
+    fn always_unavailable(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+        if path == RENEW {
+            return Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_lock_pressure"}).to_string(),
+            ));
+        }
+        replies(path, body, number)
+    }
+    let server = server(always_unavailable);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async {
+        // Blocks its thread past the 450 ms lease, so the dropped callback is
+        // confirmed stopped only after the deadline.
+        std::thread::sleep(Duration::from_millis(700));
+        Ok(json!(true))
+    });
+    tokio::spawn(async move { worker.poll_activity_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(server.request_count(RENEW) >= 2);
+    assert_eq!(server.request_count(COMPLETE), 0);
+    assert_eq!(
+        server.request_count(FAIL),
+        0,
+        "a late release must not be sent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivered_lease_is_measured_from_the_poll_start() {
+    fn slow_poll(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+        match path {
+            POLL => {
+                // The Server stamps the 450 ms grant, then the reply takes
+                // 350 ms to arrive.
+                let wire = delivery().to_string();
+                std::thread::sleep(Duration::from_millis(350));
+                Some(("200 OK", wire))
+            }
+            RENEW => Some((
+                "503 Service Unavailable",
+                json!({"reason":"backend_lock_pressure"}).to_string(),
+            )),
+            _ => replies(path, body, number),
+        }
+    }
+    let server = server(slow_poll);
+    let mut worker = worker(&server);
+    worker.register_activity("LeaseActivity", |_ctx, _args| async {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        Ok(json!(true))
+    });
+    let started = std::time::Instant::now();
+    worker.poll_activity_once().await.unwrap();
+    // Measured from the reply, the grant would seem to last until ~800 ms and
+    // the claim would be held past the Server's real deadline (~450 ms).
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "claim held for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(server.request_count(COMPLETE), 0);
+}
+
 #[tokio::test]
 async fn refused_renewal_ends_the_claim_without_a_release() {
     fn refused(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
@@ -768,13 +836,28 @@ fn lease_loss_reason_names_released_and_server_settled_attempts() {
     );
     assert_eq!(LeaseLossReason::LeaseExpired.as_str(), "lease_expired");
 
-    // Servers record failure_reason beside the exception; without a new
-    // ActivityFailure field it is not retained, so this falls back.
-    let revoked_beside =
-        failure_from(json!({"exception_class":lease_class,"failure_reason":"worker_deregistered"}));
+    // Server 3.16 shape: failure_reason beside exception_class, no exception.
+    let revoked_beside = failure_from(json!({"exception_class":lease_class,
+        "failure_category":"internal","failure_reason":"worker_deregistered",
+        "lease_owner":"gone-worker","non_retryable":false,"timeout_kind":"lease"}));
     assert_eq!(
         revoked_beside.lease_loss_reason(),
-        Some(LeaseLossReason::LeaseExpired)
+        Some(LeaseLossReason::WorkerDeregistered)
+    );
+    assert_eq!(
+        revoked_beside.exception.as_ref().unwrap()["failure_reason"],
+        "worker_deregistered"
+    );
+    // A recorded exception keeps its own fields and gains only the reason.
+    let with_exception = failure_from(json!({"exception_class":lease_class,
+        "failure_reason":"worker_deregistered","exception":{"class":lease_class,"message":"lost"}}));
+    assert_eq!(
+        with_exception.lease_loss_reason(),
+        Some(LeaseLossReason::WorkerDeregistered)
+    );
+    assert_eq!(
+        with_exception.exception.as_ref().unwrap()["message"],
+        "lost"
     );
 
     let revoked = failure_from(json!({"exception":{"class":lease_class,
