@@ -5659,6 +5659,10 @@ impl Client {
             request = request.bearer_auth(token);
         }
 
+        // A task report before externalization, kept so it can be encoded
+        // again (once) if the Server refuses it as too large for a policy
+        // that changed since it was cached.
+        let mut unexternalized: Option<Value> = None;
         if let Some(body) = body {
             let mut body = serde_json::to_value(body)?;
             self.check_activity_lease_request(path, Some(&body))?;
@@ -5678,6 +5682,9 @@ impl Client {
                 reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
             ) {
                 self.check_activity_lease_request(path, Some(&body))?;
+                if report.is_none() && is_task_report(path) {
+                    unexternalized = Some(body.clone());
+                }
                 self.externalize_runtime_payloads(&mut body, path, protocol)
                     .await?;
                 self.check_activity_lease_request(path, Some(&body))?;
@@ -5851,6 +5858,28 @@ impl Client {
                 // So is a completion over the history-transaction budget.
                 if let Some(refusal) = workflow_task_history_limit_exceeded(status, &body, path) {
                     return Err(Error::WorkflowTaskHistoryLimitExceeded(refusal));
+                }
+                // A report sent inline under a cached payload policy the
+                // Server has since lowered is refused as too large, and nothing
+                // was recorded. Rediscover the policy, encode the same report
+                // again (externalizing what the new limit requires) and resend
+                // it once. A second refusal is a genuinely too-large report.
+                if let Some(original) = unexternalized
+                    .take()
+                    .filter(|_| report_payload_too_large(status, &body))
+                {
+                    tracing::warn!(
+                        target: "durable_workflow::worker",
+                        path,
+                        "report refused as too large; rediscovering the payload policy and resending it once"
+                    );
+                    self.forget_runtime_upload_policy(protocol);
+                    let mut fresh = original;
+                    self.externalize_runtime_payloads(&mut fresh, path, protocol)
+                        .await?;
+                    self.check_activity_lease_request(path, Some(&fresh))?;
+                    *request.body_mut() = Some(serde_json::to_vec(&fresh)?.into());
+                    continue;
                 }
                 let error = Error::Http { status, body };
                 deferred_workflow_completion |= worker_deferred_workflow_completion_retry_after(
@@ -6866,7 +6895,7 @@ fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
 /// A failed read-only cluster-info discovery a running worker waits out: a
 /// connection or timeout failure, any 5xx or a 429, unless the Server says
 /// `retryable: false`.
-fn cluster_info_failure_is_transient(error: &Error) -> bool {
+pub(crate) fn cluster_info_failure_is_transient(error: &Error) -> bool {
     let (status, body) = match error {
         Error::Timeout | Error::Transport(_) => return true,
         Error::Http { status, body } => (status.as_u16(), body.as_str()),
@@ -6878,6 +6907,23 @@ fn cluster_info_failure_is_transient(error: &Error) -> bool {
         .and_then(|body| body.get("retryable").and_then(Value::as_bool))
         == Some(false);
     (status >= 500 || status == 429) && !refused
+}
+
+/// An activity report (completion or failure) whose payloads may be encoded
+/// again after a too-large refusal. Workflow-task completions keep their own
+/// typed size refusals unchanged.
+fn is_task_report(path: &str) -> bool {
+    path.starts_with("/worker/activity-tasks/")
+        && (path.ends_with("/complete") || path.ends_with("/fail"))
+}
+
+/// The Server refused a report as larger than its current limit.
+fn report_payload_too_large(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        || serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|body| body.get("reason")?.as_str().map(str::to_owned))
+            .is_some_and(|reason| reason == "payload_too_large")
 }
 
 /// A worker task poll: idempotent by its poll request ID, so the only

@@ -17,6 +17,19 @@ pub(super) struct Policy {
     completion_context: bool,
 }
 
+/// How long a discovered payload policy is used before it is refreshed.
+const POLICY_TTL: Duration = Duration::from_secs(60);
+/// After a failed refresh, how long the last-known policy is kept before
+/// discovery is tried again.
+const POLICY_OUTAGE_RETRY: Duration = Duration::from_secs(10);
+
+fn policy_role(protocol: RequestProtocol) -> usize {
+    usize::from(matches!(
+        protocol,
+        RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
+    ))
+}
+
 fn unsupported(message: &str) -> Error {
     Error::Codec(format!("external_payload_unsupported: {message}"))
 }
@@ -279,31 +292,54 @@ impl Client {
     }
 
     async fn runtime_upload_policy(&self, protocol: RequestProtocol) -> Result<Policy> {
-        let role = usize::from(matches!(
-            protocol,
-            RequestProtocol::DefaultWorker | RequestProtocol::Worker(_)
-        ));
+        let role = policy_role(protocol);
         let cached = self
             .runtime_upload_policy
             .lock()
             .map_err(|_| unsupported("discovery cache poisoned"))?[role]
             .clone();
-        if let Some((checked, policy)) = cached {
-            if checked.elapsed() < Duration::from_secs(60) {
-                return Ok(policy);
+        if let Some((checked, policy)) = &cached {
+            if checked.elapsed() < POLICY_TTL {
+                return Ok(policy.clone());
             }
         }
         // Discovery uses the control-plane header with this operation's credential
         // role, so a worker never needs the application's client token.
-        let info = self
-            .retry_cluster_info(|| async {
-                let request = self
-                    .runtime_payload_request(reqwest::Method::GET, "/cluster/info", protocol, true)?
-                    .build()?;
-                self.runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
-                    .await
-            })
-            .await?;
+        let read = || async {
+            let request = self
+                .runtime_payload_request(reqwest::Method::GET, "/cluster/info", protocol, true)?
+                .build()?;
+            self.runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
+                .await
+        };
+        let info = match cached {
+            // An expired policy is refreshed with one attempt. Through a
+            // cluster-info outage the last-known policy keeps reports moving,
+            // and discovery is tried again after a short pause, not before
+            // every request.
+            Some((_, stale)) => match read().await {
+                Ok(info) => info,
+                Err(error) if crate::cluster_info_failure_is_transient(&error) => {
+                    tracing::warn!(
+                        target: "durable_workflow::worker",
+                        error = %error,
+                        "cluster info unavailable; keeping the last-known payload policy"
+                    );
+                    let retry_at = Instant::now()
+                        .checked_sub(POLICY_TTL.saturating_sub(POLICY_OUTAGE_RETRY))
+                        .unwrap_or_else(Instant::now);
+                    self.runtime_upload_policy
+                        .lock()
+                        .map_err(|_| unsupported("discovery cache poisoned"))?[role] =
+                        Some((retry_at, stale.clone()));
+                    return Ok(stale);
+                }
+                Err(error) => return Err(error),
+            },
+            // Without any policy, a report cannot be encoded: wait out the
+            // outage under the running worker's rules.
+            None => self.retry_cluster_info(read).await?,
+        };
         self.observe_failure_request_limit(&info);
         let policy = Policy::from_info(&info)?;
         self.runtime_upload_policy
@@ -311,6 +347,14 @@ impl Client {
             .map_err(|_| unsupported("discovery cache poisoned"))?[role] =
             Some((Instant::now(), policy.clone()));
         Ok(policy)
+    }
+
+    /// Forget the cached payload policy, so the next report rediscovers it
+    /// (after the Server refused a report as too large).
+    pub(super) fn forget_runtime_upload_policy(&self, protocol: RequestProtocol) {
+        if let Ok(mut cache) = self.runtime_upload_policy.lock() {
+            cache[policy_role(protocol)] = None;
+        }
     }
 
     fn runtime_payload_request(

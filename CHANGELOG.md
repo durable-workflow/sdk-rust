@@ -10,6 +10,14 @@
   every 5 minutes after, until it succeeds or the worker stops. An explicit
   `retryable: false`, 401, 403 and other refusals are still returned.
   `Client::cluster_info` and Clients outside a running worker make one attempt.
+  When the cached payload policy (refreshed every 60 s) expires during such an
+  outage, reports keep using the last-known policy and discovery is tried
+  again 10 s later; only a worker that has no policy yet waits.
+- An activity report the Server refuses as too large (413 `payload_too_large`)
+  because it lowered its inline limit since the policy was cached is no longer
+  lost. The worker forgets the policy, rediscovers it, encodes the same report
+  again (externalizing payloads the new limit requires) and resends it once.
+  A second refusal is handled as a genuinely too-large report.
 
 - **BEHAVIOUR CHANGE: `Worker::recover_transient_outages` now defaults to
   `true`.** `run` and `run_until` keep running through transient Server

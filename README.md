@@ -1173,7 +1173,11 @@ Server settles the attempt.
 
 A running worker's cluster-info reads (startup discovery and the payload
 policy read before a report) retry a connection failure, timeout, 5xx or 429
-the same way.
+the same way. Once a payload policy is known, an outage does not hold reports
+back: the last-known policy is used and discovery is tried again 10 s later.
+If the Server refuses a report as too large because it lowered its inline
+limit, the worker rediscovers the policy, encodes the report again and resends
+it once.
 
 An explicit `retryable: false`, 401, 403 and other protocol refusals, codec
 and handler failures stop the worker: it emits a `tracing` error event and
