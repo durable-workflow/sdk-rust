@@ -1,0 +1,47 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-activity-lease-loss-reason",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.activity-lease-loss",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "event_type": "ActivityScheduled",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.lease-loss.activity"
+      }
+    },
+    {
+      "event_type": "ActivityFailed",
+      "payload": {
+        "sequence": 1,
+        "activity_type": "corpus.lease-loss.activity",
+        "activity_execution_id": "activity-lease-loss-1",
+        "exception_class": "Workflow\\V2\\Exceptions\\ActivityLeaseExpiredException",
+        "failure_category": "internal",
+        "failure_reason": "worker_deregistered",
+        "lease_owner": "deregistered-worker",
+        "non_retryable": false,
+        "message": "Activity corpus.lease-loss.activity lost its original task lease before the attempt settled."
+      }
+    }
+  ],
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": "worker_deregistered"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": "worker_deregistered"
+  }
+}
