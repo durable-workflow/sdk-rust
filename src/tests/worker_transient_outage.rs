@@ -416,3 +416,120 @@ fn a_continuing_outage_escalates_to_error_at_one_minute_then_every_five() {
     assert_eq!(outage.log.failed(at(759)), None);
     assert_eq!(outage.log.failed(at(760)), Some(Duration::from_secs(60)));
 }
+
+const CLUSTER_INFO: &str = "/api/cluster/info";
+
+fn cluster_info_down_twice(
+    path: &str,
+    body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (CLUSTER_INFO, 1) => Some(("500 Internal Server Error", "upstream exploded".into())),
+        // Request 2 is dropped without a reply (see `refused_second`).
+        (CLUSTER_INFO, _) => Some((
+            "200 OK",
+            json!({"worker_protocol":{"server_capabilities":{"query_task_authority":true}}})
+                .to_string(),
+        )),
+        ("/api/worker/register", _) => {
+            let request: Value = serde_json::from_str(body).unwrap();
+            Some((
+                "200 OK",
+                json!({"registered":true,"worker_id":request["worker_id"],
+                    "heartbeat_interval_seconds":3600,"protocol_version":"1.20",
+                    "server_capabilities":{"query_task_authority":true}})
+                .to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn refused_second(path: &str, number: usize) -> bool {
+    path == CLUSTER_INFO && number == 2
+}
+
+#[tokio::test]
+async fn startup_cluster_info_failures_are_waited_out() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(cluster_info_down_twice),
+        drop_request: Some(refused_second),
+        ..MockWorkerBehavior::default()
+    });
+    let mut worker = worker(&server).require_query_task_authority(true);
+    worker.register_query("counter", "current", |_ctx, _args| async move {
+        Ok(Value::Null)
+    });
+    let polling = async {
+        while server.request_count(WORKFLOW_POLL) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), worker.run_until(polling))
+        .await
+        .expect("startup must get past the outage")
+        .expect("a cluster-info outage must not stop the worker");
+    assert_eq!(server.request_count(CLUSTER_INFO), 3);
+    assert_eq!(server.request_count("/api/worker/register"), 1);
+}
+
+fn completion_discovery_down_twice(
+    path: &str,
+    _body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (CLUSTER_INFO, 1) => Some(("500 Internal Server Error", "upstream exploded".into())),
+        (CLUSTER_INFO, _) => Some(("200 OK", json!({}).to_string())),
+        (COMPLETE, _) => Some(("200 OK", json!({"recorded":true}).to_string())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn run_time_cluster_info_failures_are_waited_out() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(completion_discovery_down_twice),
+        drop_request: Some(refused_second),
+        concurrent_requests: true,
+        ..MockWorkerBehavior::default()
+    });
+    let worker = activity_worker(&server)
+        .max_concurrent_activity_tasks(1)
+        .poll_timeout(Duration::from_millis(10));
+    let completed = async {
+        while server.request_count(COMPLETE) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), worker.run_until(completed))
+        .await
+        .expect("the completion must get past the outage")
+        .expect("a cluster-info outage must not stop the worker");
+    assert_eq!(server.request_count(CLUSTER_INFO), 3);
+    assert_eq!(server.request_count(COMPLETE), 1);
+}
+
+#[test]
+fn cluster_info_failures_other_than_refusals_are_transient() {
+    let http = |status: u16, body: &str| Error::Http {
+        status: reqwest::StatusCode::from_u16(status).unwrap(),
+        body: body.to_owned(),
+    };
+    assert!(cluster_info_failure_is_transient(&http(
+        500,
+        "upstream exploded"
+    )));
+    assert!(cluster_info_failure_is_transient(&http(503, "")));
+    assert!(cluster_info_failure_is_transient(&http(429, "{}")));
+    assert!(cluster_info_failure_is_transient(&Error::Timeout));
+    assert!(!cluster_info_failure_is_transient(&http(
+        500,
+        r#"{"retryable":false}"#
+    )));
+    assert!(!cluster_info_failure_is_transient(&http(401, "")));
+    assert!(!cluster_info_failure_is_transient(&http(404, "")));
+}

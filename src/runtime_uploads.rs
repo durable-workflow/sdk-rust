@@ -295,11 +295,14 @@ impl Client {
         }
         // Discovery uses the control-plane header with this operation's credential
         // role, so a worker never needs the application's client token.
-        let request = self
-            .runtime_payload_request(reqwest::Method::GET, "/cluster/info", protocol, true)?
-            .build()?;
         let info = self
-            .runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
+            .retry_cluster_info(|| async {
+                let request = self
+                    .runtime_payload_request(reqwest::Method::GET, "/cluster/info", protocol, true)?
+                    .build()?;
+                self.runtime_payload_json(request, protocol, 2 * 1024 * 1024, None)
+                    .await
+            })
             .await?;
         self.observe_failure_request_limit(&info);
         let policy = Policy::from_info(&info)?;

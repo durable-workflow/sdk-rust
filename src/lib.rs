@@ -3566,6 +3566,44 @@ impl Client {
         .await
     }
 
+    /// Run a read-only cluster-info discovery. For a running worker, a
+    /// transient failure is retried with the shared jittered backoff (an
+    /// outage logged as ERROR after 60 s, then every 5 minutes) until it
+    /// succeeds or the worker stops; elsewhere it is one attempt.
+    pub(crate) async fn retry_cluster_info<T, F, Fut>(&self, mut read: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let Some(admission) = self.worker_storage_admission.as_ref() else {
+            return read().await;
+        };
+        let mut failures = 0_u32;
+        let mut outage = OutageLog::default();
+        loop {
+            let error = match read().await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            if !cluster_info_failure_is_transient(&error) || admission.stop.load(Ordering::SeqCst) {
+                return Err(error);
+            }
+            failures = failures.saturating_add(1);
+            outage.report("", "", &error);
+            let delay = worker_outage_delay(failures);
+            tracing::warn!(
+                target: "durable_workflow::worker",
+                error = %error,
+                retry_in_ms = delay.as_millis() as u64,
+                "cluster info unavailable; retrying"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = wait_for_worker_stop(&admission.stop) => return Err(error),
+            }
+        }
+    }
+
     pub async fn cluster_info(&self) -> Result<Value> {
         let discovery: Value = self
             .request_json(
@@ -5750,7 +5788,9 @@ impl Client {
                                 "unknown server capabilities digest; reading capabilities from cluster info"
                             );
                             self.capabilities_digest.forget();
-                            let info: Value = Box::pin(
+                            // One read-only attempt. It never fails this
+                            // request: the answer is already received.
+                            let info = Box::pin(
                                 self.request_json_unresolved_with_timeout::<Value, Value>(
                                     reqwest::Method::GET,
                                     "/cluster/info",
@@ -5759,18 +5799,33 @@ impl Client {
                                     timeout,
                                 ),
                             )
-                            .await?;
-                            let Some(full) = info["worker_protocol"]["server_capabilities"]
-                                .as_object()
-                                .filter(|full| !full.contains_key("digest"))
-                            else {
-                                return Err(error);
+                            .await;
+                            let full = info.as_ref().ok().and_then(|info| {
+                                info["worker_protocol"]["server_capabilities"]
+                                    .as_object()
+                                    .filter(|full| !full.contains_key("digest"))
+                                    .cloned()
+                            });
+                            if full.is_none() {
+                                tracing::warn!(
+                                    target: "durable_workflow::worker",
+                                    path,
+                                    "cluster info unavailable; using the answer without its capabilities, which later requests learn again"
+                                );
+                            }
+                            // Without capabilities the unknown copies are
+                            // dropped from the answer, which is still used.
+                            let fallback = match &full {
+                                Some(full) => {
+                                    server_capabilities_digest::Fallback::Capabilities(full)
+                                }
+                                None => server_capabilities_digest::Fallback::Drop,
                             };
                             let restored = self.capabilities_digest.restore_with(
                                 status.as_u16(),
                                 &bytes,
                                 captured,
-                                Some(full),
+                                Some(fallback),
                             )?;
                             // Later requests start again from `none`.
                             self.capabilities_digest.forget();
@@ -6806,6 +6861,23 @@ fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
         .initial_backoff
         .saturating_mul(1_u32 << exponent)
         .min(policy.max_backoff)
+}
+
+/// A failed read-only cluster-info discovery a running worker waits out: a
+/// connection or timeout failure, any 5xx or a 429, unless the Server says
+/// `retryable: false`.
+fn cluster_info_failure_is_transient(error: &Error) -> bool {
+    let (status, body) = match error {
+        Error::Timeout | Error::Transport(_) => return true,
+        Error::Http { status, body } => (status.as_u16(), body.as_str()),
+        Error::Protocol(failure) => (failure.status, ""),
+        _ => return false,
+    };
+    let refused = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|body| body.get("retryable").and_then(Value::as_bool))
+        == Some(false);
+    (status >= 500 || status == 429) && !refused
 }
 
 /// A worker task poll: idempotent by its poll request ID, so the only
@@ -9407,12 +9479,14 @@ impl Worker {
         if self.nexus_cooperative_cancellation_enabled {
             let info: Value = self
                 .client
-                .request_json(
-                    reqwest::Method::GET,
-                    "/cluster/info",
-                    RequestProtocol::Worker("1.20"),
-                    Option::<&Value>::None,
-                )
+                .retry_cluster_info(|| {
+                    self.client.request_json(
+                        reqwest::Method::GET,
+                        "/cluster/info",
+                        RequestProtocol::Worker("1.20"),
+                        Option::<&Value>::None,
+                    )
+                })
                 .await?;
             if !nexus::installed_cooperation(&info["worker_protocol"]["server_capabilities"]) {
                 return Err(Error::CooperativeCancellationUnavailable(
@@ -9429,13 +9503,16 @@ impl Worker {
             // Discovery uses the Worker credential, including worker-only Clients.
             let discovery: Value = self
                 .client
-                .request_json_unresolved_with_timeout::<Value, Value>(
-                    reqwest::Method::GET,
-                    "/cluster/info",
-                    RequestProtocol::Worker("1.20"),
-                    None,
-                    Duration::from_secs(5),
-                )
+                .retry_cluster_info(|| {
+                    self.client
+                        .request_json_unresolved_with_timeout::<Value, Value>(
+                            reqwest::Method::GET,
+                            "/cluster/info",
+                            RequestProtocol::Worker("1.20"),
+                            None,
+                            Duration::from_secs(5),
+                        )
+                })
                 .await?;
             if discovery["worker_protocol"]["server_capabilities"]["query_task_authority"] != true {
                 return Err(Error::WorkerLoop(

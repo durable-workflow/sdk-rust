@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A failed cluster-info read no longer stops a running worker. Startup
+  discovery (query-task authority, Nexus cooperation) and the inline-payload
+  policy read before a report retry a connection failure, timeout, 5xx or 429
+  with the shared jittered backoff, uniform in `[0, min(4 s, 0.25 s *
+  2^(n-1))]`, logging a `tracing` ERROR once the outage has lasted 60 s and
+  every 5 minutes after, until it succeeds or the worker stops. An explicit
+  `retryable: false`, 401, 403 and other refusals are still returned.
+  `Client::cluster_info` and Clients outside a running worker make one attempt.
+
 - **BEHAVIOUR CHANGE: `Worker::recover_transient_outages` now defaults to
   `true`.** `run` and `run_until` keep running through transient Server
   outages instead of returning the error once `WorkerRetryPolicy.max_retries`
@@ -96,8 +105,10 @@
   because a completion's answer can carry the next leased task, and the full
   capabilities are read with `GET /api/cluster/info`
   (`worker_protocol.server_capabilities`) and put in place of the unknown
-  digest. Only an unknown digest that cannot be recovered this way is
-  `Error::Protocol` with reason `server_capabilities_digest_unknown`.
+  digest. If that read fails, the answer is still used without the field and
+  later requests learn the capabilities again; the request never fails. A
+  poll whose resend names an unknown digest again is `Error::Protocol` with
+  reason `server_capabilities_digest_unknown`.
   Decoded response bodies are capped at 128 MiB by default
   (`ClientBuilder::max_response_bytes`); a larger body stops being read and
   fails with the new `Error::ResponseBodyTooLarge`, so a small gzip answer
