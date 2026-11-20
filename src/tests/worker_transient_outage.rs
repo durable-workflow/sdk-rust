@@ -660,3 +660,73 @@ async fn an_expired_policy_keeps_reports_moving_through_a_cluster_info_outage() 
     // One refresh attempt, then the last-known policy for the next 10 s.
     assert_eq!(server.request_count(CLUSTER_INFO), 2);
 }
+
+const FAIL: &str = "/api/worker/activity-tasks/retry-task/fail";
+
+fn too_large_refusal() -> (&'static str, String) {
+    (
+        "413 Payload Too Large",
+        json!({"reason":"payload_too_large","message":"request exceeds the limit"}).to_string(),
+    )
+}
+
+fn still_too_large(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1 | 2) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (CLUSTER_INFO, 1) => Some(("200 OK", payload_policy(2 * 1024 * 1024))),
+        (CLUSTER_INFO, _) => Some(("200 OK", payload_policy(100 * 1024))),
+        (UPLOAD, _) => Some(("201 Created", uploaded(body))),
+        // Refused inline, and refused again after it was re-encoded.
+        (COMPLETE, 2 | 3) => Some(too_large_refusal()),
+        (COMPLETE, _) | (FAIL, _) => Some(("200 OK", json!({"recorded":true}).to_string())),
+        _ => None,
+    }
+}
+
+fn no_storage_after_rediscovery(
+    path: &str,
+    body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (CLUSTER_INFO, 2..) => {
+            let mut policy: Value = serde_json::from_str(&payload_policy(100 * 1024)).unwrap();
+            policy["namespace"]["external_payload_storage"]["status"] = json!("unavailable");
+            Some(("200 OK", policy.to_string()))
+        }
+        (COMPLETE, 2) => Some(too_large_refusal()),
+        _ => still_too_large(path, body, number),
+    }
+}
+
+#[tokio::test]
+async fn a_result_still_too_large_after_rediscovery_fails_the_attempt_not_the_worker() {
+    for (case, handler) in [
+        ("refused again", still_too_large as RequestOverride),
+        ("no storage", no_storage_after_rediscovery),
+    ] {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(handler),
+            ..MockWorkerBehavior::default()
+        });
+        let worker = sized_worker(&server);
+        for _ in 0..2 {
+            let outcome = worker.poll_activity_once().await;
+            assert!(
+                matches!(outcome, Ok(ManagedPollOutcome::Handled)),
+                "{case}: the worker keeps running: {outcome:?}"
+            );
+        }
+        let failures = server.request_bodies(FAIL);
+        assert_eq!(failures.len(), 1, "{case}");
+        let failure = &failures[0]["failure"];
+        assert_eq!(failure["type"], "ActivityResultTooLarge", "{case}");
+        assert_eq!(failure["class"], "ActivityResultTooLarge", "{case}");
+        assert_eq!(failure["non_retryable"], true, "{case}");
+        assert!(
+            failure["message"].as_str().unwrap().contains("too large"),
+            "{case}"
+        );
+    }
+}

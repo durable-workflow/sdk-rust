@@ -1892,30 +1892,27 @@ impl Worker {
             }
             return Ok(ManagedPollOutcome::Handled);
         }
-        let task_outcome = if result.is_ok() {
+        let mut task_outcome = if result.is_ok() {
             "completed"
         } else {
             "failed"
         };
         let settled = match result {
             Ok(value) => {
-                self.settle_activity_report(
-                    crate::ActivityReport::Completed,
-                    &guard.task_id,
-                    &guard.attempt_id,
-                    &guard.owner,
-                    lease_deadline,
-                    || {
-                        self.client.complete_activity_task(
-                            &guard.task_id,
-                            &guard.attempt_id,
-                            &guard.owner,
-                            value.clone(),
-                            &task.payload_codec,
-                        )
-                    },
-                )
-                .await?
+                let (settlement, too_large) = self
+                    .settle_activity_completion(
+                        &guard.task_id,
+                        &guard.attempt_id,
+                        &guard.owner,
+                        lease_deadline,
+                        &value,
+                        &task.payload_codec,
+                    )
+                    .await?;
+                if too_large {
+                    task_outcome = "failed";
+                }
+                settlement
             }
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Err(error) => {

@@ -6926,6 +6926,29 @@ fn report_payload_too_large(status: reqwest::StatusCode, body: &str) -> bool {
             .is_some_and(|reason| reason == "payload_too_large")
 }
 
+/// `failure.type` and `failure.class` of an attempt whose result could not be
+/// delivered because it is too large.
+pub(crate) const ACTIVITY_RESULT_TOO_LARGE: &str = "ActivityResultTooLarge";
+
+/// An activity completion that failed only because its result is too large:
+/// the Server refused it as too large (after the one re-encode), or it could
+/// not be externalized (too large to upload, or no payload storage).
+fn activity_result_too_large(error: &Error) -> bool {
+    match error {
+        Error::ActivityTaskRejected(rejection) => {
+            rejection.status == 413 || rejection.reason == "payload_too_large"
+        }
+        Error::Codec(message) => [
+            "external_payload_oversized:",
+            "external_payload_unavailable:",
+            "payload_too_large:",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix)),
+        _ => false,
+    }
+}
+
 /// A worker task poll: idempotent by its poll request ID, so the only
 /// request that may be resent to recover elided capabilities.
 fn is_task_poll(path: &str) -> bool {
@@ -10414,23 +10437,20 @@ impl Worker {
             Err(error) if activity_hydration::stopped(&error) => ActivitySettlement::Recorded,
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
-                self.settle_activity_report(
-                    ActivityReport::Completed,
-                    &task_id,
-                    &attempt_id,
-                    &lease_owner,
-                    lease_deadline,
-                    || {
-                        self.client.complete_activity_task(
-                            &task_id,
-                            &attempt_id,
-                            &lease_owner,
-                            value.clone(),
-                            &codec,
-                        )
-                    },
-                )
-                .await?
+                let (settlement, too_large) = self
+                    .settle_activity_completion(
+                        &task_id,
+                        &attempt_id,
+                        &lease_owner,
+                        lease_deadline,
+                        &value,
+                        &codec,
+                    )
+                    .await?;
+                if too_large {
+                    task_outcome = "failed";
+                }
+                settlement
             }
             Err(error) => {
                 let failure = ActivityError::from_error(&error, "RustActivityFailure");
@@ -10554,6 +10574,77 @@ impl Worker {
                 None => tokio::time::sleep(delay).await,
             }
         }
+    }
+
+    /// Complete an activity. When its result cannot be delivered because it is
+    /// too large (still refused after the payload policy was rediscovered, or
+    /// too large to externalize), report the attempt as a non-retryable
+    /// `ActivityResultTooLarge` failure instead, so the worker keeps running.
+    /// Returns the settlement and whether it was that failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn settle_activity_completion<T: Serialize + Clone>(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        owner: &str,
+        lease_deadline: Option<tokio::time::Instant>,
+        value: &T,
+        codec: &str,
+    ) -> Result<(ActivitySettlement, bool)> {
+        let completion = self
+            .settle_activity_report(
+                ActivityReport::Completed,
+                task_id,
+                attempt_id,
+                owner,
+                lease_deadline,
+                || {
+                    self.client.complete_activity_task(
+                        task_id,
+                        attempt_id,
+                        owner,
+                        value.clone(),
+                        codec,
+                    )
+                },
+            )
+            .await;
+        let error = match completion {
+            Ok(settlement) => return Ok((settlement, false)),
+            Err(error) if activity_result_too_large(&error) => error,
+            Err(error) => return Err(error),
+        };
+        tracing::error!(
+            target: "durable_workflow::worker",
+            worker_id = %self.worker_id,
+            task_id,
+            error = %error,
+            "activity result is too large to deliver; reporting a non-retryable ActivityResultTooLarge failure"
+        );
+        let failure = json!({
+            "type": ACTIVITY_RESULT_TOO_LARGE,
+            "class": ACTIVITY_RESULT_TOO_LARGE,
+            "non_retryable": true,
+            "message": format!("activity result is too large to deliver: {error}"),
+        });
+        let settlement = self
+            .settle_activity_report(
+                ActivityReport::Failed,
+                task_id,
+                attempt_id,
+                owner,
+                lease_deadline,
+                || {
+                    self.client.fail_activity_task_with_failure(
+                        task_id,
+                        attempt_id,
+                        owner,
+                        failure.clone(),
+                    )
+                },
+            )
+            .await?;
+        Ok((settlement, true))
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {

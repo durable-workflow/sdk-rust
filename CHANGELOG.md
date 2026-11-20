@@ -17,7 +17,10 @@
   because it lowered its inline limit since the policy was cached is no longer
   lost. The worker forgets the policy, rediscovers it, encodes the same report
   again (externalizing payloads the new limit requires) and resends it once.
-  A second refusal is handled as a genuinely too-large report.
+  A result that is still too large (refused again, above the upload limit, or
+  with no payload storage) no longer stops the worker: the attempt is failed
+  as a non-retryable `ActivityResultTooLarge` (`failure.type` and
+  `failure.class`), as in the PHP SDK, and the worker keeps running.
 
 - **BEHAVIOUR CHANGE: `Worker::recover_transient_outages` now defaults to
   `true`.** `run` and `run_until` keep running through transient Server
