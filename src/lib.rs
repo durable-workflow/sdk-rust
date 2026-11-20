@@ -23,6 +23,7 @@ mod replay_clock;
 mod run_activities;
 mod runtime_payloads;
 mod runtime_uploads;
+mod server_capabilities_digest;
 mod signal_with_start;
 mod sticky_worker;
 mod sticky_workflow_cache;
@@ -3491,6 +3492,9 @@ pub struct Client {
     signal_with_start_supported: Arc<AtomicBool>,
     activity_lease_discovery: Arc<activity_lease::Discovery>,
     activity_lease_authority: Option<Arc<activity_lease::authority::Authority>>,
+    /// server#1262: the newest capabilities digest learned from a tagged copy,
+    /// shared by this Client's clones.
+    capabilities_digest: server_capabilities_digest::Digest,
     #[cfg(feature = "telemetry")]
     execution_telemetry: Option<telemetry::ExecutionTelemetry>,
     #[cfg(feature = "telemetry")]
@@ -5592,6 +5596,16 @@ impl Client {
                 );
             }
         }
+        // server#1262: a worker request names the capabilities it holds, and
+        // its answer is restored against exactly that pair (captured here).
+        let capabilities = (!matches!(protocol, RequestProtocol::ControlPlane))
+            .then(|| self.capabilities_digest.capture());
+        if let Some(captured) = &capabilities {
+            request = request.header(
+                server_capabilities_digest::HEADER,
+                server_capabilities_digest::Digest::header(captured),
+            );
+        }
 
         if let Some(token) = auth_token {
             request = request.bearer_auth(token);
@@ -5684,6 +5698,19 @@ impl Client {
             {
                 Some(authority) => authority.protect(received).await?,
                 None => received.await?,
+            };
+            // Restore elided capabilities before any reader, success or error.
+            let bytes = match &capabilities {
+                Some(captured) => {
+                    match self
+                        .capabilities_digest
+                        .restore(status.as_u16(), &bytes, captured)?
+                    {
+                        Some(restored) => restored.into(),
+                        None => bytes,
+                    }
+                }
+                None => bytes,
             };
 
             if !status.is_success() {
@@ -6696,6 +6723,7 @@ impl ClientBuilder {
             update_outcome_reads_supported: Arc::new(AtomicBool::new(false)),
             signal_with_start_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
+            capabilities_digest: server_capabilities_digest::Digest::default(),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
             execution_telemetry: None,

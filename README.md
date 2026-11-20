@@ -296,6 +296,22 @@ Handlers run as async futures on Tokio and must yield. Use
 cancellation boundary. A concurrency setting does not provide CPU isolation or
 make blocking code cancellable.
 
+### Worker response size
+
+Every request sends `Accept-Encoding: gzip` and decodes compressed answers.
+Worker-plane requests also send `X-Durable-Workflow-Server-Capabilities-Digest`
+with the digest of the Server capabilities this Client already holds, or `none`.
+A Server that supports it (native Server 3.17 or later) then replaces each repeated
+`server_capabilities` object with that digest, or sends a full copy tagged with
+a `digest` member when the capabilities changed. The Client captures the
+digest and object when it sends each request and restores that request's
+answer before anything reads it, so readers always see the full object, even
+when requests overlap a rolling deploy. Clones share what they learned. An
+answer naming a digest that request did not send, and that the answer itself
+does not carry, is `Error::Protocol` with reason
+`server_capabilities_digest_unknown`. Older Servers ignore both headers and
+answer in full.
+
 ### Query execution authority
 
 On a runtime advertising `query_task_authority` with worker protocol 1.20,
