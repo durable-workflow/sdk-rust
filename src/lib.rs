@@ -5285,6 +5285,7 @@ impl Client {
             )
             .await?;
         let ready_age = metrics::ready_age_from_poll(&wire);
+        let lease_deadline = poll_lease_deadline(&wire, requested);
         let lease = activity_lease::authority::Lease::confirm(
             self, &wire, worker_id, task_queue, requested,
         )
@@ -5333,6 +5334,7 @@ impl Client {
         if let Some(task) = data.task.as_mut() {
             task.hydration_claim = claim;
             task.activity_lease = lease;
+            task.lease_deadline = lease_deadline;
             self.worker_dispatch_metrics
                 .ready_age("activity", task_queue, ready_age);
         }
@@ -6110,6 +6112,56 @@ fn activity_task_rejection_is_final(error: &Error) -> bool {
     )
 }
 
+/// Which activity outcome a settlement reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityReport {
+    Completed,
+    Failed,
+}
+
+/// How an activity settlement ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivitySettlement {
+    /// The Server recorded this report, possibly on an earlier copy.
+    Recorded,
+    /// The attempt was already closed by something else; nothing recorded.
+    Closed,
+    /// Transient failures outlasted the lease; the Server settles it.
+    LeaseEnded,
+}
+
+/// The Server's answer to a resent settlement whose first copy it already
+/// recorded. Native Server 3.17 answers a duplicate completion with
+/// `409 {"reason":"stale_attempt","recorded":false}` naming this task,
+/// attempt and owner with `activity_status`, `attempt_status` and
+/// `task_status` all `completed` (a failure: `attempt_status` `failed`). A
+/// `stale_attempt` in any other state is someone else's outcome.
+pub(crate) fn activity_report_already_recorded(
+    error: &Error,
+    report: ActivityReport,
+    task_id: &str,
+    attempt_id: &str,
+    owner: &str,
+) -> bool {
+    let Error::ActivityTaskRejected(rejection) = error else {
+        return false;
+    };
+    let body = &rejection.body;
+    let field = |name: &str| body.get(name).and_then(Value::as_str);
+    let own = rejection.status == 409
+        && rejection.reason == "stale_attempt"
+        && body.get("recorded").and_then(Value::as_bool) == Some(false)
+        && field("task_id") == Some(task_id)
+        && field("activity_attempt_id") == Some(attempt_id)
+        && field("lease_owner") == Some(owner);
+    own && match report {
+        ActivityReport::Completed => ["activity_status", "attempt_status", "task_status"]
+            .iter()
+            .all(|name| field(name) == Some("completed")),
+        ActivityReport::Failed => field("attempt_status") == Some("failed"),
+    }
+}
+
 /// A workflow-task report the server answered with a non-recorded receipt
 /// for exactly this task, attempt and run, which settles the managed tick:
 /// the run's terminal timeout (`run_timed_out` with `run_status=failed`), a
@@ -6314,7 +6366,7 @@ fn worker_operation_is_retryable(error: &Error) -> bool {
 /// whose reason is `storage_unavailable` or `backend_unavailable`; or any 5xx
 /// or 429 that says `retryable: true`. An explicit `retryable: false`, 401,
 /// 403 and every other protocol refusal stay fatal.
-fn worker_error_is_transient(error: &Error) -> bool {
+pub(crate) fn worker_error_is_transient(error: &Error) -> bool {
     let (status, body) = match error {
         Error::Timeout => return true,
         Error::Transport(error) => {
@@ -6342,10 +6394,22 @@ fn worker_error_is_transient(error: &Error) -> bool {
 
 /// The shared outage backoff: uniform in `[0, min(4 s, 0.25 s * 2^(n-1))]`
 /// for the n-th consecutive transient failure (n from 1).
-fn worker_outage_delay(failures: u32) -> Duration {
+pub(crate) fn worker_outage_delay(failures: u32) -> Duration {
     let ceiling = Duration::from_millis(250 << failures.saturating_sub(1).min(4));
     let (bits, _) = Uuid::new_v4().as_u64_pair();
     ceiling.mul_f64((bits >> 11) as f64 / (1_u64 << 53) as f64)
+}
+
+/// The delivered activity lease's end on the local clock, measured from when
+/// the poll was sent (`lease_expires_at - server_time`).
+fn poll_lease_deadline(
+    wire: &Value,
+    requested: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let parse = |value: &Value| DateTime::parse_from_rfc3339(value.as_str()?).ok();
+    let expires = parse(&wire["task"]["lease_expires_at"])?;
+    let server = parse(&wire["server_time"])?;
+    requested.checked_add((expires - server).to_std().ok()?)
 }
 
 fn worker_storage_admission_body(error: &Error) -> Option<Value> {
@@ -8346,6 +8410,13 @@ impl Worker {
     /// 403, other protocol refusals, codec and handler failures stop the worker
     /// with a `tracing` error event and are returned.
     ///
+    /// Activity completions, failures and `worker_lost` releases that hit a
+    /// transient are resent unchanged while the lease lasts; the Server's
+    /// answer to a copy it already recorded counts as recorded.
+    ///
+    /// Unlike the Python SDK, whose pollers retry 401 and 403 so credentials
+    /// can rotate, this worker (like PHP's) stops on them after logging.
+    ///
     /// Pass `false` to restore the bounded contract: the worker returns the
     /// error once the retry budget is spent. `run_once` always remains bounded.
     /// `max_retries = 0` disables retries, even when this option is enabled.
@@ -9991,6 +10062,7 @@ impl Worker {
             return self.settle_cooperative_activity(task, task_metrics).await;
         }
         let session = self.track_session_task(task.worker_session.as_ref())?;
+        let lease_deadline = task.lease_deadline;
         let invocation = task.invocation(session);
         let task = task.task;
 
@@ -10006,48 +10078,156 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
         let codec = task.payload_codec.clone();
         let result = self.execute_session_activity_task(task, invocation).await;
-        let task_outcome = if result.is_ok() {
+        let mut task_outcome = if result.is_ok() {
             "completed"
         } else if matches!(result, Err(Error::ActivityExecutionAbandoned(_))) {
             "expired"
         } else {
             "failed"
         };
-        match result {
-            Err(Error::ActivityExecutionAbandoned(_)) => {}
-            Err(error) if activity_hydration::stopped(&error) => {}
+        let settled = match result {
+            Err(Error::ActivityExecutionAbandoned(_)) => ActivitySettlement::Recorded,
+            Err(error) if activity_hydration::stopped(&error) => ActivitySettlement::Recorded,
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
-                let completion = self
-                    .client
-                    .complete_activity_task(&task_id, &attempt_id, &lease_owner, value, &codec)
-                    .await;
-                if let Err(error) = completion {
-                    if !activity_task_rejection_is_final(&error) {
-                        return Err(error);
-                    }
-                }
+                self.settle_activity_report(
+                    ActivityReport::Completed,
+                    &task_id,
+                    &attempt_id,
+                    &lease_owner,
+                    lease_deadline,
+                    || {
+                        self.client.complete_activity_task(
+                            &task_id,
+                            &attempt_id,
+                            &lease_owner,
+                            value.clone(),
+                            &codec,
+                        )
+                    },
+                )
+                .await?
             }
             Err(error) => {
-                let failure = self
-                    .client
-                    .fail_activity_task_with_error(
-                        &task_id,
-                        &attempt_id,
-                        &lease_owner,
-                        &ActivityError::from_error(&error, "RustActivityFailure"),
-                    )
-                    .await;
-                if let Err(error) = failure {
-                    if !activity_task_rejection_is_final(&error) {
-                        return Err(error);
-                    }
-                }
+                let failure = ActivityError::from_error(&error, "RustActivityFailure");
+                self.settle_activity_report(
+                    ActivityReport::Failed,
+                    &task_id,
+                    &attempt_id,
+                    &lease_owner,
+                    lease_deadline,
+                    || {
+                        self.client.fail_activity_task_with_error(
+                            &task_id,
+                            &attempt_id,
+                            &lease_owner,
+                            &failure,
+                        )
+                    },
+                )
+                .await?
             }
+        };
+        match settled {
+            ActivitySettlement::Recorded => {}
+            // A stale attempt someone else closed is not this worker's outcome.
+            ActivitySettlement::Closed if task_outcome == "completed" => task_outcome = "expired",
+            ActivitySettlement::Closed => {}
+            ActivitySettlement::LeaseEnded => task_outcome = "expired",
         }
 
         task_metrics.outcome(task_outcome);
         Ok(ManagedPollOutcome::Handled)
+    }
+
+    /// Send one activity settlement (complete or fail), resending the same
+    /// report after a transient failure with the shared jittered backoff while
+    /// the lease lasts. A maintained lease authority bounds this too: it ends
+    /// the publication when the claim is lost. The resend is idempotent: the
+    /// Server's answer to a copy it already recorded counts as recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn settle_activity_report<F, Fut>(
+        &self,
+        report: ActivityReport,
+        task_id: &str,
+        attempt_id: &str,
+        owner: &str,
+        lease_deadline: Option<tokio::time::Instant>,
+        mut send: F,
+    ) -> Result<ActivitySettlement>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        let mut failures = 0_u32;
+        loop {
+            let error = match send().await {
+                Ok(_) => return Ok(ActivitySettlement::Recorded),
+                Err(error)
+                    if activity_report_already_recorded(
+                        &error, report, task_id, attempt_id, owner,
+                    ) =>
+                {
+                    return Ok(ActivitySettlement::Recorded)
+                }
+                Err(error) if activity_task_rejection_is_final(&error) => {
+                    return Ok(ActivitySettlement::Closed)
+                }
+                Err(error) => error,
+            };
+            let stopping = self
+                .run_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst));
+            if !worker_error_is_transient(&error) || self.retry_policy.max_retries == 0 || stopping
+            {
+                return Err(error);
+            }
+            failures = failures.saturating_add(1);
+            let delay = worker_outage_delay(failures);
+            let lease_left = self
+                .client
+                .activity_lease_authority
+                .as_ref()
+                .and_then(|authority| authority.lease_left())
+                .or_else(|| {
+                    lease_deadline.map(|deadline| {
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    })
+                });
+            let out_of_time = match lease_left {
+                Some(left) => delay >= left,
+                // No known lease: keep the ordinary bounded budget.
+                None => failures as usize > self.retry_policy.max_retries,
+            };
+            if out_of_time {
+                tracing::error!(
+                    target: "durable_workflow::worker",
+                    worker_id = %self.worker_id,
+                    task_id,
+                    error = %error,
+                    "activity outcome not delivered before its lease ended; the Server settles the attempt"
+                );
+                return Ok(ActivitySettlement::LeaseEnded);
+            }
+            tracing::warn!(
+                target: "durable_workflow::worker",
+                worker_id = %self.worker_id,
+                task_id,
+                error = %error,
+                retry_in_ms = delay.as_millis() as u64,
+                "transient failure reporting an activity outcome; resending it"
+            );
+            match &self.run_stop {
+                Some(stop) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = wait_for_worker_stop(stop) => return Err(error),
+                    }
+                }
+                None => tokio::time::sleep(delay).await,
+            }
+        }
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {

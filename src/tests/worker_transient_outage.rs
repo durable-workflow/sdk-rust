@@ -195,3 +195,155 @@ fn outage_backoff_uses_full_jitter_up_to_four_seconds() {
             .any(|delay| *delay < Duration::from_millis(ceiling / 2)));
     }
 }
+
+const ACTIVITY_POLL: &str = "/api/worker/activity-tasks/poll";
+const COMPLETE: &str = "/api/worker/activity-tasks/retry-task/complete";
+
+fn stamp(after: Duration) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + after;
+    DateTime::from_timestamp(now.as_secs() as i64, now.subsec_nanos())
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+fn activity_delivery(lease: Duration) -> String {
+    json!({
+        "server_time": stamp(Duration::ZERO),
+        "task": {
+            "task_id":"retry-task","workflow_id":"retry-workflow","run_id":"retry-run",
+            "activity_execution_id":"retry-execution","activity_attempt_id":"retry-attempt",
+            "activity_type":"RetryActivity","attempt_number":1,"lease_owner":"retry-worker",
+            "task_queue":"rust-workers","payload_codec":"avro",
+            "lease_expires_at": stamp(lease),
+            "arguments": encode_value_envelope(&json!([]), DEFAULT_CODEC).unwrap(),
+        }
+    })
+    .to_string()
+}
+
+/// Native Server 3.17's answer to a resent completion it already recorded.
+fn duplicate_completion() -> String {
+    json!({"task_id":"retry-task","activity_attempt_id":"retry-attempt","outcome":"completed",
+        "recorded":false,"reason":"stale_attempt","next_task_id":null,"lease_owner":"retry-worker",
+        "activity_status":"completed","attempt_status":"completed","task_status":"completed",
+        "protocol_version":"1.20"})
+    .to_string()
+}
+
+fn committed_then_hidden(path: &str, _body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1) => Some(("200 OK", activity_delivery(Duration::from_secs(5)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        // The first completion is committed, but its answer is lost upstream.
+        (COMPLETE, 1) => Some(storage_unavailable()),
+        (COMPLETE, _) => Some(("409 Conflict", duplicate_completion())),
+        _ => None,
+    }
+}
+
+fn activity_worker(server: &MockWorkerServer) -> Worker {
+    let client = Client::builder(server.base_url()).build().expect("client");
+    let mut worker = Worker::new(client, "rust-workers")
+        .worker_id("retry-worker")
+        .retry_policy(WorkerRetryPolicy {
+            max_retries: 5,
+            initial_backoff: Duration::from_millis(2),
+            max_backoff: Duration::from_millis(5),
+        });
+    worker.register_activity("RetryActivity", |_ctx, _args| async { Ok(json!("done")) });
+    worker
+}
+
+#[tokio::test]
+async fn completion_lost_after_commit_is_resent_and_its_duplicate_counts_as_recorded() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(committed_then_hidden),
+        ..MockWorkerBehavior::default()
+    });
+    let outcome = activity_worker(&server).poll_activity_once().await;
+    assert!(
+        matches!(outcome, Ok(ManagedPollOutcome::Handled)),
+        "{outcome:?}"
+    );
+    let bodies = server.request_bodies(COMPLETE);
+    assert_eq!(bodies.len(), 2, "the same completion is resent once");
+    assert_eq!(bodies[0], bodies[1], "the resend is the identical report");
+}
+
+fn never_delivered(path: &str, _body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1) => Some(("200 OK", activity_delivery(Duration::from_millis(400)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (COMPLETE, _) => Some(storage_unavailable()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn completion_resends_stop_when_the_lease_ends() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(never_delivered),
+        ..MockWorkerBehavior::default()
+    });
+    let started = Instant::now();
+    let outcome = activity_worker(&server).poll_activity_once().await;
+    assert!(
+        matches!(outcome, Ok(ManagedPollOutcome::Handled)),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "bounded by the lease"
+    );
+    assert!(
+        server.request_count(COMPLETE) >= 2,
+        "resent while the lease lasted"
+    );
+}
+
+#[test]
+fn only_this_attempts_own_recorded_outcome_counts_as_a_duplicate() {
+    let rejection = |body: Value| {
+        Error::ActivityTaskRejected(ActivityTaskRejection {
+            operation: "complete".into(),
+            status: 409,
+            reason: body["reason"].as_str().unwrap_or_default().into(),
+            task_id: "retry-task".into(),
+            activity_attempt_id: "retry-attempt".into(),
+            cancel_requested: false,
+            can_continue: None,
+            run_closed_reason: None,
+            body,
+        })
+    };
+    let own: Value = serde_json::from_str(&duplicate_completion()).unwrap();
+    let check = |body: &Value, report| {
+        activity_report_already_recorded(
+            &rejection(body.clone()),
+            report,
+            "retry-task",
+            "retry-attempt",
+            "retry-worker",
+        )
+    };
+    assert!(check(&own, ActivityReport::Completed));
+    assert!(!check(&own, ActivityReport::Failed));
+    for (field, value) in [
+        ("activity_status", "expired"),
+        ("attempt_status", "failed"),
+        ("task_status", "cancelled"),
+        ("lease_owner", "another-worker"),
+        ("activity_attempt_id", "another-attempt"),
+    ] {
+        let mut other = own.clone();
+        other[field] = json!(value);
+        assert!(!check(&other, ActivityReport::Completed), "{field}={value}");
+    }
+    let mut recorded = own.clone();
+    recorded["recorded"] = json!(true);
+    assert!(!check(&recorded, ActivityReport::Completed));
+    let mut failed = own.clone();
+    failed["attempt_status"] = json!("failed");
+    failed["outcome"] = json!("failed");
+    assert!(check(&failed, ActivityReport::Failed));
+}

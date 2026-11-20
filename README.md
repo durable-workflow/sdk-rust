@@ -1131,12 +1131,28 @@ for the n-th consecutive failure, the schedule shared by every Durable Workflow
 SDK. Shutdown interrupts every wait and settles any poll response already in
 flight.
 
+An activity completion, failure or `worker_lost` release that hits a
+transient failure is resent unchanged with the same backoff while the
+activity's lease lasts (a maintained lease keeps being renewed meanwhile). If
+the Server had already committed the first copy, native Server 3.17 answers the
+resend with `409 {"reason":"stale_attempt","recorded":false}` naming this
+task, attempt and owner with every status `completed` (or `attempt_status`
+`failed` for a failure); the worker counts that as its own recorded outcome. A
+`stale_attempt` in any other state means the attempt was closed by something
+else. When the lease runs out first, the worker logs a `tracing` error and the
+Server settles the attempt.
+
 An explicit `retryable: false`, 401, 403 and other protocol refusals, codec
 and handler failures stop the worker: it emits a `tracing` error event and
 returns the error. `.recover_transient_outages(false)` restores bounded retries,
 `run_once` remains bounded in either mode, and
 `WorkerRetryPolicy.max_retries = 0` disables retries. Keep a process supervisor
 for crashes.
+
+Credential refusals differ between SDKs. The Rust and PHP workers stop on a
+401 or 403 after logging it as an error, so a supervisor restarts them with new
+credentials. The Python SDK's pollers keep retrying 401 and 403, logging an
+error on every refusal, so credentials can rotate under a running worker.
 
 ### Runnable examples
 
