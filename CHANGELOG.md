@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+- A timeout, transport error, 429 or 5xx on the activity lease renewal made
+  before the callback starts no longer drops the claimed task (#302, the Rust
+  side of sdk-php#445). Previously the Worker gave up on the claim without
+  completing, failing or releasing it, so the Server held the lease until it
+  expired and, with one attempt, failed the workflow. The callback now starts
+  under the poll's original grant, and lease maintenance retries the renewal
+  after a fully jittered wait, uniform in `[0, min(4 s, 0.25 s * 2^n)]` after
+  the n-th consecutive failure, the same schedule as the other SDKs. Each
+  attempt spends at most half of the remaining grant. A delivered lease is now
+  measured from the poll's start rather than its reply. A refusal or a changed
+  claim identity still ends the claim before the callback starts. Recorded
+  history and replay are unchanged.
+- A claim whose renewal does not recover is now released explicitly instead of
+  held silently until the lease expires. The Worker keeps a reserve at the end
+  of the lease (at most 10 s and at most a fifth of the grant). Once renewal
+  has failed and only that reserve is left, at start or later, it drops the
+  callback future. Only after the callback has confirmed stopped, and only
+  while more than a margin of the lease (at most 1 s) is left, it fails the
+  attempt with `failure.type` `worker_lost`, `failure.class`
+  `ActivityWorkerLost`, `non_retryable: false` and a message naming the local
+  cause. A callback that blocks past that point is not released; the Server
+  records `lease_expired`, so one attempt never runs twice. The Server's retry
+  policy then acts at once, and `worker_lost` can be listed in
+  `non_retryable_error_types`. A Server refusal such as `lease_expired`, as
+  well as expiry and Worker shutdown, still ends the claim without a report.
+  The default retry policy is unchanged.
+- `ActivityFailure::lease_loss_reason()` returns a `LeaseLossReason`
+  (`LeaseExpired`, `WorkerDeregistered` or `WorkerLost`, with `as_str()` giving
+  `lease_expired`, `worker_deregistered` or `worker_lost`; the enum is
+  `#[non_exhaustive]`) when an attempt lost its worker, and `None` otherwise.
+  `WorkerLost` is a Worker release (`exception_type` `worker_lost`). For a
+  lease the Server settled (`ActivityLeaseExpiredException`) it is the
+  Server's recorded `failure_reason`, `LeaseExpired` by default. The Server
+  records that reason beside the exception, so replay now copies it into
+  `ActivityFailure::exception` as `failure_reason`, creating a minimal
+  `{class, failure_reason}` descriptor when the event recorded no exception.
+  No existing type changes.
+
 ## 4.21.0
 
 - `Client::signal_with_start` starts a workflow or reuses its open run and

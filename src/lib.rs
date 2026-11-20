@@ -1562,6 +1562,72 @@ pub struct ActivityFailure {
     pub exception: Option<Value>,
 }
 
+/// Why an activity attempt lost its worker. See [`ActivityFailure::lease_loss_reason`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LeaseLossReason {
+    /// The Server settled the attempt because its lease expired.
+    LeaseExpired,
+    /// The Server settled the attempt because its worker deregistered. Only
+    /// reported when the recorded exception carries that `failure_reason`.
+    WorkerDeregistered,
+    /// The worker released the attempt because it could not renew the lease.
+    WorkerLost,
+}
+
+impl LeaseLossReason {
+    /// The stable wire name: `lease_expired`, `worker_deregistered` or `worker_lost`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseExpired => "lease_expired",
+            Self::WorkerDeregistered => "worker_deregistered",
+            Self::WorkerLost => "worker_lost",
+        }
+    }
+}
+
+impl std::fmt::Display for LeaseLossReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `exception_class` the Server records when it settles a lost activity lease.
+const ACTIVITY_LEASE_EXPIRED_CLASS: &str =
+    "Workflow\\V2\\Exceptions\\ActivityLeaseExpiredException";
+
+impl ActivityFailure {
+    /// Why the attempt lost its worker, or `None` when it failed for another
+    /// reason.
+    ///
+    /// `WorkerLost` means a worker released the attempt (`exception_type`
+    /// `worker_lost`) because it could not keep the lease. A lease the Server
+    /// settled (`ActivityLeaseExpiredException`) reports the Server's recorded
+    /// `failure_reason`: `WorkerDeregistered`, or `LeaseExpired` by default.
+    /// The Server records that reason beside the exception in the history
+    /// payload; replay copies it into `exception.failure_reason`, so this
+    /// works without a new field. Whether to retry is the retry policy's
+    /// choice; the default policy is unchanged.
+    pub fn lease_loss_reason(&self) -> Option<LeaseLossReason> {
+        if self.exception_type.as_deref() == Some(activity_lease::authority::WORKER_LOST_TYPE) {
+            return Some(LeaseLossReason::WorkerLost);
+        }
+        if self.exception_class.as_deref() != Some(ACTIVITY_LEASE_EXPIRED_CLASS) {
+            return None;
+        }
+        let recorded = self.exception.as_ref().and_then(|exception| {
+            exception
+                .get("failure_reason")
+                .or_else(|| exception.get("properties")?.get("failure_reason"))
+                .and_then(Value::as_str)
+        });
+        Some(match recorded {
+            Some("worker_deregistered") => LeaseLossReason::WorkerDeregistered,
+            _ => LeaseLossReason::LeaseExpired,
+        })
+    }
+}
+
 /// Stable terminal categories returned when an awaited child does not succeed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildWorkflowFailureKind {
@@ -5207,6 +5273,8 @@ impl Client {
             "poll_request_id": poll_request_id,
             "timeout_seconds": long_poll_timeout_seconds(timeout),
         });
+        // A delivered lease is measured from the poll's start, not its reply.
+        let requested = tokio::time::Instant::now();
         let mut wire: Value = self
             .poll_request_json_unresolved(
                 "/worker/activity-tasks/poll",
@@ -5217,8 +5285,10 @@ impl Client {
             )
             .await?;
         let ready_age = metrics::ready_age_from_poll(&wire);
-        let lease =
-            activity_lease::authority::Lease::confirm(self, &wire, worker_id, task_queue).await?;
+        let lease = activity_lease::authority::Lease::confirm(
+            self, &wire, worker_id, task_queue, requested,
+        )
+        .await?;
         let observed = self.with_activity_lease_authority(
             lease.as_ref().map(|lease| Arc::clone(&lease.authority)),
         );
@@ -5249,7 +5319,13 @@ impl Client {
             Ok(data)
         };
         let mut data: worker_session::SessionPollResponse = match lease.as_ref() {
-            Some(lease) => lease.authority.protect(loading).await?,
+            Some(lease) => match lease.authority.protect(loading).await {
+                Ok(data) => data,
+                Err(error) => {
+                    lease.settle_release().await;
+                    return Err(error);
+                }
+            },
             None => {
                 activity_hydration::HydrationClaim::protect(claim.as_ref(), self, loading).await?
             }
@@ -9830,6 +9906,9 @@ impl Worker {
         };
         match result {
             Err(Error::ActivityExecutionAbandoned(_)) => {
+                if let Some(lease) = &lease {
+                    lease.settle_release().await;
+                }
                 task_metrics.outcome("expired");
                 Ok(ManagedPollOutcome::Handled)
             }
@@ -19407,10 +19486,31 @@ fn activity_outcome(
         ),
         _ => unreachable!("activity_outcome is called only for terminal activity events"),
     };
-    let exception = payload
+    let mut exception = payload
         .get("exception")
         .filter(|value| !value.is_null())
         .cloned();
+    // A Server-settled lease loss records `failure_reason` beside the
+    // exception. Carry it in the exception descriptor so that
+    // `ActivityFailure::lease_loss_reason` can read it without a new field.
+    if payload_string(payload, "exception_class").as_deref() == Some(ACTIVITY_LEASE_EXPIRED_CLASS) {
+        if let Some(reason) = payload_string(payload, "failure_reason") {
+            match &mut exception {
+                Some(Value::Object(fields)) => {
+                    fields
+                        .entry("failure_reason")
+                        .or_insert_with(|| json!(reason));
+                }
+                None => {
+                    exception = Some(json!({
+                        "class": ACTIVITY_LEASE_EXPIRED_CLASS,
+                        "failure_reason": reason,
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+    }
     let failure_category = payload_string(payload, "failure_category");
     let timeout_kind = payload_string(payload, "timeout_kind");
     let reason = payload_string(payload, "reason").unwrap_or_else(|| match kind {

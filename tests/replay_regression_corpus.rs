@@ -558,6 +558,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.run-closed-selection"
             | "corpus.run-closed-all-failure"
             | "corpus.signal-external"
+            | "corpus.activity-lease-loss"
     ) {
         return Err(format!(
             "replay fixture {fixture_id} has no registered Rust workflow {workflow_type:?}"
@@ -1052,6 +1053,19 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                 )
                 .await?;
                 Ok(json!("unreachable"))
+            });
+        }
+        "corpus.activity-lease-loss" => {
+            // A recorded lease loss replays its typed reason from history.
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                match ctx.activity("corpus.lease-loss.activity", json!([])).await {
+                    Err(Error::ActivityFailed(failure)) => Ok(json!(failure
+                        .lease_loss_reason()
+                        .map(|reason| reason.as_str()))),
+                    other => Err(Error::WorkerLoop(format!(
+                        "expected a recorded activity failure, got {other:?}"
+                    ))),
+                }
             });
         }
         "corpus.redrive-boundary" => {
