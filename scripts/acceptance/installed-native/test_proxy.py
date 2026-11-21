@@ -11,6 +11,7 @@ class ForwardableHeadersTest(unittest.TestCase):
     def test_relays_only_the_reviewed_set(self):
         relayed = forwardable_headers([
             ('Content-Type', 'application/json'),
+            ('Content-Encoding', 'gzip'),
             ('X-Durable-Workflow-Protocol-Version', '1.20'),
             ('Retry-After', '1'),
             ('Connection', 'keep-alive'),
@@ -22,6 +23,7 @@ class ForwardableHeadersTest(unittest.TestCase):
         ])
         self.assertEqual(relayed, [
             ('Content-Type', 'application/json'),
+            ('Content-Encoding', 'gzip'),
             ('X-Durable-Workflow-Protocol-Version', '1.20'),
             ('Retry-After', '1'),
         ])
@@ -31,6 +33,7 @@ class ForwardableHeadersTest(unittest.TestCase):
         # this set needs review; request-only names such as
         # x-durable-workflow-payload-completion must not be relayed.
         self.assertEqual(frozenset(FORWARDED_HEADERS), frozenset((
+            'content-encoding',
             'content-type',
             'retry-after',
             'x-durable-workflow-control-plane-version',
