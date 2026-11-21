@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 4.22.0
+
 - A failed cluster-info read no longer stops a running worker. Startup
   discovery (query-task authority, Nexus cooperation) and the inline-payload
   policy read before a report retry a connection failure, timeout, 5xx or 429
