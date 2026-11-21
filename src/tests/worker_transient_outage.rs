@@ -670,6 +670,23 @@ fn too_large_refusal() -> (&'static str, String) {
     )
 }
 
+#[test]
+fn only_a_typed_size_refusal_allows_reencoding_a_report() {
+    let (_, typed_body) = too_large_refusal();
+    assert!(crate::report_payload_too_large(
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        &typed_body,
+    ));
+    assert!(!crate::report_payload_too_large(
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "Proxy rejected the request",
+    ));
+    assert!(!crate::report_payload_too_large(
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        &typed_body,
+    ));
+}
+
 fn still_too_large(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
     match (path, number) {
         (ACTIVITY_POLL, 1 | 2) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),

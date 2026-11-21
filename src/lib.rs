@@ -6917,10 +6917,10 @@ fn is_task_report(path: &str) -> bool {
         && (path.ends_with("/complete") || path.ends_with("/fail"))
 }
 
-/// The Server refused a report as larger than its current limit.
+/// The Server refused the report's size before reading its body.
 fn report_payload_too_large(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
-        || serde_json::from_str::<Value>(body)
+        && serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|body| body.get("reason")?.as_str().map(str::to_owned))
             .is_some_and(|reason| reason == "payload_too_large")
@@ -6936,7 +6936,7 @@ pub(crate) const ACTIVITY_RESULT_TOO_LARGE: &str = "ActivityResultTooLarge";
 fn activity_result_too_large(error: &Error) -> bool {
     match error {
         Error::ActivityTaskRejected(rejection) => {
-            rejection.status == 413 || rejection.reason == "payload_too_large"
+            rejection.status == 413 && rejection.reason == "payload_too_large"
         }
         Error::Codec(message) => [
             "external_payload_oversized:",
