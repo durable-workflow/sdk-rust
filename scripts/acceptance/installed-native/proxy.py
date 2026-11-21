@@ -5,13 +5,14 @@ It records every workflow-task /complete and /fail acknowledgement to
 is held for that many seconds before forwarding, unchanged, so a run or
 execution deadline passes while the worker waits for the receipt.
 """
-import http.client, http.server, json, pathlib, re, threading, time
+import gzip, http.client, http.server, json, pathlib, re, threading, time
 
 state = pathlib.Path('/state')
 lock = threading.Lock()
 
 # Response headers the SDK reads from the native Server; anything else is dropped.
 FORWARDED_HEADERS = {
+    'content-encoding': 'Content-Encoding',
     'content-type': 'Content-Type',
     'retry-after': 'Retry-After',
     'x-durable-workflow-control-plane-version': 'X-Durable-Workflow-Control-Plane-Version',
@@ -65,20 +66,24 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'connection')}
         connection.request(self.command, self.path, body=raw, headers=headers)
         response = connection.getresponse()
+        response_headers = forwardable_headers(response.getheaders())
         body = response.read()
         if self.path.endswith(('/fail', '/complete')) and '/workflow-tasks/' in self.path:
+            receipt = body
+            if response.getheader('Content-Encoding', '').strip().lower() == 'gzip':
+                receipt = gzip.decompress(body)
             event = {
                 'time': time.time(), 'path': self.path, 'status': response.status,
                 'delay_seconds': delayed,
                 'request_attempt': request.get('workflow_task_attempt'),
                 'failure_type': request.get('failure', {}).get('type'),
-                'response': {k: v for k, v in json.loads(body).items() if k != 'server_capabilities'},
+                'response': {k: v for k, v in json.loads(receipt).items() if k != 'server_capabilities'},
             }
             with lock:
                 with (state / 'acks.jsonl').open('a') as log:
                     log.write(json.dumps(event) + '\n')
         self.send_response(response.status)
-        for key, value in forwardable_headers(response.getheaders()):
+        for key, value in response_headers:
             self.send_header(key, value)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Connection', 'close')
