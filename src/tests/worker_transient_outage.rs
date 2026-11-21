@@ -416,3 +416,334 @@ fn a_continuing_outage_escalates_to_error_at_one_minute_then_every_five() {
     assert_eq!(outage.log.failed(at(759)), None);
     assert_eq!(outage.log.failed(at(760)), Some(Duration::from_secs(60)));
 }
+
+const CLUSTER_INFO: &str = "/api/cluster/info";
+
+fn cluster_info_down_twice(
+    path: &str,
+    body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (CLUSTER_INFO, 1) => Some(("500 Internal Server Error", "upstream exploded".into())),
+        // Request 2 is dropped without a reply (see `refused_second`).
+        (CLUSTER_INFO, _) => Some((
+            "200 OK",
+            json!({"worker_protocol":{"server_capabilities":{"query_task_authority":true}}})
+                .to_string(),
+        )),
+        ("/api/worker/register", _) => {
+            let request: Value = serde_json::from_str(body).unwrap();
+            Some((
+                "200 OK",
+                json!({"registered":true,"worker_id":request["worker_id"],
+                    "heartbeat_interval_seconds":3600,"protocol_version":"1.20",
+                    "server_capabilities":{"query_task_authority":true}})
+                .to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn refused_second(path: &str, number: usize) -> bool {
+    path == CLUSTER_INFO && number == 2
+}
+
+#[tokio::test]
+async fn startup_cluster_info_failures_are_waited_out() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(cluster_info_down_twice),
+        drop_request: Some(refused_second),
+        ..MockWorkerBehavior::default()
+    });
+    let mut worker = worker(&server).require_query_task_authority(true);
+    worker.register_query("counter", "current", |_ctx, _args| async move {
+        Ok(Value::Null)
+    });
+    let polling = async {
+        while server.request_count(WORKFLOW_POLL) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), worker.run_until(polling))
+        .await
+        .expect("startup must get past the outage")
+        .expect("a cluster-info outage must not stop the worker");
+    assert_eq!(server.request_count(CLUSTER_INFO), 3);
+    assert_eq!(server.request_count("/api/worker/register"), 1);
+}
+
+fn completion_discovery_down_twice(
+    path: &str,
+    _body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (CLUSTER_INFO, 1) => Some(("500 Internal Server Error", "upstream exploded".into())),
+        (CLUSTER_INFO, _) => Some(("200 OK", json!({}).to_string())),
+        (COMPLETE, _) => Some(("200 OK", json!({"recorded":true}).to_string())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn run_time_cluster_info_failures_are_waited_out() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(completion_discovery_down_twice),
+        drop_request: Some(refused_second),
+        concurrent_requests: true,
+        ..MockWorkerBehavior::default()
+    });
+    let worker = activity_worker(&server)
+        .max_concurrent_activity_tasks(1)
+        .poll_timeout(Duration::from_millis(10));
+    let completed = async {
+        while server.request_count(COMPLETE) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), worker.run_until(completed))
+        .await
+        .expect("the completion must get past the outage")
+        .expect("a cluster-info outage must not stop the worker");
+    assert_eq!(server.request_count(CLUSTER_INFO), 3);
+    assert_eq!(server.request_count(COMPLETE), 1);
+}
+
+#[test]
+fn cluster_info_failures_other_than_refusals_are_transient() {
+    let http = |status: u16, body: &str| Error::Http {
+        status: reqwest::StatusCode::from_u16(status).unwrap(),
+        body: body.to_owned(),
+    };
+    assert!(cluster_info_failure_is_transient(&http(
+        500,
+        "upstream exploded"
+    )));
+    assert!(cluster_info_failure_is_transient(&http(503, "")));
+    assert!(cluster_info_failure_is_transient(&http(429, "{}")));
+    assert!(cluster_info_failure_is_transient(&Error::Timeout));
+    assert!(!cluster_info_failure_is_transient(&http(
+        500,
+        r#"{"retryable":false}"#
+    )));
+    assert!(!cluster_info_failure_is_transient(&http(401, "")));
+    assert!(!cluster_info_failure_is_transient(&http(404, "")));
+}
+
+const UPLOAD: &str = "/api/external-payloads/v1";
+
+fn payload_policy(threshold: usize) -> String {
+    let mut policy = super::runtime_uploads::policy();
+    policy["limits"]["max_payload_bytes"] = json!(4 * 1024 * 1024);
+    let storage = &mut policy["namespace"]["external_payload_storage"];
+    storage["threshold_bytes"] = json!(threshold);
+    storage["transport"]["limits"]["max_payload_bytes"] = json!(8 * 1024 * 1024);
+    policy.to_string()
+}
+
+fn uploaded(blob: &str) -> String {
+    json!({"schema":"durable-workflow.v2.runtime-external-payload-upload.v1",
+        "transport_version":1, "reference":super::runtime_uploads::reference(blob)})
+    .to_string()
+}
+
+fn sized_worker(server: &MockWorkerServer) -> Worker {
+    let client = Client::builder(server.base_url()).build().expect("client");
+    let mut worker = Worker::new(client, "rust-workers")
+        .worker_id("retry-worker")
+        .retry_policy(WorkerRetryPolicy {
+            max_retries: 5,
+            initial_backoff: Duration::from_millis(2),
+            max_backoff: Duration::from_millis(5),
+        });
+    let calls = Arc::new(AtomicUsize::new(0));
+    worker.register_activity("RetryActivity", move |_ctx, _args| {
+        let call = calls.fetch_add(1, Ordering::SeqCst);
+        async move {
+            Ok(if call == 0 {
+                json!("small")
+            } else {
+                json!("x".repeat(500_000))
+            })
+        }
+    });
+    worker
+}
+
+fn lowered_limit(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1 | 2) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        // Cached at 2 MB; the Server then lowers its inline limit to 100 KB.
+        (CLUSTER_INFO, 1) => Some(("200 OK", payload_policy(2 * 1024 * 1024))),
+        (CLUSTER_INFO, _) => Some(("200 OK", payload_policy(100 * 1024))),
+        (UPLOAD, _) => Some(("201 Created", uploaded(body))),
+        // The large result sent inline under the stale policy is refused.
+        (COMPLETE, 2) => Some((
+            "413 Payload Too Large",
+            json!({"reason":"payload_too_large","message":"request exceeds 100 KB"}).to_string(),
+        )),
+        (COMPLETE, _) => Some(("200 OK", json!({"recorded":true}).to_string())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_report_refused_after_a_lowered_limit_is_externalized_and_resent_once() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(lowered_limit),
+        ..MockWorkerBehavior::default()
+    });
+    let worker = sized_worker(&server);
+    for _ in 0..2 {
+        let outcome = worker.poll_activity_once().await;
+        assert!(
+            matches!(outcome, Ok(ManagedPollOutcome::Handled)),
+            "{outcome:?}"
+        );
+    }
+    let completes = server.request_bodies(COMPLETE);
+    assert_eq!(completes.len(), 3, "small, refused large, re-encoded large");
+    assert!(
+        completes[1]["result"].to_string().len() > 500_000,
+        "first sent inline"
+    );
+    assert_eq!(
+        completes[2]["result"]["external_payload"]["schema"],
+        crate::runtime_payloads::SCHEMA,
+        "resent with the payload externalized: {}",
+        completes[2]["result"]
+    );
+    assert_eq!(server.request_count(UPLOAD), 1);
+    assert_eq!(server.request_count(CLUSTER_INFO), 2, "rediscovered once");
+}
+
+fn policy_then_outage(path: &str, _body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1..=3) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (CLUSTER_INFO, 1) => Some(("200 OK", payload_policy(2 * 1024 * 1024))),
+        (CLUSTER_INFO, _) => Some(("500 Internal Server Error", "upstream exploded".into())),
+        (COMPLETE, _) => Some(("200 OK", json!({"recorded":true}).to_string())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn an_expired_policy_keeps_reports_moving_through_a_cluster_info_outage() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(policy_then_outage),
+        ..MockWorkerBehavior::default()
+    });
+    let worker = activity_worker(&server);
+    worker.poll_activity_once().await.unwrap();
+    assert_eq!(server.request_count(CLUSTER_INFO), 1);
+    // Age the cached policy past its 60 s lifetime.
+    {
+        let mut cache = worker.client.runtime_upload_policy.lock().unwrap();
+        for entry in cache.iter_mut().flatten() {
+            entry.0 = std::time::Instant::now() - Duration::from_secs(61);
+        }
+    }
+    let started = Instant::now();
+    worker.poll_activity_once().await.unwrap();
+    worker.poll_activity_once().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "reports did not wait for the outage"
+    );
+    assert_eq!(server.request_count(COMPLETE), 3, "every report was sent");
+    // One refresh attempt, then the last-known policy for the next 10 s.
+    assert_eq!(server.request_count(CLUSTER_INFO), 2);
+}
+
+const FAIL: &str = "/api/worker/activity-tasks/retry-task/fail";
+
+fn too_large_refusal() -> (&'static str, String) {
+    (
+        "413 Payload Too Large",
+        json!({"reason":"payload_too_large","message":"request exceeds the limit"}).to_string(),
+    )
+}
+
+#[test]
+fn only_a_typed_size_refusal_allows_reencoding_a_report() {
+    let (_, typed_body) = too_large_refusal();
+    assert!(crate::report_payload_too_large(
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        &typed_body,
+    ));
+    assert!(!crate::report_payload_too_large(
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "Proxy rejected the request",
+    ));
+    assert!(!crate::report_payload_too_large(
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        &typed_body,
+    ));
+}
+
+fn still_too_large(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (ACTIVITY_POLL, 1 | 2) => Some(("200 OK", activity_delivery(Duration::from_secs(30)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (CLUSTER_INFO, 1) => Some(("200 OK", payload_policy(2 * 1024 * 1024))),
+        (CLUSTER_INFO, _) => Some(("200 OK", payload_policy(100 * 1024))),
+        (UPLOAD, _) => Some(("201 Created", uploaded(body))),
+        // Refused inline, and refused again after it was re-encoded.
+        (COMPLETE, 2 | 3) => Some(too_large_refusal()),
+        (COMPLETE, _) | (FAIL, _) => Some(("200 OK", json!({"recorded":true}).to_string())),
+        _ => None,
+    }
+}
+
+fn no_storage_after_rediscovery(
+    path: &str,
+    body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (CLUSTER_INFO, 2..) => {
+            let mut policy: Value = serde_json::from_str(&payload_policy(100 * 1024)).unwrap();
+            policy["namespace"]["external_payload_storage"]["status"] = json!("unavailable");
+            Some(("200 OK", policy.to_string()))
+        }
+        (COMPLETE, 2) => Some(too_large_refusal()),
+        _ => still_too_large(path, body, number),
+    }
+}
+
+#[tokio::test]
+async fn a_result_still_too_large_after_rediscovery_fails_the_attempt_not_the_worker() {
+    for (case, handler) in [
+        ("refused again", still_too_large as RequestOverride),
+        ("no storage", no_storage_after_rediscovery),
+    ] {
+        let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+            request_override: Some(handler),
+            ..MockWorkerBehavior::default()
+        });
+        let worker = sized_worker(&server);
+        for _ in 0..2 {
+            let outcome = worker.poll_activity_once().await;
+            assert!(
+                matches!(outcome, Ok(ManagedPollOutcome::Handled)),
+                "{case}: the worker keeps running: {outcome:?}"
+            );
+        }
+        let failures = server.request_bodies(FAIL);
+        assert_eq!(failures.len(), 1, "{case}");
+        let failure = &failures[0]["failure"];
+        assert_eq!(failure["type"], "ActivityResultTooLarge", "{case}");
+        assert_eq!(failure["class"], "ActivityResultTooLarge", "{case}");
+        assert_eq!(failure["non_retryable"], true, "{case}");
+        assert!(
+            failure["message"].as_str().unwrap().contains("too large"),
+            "{case}"
+        );
+    }
+}

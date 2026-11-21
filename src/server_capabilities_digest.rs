@@ -32,6 +32,15 @@ pub(crate) struct Pair {
 /// The pair a request was sent with (`None` before any tagged copy).
 pub(crate) type Captured = Option<Pair>;
 
+/// What replaces a digest string that matches nothing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fallback<'a> {
+    /// Full capabilities read separately (from cluster info).
+    Capabilities(&'a Map<String, Value>),
+    /// Remove the field: the answer is used without its capabilities.
+    Drop,
+}
+
 /// The newest pair this Client learned, shared by its clones.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Digest(Arc<Mutex<Option<Pair>>>);
@@ -65,6 +74,19 @@ impl Digest {
         bytes: &[u8],
         captured: &Captured,
     ) -> Result<Option<Vec<u8>>, Error> {
+        self.restore_with(status, bytes, captured, None)
+    }
+
+    /// Like [`Digest::restore`], but a digest string that matches nothing is
+    /// replaced by `fallback`: full capabilities read separately (from
+    /// cluster info) for an answer that must not be requested again.
+    pub(crate) fn restore_with(
+        &self,
+        status: u16,
+        bytes: &[u8],
+        captured: &Captured,
+        fallback: Option<Fallback<'_>>,
+    ) -> Result<Option<Vec<u8>>, Error> {
         if !contains(bytes, FIELD.as_bytes()) {
             return Ok(None);
         }
@@ -75,7 +97,7 @@ impl Digest {
         let mut learned = None;
         collect_tagged(&mut answer, 1, &mut learned);
         let mut changed = learned.is_some();
-        if let Err(digest) = replace(&mut answer, 1, captured, &learned, &mut changed) {
+        if let Err(digest) = replace(&mut answer, 1, captured, &learned, fallback, &mut changed) {
             return Err(Error::Protocol(ProtocolFailure {
                 status,
                 reason: "server_capabilities_digest_unknown".to_owned(),
@@ -141,8 +163,10 @@ fn replace(
     depth: usize,
     captured: &Captured,
     learned: &Option<Pair>,
+    fallback: Option<Fallback<'_>>,
     changed: &mut bool,
 ) -> Result<(), String> {
+    let mut dropped = false;
     for (key, value) in answer.iter_mut() {
         if key == FIELD {
             let Value::String(digest) = value else {
@@ -151,18 +175,27 @@ fn replace(
             if !digest.starts_with(PREFIX) {
                 continue;
             }
-            let pair = [captured.as_ref(), learned.as_ref()]
+            let known = [captured.as_ref(), learned.as_ref()]
                 .into_iter()
                 .flatten()
                 .find(|pair| pair.digest == *digest)
-                .ok_or_else(|| digest.clone())?;
-            *value = Value::Object((*pair.capabilities).clone());
+                .map(|pair| &*pair.capabilities);
+            match (known, fallback) {
+                (Some(capabilities), _) | (None, Some(Fallback::Capabilities(capabilities))) => {
+                    *value = Value::Object(capabilities.clone());
+                }
+                (None, Some(Fallback::Drop)) => dropped = true,
+                (None, None) => return Err(digest.clone()),
+            }
             *changed = true;
         } else if depth < MAX_DEPTH {
             if let Value::Object(nested) = value {
-                replace(nested, depth + 1, captured, learned, changed)?;
+                replace(nested, depth + 1, captured, learned, fallback, changed)?;
             }
         }
+    }
+    if dropped {
+        answer.remove(FIELD);
     }
     Ok(())
 }

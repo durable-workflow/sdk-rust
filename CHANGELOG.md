@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- A failed cluster-info read no longer stops a running worker. Startup
+  discovery (query-task authority, Nexus cooperation) and the inline-payload
+  policy read before a report retry a connection failure, timeout, 5xx or 429
+  with the shared jittered backoff, uniform in `[0, min(4 s, 0.25 s *
+  2^(n-1))]`, logging a `tracing` ERROR once the outage has lasted 60 s and
+  every 5 minutes after, until it succeeds or the worker stops. An explicit
+  `retryable: false`, 401, 403 and other refusals are still returned.
+  `Client::cluster_info` and Clients outside a running worker make one attempt.
+  When the cached payload policy (refreshed every 60 s) expires during such an
+  outage, reports keep using the last-known policy and discovery is tried
+  again 10 s later; only a worker that has no policy yet waits.
+- An activity report the Server refuses as too large (413 `payload_too_large`)
+  because it lowered its inline limit since the policy was cached is no longer
+  lost. The worker forgets the policy, rediscovers it, encodes the same report
+  again (externalizing payloads the new limit requires) and resends it once.
+  A result that is still too large (refused again, above the upload limit, or
+  with no payload storage) no longer stops the worker: the attempt is failed
+  as a non-retryable `ActivityResultTooLarge` (`failure.type` and
+  `failure.class`), as in the PHP SDK, and the worker keeps running.
+
 - **BEHAVIOUR CHANGE: `Worker::recover_transient_outages` now defaults to
   `true`.** `run` and `run_until` keep running through transient Server
   outages instead of returning the error once `WorkerRetryPolicy.max_retries`
@@ -90,11 +110,16 @@
   used for later requests, so overlapping requests across a rolling deploy each
   restore their own capabilities. A digest string that matches neither the
   request's digest nor a tagged copy in the same answer makes the Client
-  forget its held digest and resend that same request once with `none`; a
-  resent report the Server already committed comes back as its usual
-  non-recorded receipt (for an activity completion, `409 stale_attempt`), which
-  the worker settles as before. Only an unknown digest on the resend is
-  `Error::Protocol` with reason `server_capabilities_digest_unknown`.
+  forget its held digest. Only a task poll, idempotent by its poll request ID,
+  is resent once with `none`. Any other request (a completion, failure,
+  heartbeat, start or signal) is never resent: its answer is kept as received,
+  because a completion's answer can carry the next leased task, and the full
+  capabilities are read with `GET /api/cluster/info`
+  (`worker_protocol.server_capabilities`) and put in place of the unknown
+  digest. If that read fails, the answer is still used without the field and
+  later requests learn the capabilities again; the request never fails. A
+  poll whose resend names an unknown digest again is `Error::Protocol` with
+  reason `server_capabilities_digest_unknown`.
   Decoded response bodies are capped at 128 MiB by default
   (`ClientBuilder::max_response_bytes`); a larger body stops being read and
   fails with the new `Error::ResponseBodyTooLarge`, so a small gzip answer

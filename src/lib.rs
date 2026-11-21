@@ -3566,6 +3566,44 @@ impl Client {
         .await
     }
 
+    /// Run a read-only cluster-info discovery. For a running worker, a
+    /// transient failure is retried with the shared jittered backoff (an
+    /// outage logged as ERROR after 60 s, then every 5 minutes) until it
+    /// succeeds or the worker stops; elsewhere it is one attempt.
+    pub(crate) async fn retry_cluster_info<T, F, Fut>(&self, mut read: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let Some(admission) = self.worker_storage_admission.as_ref() else {
+            return read().await;
+        };
+        let mut failures = 0_u32;
+        let mut outage = OutageLog::default();
+        loop {
+            let error = match read().await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            if !cluster_info_failure_is_transient(&error) || admission.stop.load(Ordering::SeqCst) {
+                return Err(error);
+            }
+            failures = failures.saturating_add(1);
+            outage.report("", "", &error);
+            let delay = worker_outage_delay(failures);
+            tracing::warn!(
+                target: "durable_workflow::worker",
+                error = %error,
+                retry_in_ms = delay.as_millis() as u64,
+                "cluster info unavailable; retrying"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = wait_for_worker_stop(&admission.stop) => return Err(error),
+            }
+        }
+    }
+
     pub async fn cluster_info(&self) -> Result<Value> {
         let discovery: Value = self
             .request_json(
@@ -5621,6 +5659,10 @@ impl Client {
             request = request.bearer_auth(token);
         }
 
+        // A task report before externalization, kept so it can be encoded
+        // again (once) if the Server refuses it as too large for a policy
+        // that changed since it was cached.
+        let mut unexternalized: Option<Value> = None;
         if let Some(body) = body {
             let mut body = serde_json::to_value(body)?;
             self.check_activity_lease_request(path, Some(&body))?;
@@ -5640,6 +5682,9 @@ impl Client {
                 reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
             ) {
                 self.check_activity_lease_request(path, Some(&body))?;
+                if report.is_none() && is_task_report(path) {
+                    unexternalized = Some(body.clone());
+                }
                 self.externalize_runtime_payloads(&mut body, path, protocol)
                     .await?;
                 self.check_activity_lease_request(path, Some(&body))?;
@@ -5720,16 +5765,18 @@ impl Client {
                         Ok(Some(restored)) => restored,
                         Ok(None) => bytes,
                         // An answer naming a digest this request did not send
-                        // is recoverable once: forget the held pair and resend
-                        // this same request asking for full capabilities. A
-                        // resent report the Server already committed comes
-                        // back as its usual non-recorded receipt.
-                        Err(error) if !digest_resent => {
+                        // is recoverable. Only a task poll, which is
+                        // idempotent by its poll request ID, is resent asking
+                        // for full capabilities. Any other request may have
+                        // committed (a completion's answer can carry the next
+                        // leased task), so its answer is kept as received and
+                        // the capabilities are read from cluster info.
+                        Err(error) if !digest_resent && is_task_poll(path) => {
                             tracing::warn!(
                                 target: "durable_workflow::worker",
                                 path,
                                 error = %error,
-                                "unknown server capabilities digest; resending without it"
+                                "unknown server capabilities digest; resending the poll without it"
                             );
                             self.capabilities_digest.forget();
                             request.headers_mut().insert(
@@ -5739,6 +5786,57 @@ impl Client {
                             capabilities = Some(None);
                             digest_resent = true;
                             continue;
+                        }
+                        Err(error) if !is_task_poll(path) && path != "/cluster/info" => {
+                            tracing::warn!(
+                                target: "durable_workflow::worker",
+                                path,
+                                error = %error,
+                                "unknown server capabilities digest; reading capabilities from cluster info"
+                            );
+                            self.capabilities_digest.forget();
+                            // One read-only attempt. It never fails this
+                            // request: the answer is already received.
+                            let info = Box::pin(
+                                self.request_json_unresolved_with_timeout::<Value, Value>(
+                                    reqwest::Method::GET,
+                                    "/cluster/info",
+                                    RequestProtocol::DefaultWorker,
+                                    None,
+                                    timeout,
+                                ),
+                            )
+                            .await;
+                            let full = info.as_ref().ok().and_then(|info| {
+                                info["worker_protocol"]["server_capabilities"]
+                                    .as_object()
+                                    .filter(|full| !full.contains_key("digest"))
+                                    .cloned()
+                            });
+                            if full.is_none() {
+                                tracing::warn!(
+                                    target: "durable_workflow::worker",
+                                    path,
+                                    "cluster info unavailable; using the answer without its capabilities, which later requests learn again"
+                                );
+                            }
+                            // Without capabilities the unknown copies are
+                            // dropped from the answer, which is still used.
+                            let fallback = match &full {
+                                Some(full) => {
+                                    server_capabilities_digest::Fallback::Capabilities(full)
+                                }
+                                None => server_capabilities_digest::Fallback::Drop,
+                            };
+                            let restored = self.capabilities_digest.restore_with(
+                                status.as_u16(),
+                                &bytes,
+                                captured,
+                                Some(fallback),
+                            )?;
+                            // Later requests start again from `none`.
+                            self.capabilities_digest.forget();
+                            restored.unwrap_or(bytes)
                         }
                         Err(error) => return Err(error),
                     }
@@ -5760,6 +5858,28 @@ impl Client {
                 // So is a completion over the history-transaction budget.
                 if let Some(refusal) = workflow_task_history_limit_exceeded(status, &body, path) {
                     return Err(Error::WorkflowTaskHistoryLimitExceeded(refusal));
+                }
+                // A report sent inline under a cached payload policy the
+                // Server has since lowered is refused as too large, and nothing
+                // was recorded. Rediscover the policy, encode the same report
+                // again (externalizing what the new limit requires) and resend
+                // it once. A second refusal is a genuinely too-large report.
+                if let Some(original) = unexternalized
+                    .take()
+                    .filter(|_| report_payload_too_large(status, &body))
+                {
+                    tracing::warn!(
+                        target: "durable_workflow::worker",
+                        path,
+                        "report refused as too large; rediscovering the payload policy and resending it once"
+                    );
+                    self.forget_runtime_upload_policy(protocol);
+                    let mut fresh = original;
+                    self.externalize_runtime_payloads(&mut fresh, path, protocol)
+                        .await?;
+                    self.check_activity_lease_request(path, Some(&fresh))?;
+                    *request.body_mut() = Some(serde_json::to_vec(&fresh)?.into());
+                    continue;
                 }
                 let error = Error::Http { status, body };
                 deferred_workflow_completion |= worker_deferred_workflow_completion_retry_after(
@@ -6770,6 +6890,72 @@ fn worker_retry_delay(policy: WorkerRetryPolicy, retry: usize) -> Duration {
         .initial_backoff
         .saturating_mul(1_u32 << exponent)
         .min(policy.max_backoff)
+}
+
+/// A failed read-only cluster-info discovery a running worker waits out: a
+/// connection or timeout failure, any 5xx or a 429, unless the Server says
+/// `retryable: false`.
+pub(crate) fn cluster_info_failure_is_transient(error: &Error) -> bool {
+    let (status, body) = match error {
+        Error::Timeout | Error::Transport(_) => return true,
+        Error::Http { status, body } => (status.as_u16(), body.as_str()),
+        Error::Protocol(failure) => (failure.status, ""),
+        _ => return false,
+    };
+    let refused = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|body| body.get("retryable").and_then(Value::as_bool))
+        == Some(false);
+    (status >= 500 || status == 429) && !refused
+}
+
+/// An activity report (completion or failure) whose payloads may be encoded
+/// again after a too-large refusal. Workflow-task completions keep their own
+/// typed size refusals unchanged.
+fn is_task_report(path: &str) -> bool {
+    path.starts_with("/worker/activity-tasks/")
+        && (path.ends_with("/complete") || path.ends_with("/fail"))
+}
+
+/// The Server refused the report's size before reading its body.
+fn report_payload_too_large(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        && serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|body| body.get("reason")?.as_str().map(str::to_owned))
+            .is_some_and(|reason| reason == "payload_too_large")
+}
+
+/// `failure.type` and `failure.class` of an attempt whose result could not be
+/// delivered because it is too large.
+pub(crate) const ACTIVITY_RESULT_TOO_LARGE: &str = "ActivityResultTooLarge";
+
+/// An activity completion that failed only because its result is too large:
+/// the Server refused it as too large (after the one re-encode), or it could
+/// not be externalized (too large to upload, or no payload storage).
+fn activity_result_too_large(error: &Error) -> bool {
+    match error {
+        Error::ActivityTaskRejected(rejection) => {
+            rejection.status == 413 && rejection.reason == "payload_too_large"
+        }
+        Error::Codec(message) => [
+            "external_payload_oversized:",
+            "external_payload_unavailable:",
+            "payload_too_large:",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix)),
+        _ => false,
+    }
+}
+
+/// A worker task poll: idempotent by its poll request ID, so the only
+/// request that may be resent to recover elided capabilities.
+fn is_task_poll(path: &str) -> bool {
+    matches!(
+        path,
+        "/worker/workflow-tasks/poll" | "/worker/activity-tasks/poll" | "/worker/query-tasks/poll"
+    )
 }
 
 /// Default cap on one decoded response body.
@@ -9362,12 +9548,14 @@ impl Worker {
         if self.nexus_cooperative_cancellation_enabled {
             let info: Value = self
                 .client
-                .request_json(
-                    reqwest::Method::GET,
-                    "/cluster/info",
-                    RequestProtocol::Worker("1.20"),
-                    Option::<&Value>::None,
-                )
+                .retry_cluster_info(|| {
+                    self.client.request_json(
+                        reqwest::Method::GET,
+                        "/cluster/info",
+                        RequestProtocol::Worker("1.20"),
+                        Option::<&Value>::None,
+                    )
+                })
                 .await?;
             if !nexus::installed_cooperation(&info["worker_protocol"]["server_capabilities"]) {
                 return Err(Error::CooperativeCancellationUnavailable(
@@ -9384,13 +9572,16 @@ impl Worker {
             // Discovery uses the Worker credential, including worker-only Clients.
             let discovery: Value = self
                 .client
-                .request_json_unresolved_with_timeout::<Value, Value>(
-                    reqwest::Method::GET,
-                    "/cluster/info",
-                    RequestProtocol::Worker("1.20"),
-                    None,
-                    Duration::from_secs(5),
-                )
+                .retry_cluster_info(|| {
+                    self.client
+                        .request_json_unresolved_with_timeout::<Value, Value>(
+                            reqwest::Method::GET,
+                            "/cluster/info",
+                            RequestProtocol::Worker("1.20"),
+                            None,
+                            Duration::from_secs(5),
+                        )
+                })
                 .await?;
             if discovery["worker_protocol"]["server_capabilities"]["query_task_authority"] != true {
                 return Err(Error::WorkerLoop(
@@ -10246,23 +10437,20 @@ impl Worker {
             Err(error) if activity_hydration::stopped(&error) => ActivitySettlement::Recorded,
             Err(error) if worker_storage_admission_body(&error).is_some() => return Err(error),
             Ok(value) => {
-                self.settle_activity_report(
-                    ActivityReport::Completed,
-                    &task_id,
-                    &attempt_id,
-                    &lease_owner,
-                    lease_deadline,
-                    || {
-                        self.client.complete_activity_task(
-                            &task_id,
-                            &attempt_id,
-                            &lease_owner,
-                            value.clone(),
-                            &codec,
-                        )
-                    },
-                )
-                .await?
+                let (settlement, too_large) = self
+                    .settle_activity_completion(
+                        &task_id,
+                        &attempt_id,
+                        &lease_owner,
+                        lease_deadline,
+                        &value,
+                        &codec,
+                    )
+                    .await?;
+                if too_large {
+                    task_outcome = "failed";
+                }
+                settlement
             }
             Err(error) => {
                 let failure = ActivityError::from_error(&error, "RustActivityFailure");
@@ -10386,6 +10574,77 @@ impl Worker {
                 None => tokio::time::sleep(delay).await,
             }
         }
+    }
+
+    /// Complete an activity. When its result cannot be delivered because it is
+    /// too large (still refused after the payload policy was rediscovered, or
+    /// too large to externalize), report the attempt as a non-retryable
+    /// `ActivityResultTooLarge` failure instead, so the worker keeps running.
+    /// Returns the settlement and whether it was that failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn settle_activity_completion<T: Serialize + Clone>(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        owner: &str,
+        lease_deadline: Option<tokio::time::Instant>,
+        value: &T,
+        codec: &str,
+    ) -> Result<(ActivitySettlement, bool)> {
+        let completion = self
+            .settle_activity_report(
+                ActivityReport::Completed,
+                task_id,
+                attempt_id,
+                owner,
+                lease_deadline,
+                || {
+                    self.client.complete_activity_task(
+                        task_id,
+                        attempt_id,
+                        owner,
+                        value.clone(),
+                        codec,
+                    )
+                },
+            )
+            .await;
+        let error = match completion {
+            Ok(settlement) => return Ok((settlement, false)),
+            Err(error) if activity_result_too_large(&error) => error,
+            Err(error) => return Err(error),
+        };
+        tracing::error!(
+            target: "durable_workflow::worker",
+            worker_id = %self.worker_id,
+            task_id,
+            error = %error,
+            "activity result is too large to deliver; reporting a non-retryable ActivityResultTooLarge failure"
+        );
+        let failure = json!({
+            "type": ACTIVITY_RESULT_TOO_LARGE,
+            "class": ACTIVITY_RESULT_TOO_LARGE,
+            "non_retryable": true,
+            "message": format!("activity result is too large to deliver: {error}"),
+        });
+        let settlement = self
+            .settle_activity_report(
+                ActivityReport::Failed,
+                task_id,
+                attempt_id,
+                owner,
+                lease_deadline,
+                || {
+                    self.client.fail_activity_task_with_failure(
+                        task_id,
+                        attempt_id,
+                        owner,
+                        failure.clone(),
+                    )
+                },
+            )
+            .await?;
+        Ok((settlement, true))
     }
 
     async fn poll_query_once(&self) -> Result<ManagedPollOutcome> {

@@ -68,6 +68,11 @@ async fn server(replies: Vec<Reply>) -> (String, JoinHandle<Vec<String>>) {
                 bytes.extend_from_slice(&buf[..count]);
             }
             heads.push(head);
+            if reply.status == 0 {
+                // Close without any reply: the client sees a transport error.
+                drop(stream);
+                continue;
+            }
             let mut response = format!("HTTP/1.1 {} Reply\r\n", reply.status);
             for (name, value) in &reply.headers {
                 response.push_str(&format!("{name}: {value}\r\n"));
@@ -206,21 +211,30 @@ async fn worker_answers_are_restored_from_the_digest_each_request_sent() {
 }
 
 #[tokio::test]
-async fn a_completion_resent_after_a_garbled_answer_gets_its_committed_receipt() {
+async fn a_garbled_completion_answer_is_kept_and_capabilities_come_from_cluster_info() {
     let d1 = "sha256:d1";
     let (url, requests) = server(vec![
-        json_reply(200, json!({"task": null, "server_capabilities": tagged(d1)})),
+        json_reply(
+            200,
+            json!({"task": null, "server_capabilities": tagged(d1)}),
+        ),
         // The first completion discovers the inline payload policy.
         json_reply(200, json!({})),
-        // The Server committed the completion, but its answer is garbled.
-        json_reply(200, json!({"recorded": true, "server_capabilities": "sha256:unknown"})),
-        // Native Server 3.17's answer to the resent copy.
+        // The Server committed the completion; its answer carries a result
+        // that must not be lost and an unknown digest.
         json_reply(
-            409,
-            json!({"task_id":"task-1","activity_attempt_id":"attempt-1","outcome":"completed",
-                "recorded":false,"reason":"stale_attempt","lease_owner":"worker",
-                "activity_status":"completed","attempt_status":"completed","task_status":"completed",
-                "server_capabilities": tagged(d1)}),
+            200,
+            json!({"recorded": true, "next_task": {"task_id": "next-1"},
+                "server_capabilities": "sha256:unknown"}),
+        ),
+        // Read-only capability recovery.
+        json_reply(
+            200,
+            json!({"worker_protocol": {"server_capabilities": tagged("sha256:d2")}}),
+        ),
+        json_reply(
+            200,
+            json!({"task": null, "server_capabilities": tagged("sha256:d2")}),
         ),
     ])
     .await;
@@ -229,30 +243,38 @@ async fn a_completion_resent_after_a_garbled_answer_gets_its_committed_receipt()
         .poll_workflow_task_response("worker", "queue", Duration::from_secs(1))
         .await
         .unwrap();
-    let Err(Error::ActivityTaskRejected(receipt)) = client
+    let answer = client
         .complete_activity_task("task-1", "attempt-1", "worker", json!("done"), "avro")
         .await
-    else {
-        panic!("the resent completion must return the Server's receipt");
-    };
-    // The worker settles this non-recorded receipt like any stale attempt.
-    assert_eq!(receipt.status, 409);
-    assert_eq!(receipt.reason, "stale_attempt");
-    assert_eq!(receipt.body["server_capabilities"], capabilities());
+        .expect("the completion's own answer is used");
+    assert_eq!(answer["recorded"], true);
+    assert_eq!(answer["next_task"]["task_id"], "next-1");
+    assert_eq!(answer["server_capabilities"], capabilities());
+    client
+        .poll_workflow_task_response("worker", "queue", Duration::from_secs(1))
+        .await
+        .unwrap();
 
     let heads = requests.await.unwrap();
+    let completes = heads
+        .iter()
+        .filter(|head| head.starts_with("post /api/worker/activity-tasks/task-1/complete"))
+        .count();
+    assert_eq!(completes, 1, "a completion is never resent");
+    assert!(
+        heads[3].starts_with("get /api/cluster/info"),
+        "{}",
+        heads[3]
+    );
     let sent: Vec<_> = heads
         .iter()
         .map(|head| header(head, "x-durable-workflow-server-capabilities-digest"))
         .collect();
-    assert!(
-        heads[1].starts_with("get /api/cluster/info"),
-        "{}",
-        heads[1]
+    // The held pair is forgotten: cluster info and the next poll send none.
+    assert_eq!(
+        sent,
+        [Some("none"), None, Some(d1), Some("none"), Some("none")]
     );
-    assert!(heads[2].starts_with("post /api/worker/activity-tasks/task-1/complete"));
-    assert!(heads[3].starts_with("post /api/worker/activity-tasks/task-1/complete"));
-    assert_eq!(sent, [Some("none"), None, Some(d1), Some("none")]);
 }
 
 #[tokio::test]
@@ -279,4 +301,78 @@ async fn decoded_response_bodies_are_capped() {
         "{error:?}"
     );
     requests.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_garbled_answer_survives_unavailable_cluster_info() {
+    for (case, failed_read) in [
+        (
+            "500",
+            json_reply(500, json!({"message": "upstream exploded"})),
+        ),
+        (
+            "connection dropped",
+            Reply {
+                status: 0,
+                headers: vec![],
+                body: vec![],
+            },
+        ),
+    ] {
+        let d1 = "sha256:d1";
+        let (url, requests) = server(vec![
+            json_reply(
+                200,
+                json!({"task": null, "server_capabilities": tagged(d1)}),
+            ),
+            json_reply(200, json!({})),
+            json_reply(
+                200,
+                json!({"recorded": true, "next_task": {"task_id": "next-1"},
+                    "server_capabilities": "sha256:unknown"}),
+            ),
+            failed_read,
+            // Later requests ask with `none` and learn the capabilities again.
+            json_reply(
+                200,
+                json!({"task": null, "server_capabilities": tagged("sha256:d2")}),
+            ),
+        ])
+        .await;
+        let client = client(&url);
+        client
+            .poll_workflow_task_response("worker", "queue", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let answer = client
+            .complete_activity_task("task-1", "attempt-1", "worker", json!("done"), "avro")
+            .await
+            .unwrap_or_else(|error| panic!("{case}: the received answer must be used: {error:?}"));
+        assert_eq!(answer["recorded"], true, "{case}");
+        assert_eq!(answer["next_task"]["task_id"], "next-1", "{case}");
+        assert!(
+            answer.get("server_capabilities").is_none(),
+            "{case}: dropped, not garbled"
+        );
+        let next = client
+            .poll_workflow_task_response("worker", "queue", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            next.server_capabilities,
+            Some(capabilities()),
+            "{case}: learned again"
+        );
+
+        let heads = requests.await.unwrap();
+        let sent: Vec<_> = heads
+            .iter()
+            .map(|head| header(head, "x-durable-workflow-server-capabilities-digest"))
+            .collect();
+        assert_eq!(
+            sent,
+            [Some("none"), None, Some(d1), Some("none"), Some("none")],
+            "{case}"
+        );
+    }
 }

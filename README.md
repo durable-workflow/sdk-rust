@@ -308,11 +308,13 @@ digest and object when it sends each request and restores that request's
 answer before anything reads it, so readers always see the full object, even
 when requests overlap a rolling deploy. Clones share what they learned. An
 answer naming a digest that request did not send, and that the answer itself
-does not carry, makes the Client forget its digest and resend that request once
-asking for full capabilities. A resent report the Server already committed
-gets its usual non-recorded receipt, which the worker settles. Only a second
-unknown digest is `Error::Protocol` with reason
-`server_capabilities_digest_unknown`. Older Servers ignore both headers and
+does not carry, makes the Client forget its digest. A task poll is resent once
+asking for full capabilities. Any other request is never resent, since it may
+already have committed: its answer is kept as received and the capabilities
+are read from `GET /api/cluster/info`. If that read fails, the answer is still
+used without the field and later requests learn the capabilities again. A
+poll whose resend names an unknown digest again is `Error::Protocol` with
+reason `server_capabilities_digest_unknown`. Older Servers ignore both headers and
 answer in full.
 
 A decoded response body is capped at 128 MiB by default. Set
@@ -1168,6 +1170,15 @@ task, attempt and owner with every status `completed` (or `attempt_status`
 `stale_attempt` in any other state means the attempt was closed by something
 else. When the lease runs out first, the worker logs a `tracing` error and the
 Server settles the attempt.
+
+A running worker's cluster-info reads (startup discovery and the payload
+policy read before a report) retry a connection failure, timeout, 5xx or 429
+the same way. Once a payload policy is known, an outage does not hold reports
+back: the last-known policy is used and discovery is tried again 10 s later.
+If the Server refuses a report as too large because it lowered its inline
+limit, the worker rediscovers the policy, encodes the report again and resends
+it once. A result that is still too large, or cannot be externalized, fails the
+attempt as a non-retryable `ActivityResultTooLarge`; the worker keeps running.
 
 An explicit `retryable: false`, 401, 403 and other protocol refusals, codec
 and handler failures stop the worker: it emits a `tracing` error event and
