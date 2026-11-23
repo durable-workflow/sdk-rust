@@ -94,6 +94,7 @@ impl WorkflowContext {
     /// Committed results are replayed without executing the callback. A worker
     /// lost before acknowledgment can execute the callback again, so side effects
     /// must be idempotent. Callbacks must yield to Tokio and avoid blocking work.
+    #[track_caller]
     pub fn local_activity<T: Serialize>(
         &self,
         activity_type: impl Into<String>,
@@ -102,6 +103,7 @@ impl WorkflowContext {
         self.local_activity_with_options(activity_type, LocalActivityOptions::new(), args)
     }
 
+    #[track_caller]
     pub fn local_activity_with_options<T: Serialize>(
         &self,
         activity_type: impl Into<String>,
@@ -135,6 +137,7 @@ impl WorkflowContext {
         args: T,
     ) -> Result<AvroValue> {
         let mut call = self.local_activity_with_options(activity_type, options, args);
+        call.source = None;
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 

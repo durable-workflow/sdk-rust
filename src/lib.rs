@@ -75,6 +75,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     io::{self, Read},
+    panic::Location,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -12372,6 +12373,7 @@ impl WorkflowContext {
         }))
     }
 
+    #[track_caller]
     pub fn activity<T: Serialize>(
         &self,
         activity_type: impl Into<String>,
@@ -12380,6 +12382,7 @@ impl WorkflowContext {
         self.activity_with_options(activity_type, ActivityOptions::new(), args)
     }
 
+    #[track_caller]
     pub fn activity_on_queue<T, Q>(
         &self,
         activity_type: impl Into<String>,
@@ -12432,13 +12435,25 @@ impl WorkflowContext {
     /// }
     /// # }
     /// ```
+    #[track_caller]
     pub fn activity_with_options<T: Serialize>(
         &self,
         activity_type: impl Into<String>,
         options: ActivityOptions,
         args: T,
     ) -> ActivityCall {
+        self.activity_with_options_at(activity_type, options, args, Some(Location::caller()))
+    }
+
+    fn activity_with_options_at<T: Serialize>(
+        &self,
+        activity_type: impl Into<String>,
+        options: ActivityOptions,
+        args: T,
+        source: Option<&'static Location<'static>>,
+    ) -> ActivityCall {
         ActivityCall {
+            source,
             ctx: self.clone(),
             activity_type: activity_type.into(),
             options,
@@ -12456,7 +12471,8 @@ impl WorkflowContext {
         activity_type: impl Into<String>,
         args: T,
     ) -> Result<AvroValue> {
-        let mut call = self.activity(activity_type, args);
+        let mut call =
+            self.activity_with_options_at(activity_type, ActivityOptions::new(), args, None);
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 
@@ -12466,7 +12482,7 @@ impl WorkflowContext {
         options: ActivityOptions,
         args: T,
     ) -> Result<AvroValue> {
-        let mut call = self.activity_with_options(activity_type, options, args);
+        let mut call = self.activity_with_options_at(activity_type, options, args, None);
         std::future::poll_fn(|cx| Pin::new(&mut call).poll_avro_value(cx)).await
     }
 
@@ -12505,6 +12521,7 @@ impl WorkflowContext {
             )
         });
         let mut call = ActivityCall {
+            source: None,
             ctx: self.clone(),
             activity_type: activity_type.clone(),
             options,
@@ -12793,11 +12810,13 @@ impl WorkflowContext {
     /// });
     /// # }
     /// ```
+    #[track_caller]
     pub fn sleep(&self, duration: Duration) -> TimerCall {
         let delay_seconds = duration
             .as_secs()
             .checked_add(u64::from(duration.subsec_nanos() > 0));
         TimerCall {
+            source: Some(Location::caller()),
             ctx: self.clone(),
             delay_seconds,
             scheduled: false,
@@ -12807,6 +12826,7 @@ impl WorkflowContext {
     }
 
     /// Alias for [`WorkflowContext::sleep`] for timer-oriented workflow code.
+    #[track_caller]
     pub fn start_timer(&self, duration: Duration) -> TimerCall {
         self.sleep(duration)
     }
@@ -15156,6 +15176,7 @@ fn parallel_leaf_call(
             options,
             arguments,
         } => ParallelLeafCall::Activity(ActivityCall {
+            source: None,
             ctx: ctx.clone(),
             activity_type,
             options,
@@ -15184,6 +15205,7 @@ fn parallel_leaf_call(
                 .as_secs()
                 .checked_add(u64::from(duration.subsec_nanos() > 0));
             ParallelLeafCall::Timer(TimerCall {
+                source: None,
                 ctx: ctx.clone(),
                 delay_seconds,
                 scheduled: false,
@@ -16761,10 +16783,11 @@ impl Saga {
         while let Some(compensation) = self.compensations.pop() {
             if let Err(compensation_failure) = self
                 .ctx
-                .activity_with_options(
+                .activity_with_options_at(
                     compensation.activity_type.clone(),
                     compensation.options,
                     compensation.arguments,
+                    None,
                 )
                 .await
             {
@@ -16792,6 +16815,7 @@ impl Saga {
 }
 
 pub struct ActivityCall {
+    source: Option<&'static Location<'static>>,
     ctx: WorkflowContext,
     activity_type: String,
     options: ActivityOptions,
@@ -16804,7 +16828,13 @@ pub struct ActivityCall {
 }
 
 impl ActivityCall {
-    fn poll_avro_value(
+    fn poll_avro_value(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<AvroValue>> {
+        let source = self.source;
+        self.poll_history(cx)
+            .map(|result| result.map_err(|error| replay_error_at(error, source)))
+    }
+
+    fn poll_history(
         mut self: Pin<&mut Self>,
         _cx: &mut TaskContext<'_>,
     ) -> Poll<Result<AvroValue>> {
@@ -17124,6 +17154,7 @@ impl Future for ActivityCall {
 
 /// Future returned by [`WorkflowContext::sleep`].
 pub struct TimerCall {
+    source: Option<&'static Location<'static>>,
     ctx: WorkflowContext,
     delay_seconds: Option<u64>,
     scheduled: bool,
@@ -17134,7 +17165,15 @@ pub struct TimerCall {
 impl Future for TimerCall {
     type Output = Result<()>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let source = self.source;
+        self.poll_history(cx)
+            .map(|result| result.map_err(|error| replay_error_at(error, source)))
+    }
+}
+
+impl TimerCall {
+    fn poll_history(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
         if self.matched_pending {
             return Poll::Pending;
         }
@@ -17945,6 +17984,19 @@ impl Future for ChildWorkflowCall {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+fn replay_error_at(mut error: Error, source: Option<&'static Location<'static>>) -> Error {
+    if let (Error::NonDeterministicReplay(failure), Some(source)) = (&mut error, source) {
+        if let Some(file) = source.file().rsplit(['/', '\\']).next() {
+            if !file.is_empty() && !file.chars().any(char::is_control) {
+                failure
+                    .message
+                    .push_str(&format!(" Authored at {file}:{}.", source.line()));
+            }
+        }
+    }
+    error
 }
 
 fn command_mismatch(recorded: &RecordedCommand, actual: impl Into<String>) -> Error {
@@ -28827,6 +28879,34 @@ mod tests {
         assert_eq!(failure.expected.as_deref(), Some("condition wait"));
     }
 
+    #[tokio::test]
+    async fn replay_reports_the_authored_activity_before_a_recorded_timer() {
+        let history = vec![history_event(
+            "TimerScheduled",
+            json!({"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}),
+        )];
+        let ctx = workflow_context(history.clone());
+        let authored_line = line!() + 1;
+        let result = ctx.activity("hello", json!([])).await;
+        let Err(Error::NonDeterministicReplay(failure)) = result else {
+            panic!("activity reordered before a recorded timer must fail");
+        };
+        assert_eq!(failure.reason, "recorded_command_mismatch");
+        assert_eq!(failure.sequence, Some(1));
+        assert_eq!(failure.expected.as_deref(), Some("timer"));
+        assert!(failure
+            .message
+            .ends_with(&format!(" Authored at lib.rs:{authored_line}.")));
+        assert!(!failure.message.contains("src/lib.rs"));
+
+        let ctx = workflow_context(history);
+        let result = ctx.activity_avro_value("hello", json!([])).await;
+        let Err(Error::NonDeterministicReplay(failure)) = result else {
+            panic!("the Avro wrapper must preserve the determinism error");
+        };
+        assert!(!failure.message.contains("Authored at"));
+    }
+
     #[test]
     fn replay_orders_signal_waits_and_timers_in_one_command_stream() {
         let signal_then_timer = vec![
@@ -28868,6 +28948,7 @@ mod tests {
             .expect("signal and timer history consumed in order");
 
         let reordered = workflow_context(signal_then_timer);
+        let authored_line = line!() + 1;
         let mut timer_first = Box::pin(reordered.sleep(Duration::from_secs(5)));
         let Poll::Ready(Err(Error::NonDeterministicReplay(failure))) =
             timer_first.as_mut().poll(&mut task_context)
@@ -28877,6 +28958,9 @@ mod tests {
         assert_eq!(failure.reason, "recorded_command_mismatch");
         assert_eq!(failure.sequence, Some(1));
         assert_eq!(failure.expected.as_deref(), Some("signal wait"));
+        assert!(failure
+            .message
+            .ends_with(&format!(" Authored at lib.rs:{authored_line}.")));
 
         let timer_then_signal = vec![
             history_event(
