@@ -78,14 +78,21 @@ pub(super) fn competing_selection(
         || history_sequence(candidate).is_none_or(|recorded| recorded <= sequence)
         || !history.iter().any(|event| {
             history_sequence(event) == Some(sequence)
-                && event.raw.get("id").or_else(|| event.raw.get("event_id"))
-                    .and_then(Value::as_str) == Some(terminal_id)
+                && event
+                    .raw
+                    .get("id")
+                    .or_else(|| event.raw.get("event_id"))
+                    .and_then(Value::as_str)
+                    == Some(terminal_id)
                 && candidate.payload["resolution_event_type"] == event.event_type
         })
     {
         return Err(invalid());
     }
-    Ok(Some(CompetingSelection { terminal_id: terminal_id.to_owned(), sequence }))
+    Ok(Some(CompetingSelection {
+        terminal_id: terminal_id.to_owned(),
+        sequence,
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -221,12 +228,14 @@ impl Wait {
             }
         }
         if let Some(error) = final_error.filter(|_| {
-            pending.is_none_or(|pending| terminal_boundary.is_some_and(|terminal| pending >= terminal))
-        })
-        {
+            pending
+                .is_none_or(|pending| terminal_boundary.is_some_and(|terminal| pending >= terminal))
+        }) {
             return Err(error);
         }
-        if let Some(terminal) = terminal_boundary.filter(|terminal| pending.is_none_or(|pending| pending >= *terminal)) {
+        if let Some(terminal) =
+            terminal_boundary.filter(|terminal| pending.is_none_or(|pending| pending >= *terminal))
+        {
             let mut command = json!({"type":"resolve_condition_wait","condition_wait_id":self.id,"satisfied":false});
             if let Some(candidate) = competing.filter(|candidate| candidate.sequence == terminal) {
                 command["competing_resolution_event_id"] = json!(candidate.terminal_id);

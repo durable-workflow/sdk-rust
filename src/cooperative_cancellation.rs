@@ -1387,12 +1387,12 @@ impl Client {
                 };
                 let mut claim = CooperativeWorkflowTask {
                     task,
-                    ordered_condition_claim: condition_input_order::read_claim(
-                        &value["task"],
-                    )
-                    .map_err(|_| {
-                        invalid("cooperative poll returned an invalid condition admission snapshot")
-                    })?,
+                    ordered_condition_claim: condition_input_order::read_claim(&value["task"])
+                        .map_err(|_| {
+                            invalid(
+                                "cooperative poll returned an invalid condition admission snapshot",
+                            )
+                        })?,
                     cancellation_request,
                     sticky_snapshot: None,
                     verified_payloads,

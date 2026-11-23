@@ -5092,10 +5092,7 @@ impl Client {
         timeout: Duration,
         poll_request_id: &str,
         transport_retries: usize,
-    ) -> Result<(
-        PollWorkflowTaskResponse,
-        condition_input_order::Claim,
-    )> {
+    ) -> Result<(PollWorkflowTaskResponse, condition_input_order::Claim)> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
@@ -11586,8 +11583,10 @@ impl Worker {
             .load(Ordering::SeqCst);
         workflow_state.condition_input_order_supported =
             self.condition_input_order_supported.load(Ordering::SeqCst);
-        workflow_state.condition_wait_pending_input_sequence = self.ordered_condition_claim.pending_input;
-        workflow_state.condition_wait_input_order_authoring = self.ordered_condition_claim.authoring;
+        workflow_state.condition_wait_pending_input_sequence =
+            self.ordered_condition_claim.pending_input;
+        workflow_state.condition_wait_input_order_authoring =
+            self.ordered_condition_claim.authoring;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
         if let Some(canonical) = cancellation_history {
@@ -17938,9 +17937,15 @@ impl ConditionWaitCall {
                 state.matched_recorded_pending = true;
                 return Poll::Pending;
             }
-            selection.map(|entry| condition_input_order::competing_selection(
-                &state.history_events, &entry.parallel_group_id,
-            )).transpose()?.flatten()
+            selection
+                .map(|entry| {
+                    condition_input_order::competing_selection(
+                        &state.history_events,
+                        &entry.parallel_group_id,
+                    )
+                })
+                .transpose()?
+                .flatten()
         };
         let decision = wait.evaluate(&ctx.state, &*self.predicate, competing.as_ref())?;
         let mut state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
@@ -18036,7 +18041,10 @@ impl ConditionWaitCall {
         ]);
         if let Some(timeout_seconds) = options.timeout_seconds {
             command.insert("timeout_seconds".to_string(), json!(timeout_seconds));
-            if !recorded_wait && state.condition_input_order_supported && state.condition_wait_input_order_authoring {
+            if !recorded_wait
+                && state.condition_input_order_supported
+                && state.condition_wait_input_order_authoring
+            {
                 command.insert(
                     condition_input_order::CAPABILITY.into(),
                     json!(condition_input_order::ORDER),
@@ -26596,10 +26604,13 @@ mod tests {
                 state.condition_input_order_supported = true;
                 state.condition_wait_input_order_authoring = authoring;
             }
-            let mut wait = Box::pin(ctx.wait_condition(
-                ConditionWaitOptions::new("approval", "approval-v1").timeout(Duration::from_secs(2)),
-                || Ok(false),
-            ));
+            let mut wait = Box::pin(
+                ctx.wait_condition(
+                    ConditionWaitOptions::new("approval", "approval-v1")
+                        .timeout(Duration::from_secs(2)),
+                    || Ok(false),
+                ),
+            );
             let mut task_context = TaskContext::from_waker(noop_waker_ref());
             assert!(wait.as_mut().poll(&mut task_context).is_pending());
             let commands = ctx.take_commands().unwrap();
