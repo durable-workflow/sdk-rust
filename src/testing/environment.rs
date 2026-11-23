@@ -130,40 +130,44 @@ impl WorkflowEnvironment {
         if let Some(queue) = &history.task_queue {
             worker.task_queue = queue.clone();
         }
-        let (decision, sequence) =
-            match worker.prepare_workflow_task_execution(history.task.clone(), None)? {
-                crate::PreparedWorkflowTask::Decision(decision) => (decision, 1),
-                crate::PreparedWorkflowTask::Execution {
-                    task,
-                    context,
-                    mut future,
-                } => {
-                    let sequence = {
-                        let state = context
-                            .state
-                            .lock()
-                            .map_err(|_| Error::WorkflowStatePoisoned)?;
-                        state
-                            .recorded_commands
-                            .last()
-                            .map_or(1, |command| command.sequence().saturating_add(1))
-                    };
-                    let outcome = Worker::poll_workflow_future(&context, &mut future)?;
-                    {
-                        let state = context
-                            .state
-                            .lock()
-                            .map_err(|_| Error::WorkflowStatePoisoned)?;
-                        if !state.local_activity_requests.is_empty() {
-                            validate_commands(&state.commands, sequence)?;
-                        }
+        let (decision, sequence, continuation_consumed) = match worker
+            .prepare_workflow_task_execution(history.task.clone(), None)?
+        {
+            crate::PreparedWorkflowTask::Decision(decision) => (decision, 1, false),
+            crate::PreparedWorkflowTask::Execution {
+                task,
+                context,
+                mut future,
+            } => {
+                let sequence = {
+                    let state = context
+                        .state
+                        .lock()
+                        .map_err(|_| Error::WorkflowStatePoisoned)?;
+                    state
+                        .recorded_commands
+                        .last()
+                        .map_or(1, |command| command.sequence().saturating_add(1))
+                };
+                let outcome = Worker::poll_workflow_future(&context, &mut future)?;
+                {
+                    let state = context
+                        .state
+                        .lock()
+                        .map_err(|_| Error::WorkflowStatePoisoned)?;
+                    if !state.local_activity_requests.is_empty() {
+                        validate_commands(&state.commands, sequence)?;
                     }
-                    (
-                        worker.finish_workflow_task_execution(&task, &context, outcome)?,
-                        sequence,
-                    )
                 }
-            };
+                let decision = worker.finish_workflow_task_execution(&task, &context, outcome)?;
+                let continuation_consumed = context
+                    .state
+                    .lock()
+                    .map_err(|_| Error::WorkflowStatePoisoned)?
+                    .continue_as_new_consumed;
+                (decision, sequence, continuation_consumed)
+            }
+        };
         if !decision.commands.is_empty() && recorded_structural_limit_failure(history) {
             // The worker failed this run because the Server refused the next
             // completion over a structural limit (completion size or history
@@ -176,9 +180,9 @@ impl WorkflowEnvironment {
             });
         }
         validate_commands(&decision.commands, sequence)?;
-        validate_terminal(history, &decision.commands, sequence)?;
+        validate_terminal(history, &decision.commands, sequence, continuation_consumed)?;
         Ok(ReplayReport {
-            completed: decision.commands.iter().any(terminal_command),
+            completed: continuation_consumed || decision.commands.iter().any(terminal_command),
             commands: decision.commands,
         })
     }
@@ -219,7 +223,12 @@ fn validate_commands(commands: &[Value], sequence: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_terminal(history: &WorkflowHistory, commands: &[Value], sequence: u64) -> Result<()> {
+fn validate_terminal(
+    history: &WorkflowHistory,
+    commands: &[Value],
+    sequence: u64,
+    continuation_consumed: bool,
+) -> Result<()> {
     let Some((recorded, expected)) =
         history
             .events()
@@ -234,6 +243,9 @@ fn validate_terminal(history: &WorkflowHistory, commands: &[Value], sequence: u6
     else {
         return Ok(());
     };
+    if expected == "continue_as_new" && continuation_consumed && commands.is_empty() {
+        return Ok(());
+    }
     let command = commands
         .iter()
         .find(|command| command["type"] == expected)

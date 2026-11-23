@@ -41,7 +41,7 @@ fn replaying(state: &WorkflowState) -> bool {
         || state.cancellation_delivery_intent.is_some()
         || state.cancellation_scope_opening.is_some()
         || (state.cancellation_history.delivery.is_some() && !state.cancellation_consumed)
-        || (state.recorded_continue_as_new_sequence.is_some() && !state.continue_as_new_consumed)
+        || (state.recorded_continue_as_new.is_some() && !state.continue_as_new_consumed)
         || state.scope_delivery.as_ref().is_some_and(|replay| {
             replay.intent.is_some()
                 || replay

@@ -14,10 +14,10 @@ use std::{
 
 use durable_workflow::{
     decode_payload, encode_payload, json, ActivityOptions, ActivityRetryPolicy, AvroValue,
-    ChildWorkflowOptions, Client, ConditionWaitOptions, ConditionWaitResult, Error,
-    ParallelOperation, ParallelResult, PayloadEnvelope, SearchAttributeUpdate, SelectionKey,
-    StickyCacheOptions, Value, Worker, WorkerRetryPolicy, WorkflowContext, WorkflowInstance,
-    DEFAULT_CODEC,
+    ChildWorkflowOptions, Client, ConditionWaitOptions, ConditionWaitResult, ContinueAsNewOptions,
+    ContinueAsNewTarget, Error, ParallelOperation, ParallelResult, PayloadEnvelope,
+    SearchAttributeUpdate, SelectionKey, StickyCacheOptions, Value, Worker, WorkerRetryPolicy,
+    WorkflowContext, WorkflowInstance, DEFAULT_CODEC,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -544,6 +544,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.activity-policy-author"
             | "corpus.business-replay-clock"
             | "corpus.replay-aware-logging"
+            | "corpus.continue-as-new-promoted"
             | "corpus.replay-aware-nexus-pending"
             | "corpus.business-replay-clock-child"
             | "corpus.business-replay-clock-signal"
@@ -690,6 +691,15 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             .map_err(|error| format!("{fixture_id} sticky cache configuration failed: {error}"))?;
     }
     match workflow_type {
+        "corpus.continue-as-new-promoted" => {
+            worker.register_workflow(workflow_type, |ctx, _input| async move {
+                ctx.continue_as_new_with_target(
+                    ContinueAsNewOptions::new(),
+                    ContinueAsNewTarget::Promoted,
+                    json!(["next state"]),
+                )
+            });
+        }
         "corpus.replay-aware-logging" => workflow_logging::register(&mut worker, workflow_type),
         "corpus.replay-aware-nexus-pending" => {
             workflow_logging::register_nexus_pending(&mut worker, workflow_type)
