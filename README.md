@@ -545,6 +545,13 @@ commands return `Error::NonDeterministicReplay(ReplayFailure)` with `sequence`,
 fresh in-process run to test new logic. A report contains the reconstructed
 terminal commands or an empty decision for a recorded pending operation.
 
+When a direct `ctx.activity(...)`, `ctx.local_activity(...)`, or `ctx.sleep(...)`
+call disagrees with history, read `ReplayFailure.message` for the source filename
+and line where the SDK future was built. The SDK can capture that call's source
+coordinates from Rust's caller metadata. It has no function name or location for
+typed and Avro async wrappers, grouped operations, or errors raised while
+validating history before a call runs.
+
 Keep workflow command order deterministic:
 
 | Pattern | Durable replacement |

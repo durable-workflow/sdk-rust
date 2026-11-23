@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-authored-call-step-reorder",
+  "protocol_version": "1.20",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.activity-policy-author", "input": [], "payload_codec": "avro"},
+  "history": [
+    {"event_type": "TimerScheduled", "payload": {"sequence": 1, "timer_id": "timer-1", "delay_seconds": 5}}
+  ],
+  "expected": {"type": "complete_workflow", "result": "unreachable"},
+  "expected_failure": "Authored at replay_regression_corpus.rs:"
+}
