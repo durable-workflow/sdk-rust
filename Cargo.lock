@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "durable-workflow"
-version = "4.22.1"
+version = "4.23.0"
 dependencies = [
  "apache-avro",
  "base64 0.22.1",
