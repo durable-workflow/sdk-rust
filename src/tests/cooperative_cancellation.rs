@@ -3303,10 +3303,10 @@ async fn cooperative_registration_uses_explicit_protocol_and_preserves_other_cli
             .as_array()
             .unwrap()
             .contains(&json!("cooperative_cancellation")));
-        assert_eq!(
-            body["capability_manifest"],
-            portable_worker_affinity_capability_manifest()
-        );
+        let mut manifest = portable_worker_affinity_capability_manifest();
+        manifest[CONTINUE_AS_NEW_TARGET_CAPABILITY] =
+            json!({"supported": true, "minimum_protocol_version": "1.21"});
+        assert_eq!(body["capability_manifest"], manifest);
     }
 }
 
