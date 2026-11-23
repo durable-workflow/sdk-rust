@@ -74,7 +74,11 @@ impl Worker {
     pub(super) async fn poll_workflow_with_sticky_cache(
         &self,
         poll_request_id: &str,
-    ) -> Result<(PollWorkflowTaskResponse, Option<StickySnapshot>)> {
+    ) -> Result<(
+        PollWorkflowTaskResponse,
+        Option<StickySnapshot>,
+        condition_input_order::PendingInput,
+    )> {
         if self.client.sticky_cache.is_none() {
             return self
                 .client
@@ -86,7 +90,7 @@ impl Worker {
                     0,
                 )
                 .await
-                .map(|response| (response, None));
+                .map(|(response, pending)| (response, None, pending));
         }
         let body = json!({"worker_id":self.worker_id,"task_queue":self.task_queue,
             "poll_request_id":poll_request_id,"timeout_seconds":long_poll_timeout_seconds(self.poll_timeout),
@@ -107,6 +111,7 @@ impl Worker {
             &self.client.namespace,
         )?;
         let (loaded, _) = workflow_hydration::HydrationClaim::protect(claim, &self.client, async {
+            let pending = condition_input_order::pending_input(&wire["task"])?;
             self.client
                 .resolve_runtime_payloads(
                     &mut wire,
@@ -124,7 +129,7 @@ impl Worker {
             } else {
                 None
             };
-            Ok((response, snapshot))
+            Ok((response, snapshot, pending))
         })
         .await?;
         if loaded.0.task.is_some() {
