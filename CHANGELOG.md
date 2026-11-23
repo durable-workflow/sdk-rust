@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 4.23.0
+
+- Workers can request `ContinueAsNewTarget::Promoted` after Server confirms
+  support for the current registration. Plain continue-as-new keeps the
+  predecessor's build. If the queue has no eligible promoted build, the worker
+  reports the refusal on the current attempt so the workflow task can retry.
+  (durable-workflow/workflow#880)
+
 ## 4.22.1
 
 - Replay mismatches from direct activity, local activity and timer calls report
