@@ -77,7 +77,7 @@ impl Worker {
     ) -> Result<(
         PollWorkflowTaskResponse,
         Option<StickySnapshot>,
-        condition_input_order::PendingInput,
+        condition_input_order::Claim,
     )> {
         if self.client.sticky_cache.is_none() {
             return self
@@ -111,7 +111,7 @@ impl Worker {
             &self.client.namespace,
         )?;
         let (loaded, _) = workflow_hydration::HydrationClaim::protect(claim, &self.client, async {
-            let pending = condition_input_order::pending_input(&wire["task"])?;
+            let pending = condition_input_order::read_claim(&wire["task"])?;
             self.client
                 .resolve_runtime_payloads(
                     &mut wire,

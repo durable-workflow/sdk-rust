@@ -79,7 +79,7 @@ pub struct WorkflowTaskHeartbeat {
 #[derive(Clone, Debug)]
 pub struct CooperativeWorkflowTask {
     task: WorkflowTask,
-    ordered_condition_pending_input: condition_input_order::PendingInput,
+    ordered_condition_claim: condition_input_order::Claim,
     cancellation_request: Option<CancellationRequest>,
     sticky_snapshot: Option<sticky_worker::StickySnapshot>,
     verified_payloads: runtime_payloads::VerifiedPayloads,
@@ -1387,7 +1387,7 @@ impl Client {
                 };
                 let mut claim = CooperativeWorkflowTask {
                     task,
-                    ordered_condition_pending_input: condition_input_order::pending_input(
+                    ordered_condition_claim: condition_input_order::read_claim(
                         &value["task"],
                     )
                     .map_err(|_| {
@@ -2132,7 +2132,7 @@ impl Worker {
         claim: &CooperativeWorkflowTask,
     ) -> Result<Option<WorkflowTaskDecision>> {
         let mut claimed_worker = self.clone();
-        claimed_worker.ordered_condition_pending_input = claim.ordered_condition_pending_input;
+        claimed_worker.ordered_condition_claim = claim.ordered_condition_claim;
         let mut verified_payloads = claim.verified_payloads.clone();
         let (owner, run_id) = cancellation_claim(&claim.task)?;
         if owner != self.worker_id {

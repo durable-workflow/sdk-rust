@@ -5094,7 +5094,7 @@ impl Client {
         transport_retries: usize,
     ) -> Result<(
         PollWorkflowTaskResponse,
-        condition_input_order::PendingInput,
+        condition_input_order::Claim,
     )> {
         let body = json!({
             "worker_id": worker_id,
@@ -5117,7 +5117,7 @@ impl Client {
             workflow_hydration::HydrationClaim::from_poll(&wire, worker_id, &self.namespace)?;
         let ((data, pending_input), _) =
             workflow_hydration::HydrationClaim::protect(claim, self, async {
-                let pending_input = condition_input_order::pending_input(&wire["task"])?;
+                let pending_input = condition_input_order::read_claim(&wire["task"])?;
                 self.resolve_runtime_payloads(
                     &mut wire,
                     "/worker/workflow-tasks/poll",
@@ -8707,7 +8707,7 @@ pub struct Worker {
     /// the `signal_external_workflow` command.
     signal_external_workflow_supported: Arc<AtomicBool>,
     condition_input_order_supported: Arc<AtomicBool>,
-    ordered_condition_pending_input: condition_input_order::PendingInput,
+    ordered_condition_claim: condition_input_order::Claim,
 }
 
 impl Worker {
@@ -8758,7 +8758,7 @@ impl Worker {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             signal_external_workflow_supported: Arc::new(AtomicBool::new(false)),
             condition_input_order_supported: Arc::new(AtomicBool::new(false)),
-            ordered_condition_pending_input: None,
+            ordered_condition_claim: condition_input_order::Claim::default(),
         }
     }
 
@@ -10269,7 +10269,7 @@ impl Worker {
             .unwrap_or_else(|| self.worker_id.clone());
 
         let mut claimed_worker = self.clone();
-        claimed_worker.ordered_condition_pending_input = pending_input;
+        claimed_worker.ordered_condition_claim = pending_input;
         let decision = match claimed_worker
             .execute_workflow_with_local_activities(task)
             .await
@@ -11586,7 +11586,8 @@ impl Worker {
             .load(Ordering::SeqCst);
         workflow_state.condition_input_order_supported =
             self.condition_input_order_supported.load(Ordering::SeqCst);
-        workflow_state.condition_wait_pending_input_sequence = self.ordered_condition_pending_input;
+        workflow_state.condition_wait_pending_input_sequence = self.ordered_condition_claim.pending_input;
+        workflow_state.condition_wait_input_order_authoring = self.ordered_condition_claim.authoring;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
         if let Some(canonical) = cancellation_history {
@@ -13852,6 +13853,7 @@ struct WorkflowState {
     /// `signal_external_workflow` command.
     signal_external_workflow_supported: bool,
     condition_input_order_supported: bool,
+    condition_wait_input_order_authoring: bool,
     condition_wait_pending_input_sequence: condition_input_order::PendingInput,
     condition_input_view: Option<condition_input_order::View>,
 }
@@ -14209,6 +14211,7 @@ impl WorkflowState {
             message_stream_waits: HashMap::new(),
             signal_external_workflow_supported: false,
             condition_input_order_supported: false,
+            condition_wait_input_order_authoring: false,
             condition_wait_pending_input_sequence: None,
             condition_input_view: None,
         })
@@ -18033,7 +18036,7 @@ impl ConditionWaitCall {
         ]);
         if let Some(timeout_seconds) = options.timeout_seconds {
             command.insert("timeout_seconds".to_string(), json!(timeout_seconds));
-            if !recorded_wait && state.condition_input_order_supported {
+            if !recorded_wait && state.condition_input_order_supported && state.condition_wait_input_order_authoring {
                 command.insert(
                     condition_input_order::CAPABILITY.into(),
                     json!(condition_input_order::ORDER),
@@ -26582,6 +26585,27 @@ mod tests {
         };
         assert_eq!(failure.reason, "timer_delay_mismatch");
         assert_eq!(failure.sequence, Some(1));
+    }
+
+    #[test]
+    fn ordered_condition_wait_requires_the_current_claim_to_author_new_history() {
+        for authoring in [false, true] {
+            let ctx = workflow_context(Vec::new());
+            {
+                let mut state = ctx.state.lock().unwrap();
+                state.condition_input_order_supported = true;
+                state.condition_wait_input_order_authoring = authoring;
+            }
+            let mut wait = Box::pin(ctx.wait_condition(
+                ConditionWaitOptions::new("approval", "approval-v1").timeout(Duration::from_secs(2)),
+                || Ok(false),
+            ));
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(wait.as_mut().poll(&mut task_context).is_pending());
+            let commands = ctx.take_commands().unwrap();
+            assert_eq!(commands[0]["type"], "open_condition_wait");
+            assert_eq!(condition_input_order::marked(&commands[0]), authoring);
+        }
     }
 
     #[test]

@@ -7,13 +7,20 @@ use std::{
 };
 
 pub(super) const CAPABILITY: &str = "condition_wait_input_order";
+const AUTHORING: &str = "condition_wait_input_order_authoring";
 pub(super) const ORDER: &str = "durable_receipt_order";
 
 /// An omitted snapshot differs from a snapshot with no outstanding receipts.
 pub(super) type PendingInput = Option<Option<u64>>;
 
-pub(super) fn pending_input(task: &Value) -> Result<PendingInput> {
-    match task.get("condition_wait_pending_input_sequence") {
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Claim {
+    pub(super) authoring: bool,
+    pub(super) pending_input: PendingInput,
+}
+
+pub(super) fn read_claim(task: &Value) -> Result<Claim> {
+    let pending_input = match task.get("condition_wait_pending_input_sequence") {
         None => Ok(None),
         Some(Value::Null) => Ok(Some(None)),
         Some(value) => value
@@ -23,7 +30,11 @@ pub(super) fn pending_input(task: &Value) -> Result<PendingInput> {
             .ok_or_else(|| {
                 crate::Error::Codec("invalid pending condition input history sequence".into())
             }),
-    }
+    }?;
+    Ok(Claim {
+        authoring: task[AUTHORING] == true,
+        pending_input,
+    })
 }
 
 pub(super) fn marked(payload: &Value) -> bool {
