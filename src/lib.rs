@@ -36420,6 +36420,7 @@ mod tests {
                 activity_checkpoint::CAPABILITY,
                 QUERY_TASKS_CAPABILITY,
                 WORKFLOW_UPDATES_CAPABILITY,
+                condition_input_order::CAPABILITY,
                 MESSAGE_STREAMS_CAPABILITY
             ])
         );
