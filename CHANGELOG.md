@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 4.22.1
+
+- Replay mismatches from direct activity, local activity and timer calls report
+  the authored filename and line where the future was created. The existing
+  replay reason and sequence remain available.
+- Require `url` 2.5.9 or later when resolving the SDK's HTTP dependencies
+  ([RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html)).
+
 ## 4.22.0
 
 - A failed cluster-info read no longer stops a running worker. Startup
