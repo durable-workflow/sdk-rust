@@ -38,6 +38,45 @@ fn history_sequence(event: &HistoryEvent) -> Option<u64> {
         .filter(|sequence| *sequence > 0)
 }
 
+pub(super) struct CompetingSelection {
+    terminal_id: String,
+    sequence: u64,
+}
+
+pub(super) fn competing_selection(
+    history: &[HistoryEvent],
+    group_id: &str,
+) -> Result<Option<CompetingSelection>> {
+    let mut candidates = history.iter().filter(|event| {
+        event.event_type == "SelectionCandidateReady"
+            && event.payload["selection_group_id"] == group_id
+    });
+    let Some(candidate) = candidates.next() else {
+        return Ok(None);
+    };
+    let invalid = || crate::Error::Codec("invalid ordered selection candidate evidence".into());
+    let terminal_id = candidate.payload["resolution_event_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(invalid)?;
+    let sequence = candidate.payload["resolution_event_sequence"]
+        .as_u64()
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(invalid)?;
+    if candidates.next().is_some()
+        || history_sequence(candidate).is_none_or(|recorded| recorded <= sequence)
+        || !history.iter().any(|event| {
+            history_sequence(event) == Some(sequence)
+                && event.raw.get("id").or_else(|| event.raw.get("event_id"))
+                    .and_then(Value::as_str) == Some(terminal_id)
+                && candidate.payload["resolution_event_type"] == event.event_type
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(Some(CompetingSelection { terminal_id: terminal_id.to_owned(), sequence }))
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Wait {
     pub(super) id: String,
@@ -116,6 +155,7 @@ impl Wait {
         &self,
         state: &Arc<Mutex<WorkflowState>>,
         predicate: &dyn Fn() -> Result<bool>,
+        competing: Option<&CompetingSelection>,
     ) -> Result<Option<Value>> {
         let (inputs, pending) = {
             let state = state
@@ -128,7 +168,9 @@ impl Wait {
             })?;
             (Arc::new(applied_receipts(&state.history_events)), pending)
         };
-        let boundary = [self.fire, pending]
+        let competing_position = competing.map(|candidate| candidate.sequence);
+        let terminal_boundary = [self.fire, competing_position].into_iter().flatten().min();
+        let boundary = [terminal_boundary, pending]
             .into_iter()
             .flatten()
             .min()
@@ -167,18 +209,18 @@ impl Wait {
                 Err(error) => final_error = Some(error),
             }
         }
-        if let Some(error) = final_error
-            .filter(|_| pending.is_none_or(|pending| self.fire.is_some_and(|fire| pending >= fire)))
+        if let Some(error) = final_error.filter(|_| {
+            pending.is_none_or(|pending| terminal_boundary.is_some_and(|terminal| pending >= terminal))
+        })
         {
             return Err(error);
         }
-        if self
-            .fire
-            .is_some_and(|fire| pending.is_none_or(|pending| pending >= fire))
-        {
-            return Ok(Some(
-                json!({"type":"resolve_condition_wait","condition_wait_id":self.id,"satisfied":false}),
-            ));
+        if let Some(terminal) = terminal_boundary.filter(|terminal| pending.is_none_or(|pending| pending >= *terminal)) {
+            let mut command = json!({"type":"resolve_condition_wait","condition_wait_id":self.id,"satisfied":false});
+            if let Some(candidate) = competing.filter(|candidate| candidate.sequence == terminal) {
+                command["competing_resolution_event_id"] = json!(candidate.terminal_id);
+            }
+            return Ok(Some(command));
         }
         Ok(None)
     }

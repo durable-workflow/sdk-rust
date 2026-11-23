@@ -17919,7 +17919,7 @@ impl ConditionWaitCall {
             .parallel_group_path
             .first()
             .filter(|entry| entry.parallel_group_mode.as_deref() == Some("select"));
-        {
+        let competing = {
             let mut state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
             if !state.condition_input_order_supported {
                 return Poll::Ready(Err(Error::WorkerLoop(
@@ -17935,8 +17935,11 @@ impl ConditionWaitCall {
                 state.matched_recorded_pending = true;
                 return Poll::Pending;
             }
-        }
-        let decision = wait.evaluate(&ctx.state, &*self.predicate)?;
+            selection.map(|entry| condition_input_order::competing_selection(
+                &state.history_events, &entry.parallel_group_id,
+            )).transpose()?.flatten()
+        };
+        let decision = wait.evaluate(&ctx.state, &*self.predicate, competing.as_ref())?;
         let mut state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
         if let Some(decision) = decision {
             let satisfied = decision["satisfied"] == true;
