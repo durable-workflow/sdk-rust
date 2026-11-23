@@ -4674,6 +4674,11 @@ impl Client {
             "max_concurrent_workflow_tasks": max_concurrent_workflow_tasks,
             "max_concurrent_activity_tasks": max_concurrent_activity_tasks
         });
+        if self.worker_protocol_version == WorkerProtocolVersion::V120 {
+            body["capability_manifest"][CONTINUE_AS_NEW_TARGET_CAPABILITY] = json!({
+                "supported": true, "minimum_protocol_version": CONTINUE_AS_NEW_TARGET_PROTOCOL,
+            });
+        }
         if capabilities
             .iter()
             .any(|capability| capability == "nexus_cooperative_cancellation")

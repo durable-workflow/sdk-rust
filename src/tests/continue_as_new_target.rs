@@ -10,6 +10,10 @@ const FAIL: &str = "/api/worker/workflow-tasks/continue-target-task/fail";
 fn respond(path: &str, body: &str, number: usize) -> Option<(&'static str, String)> {
     if path.ends_with("/worker/register") {
         let request: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            request["capability_manifest"][CONTINUE_AS_NEW_TARGET_CAPABILITY],
+            json!({"supported": true, "minimum_protocol_version": "1.21"}),
+        );
         let mut ack = json!({
             "registered": true,
             "worker_id": request["worker_id"],
