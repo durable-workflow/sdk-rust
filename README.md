@@ -567,6 +567,23 @@ Keep workflow command order deterministic:
 See the runnable [`workflow_testing`](examples/workflow_testing.rs) example and
 [`workflow_testing` tests](tests/workflow_testing.rs).
 
+### Choose the successor build when continuing as new
+
+`ctx.continue_as_new(args)` keeps the current run's build pin. To use the
+promoted build eligible for the successor's queue and workflow type, return
+`ctx.continue_as_new_with_target(ContinueAsNewOptions::new(),
+ContinueAsNewTarget::Promoted, args)` from the workflow handler. The successor
+starts with fresh history. Pass arguments that the promoted code can decode
+and accept.
+
+The worker requires an acknowledgement of explicit build targeting in its
+current registration. Both explicit targets return
+`Error::ContinueAsNewTargetUnsupported` locally without that acknowledgement.
+If no promoted build qualifies when the server admits the command, the worker
+reports `promoted_build_unavailable` on the same task attempt and the server
+applies its ordinary task retry policy. A committed continuation replays its
+recorded choice without looking up the current promotion.
+
 ## Workflow logging
 
 Use `ctx.logger()` for observations written from workflow code. It sends events

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-continue-as-new-promoted-cold-replay",
+  "protocol_version": "1.21",
+  "bindings": ["rust"],
+  "workflow": {"type": "corpus.continue-as-new-promoted", "input": [], "payload_codec": "avro"},
+  "history": [
+    {
+      "event_type": "WorkflowContinuedAsNew",
+      "payload": {
+        "sequence": 1,
+        "continued_to_run_id": "run-promoted",
+        "build_transition": {"from_compatibility": null, "to_compatibility": "build-b", "resolution": "promoted"}
+      }
+    }
+  ],
+  "expected": {
+    "waiting_for_history": true,
+    "task_failure": {"failure": {"type": "WorkflowTaskWaitingForHistory", "message": "Workflow task waiting for scheduled history."}}
+  }
+}

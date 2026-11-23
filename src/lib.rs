@@ -109,6 +109,9 @@ pub use worker_session::{WorkerSession, WorkerSessionOptions};
 
 pub const WORKER_PROTOCOL_VERSION: &str = "1.20";
 pub const MINIMUM_WORKER_PROTOCOL_VERSION: &str = "1.19";
+const CONTINUE_AS_NEW_TARGET_PROTOCOL: &str = "1.21";
+const CONTINUE_AS_NEW_TARGET_CAPABILITY: &str = "continue_as_new_target_build";
+const PROMOTED_BUILD_UNAVAILABLE: &str = "promoted_build_unavailable";
 
 /// Select the worker request protocol without enabling optional capabilities.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -505,6 +508,12 @@ pub enum Error {
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
     InvalidContinueAsNewOptions(#[from] ContinueAsNewOptionsError),
+    /// A raw continue-as-new command specified an invalid build target.
+    #[error("invalid_target_build: expected the exact inherited or promoted target")]
+    InvalidContinueAsNewTarget,
+    /// The current worker registration did not negotiate explicit build targets.
+    #[error("unsupported_target_build: the current worker registration does not support explicit continue-as-new targets")]
+    ContinueAsNewTargetUnsupported,
     #[doc(hidden)]
     #[error("workflow requested continue as new")]
     ContinueAsNew(ContinueAsNewRequest),
@@ -1341,6 +1350,32 @@ pub struct ContinueAsNewOptions {
     pub task_queue: Option<String>,
 }
 
+/// How the successor's build is selected at continue-as-new admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinueAsNewTarget {
+    /// Keep the predecessor's build pin.
+    Inherited,
+    /// Use the promoted build eligible for the successor's queue and type.
+    Promoted,
+}
+
+impl ContinueAsNewTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherited => "inherited",
+            Self::Promoted => "promoted",
+        }
+    }
+
+    fn parse(value: &Value) -> Option<Self> {
+        match value.as_str()? {
+            "inherited" => Some(Self::Inherited),
+            "promoted" => Some(Self::Promoted),
+            _ => None,
+        }
+    }
+}
+
 impl ContinueAsNewOptions {
     pub fn new() -> Self {
         Self::default()
@@ -1394,6 +1429,7 @@ pub struct WorkflowHistoryBudget {
 pub struct ContinueAsNewRequest {
     arguments: AvroValue,
     options: ContinueAsNewOptions,
+    target_build: Option<ContinueAsNewTarget>,
 }
 
 impl WorkflowCommandOptions {
@@ -3487,6 +3523,7 @@ pub struct Client {
     worker_sessions_enabled: bool,
     max_concurrent_worker_sessions: usize,
     worker_build_id: Option<String>,
+    continue_as_new_registrations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     sticky_cache: Option<Arc<Mutex<sticky_workflow_cache::StickyWorkflowCache>>>,
     runtime_upload_policy: Arc<Mutex<runtime_uploads::PolicyCache>>,
     failure_request_limit: Arc<AtomicUsize>,
@@ -4605,6 +4642,10 @@ impl Client {
         workflow_command_contracts: Value,
         workflow_definition_fingerprints: Option<BTreeMap<String, String>>,
     ) -> Result<RegisterWorkerResponse> {
+        let target_support = Arc::new(AtomicBool::new(false));
+        if let Ok(mut registrations) = self.continue_as_new_registrations.lock() {
+            registrations.insert(worker_id.to_owned(), Arc::clone(&target_support));
+        }
         if let Some(contracts) = workflow_command_contracts.as_object() {
             for (workflow_type, contract) in contracts {
                 let Some(update_validators) = contract.get("update_validators") else {
@@ -4776,7 +4817,35 @@ impl Client {
                 return Err(error);
             }
         }
-        Ok(serde_json::from_value(response)?)
+        let target_confirmed = self.worker_protocol_version == WorkerProtocolVersion::V120
+            && response["registered"] == true
+            && response["worker_id"].as_str() == Some(worker_id)
+            && response["namespace"].as_str() == Some(self.namespace.as_str())
+            && response["task_queue"].as_str() == Some(task_queue)
+            && response["server_capabilities"][CONTINUE_AS_NEW_TARGET_CAPABILITY] == true
+            && response["protocol_version"]
+                .as_str()
+                .and_then(|version| version.strip_prefix("1."))
+                .filter(|minor| {
+                    !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .and_then(|minor| minor.parse::<u64>().ok())
+                .is_some_and(|minor| minor >= 21);
+        let response = serde_json::from_value(response)?;
+        target_support.store(target_confirmed, Ordering::SeqCst);
+        Ok(response)
+    }
+
+    fn worker_supports_continue_as_new_target(&self, worker_id: &str) -> bool {
+        self.continue_as_new_registrations
+            .lock()
+            .ok()
+            .and_then(|registrations| {
+                registrations
+                    .get(worker_id)
+                    .map(|supported| supported.load(Ordering::SeqCst))
+            })
+            .unwrap_or(false)
     }
 
     /// Gracefully remove one worker's registration through the worker plane.
@@ -4788,6 +4857,9 @@ impl Client {
         &self,
         worker_id: &str,
     ) -> Result<WorkerDeregistrationEnvelope> {
+        if let Ok(mut registrations) = self.continue_as_new_registrations.lock() {
+            registrations.remove(worker_id);
+        }
         let path = format!(
             "/worker/registrations/{}",
             percent_encode_path_segment(worker_id)
@@ -5150,6 +5222,20 @@ impl Client {
         message_stream_waits: Vec<Value>,
         sticky_cache: Option<Value>,
     ) -> Result<Value> {
+        let target_supported = self.worker_supports_continue_as_new_target(lease_owner);
+        let mut continuation = false;
+        for command in &commands {
+            let is_continuation = command["type"] == "continue_as_new";
+            if let Some(target) = command.get("target_build") {
+                if !is_continuation || ContinueAsNewTarget::parse(target).is_none() {
+                    return Err(Error::InvalidContinueAsNewTarget);
+                }
+                if !target_supported {
+                    return Err(Error::ContinueAsNewTargetUnsupported);
+                }
+            }
+            continuation |= is_continuation;
+        }
         validate_workflow_task_commands(&commands)?;
         let has_message_stream_metadata =
             !message_stream_cursors.is_empty() || !message_stream_waits.is_empty();
@@ -5165,7 +5251,9 @@ impl Client {
             &commands,
             has_message_stream_metadata,
         );
-        let protocol_version = if sticky_cache.is_some()
+        let protocol_version = if continuation && target_supported {
+            CONTINUE_AS_NEW_TARGET_PROTOCOL
+        } else if sticky_cache.is_some()
             && protocol_version
                 .strip_prefix("1.")
                 .and_then(|minor| minor.parse::<u64>().ok())
@@ -5263,19 +5351,21 @@ impl Client {
         workflow_task_attempt: u64,
         failure: Value,
     ) -> Result<Value> {
+        let protocol = if failure["reason"] == PROMOTED_BUILD_UNAVAILABLE
+            && self.worker_supports_continue_as_new_target(lease_owner)
+        {
+            RequestProtocol::Worker(CONTINUE_AS_NEW_TARGET_PROTOCOL)
+        } else {
+            RequestProtocol::DefaultWorker
+        };
         let body = json!({
             "lease_owner": lease_owner,
             "workflow_task_attempt": workflow_task_attempt,
             "failure": failure,
         });
         let path = format!("/worker/workflow-tasks/{task_id}/fail");
-        self.request_json(
-            reqwest::Method::POST,
-            &path,
-            RequestProtocol::DefaultWorker,
-            Some(&body),
-        )
-        .await
+        self.request_json(reqwest::Method::POST, &path, protocol, Some(&body))
+            .await
     }
 
     pub async fn poll_activity_task(
@@ -5555,6 +5645,14 @@ impl Client {
     }
 
     fn worker_request_protocol(&self, protocol: RequestProtocol) -> Result<RequestProtocol> {
+        // Only the negotiated task report uses 1.21. Keep auxiliary discovery
+        // and payload uploads/downloads on the configured worker protocol.
+        let protocol = match protocol {
+            RequestProtocol::Worker(CONTINUE_AS_NEW_TARGET_PROTOCOL) => {
+                RequestProtocol::DefaultWorker
+            }
+            other => other,
+        };
         Ok(match protocol {
             RequestProtocol::DefaultWorker | RequestProtocol::Worker(_) => {
                 let selected = self.worker_protocol_version.as_str();
@@ -5617,6 +5715,10 @@ impl Client {
     ) -> Result<T> {
         #[cfg(feature = "telemetry")]
         self.begin_observability_discovery(&method, path);
+        let continuation_report = matches!(
+            protocol,
+            RequestProtocol::Worker(CONTINUE_AS_NEW_TARGET_PROTOCOL)
+        );
         let protocol = self.worker_request_protocol(protocol)?;
         let auth_token = self.auth_token(protocol)?;
         let mut request = self
@@ -5635,6 +5737,11 @@ impl Client {
                 );
             }
             RequestProtocol::Worker(version) => {
+                let version = if continuation_report {
+                    CONTINUE_AS_NEW_TARGET_PROTOCOL
+                } else {
+                    version
+                };
                 request = request.header("X-Durable-Workflow-Protocol-Version", version);
             }
             RequestProtocol::ControlPlane => {
@@ -5808,12 +5915,17 @@ impl Client {
                                 ),
                             )
                             .await;
-                            let full = info.as_ref().ok().and_then(|info| {
+                            let mut full = info.as_ref().ok().and_then(|info| {
                                 info["worker_protocol"]["server_capabilities"]
                                     .as_object()
                                     .filter(|full| !full.contains_key("digest"))
                                     .cloned()
                             });
+                            if path == "/worker/register" {
+                                if let Some(full) = &mut full {
+                                    full.remove(CONTINUE_AS_NEW_TARGET_CAPABILITY);
+                                }
+                            }
                             if full.is_none() {
                                 tracing::warn!(
                                     target: "durable_workflow::worker",
@@ -6838,6 +6950,18 @@ fn worker_backend_unavailable_body(error: &Error) -> Option<Value> {
     (body.get("reason")?.as_str()? == "backend_unavailable").then_some(body)
 }
 
+fn is_promoted_build_refusal(error: &Error) -> bool {
+    let Error::Http { status, body } = error else {
+        return false;
+    };
+    *status == reqwest::StatusCode::CONFLICT
+        && serde_json::from_str::<Value>(body).is_ok_and(|body| {
+            body["reason"] == PROMOTED_BUILD_UNAVAILABLE
+                && body.get("request_admitted") == Some(&Value::Bool(false))
+                && body.get("retryable") == Some(&Value::Bool(true))
+        })
+}
+
 fn worker_operation_is_explicitly_non_retryable(error: &Error) -> bool {
     let Error::Http { body, .. } = error else {
         return false;
@@ -7133,6 +7257,7 @@ impl ClientBuilder {
             worker_sessions_enabled: false,
             max_concurrent_worker_sessions: 10,
             worker_build_id: None,
+            continue_as_new_registrations: Arc::default(),
             sticky_cache: None,
             runtime_upload_policy: Arc::new(Mutex::new([None, None])),
             failure_request_limit: Arc::new(AtomicUsize::new(failure_reporting::REQUEST_BYTES)),
@@ -10248,6 +10373,9 @@ impl Worker {
                     .await
             }
             Ok(decision) => {
+                let promoting = decision.commands.iter().any(|command| {
+                    command["type"] == "continue_as_new" && command["target_build"] == "promoted"
+                });
                 let sticky_claim = self.sticky_claim(snapshot.as_ref(), &decision.commands)?;
                 match self
                     .client
@@ -10262,6 +10390,21 @@ impl Worker {
                     )
                     .await
                 {
+                    Err(error) if promoting && is_promoted_build_refusal(&error) => {
+                        self.discard_sticky_snapshot(snapshot.as_ref())?;
+                        self.client
+                            .fail_workflow_task_with_failure(
+                                task_id,
+                                lease_owner,
+                                attempt,
+                                json!({
+                                    "message": "No selectable promoted build serves the successor's queue and workflow type",
+                                    "type": "PromotedBuildUnavailable",
+                                    "reason": PROMOTED_BUILD_UNAVAILABLE,
+                                }),
+                            )
+                            .await
+                    }
                     Err(
                         error @ (Error::WorkflowTaskCompletionTooLarge(_)
                         | Error::WorkflowTaskHistoryLimitExceeded(_)),
@@ -10281,6 +10424,10 @@ impl Worker {
                 }
             }
             Err(error @ Error::CancellationScopeExecutionUnavailable) => return Err(error),
+            Err(error @ Error::ContinueAsNewTargetUnsupported) => {
+                self.discard_sticky_snapshot(snapshot.as_ref())?;
+                return Err(error);
+            }
             Err(error @ Error::FailureReporting(_)) => {
                 self.discard_sticky_snapshot(snapshot.as_ref())?;
                 return Err(error);
@@ -11142,6 +11289,7 @@ impl Worker {
                 // Query replay never submits commands, so an external signal
                 // past the recorded history waits like any new command.
                 replayed_state.signal_external_workflow_supported = true;
+                let has_recorded_continuation = replayed_state.recorded_continue_as_new.is_some();
                 let workflow_state = Arc::new(Mutex::new(replayed_state));
                 let workflow_context = WorkflowContext {
                     state: workflow_state,
@@ -11173,6 +11321,20 @@ impl Worker {
                     invocation.future.as_mut().poll(&mut cx)
                 };
                 match outcome {
+                    Poll::Ready(Err(Error::ContinueAsNew(request)))
+                        if has_recorded_continuation =>
+                    {
+                        workflow_context
+                            .continue_as_new_command(request)
+                            .and_then(|_| workflow_context.ensure_history_consumed())
+                            .map_err(|error| {
+                                QueryTaskExecutionFailure::new(
+                                    "query_workflow_state_unavailable",
+                                    format!("workflow replay failed before query: {error}"),
+                                    "QueryWorkflowStateUnavailable",
+                                )
+                            })?;
+                    }
                     Poll::Ready(Ok(_)) => {
                         workflow_context
                             .ensure_history_consumed()
@@ -11387,6 +11549,10 @@ impl Worker {
             },
         )?;
         workflow_state.observation_namespace = Some(self.client.namespace.clone());
+        workflow_state.continue_as_new_target_supported =
+            self.client.worker_supports_continue_as_new_target(
+                task.lease_owner.as_deref().unwrap_or(&self.worker_id),
+            );
         workflow_state.signal_external_workflow_supported = self
             .signal_external_workflow_supported
             .load(Ordering::SeqCst);
@@ -12366,10 +12532,43 @@ impl WorkflowContext {
         options: ContinueAsNewOptions,
         args: T,
     ) -> Result<Value> {
+        self.request_continue_as_new(options, None, args)
+    }
+
+    /// Continue on an explicitly selected build. The successor must be able to
+    /// decode and accept the supplied arguments on that build.
+    ///
+    /// On a new execution, the current worker registration must acknowledge
+    /// build targets. Otherwise the authoring call returns
+    /// [`Error::ContinueAsNewTargetUnsupported`] and the worker sends no report.
+    pub fn continue_as_new_with_target<T: Serialize>(
+        &self,
+        options: ContinueAsNewOptions,
+        target: ContinueAsNewTarget,
+        args: T,
+    ) -> Result<Value> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::WorkflowStatePoisoned)?;
+        if state.recorded_continue_as_new.is_none() && !state.continue_as_new_target_supported {
+            return Err(Error::ContinueAsNewTargetUnsupported);
+        }
+        drop(state);
+        self.request_continue_as_new(options, Some(target), args)
+    }
+
+    fn request_continue_as_new<T: Serialize>(
+        &self,
+        options: ContinueAsNewOptions,
+        target_build: Option<ContinueAsNewTarget>,
+        args: T,
+    ) -> Result<Value> {
         options.validate()?;
         Err(Error::ContinueAsNew(ContinueAsNewRequest {
             arguments: normalize_avro_arguments(AvroValue::from_serialize(&args)?),
             options,
+            target_build,
         }))
     }
 
@@ -13419,7 +13618,19 @@ impl WorkflowContext {
         if let Some(recorded) = state.recorded_commands.get(state.command_cursor).cloned() {
             return Err(command_mismatch(&recorded, "continue as new"));
         }
-        if state.recorded_continue_as_new_sequence.is_some() {
+        if let Some(recorded) = &state.recorded_continue_as_new {
+            let target = request
+                .target_build
+                .unwrap_or(ContinueAsNewTarget::Inherited);
+            if recorded.target != target {
+                return Err(invalid_recorded_history(
+                    "continue_as_new_target_mismatch",
+                    recorded.sequence,
+                    recorded.target.as_str(),
+                    target.as_str(),
+                    "replayed continue-as-new requested a different build target",
+                ));
+            }
             state.continue_as_new_consumed = true;
             return Ok(None);
         }
@@ -13435,6 +13646,9 @@ impl WorkflowContext {
         }
         if let Some(task_queue) = request.options.task_queue {
             command.insert("queue".to_string(), json!(task_queue));
+        }
+        if let Some(target) = request.target_build {
+            command.insert("target_build".to_string(), json!(target.as_str()));
         }
         Ok(Some(Value::Object(command)))
     }
@@ -13491,13 +13705,14 @@ impl WorkflowContext {
                 "workflow completed without reaching its committed cancellation boundary",
             ));
         }
-        if let Some(sequence) = state
-            .recorded_continue_as_new_sequence
+        if let Some(recorded) = state
+            .recorded_continue_as_new
+            .as_ref()
             .filter(|_| !state.continue_as_new_consumed)
         {
             return Err(Error::NonDeterministicReplay(ReplayFailure::new(
                 "recorded_continue_as_new_unconsumed",
-                Some(sequence),
+                Some(recorded.sequence),
                 Some("continue as new".to_string()),
                 Some("workflow completion".to_string()),
                 "workflow completed without consuming its recorded continue-as-new transition",
@@ -13580,8 +13795,9 @@ struct WorkflowState {
     selection_markers: Vec<SelectionMarker>,
     selection_marker_cursor: usize,
     cancelled_selection_members: Vec<SelectionCancellation>,
-    recorded_continue_as_new_sequence: Option<u64>,
+    recorded_continue_as_new: Option<RecordedContinueAsNew>,
     continue_as_new_consumed: bool,
+    continue_as_new_target_supported: bool,
     command_cursor: usize,
     condition_wait_occurrence_counter: u64,
     matched_recorded_pending: bool,
@@ -13623,6 +13839,50 @@ fn settled_at_run_close(event: &HistoryEvent) -> bool {
 fn history_observed_by_workflow(mut history: Vec<HistoryEvent>) -> Vec<HistoryEvent> {
     history.retain(|event| !settled_at_run_close(event));
     history
+}
+
+#[derive(Debug)]
+struct RecordedContinueAsNew {
+    sequence: u64,
+    target: ContinueAsNewTarget,
+}
+
+impl RecordedContinueAsNew {
+    fn from_event(event: &HistoryEvent) -> Result<Self> {
+        let sequence = durable_event_sequence(event).ok_or_else(|| {
+            Error::NonDeterministicReplay(ReplayFailure::new(
+                "continue_as_new_sequence_missing",
+                None,
+                Some("recorded transition sequence".to_string()),
+                Some("missing sequence".to_string()),
+                "WorkflowContinuedAsNew history is missing its recorded sequence",
+            ))
+        })?;
+        let target = match event.payload.get("build_transition") {
+            None => ContinueAsNewTarget::Inherited,
+            Some(transition) => {
+                let has_markers = ["from_compatibility", "to_compatibility"]
+                    .iter()
+                    .all(|field| {
+                        transition
+                            .get(field)
+                            .is_some_and(|value| value.is_null() || value.is_string())
+                    });
+                ContinueAsNewTarget::parse(&transition["resolution"])
+                    .filter(|_| has_markers)
+                    .ok_or_else(|| {
+                        invalid_recorded_history(
+                            "continue_as_new_build_transition_invalid",
+                            sequence,
+                            "recorded resolution and both nullable build markers",
+                            "invalid build transition",
+                            "WorkflowContinuedAsNew history contains malformed build metadata",
+                        )
+                    })?
+            }
+        };
+        Ok(Self { sequence, target })
+    }
 }
 
 impl WorkflowState {
@@ -13790,19 +14050,9 @@ impl WorkflowState {
                 "workflow history records one continue-as-new transition more than once",
             ));
         }
-        let recorded_continue_as_new_sequence = recorded_continue_as_new
+        let recorded_continue_as_new = recorded_continue_as_new
             .first()
-            .map(|event| {
-                durable_event_sequence(event).ok_or_else(|| {
-                    Error::NonDeterministicReplay(ReplayFailure::new(
-                        "continue_as_new_sequence_missing",
-                        None,
-                        Some("recorded transition sequence".to_string()),
-                        Some("missing sequence".to_string()),
-                        "WorkflowContinuedAsNew history is missing its recorded sequence",
-                    ))
-                })
-            })
+            .map(|event| RecordedContinueAsNew::from_event(event))
             .transpose()?;
         let mut message_stream_cursors = HashMap::new();
         for event in &history {
@@ -13903,8 +14153,9 @@ impl WorkflowState {
             selection_markers,
             selection_marker_cursor: 0,
             cancelled_selection_members,
-            recorded_continue_as_new_sequence,
+            recorded_continue_as_new,
             continue_as_new_consumed: false,
+            continue_as_new_target_supported: false,
             command_cursor: 0,
             condition_wait_occurrence_counter: 0,
             matched_recorded_pending: false,
@@ -20691,6 +20942,7 @@ fn workflow_task_integrity_error(error: &Error) -> bool {
         Error::NonDeterministicReplay(_)
             | Error::Protocol(_)
             | Error::CancellationScopeExecutionUnavailable
+            | Error::ContinueAsNewTargetUnsupported
             | Error::SignalExternalWorkflowUnavailable
             | Error::MissingWorkflowCommandIdentity
             | Error::WorkflowStatePoisoned
@@ -21118,6 +21370,7 @@ mod tests {
     mod child_workflow_policies;
     mod completion_limits;
     mod condition_fingerprint;
+    mod continue_as_new_target;
     mod cooperative_cancellation;
     mod external_signal;
     mod history_transaction_limit;
