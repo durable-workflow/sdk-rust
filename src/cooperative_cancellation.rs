@@ -79,6 +79,7 @@ pub struct WorkflowTaskHeartbeat {
 #[derive(Clone, Debug)]
 pub struct CooperativeWorkflowTask {
     task: WorkflowTask,
+    ordered_condition_claim: condition_input_order::Claim,
     cancellation_request: Option<CancellationRequest>,
     sticky_snapshot: Option<sticky_worker::StickySnapshot>,
     verified_payloads: runtime_payloads::VerifiedPayloads,
@@ -1386,6 +1387,12 @@ impl Client {
                 };
                 let mut claim = CooperativeWorkflowTask {
                     task,
+                    ordered_condition_claim: condition_input_order::read_claim(&value["task"])
+                        .map_err(|_| {
+                            invalid(
+                                "cooperative poll returned an invalid condition admission snapshot",
+                            )
+                        })?,
                     cancellation_request,
                     sticky_snapshot: None,
                     verified_payloads,
@@ -2124,6 +2131,8 @@ impl Worker {
         &self,
         claim: &CooperativeWorkflowTask,
     ) -> Result<Option<WorkflowTaskDecision>> {
+        let mut claimed_worker = self.clone();
+        claimed_worker.ordered_condition_claim = claim.ordered_condition_claim;
         let mut verified_payloads = claim.verified_payloads.clone();
         let (owner, run_id) = cancellation_claim(&claim.task)?;
         if owner != self.worker_id {
@@ -2140,7 +2149,7 @@ impl Worker {
                 ));
             }
             for _ in 0..1000 {
-                let mut decision = self.execute_workflow_task_decision(task.clone())?;
+                let mut decision = claimed_worker.execute_workflow_task_decision(task.clone())?;
                 if let Some(intent) = decision.cancellation_scope_delivery.as_ref() {
                     if !decision.commands.is_empty() {
                         decision.cancellation_scope_delivery = None;
@@ -2204,7 +2213,7 @@ impl Worker {
             // remeasured, so do not expose the old snapshot's size as current.
             task.total_history_events = None;
             task.history_size_bytes = None;
-            let mut decision = self.execute_workflow_task_decision_with_cancellation(
+            let mut decision = claimed_worker.execute_workflow_task_decision_with_cancellation(
                 task.clone(),
                 Some(observation),
             )?;

@@ -522,6 +522,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.memo-signed-zero"
             | "corpus.search-attribute-type-mismatch"
             | "corpus.condition-search"
+            | "corpus.recorded-ordered-condition"
             | "corpus.condition-search-adjacent"
             | "corpus.grouped-condition-reopen"
             | "corpus.grouped-condition-timed-reopen"
@@ -1238,6 +1239,18 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
                     SearchAttributeUpdate::new().string("customer_tier", "gold")?,
                 )?;
                 Ok(json!("unreachable"))
+            });
+        }
+        "corpus.recorded-ordered-condition" => {
+            worker.register_workflow(workflow_type, |ctx, _| async move {
+                let outcome = ctx
+                    .wait_condition(
+                        ConditionWaitOptions::new("approval", "approval-v1")
+                            .timeout(Duration::from_secs(2)),
+                        || Ok(false),
+                    )
+                    .await?;
+                Ok(json!(outcome == ConditionWaitResult::Satisfied))
             });
         }
         "corpus.condition-search" => {

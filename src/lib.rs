@@ -10,6 +10,7 @@ mod cancellation_replay_clock;
 mod cancellation_scope;
 mod cancellation_scope_history;
 mod cancellation_scope_replay;
+mod condition_input_order;
 mod cooperative_cancellation;
 mod external_signal;
 mod failure_reporting;
@@ -5081,6 +5082,7 @@ impl Client {
             1,
         )
         .await
+        .map(|(response, _)| response)
     }
 
     async fn poll_workflow_task_response_with_request_id(
@@ -5090,7 +5092,7 @@ impl Client {
         timeout: Duration,
         poll_request_id: &str,
         transport_retries: usize,
-    ) -> Result<PollWorkflowTaskResponse> {
+    ) -> Result<(PollWorkflowTaskResponse, condition_input_order::Claim)> {
         let body = json!({
             "worker_id": worker_id,
             "task_queue": task_queue,
@@ -5110,26 +5112,28 @@ impl Client {
         let ready_age = metrics::ready_age_from_poll(&wire);
         let claim =
             workflow_hydration::HydrationClaim::from_poll(&wire, worker_id, &self.namespace)?;
-        let (data, _) = workflow_hydration::HydrationClaim::protect(claim, self, async {
-            self.resolve_runtime_payloads(
-                &mut wire,
-                "/worker/workflow-tasks/poll",
-                RequestProtocol::Worker(self.worker_protocol_version.as_str()),
-            )
+        let ((data, pending_input), _) =
+            workflow_hydration::HydrationClaim::protect(claim, self, async {
+                let pending_input = condition_input_order::read_claim(&wire["task"])?;
+                self.resolve_runtime_payloads(
+                    &mut wire,
+                    "/worker/workflow-tasks/poll",
+                    RequestProtocol::Worker(self.worker_protocol_version.as_str()),
+                )
+                .await?;
+                let mut data: PollWorkflowTaskResponse = serde_json::from_value(wire)?;
+                if let Some(task) = data.task.as_mut() {
+                    self.fetch_remaining_workflow_history(worker_id, task)
+                        .await?;
+                }
+                Ok((data, pending_input))
+            })
             .await?;
-            let mut data: PollWorkflowTaskResponse = serde_json::from_value(wire)?;
-            if let Some(task) = data.task.as_mut() {
-                self.fetch_remaining_workflow_history(worker_id, task)
-                    .await?;
-            }
-            Ok(data)
-        })
-        .await?;
         if data.task.is_some() {
             self.worker_dispatch_metrics
                 .ready_age("workflow", task_queue, ready_age);
         }
-        Ok(data)
+        Ok((data, pending_input))
     }
 
     async fn fetch_remaining_workflow_history(
@@ -8699,6 +8703,8 @@ pub struct Worker {
     /// Whether the latest workflow poll's `server_capabilities` advertised
     /// the `signal_external_workflow` command.
     signal_external_workflow_supported: Arc<AtomicBool>,
+    condition_input_order_supported: Arc<AtomicBool>,
+    ordered_condition_claim: condition_input_order::Claim,
 }
 
 impl Worker {
@@ -8748,6 +8754,8 @@ impl Worker {
             resource_capabilities: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             signal_external_workflow_supported: Arc::new(AtomicBool::new(false)),
+            condition_input_order_supported: Arc::new(AtomicBool::new(false)),
+            ordered_condition_claim: condition_input_order::Claim::default(),
         }
     }
 
@@ -8756,6 +8764,10 @@ impl Worker {
     fn observe_workflow_poll_capabilities(&self, capabilities: Option<&Value>) {
         self.signal_external_workflow_supported.store(
             external_signal::runtime_supports(capabilities),
+            Ordering::SeqCst,
+        );
+        self.condition_input_order_supported.store(
+            capabilities.is_some_and(condition_input_order::marked),
             Ordering::SeqCst,
         );
     }
@@ -9824,6 +9836,7 @@ impl Worker {
                         .then(|| "nexus_cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
+                    Some(condition_input_order::CAPABILITY.to_string()),
                     worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
                         .then(|| MESSAGE_STREAMS_CAPABILITY.to_string()),
                 ]
@@ -10225,7 +10238,9 @@ impl Worker {
             .await;
         poll_metrics.poll(&response, |value| value.0.outcome());
         drop(poll_metrics);
-        let Some((response, snapshot)) = self.settle_worker_poll_response(response).await? else {
+        let Some((response, snapshot, pending_input)) =
+            self.settle_worker_poll_response(response).await?
+        else {
             return Ok(ManagedPollOutcome::Idle);
         };
         if response.outcome().should_stop() {
@@ -10250,7 +10265,12 @@ impl Worker {
             .clone()
             .unwrap_or_else(|| self.worker_id.clone());
 
-        let decision = match self.execute_workflow_with_local_activities(task).await {
+        let mut claimed_worker = self.clone();
+        claimed_worker.ordered_condition_claim = pending_input;
+        let decision = match claimed_worker
+            .execute_workflow_with_local_activities(task)
+            .await
+        {
             Ok(Some(decision)) => Ok(decision),
             Ok(None) => {
                 task_metrics.outcome("expired");
@@ -11561,6 +11581,12 @@ impl Worker {
         workflow_state.signal_external_workflow_supported = self
             .signal_external_workflow_supported
             .load(Ordering::SeqCst);
+        workflow_state.condition_input_order_supported =
+            self.condition_input_order_supported.load(Ordering::SeqCst);
+        workflow_state.condition_wait_pending_input_sequence =
+            self.ordered_condition_claim.pending_input;
+        workflow_state.condition_wait_input_order_authoring =
+            self.ordered_condition_claim.authoring;
         workflow_state.history_budget = history_budget;
         workflow_state.workflow_command_identity = workflow_command_identity;
         if let Some(canonical) = cancellation_history {
@@ -12916,6 +12942,10 @@ impl WorkflowContext {
             .filter(|event| {
                 event.event_type == "SignalReceived"
                     && event.payload.get("signal_name").and_then(Value::as_str) == Some(signal_name)
+                    && state
+                        .condition_input_view
+                        .as_ref()
+                        .is_none_or(|view| view.includes(event))
             })
             .map(|event| decode_signal_event_arguments(event, &state.payload_codec))
             .collect()
@@ -12952,6 +12982,10 @@ impl WorkflowContext {
                 "UpdateAccepted" | "UpdateApplied"
             ) || event.payload.get("update_name").and_then(Value::as_str) != Some(update_name)
                 || event.payload.get("arguments").is_none()
+                || state
+                    .condition_input_view
+                    .as_ref()
+                    .is_some_and(|view| !view.includes(event))
             {
                 continue;
             }
@@ -13817,6 +13851,10 @@ struct WorkflowState {
     /// Whether the Server that delivered this task advertises the
     /// `signal_external_workflow` command.
     signal_external_workflow_supported: bool,
+    condition_input_order_supported: bool,
+    condition_wait_input_order_authoring: bool,
+    condition_wait_pending_input_sequence: condition_input_order::PendingInput,
+    condition_input_view: Option<condition_input_order::View>,
 }
 
 /// `cancellation_reason` of an `ActivityCancelled` that the run's own close
@@ -14171,6 +14209,10 @@ impl WorkflowState {
             message_stream_cursors,
             message_stream_waits: HashMap::new(),
             signal_external_workflow_supported: false,
+            condition_input_order_supported: false,
+            condition_wait_input_order_authoring: false,
+            condition_wait_pending_input_sequence: None,
+            condition_input_view: None,
         })
     }
 }
@@ -14295,6 +14337,7 @@ enum RecordedCommand {
         predicate_identity: String,
         timeout_seconds: Option<u64>,
         result: Option<ConditionWaitResult>,
+        ordered_wait: Option<condition_input_order::Wait>,
         parallel_group_path: Option<Vec<ParallelGroupMetadata>>,
     },
     SearchAttributes {
@@ -16503,11 +16546,12 @@ fn validated_selection_resolution_sequence(
         if !terminal_types.contains(&event.event_type.as_str()) {
             continue;
         }
-        if matches!(command, RecordedCommand::ConditionWait { .. }) {
+        if let RecordedCommand::ConditionWait { ordered_wait, .. } = command {
             if !(matches!(
                 event.event_type.as_str(),
                 "ConditionWaitSatisfied" | "ConditionWaitTimedOut"
-            ) || (event.event_type == "TimerFired"
+            ) || (ordered_wait.is_none()
+                && event.event_type == "TimerFired"
                 && event.payload.get("timer_kind").and_then(Value::as_str)
                     == Some("condition_timeout")))
             {
@@ -17598,7 +17642,7 @@ impl Future for ConditionWaitCall {
             }
         };
 
-        let recorded_result = {
+        let (recorded_result, ordered_wait) = {
             let mut state = match ctx.state.lock() {
                 Ok(state) => state,
                 Err(_) => return Poll::Ready(Err(Error::WorkflowStatePoisoned)),
@@ -17623,6 +17667,7 @@ impl Future for ConditionWaitCall {
 
             let mut cursor = state.command_cursor;
             let mut result = None;
+            let mut ordered_wait = None;
             let mut pending_delivery = false;
             let mut first_sequence = None;
             let mut latest_timeout_seconds = None;
@@ -17649,6 +17694,7 @@ impl Future for ConditionWaitCall {
                     ref predicate_identity,
                     timeout_seconds,
                     result: recorded_result,
+                    ordered_wait: recorded_ordered_wait,
                     ref parallel_group_path,
                     ..
                 }) = recorded
@@ -17714,6 +17760,7 @@ impl Future for ConditionWaitCall {
                     Err(error) => return Poll::Ready(Err(error)),
                 }
                 result = recorded_result;
+                ordered_wait = recorded_ordered_wait;
                 if result.is_some() {
                     state.consume_replay_sequence(sequence, &self.parallel_group_path);
                 }
@@ -17725,7 +17772,7 @@ impl Future for ConditionWaitCall {
                 self.opened_wait = true;
                 return Poll::Pending;
             }
-            match (result, first_sequence) {
+            let result = match (result, first_sequence) {
                 // A grouped (parallel or select) reopen keeps the authored
                 // timeout while the history does: the PHP Server accepts a
                 // grouped reopen only when its timeout equals both the original
@@ -17739,7 +17786,7 @@ impl Future for ConditionWaitCall {
                 {
                     None
                 }
-                (None, Some(first_sequence)) => {
+                (None, Some(first_sequence)) if ordered_wait.is_none() => {
                     // The logical wait stays open: its deadline is fixed at the
                     // first physical open, not reset by a wake that left the
                     // predicate false.
@@ -17752,11 +17799,16 @@ impl Future for ConditionWaitCall {
                     None
                 }
                 (result, _) => result,
-            }
+            };
+            (result, ordered_wait)
         };
 
         if let Some(result) = recorded_result {
             return Poll::Ready(Ok(result));
+        }
+
+        if let Some(wait) = ordered_wait {
+            return self.poll_ordered_condition(wait);
         }
 
         self.poll_open_condition(options, true)
@@ -17860,6 +17912,61 @@ fn condition_reopen_timeout(
 }
 
 impl ConditionWaitCall {
+    fn poll_ordered_condition(
+        mut self: Pin<&mut Self>,
+        wait: condition_input_order::Wait,
+    ) -> Poll<Result<ConditionWaitResult>> {
+        let ctx = self.ctx.clone();
+        let selection = self
+            .parallel_group_path
+            .first()
+            .filter(|entry| entry.parallel_group_mode.as_deref() == Some("select"));
+        let competing = {
+            let mut state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+            if !state.condition_input_order_supported {
+                return Poll::Ready(Err(Error::WorkerLoop(
+                    "Server did not negotiate ordered condition input replay".into(),
+                )));
+            }
+            if selection.is_some_and(|entry| {
+                state
+                    .selection_markers
+                    .iter()
+                    .any(|marker| marker.selection_group_id == entry.parallel_group_id)
+            }) {
+                state.matched_recorded_pending = true;
+                return Poll::Pending;
+            }
+            selection
+                .map(|entry| {
+                    condition_input_order::competing_selection(
+                        &state.history_events,
+                        &entry.parallel_group_id,
+                    )
+                })
+                .transpose()?
+                .flatten()
+        };
+        let decision = wait.evaluate(&ctx.state, &*self.predicate, competing.as_ref())?;
+        let mut state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+        if let Some(decision) = decision {
+            let satisfied = decision["satisfied"] == true;
+            state.commands.push(decision);
+            if selection.is_none() {
+                let result = if satisfied {
+                    ConditionWaitResult::Satisfied
+                } else {
+                    ConditionWaitResult::TimedOut
+                };
+                return Poll::Ready(Ok(result));
+            }
+        }
+        state.matched_recorded_pending = true;
+        state.observation_pending = true;
+        self.opened_wait = true;
+        Poll::Pending
+    }
+
     fn poll_new_condition(
         self: Pin<&mut Self>,
         options: ValidatedConditionWaitOptions,
@@ -17934,6 +18041,20 @@ impl ConditionWaitCall {
         ]);
         if let Some(timeout_seconds) = options.timeout_seconds {
             command.insert("timeout_seconds".to_string(), json!(timeout_seconds));
+            if !recorded_wait
+                && state.condition_input_order_supported
+                && state.condition_wait_input_order_authoring
+            {
+                command.insert(
+                    condition_input_order::CAPABILITY.into(),
+                    json!(condition_input_order::ORDER),
+                );
+                command.insert("deadline_policy".into(), json!("occurrence"));
+                command.insert(
+                    "condition_wait_timeout_budget_seconds".into(),
+                    json!(timeout_seconds),
+                );
+            }
         }
         apply_parallel_group_path(&mut command, &self.parallel_group_path);
         ctx.apply_scope_membership(&mut command);
@@ -20139,7 +20260,22 @@ fn recorded_condition_wait(
             ConditionWaitResult::Satisfied
         }
     });
-    let result = if !fired.is_empty() {
+    let ordered_wait = if condition_input_order::marked(&opened.payload) {
+        let wait = condition_input_order::Wait::read(
+            opened,
+            scheduled.first().copied(),
+            fired.first().copied(),
+            &condition_wait_id,
+            sequence,
+        )?;
+        if let Some(terminal) = terminal.first() {
+            wait.verify_terminal(terminal, sequence)?;
+        }
+        Some(wait)
+    } else {
+        None
+    };
+    let result = if !fired.is_empty() && ordered_wait.is_none() {
         if result == Some(ConditionWaitResult::Satisfied) {
             return Err(invalid_recorded_history(
                 "condition_wait_terminal_conflict",
@@ -20161,6 +20297,7 @@ fn recorded_condition_wait(
         predicate_identity,
         timeout_seconds,
         result,
+        ordered_wait,
         parallel_group_path: recorded_condition_group_path(condition_events, all_events, sequence)?,
     })
 }
@@ -26459,6 +26596,121 @@ mod tests {
     }
 
     #[test]
+    fn ordered_condition_wait_requires_the_current_claim_to_author_new_history() {
+        for authoring in [false, true] {
+            let ctx = workflow_context(Vec::new());
+            {
+                let mut state = ctx.state.lock().unwrap();
+                state.condition_input_order_supported = true;
+                state.condition_wait_input_order_authoring = authoring;
+            }
+            let mut wait = Box::pin(
+                ctx.wait_condition(
+                    ConditionWaitOptions::new("approval", "approval-v1")
+                        .timeout(Duration::from_secs(2)),
+                    || Ok(false),
+                ),
+            );
+            let mut task_context = TaskContext::from_waker(noop_waker_ref());
+            assert!(wait.as_mut().poll(&mut task_context).is_pending());
+            let commands = ctx.take_commands().unwrap();
+            assert_eq!(commands[0]["type"], "open_condition_wait");
+            assert_eq!(condition_input_order::marked(&commands[0]), authoring);
+        }
+    }
+
+    #[test]
+    fn ordered_condition_wait_keeps_the_first_applied_prefix_on_cold_replay() {
+        let identity = json!({
+            "sequence": 1,
+            "condition_wait_id": "wait",
+            "condition_wait_occurrence_id": "rust:condition-wait:0",
+            "condition_key": "approval",
+            "condition_definition_fingerprint": "approval-v1",
+            "condition_wait_input_order": "durable_receipt_order",
+        });
+        let mut opened = identity.clone();
+        opened["timeout_seconds"] = json!(2);
+        let mut timer = identity.clone();
+        timer["timer_kind"] = json!("condition_timeout");
+        timer["timer_id"] = json!("timer");
+        timer["delay_seconds"] = json!(2);
+        let event = |sequence, kind, payload| {
+            let mut event = history_event(kind, payload);
+            event.raw.insert("sequence".into(), json!(sequence));
+            event
+        };
+        let mut history = vec![
+            event(3, "ConditionWaitOpened", opened),
+            event(4, "TimerScheduled", timer.clone()),
+            event(
+                5,
+                "SignalReceived",
+                json!({"workflow_command_id":"approve","signal_name":"approval","arguments":fixture_envelope(json!([true]))}),
+            ),
+            event(
+                6,
+                "SignalReceived",
+                json!({"workflow_command_id":"withdraw","signal_name":"approval","arguments":fixture_envelope(json!([false]))}),
+            ),
+            event(7, "TimerFired", timer),
+            event(
+                8,
+                "SignalApplied",
+                json!({"workflow_command_id":"approve","signal_wait_id":"signal-command:approve"}),
+            ),
+            event(
+                9,
+                "SignalApplied",
+                json!({"workflow_command_id":"withdraw","signal_wait_id":"signal-command:withdraw"}),
+            ),
+        ];
+        let ctx = workflow_context(history.clone());
+        {
+            let mut state = ctx.state.lock().unwrap();
+            state.condition_input_order_supported = true;
+            state.condition_wait_pending_input_sequence = Some(None);
+        }
+        let options =
+            || ConditionWaitOptions::new("approval", "approval-v1").timeout(Duration::from_secs(2));
+        let reads = ctx.clone();
+        let mut wait = Box::pin(ctx.wait_condition(options(), move || {
+            Ok(reads
+                .signals("approval")?
+                .last()
+                .and_then(|values| values[0].as_bool())
+                .unwrap_or(false))
+        }));
+        let mut task_context = TaskContext::from_waker(noop_waker_ref());
+        assert!(matches!(
+            wait.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+        ));
+        assert_eq!(
+            ctx.take_commands().unwrap(),
+            [json!({
+                "type":"resolve_condition_wait", "condition_wait_id":"wait", "satisfied":true,
+                "input_receipt_sequence":5,
+            })]
+        );
+        assert_eq!(ctx.signals("approval").unwrap().last().unwrap()[0], false);
+
+        let mut outcome = identity;
+        outcome["input_receipt_sequence"] = json!(5);
+        outcome["timer_fired_sequence"] = json!(7);
+        outcome["timer_id"] = json!("timer");
+        history.push(event(10, "ConditionWaitSatisfied", outcome));
+        let ctx = workflow_context(history);
+        let mut wait =
+            Box::pin(ctx.wait_condition(options(), || panic!("the recorded outcome owns replay")));
+        assert!(matches!(
+            wait.as_mut().poll(&mut task_context),
+            Poll::Ready(Ok(ConditionWaitResult::Satisfied))
+        ));
+        assert!(ctx.take_commands().unwrap().is_empty());
+    }
+
+    #[test]
     fn workflow_condition_wait_emits_published_identity_and_timeout_contract() {
         let ctx = workflow_context(Vec::new());
         let mut wait = Box::pin(
@@ -26875,6 +27127,7 @@ mod tests {
             predicate_identity: format!("sha256:member-{index}"),
             timeout_seconds: Some(300),
             result: None,
+            ordered_wait: None,
             parallel_group_path: Some(vec![parallel_group_entry(base, size, index, "condition")]),
         }
     }
@@ -26957,6 +27210,7 @@ mod tests {
             predicate_identity: "sha256:approval".into(),
             timeout_seconds: Some(30),
             result: None,
+            ordered_wait: None,
             parallel_group_path: None,
         };
         assert_eq!(order(vec![ungrouped(1), ungrouped(2)]), vec![1, 2]);
@@ -36166,6 +36420,7 @@ mod tests {
                 activity_checkpoint::CAPABILITY,
                 QUERY_TASKS_CAPABILITY,
                 WORKFLOW_UPDATES_CAPABILITY,
+                condition_input_order::CAPABILITY,
                 MESSAGE_STREAMS_CAPABILITY
             ])
         );
