@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 4.24.0
+
+- When a compatible Native Server enables ordered condition authoring, timed
+  waits evaluate signal and successful update effects in durable receipt order
+  before the original timer. In a selection, the first qualifying prefix
+  competes with the original terminal event from a child or child-only group.
+  Replay preserves the committed result.
+  ([Durable Workflow #230](https://github.com/durable-workflow/.github/issues/230))
+
 ## 4.23.0
 
 - Workers can request `ContinueAsNewTarget::Promoted` after Server confirms
