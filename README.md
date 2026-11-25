@@ -565,6 +565,80 @@ share that budget across all pages. Lease renewals do not restart it. Low-level
 cooperative polls retain their long-poll timeout plus five seconds, and explicit
 canonical cancellation refreshes retain their five-second budget.
 
+### Workflow time and the replay clock
+
+`WorkflowContext::replay_now()` returns a replay-safe UTC
+`chrono::DateTime<Utc>` that advances with consumed history. Every replay of
+the same history returns the same values, so workflow code can use it for
+deadlines and elapsed time.
+
+- **At workflow entry**, before any durable step, it returns the run's start
+  from the workflow task's `replay_clock` carrier (`WorkerReplayClock` v1, sent
+  by Server 3.6.0 and later). A redrive successor whose history proves the
+  original start uses that start.
+- **After a supported durable step** (a remote activity, a plain timer, a child
+  workflow, a persisted signal delivery, a condition wait, or a validated
+  all-group of activities, timers or children) it returns that step's recorded
+  time.
+- **Repeated reads** between two durable steps return the same value.
+
+A deadline loop around a durable timer therefore terminates, and the difference
+between two reads taken after two durable steps is their recorded elapsed time:
+
+```rust,no_run
+use std::time::Duration;
+use durable_workflow::{json, Worker};
+# fn configure(worker: &mut Worker) {
+worker.register_workflow("orders.wait-ready", |ctx, args| async move {
+    let deadline = ctx.replay_now()? + chrono::Duration::hours(1);
+    while ctx.replay_now()? < deadline {
+        if ctx.activity("orders.poll", args.clone()).await? == json!(true) {
+            return Ok(json!("ready"));
+        }
+        ctx.sleep(Duration::from_secs(60)).await?;
+    }
+    Ok(json!("timed out"))
+});
+# }
+```
+
+Where the SDK cannot prove a time, `replay_now()` returns
+`Error::ReplayClockUnavailable` instead of using wall time or any other value.
+An unhandled `Error::ReplayClockUnavailable` fails the workflow like any other
+error. The clock is unavailable:
+
+- at entry when the task carries no valid `replay_clock` (Servers older than
+  3.6.0, a run whose start the Server cannot prove, or a `WorkflowTask` executed
+  directly without a poll);
+- after inline and local operations: side effects, version markers, local
+  activities and memo or search-attribute upserts. These stay unavailable until
+  the platform defines a persisted time for those steps;
+- after group modes other than the validated all-groups, and inside condition
+  predicates;
+- in cancellation callbacks.
+
+Query handlers read the time of the rebuilt workflow prefix only when its final
+boundary is proved, and update handlers read their committed `UpdateAccepted`
+time; otherwise they are unavailable too. A query or replayed update validator
+that rebuilds the workflow body uses its own task's `replay_clock`. Server
+sends that key on query and update-validation tasks from the release that
+includes server#1338, with `null` meaning the run has no provable start. When
+the key is absent, as on older Servers, a rebuild in which the workflow reads
+the clock at entry fails the query with `query_workflow_state_unavailable`,
+even if the workflow handles the error, so it never answers with state its
+workflow task did not compute.
+
+Do not use timestamps to order emitted events. Order them by stream offset,
+outbox sequence or a workflow-local counter.
+
+**Upgrading:** earlier releases reported `replay_now()` as unavailable at
+entry. A running workflow whose code branches on that, for example with
+`replay_now().ok()` at entry, takes the other branch when it replays on the
+new SDK. Version such code or drain those runs before you upgrade workers.
+
+See [the replay-clock source notes](docs/replay-clock-source.md) for the exact
+boundary rules.
+
 ## Testing without a Server
 
 `testing::WorkflowEnvironment` runs registered workflows and activities in the
@@ -628,6 +702,13 @@ assert!(report.completed); // A running snapshot can remain durably pending.
 # }
 ```
 
+A workflow that reads `replay_now()` at entry also needs the original workflow
+task's `replay_clock` object: pass it with
+`WorkflowHistory::from_export(export)?.replay_clock(carrier)?`. The builder
+refuses an invalid carrier or one for another run. `WorkflowHistory::export()`
+does not include it, and `WorkflowEnvironment::run_workflow` supplies none, so
+entry stays unavailable there.
+
 For the raw history API, combine **all** pages and call
 `WorkflowHistory::from_history("hello", original_input, response)?`.
 Set `.task_queue("original-queue")` if that context is absent. Exports must
@@ -656,7 +737,8 @@ Keep workflow command order deterministic:
 | Pattern | Durable replacement |
 | --- | --- |
 | Iterating a `HashMap` while scheduling | Sort keys first or use a `BTreeMap` |
-| Reading the system clock, randomness or a UUID | `ctx.side_effect(...)` for a recorded snapshot, or an activity |
+| Reading the system clock for a deadline or elapsed time | `ctx.replay_now()?` |
+| Reading randomness, a UUID or another wall-clock snapshot | `ctx.side_effect(...)` for a recorded snapshot, or an activity |
 | `tokio::time::sleep`, `std::thread::sleep` | `ctx.sleep(...)` / `ctx.start_timer(...)` |
 | `tokio::select!`, racing ordinary futures | `ctx.select(...)` / `ctx.select_keyed(...)` |
 | Untracked concurrent durable calls | SDK `ctx.parallel(...)` with stable input ordering |
