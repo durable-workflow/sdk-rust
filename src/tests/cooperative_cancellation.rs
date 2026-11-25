@@ -4259,14 +4259,14 @@ fn coordinator_responses(path: &str, body: &str, number: usize) -> Option<(&'sta
     None
 }
 
-fn coordinator_server() -> MockWorkerServer {
+pub(super) fn coordinator_server() -> MockWorkerServer {
     MockWorkerServer::start_with_behavior(MockWorkerBehavior {
         request_override: Some(coordinator_responses),
         ..Default::default()
     })
 }
 
-fn coordinator_worker(server: &MockWorkerServer, case: &str) -> Worker {
+pub(super) fn coordinator_worker(server: &MockWorkerServer, case: &str) -> Worker {
     let mut worker = Worker::new(client(server, case), "queue")
         .worker_id("actual-owner")
         .cooperative_cancellation(true);
@@ -4279,7 +4279,7 @@ fn coordinator_worker(server: &MockWorkerServer, case: &str) -> Worker {
     worker
 }
 
-fn register_coordinator_timer(
+pub(super) fn register_coordinator_timer(
     worker: &mut Worker,
     observed: Arc<Mutex<Vec<CooperativeCancellationRequested>>>,
 ) {

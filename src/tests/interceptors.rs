@@ -275,10 +275,26 @@ impl WorkerInterceptor for Tamper {
                     drop(next);
                     Ok(self.stash.lock().unwrap().take().expect("stashed outcome"))
                 }
-                // Start the core but drop it before completion.
+                // Create the core future but drop it before it is polled.
                 "abandon" => {
                     drop(next.run());
                     Err(Error::WorkerLoop("abandoned".into()))
+                }
+                // Fail without running the rest of the chain.
+                "fail-before-next" => {
+                    drop(next);
+                    Err(Error::WorkerLoop("tenant lookup failed".into()))
+                }
+                // Let the core begin, then drop it partway through.
+                "abandon-started" => {
+                    let mut core = next.run();
+                    std::future::poll_fn(|cx| {
+                        let _ = core.as_mut().poll(cx);
+                        Poll::Ready(())
+                    })
+                    .await;
+                    drop(core);
+                    Err(Error::WorkerLoop("gave up".into()))
                 }
                 _ => unreachable!(),
             }
@@ -700,4 +716,239 @@ async fn the_offline_environment_runs_activity_interceptors() {
             "outer:activity:after:true",
         ]
     );
+}
+
+#[tokio::test]
+async fn a_retained_core_failure_cannot_change_the_reported_error() {
+    struct RetainFailure(Arc<Mutex<Option<WorkflowTaskFailure>>>);
+    impl WorkerInterceptor for RetainFailure {
+        fn execute_workflow_task<'a>(
+            &'a self,
+            _context: &'a WorkflowTaskInterceptorContext,
+            next: WorkflowTaskNext<'a>,
+        ) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
+            Box::pin(async move {
+                let outcome = next.run().await;
+                if let Err(Error::WorkflowTaskFailed(failure)) = &outcome {
+                    *self.0.lock().unwrap() = Some(failure.clone());
+                }
+                outcome
+            })
+        }
+    }
+    let retained = Arc::new(Mutex::new(None));
+    // No workflow registered: the core fails with WorkflowNotRegistered.
+    let worker = plain_worker().interceptor(RetainFailure(retained.clone()));
+    let error = worker
+        .execute_workflow_with_local_activities(workflow_task(Vec::new()))
+        .await
+        .expect_err("the core failure is reported");
+    assert!(
+        matches!(&error, Error::WorkflowNotRegistered(name) if name == "ship-order"),
+        "the original error survives a retained copy: {error:?}"
+    );
+    let retained = retained.lock().unwrap();
+    let failure = retained.as_ref().expect("the interceptor kept the failure");
+    assert_eq!(failure.kind(), "WorkflowNotRegistered");
+    assert_eq!(failure.message(), error.to_string());
+    assert_eq!(failure.debug(), format!("{error:?}"));
+    assert_eq!(failure.to_string(), error.to_string());
+}
+
+#[tokio::test]
+async fn an_interceptor_error_before_next_is_part_of_the_task_failure() {
+    let stash = Arc::new(Mutex::new(None));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut worker = tamper_worker("fail-before-next", &stash);
+    let counted = runs.clone();
+    worker.register_workflow("ship-order", move |ctx, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async move { ctx.activity("ship", json!([])).await }
+    });
+    let error = worker
+        .execute_workflow_with_local_activities(workflow_task(Vec::new()))
+        .await
+        .expect_err("the interceptor error fails the task");
+    let Error::WorkflowTaskInterceptor(message) = &error else {
+        panic!("expected an interceptor failure, got {error:?}");
+    };
+    assert!(
+        message.ends_with(
+            "Tamper failed without calling next: worker loop error: tenant lookup failed"
+        ),
+        "{message}"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_core_dropped_partway_is_reported_as_abandoned() {
+    let stash = Arc::new(Mutex::new(None));
+    // A local activity makes the core wait on the network, so dropping it
+    // after one poll abandons it partway.
+    let mut worker = tamper_worker("abandon-started", &stash).local_activities(true);
+    worker.register_workflow("ship-order", |ctx, _| async move {
+        ctx.local_activity("label", json!([])).await
+    });
+    worker.register_activity("label", |_, args| async move { Ok(args) });
+    let error = worker
+        .execute_workflow_with_local_activities(workflow_task(Vec::new()))
+        .await
+        .expect_err("an abandoned core fails the task");
+    assert!(
+        matches!(&error, Error::WorkflowTaskInterceptor(message)
+            if message == "a workflow task interceptor dropped the workflow task before it completed: worker loop error: gave up"),
+        "{error:?}"
+    );
+}
+
+fn local_activity_server(
+    path: &str,
+    _body: &str,
+    _request: usize,
+) -> Option<(&'static str, String)> {
+    if path.ends_with("/cluster/info") {
+        return Some((
+            "200 OK",
+            json!({"limits":{"max_payload_bytes":1048576}}).to_string(),
+        ));
+    }
+    if path.contains("/workflow-tasks/") && path.ends_with("/heartbeat") {
+        return Some((
+            "200 OK",
+            json!({"task_id":"local-task","lease_owner":"interceptor-worker",
+                "workflow_task_attempt":2,"renewed":true,"reason":null,"task_status":"leased",
+                "run_status":"running","lease_expires_at":"2099-01-01T00:00:00Z"})
+            .to_string(),
+        ));
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_local_activity_runs_through_the_activity_hook_inside_the_workflow_task() {
+    struct Local(Events);
+    impl WorkerInterceptor for Local {
+        fn execute_workflow_task<'a>(
+            &'a self,
+            _context: &'a WorkflowTaskInterceptorContext,
+            next: WorkflowTaskNext<'a>,
+        ) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push("workflow:before".into());
+                let outcome = next.run().await;
+                self.0.lock().unwrap().push("workflow:after".into());
+                outcome
+            })
+        }
+
+        fn execute_activity(
+            &self,
+            context: ActivityInterceptorContext,
+            next: ActivityNext,
+        ) -> InterceptorFuture<'_, Result<AvroValue>> {
+            self.0.lock().unwrap().push(format!(
+                "activity:{}:local={}:{:?}",
+                context.activity_type(),
+                context.is_local(),
+                context.workflow_id()
+            ));
+            next.run(context)
+        }
+    }
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(local_activity_server),
+        ..MockWorkerBehavior::default()
+    });
+    let client = Client::builder(server.base_url())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client");
+    let events = events();
+    let mut worker = Worker::new(client, "orders")
+        .worker_id("interceptor-worker")
+        .local_activities(true)
+        .interceptor(Local(events.clone()));
+    worker.register_workflow("ship-order", |ctx, _| async move {
+        ctx.local_activity("label", json!(["parcel"])).await
+    });
+    worker.register_activity("label", |_, args| async move { Ok(json!({"label": args})) });
+    let mut task = workflow_task(Vec::new());
+    task.task_id = "local-task".into();
+    task.lease_owner = Some("interceptor-worker".into());
+    let decision = worker
+        .execute_workflow_with_local_activities(task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.commands[0]["type"], "record_local_activity");
+    assert_eq!(
+        take(&events),
+        [
+            "workflow:before",
+            r#"activity:label:local=true:Some("order-1")"#,
+            "workflow:after",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_cooperative_worker_fails_the_task_for_an_interceptor_error_after_replay() {
+    use super::cooperative_cancellation::{
+        coordinator_server, coordinator_worker, register_coordinator_timer,
+    };
+    let server = coordinator_server();
+    let stash = Arc::new(Mutex::new(None));
+    let mut worker = coordinator_worker(&server, "coordinator-valid").interceptor(Tamper {
+        mode: "fail-after-core",
+        stash: stash.clone(),
+    });
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    register_coordinator_timer(&mut worker, observed.clone());
+    assert_eq!(
+        worker.poll_workflow_once().await.expect("settled"),
+        ManagedPollOutcome::Handled
+    );
+    assert_eq!(observed.lock().unwrap().len(), 1, "the replay delivered");
+    assert!(stash.lock().unwrap().is_some(), "the core completed");
+    let requests = server.requests.lock().unwrap();
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/complete")));
+    let failure = requests
+        .iter()
+        .find(|request| request.path.ends_with("/fail"))
+        .expect("the workflow task is failed");
+    let body: Value = serde_json::from_str(&failure.body).unwrap();
+    assert_eq!(body["lease_owner"], "actual-owner");
+    assert!(
+        body.to_string().contains("audit sink unavailable"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_cooperative_worker_does_not_settle_a_replay_dropped_partway() {
+    use super::cooperative_cancellation::{
+        coordinator_server, coordinator_worker, register_coordinator_timer,
+    };
+    let server = coordinator_server();
+    let stash = Arc::new(Mutex::new(None));
+    let mut worker = coordinator_worker(&server, "coordinator-valid").interceptor(Tamper {
+        mode: "abandon-started",
+        stash,
+    });
+    register_coordinator_timer(&mut worker, Arc::new(Mutex::new(Vec::new())));
+    let error = worker
+        .poll_workflow_once()
+        .await
+        .expect_err("an uncertain replay is not settled");
+    assert!(
+        matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("dropped the workflow task")),
+        "{error:?}"
+    );
+    let requests = server.requests.lock().unwrap();
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/complete") || request.path.ends_with("/fail")));
 }
