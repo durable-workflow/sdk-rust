@@ -14,6 +14,7 @@ mod condition_input_order;
 mod cooperative_cancellation;
 mod external_signal;
 mod failure_reporting;
+pub mod interceptors;
 mod local_activity;
 pub mod metrics;
 mod nexus;
@@ -61,6 +62,9 @@ pub use cancellation_scope_history::{
 pub use cancellation_scope_replay::CancellationScopeRequested;
 pub use external_signal::{ExternalSignalCall, ExternalSignalOutcome, ExternalSignalResult};
 pub use failure_reporting::FailureReportError;
+pub use interceptors::{
+    PassthroughWorkerInterceptor, QueryTaskFailure, WorkerInterceptor, WorkflowTaskFailure,
+};
 pub use run_activities::{
     WorkflowActivity, WorkflowActivityAttempt, WorkflowActivityList, WorkflowActivityMetadataError,
 };
@@ -506,6 +510,15 @@ pub enum Error {
     InvalidCooperativeCancellation(String),
     #[error("activity execution no longer owns its claim: {0}")]
     ActivityExecutionAbandoned(String),
+    /// The workflow-task core's own error, as a workflow-task interceptor
+    /// receives it from `next`. The worker reports the original error.
+    #[error("{0}")]
+    WorkflowTaskFailed(WorkflowTaskFailure),
+    /// A workflow-task interceptor failed after the core succeeded, or
+    /// returned without running `next`. The worker fails the workflow task;
+    /// nothing is recorded and the Server retries it.
+    #[error("{0}")]
+    WorkflowTaskInterceptor(String),
     #[error(transparent)]
     InvalidActivityOptions(ActivityOptionsError),
     #[error(transparent)]
@@ -8716,6 +8729,7 @@ pub struct Worker {
     signal_external_workflow_supported: Arc<AtomicBool>,
     condition_input_order_supported: Arc<AtomicBool>,
     ordered_condition_claim: condition_input_order::Claim,
+    interceptors: Arc<[interceptors::RegisteredInterceptor]>,
 }
 
 impl Worker {
@@ -8767,6 +8781,7 @@ impl Worker {
             signal_external_workflow_supported: Arc::new(AtomicBool::new(false)),
             condition_input_order_supported: Arc::new(AtomicBool::new(false)),
             ordered_condition_claim: condition_input_order::Claim::default(),
+            interceptors: Arc::new([]),
         }
     }
 
@@ -8813,6 +8828,26 @@ impl Worker {
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
         self
+    }
+
+    /// Append a [`WorkerInterceptor`] around workflow tasks, activities and
+    /// queries. Interceptors run in registration order; the first is the
+    /// outermost. See [`interceptors`] for the determinism rules.
+    pub fn interceptor(mut self, interceptor: impl WorkerInterceptor) -> Self {
+        let mut chain = self.interceptors.to_vec();
+        chain.push(interceptors::RegisteredInterceptor::new(interceptor));
+        self.interceptors = chain.into();
+        self
+    }
+
+    /// Append several interceptors, in order, after any already registered.
+    pub fn interceptors<I>(self, interceptors: impl IntoIterator<Item = I>) -> Self
+    where
+        I: WorkerInterceptor,
+    {
+        interceptors
+            .into_iter()
+            .fold(self, |worker, interceptor| worker.interceptor(interceptor))
     }
 
     /// Require original query timing and non-renewing runtime observation.
@@ -11181,12 +11216,26 @@ impl Worker {
                     self.query_telemetry_fields(&task),
                     false,
                     authority.and_then(|_| self.query_observations(&task)),
-                    self.execute_query_task_inner(task, authority, replay_entry),
+                    self.intercepted_query_task(task, authority, replay_entry),
                 )
                 .await;
         }
-        self.execute_query_task_inner(task, authority, replay_entry)
+        self.intercepted_query_task(task, authority, replay_entry)
             .await
+    }
+
+    async fn intercepted_query_task(
+        &self,
+        task: QueryTask,
+        authority: Option<&query_authority::Authority>,
+        replay_entry: replay_clock::Attestation,
+    ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
+        let context = self.query_task_interceptor_context(&task);
+        self.intercept_query_task(
+            context,
+            self.execute_query_task_inner(task, authority, replay_entry),
+        )
+        .await
     }
 
     async fn execute_query_task_inner(
@@ -12058,6 +12107,7 @@ impl Worker {
             let telemetry = telemetry.clone();
             let fields = self.callback_telemetry_fields(&context, local);
             let handler = handler.clone();
+            let chain = self.interceptors.clone();
             let name = if local {
                 "durable.local_activity.attempt"
             } else {
@@ -12065,18 +12115,14 @@ impl Worker {
             };
             return Box::pin(async move {
                 telemetry
-                    .run(
-                        name,
-                        fields,
-                        true,
-                        async move { handler(context, args).await },
-                    )
+                    .run(name, fields, true, async move {
+                        interceptors::intercept_activity(&chain, &handler, context, args, local)
+                            .await
+                    })
                     .await
             });
         }
-        #[cfg(not(feature = "telemetry"))]
-        let _ = local;
-        handler(context, args)
+        interceptors::intercept_activity(&self.interceptors, handler, context, args, local)
     }
 }
 
@@ -21570,6 +21616,7 @@ mod tests {
     mod cooperative_cancellation;
     mod external_signal;
     mod history_transaction_limit;
+    mod interceptors;
     mod local_activity;
     mod nexus;
     mod path_segments;
