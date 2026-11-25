@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Workers can register update validators with
+  `Worker::register_update_validator` (or the Avro and replayed-state
+  variants). The Server runs a validator before accepting the update; an
+  `UpdateRejection` rejects it with reason `update_validator_rejected`, so the
+  handler never runs and no acceptance is recorded. Validators are read-only:
+  one that adds a workflow command is refused. A worker with validators
+  advertises `update_validators` and `update_validation_tasks`, refuses a
+  Server without synchronous update validation, and leases validation tasks
+  through its multiplexed workflow poll. `Error::update_validator_rejection()`
+  and `Error::is_update_validation_failed()` tell a rejection from a failed
+  update. Low-level registration now accepts a list of validator names.
+  ([Durable Workflow #234](https://github.com/durable-workflow/.github/issues/234))
+
 ## 4.24.0
 
 - When a compatible Native Server enables ordered condition authoring, timed
