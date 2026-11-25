@@ -453,11 +453,12 @@ pub enum Error {
         "workflow command contract for {workflow_type:?} declares malformed update validators: expected a list of non-empty update names"
     )]
     UnsupportedUpdateValidators { workflow_type: String },
-    /// An update validator refused an update before acceptance. Validators
-    /// return this through [`UpdateRejection`]; the worker reports it to the
-    /// Server as `update_validator_rejected`.
+    /// Worker side: an update validator returned this [`UpdateRejection`].
+    /// The worker reports it to the Server as `update_validator_rejected`.
+    /// A caller reads the Server's answer with
+    /// [`Error::update_validator_rejection`] instead.
     #[error(transparent)]
-    UpdateValidatorRejected(UpdateRejection),
+    UpdateRejection(UpdateRejection),
     /// The worker declares update validators, but registration cannot safely
     /// run them: a validator names an update the workflow does not handle, or
     /// the Server does not advertise synchronous pre-accept update validation
@@ -11272,7 +11273,7 @@ impl Worker {
     /// inner result is the handler's own outcome. With `read_only`, used for
     /// update validators, a panic is an execution failure and a handler that
     /// adds commands to the reconstructed workflow is refused with
-    /// [`Error::UpdateValidatorRejected`].
+    /// [`Error::UpdateRejection`].
     async fn run_registered_query(
         &self,
         mut task: QueryTask,
@@ -11548,7 +11549,7 @@ impl Worker {
                 .commands
                 .len();
             if after > before {
-                return Ok(Err(Error::UpdateValidatorRejected(
+                return Ok(Err(Error::UpdateRejection(
                     update_validation::scheduled_work_refusal(),
                 )));
             }

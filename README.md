@@ -253,15 +253,19 @@ worker cannot run (for example because replay fails), reports
 `update_validation_worker_failed`, which is distinct from a rejection.
 
 Each validator needs a registered update handler for the same workflow type
-and update name. A worker with validators advertises them in its workflow
+and update name, and a replayed validator needs the workflow registered with
+`register_replayed_workflow` and the same state type; registration checks both. A worker with validators advertises them in its workflow
 command contract (`update_validators`) and the `update_validation_tasks`
 capability. `Worker::register` refuses a Server that does not advertise
 synchronous update validation with multiplexed polling
 (`Error::UpdateValidationUnavailable`); native Server already serves update
 validation tasks. The worker's workflow long poll then also leases validation
 tasks, under the same `max_concurrent_workflow_tasks` capacity, and answers each
-one with an approval or a rejection. A completion the Server fences because the
-lease moved on is logged, not retried.
+one with an approval or a rejection, also while the worker is stopping. A
+completion the Server fences because the lease moved on is logged, not retried.
+Worker task metrics use `task_kind` `update_validation` with outcome `approved`,
+`rejected`, `failed` or `expired`. Inside the worker a validator's refusal is
+`Error::UpdateRejection`; callers never see that variant.
 
 Callers tell a rejection from a failed update without parsing messages.
 `Error::update_validator_rejection()` returns the message, validation errors and

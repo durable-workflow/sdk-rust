@@ -120,7 +120,7 @@ impl std::error::Error for UpdateRejection {}
 impl From<Error> for UpdateRejection {
     fn from(error: Error) -> Self {
         match error {
-            Error::UpdateValidatorRejected(rejection) => rejection,
+            Error::UpdateRejection(rejection) => rejection,
             error => Self::new(error.to_string()).with_type(VALIDATOR_ERROR_TYPE),
         }
     }
@@ -553,6 +553,16 @@ impl Worker {
                         "update validator {workflow_type}.{update_name} has no registered workflow update handler"
                     )));
                 }
+                if let Some(RegisteredQuery::Replayed { state_type, .. }) =
+                    validators.get(update_name)
+                {
+                    let workflow = &self.workflows[workflow_type];
+                    if workflow.replay.is_none() || workflow.state_type != Some(*state_type) {
+                        return Err(Error::UpdateValidationUnavailable(format!(
+                            "replayed update validator {workflow_type}.{update_name} needs the workflow registered with register_replayed_workflow and the same state type"
+                        )));
+                    }
+                }
             }
         }
         // Discovery uses the Worker credential, including worker-only Clients.
@@ -596,39 +606,62 @@ impl Worker {
             );
             return ManagedPollOutcome::Handled;
         };
+        let mut task_metrics = self
+            .metrics
+            .worker(true, "update_validation", &self.task_queue);
+        task_metrics.outcome("failed");
         let decision = self.decide_update_validation(task).await;
         let lease_owner = self.worker_id.clone();
-        let completed = self
-            .retry_worker_operation(|| async {
-                match &decision {
-                    Ok(()) => {
-                        self.client
-                            .approve_update_validation_task(&task_id, &lease_owner, attempt)
-                            .await
-                    }
-                    Err((reason, rejection)) => {
-                        self.client
-                            .reject_update_validation_task(
-                                &task_id,
-                                &lease_owner,
-                                attempt,
-                                reason,
-                                rejection,
-                            )
-                            .await
-                    }
+        // The answer is sent even while the worker stops, as query and
+        // workflow-task completions are: the caller is waiting on it.
+        let mut retries = 0;
+        let completed = loop {
+            let completion = match &decision {
+                Ok(()) => {
+                    self.client
+                        .approve_update_validation_task(&task_id, &lease_owner, attempt)
+                        .await
                 }
-            })
-            .await;
+                Err((reason, rejection)) => {
+                    self.client
+                        .reject_update_validation_task(
+                            &task_id,
+                            &lease_owner,
+                            attempt,
+                            reason,
+                            rejection,
+                        )
+                        .await
+                }
+            };
+            match completion {
+                Err(error)
+                    if crate::worker_operation_is_retryable(&error)
+                        && retries < self.retry_policy.max_retries =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(crate::worker_poll_retry_delay(self.retry_policy, retries))
+                        .await;
+                }
+                completion => break completion,
+            }
+        };
         match completed {
-            Ok(_) => {}
+            Ok(_) => task_metrics.outcome(match &decision {
+                Ok(()) => "approved",
+                Err((UPDATE_VALIDATOR_REJECTED, _)) => "rejected",
+                Err(_) => "failed",
+            }),
             Err(error) => match fenced(&error) {
-                Some(reason) => tracing::info!(
-                    target: "durable_workflow::worker",
-                    update_validation_task_id = task_id.as_str(),
-                    reason = reason.as_str(),
-                    "update validation completion was fenced"
-                ),
+                Some(reason) => {
+                    task_metrics.outcome("expired");
+                    tracing::info!(
+                        target: "durable_workflow::worker",
+                        update_validation_task_id = task_id.as_str(),
+                        reason = reason.as_str(),
+                        "update validation completion was fenced"
+                    )
+                }
                 None => tracing::warn!(
                     target: "durable_workflow::worker",
                     update_validation_task_id = task_id.as_str(),
@@ -728,5 +761,5 @@ impl Worker {
 fn approve(outcome: std::result::Result<(), UpdateRejection>) -> Result<AvroValue> {
     outcome
         .map(|()| AvroValue::Null)
-        .map_err(Error::UpdateValidatorRejected)
+        .map_err(Error::UpdateRejection)
 }

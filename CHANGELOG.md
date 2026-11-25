@@ -10,7 +10,9 @@
   one that adds a workflow command is refused. A worker with validators
   advertises `update_validators` and `update_validation_tasks`, refuses a
   Server without synchronous update validation, and leases validation tasks
-  through its multiplexed workflow poll. `Error::update_validator_rejection()`
+  through its multiplexed workflow poll, recorded as worker task metrics with
+  `task_kind` `update_validation`. Inside the worker a refusal is
+  `Error::UpdateRejection`. `Error::update_validator_rejection()`
   and `Error::is_update_validation_failed()` tell a rejection from a failed
   update. Low-level registration now accepts a list of validator names.
   ([Durable Workflow #234](https://github.com/durable-workflow/.github/issues/234))

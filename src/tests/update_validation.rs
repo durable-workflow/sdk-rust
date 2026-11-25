@@ -496,3 +496,72 @@ fn server_capability_check_requires_the_multiplexed_poll_shape() {
         ["task_kinds"] = json!(["workflow"]);
     assert!(!supports(&info));
 }
+
+#[tokio::test]
+async fn registration_refuses_a_replayed_validator_with_another_state_type() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(validating_server),
+        ..MockWorkerBehavior::default()
+    });
+    let mut worker = order_worker(Client::new(server.base_url()).unwrap());
+    worker.register_replayed_update_validator(
+        "orders",
+        "approve",
+        |_ctx, _state: Arc<u64>, _args| Ok(()),
+    );
+    let error = worker.register().await.unwrap_err();
+    assert!(
+        matches!(&error, Error::UpdateValidationUnavailable(message) if message.contains("same state type")),
+        "{error}"
+    );
+    assert_eq!(server.request_count("/api/cluster/info"), 0);
+    assert_eq!(server.request_count("/api/worker/register"), 0);
+}
+
+#[derive(Default)]
+struct TaskOutcomes(Mutex<Vec<(String, String)>>);
+
+impl metrics::MetricsRecorder for TaskOutcomes {
+    fn increment(&self, name: &str, _: u64, tags: &metrics::MetricTags) {
+        if name == "durable_workflow_worker_tasks" {
+            let tag = |key: &str| tags.get(key).cloned().unwrap_or_default();
+            self.0
+                .lock()
+                .unwrap()
+                .push((tag("task_kind"), tag("outcome")));
+        }
+    }
+    fn record(&self, _: &str, _: f64, _: &metrics::MetricTags) {}
+}
+
+#[tokio::test]
+async fn validation_tasks_record_worker_task_metrics_and_answer_while_stopping() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(validating_server),
+        ..MockWorkerBehavior::default()
+    });
+    let outcomes = Arc::new(TaskOutcomes::default());
+    let mut worker = with_limit_validator(order_worker(Client::new(server.base_url()).unwrap()))
+        .metrics_recorder(outcomes.clone());
+    worker.register().await.unwrap();
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+
+    // A stop requested while a validation is in flight still sends its answer.
+    worker.run_stop = Some(Arc::new(AtomicBool::new(true)));
+    let task = validation_task("val-approve", "approve", 3);
+    assert!(matches!(
+        worker.execute_update_validation_task(task).await,
+        ManagedPollOutcome::Handled
+    ));
+    assert_eq!(
+        server.request_count("/api/worker/update-validation-tasks/val-approve/approve"),
+        1
+    );
+    assert_eq!(
+        *outcomes.0.lock().unwrap(),
+        vec![
+            ("update_validation".to_string(), "rejected".to_string()),
+            ("update_validation".to_string(), "approved".to_string()),
+        ]
+    );
+}
