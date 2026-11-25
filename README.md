@@ -624,9 +624,10 @@ that rebuilds the workflow body uses its own task's `replay_clock`. Server
 sends that key on query and update-validation tasks from the release that
 includes server#1338, with `null` meaning the run has no provable start. When
 the key is absent, as on older Servers, a rebuild in which the workflow reads
-the clock at entry fails the query with `query_workflow_state_unavailable`,
-even if the workflow handles the error, so it never answers with state its
-workflow task did not compute.
+the clock at entry fails instead of answering, even if the workflow handles the
+error: a query reports `query_workflow_state_unavailable`, and a replayed
+update validator reports `update_validation_worker_failed`. Neither answers
+with state its workflow task did not compute.
 
 Do not use timestamps to order emitted events. Order them by stream offset,
 outbox sequence or a workflow-local counter.
@@ -634,10 +635,11 @@ outbox sequence or a workflow-local counter.
 **Upgrading:** earlier releases reported `replay_now()` as unavailable at
 entry. A running workflow whose code branches on that, for example with
 `replay_now().ok()` at entry, takes the other branch when it replays on the
-new SDK. Version such code or drain those runs before you upgrade workers.
+new SDK, or when the Server is upgraded to 3.6.0 or later. Version such code or
+drain those runs before you upgrade.
 
-See [the replay-clock source notes](docs/replay-clock-source.md) for the exact
-boundary rules.
+See [the replay-clock source notes](https://github.com/durable-workflow/sdk-rust/blob/main/docs/replay-clock-source.md)
+for the exact boundary rules.
 
 ## Testing without a Server
 
