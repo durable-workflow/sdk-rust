@@ -267,6 +267,12 @@ Worker task metrics use `task_kind` `update_validation` with outcome `approved`,
 `rejected`, `failed` or `expired`. Inside the worker a validator's refusal is
 `Error::UpdateRejection`; callers never see that variant.
 
+Worker interceptors wrap each validation task through
+`execute_update_validation_task` (see [Worker interceptors](#worker-interceptors)).
+They observe the validator's decision but cannot change it; a broken
+interceptor chain reports `update_validation_worker_failed`, so nothing is
+accepted.
+
 Callers tell a rejection from a failed update without parsing messages.
 `Error::update_validator_rejection()` returns the message, validation errors and
 ids of an update the validator rejected; `Error::is_update_validation_failed()`
@@ -726,6 +732,7 @@ interceptor.
 | `execute_workflow_task` | one workflow task, including replay | `WorkflowTaskInterceptorContext` | `next.run()` returns a read-only `WorkflowTaskOutcome` |
 | `execute_activity` | one activity or local activity attempt | `ActivityInterceptorContext` | `next.run(context)` returns the activity result |
 | `execute_query_task` | one query task | `QueryTaskInterceptorContext` | `next.run()` returns the query result or `QueryTaskFailure` |
+| `execute_update_validation_task` | one update-validation task | `UpdateValidationInterceptorContext` | `next.run()` returns a read-only `UpdateValidationOutcome` |
 
 Contexts are read-only. They carry the worker id, task queue, namespace and the
 task's identity: task id, workflow id, run id, workflow or activity type,
@@ -820,6 +827,20 @@ Workflow-task interceptors cannot change what a workflow records:
   new for that task: audit every successful outcome, whatever the replay
   state. If a task fails after an interceptor observed it, its retry can
   repeat the same outcome; `context.attempt()` above 1 identifies a retry.
+
+Update-validation interceptors cannot change whether an update is accepted:
+
+- `next.run()` takes no input, so the validator always runs on the task as
+  received, and the worker sends the validator's own approval or rejection.
+  The outcome is a read-only view: `is_approved()`, `is_rejected()`,
+  `is_worker_failure()`, `reason()` and `rejection()`.
+- An interceptor error, returning or failing without running `next`, or
+  dropping the validation partway makes the worker report
+  `update_validation_worker_failed` instead. The update is not accepted, and
+  the caller's retry with the same request id asks the validator again.
+- The context carries the worker, task queue, namespace, validation task id
+  and attempt, workflow id, run id, workflow type, update name and trace
+  carrier.
 
 The offline `WorkflowEnvironment` runs activity interceptors registered on the
 worker it wraps. It has no workflow or query tasks, so those hooks do not run

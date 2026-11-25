@@ -68,7 +68,8 @@ pub use cancellation_scope_replay::CancellationScopeRequested;
 pub use external_signal::{ExternalSignalCall, ExternalSignalOutcome, ExternalSignalResult};
 pub use failure_reporting::FailureReportError;
 pub use interceptors::{
-    PassthroughWorkerInterceptor, QueryTaskFailure, WorkerInterceptor, WorkflowTaskFailure,
+    PassthroughWorkerInterceptor, QueryTaskFailure, UpdateValidationOutcome, WorkerInterceptor,
+    WorkflowTaskFailure,
 };
 pub use run_activities::{
     WorkflowActivity, WorkflowActivityAttempt, WorkflowActivityList, WorkflowActivityMetadataError,

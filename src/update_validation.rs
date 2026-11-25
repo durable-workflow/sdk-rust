@@ -610,7 +610,10 @@ impl Worker {
             .metrics
             .worker(true, "update_validation", &self.task_queue);
         task_metrics.outcome("failed");
-        let decision = self.decide_update_validation(task).await;
+        let context = self.update_validation_interceptor_context(&task);
+        let decision = self
+            .intercept_update_validation(context, self.decide_update_validation(task))
+            .await;
         let lease_owner = self.worker_id.clone();
         // The answer is sent even while the worker stops, as query and
         // workflow-task completions are: the caller is waiting on it.

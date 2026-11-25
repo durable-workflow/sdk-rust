@@ -565,3 +565,155 @@ async fn validation_tasks_record_worker_task_metrics_and_answer_while_stopping()
         ]
     );
 }
+
+/// Records what an update-validation interceptor observed, and how it breaks the chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValidationAuditMode {
+    Observe,
+    SkipNext,
+    FailAfter,
+}
+
+struct ValidationAudit {
+    mode: ValidationAuditMode,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl WorkerInterceptor for ValidationAudit {
+    fn execute_update_validation_task<'a>(
+        &'a self,
+        context: &'a crate::interceptors::UpdateValidationInterceptorContext,
+        next: crate::interceptors::UpdateValidationNext<'a>,
+    ) -> crate::interceptors::InterceptorFuture<'a, Result<UpdateValidationOutcome>> {
+        Box::pin(async move {
+            let identity = format!(
+                "{}:{}:{}:{}",
+                context.update_validation_task_id(),
+                context.workflow_id().unwrap_or_default(),
+                context.update_name(),
+                context.attempt()
+            );
+            if self.mode == ValidationAuditMode::SkipNext {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("{identity}:skipped"));
+                // Outcomes cannot be forged; skipping next returns an error.
+                return Err(Error::WorkflowTaskInterceptor("skipped".into()));
+            }
+            let outcome = next.run().await?;
+            self.seen.lock().unwrap().push(format!(
+                "{identity}:{}",
+                outcome.reason().unwrap_or("approved")
+            ));
+            if self.mode == ValidationAuditMode::FailAfter {
+                return Err(Error::WorkflowTaskInterceptor("audit store down".into()));
+            }
+            Ok(outcome)
+        })
+    }
+}
+
+fn audited(mode: ValidationAuditMode) -> (Worker, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker =
+        with_limit_validator(order_worker(offline_client())).interceptor(ValidationAudit {
+            mode,
+            seen: seen.clone(),
+        });
+    (worker, seen)
+}
+
+async fn intercepted(
+    worker: &Worker,
+    task: Value,
+) -> std::result::Result<(), (&'static str, UpdateRejection)> {
+    let context = worker.update_validation_interceptor_context(&task);
+    worker
+        .intercept_update_validation(context, worker.decide_update_validation(task))
+        .await
+}
+
+#[tokio::test]
+async fn validation_interceptors_observe_the_decision_without_changing_it() {
+    let (worker, seen) = audited(ValidationAuditMode::Observe);
+
+    let (reason, rejection) = intercepted(&worker, validation_task("v1", "approve", 7))
+        .await
+        .expect_err("the validator's rejection stands");
+    assert_eq!(reason, UPDATE_VALIDATOR_REJECTED);
+    assert_eq!(rejection.message, "amount 7 exceeds the limit 5");
+    intercepted(&worker, validation_task("v2", "approve", 3))
+        .await
+        .expect("the validator's approval stands");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "v1:order-1:approve:1:update_validator_rejected".to_string(),
+            "v2:order-1:approve:1:approved".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_broken_validation_chain_is_a_worker_failure_not_an_approval() {
+    // Skipping next never runs the validator, so nothing may be approved.
+    let (worker, seen) = audited(ValidationAuditMode::SkipNext);
+    let (reason, rejection) = intercepted(&worker, validation_task("v1", "approve", 3))
+        .await
+        .expect_err("a skipped validator cannot approve");
+    assert_eq!(reason, UPDATE_VALIDATION_WORKER_FAILED);
+    assert!(
+        rejection.message.contains("failed without running next"),
+        "{rejection}"
+    );
+    assert_eq!(
+        rejection.failure_type.as_deref(),
+        Some("UpdateValidationInterceptor")
+    );
+    assert_eq!(*seen.lock().unwrap(), vec!["v1:order-1:approve:1:skipped"]);
+
+    // An interceptor error after an approval also withholds acceptance.
+    let (worker, _) = audited(ValidationAuditMode::FailAfter);
+    let (reason, rejection) = intercepted(&worker, validation_task("v2", "approve", 3))
+        .await
+        .expect_err("a failed interceptor withholds the approval");
+    assert_eq!(reason, UPDATE_VALIDATION_WORKER_FAILED);
+    assert!(
+        rejection.message.contains("audit store down"),
+        "{rejection}"
+    );
+}
+
+#[tokio::test]
+async fn worker_answers_intercepted_validations_with_the_validators_decision() {
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(validating_server),
+        ..MockWorkerBehavior::default()
+    });
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = with_limit_validator(order_worker(Client::new(server.base_url()).unwrap()))
+        .interceptor(ValidationAudit {
+            mode: ValidationAuditMode::Observe,
+            seen: seen.clone(),
+        });
+    worker.register().await.unwrap();
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+
+    // The interceptor saw both validations; the answers are the validator's own.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "val-reject:order-1:approve:1:update_validator_rejected".to_string(),
+            "val-approve:order-1:approve:1:approved".to_string(),
+        ]
+    );
+    let rejected = server.request_body("/api/worker/update-validation-tasks/val-reject/reject");
+    assert_eq!(rejected["failure"]["reason"], "update_validator_rejected");
+    assert_eq!(
+        server.request_count("/api/worker/update-validation-tasks/val-approve/approve"),
+        1
+    );
+}
