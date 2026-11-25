@@ -13,10 +13,14 @@ pub(super) const ORDER: &str = "durable_receipt_order";
 /// An omitted snapshot differs from a snapshot with no outstanding receipts.
 pub(super) type PendingInput = Option<Option<u64>>;
 
+/// Per-claim task evidence read from the poll's wire task, beside the public
+/// `WorkflowTask` model (whose stable 4.x struct literals stay unchanged).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Claim {
     pub(super) authoring: bool,
     pub(super) pending_input: PendingInput,
+    /// The validated `replay_clock` entry carrier (.github#215).
+    pub(super) replay_entry: Option<crate::replay_clock::Entry>,
 }
 
 pub(super) fn read_claim(task: &Value) -> Result<Claim> {
@@ -34,6 +38,7 @@ pub(super) fn read_claim(task: &Value) -> Result<Claim> {
     Ok(Claim {
         authoring: task[AUTHORING] == true,
         pending_input,
+        replay_entry: crate::replay_clock::entry(task),
     })
 }
 

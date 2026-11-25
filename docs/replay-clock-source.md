@@ -18,7 +18,7 @@ counter identity to order emitted events.
 | Boundary | Authority in this cohort | Availability |
 | --- | --- | --- |
 | Redrive entry | Unique `WorkflowStarted` with `recovery_kind=redrive` and valid `replayed_started_at` | Recorded original start |
-| Ordinary entry | Core uses original `WorkflowRun.started_at`; current Rust worker task has no such carrier | Unavailable, even if the start history row has an insertion timestamp |
+| Ordinary entry | The workflow task's `replay_clock` carrier (`WorkerReplayClock` v1, Server 3.6.0+): `schema` `durable-workflow.worker-replay-clock/v1`, `workflow_run_id` equal to the task's run, strict `started_at` (`YYYY-MM-DDTHH:MM:SS.ffffffZ`) and a `source` that matches the history's start kind (`run_started_at` for an ordinary, continued or child run; `redrive_replayed_started_at` for a redrive successor) | The carrier's `started_at`, identical on every lease of the run. A missing, invalid or mismatched carrier keeps entry unavailable, even if the start history row has an insertion timestamp. A redrive anchor proved from history is kept |
 | Scalar remote activity | Existing validated command sequence/type/result correlation, then the selected terminal event | Selected recorded time; successful redrive reuse retains `reused_recorded_at`; the existing Core failure branch uses its event time |
 | Scalar plain timer | Existing validated `TimerScheduled`/`TimerFired` pair, exact sequence/ID/delay | Matched fire time, with recorded reuse provenance |
 | Scalar child result | One schedule, optional start and unique parent `ChildRunCompleted` / `ChildRunFailed` / `ChildRunCancelled` / `ChildRunTerminated`, with matching nonempty child call, instance, run and type identities | Parent resolution event time for both send and throw; child `closed_at` and `reused_recorded_at` are not this branch's clock authority |
@@ -41,12 +41,14 @@ return/error; one workflow cannot read another workflow's active clock. Query
 and update contexts own an immutable engine-correlated value, with no shared
 ambient mutable state. Clock reads append no commands/history.
 
-The ordinary entry gap is [confirmed by Server](https://github.com/durable-workflow/server/issues/325#issuecomment-6671799265):
-worker claims omit `run.started_at`; native start and history insertion sample
-time separately. The existing describe endpoint needs exact namespace/workflow/run
-binding; export summary time does not establish a worker anchor. Server owns a
-later additive authoritative task carrier and its precision/missing contract.
-This source does not add a wire field or extra describe/export RPC.
+Ordinary entry reads Server's additive task carrier
+([`docs/contracts/worker-replay-entry-clock.md`](https://github.com/durable-workflow/server/blob/main/docs/contracts/worker-replay-entry-clock.md),
+server#1156). History insertion, dispatch and lease times are never substituted:
+native start and history insertion sample time separately. The worker reads the
+carrier from the polled wire task beside the public `WorkflowTask` model, whose
+4.x struct literals are unchanged, so a `WorkflowTask` built or executed directly
+without a poll keeps entry unavailable. Query, update and snapshot callbacks do
+not receive the workflow task's carrier and keep their own authority.
 
 An advancing time immediately after a newly authored inline marker/local result
 also needs an explicitly selected opt-in persistence/resume boundary. It cannot

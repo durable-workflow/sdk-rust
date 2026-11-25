@@ -554,6 +554,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             | "corpus.business-replay-clock-parallel-activity"
             | "corpus.business-replay-clock-parallel-timer"
             | "corpus.business-replay-clock-parallel-child"
+            | "corpus.business-replay-clock-entry"
             | "corpus.nexus-result"
             | "corpus.schedule-origin-window"
             | "corpus.nexus-cancellation"
@@ -628,6 +629,7 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
         "sticky_replay_mode",
         "last_history_sequence",
         "total_history_events",
+        "replay_clock",
     ] {
         if let Some(value) = fixture["worker_task"].get(field) {
             task[field] = value.clone();
@@ -706,6 +708,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
             workflow_logging::register_nexus_pending(&mut worker, workflow_type)
         }
         "corpus.business-replay-clock" => business_clock::register(&mut worker, workflow_type),
+        "corpus.business-replay-clock-entry" => {
+            business_clock::register_entry(&mut worker, workflow_type)
+        }
         "corpus.business-replay-clock-signal" => {
             business_clock::register_signal(&mut worker, workflow_type)
         }

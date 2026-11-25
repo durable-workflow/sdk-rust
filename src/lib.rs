@@ -11573,6 +11573,7 @@ impl Worker {
                 delivery: self.allow_cancellation_scope_delivery,
             },
         )?;
+        workflow_state.adopt_replay_entry(self.ordered_condition_claim.replay_entry);
         workflow_state.observation_namespace = Some(self.client.namespace.clone());
         workflow_state.continue_as_new_target_supported =
             self.client.worker_supports_continue_as_new_target(

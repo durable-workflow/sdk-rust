@@ -528,3 +528,5 @@ mod parallel_timer;
 mod parallel;
 
 mod parallel_child;
+
+mod entry;

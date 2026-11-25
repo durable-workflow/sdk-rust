@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `WorkflowContext::replay_now()` is available at ordinary workflow entry,
+  before any durable step. It returns the `replay_clock` instant (`WorkerReplayClock`
+  v1) that Server 3.6.0+ sends on workflow tasks: the run's own start, or a
+  redrive successor's original start. The value is pinned to the run's stored
+  rows, so every replay reads the same instant. A task without a valid carrier,
+  or whose carrier names another run or disagrees with the history's start kind,
+  keeps entry unavailable as before. Query, update and cancellation clocks are
+  unchanged. ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))
+
 ## 4.24.0
 
 - When a compatible Native Server enables ordered condition authoring, timed

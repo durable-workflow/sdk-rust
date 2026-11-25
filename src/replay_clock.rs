@@ -115,6 +115,67 @@ fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
     parse(start.payload.get("replayed_started_at"))
 }
 
+/// `WorkerReplayClock` v1, the workflow task's entry instant (Server #1132/#1156).
+const ENTRY_SCHEMA: &str = "durable-workflow.worker-replay-clock/v1";
+
+/// A validated `replay_clock` carrier from one workflow task claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Entry {
+    started_at: DateTime<Utc>,
+    redrive: bool,
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`, exactly as the v1 schema pattern requires.
+fn strict_entry_time(text: &str) -> Option<DateTime<Utc>> {
+    let bytes = text.as_bytes();
+    let shape = bytes.len() == 27
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'.',
+            26 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        });
+    let time = DateTime::parse_from_rfc3339(text).ok().filter(|_| shape)?;
+    // chrono admits a leap second as nanoseconds >= 1s; the carrier cannot.
+    (time.timestamp_subsec_nanos() < 1_000_000_000).then(|| time.with_timezone(&Utc))
+}
+
+/// Read the task's `replay_clock`. Anything other than a complete v1 object
+/// for this task's run is absent: the SDK never substitutes another time.
+pub(super) fn entry(task: &Value) -> Option<Entry> {
+    let carrier = task.get("replay_clock")?.as_object()?;
+    let run_id = task.get("run_id")?.as_str().filter(|id| !id.is_empty())?;
+    if carrier.get("schema").and_then(Value::as_str) != Some(ENTRY_SCHEMA)
+        || carrier.get("workflow_run_id").and_then(Value::as_str) != Some(run_id)
+    {
+        return None;
+    }
+    let redrive = match carrier.get("source").and_then(Value::as_str)? {
+        "run_started_at" => false,
+        "redrive_replayed_started_at" => true,
+        _ => return None,
+    };
+    Some(Entry {
+        started_at: strict_entry_time(carrier.get("started_at")?.as_str()?)?,
+        redrive,
+    })
+}
+
+/// Whether this history declares a redrive start, whether or not it is proved.
+fn declares_redrive(history: &[HistoryEvent]) -> bool {
+    history.iter().any(|event| match event.event_type.as_str() {
+        "WorkflowStarted" => {
+            event.payload["recovery_kind"] == "redrive"
+                || event.payload.get("replayed_started_at").is_some()
+                || event.payload.get("resume_step_sequence").is_some()
+        }
+        "StartAccepted" => event.payload["outcome"] == "redriven",
+        _ => false,
+    })
+}
+
 #[derive(Debug)]
 pub(super) struct Clock {
     time: Option<DateTime<Utc>>,
@@ -433,9 +494,26 @@ impl Clock {
     pub(super) fn unavailable(&mut self) {
         self.time = None;
     }
+
+    /// Ordinary entry time from a validated task carrier, before any
+    /// boundary is consumed. Its source must match the history's start kind.
+    /// A redrive anchor already proved from history is kept as it was.
+    fn adopt_entry(&mut self, history: &[HistoryEvent], entry: Entry) {
+        if self.time.is_none() && entry.redrive == declares_redrive(history) {
+            self.time = Some(entry.started_at);
+        }
+    }
 }
 
 impl WorkflowState {
+    /// Apply this claim's `replay_clock` carrier. Call it once, after
+    /// construction and before the workflow body runs.
+    pub(super) fn adopt_replay_entry(&mut self, entry: Option<Entry>) {
+        if let Some(entry) = entry {
+            self.replay_clock.adopt_entry(&self.history_events, entry);
+        }
+    }
+
     pub(super) fn consume_replay_sequence(
         &mut self,
         sequence: u64,
@@ -531,10 +609,17 @@ impl WorkflowContext {
     /// or invalid evidence returns [`Error::ReplayClockUnavailable`]. The clock
     /// is available only while this workflow's handler/future is executing.
     ///
+    /// Before any boundary is consumed, the clock is the workflow task's
+    /// Server-provided `replay_clock` entry instant (`WorkerReplayClock` v1):
+    /// the run's own start, or a redrive successor's original start. It is
+    /// pinned to the run's stored rows, so every replay reads the same value.
+    /// A task without a valid carrier keeps entry unavailable, except for the
+    /// explicit redrive start anchor proved from history.
+    ///
     /// Supported boundaries are correlated scalar activity, timer, child, signal
-    /// and condition results, persisted Activity and Timer all groups, and the
-    /// explicit redrive start anchor. Ordinary start authority, inline metadata
-    /// and local completions, and other grouped families remain unavailable.
+    /// and condition results, and persisted Activity, Timer and Child all
+    /// groups. Inline metadata and local completions, and other grouped
+    /// families remain unavailable.
     /// Cancellation's existing budget clock is unchanged.
     /// Migrate business decisions through normal workflow versioning. Event
     /// timestamps do not provide a total order; retain stream/counter identity.
