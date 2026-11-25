@@ -1,4 +1,5 @@
-//! Ordered worker interceptors around workflow tasks, activities and queries.
+//! Ordered worker interceptors around workflow tasks, activities, queries and
+//! update validations.
 //!
 //! Register interceptors with [`Worker::interceptor`](crate::Worker::interceptor)
 //! or [`Worker::interceptors`](crate::Worker::interceptors). The first
@@ -13,6 +14,7 @@
 //! | [`WorkerInterceptor::execute_workflow_task`] | one workflow task (replay plus new execution) | [`WorkflowTaskInterceptorContext`] | [`WorkflowTaskOutcome`] |
 //! | [`WorkerInterceptor::execute_activity`] | one activity or local activity attempt | [`ActivityInterceptorContext`] | the activity result |
 //! | [`WorkerInterceptor::execute_query_task`] | one query task | [`QueryTaskInterceptorContext`] | the query result or [`QueryTaskFailure`] |
+//! | [`WorkerInterceptor::execute_update_validation_task`] | one update-validation task | [`UpdateValidationInterceptorContext`] | a read-only [`UpdateValidationOutcome`] |
 //!
 //! Workflow-task interceptors cannot change what the workflow records. The
 //! core always runs the task as received ([`WorkflowTaskNext::run`] takes no
@@ -28,13 +30,25 @@
 //! that task. A failed task's retry can repeat an outcome; use
 //! [`WorkflowTaskInterceptorContext::attempt`] to detect retries.
 //!
+//! Update-validation interceptors observe a validator's decision and cannot
+//! change it. The validator always runs on the task as received
+//! ([`UpdateValidationNext::run`] takes no input) and the worker sends the
+//! validator's own approval or rejection. If an interceptor fails, returns
+//! without running `next`, or drops the validation partway, the worker reports
+//! `update_validation_worker_failed` instead: the update is not accepted, and
+//! the caller's retry with the same request id asks the validator again.
+//!
 //! Built-in [`ExecutionTelemetry`](crate::telemetry::ExecutionTelemetry) stays
 //! outermost: its spans wrap the whole interceptor chain.
 
 use crate::{
-    recorded_commands, ActivityContext, ActivityHandler, AvroValue, Error, QueryTask,
-    QueryTaskExecutionFailure, Result, Value, Worker, WorkflowIdentity, WorkflowReplayState,
-    WorkflowTask, WorkflowTaskDecision,
+    recorded_commands,
+    update_validation::{
+        UpdateRejection, UPDATE_VALIDATION_WORKER_FAILED, UPDATE_VALIDATOR_REJECTED,
+    },
+    ActivityContext, ActivityHandler, AvroValue, Error, QueryTask, QueryTaskExecutionFailure,
+    Result, Value, Worker, WorkflowIdentity, WorkflowReplayState, WorkflowTask,
+    WorkflowTaskDecision,
 };
 use std::{
     fmt,
@@ -122,6 +136,21 @@ pub trait WorkerInterceptor: Send + Sync + 'static {
         let _ = context;
         next.run()
     }
+
+    /// Wrap one update-validation task. Run `next` exactly once.
+    ///
+    /// The returned outcome is ignored: the worker sends the validator's own
+    /// approval or rejection. Returning an error, returning without running
+    /// `next`, or dropping it partway makes the worker report
+    /// `update_validation_worker_failed`, so the update is not accepted.
+    fn execute_update_validation_task<'a>(
+        &'a self,
+        context: &'a UpdateValidationInterceptorContext,
+        next: UpdateValidationNext<'a>,
+    ) -> InterceptorFuture<'a, Result<UpdateValidationOutcome>> {
+        let _ = context;
+        next.run()
+    }
 }
 
 impl<T: WorkerInterceptor + ?Sized> WorkerInterceptor for Arc<T> {
@@ -147,6 +176,14 @@ impl<T: WorkerInterceptor + ?Sized> WorkerInterceptor for Arc<T> {
         next: QueryTaskNext<'a>,
     ) -> InterceptorFuture<'a, std::result::Result<AvroValue, QueryTaskFailure>> {
         (**self).execute_query_task(context, next)
+    }
+
+    fn execute_update_validation_task<'a>(
+        &'a self,
+        context: &'a UpdateValidationInterceptorContext,
+        next: UpdateValidationNext<'a>,
+    ) -> InterceptorFuture<'a, Result<UpdateValidationOutcome>> {
+        (**self).execute_update_validation_task(context, next)
     }
 }
 
@@ -881,5 +918,241 @@ impl Worker {
         .run()
         .await
         .map_err(QueryTaskExecutionFailure::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Update validation
+// ---------------------------------------------------------------------------
+
+/// Read-only context of one update-validation task.
+#[derive(Clone, Debug)]
+pub struct UpdateValidationInterceptorContext {
+    worker_id: String,
+    task_queue: String,
+    namespace: String,
+    update_validation_task_id: String,
+    attempt: u64,
+    workflow_id: Option<String>,
+    run_id: Option<String>,
+    workflow_type: String,
+    update_name: String,
+    observability_context: Option<Value>,
+}
+
+impl UpdateValidationInterceptorContext {
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+    pub fn task_queue(&self) -> &str {
+        &self.task_queue
+    }
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+    pub fn update_validation_task_id(&self) -> &str {
+        &self.update_validation_task_id
+    }
+    /// The validation attempt; above 1 when the Server redelivers the task.
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+    pub fn workflow_id(&self) -> Option<&str> {
+        self.workflow_id.as_deref()
+    }
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+    pub fn workflow_type(&self) -> &str {
+        &self.workflow_type
+    }
+    pub fn update_name(&self) -> &str {
+        &self.update_name
+    }
+    /// The task's optional, untrusted observability metadata (trace carrier).
+    pub fn observability_context(&self) -> Option<&Value> {
+        self.observability_context.as_ref()
+    }
+}
+
+/// A read-only view of the decision the validator produced.
+///
+/// It is only obtained from [`UpdateValidationNext::run`]. The worker sends
+/// the validator's own decision, never a returned outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateValidationOutcome {
+    rejection: Option<(&'static str, UpdateRejection)>,
+}
+
+impl UpdateValidationOutcome {
+    /// The validator approved the update.
+    pub fn is_approved(&self) -> bool {
+        self.rejection.is_none()
+    }
+    /// The validator refused the update (`update_validator_rejected`).
+    pub fn is_rejected(&self) -> bool {
+        matches!(self.rejection, Some((UPDATE_VALIDATOR_REJECTED, _)))
+    }
+    /// The validator could not run (`update_validation_worker_failed`).
+    pub fn is_worker_failure(&self) -> bool {
+        matches!(self.rejection, Some((UPDATE_VALIDATION_WORKER_FAILED, _)))
+    }
+    /// The failure reason the worker reports, or `None` for an approval.
+    pub fn reason(&self) -> Option<&str> {
+        self.rejection.as_ref().map(|(reason, _)| *reason)
+    }
+    /// The rejection or failure the worker reports, or `None` for an approval.
+    pub fn rejection(&self) -> Option<&UpdateRejection> {
+        self.rejection.as_ref().map(|(_, rejection)| rejection)
+    }
+}
+
+/// The validator's decision: approve, or the failure reason and rejection.
+pub(crate) type ValidationDecision = std::result::Result<(), (&'static str, UpdateRejection)>;
+
+struct ValidationCore<'a> {
+    future: InterceptorFuture<'a, ValidationDecision>,
+    record: &'a Mutex<Option<ValidationDecision>>,
+    started: &'a AtomicBool,
+}
+
+/// Continues an update-validation chain; the innermost `next` runs the validator.
+pub struct UpdateValidationNext<'a> {
+    chain: &'a [RegisteredInterceptor],
+    index: usize,
+    reached: &'a AtomicUsize,
+    context: &'a UpdateValidationInterceptorContext,
+    core: ValidationCore<'a>,
+}
+
+impl<'a> UpdateValidationNext<'a> {
+    /// Run the rest of the chain and the validator with the task as received.
+    pub fn run(self) -> InterceptorFuture<'a, Result<UpdateValidationOutcome>> {
+        if let Some(registered) = self.chain.get(self.index) {
+            let (reached, index) = (self.reached, self.index);
+            let next = UpdateValidationNext {
+                index: self.index + 1,
+                ..self
+            };
+            let hook = registered
+                .interceptor
+                .execute_update_validation_task(next.context, next);
+            return Box::pin(async move {
+                reached.fetch_max(index, Ordering::SeqCst);
+                hook.await
+            });
+        }
+        let ValidationCore {
+            future,
+            record,
+            started,
+        } = self.core;
+        Box::pin(async move {
+            started.store(true, Ordering::SeqCst);
+            let decision = future.await;
+            let outcome = UpdateValidationOutcome {
+                rejection: decision.clone().err(),
+            };
+            if let Ok(mut slot) = record.lock() {
+                *slot = Some(decision);
+            }
+            Ok(outcome)
+        })
+    }
+}
+
+impl Worker {
+    /// The interceptor context for an update-validation task, or `None` without interceptors.
+    pub(crate) fn update_validation_interceptor_context(
+        &self,
+        task: &Value,
+    ) -> Option<UpdateValidationInterceptorContext> {
+        if self.interceptors.is_empty() {
+            return None;
+        }
+        let text = |field: &str| task[field].as_str().map(str::to_string);
+        Some(UpdateValidationInterceptorContext {
+            worker_id: self.worker_id.clone(),
+            task_queue: self.task_queue.clone(),
+            namespace: self.client.namespace.clone(),
+            update_validation_task_id: text("update_validation_task_id").unwrap_or_default(),
+            attempt: task["update_validation_attempt"].as_u64().unwrap_or(1),
+            workflow_id: text("workflow_id"),
+            run_id: text("run_id"),
+            workflow_type: text("workflow_type").unwrap_or_default(),
+            update_name: text("update_name").unwrap_or_default(),
+            observability_context: task
+                .get("observability_context")
+                .filter(|value| !value.is_null())
+                .cloned(),
+        })
+    }
+
+    /// Run one validator inside the interceptor chain.
+    ///
+    /// Returns exactly the validator's decision. A broken chain becomes an
+    /// `update_validation_worker_failed` rejection, so nothing is accepted.
+    pub(crate) async fn intercept_update_validation<F>(
+        &self,
+        context: Option<UpdateValidationInterceptorContext>,
+        core: F,
+    ) -> ValidationDecision
+    where
+        F: Future<Output = ValidationDecision> + Send,
+    {
+        let Some(context) = context else {
+            return core.await;
+        };
+        let record = Mutex::new(None);
+        let reached = AtomicUsize::new(0);
+        let started = AtomicBool::new(false);
+        let chain = UpdateValidationNext {
+            chain: &self.interceptors,
+            index: 0,
+            reached: &reached,
+            context: &context,
+            core: ValidationCore {
+                future: Box::pin(core),
+                record: &record,
+                started: &started,
+            },
+        }
+        .run()
+        .await
+        .map(drop);
+        let failed = |message: String| {
+            Err((
+                UPDATE_VALIDATION_WORKER_FAILED,
+                UpdateRejection::new(message).with_type("UpdateValidationInterceptor"),
+            ))
+        };
+        let Some(decision) = record.into_inner().ok().flatten() else {
+            let error = match &chain {
+                Ok(()) => String::new(),
+                Err(error) => format!(": {error}"),
+            };
+            if started.load(Ordering::SeqCst) {
+                return failed(format!(
+                    "an update validation interceptor dropped the validation before it completed{error}"
+                ));
+            }
+            let skipped = &self.interceptors[reached
+                .load(Ordering::SeqCst)
+                .min(self.interceptors.len() - 1)];
+            return failed(match chain {
+                Ok(()) => format!(
+                    "update validation interceptor {} returned without running next",
+                    skipped.name
+                ),
+                Err(_) => format!(
+                    "update validation interceptor {} failed without running next{error}",
+                    skipped.name
+                ),
+            });
+        };
+        match chain {
+            Ok(()) => decision,
+            Err(error) => failed(format!("update validation interceptor failed: {error}")),
+        }
     }
 }

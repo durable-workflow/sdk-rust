@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Worker interceptors also wrap update-validation tasks through
+  `WorkerInterceptor::execute_update_validation_task`, with an
+  `UpdateValidationInterceptorContext` (validation task id, attempt, workflow
+  and run ids, workflow type, update name, trace carrier). The hook has a
+  passthrough default. Interceptors see a read-only `UpdateValidationOutcome`
+  and cannot change the validator's decision; an interceptor error, a skipped
+  `next` or a dropped validation reports `update_validation_worker_failed`, so
+  the update is not accepted.
+  ([Durable Workflow #234](https://github.com/durable-workflow/.github/issues/234),
+  [#226](https://github.com/durable-workflow/.github/issues/226))
+
 - `WorkflowContext::replay_now()` is available at ordinary workflow entry,
   before any durable step. It returns the `replay_clock` instant (`WorkerReplayClock`
   v1) that Server 3.6.0+ sends on workflow tasks: the run's own start, or a
