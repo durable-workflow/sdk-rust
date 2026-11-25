@@ -47,8 +47,21 @@ server#1156). History insertion, dispatch and lease times are never substituted:
 native start and history insertion sample time separately. The worker reads the
 carrier from the polled wire task beside the public `WorkflowTask` model, whose
 4.x struct literals are unchanged, so a `WorkflowTask` built or executed directly
-without a poll keeps entry unavailable. Query, update and snapshot callbacks do
-not receive the workflow task's carrier and keep their own authority.
+without a poll keeps entry unavailable. A v1 carrier has exactly the four keys
+`schema`, `workflow_run_id`, `started_at` and `source`; an extra key, a
+non-string field, or a `replayed_started_at` recorded on a start event that
+differs from `started_at` makes it absent. Step times always come from history;
+only the entry value comes from the carrier.
+
+A replayed-instance query rebuilds the workflow body with the carrier on its
+own query task. Server attaches the carrier to workflow tasks, including update
+tasks, but not yet to query tasks, so a query of a run whose body propagates an
+unavailable entry read fails visibly (`query_workflow_state_unavailable`) until
+it does. Rust update tasks run the update handler against history without
+rebuilding the body. Query, update and snapshot handler reads keep their own
+authority. Offline replay takes the carrier with
+`WorkflowHistory::replay_clock(carrier)`. An unhandled
+`Error::ReplayClockUnavailable` fails the workflow like any other error.
 
 An advancing time immediately after a newly authored inline marker/local result
 also needs an explicitly selected opt-in persistence/resume boundary. It cannot

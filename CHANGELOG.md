@@ -8,7 +8,11 @@
   redrive successor's original start. The value is pinned to the run's stored
   rows, so every replay reads the same instant. A task without a valid carrier,
   or whose carrier names another run or disagrees with the history's start kind,
-  keeps entry unavailable as before. Query, update and cancellation clocks are
+  keeps entry unavailable as before. A replayed-instance query rebuilds the body
+  with its own task's carrier; Server does not send one on query tasks yet, so
+  querying a run whose body propagates an unavailable entry read fails visibly.
+  `WorkflowHistory::replay_clock(carrier)` supplies the carrier to offline
+  replay. Query and update handler reads and the cancellation clock are
   unchanged. ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))
 
 ## 4.24.0

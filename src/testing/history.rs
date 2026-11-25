@@ -12,6 +12,7 @@ use serde::Serialize;
 pub struct WorkflowHistory {
     pub(super) task: WorkflowTask,
     pub(super) task_queue: Option<String>,
+    pub(super) replay_clock: Option<Value>,
 }
 
 fn invalid(message: &str) -> crate::Error {
@@ -163,13 +164,31 @@ impl WorkflowHistory {
             "workflow_type":workflow_type, "workflow_id":workflow_id, "run_id":run_id,
             "payload_codec":DEFAULT_CODEC, "arguments":input, "history_events":events,
         }))?;
-        Ok(Self { task, task_queue })
+        Ok(Self {
+            task,
+            task_queue,
+            replay_clock: None,
+        })
     }
 
     /// Override task-queue context omitted by a raw history response.
     pub fn task_queue(mut self, queue: impl Into<String>) -> Self {
         self.task_queue = Some(queue.into());
         self
+    }
+
+    /// Supply the run's `replay_clock` entry carrier (`WorkerReplayClock` v1)
+    /// that Server sent on its workflow tasks, so a replayed body that reads
+    /// [`crate::WorkflowContext::replay_now`] at entry sees the same instant.
+    /// An invalid carrier, or one for another run, is ignored as a worker
+    /// ignores it; without one, entry stays unavailable.
+    pub fn replay_clock(mut self, carrier: Value) -> Self {
+        self.replay_clock = Some(carrier);
+        self
+    }
+
+    pub(super) fn replay_entry(&self) -> Option<crate::replay_clock::Entry> {
+        crate::replay_clock::entry_for(self.replay_clock.as_ref(), self.task.run_id.as_deref())
     }
 
     pub fn workflow_type(&self) -> &str {

@@ -10869,6 +10869,9 @@ impl Worker {
             Err(_) => return Ok(ManagedPollOutcome::Handled),
             Ok(result) => result?,
         }
+        // Server does not attach the entry carrier to query tasks yet. When it
+        // does, a reconstructed workflow body reads it as a workflow task would.
+        let replay_entry = replay_clock::entry(&wire["task"]);
         let response: PollQueryTaskResponse = serde_json::from_value(wire)?;
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
@@ -10890,7 +10893,7 @@ impl Worker {
         let execution = query_authority::Authority::protect(
             authority.as_ref(),
             self,
-            self.execute_query_task_with_authority(task, authority.as_ref()),
+            self.execute_query_task_with_authority(task, authority.as_ref(), replay_entry),
         )
         .await;
         let execution = match execution {
@@ -11146,13 +11149,15 @@ impl Worker {
         &self,
         task: QueryTask,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
-        self.execute_query_task_with_authority(task, None).await
+        self.execute_query_task_with_authority(task, None, None)
+            .await
     }
 
     async fn execute_query_task_with_authority(
         &self,
         task: QueryTask,
         authority: Option<&query_authority::Authority>,
+        replay_entry: Option<replay_clock::Entry>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &self.telemetry {
@@ -11162,17 +11167,19 @@ impl Worker {
                     self.query_telemetry_fields(&task),
                     false,
                     authority.and_then(|_| self.query_observations(&task)),
-                    self.execute_query_task_inner(task, authority),
+                    self.execute_query_task_inner(task, authority, replay_entry),
                 )
                 .await;
         }
-        self.execute_query_task_inner(task, authority).await
+        self.execute_query_task_inner(task, authority, replay_entry)
+            .await
     }
 
     async fn execute_query_task_inner(
         &self,
         mut task: QueryTask,
         authority: Option<&query_authority::Authority>,
+        replay_entry: Option<replay_clock::Entry>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         validate_query_task_payloads(&task).map_err(|error| {
             QueryTaskExecutionFailure::new(
@@ -11314,6 +11321,10 @@ impl Worker {
                 // Query replay never submits commands, so an external signal
                 // past the recorded history waits like any new command.
                 replayed_state.signal_external_workflow_supported = true;
+                // The rebuilt body reads entry time as the workflow task did.
+                // Without a carrier on this task it stays unavailable, and a
+                // body that propagates that error fails this query visibly.
+                replayed_state.adopt_replay_entry(replay_entry);
                 let has_recorded_continuation = replayed_state.recorded_continue_as_new.is_some();
                 let workflow_state = Arc::new(Mutex::new(replayed_state));
                 let workflow_context = WorkflowContext {
