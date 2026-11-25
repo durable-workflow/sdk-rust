@@ -105,6 +105,23 @@ fn entry_carrier_accepts_only_a_complete_v1_object_for_this_run() {
 }
 
 #[test]
+fn query_attestation_distinguishes_absent_null_and_object_keys() {
+    assert_eq!(attestation(&json!({"run_id":RUN})), Attestation::Unattested);
+    assert_eq!(
+        attestation(&json!({"run_id":RUN,"replay_clock":null})),
+        Attestation::Unprovable
+    );
+    assert_eq!(
+        attestation(&json!({"run_id":RUN,"replay_clock":{}})),
+        Attestation::Unattested
+    );
+    assert!(matches!(
+        attestation(&task(carrier("run_started_at", ENTRY))),
+        Attestation::Entry(_)
+    ));
+}
+
+#[test]
 fn entry_read_returns_the_carrier_and_replays_identically() {
     let mut history = vec![ordinary_start()];
     history.extend(timer(1, "2026-03-04T05:06:12.5Z"));
@@ -214,6 +231,26 @@ fn entry_carrier_must_agree_with_an_unproved_recorded_anchor() {
     let guard = Guard::enter(&ctx);
     assert!(unavailable(&ctx));
     drop(guard);
+    // An unparsable recorded anchor refuses the carrier too.
+    let ctx = entry_context(
+        vec![unproved("not a time")],
+        Some(carrier("redrive_replayed_started_at", ENTRY)),
+    );
+    let guard = Guard::enter(&ctx);
+    assert!(unavailable(&ctx));
+    drop(guard);
+    // A null anchor or resume step is absent: the history is ordinary.
+    let ctx = entry_context(
+        vec![event(
+            "WorkflowStarted",
+            json!({"workflow_run_id":RUN,"replayed_started_at":null,"resume_step_sequence":null}),
+            "2026-03-04T05:06:09Z",
+        )],
+        Some(carrier("run_started_at", ENTRY)),
+    );
+    let guard = Guard::enter(&ctx);
+    assert_eq!(read(&ctx), ENTRY);
+    drop(guard);
     let ctx = entry_context(
         vec![unproved("2026-03-04T05:06:07.891234+00:00")],
         Some(carrier("redrive_replayed_started_at", ENTRY)),
@@ -303,32 +340,120 @@ fn entry_reading_worker() -> Worker {
     worker
 }
 
+/// A body that tolerates an unavailable entry read stores what it saw.
+fn tolerant_worker() -> Worker {
+    let mut worker = Worker::new(Client::new("http://127.0.0.1:8080").unwrap(), "clock-tests");
+    worker.register_replayed_workflow("clock", String::new, |ctx, _args, state| async move {
+        let entry = ctx.replay_now().map_or_else(
+            |_| "none".to_string(),
+            |time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        );
+        state.update(|value| *value = entry.clone())?;
+        Ok(json!(entry))
+    });
+    worker.register_replayed_query::<String, _, _>(
+        "clock",
+        "entry",
+        |_ctx, state, _args| async move { Ok(json!(state.as_str())) },
+    );
+    worker
+}
+
 #[tokio::test]
-async fn entry_reading_body_rebuilds_for_queries_only_with_the_carrier() {
-    let worker = entry_reading_worker();
-    let query: QueryTask = serde_json::from_value(json!({
-        "query_task_id":"q1","workflow_type":"clock","query_name":"entry","run_id":RUN,
-        "payload_codec":DEFAULT_CODEC,
-        "history_events":[{"event_type":"WorkflowStarted","payload":{"workflow_run_id":RUN},"recorded_at":"2026-03-04T05:06:09Z"}],
-    }))
-    .unwrap();
-    // Server sends no carrier on query tasks today: the rebuilt body's
-    // unavailable entry read fails the query visibly, never silently.
-    let failure = worker.execute_query_task(query.clone()).await.unwrap_err();
+async fn query_rebuild_of_an_entry_read_follows_the_query_tasks_attestation() {
+    let worker = tolerant_worker();
+    let started = json!({"event_type":"WorkflowStarted","payload":{"workflow_run_id":RUN},"recorded_at":"2026-03-04T05:06:09Z"});
+    let workflow = |clock: Option<Value>| {
+        let mut wire = json!({"task_id":"t1","workflow_id":"entry-workflow","run_id":RUN,
+            "workflow_type":"clock","payload_codec":DEFAULT_CODEC,"history_events":[started]});
+        if let Some(clock) = clock {
+            wire["replay_clock"] = clock;
+        }
+        let mut worker = tolerant_worker();
+        worker.ordered_condition_claim = condition_input_order::read_claim(&wire).unwrap();
+        let task: WorkflowTask = serde_json::from_value(wire).unwrap();
+        let commands = worker.execute_workflow_task(task).unwrap();
+        decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap()
+    };
+    let query = |clock: Option<Value>| {
+        let mut wire = json!({"query_task_id":"q1","workflow_type":"clock","query_name":"entry",
+            "run_id":RUN,"payload_codec":DEFAULT_CODEC,"history_events":[started]});
+        if let Some(clock) = clock {
+            wire["replay_clock"] = clock;
+        }
+        let attestation = attestation(&wire);
+        let task: QueryTask = serde_json::from_value(wire).unwrap();
+        (task, attestation)
+    };
+    let ask = |(task, attestation): (QueryTask, Attestation)| {
+        let worker = &worker;
+        async move {
+            worker
+                .execute_query_task_with_authority(task, None, attestation)
+                .await
+                .map(|answer| answer.into_json().unwrap())
+        }
+    };
+
+    // A Server before #1338 omits the key: the tolerant body's "none" is not
+    // what the workflow task computed, so the query fails closed.
+    let failure = ask(query(None)).await.unwrap_err();
     assert_eq!(failure.reason, "query_workflow_state_unavailable");
     assert!(
-        failure.message.contains("replay time is unavailable"),
+        failure.message.contains("does not attest"),
         "{}",
         failure.message
     );
-    let carried = entry(&json!({"run_id":RUN,"replay_clock":carrier("run_started_at", ENTRY)}));
+    // An invalid object is unattested too.
+    let mut invalid = carrier("run_started_at", ENTRY);
+    invalid["schema"] = json!("other");
+    assert_eq!(
+        ask(query(Some(invalid))).await.unwrap_err().reason,
+        "query_workflow_state_unavailable"
+    );
+    // A Server attesting no provable start matches a workflow task without one.
+    assert_eq!(workflow(None), json!("none"));
+    assert_eq!(ask(query(Some(Value::Null))).await.unwrap(), json!("none"));
+    // A carrier on both answers with the same entry.
+    let clock = carrier("run_started_at", ENTRY);
+    assert_eq!(workflow(Some(clock.clone())), json!(ENTRY));
     for _ in 0..2 {
-        let answer = worker
-            .execute_query_task_with_authority(query.clone(), None, carried)
-            .await
-            .unwrap();
-        assert_eq!(answer.into_json().unwrap(), json!(ENTRY));
+        assert_eq!(ask(query(Some(clock.clone()))).await.unwrap(), json!(ENTRY));
     }
+    // The public, wire-less path has no attestation.
+    let (task, _) = query(Some(clock));
+    assert_eq!(
+        worker.execute_query_task(task).await.unwrap_err().reason,
+        "query_workflow_state_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn query_rebuild_without_an_entry_read_is_unaffected_by_attestation() {
+    let mut worker = Worker::new(Client::new("http://127.0.0.1:8080").unwrap(), "clock-tests");
+    worker.register_replayed_workflow(
+        "clock",
+        || 7_u64,
+        |_ctx, _args, _state| async move { Ok(Value::Null) },
+    );
+    worker.register_replayed_query::<u64, _, _>(
+        "clock",
+        "value",
+        |_ctx, state, _args| async move { Ok(json!(*state)) },
+    );
+    let task: QueryTask = serde_json::from_value(json!({"query_task_id":"q1","workflow_type":"clock",
+        "query_name":"value","run_id":RUN,"payload_codec":DEFAULT_CODEC,
+        "history_events":[{"event_type":"WorkflowStarted","payload":{"workflow_run_id":RUN},"recorded_at":"2026-03-04T05:06:09Z"}]}))
+    .unwrap();
+    assert_eq!(
+        worker
+            .execute_query_task(task)
+            .await
+            .unwrap()
+            .into_json()
+            .unwrap(),
+        json!(7)
+    );
 }
 
 #[test]
@@ -364,11 +489,17 @@ fn offline_replay_takes_the_carrier_as_an_optional_input() {
     assert!(environment.replay(&history).is_err());
     let mut foreign = carrier("run_started_at", ENTRY);
     foreign["workflow_run_id"] = json!("another-run");
-    assert!(environment
-        .replay(&history.clone().replay_clock(foreign))
+    assert!(history.clone().replay_clock(foreign).is_err());
+    assert!(history
+        .clone()
+        .replay_clock(json!({"started_at":ENTRY}))
         .is_err());
     let report = environment
-        .replay(&history.replay_clock(carrier("run_started_at", ENTRY)))
+        .replay(
+            &history
+                .replay_clock(carrier("run_started_at", ENTRY))
+                .unwrap(),
+        )
         .unwrap();
     assert!(report.completed);
 }

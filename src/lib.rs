@@ -10882,9 +10882,9 @@ impl Worker {
             Err(_) => return Ok(ManagedPollOutcome::Handled),
             Ok(result) => result?,
         }
-        // Server does not attach the entry carrier to query tasks yet. When it
-        // does, a reconstructed workflow body reads it as a workflow task would.
-        let replay_entry = replay_clock::entry(&wire["task"]);
+        // Server #1338 attests the entry instant on query tasks; an older
+        // Server omits the key and leaves the rebuild's entry unattested.
+        let replay_entry = replay_clock::attestation(&wire["task"]);
         let response: PollQueryTaskResponse = serde_json::from_value(wire)?;
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
@@ -11162,7 +11162,8 @@ impl Worker {
         &self,
         task: QueryTask,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
-        self.execute_query_task_with_authority(task, None, None)
+        // Without the wire task there is no attestation.
+        self.execute_query_task_with_authority(task, None, replay_clock::Attestation::Unattested)
             .await
     }
 
@@ -11170,7 +11171,7 @@ impl Worker {
         &self,
         task: QueryTask,
         authority: Option<&query_authority::Authority>,
-        replay_entry: Option<replay_clock::Entry>,
+        replay_entry: replay_clock::Attestation,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &self.telemetry {
@@ -11192,7 +11193,7 @@ impl Worker {
         &self,
         mut task: QueryTask,
         authority: Option<&query_authority::Authority>,
-        replay_entry: Option<replay_clock::Entry>,
+        replay_entry: replay_clock::Attestation,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         validate_query_task_payloads(&task).map_err(|error| {
             QueryTaskExecutionFailure::new(
@@ -11335,9 +11336,8 @@ impl Worker {
                 // past the recorded history waits like any new command.
                 replayed_state.signal_external_workflow_supported = true;
                 // The rebuilt body reads entry time as the workflow task did.
-                // Without a carrier on this task it stays unavailable, and a
-                // body that propagates that error fails this query visibly.
-                replayed_state.adopt_replay_entry(replay_entry);
+                // An unattested entry read fails this query after the body runs.
+                replayed_state.attest_replay_entry(replay_entry);
                 let has_recorded_continuation = replayed_state.recorded_continue_as_new.is_some();
                 let workflow_state = Arc::new(Mutex::new(replayed_state));
                 let workflow_context = WorkflowContext {
@@ -11369,6 +11369,27 @@ impl Worker {
                         })?;
                     invocation.future.as_mut().poll(&mut cx)
                 };
+                if workflow_context
+                    .state
+                    .lock()
+                    .map_err(|_| {
+                        QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            "workflow state poisoned",
+                            "QueryWorkflowStateUnavailable",
+                        )
+                    })?
+                    .read_unattested_replay_entry()
+                {
+                    // A tolerant body would otherwise answer from state the
+                    // workflow task never computed.
+                    return Err(QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        "the replayed workflow read replay_now() at entry, but this query task \
+                         does not attest the run's replay_clock entry instant",
+                        "QueryWorkflowStateUnavailable",
+                    ));
+                }
                 match outcome {
                     Poll::Ready(Err(Error::ContinueAsNew(request)))
                         if has_recorded_continuation =>

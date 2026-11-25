@@ -180,11 +180,18 @@ impl WorkflowHistory {
     /// Supply the run's `replay_clock` entry carrier (`WorkerReplayClock` v1)
     /// that Server sent on its workflow tasks, so a replayed body that reads
     /// [`crate::WorkflowContext::replay_now`] at entry sees the same instant.
-    /// An invalid carrier, or one for another run, is ignored as a worker
-    /// ignores it; without one, entry stays unavailable.
-    pub fn replay_clock(mut self, carrier: Value) -> Self {
+    /// The carrier is validated now against this history's run ID: an
+    /// invalid carrier, or one for another run, is refused. Without one,
+    /// entry stays unavailable. [`Self::export`] does not include it, and
+    /// [`crate::testing::WorkflowEnvironment::run_workflow`] supplies none.
+    pub fn replay_clock(mut self, carrier: Value) -> Result<Self> {
+        if crate::replay_clock::entry_for(Some(&carrier), self.task.run_id.as_deref()).is_none() {
+            return Err(invalid(
+                "replay_clock must be a v1 WorkerReplayClock object for this history's run",
+            ));
+        }
         self.replay_clock = Some(carrier);
-        self
+        Ok(self)
     }
 
     pub(super) fn replay_entry(&self) -> Option<crate::replay_clock::Entry> {

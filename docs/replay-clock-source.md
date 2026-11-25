@@ -53,15 +53,25 @@ non-string field, or a `replayed_started_at` recorded on a start event that
 differs from `started_at` makes it absent. Step times always come from history;
 only the entry value comes from the carrier.
 
-A replayed-instance query rebuilds the workflow body with the carrier on its
-own query task. Server attaches the carrier to workflow tasks, including update
-tasks, but not yet to query tasks, so a query of a run whose body propagates an
-unavailable entry read fails visibly (`query_workflow_state_unavailable`) until
-it does. Rust update tasks run the update handler against history without
-rebuilding the body. Query, update and snapshot handler reads keep their own
-authority. Offline replay takes the carrier with
-`WorkflowHistory::replay_clock(carrier)`. An unhandled
-`Error::ReplayClockUnavailable` fails the workflow like any other error.
+A replayed-instance query rebuilds the workflow body with its own query task's
+`replay_clock` attestation. Server #1338 always sends that key on query and
+update-validation tasks: the v1 object when the start is provable, explicit
+`null` when it is not. An object is validated and used as on a workflow task;
+an invalid object counts as unattested. `null` keeps entry unavailable, as on
+the run's workflow tasks. When the key is absent (an older Server) and the
+rebuilt body reads `replay_now()` before consuming any boundary, without a
+history-proved redrive anchor, the query fails with
+`query_workflow_state_unavailable` whatever the body did with the unavailable
+result. A tolerant body would otherwise answer from state its workflow task
+never computed. A replayed query handler's own `replay_now()` reads that
+rebuilt prefix. Rust update tasks run the update handler against history
+without rebuilding the body, and their handler time remains the committed
+`UpdateAccepted` time. Offline replay takes the carrier with
+`WorkflowHistory::replay_clock(carrier)`, which refuses an invalid carrier or
+one for another run. `WorkflowHistory::export()` does not include it, and the
+offline `WorkflowEnvironment::run_workflow` supplies none, so entry stays
+unavailable there. An unhandled `Error::ReplayClockUnavailable` fails the
+workflow like any other error.
 
 An advancing time immediately after a newly authored inline marker/local result
 also needs an explicitly selected opt-in persistence/resume boundary. It cannot

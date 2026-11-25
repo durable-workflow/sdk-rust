@@ -9,11 +9,21 @@
   rows, so every replay reads the same instant. A task without a valid carrier,
   or whose carrier names another run or disagrees with the history's start kind,
   keeps entry unavailable as before. A replayed-instance query rebuilds the body
-  with its own task's carrier; Server does not send one on query tasks yet, so
-  querying a run whose body propagates an unavailable entry read fails visibly.
-  `WorkflowHistory::replay_clock(carrier)` supplies the carrier to offline
-  replay. Query and update handler reads and the cancellation clock are
-  unchanged. ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))
+  with its own query task's `replay_clock` attestation: the v1 object is used as
+  on a workflow task, and an explicit `null` keeps entry unavailable. When the
+  query task omits the key (a Server before #1338) and the rebuilt body reads
+  `replay_now()` at entry, the query fails with
+  `query_workflow_state_unavailable`, even if the body tolerated the
+  unavailable result. `WorkflowHistory::replay_clock(carrier)` validates and
+  supplies the carrier to offline replay. Update handler reads and the
+  cancellation clock are unchanged.
+  ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))
+
+  Upgrade note: `replay_now()` shipped in 4.24.0 and returned
+  `Error::ReplayClockUnavailable` at ordinary entry. A running workflow whose
+  code branches on that error at entry (for example with `.ok()` or
+  `unwrap_or`) now takes the other branch on replay once its tasks carry the
+  instant. Put such a change behind workflow versioning before upgrading.
 
 - Workers with cooperative cancellation enabled advertise the
   `timeout_cleanup` capability, version 1. A native Server can then admit
