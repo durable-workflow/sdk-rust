@@ -804,8 +804,9 @@ Workflow-task interceptors cannot change what a workflow records:
 - The worker submits exactly the commands the workflow produced. The outcome is
   a read-only view of them.
 - If the task fails, the worker reports that failure even when an interceptor
-  returns `Ok`. Interceptors see it as `Error::WorkflowTaskFailed`, with the
-  original error available from `.error()`.
+  returns `Ok`. Interceptors see it as `Error::WorkflowTaskFailed`, a read-only
+  description with `.kind()`, `.message()` and `.debug()`; the worker keeps
+  the original error.
 - An interceptor error after the task succeeded, or returning without running
   `next`, fails the workflow task with `Error::WorkflowTaskInterceptor`.
   Nothing is recorded and the Server retries the task. The workflow does not
