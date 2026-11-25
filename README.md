@@ -807,10 +807,12 @@ Workflow-task interceptors cannot change what a workflow records:
   returns `Ok`. Interceptors see it as `Error::WorkflowTaskFailed`, a read-only
   description with `.kind()`, `.message()` and `.debug()`; the worker keeps
   the original error.
-- An interceptor error after the task succeeded, or returning without running
-  `next`, fails the workflow task with `Error::WorkflowTaskInterceptor`.
-  Nothing is recorded and the Server retries the task. The workflow does not
-  fail.
+- An interceptor error after the task succeeded, returning or failing without
+  running `next`, or dropping the task partway fails the workflow task with
+  `Error::WorkflowTaskInterceptor`. Nothing is recorded and the Server retries
+  the task. The workflow does not fail. With cooperative cancellation enabled,
+  a replay dropped partway (possibly during a cancellation delivery) is not
+  reported: the poll returns the error and the task's lease expires.
 - Interceptors run on every workflow task. `context.replay_state()` is
   `Replaying` when the task re-ran commands committed by earlier tasks before
   new execution, and `Executing` for a task with no committed history. The

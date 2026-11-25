@@ -390,7 +390,7 @@ async fn skipping_next_fails_the_workflow_task_without_running_workflow_code() {
         panic!("expected an interceptor failure, got {error:?}");
     };
     assert!(
-        message.ends_with("Tamper returned without calling next"),
+        message.ends_with("Tamper returned without running next"),
         "{message}"
     );
     assert!(
@@ -405,7 +405,7 @@ async fn skipping_next_fails_the_workflow_task_without_running_workflow_code() {
         .await
         .expect_err("an abandoned core fails the task");
     assert!(
-        matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("without calling next")),
+        matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("without running next")),
         "{error:?}"
     );
 
@@ -427,7 +427,7 @@ async fn skipping_next_fails_the_workflow_task_without_running_workflow_code() {
         .await
         .expect_err("a caught violation still fails the task");
     assert!(
-        matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("without calling next")),
+        matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("without running next")),
         "{error:?}"
     );
     assert!(
@@ -774,7 +774,7 @@ async fn an_interceptor_error_before_next_is_part_of_the_task_failure() {
     };
     assert!(
         message.ends_with(
-            "Tamper failed without calling next: worker loop error: tenant lookup failed"
+            "Tamper failed without running next: worker loop error: tenant lookup failed"
         ),
         "{message}"
     );
@@ -787,10 +787,18 @@ async fn a_core_dropped_partway_is_reported_as_abandoned() {
     // A local activity makes the core wait on the network, so dropping it
     // after one poll abandons it partway.
     let mut worker = tamper_worker("abandon-started", &stash).local_activities(true);
-    worker.register_workflow("ship-order", |ctx, _| async move {
-        ctx.local_activity("label", json!([])).await
+    let workflow_ran = Arc::new(AtomicBool::new(false));
+    let activity_ran = Arc::new(AtomicBool::new(false));
+    let ran = workflow_ran.clone();
+    worker.register_workflow("ship-order", move |ctx, _| {
+        ran.store(true, Ordering::SeqCst);
+        async move { ctx.local_activity("label", json!([])).await }
     });
-    worker.register_activity("label", |_, args| async move { Ok(args) });
+    let label = activity_ran.clone();
+    worker.register_activity("label", move |_, args| {
+        label.store(true, Ordering::SeqCst);
+        async move { Ok(args) }
+    });
     let error = worker
         .execute_workflow_with_local_activities(workflow_task(Vec::new()))
         .await
@@ -800,6 +808,41 @@ async fn a_core_dropped_partway_is_reported_as_abandoned() {
             if message == "a workflow task interceptor dropped the workflow task before it completed: worker loop error: gave up"),
         "{error:?}"
     );
+    // The core really began (workflow code requested the local activity) and
+    // was dropped while admitting it over the network, before the callback.
+    assert!(
+        workflow_ran.load(Ordering::SeqCst),
+        "the core never started"
+    );
+    assert!(
+        !activity_ran.load(Ordering::SeqCst),
+        "the core finished its local activity"
+    );
+}
+
+#[tokio::test]
+async fn an_unpolled_next_blames_the_interceptor_that_dropped_it() {
+    let stash = Arc::new(Mutex::new(None));
+    // The outer interceptor creates the inner chain's future and drops it
+    // unpolled, so the inner interceptor never runs.
+    let inner_ran = events();
+    let mut worker = tamper_worker("abandon", &stash).interceptor(Recorder {
+        name: "inner",
+        events: inner_ran.clone(),
+    });
+    register_ship_order(&mut worker);
+    let error = worker
+        .execute_workflow_with_local_activities(workflow_task(Vec::new()))
+        .await
+        .expect_err("an unpolled next fails the task");
+    let Error::WorkflowTaskInterceptor(message) = &error else {
+        panic!("expected an interceptor failure, got {error:?}");
+    };
+    assert!(
+        message.ends_with("Tamper failed without running next: worker loop error: abandoned"),
+        "{message}"
+    );
+    assert!(take(&inner_ran).is_empty(), "the inner interceptor ran");
 }
 
 fn local_activity_server(
@@ -923,6 +966,43 @@ async fn the_cooperative_worker_fails_the_task_for_an_interceptor_error_after_re
     assert_eq!(body["lease_owner"], "actual-owner");
     assert!(
         body.to_string().contains("audit sink unavailable"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_cooperative_worker_fails_the_task_when_an_interceptor_fails_before_replay() {
+    use super::cooperative_cancellation::{
+        coordinator_server, coordinator_worker, register_coordinator_timer,
+    };
+    let server = coordinator_server();
+    let stash = Arc::new(Mutex::new(None));
+    let mut worker = coordinator_worker(&server, "coordinator-valid").interceptor(Tamper {
+        mode: "fail-before-next",
+        stash,
+    });
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    register_coordinator_timer(&mut worker, observed.clone());
+    assert_eq!(
+        worker.poll_workflow_once().await.expect("settled"),
+        ManagedPollOutcome::Handled
+    );
+    assert!(observed.lock().unwrap().is_empty(), "the replay never ran");
+    let requests = server.requests.lock().unwrap();
+    assert!(!requests
+        .iter()
+        .any(|request| request.path.ends_with("/complete")
+            || request.path.ends_with("/deliver-cancellation")));
+    let failures = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/fail"))
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1, "one workflow task failure");
+    let body: Value = serde_json::from_str(&failures[0].body).unwrap();
+    assert_eq!(body["lease_owner"], "actual-owner");
+    assert!(
+        body.to_string()
+            .contains("failed without running next: worker loop error: tenant lookup failed"),
         "{body}"
     );
 }

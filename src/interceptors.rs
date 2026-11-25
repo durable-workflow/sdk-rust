@@ -391,15 +391,21 @@ impl<'a> WorkflowTaskNext<'a> {
     ///
     /// A core failure is returned as [`Error::WorkflowTaskFailed`].
     pub fn run(self) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
-        self.reached.fetch_max(self.index, Ordering::SeqCst);
         if let Some(registered) = self.chain.get(self.index) {
+            // Record the deepest hook that actually began running, on its
+            // first poll: creating `next.run()` and dropping it is not running it.
+            let (reached, index) = (self.reached, self.index);
             let next = WorkflowTaskNext {
                 index: self.index + 1,
                 ..self
             };
-            return registered
+            let hook = registered
                 .interceptor
                 .execute_workflow_task(next.context, next);
+            return Box::pin(async move {
+                reached.fetch_max(index, Ordering::SeqCst);
+                hook.await
+            });
         }
         let WorkflowCore {
             future,
@@ -526,11 +532,11 @@ impl Worker {
                 .min(self.interceptors.len() - 1)];
             let message = match chain {
                 Ok(()) => format!(
-                    "workflow task interceptor {} returned without calling next",
+                    "workflow task interceptor {} returned without running next",
                     skipped.name
                 ),
                 Err(_) => format!(
-                    "workflow task interceptor {} failed without calling next{error}",
+                    "workflow task interceptor {} failed without running next{error}",
                     skipped.name
                 ),
             };

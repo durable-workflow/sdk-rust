@@ -47,10 +47,13 @@
   replay state. Workflow-task interceptors see a read-only view of the
   commands: the worker always submits the commands the workflow produced and
   reports its own failure, which interceptors see as a read-only
-  `WorkflowTaskFailure` (kind, message and debug text). An interceptor error after a successful task, or
-  skipping `next`, fails the workflow task without recording anything.
-  Activity interceptors may transform arguments and results. Built-in
-  execution telemetry stays outermost. See `examples/audit_interceptor.rs`.
+  `WorkflowTaskFailure` (kind, message and debug text). An interceptor error
+  after a successful task, or skipping `next`, fails the workflow task without
+  recording anything. With cooperative cancellation, a replay an interceptor
+  drops partway is not reported: the poll returns the error and the task's
+  lease expires. Activity interceptors may transform arguments and results.
+  Built-in execution telemetry stays outermost. See
+  `examples/audit_interceptor.rs`.
   ([Durable Workflow #226](https://github.com/durable-workflow/.github/issues/226))
 
 - Workers can register update validators with
