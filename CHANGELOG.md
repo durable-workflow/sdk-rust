@@ -10,7 +10,8 @@
   or whose carrier names another run or disagrees with the history's start kind,
   keeps entry unavailable as before. A replayed-instance query rebuilds the body
   with its own query task's `replay_clock` attestation: the v1 object is used as
-  on a workflow task, and an explicit `null` keeps entry unavailable. When the
+  on a workflow task, and an explicit `null` or a refused object keeps entry
+  unavailable. When the
   query task omits the key (a Server before #1338) and the rebuilt body reads
   `replay_now()` at entry, the query fails with
   `query_workflow_state_unavailable`, even if the body tolerated the

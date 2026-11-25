@@ -113,7 +113,7 @@ fn query_attestation_distinguishes_absent_null_and_object_keys() {
     );
     assert_eq!(
         attestation(&json!({"run_id":RUN,"replay_clock":{}})),
-        Attestation::Unattested
+        Attestation::Unprovable
     );
     assert!(matches!(
         attestation(&task(carrier("run_started_at", ENTRY))),
@@ -404,13 +404,12 @@ async fn query_rebuild_of_an_entry_read_follows_the_query_tasks_attestation() {
         "{}",
         failure.message
     );
-    // An invalid object is unattested too.
+    // An object this SDK refuses was refused on the workflow task too: no
+    // entry was carried there, so the rebuild matches it.
     let mut invalid = carrier("run_started_at", ENTRY);
     invalid["schema"] = json!("other");
-    assert_eq!(
-        ask(query(Some(invalid))).await.unwrap_err().reason,
-        "query_workflow_state_unavailable"
-    );
+    assert_eq!(workflow(Some(invalid.clone())), json!("none"));
+    assert_eq!(ask(query(Some(invalid))).await.unwrap(), json!("none"));
     // A Server attesting no provable start matches a workflow task without one.
     assert_eq!(workflow(None), json!("none"));
     assert_eq!(ask(query(Some(Value::Null))).await.unwrap(), json!("none"));
@@ -502,4 +501,71 @@ fn offline_replay_takes_the_carrier_as_an_optional_input() {
         )
         .unwrap();
     assert!(report.completed);
+}
+
+#[tokio::test]
+async fn an_empty_group_keeps_the_entry_clock_and_its_attestation_rule() {
+    // An empty root group consumes no history and keeps the entry value, so
+    // a read after it is still an entry read and follows the attestation.
+    let worker_for = || {
+        let mut worker = Worker::new(Client::new("http://127.0.0.1:8080").unwrap(), "clock-tests");
+        worker.register_replayed_workflow("clock", String::new, |ctx, _args, state| async move {
+            ctx.parallel(Vec::new()).await?;
+            let read = ctx.replay_now().map_or_else(
+                |_| "none".to_string(),
+                |time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            );
+            state.update(|value| *value = read.clone())?;
+            Ok(json!(read))
+        });
+        worker.register_replayed_query::<String, _, _>(
+            "clock",
+            "entry",
+            |_ctx, state, _args| async move { Ok(json!(state.as_str())) },
+        );
+        worker
+    };
+    let started = json!({"event_type":"WorkflowStarted","payload":{"workflow_run_id":RUN},"recorded_at":"2026-03-04T05:06:09Z"});
+    let workflow = |clock: Option<Value>| {
+        let mut wire = json!({"task_id":"t1","workflow_id":"entry-workflow","run_id":RUN,
+            "workflow_type":"clock","payload_codec":DEFAULT_CODEC,"history_events":[started]});
+        if let Some(clock) = clock {
+            wire["replay_clock"] = clock;
+        }
+        let mut worker = worker_for();
+        worker.ordered_condition_claim = condition_input_order::read_claim(&wire).unwrap();
+        let commands = worker
+            .execute_workflow_task(serde_json::from_value(wire).unwrap())
+            .unwrap();
+        decode_wire_value(&commands[0]["result"], DEFAULT_CODEC).unwrap()
+    };
+    let worker = worker_for();
+    let query = |clock: Option<Value>| {
+        let mut query = json!({"query_task_id":"q1","workflow_type":"clock","query_name":"entry",
+            "run_id":RUN,"payload_codec":DEFAULT_CODEC,"history_events":[started]});
+        if let Some(clock) = clock {
+            query["replay_clock"] = clock;
+        }
+        let attestation = attestation(&query);
+        let worker = &worker;
+        async move {
+            worker
+                .execute_query_task_with_authority(
+                    serde_json::from_value(query).unwrap(),
+                    None,
+                    attestation,
+                )
+                .await
+                .map(|answer| answer.into_json().unwrap())
+        }
+    };
+    let clock = carrier("run_started_at", ENTRY);
+    assert_eq!(workflow(Some(clock.clone())), json!(ENTRY));
+    assert_eq!(workflow(None), json!("none"));
+    assert_eq!(
+        query(None).await.unwrap_err().reason,
+        "query_workflow_state_unavailable"
+    );
+    assert_eq!(query(Some(Value::Null)).await.unwrap(), json!("none"));
+    assert_eq!(query(Some(clock)).await.unwrap(), json!(ENTRY));
 }

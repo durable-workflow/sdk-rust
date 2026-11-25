@@ -187,9 +187,10 @@ fn present(value: Option<&Value>) -> bool {
 /// unknown to the rebuild.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Attestation {
-    /// No key, or an invalid object: the rebuild cannot know the entry.
+    /// No key: the rebuild cannot know the entry its workflow tasks had.
     Unattested,
-    /// Explicit `null`: no workflow task of this run carried an entry.
+    /// Explicit `null`, or an object this SDK refuses (as it refused the
+    /// same object on the run's workflow tasks): no entry was carried.
     Unprovable,
     Entry(Entry),
 }
@@ -198,7 +199,7 @@ pub(super) fn attestation(task: &Value) -> Attestation {
     match task.get("replay_clock") {
         None => Attestation::Unattested,
         Some(Value::Null) => Attestation::Unprovable,
-        Some(_) => entry(task).map_or(Attestation::Unattested, Attestation::Entry),
+        Some(_) => entry(task).map_or(Attestation::Unprovable, Attestation::Entry),
     }
 }
 
