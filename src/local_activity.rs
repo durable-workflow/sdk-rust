@@ -258,9 +258,7 @@ impl Worker {
                     false,
                     self.workflow_observations(&task),
                     async {
-                        let mut decision = self
-                            .execute_workflow_with_local_activities_inner(task)
-                            .await?;
+                        let mut decision = self.intercepted_workflow_task(task).await?;
                         if let Some(decision) = &mut decision {
                             self.stamp_observability_commands(&mut decision.commands);
                         }
@@ -269,8 +267,20 @@ impl Worker {
                 )
                 .await;
         }
-        self.execute_workflow_with_local_activities_inner(task)
-            .await
+        self.intercepted_workflow_task(task).await
+    }
+
+    /// One workflow task inside the user interceptor chain (telemetry stays outside).
+    async fn intercepted_workflow_task(
+        &self,
+        task: WorkflowTask,
+    ) -> Result<Option<WorkflowTaskDecision>> {
+        let context = self.workflow_task_interceptor_context(&task);
+        self.intercept_workflow_task(
+            context,
+            self.execute_workflow_with_local_activities_inner(task),
+        )
+        .await
     }
 
     async fn execute_workflow_with_local_activities_inner(

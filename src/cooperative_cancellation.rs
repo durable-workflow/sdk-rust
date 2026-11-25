@@ -2103,11 +2103,20 @@ impl Worker {
         }
         // An uncertain observation, delivery or canonical refresh cannot become
         // an application failure or be published as a workflow-task decision.
-        let Some(decision) = self.replay_cooperative_workflow_claim(&claim).await? else {
-            return Ok(ManagedPollOutcome::Handled);
+        let context = self.workflow_task_interceptor_context(&claim.task);
+        let decision = match self
+            .intercept_workflow_task(context, self.replay_cooperative_workflow_claim(&claim))
+            .await
+        {
+            Ok(Some(decision)) => Ok(decision),
+            Ok(None) => return Ok(ManagedPollOutcome::Handled),
+            // An interceptor failure after a successful replay fails only this
+            // workflow task; nothing is recorded.
+            Err(error @ Error::WorkflowTaskInterceptor(_)) => Err(error),
+            Err(error) => return Err(error),
         };
         let (owner, _) = cancellation_claim(&claim.task)?;
-        let task_outcome = crate::metrics::workflow_task_outcome(Some(&decision));
+        let task_outcome = crate::metrics::workflow_task_outcome(decision.as_ref().ok());
         let settled = completion_worker
             .as_ref()
             .unwrap_or(self)
@@ -2116,7 +2125,7 @@ impl Worker {
                 owner,
                 claim.task.workflow_task_attempt,
                 claim.task.run_id.as_deref(),
-                Ok(decision),
+                decision,
                 memo_updates_supported,
                 claim.sticky_snapshot.clone(),
             )

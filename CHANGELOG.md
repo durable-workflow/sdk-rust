@@ -15,6 +15,18 @@
   and cannot be added as a resource capability.
   ([Server #1201](https://github.com/durable-workflow/server/issues/1201))
 
+- Workers accept ordered interceptors around workflow tasks, activities and
+  queries with `Worker::interceptor` and `Worker::interceptors`. The first
+  interceptor registered is the outermost. Contexts carry the worker, task
+  queue, namespace and task identity; workflow-task contexts also expose
+  replay state. Workflow-task interceptors see a read-only view of the
+  commands: the worker always submits the commands the workflow produced and
+  reports its own failure. An interceptor error after a successful task, or
+  skipping `next`, fails the workflow task without recording anything.
+  Activity interceptors may transform arguments and results. Built-in
+  execution telemetry stays outermost. See `examples/audit_interceptor.rs`.
+  ([Durable Workflow #226](https://github.com/durable-workflow/.github/issues/226))
+
 ## 4.24.0
 
 - When a compatible Native Server enables ordered condition authoring, timed
