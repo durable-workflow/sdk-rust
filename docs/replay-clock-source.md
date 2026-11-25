@@ -18,7 +18,7 @@ counter identity to order emitted events.
 | Boundary | Authority in this cohort | Availability |
 | --- | --- | --- |
 | Redrive entry | Unique `WorkflowStarted` with `recovery_kind=redrive` and valid `replayed_started_at` | Recorded original start |
-| Ordinary entry | Core uses original `WorkflowRun.started_at`; current Rust worker task has no such carrier | Unavailable, even if the start history row has an insertion timestamp |
+| Ordinary entry | The workflow task's `replay_clock` carrier (`WorkerReplayClock` v1, Server 3.6.0+): `schema` `durable-workflow.worker-replay-clock/v1`, `workflow_run_id` equal to the task's run, strict `started_at` (`YYYY-MM-DDTHH:MM:SS.ffffffZ`) and a `source` that matches the history's start kind (`run_started_at` for an ordinary, continued or child run; `redrive_replayed_started_at` for a redrive successor) | The carrier's `started_at`, identical on every lease of the run. A missing, invalid or mismatched carrier keeps entry unavailable, even if the start history row has an insertion timestamp. A redrive anchor proved from history is kept |
 | Scalar remote activity | Existing validated command sequence/type/result correlation, then the selected terminal event | Selected recorded time; successful redrive reuse retains `reused_recorded_at`; the existing Core failure branch uses its event time |
 | Scalar plain timer | Existing validated `TimerScheduled`/`TimerFired` pair, exact sequence/ID/delay | Matched fire time, with recorded reuse provenance |
 | Scalar child result | One schedule, optional start and unique parent `ChildRunCompleted` / `ChildRunFailed` / `ChildRunCancelled` / `ChildRunTerminated`, with matching nonempty child call, instance, run and type identities | Parent resolution event time for both send and throw; child `closed_at` and `reused_recorded_at` are not this branch's clock authority |
@@ -41,12 +41,40 @@ return/error; one workflow cannot read another workflow's active clock. Query
 and update contexts own an immutable engine-correlated value, with no shared
 ambient mutable state. Clock reads append no commands/history.
 
-The ordinary entry gap is [confirmed by Server](https://github.com/durable-workflow/server/issues/325#issuecomment-6671799265):
-worker claims omit `run.started_at`; native start and history insertion sample
-time separately. The existing describe endpoint needs exact namespace/workflow/run
-binding; export summary time does not establish a worker anchor. Server owns a
-later additive authoritative task carrier and its precision/missing contract.
-This source does not add a wire field or extra describe/export RPC.
+Ordinary entry reads Server's additive task carrier
+([`docs/contracts/worker-replay-entry-clock.md`](https://github.com/durable-workflow/server/blob/main/docs/contracts/worker-replay-entry-clock.md),
+server#1156). History insertion, dispatch and lease times are never substituted:
+native start and history insertion sample time separately. The worker reads the
+carrier from the polled wire task beside the public `WorkflowTask` model, whose
+4.x struct literals are unchanged, so a `WorkflowTask` built or executed directly
+without a poll keeps entry unavailable. A v1 carrier has exactly the four keys
+`schema`, `workflow_run_id`, `started_at` and `source`; an extra key, a
+non-string field, or a `replayed_started_at` recorded on a start event that
+differs from `started_at` makes it absent. Step times always come from history;
+only the entry value comes from the carrier.
+
+A replayed-instance query, and a replayed update validator, rebuilds the
+workflow body with its own query or validation task's `replay_clock`
+attestation. Server #1338 always sends that key on query and
+update-validation tasks: the v1 object when the start is provable, explicit
+`null` when it is not. An object is validated and used as on a workflow task.
+`null`, or an object this SDK refuses (as it refused the same object on the
+run's workflow tasks), keeps entry unavailable. When the key is absent (an
+older Server) and the rebuilt body reads `replay_now()` while the clock still
+holds its entry value (no boundary consumed, inline or durable; an empty group
+consumes none and keeps it), without a history-proved redrive anchor, the
+query fails with
+`query_workflow_state_unavailable` whatever the body did with the unavailable
+result. A tolerant body would otherwise answer from state its workflow task
+never computed. A replayed query handler's own `replay_now()` reads that
+rebuilt prefix. Rust update tasks run the update handler against history
+without rebuilding the body, and their handler time remains the committed
+`UpdateAccepted` time. Offline replay takes the carrier with
+`WorkflowHistory::replay_clock(carrier)`, which refuses an invalid carrier or
+one for another run. `WorkflowHistory::export()` does not include it, and the
+offline `WorkflowEnvironment::run_workflow` supplies none, so entry stays
+unavailable there. An unhandled `Error::ReplayClockUnavailable` fails the
+workflow like any other error.
 
 An advancing time immediately after a newly authored inline marker/local result
 also needs an explicitly selected opt-in persistence/resume boundary. It cannot

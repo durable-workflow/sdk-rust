@@ -115,6 +115,107 @@ fn start_time(history: &[HistoryEvent]) -> Option<DateTime<Utc>> {
     parse(start.payload.get("replayed_started_at"))
 }
 
+/// `WorkerReplayClock` v1, the workflow task's entry instant (Server #1132/#1156).
+const ENTRY_SCHEMA: &str = "durable-workflow.worker-replay-clock/v1";
+
+/// A validated `replay_clock` carrier from one workflow task claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Entry {
+    started_at: DateTime<Utc>,
+    redrive: bool,
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`, exactly as the v1 schema pattern requires.
+fn strict_entry_time(text: &str) -> Option<DateTime<Utc>> {
+    let bytes = text.as_bytes();
+    let shape = bytes.len() == 27
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'.',
+            26 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        });
+    let time = DateTime::parse_from_rfc3339(text).ok().filter(|_| shape)?;
+    // chrono admits a leap second as nanoseconds >= 1s; the carrier cannot.
+    (time.timestamp_subsec_nanos() < 1_000_000_000).then(|| time.with_timezone(&Utc))
+}
+
+/// Read the task's `replay_clock`. Anything other than a complete v1 object
+/// for this task's run is absent: the SDK never substitutes another time.
+pub(super) fn entry(task: &Value) -> Option<Entry> {
+    entry_for(
+        task.get("replay_clock"),
+        task.get("run_id").and_then(Value::as_str),
+    )
+}
+
+/// Validate one carrier against the run it is replayed for. The v1 schema
+/// has `additionalProperties: false`, so an extra key also makes it absent.
+pub(super) fn entry_for(carrier: Option<&Value>, run_id: Option<&str>) -> Option<Entry> {
+    const KEYS: [&str; 4] = ["schema", "workflow_run_id", "started_at", "source"];
+    let carrier = carrier?.as_object()?;
+    let run_id = run_id.filter(|id| !id.is_empty())?;
+    if carrier.len() != KEYS.len()
+        || !KEYS.iter().all(|key| carrier.contains_key(*key))
+        || carrier.get("schema").and_then(Value::as_str) != Some(ENTRY_SCHEMA)
+        || carrier.get("workflow_run_id").and_then(Value::as_str) != Some(run_id)
+    {
+        return None;
+    }
+    let redrive = match carrier.get("source").and_then(Value::as_str)? {
+        "run_started_at" => false,
+        "redrive_replayed_started_at" => true,
+        _ => return None,
+    };
+    Some(Entry {
+        started_at: strict_entry_time(carrier.get("started_at")?.as_str()?)?,
+        redrive,
+    })
+}
+
+/// A JSON `null` field is absent.
+fn present(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| !value.is_null())
+}
+
+/// How a query or update-validation task attests the run's entry instant.
+/// Server #1338 always sends the `replay_clock` key on those tasks: the v1
+/// object when the start is provable, explicit `null` when it is not. An
+/// older Server omits the key, so the entry its workflow tasks carried is
+/// unknown to the rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Attestation {
+    /// No key: the rebuild cannot know the entry its workflow tasks had.
+    Unattested,
+    /// Explicit `null`, or an object this SDK refuses (as it refused the
+    /// same object on the run's workflow tasks): no entry was carried.
+    Unprovable,
+    Entry(Entry),
+}
+
+pub(super) fn attestation(task: &Value) -> Attestation {
+    match task.get("replay_clock") {
+        None => Attestation::Unattested,
+        Some(Value::Null) => Attestation::Unprovable,
+        Some(_) => entry(task).map_or(Attestation::Unprovable, Attestation::Entry),
+    }
+}
+
+/// Whether this history declares a redrive start, whether or not it is proved.
+fn declares_redrive(history: &[HistoryEvent]) -> bool {
+    history.iter().any(|event| match event.event_type.as_str() {
+        "WorkflowStarted" => {
+            event.payload["recovery_kind"] == "redrive"
+                || present(event.payload.get("replayed_started_at"))
+                || present(event.payload.get("resume_step_sequence"))
+        }
+        "StartAccepted" => event.payload["outcome"] == "redriven",
+        _ => false,
+    })
+}
+
 #[derive(Debug)]
 pub(super) struct Clock {
     time: Option<DateTime<Utc>>,
@@ -122,6 +223,13 @@ pub(super) struct Clock {
     parallel_activities: parallel::Members,
     parallel_timers: parallel::Members,
     parallel_children: parallel::Members,
+    /// No boundary, inline or durable, has been consumed yet.
+    at_entry: bool,
+    /// A rebuild whose task did not attest the entry instant.
+    entry_unattested: bool,
+    /// Workflow code read the clock at an unattested entry, so the rebuilt
+    /// state may differ from what the workflow task computed.
+    unattested_entry_read: bool,
 }
 
 enum BoundaryKind {
@@ -427,15 +535,64 @@ impl Clock {
             parallel_activities: parallel_activity::members(history, commands),
             parallel_timers: parallel_timer::members(history, commands),
             parallel_children: parallel_child::members(history, commands),
+            at_entry: true,
+            entry_unattested: false,
+            unattested_entry_read: false,
         }
     }
 
     pub(super) fn unavailable(&mut self) {
         self.time = None;
+        self.at_entry = false;
+    }
+
+    /// Ordinary entry time from a validated task carrier, before any
+    /// boundary is consumed. Its source must match the history's start kind.
+    /// A redrive anchor already proved from history is kept as it was.
+    fn adopt_entry(&mut self, history: &[HistoryEvent], entry: Entry) {
+        // An anchor a start event records itself, even one this history
+        // cannot prove, must equal the carrier's.
+        // An unparsable recorded anchor also refuses the carrier.
+        let disagrees = history.iter().any(|event| {
+            event.event_type == "WorkflowStarted"
+                && event
+                    .payload
+                    .get("replayed_started_at")
+                    .filter(|value| !value.is_null())
+                    .is_some_and(|recorded| parse(Some(recorded)) != Some(entry.started_at))
+        });
+        if self.time.is_none() && entry.redrive == declares_redrive(history) && !disagrees {
+            self.time = Some(entry.started_at);
+        }
     }
 }
 
 impl WorkflowState {
+    /// Apply this claim's `replay_clock` carrier. Call it once, after
+    /// construction and before the workflow body runs.
+    pub(super) fn adopt_replay_entry(&mut self, entry: Option<Entry>) {
+        if let Some(entry) = entry {
+            self.replay_clock.adopt_entry(&self.history_events, entry);
+        }
+    }
+
+    /// Apply a query rebuild's attestation. Call it once, after construction
+    /// and before the workflow body runs.
+    pub(super) fn attest_replay_entry(&mut self, attestation: Attestation) {
+        match attestation {
+            Attestation::Unattested => self.replay_clock.entry_unattested = true,
+            Attestation::Unprovable => {}
+            Attestation::Entry(entry) => self.adopt_replay_entry(Some(entry)),
+        }
+    }
+
+    /// Whether the rebuilt body read the clock at an unattested entry. Its
+    /// state is then not proved to match the workflow task's, whatever the
+    /// body did with the unavailable result.
+    pub(super) fn read_unattested_replay_entry(&self) -> bool {
+        self.replay_clock.unattested_entry_read
+    }
+
     pub(super) fn consume_replay_sequence(
         &mut self,
         sequence: u64,
@@ -461,6 +618,7 @@ impl WorkflowState {
         self.observation_pending = false;
         // Core's query group-send branch supplies no aggregate time. Do not
         // transfer executor authority into reconstructed query execution.
+        self.replay_clock.at_entry = false;
         self.replay_clock.time = if QUERY_REPLAY.with(Cell::get) {
             None
         } else {
@@ -512,8 +670,22 @@ impl WorkflowState {
         self.replay_clock.time.ok_or_else(unavailable)
     }
 
+    /// Workflow code's read, which records an unattested entry read.
+    fn read_replay_time(&mut self) -> Result<DateTime<Utc>> {
+        let time = self.replay_time();
+        if time.is_err()
+            && self.cancellation_clock.is_none()
+            && self.replay_clock.at_entry
+            && self.replay_clock.entry_unattested
+        {
+            self.replay_clock.unattested_entry_read = true;
+        }
+        time
+    }
+
     pub(super) fn observe_replay_sequence(&mut self, sequence: u64) {
         self.observation_pending = false;
+        self.replay_clock.at_entry = false;
         self.replay_clock.time = self
             .replay_clock
             .boundaries
@@ -531,10 +703,29 @@ impl WorkflowContext {
     /// or invalid evidence returns [`Error::ReplayClockUnavailable`]. The clock
     /// is available only while this workflow's handler/future is executing.
     ///
+    /// Before any boundary is consumed, the clock is the workflow task's
+    /// Server-provided `replay_clock` entry instant (`WorkerReplayClock` v1):
+    /// the run's own start, or a redrive successor's original start. It is
+    /// pinned to the run's stored rows, so every replay reads the same value.
+    /// A task without a valid carrier keeps entry unavailable, except for the
+    /// explicit redrive start anchor proved from history. Step times come
+    /// from history; only the entry value comes from the task's carrier.
+    ///
+    /// A replayed-instance query or update validator rebuilds the body with its own task's
+    /// `replay_clock` attestation. When the query task omits that key (a
+    /// Server before #1338) and the body reads this clock at entry, the
+    /// query fails with `query_workflow_state_unavailable`, even if the body
+    /// tolerated the unavailable result: its rebuilt state is not proved to
+    /// match the workflow task's. An explicit `null` keeps entry unavailable,
+    /// as on the run's workflow tasks. Offline replay takes the carrier
+    /// through [`crate::testing::WorkflowHistory::replay_clock`]. An
+    /// unhandled [`Error::ReplayClockUnavailable`] fails the workflow like
+    /// any error.
+    ///
     /// Supported boundaries are correlated scalar activity, timer, child, signal
-    /// and condition results, persisted Activity and Timer all groups, and the
-    /// explicit redrive start anchor. Ordinary start authority, inline metadata
-    /// and local completions, and other grouped families remain unavailable.
+    /// and condition results, and persisted Activity, Timer and Child all
+    /// groups. Inline metadata and local completions, and other grouped
+    /// families remain unavailable.
     /// Cancellation's existing budget clock is unchanged.
     /// Migrate business decisions through normal workflow versioning. Event
     /// timestamps do not provide a total order; retain stream/counter identity.
@@ -546,7 +737,7 @@ impl WorkflowContext {
         self.state
             .lock()
             .map_err(|_| Error::WorkflowStatePoisoned)?
-            .replay_time()
+            .read_replay_time()
     }
 }
 

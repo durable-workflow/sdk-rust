@@ -10968,6 +10968,9 @@ impl Worker {
             Err(_) => return Ok(ManagedPollOutcome::Handled),
             Ok(result) => result?,
         }
+        // Server #1338 attests the entry instant on query tasks; an older
+        // Server omits the key and leaves the rebuild's entry unattested.
+        let replay_entry = replay_clock::attestation(&wire["task"]);
         let response: PollQueryTaskResponse = serde_json::from_value(wire)?;
         if response.outcome().should_stop() {
             return Ok(ManagedPollOutcome::Stop);
@@ -10989,7 +10992,7 @@ impl Worker {
         let execution = query_authority::Authority::protect(
             authority.as_ref(),
             self,
-            self.execute_query_task_with_authority(task, authority.as_ref()),
+            self.execute_query_task_with_authority(task, authority.as_ref(), replay_entry),
         )
         .await;
         let execution = match execution {
@@ -11245,13 +11248,16 @@ impl Worker {
         &self,
         task: QueryTask,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
-        self.execute_query_task_with_authority(task, None).await
+        // Without the wire task there is no attestation.
+        self.execute_query_task_with_authority(task, None, replay_clock::Attestation::Unattested)
+            .await
     }
 
     async fn execute_query_task_with_authority(
         &self,
         task: QueryTask,
         authority: Option<&query_authority::Authority>,
+        replay_entry: replay_clock::Attestation,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         #[cfg(feature = "telemetry")]
         if let Some(telemetry) = &self.telemetry {
@@ -11261,27 +11267,33 @@ impl Worker {
                     self.query_telemetry_fields(&task),
                     false,
                     authority.and_then(|_| self.query_observations(&task)),
-                    self.intercepted_query_task(task, authority),
+                    self.intercepted_query_task(task, authority, replay_entry),
                 )
                 .await;
         }
-        self.intercepted_query_task(task, authority).await
+        self.intercepted_query_task(task, authority, replay_entry)
+            .await
     }
 
     async fn intercepted_query_task(
         &self,
         task: QueryTask,
         authority: Option<&query_authority::Authority>,
+        replay_entry: replay_clock::Attestation,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         let context = self.query_task_interceptor_context(&task);
-        self.intercept_query_task(context, self.execute_query_task_inner(task, authority))
-            .await
+        self.intercept_query_task(
+            context,
+            self.execute_query_task_inner(task, authority, replay_entry),
+        )
+        .await
     }
 
     async fn execute_query_task_inner(
         &self,
         task: QueryTask,
         authority: Option<&query_authority::Authority>,
+        replay_entry: replay_clock::Attestation,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         validate_query_task_payloads(&task).map_err(|error| {
             QueryTaskExecutionFailure::new(
@@ -11317,7 +11329,7 @@ impl Worker {
             ));
         };
 
-        self.run_registered_query(task, query, authority, false)
+        self.run_registered_query(task, query, authority, false, replay_entry)
             .await?
             .map_err(|error| {
                 QueryTaskExecutionFailure::new("query_rejected", error.to_string(), "QueryFailed")
@@ -11338,6 +11350,7 @@ impl Worker {
         query: &RegisteredQuery,
         authority: Option<&query_authority::Authority>,
         read_only: bool,
+        replay_entry: replay_clock::Attestation,
     ) -> std::result::Result<Result<AvroValue>, QueryTaskExecutionFailure> {
         let args = decode_task_avro_arguments(task.query_arguments.as_ref(), &task.payload_codec)
             .map_err(|error| {
@@ -11446,6 +11459,9 @@ impl Worker {
                 // Query replay never submits commands, so an external signal
                 // past the recorded history waits like any new command.
                 replayed_state.signal_external_workflow_supported = true;
+                // The rebuilt body reads entry time as the workflow task did.
+                // An unattested entry read fails this query after the body runs.
+                replayed_state.attest_replay_entry(replay_entry);
                 let has_recorded_continuation = replayed_state.recorded_continue_as_new.is_some();
                 let workflow_state = Arc::new(Mutex::new(replayed_state));
                 let workflow_context = WorkflowContext {
@@ -11477,6 +11493,27 @@ impl Worker {
                         })?;
                     invocation.future.as_mut().poll(&mut cx)
                 };
+                if workflow_context
+                    .state
+                    .lock()
+                    .map_err(|_| {
+                        QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            "workflow state poisoned",
+                            "QueryWorkflowStateUnavailable",
+                        )
+                    })?
+                    .read_unattested_replay_entry()
+                {
+                    // A tolerant body would otherwise answer from state the
+                    // workflow task never computed.
+                    return Err(QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        "the replayed workflow read replay_now() at entry, but this query task \
+                         does not attest the run's replay_clock entry instant",
+                        "QueryWorkflowStateUnavailable",
+                    ));
+                }
                 match outcome {
                     Poll::Ready(Err(Error::ContinueAsNew(request)))
                         if has_recorded_continuation =>
@@ -11748,6 +11785,7 @@ impl Worker {
                 delivery: self.allow_cancellation_scope_delivery,
             },
         )?;
+        workflow_state.adopt_replay_entry(self.ordered_condition_claim.replay_entry);
         workflow_state.observation_namespace = Some(self.client.namespace.clone());
         workflow_state.continue_as_new_target_supported =
             self.client.worker_supports_continue_as_new_target(

@@ -33,6 +33,22 @@ pub(super) fn register(worker: &mut Worker, workflow_type: &str) {
     });
 }
 
+/// Ordinary entry from the task's `replay_clock` carrier (.github#215).
+pub(super) fn register_entry(worker: &mut Worker, workflow_type: &str) {
+    worker.register_workflow(workflow_type, |ctx, _| async move {
+        let entry = ctx.replay_now().ok();
+        let repeated = entry.is_some() && entry == ctx.replay_now().ok();
+        ctx.sleep(Duration::from_secs(5)).await?;
+        let timer = ctx.replay_now().ok();
+        Ok(json!({
+            "entry":entry.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "repeated_entry_reads_equal":repeated,
+            "timer":timer.map(|time| time.to_rfc3339_opts(SecondsFormat::Micros,true)),
+            "elapsed_milliseconds":entry.zip(timer).map(|(start,end)| (end-start).num_milliseconds()),
+        }))
+    });
+}
+
 pub(super) fn register_child(worker: &mut Worker, workflow_type: &str) {
     worker.register_workflow(workflow_type, |ctx, _| async move {
         let entry_unavailable = ctx.replay_now().is_err();

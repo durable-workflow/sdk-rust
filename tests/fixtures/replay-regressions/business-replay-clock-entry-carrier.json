@@ -1,0 +1,83 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-business-replay-clock-entry-carrier",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.business-replay-clock-entry",
+    "input": [],
+    "payload_codec": "avro"
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "payload": {
+        "workflow_class": "EntryClockWorkflow",
+        "workflow_type": "corpus.business-replay-clock-entry",
+        "workflow_instance_id": "entry-clock-workflow",
+        "workflow_run_id": "regression-corpus-run",
+        "workflow_command_id": "entry-clock-start",
+        "execution_deadline_at": null,
+        "run_deadline_at": null
+      },
+      "recorded_at": "2026-03-04T05:06:08.250000Z"
+    },
+    {
+      "sequence": 2,
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "entry-clock-timer",
+        "delay_seconds": 5,
+        "fire_at": "2026-03-04T05:06:13.000000Z"
+      },
+      "recorded_at": "2026-03-04T05:06:08.300000Z"
+    },
+    {
+      "sequence": 3,
+      "event_type": "TimerFired",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "entry-clock-timer",
+        "delay_seconds": 5,
+        "fire_at": "2026-03-04T05:06:13.000000Z",
+        "fired_at": "2026-03-04T05:06:13.000000Z"
+      },
+      "recorded_at": "2026-03-04T05:06:13.000000Z"
+    }
+  ],
+  "expected": {
+    "type": "complete_workflow",
+    "result": {
+      "entry": "2026-03-04T05:06:07.891234Z",
+      "repeated_entry_reads_equal": true,
+      "timer": "2026-03-04T05:06:13.000000Z",
+      "elapsed_milliseconds": 5108
+    }
+  },
+  "command_sequence": [
+    {
+      "type": "complete_workflow",
+      "result": {
+        "entry": "2026-03-04T05:06:07.891234Z",
+        "repeated_entry_reads_equal": true,
+        "timer": "2026-03-04T05:06:13.000000Z",
+        "elapsed_milliseconds": 5108
+      }
+    }
+  ],
+  "worker_task": {
+    "workflow_id": "entry-clock-workflow",
+    "payload_codec": "avro",
+    "replay_clock": {
+      "schema": "durable-workflow.worker-replay-clock/v1",
+      "workflow_run_id": "regression-corpus-run",
+      "started_at": "2026-03-04T05:06:07.891234Z",
+      "source": "run_started_at"
+    }
+  }
+}

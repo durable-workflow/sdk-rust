@@ -130,6 +130,7 @@ impl WorkflowEnvironment {
         if let Some(queue) = &history.task_queue {
             worker.task_queue = queue.clone();
         }
+        worker.ordered_condition_claim.replay_entry = history.replay_entry();
         let (decision, sequence, continuation_consumed) = match worker
             .prepare_workflow_task_execution(history.task.clone(), None)?
         {
