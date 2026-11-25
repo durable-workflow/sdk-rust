@@ -392,6 +392,32 @@ async fn skipping_next_fails_the_workflow_task_without_running_workflow_code() {
         matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("without calling next")),
         "{error:?}"
     );
+
+    // An outer interceptor that catches the violation and answers with an
+    // earlier task's outcome cannot hide it: the chain never ran the core.
+    let stash = stashed_outcome().await;
+    let mut worker = plain_worker()
+        .interceptor(Tamper {
+            mode: "swallow",
+            stash: stash.clone(),
+        })
+        .interceptor(Tamper {
+            mode: "abandon",
+            stash: stash.clone(),
+        });
+    register_ship_order(&mut worker);
+    let error = worker
+        .execute_workflow_with_local_activities(workflow_task(Vec::new()))
+        .await
+        .expect_err("a caught violation still fails the task");
+    assert!(
+        matches!(&error, Error::WorkflowTaskInterceptor(message) if message.contains("without calling next")),
+        "{error:?}"
+    );
+    assert!(
+        stash.lock().unwrap().is_none(),
+        "the outer interceptor swallowed the error"
+    );
 }
 
 #[tokio::test]

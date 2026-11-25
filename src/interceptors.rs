@@ -22,9 +22,11 @@
 //! interceptor fails after the core succeeded, or returns without running
 //! `next`, the worker fails the workflow task ([`Error::WorkflowTaskInterceptor`]);
 //! nothing is recorded and the Server retries the task. Interceptors run on
-//! every workflow task, including replays: use
-//! [`WorkflowTaskInterceptorContext::replay_state`] to avoid repeating side
-//! effects.
+//! every workflow task. [`WorkflowTaskInterceptorContext::replay_state`] says
+//! whether the task first re-ran a committed history prefix; the worker never
+//! resubmits replayed commands, so an outcome's commands are always new for
+//! that task. A failed task's retry can repeat an outcome; use
+//! [`WorkflowTaskInterceptorContext::attempt`] to detect retries.
 //!
 //! Built-in [`ExecutionTelemetry`](crate::telemetry::ExecutionTelemetry) stays
 //! outermost: its spans wrap the whole interceptor chain.
@@ -58,7 +60,7 @@ pub type InterceptorFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>
 ///     InterceptorFuture, WorkerInterceptor, WorkflowTaskInterceptorContext, WorkflowTaskNext,
 ///     WorkflowTaskOutcome,
 /// };
-/// use durable_workflow::{Result, WorkflowReplayState};
+/// use durable_workflow::Result;
 ///
 /// struct AuditLog;
 ///
@@ -70,9 +72,13 @@ pub type InterceptorFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>
 ///     ) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
 ///         Box::pin(async move {
 ///             let outcome = next.run().await?;
-///             if context.replay_state() == WorkflowReplayState::Executing {
-///                 println!("{} produced {} commands", context.task_id(), outcome.commands().len());
-///             }
+///             // The commands are always new for this task; a retry has attempt > 1.
+///             println!(
+///                 "{} attempt {} produced {} commands",
+///                 context.task_id(),
+///                 context.attempt(),
+///                 outcome.commands().len()
+///             );
 ///             Ok(outcome)
 ///         })
 ///     }
@@ -239,16 +245,18 @@ impl WorkflowTaskInterceptorContext {
     pub fn observability_context(&self) -> Option<&Value> {
         self.observability_context.as_ref()
     }
-    /// Whether this task replays a committed history prefix.
+    /// Whether this task re-runs a committed history prefix before new execution.
     ///
     /// [`WorkflowReplayState::Replaying`]: the history holds commands that
     /// earlier workflow tasks committed, so workflow code re-runs them before
     /// any new execution. [`WorkflowReplayState::Executing`]: no committed
-    /// prefix, everything the workflow does in this task is new.
-    /// [`WorkflowReplayState::Unavailable`]: the history could not be read
-    /// (the core reports why).
+    /// prefix. [`WorkflowReplayState::Unavailable`]: the history could not be
+    /// read (the core reports why).
     ///
-    /// A task retry (`attempt() > 1`) can repeat the same new execution.
+    /// Replayed commands are never resubmitted, so the outcome's commands are
+    /// new for this task in every state. Do not skip auditing a task because it
+    /// replayed. A retry of a failed task (`attempt() > 1`) can repeat an
+    /// outcome.
     pub fn replay_state(&self) -> WorkflowReplayState {
         self.replay_state
     }

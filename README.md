@@ -640,14 +640,14 @@ attempt and, for workflow tasks, history length, the task's trace carrier and
 replay state. An activity context also exposes the decoded arguments, whether
 the attempt is a local activity, and the `ActivityContext` the handler receives.
 
-An audit log that records new workflow progress and every activity attempt:
+An audit log that records every workflow task outcome and activity attempt:
 
 ```rust,no_run
 use durable_workflow::interceptors::{
     ActivityInterceptorContext, ActivityNext, InterceptorFuture,
     WorkflowTaskInterceptorContext, WorkflowTaskNext, WorkflowTaskOutcome,
 };
-use durable_workflow::{AvroValue, Client, Result, Worker, WorkerInterceptor, WorkflowReplayState};
+use durable_workflow::{AvroValue, Client, Result, Worker, WorkerInterceptor};
 
 struct AuditLog;
 
@@ -659,16 +659,17 @@ impl WorkerInterceptor for AuditLog {
     ) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
         Box::pin(async move {
             let outcome = next.run().await;
-            // Skip tasks that only replay committed history.
-            if context.replay_state() == WorkflowReplayState::Executing {
-                match &outcome {
-                    Ok(outcome) => tracing::info!(
-                        workflow_id = context.workflow_id(),
-                        commands = outcome.commands().len(),
-                        "workflow task completed"
-                    ),
-                    Err(error) => tracing::warn!(%error, "workflow task failed"),
-                }
+            match &outcome {
+                // The commands are new for this task even when it replayed
+                // history first. A retry of a failed task has attempt > 1.
+                Ok(outcome) => tracing::info!(
+                    workflow_id = context.workflow_id(),
+                    task_id = context.task_id(),
+                    attempt = context.attempt(),
+                    commands = outcome.commands().len(),
+                    "workflow task completed"
+                ),
+                Err(error) => tracing::warn!(%error, "workflow task failed"),
             }
             outcome
         })
@@ -716,11 +717,13 @@ Workflow-task interceptors cannot change what a workflow records:
   `next`, fails the workflow task with `Error::WorkflowTaskInterceptor`.
   Nothing is recorded and the Server retries the task. The workflow does not
   fail.
-- Interceptors run on every workflow task, including tasks that replay
-  history. `context.replay_state()` is `Replaying` when the task's history
-  holds commands committed by earlier tasks, and `Executing` for a task with no
-  committed history. A retried task (`context.attempt() > 1`) can repeat the
-  same work, so keep side effects idempotent.
+- Interceptors run on every workflow task. `context.replay_state()` is
+  `Replaying` when the task re-ran commands committed by earlier tasks before
+  new execution, and `Executing` for a task with no committed history. The
+  worker never resubmits replayed commands, so an outcome's commands are always
+  new for that task: audit every successful outcome, whatever the replay
+  state. If a task fails after an interceptor observed it, its retry can
+  repeat the same outcome; `context.attempt()` above 1 identifies a retry.
 
 The offline `WorkflowEnvironment` runs activity interceptors registered on the
 worker it wraps. It has no workflow or query tasks, so those hooks do not run

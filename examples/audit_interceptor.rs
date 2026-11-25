@@ -7,8 +7,7 @@ use durable_workflow::interceptors::{
     WorkflowTaskNext, WorkflowTaskOutcome,
 };
 use durable_workflow::{
-    json, AvroValue, Client, Result, Worker, WorkerInterceptor, WorkflowReplayState,
-    WorkflowResultOptions,
+    json, AvroValue, Client, Result, Worker, WorkerInterceptor, WorkflowResultOptions,
 };
 use std::time::Duration;
 
@@ -22,16 +21,16 @@ impl WorkerInterceptor for AuditLog {
     ) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
         Box::pin(async move {
             let outcome = next.run().await;
-            // Tasks that replay committed history ran their audit already.
-            let replaying = context.replay_state() == WorkflowReplayState::Replaying;
+            // The commands are new for this task even after replaying history.
+            // A retry of a failed task can repeat an outcome; attempt > 1 marks it.
             match &outcome {
                 Ok(outcome) => println!(
-                    "audit: workflow {} task {} attempt {} produced {} commands{}",
+                    "audit: workflow {} task {} attempt {} ({:?}) produced {} commands",
                     context.workflow_id().unwrap_or("?"),
                     context.task_id(),
                     context.attempt(),
+                    context.replay_state(),
                     outcome.commands().len(),
-                    if replaying { " after replay" } else { "" },
                 ),
                 Err(error) => {
                     println!("audit: workflow task {} failed: {error}", context.task_id())
