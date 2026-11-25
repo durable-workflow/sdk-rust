@@ -1478,11 +1478,16 @@ ranges remain replay errors.
 
 ### Recovering from Server outages
 
-`run` and `run_until` outlive transient Server outages by default. A transient
-failure is a connection refused, reset or timed out; an upstream 502, 503 or
-504 without a protocol body; a 503 whose reason is `storage_unavailable` or
-`backend_unavailable` (for example while native Server warms up its storage);
-or any 5xx or 429 that says `retryable: true`. Poll and worker-heartbeat
+`run` and `run_until` outlive transient Server outages by default, such as a
+database failover. A transient failure is a connection refused, reset or timed
+out; a 500, 502, 503 or 504 without a typed reason (an upstream or framework
+error page, or an untyped JSON error such as `{"message":"Server Error"}`) or
+with the generic reason `server_error` (the Server's answer when its database
+is unavailable to authenticate a request); a 503 whose reason is
+`storage_unavailable` or `backend_unavailable` (for example while native Server
+warms up its storage); or any 5xx or 429 that says `retryable: true`. Every
+worker loop treats these the same way: workflow, activity and query polls, the
+worker heartbeat, registration, and task completion and failure reports. Poll and worker-heartbeat
 retries keep going past `WorkerRetryPolicy.max_retries` for these, and a
 retried poll keeps its original request ID. Within the budget they use the
 policy's delays; beyond it every worker draws from the shared full-jitter
@@ -1494,6 +1499,23 @@ and retried after a wait drawn uniformly from `[0, min(4 s, 0.25 s * 2^(n-1))]`
 for the n-th consecutive failure, the schedule shared by every Durable Workflow
 SDK. Shutdown interrupts every wait and settles any poll response already in
 flight.
+
+When a 429 or 5xx answer carries `Retry-After` (delta-seconds or an HTTP-date),
+every retry the worker schedules after it waits at least that long, capped at
+30 s, instead of its shorter backoff. The advice is shared by the worker's
+loops and cleared by the next successful answer.
+
+A workflow-task completion or failure that hits a transient failure is resent
+unchanged (the same serialized report, so the same task, lease owner and
+attempt) within `WorkerRetryPolicy.max_retries`, using the policy's delays and
+honoring `Retry-After`. If the Server had already recorded the first copy,
+native Server answers the resend with its duplicate receipt
+(`"recorded": false, "reason": "already_completed"`), or with the not-recorded
+`task_not_leased` receipt for this task and attempt, and the task is settled.
+Any other definitive refusal of a resend (for example a lease that expired
+meanwhile) is treated like the original transient failure: the worker keeps
+running and the Server redelivers the task when its lease ends. Task-offer 409
+refusals and lease fencing are unchanged.
 
 An activity completion, failure or `worker_lost` release that hits a
 transient failure is resent unchanged with the same backoff while the
@@ -1515,8 +1537,9 @@ limit, the worker rediscovers the policy, encodes the report again and resends
 it once. A result that is still too large, or cannot be externalized, fails the
 attempt as a non-retryable `ActivityResultTooLarge`; the worker keeps running.
 
-An explicit `retryable: false`, 401, 403 and other protocol refusals, codec
-and handler failures stop the worker: it emits a `tracing` error event and
+An explicit `retryable: false`, 401, 403, other 4xx and typed protocol
+refusals (including a 5xx with a specific `reason` other than those above),
+codec and handler failures stop the worker: it emits a `tracing` error event and
 returns the error. `.recover_transient_outages(false)` restores bounded retries,
 `run_once` remains bounded in either mode, and
 `WorkerRetryPolicy.max_retries = 0` disables retries. Keep a process supervisor

@@ -158,6 +158,15 @@ fn transient_classification_matches_the_shared_definition() {
         http(503, "{}"),
         http(500, r#"{"reason":"lock_pressure","retryable":true}"#),
         http(429, r#"{"retryable":true}"#),
+        // cloud#752: a database failover answered with a plain 500.
+        http(500, ""),
+        http(500, r#"{"message":"Server Error"}"#),
+        http(500, "<html>internal server error</html>"),
+        http(
+            500,
+            r#"{"reason":"server_error","message":"Database runtime credential authentication is enabled but unavailable."}"#,
+        ),
+        http(503, r#"{"reason":"server_error"}"#),
         Error::Timeout,
     ] {
         assert!(worker_error_is_transient(&transient), "{transient:?}");
@@ -169,8 +178,11 @@ fn transient_classification_matches_the_shared_definition() {
         http(409, r#"{"reason":"stale_attempt"}"#),
         http(429, r#"{"reason":"rate_limited"}"#),
         http(500, r#"{"reason":"internal_error"}"#),
+        http(500, r#"{"reason":"server_error","retryable":false}"#),
         http(503, r#"{"reason":"draining"}"#),
+        http(501, ""),
         http(400, r#"{"retryable":true}"#),
+        http(404, ""),
     ] {
         assert!(!worker_error_is_transient(&fatal), "{fatal:?}");
     }
@@ -746,4 +758,282 @@ async fn a_result_still_too_large_after_rediscovery_fails_the_attempt_not_the_wo
             "{case}"
         );
     }
+}
+
+// cloud#752: during a database failover the Server answered HTTP 500, then
+// 503 with Retry-After. A running worker must ride that out on every loop.
+
+const HEARTBEAT: &str = "/api/worker/heartbeat";
+const QUERY_POLL: &str = "/api/worker/query-tasks/poll";
+const WORKFLOW_COMPLETE: &str = "/api/worker/workflow-tasks/recover-workflow/complete";
+/// The mock writes the status line verbatim, so a header can ride along.
+const UNAVAILABLE_RETRY_AFTER_3: &str = "503 Service Unavailable\r\nretry-after: 3";
+const UNAVAILABLE_RETRY_AFTER_2: &str = "503 Service Unavailable\r\nretry-after: 2";
+
+/// A framework's answer to an unhandled database exception.
+fn plain_500() -> (&'static str, String) {
+    (
+        "500 Internal Server Error",
+        json!({"message":"Server Error"}).to_string(),
+    )
+}
+
+fn workflow_delivery() -> String {
+    include_str!("../../tests/fixtures/worker-completion-recovery.json").to_string()
+}
+
+fn recorded() -> String {
+    json!({"outcome":"completed","recorded":true}).to_string()
+}
+
+/// Record every retry wait on this test's thread until the guard drops.
+struct RecordedWaits;
+
+impl RecordedWaits {
+    fn start() -> Self {
+        crate::retry_after::RECORDED.with(|waits| *waits.borrow_mut() = Some(Vec::new()));
+        Self
+    }
+
+    fn waits(&self) -> Vec<Duration> {
+        crate::retry_after::RECORDED.with(|waits| waits.borrow().clone().unwrap_or_default())
+    }
+}
+
+impl Drop for RecordedWaits {
+    fn drop(&mut self) {
+        crate::retry_after::RECORDED.with(|waits| *waits.borrow_mut() = None);
+    }
+}
+
+fn failover_worker(server: &MockWorkerServer, query: bool, activity: bool) -> Worker {
+    let client = Client::builder(server.base_url())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client");
+    let mut worker = Worker::new(client, "rust-workers")
+        .worker_id("recover-worker")
+        // One lane per family: a poll after a settlement proves that lane
+        // got past the settlement (shutdown during a wait returns its error).
+        .max_concurrent_workflow_tasks(1)
+        .max_concurrent_activity_tasks(1)
+        .poll_timeout(Duration::from_millis(10))
+        .retry_policy(WorkerRetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(2),
+            max_backoff: Duration::from_millis(5),
+        });
+    worker.register_workflow("recover.workflow", |_ctx, _input| async move {
+        Ok(json!("done"))
+    });
+    if query {
+        worker.register_query("recover.workflow", "state", |_ctx, _args| async move {
+            Ok(Value::Null)
+        });
+    }
+    if activity {
+        worker.register_activity("RetryActivity", |_ctx, _args| async { Ok(json!("done")) });
+    }
+    worker
+}
+
+/// Four plain 500s (past the two-retry budget), then a 503 with
+/// `Retry-After: 3`, on every poll lane and the worker heartbeat. The
+/// workflow lane then delivers a task.
+fn failover_on_every_loop(
+    path: &str,
+    _body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    let looping = matches!(path, WORKFLOW_POLL | ACTIVITY_POLL | QUERY_POLL | HEARTBEAT);
+    match (path, number) {
+        (_, 1..=4) if looping => Some(plain_500()),
+        (_, 5) if looping => Some((UNAVAILABLE_RETRY_AFTER_3, String::new())),
+        (WORKFLOW_POLL, 6) => Some(("200 OK", workflow_delivery())),
+        (ACTIVITY_POLL | QUERY_POLL | WORKFLOW_POLL, _) => {
+            Some(("200 OK", json!({"task": null}).to_string()))
+        }
+        (WORKFLOW_COMPLETE, _) => Some(("200 OK", recorded())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn plain_500s_then_retry_after_never_stop_polling_or_heartbeats() {
+    let waits = RecordedWaits::start();
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(failover_on_every_loop),
+        ..MockWorkerBehavior::default()
+    });
+    let recovered = async {
+        while server.request_count(WORKFLOW_COMPLETE) < 1
+            || [ACTIVITY_POLL, QUERY_POLL, HEARTBEAT]
+                .iter()
+                .any(|path| server.request_count(path) < 6)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        failover_worker(&server, true, true).run_until(recovered),
+    )
+    .await
+    .expect("every loop resumes after the failover")
+    .expect("plain 500s and a 503 must not stop a running worker");
+
+    assert_eq!(
+        server.request_count(WORKFLOW_COMPLETE),
+        1,
+        "the task completed"
+    );
+    let waits = waits.waits();
+    assert!(waits.len() >= 4 * 5, "every loop retried: {waits:?}");
+    // Bounded: the outage schedule never waits more than 4 s, and the
+    // Server's Retry-After (3 s) is honored, not exceeded.
+    assert!(
+        waits.iter().all(|wait| *wait <= Duration::from_secs(4)),
+        "{waits:?}"
+    );
+    assert!(
+        waits
+            .iter()
+            .any(|wait| *wait > Duration::from_millis(2_900) && *wait <= Duration::from_secs(3)),
+        "Retry-After: 3 is honored: {waits:?}"
+    );
+}
+
+/// `Retry-After` as an HTTP-date about two seconds from now.
+fn unavailable_until_two_seconds_from_now() -> &'static str {
+    let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::from_secs(2);
+    let at = DateTime::from_timestamp(at.as_secs() as i64, 0).unwrap();
+    let status = format!(
+        "503 Service Unavailable\r\nretry-after: {}",
+        at.format("%a, %d %b %Y %H:%M:%S GMT")
+    );
+    Box::leak(status.into_boxed_str())
+}
+
+fn completion_failover(path: &str, _body: &str, number: usize) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (WORKFLOW_POLL, 1) => Some(("200 OK", workflow_delivery())),
+        (WORKFLOW_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        // The Server's answer when its database is unavailable to authenticate.
+        (WORKFLOW_COMPLETE, 1) => Some((
+            "500 Internal Server Error",
+            json!({"reason":"server_error",
+                "message":"Database runtime credential authentication is enabled but unavailable."})
+            .to_string(),
+        )),
+        (WORKFLOW_COMPLETE, 2) => Some((unavailable_until_two_seconds_from_now(), String::new())),
+        (WORKFLOW_COMPLETE, _) => Some(("200 OK", recorded())),
+        (ACTIVITY_POLL, 1) => Some(("200 OK", activity_delivery(Duration::from_secs(60)))),
+        (ACTIVITY_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (COMPLETE, 1) => Some(plain_500()),
+        (COMPLETE, 2) => Some((UNAVAILABLE_RETRY_AFTER_2, String::new())),
+        (COMPLETE, _) => Some(("200 OK", "{}".into())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_completion_refused_with_500_then_retry_after_is_resent_until_recorded() {
+    let waits = RecordedWaits::start();
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(completion_failover),
+        ..MockWorkerBehavior::default()
+    });
+    let worker = failover_worker(&server, false, true);
+    let settled = async {
+        while server.request_count(WORKFLOW_COMPLETE) < 3 || server.request_count(COMPLETE) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The worker keeps polling after both settlements.
+        let polls = server.request_count(WORKFLOW_POLL);
+        while server.request_count(WORKFLOW_POLL) < polls + 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), worker.run_until(settled))
+        .await
+        .expect("both completions are delivered")
+        .expect("a 500 or 503 on a completion must not stop a running worker");
+
+    for path in [WORKFLOW_COMPLETE, COMPLETE] {
+        let bodies = server.request_bodies(path);
+        assert_eq!(
+            bodies.len(),
+            3,
+            "{path}: resent until recorded, then stopped"
+        );
+        assert!(
+            bodies.iter().all(|body| *body == bodies[0]),
+            "{path}: every resend is the identical report (same IDs and attempt)"
+        );
+    }
+    let waits = waits.waits();
+    assert!(
+        waits.iter().all(|wait| *wait <= Duration::from_secs(4)),
+        "{waits:?}"
+    );
+    // The HTTP-date names a whole second, so it is honored as 1-2 s.
+    assert!(
+        waits
+            .iter()
+            .any(|wait| *wait > Duration::from_millis(900) && *wait <= Duration::from_secs(2)),
+        "an HTTP-date Retry-After is honored: {waits:?}"
+    );
+    assert!(
+        waits
+            .iter()
+            .any(|wait| *wait > Duration::from_millis(1_900) && *wait <= Duration::from_secs(2)),
+        "Retry-After: 2 is honored: {waits:?}"
+    );
+}
+
+fn lease_lost_during_resends(
+    path: &str,
+    _body: &str,
+    number: usize,
+) -> Option<(&'static str, String)> {
+    match (path, number) {
+        (WORKFLOW_POLL, 1) => Some(("200 OK", workflow_delivery())),
+        (WORKFLOW_POLL, _) => Some(("200 OK", json!({"task": null}).to_string())),
+        (WORKFLOW_COMPLETE, 1) => Some(plain_500()),
+        (WORKFLOW_COMPLETE, _) => Some((
+            "409 Conflict",
+            json!({"reason":"lease_expired","task_id":"recover-workflow",
+                "workflow_task_attempt":3,"task_status":"leased"})
+            .to_string(),
+        )),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_after_a_resend_ends_no_worse_than_not_resending() {
+    let _waits = RecordedWaits::start();
+    let server = MockWorkerServer::start_with_behavior(MockWorkerBehavior {
+        request_override: Some(lease_lost_during_resends),
+        ..MockWorkerBehavior::default()
+    });
+    let worker = failover_worker(&server, false, false);
+    let continued = async {
+        while server.request_count(WORKFLOW_COMPLETE) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let polls = server.request_count(WORKFLOW_POLL);
+        while server.request_count(WORKFLOW_POLL) < polls + 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), worker.run_until(continued))
+        .await
+        .expect("polling continues")
+        .expect("a lease lost while resending leaves the task to the Server");
+    assert_eq!(
+        server.request_count(WORKFLOW_COMPLETE),
+        2,
+        "a definitive refusal ends the resends"
+    );
 }
