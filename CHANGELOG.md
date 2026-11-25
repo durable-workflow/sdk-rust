@@ -15,6 +15,19 @@
   replay. Query and update handler reads and the cancellation clock are
   unchanged. ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))
 
+- Workers with cooperative cancellation enabled advertise the
+  `timeout_cleanup` capability, version 1. A native Server can then admit
+  starts that reserve time for deadline-triggered timeout cleanup on their
+  queue. When workflow code lets the delivered timeout
+  `Error::CooperativeCancellationRequested` escape, uncaught or returned
+  unchanged, the `fail_workflow` command carries
+  `failure.interruption: "timeout_cleanup"`, and the Server records the cleanup
+  as completed. Other failures, including wrapped interruptions and saga
+  compensation failures, still record failed cleanup. Workers without
+  cooperative cancellation are unchanged. `timeout_cleanup` is now reserved
+  and cannot be added as a resource capability.
+  ([Server #1201](https://github.com/durable-workflow/server/issues/1201))
+
 ## 4.24.0
 
 - When a compatible Native Server enables ordered condition authoring, timed

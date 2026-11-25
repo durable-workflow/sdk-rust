@@ -3306,6 +3306,8 @@ async fn cooperative_registration_uses_explicit_protocol_and_preserves_other_cli
         let mut manifest = portable_worker_affinity_capability_manifest();
         manifest[CONTINUE_AS_NEW_TARGET_CAPABILITY] =
             json!({"supported": true, "minimum_protocol_version": "1.21"});
+        manifest["timeout_cleanup"] =
+            json!({"supported": true, "minimum_protocol_version": "1.20", "version": 1});
         assert_eq!(body["capability_manifest"], manifest);
     }
 }
@@ -5855,4 +5857,360 @@ fn cancellation_cause_delivery_cannot_add_or_drop_the_timeout_cause() {
     )
     .unwrap();
     assert!(history.request.unwrap().cause().is_timeout());
+}
+
+/// The engine's root timeout request for `run-1` (Server #1201).
+fn root_timeout_snapshot(cause: Option<&str>) -> Value {
+    let mut snapshot = json!({
+        "schema": "durable-workflow.cancellation-context/v1",
+        "request_id": "request-1",
+        "root_request_id": "request-1",
+        "root_workflow_instance_id": "child-instance",
+        "root_workflow_run_id": "run-1",
+        "parent_request_id": null,
+        "reason": "Workflow work deadline passed; timeout cleanup requested.",
+        "requester": {"type": "system", "id": "timeout_cleanup"},
+        "source": "system",
+        "requested_at": "2026-10-01T00:00:00.123456Z",
+        "cleanup_deadline_at": "2026-10-01T00:00:30.123456Z",
+        "lineage": [{"request_id": "request-1", "workflow_instance_id": "child-instance", "workflow_run_id": "run-1"}],
+    });
+    if let Some(cause) = cause {
+        snapshot["cause"] = json!(cause);
+    }
+    snapshot
+}
+
+fn timeout_cleanup_started() -> HistoryEvent {
+    serde_json::from_value(json!({
+        "event_type": "WorkflowTimeoutCleanupStarted", "workflow_command_id": "request-1",
+        "recorded_at": "2026-10-01T00:00:00.123456Z",
+        "payload": {
+            "workflow_command_id": "request-1", "timeout_kind": "execution",
+            "work_deadline_at": "2026-10-01T00:00:00+00:00",
+            "cleanup_deadline_at": "2026-10-01T00:00:30+00:00",
+            "hard_deadline_at": "2026-10-01T00:00:30+00:00",
+            "detected_at": "2026-10-01T00:00:00+00:00",
+        }
+    }))
+    .unwrap()
+}
+
+/// History in which the request in `snapshot` is delivered at the first timer.
+fn timeout_cleanup_history(snapshot: &Value) -> Vec<HistoryEvent> {
+    let mut request = timeout_request_event(snapshot);
+    request.payload["reason"] = snapshot["reason"].clone();
+    vec![
+        timeout_cleanup_started(),
+        request,
+        timeout_delivery_event(snapshot),
+    ]
+}
+
+fn timeout_cleanup_worker(cooperative: bool) -> Worker {
+    cancellation_worker().cooperative_cancellation(cooperative)
+}
+
+fn timeout_cleanup_commands<F, Fut>(
+    cooperative: bool,
+    history: Vec<HistoryEvent>,
+    workflow: F,
+) -> Vec<Value>
+where
+    F: Fn(WorkflowContext, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    let mut worker = timeout_cleanup_worker(cooperative);
+    worker.register_workflow("cancel", workflow);
+    worker.execute_workflow_task(context_task(history)).unwrap()
+}
+
+fn sole_failure(commands: &[Value]) -> &Value {
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["type"], "fail_workflow", "{commands:?}");
+    &commands[0]
+}
+
+fn assert_marked(commands: &[Value]) {
+    let command = sole_failure(commands);
+    assert_eq!(
+        command["failure"],
+        json!({"interruption": "timeout_cleanup"})
+    );
+    assert_eq!(command["exception_type"], "WorkflowCancellationRequested");
+}
+
+fn assert_unmarked(commands: &[Value]) {
+    let command = sole_failure(commands);
+    assert!(command.get("failure").is_none(), "{command}");
+}
+
+async fn sleep_through(ctx: WorkflowContext) -> Result<Value> {
+    ctx.sleep(Duration::from_secs(10)).await?;
+    Ok(Value::Null)
+}
+
+#[test]
+fn timeout_cleanup_uncaught_interruption_is_marked() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    let commands = timeout_cleanup_commands(true, timeout_cleanup_history(&snapshot), |ctx, _| {
+        sleep_through(ctx)
+    });
+    assert_marked(&commands);
+}
+
+#[test]
+fn timeout_cleanup_rethrown_interruption_is_marked() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    let commands = timeout_cleanup_commands(
+        true,
+        timeout_cleanup_history(&snapshot),
+        |ctx, _| async move {
+            match ctx.sleep(Duration::from_secs(10)).await {
+                Err(Error::CooperativeCancellationRequested(interrupted)) => {
+                    assert!(interrupted.request.cause().is_timeout());
+                    Err(Error::CooperativeCancellationRequested(interrupted))
+                }
+                other => panic!("expected the timeout interruption, got {other:?}"),
+            }
+        },
+    );
+    assert_marked(&commands);
+}
+
+#[test]
+fn timeout_cleanup_interruption_returned_after_successful_compensation_is_marked() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    let mut history = timeout_cleanup_history(&snapshot);
+    history.extend(completed_activity(2, "undo", Value::Null));
+    let commands = timeout_cleanup_commands(true, history, |ctx, _| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        saga.finish(ctx.sleep(Duration::from_secs(10)).await)
+            .await?;
+        Ok(Value::Null)
+    });
+    assert_marked(&commands);
+}
+
+#[test]
+fn timeout_cleanup_compensation_failure_is_not_marked() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    let mut history = timeout_cleanup_history(&snapshot);
+    history.extend([
+        event(
+            "ActivityScheduled",
+            json!({"sequence":2,"activity_type":"undo","task_queue":"queue"}),
+        ),
+        event(
+            "ActivityFailed",
+            json!({"sequence":2,"activity_type":"undo","non_retryable":true,
+                "exception_type":"UndoFailed","exception":{"class":"UndoFailed","message":"undo failed"}}),
+        ),
+    ]);
+    let commands = timeout_cleanup_commands(true, history, |ctx, _| async move {
+        let mut saga = ctx.saga();
+        saga.add_compensation("undo", json!([]))?;
+        saga.finish(ctx.sleep(Duration::from_secs(10)).await)
+            .await?;
+        Ok(Value::Null)
+    });
+    assert_unmarked(&commands);
+    assert_eq!(commands[0]["exception_type"], "SagaCompensationFailed");
+    // An application error raised while compensating is not marked either.
+    let commands = timeout_cleanup_commands(
+        true,
+        timeout_cleanup_history(&snapshot),
+        |ctx, _| async move {
+            let _ = ctx.sleep(Duration::from_secs(10)).await;
+            Err(Error::Codec("compensation failed".into()))
+        },
+    );
+    assert_unmarked(&commands);
+}
+
+#[test]
+fn timeout_cleanup_wrapped_interruption_is_not_marked() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    let commands = timeout_cleanup_commands(
+        true,
+        timeout_cleanup_history(&snapshot),
+        |ctx, _| async move {
+            let interrupted = ctx.sleep(Duration::from_secs(10)).await.unwrap_err();
+            Err(Error::ParallelFailed(ParallelFailure {
+                group_id: "group".into(),
+                member_path: vec![0],
+                group_path: Vec::new(),
+                completed: Vec::new(),
+                cause: Box::new(interrupted),
+            }))
+        },
+    );
+    assert_unmarked(&commands);
+}
+
+#[test]
+fn timeout_cleanup_application_constructed_interruption_is_not_marked() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    // A copy with other identity is not the delivered request.
+    let commands = timeout_cleanup_commands(
+        true,
+        timeout_cleanup_history(&snapshot),
+        |ctx, _| async move {
+            let Err(Error::CooperativeCancellationRequested(mut interrupted)) =
+                ctx.sleep(Duration::from_secs(10)).await
+            else {
+                panic!("expected delivery");
+            };
+            interrupted.request.request_id = "request-2".into();
+            interrupted.delivery.request_id = "request-2".into();
+            Err(Error::CooperativeCancellationRequested(interrupted))
+        },
+    );
+    assert_unmarked(&commands);
+    // Without a delivered request, a built timeout error is never marked.
+    let context = CancellationContext::from_value(&snapshot).unwrap();
+    let commands = timeout_cleanup_commands(true, Vec::new(), move |_ctx, _| {
+        let context = context.clone();
+        async move {
+            Err(Error::CooperativeCancellationRequested(
+                CooperativeCancellationRequested {
+                    request: CancellationRequest {
+                        request_id: "request-1".into(),
+                        requested_at: "2026-10-01T00:00:00.123456Z".into(),
+                        cleanup_deadline_at: "2026-10-01T00:00:30.123456Z".into(),
+                        history_refresh_page_token: None,
+                        context: Some(context),
+                    },
+                    delivery: CancellationDelivery {
+                        request_id: "request-1".into(),
+                        sequence: 1,
+                        call_kind: CancellationCallKind::Timer,
+                        sequence_span: 1,
+                        operation_sequence: None,
+                        operation_sequence_span: 1,
+                    },
+                },
+            ))
+        }
+    });
+    assert_unmarked(&commands);
+}
+
+#[test]
+fn timeout_cleanup_ordinary_explicit_and_descendant_cancellations_are_not_marked() {
+    let descendant = with_cause(context_snapshot(), json!("timeout"));
+    for snapshot in [
+        root_timeout_snapshot(None),
+        root_timeout_snapshot(Some("cancellation")),
+        descendant,
+    ] {
+        let commands =
+            timeout_cleanup_commands(true, timeout_cleanup_history(&snapshot), |ctx, _| {
+                sleep_through(ctx)
+            });
+        assert_unmarked(&commands);
+        assert_eq!(
+            commands[0]["exception_type"],
+            "WorkflowCancellationRequested"
+        );
+    }
+}
+
+#[test]
+fn timeout_cleanup_returning_from_cleanup_completes() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    let commands = timeout_cleanup_commands(
+        true,
+        timeout_cleanup_history(&snapshot),
+        |ctx, _| async move {
+            let Err(Error::CooperativeCancellationRequested(interrupted)) =
+                ctx.sleep(Duration::from_secs(10)).await
+            else {
+                panic!("expected delivery");
+            };
+            assert!(interrupted.request.cause().is_timeout());
+            Ok(json!("cleaned up"))
+        },
+    );
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["type"], "complete_workflow");
+    assert!(commands[0].get("failure").is_none());
+}
+
+#[test]
+fn timeout_cleanup_non_cooperative_worker_never_sends_the_marker() {
+    let snapshot = root_timeout_snapshot(Some("timeout"));
+    // Replay of a history containing WorkflowTimeoutCleanupStarted still
+    // delivers the interruption; only the advertised marker is withheld.
+    let commands = timeout_cleanup_commands(false, timeout_cleanup_history(&snapshot), |ctx, _| {
+        sleep_through(ctx)
+    });
+    assert_unmarked(&commands);
+    assert_eq!(
+        commands[0]["exception_type"],
+        "WorkflowCancellationRequested"
+    );
+}
+
+#[test]
+fn timeout_cleanup_started_event_alone_replays_unchanged() {
+    // The Server records WorkflowTimeoutCleanupStarted just before the request;
+    // a replay that ends between them neither fails nor changes commands.
+    for cooperative in [false, true] {
+        let commands =
+            timeout_cleanup_commands(cooperative, vec![timeout_cleanup_started()], |ctx, _| {
+                sleep_through(ctx)
+            });
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(commands[0]["type"], "start_timer");
+    }
+}
+
+#[tokio::test]
+async fn timeout_cleanup_registration_advertises_version_one_only_with_cooperation() {
+    let server = remote_activity_server();
+    let worker = Worker::new(client(&server, "register-valid"), "queue")
+        .worker_id("actual-owner")
+        .cooperative_cancellation(true);
+    worker.register().await.unwrap();
+    let ordinary = Worker::new(client(&server, "register-valid"), "queue").worker_id("ordinary");
+    ordinary.register().await.unwrap();
+    let requests = server.requests.lock().unwrap();
+    let bodies = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/worker/register"))
+        .map(|request| serde_json::from_str::<Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0]["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("timeout_cleanup")));
+    assert_eq!(
+        bodies[0]["capability_manifest"]["timeout_cleanup"],
+        json!({"supported": true, "minimum_protocol_version": "1.20", "version": 1})
+    );
+    assert!(!bodies[1]["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("timeout_cleanup")));
+    assert!(bodies[1]["capability_manifest"]
+        .get("timeout_cleanup")
+        .is_none());
+}
+
+#[tokio::test]
+async fn timeout_cleanup_is_not_a_resource_capability() {
+    let server = remote_activity_server();
+    let worker = Worker::new(client(&server, "register-valid"), "queue")
+        .worker_id("ordinary")
+        .capabilities(["timeout_cleanup"]);
+    assert!(matches!(worker.register().await, Err(Error::WorkerLoop(_))));
+    assert!(!server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.path.ends_with("/worker/register")));
 }
