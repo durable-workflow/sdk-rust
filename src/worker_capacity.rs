@@ -140,7 +140,33 @@ impl Worker {
         };
         let mut worker = self.clone();
         worker.client.worker_task_slot = Some(slot.marker.clone());
-        let result = worker.poll_workflow_once_reserved().await;
+        let validation = match self.update_validation_poll_slot() {
+            Ok(validation) => validation,
+            Err(error) => {
+                let result = Err(error);
+                self.stop_on_terminal_poll(&result);
+                return result;
+            }
+        };
+        worker.client.update_validation_slot = validation.clone();
+        let mut result = worker.poll_workflow_once_reserved().await;
+        if let Some(task) = validation.and_then(|slot| slot.take()) {
+            result = match result {
+                // The multiplexed poll leased an update-validation task in
+                // place of a workflow task; it runs under this reservation.
+                Ok(ManagedPollOutcome::Idle) => {
+                    worker.client.release_worker_poll();
+                    Ok(worker.execute_update_validation_task(task).await)
+                }
+                other => {
+                    tracing::warn!(
+                        target: "durable_workflow::worker",
+                        "an update validation task was leased by a poll that did not settle idle; its lease will expire"
+                    );
+                    other
+                }
+            };
+        }
         self.stop_on_terminal_poll(&result);
         result
     }

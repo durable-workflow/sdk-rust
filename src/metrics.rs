@@ -314,19 +314,36 @@ impl Client {
         resolve: bool,
     ) -> Result<T> {
         let mut observation = ClientObservation::new(self, &reqwest::Method::POST, path, protocol);
+        // A validator worker's workflow poll also leases update-validation tasks.
+        let multiplexed = self.multiplexed_workflow_poll_body(path, body)?;
         let result = async {
             let mut retries = 0;
             loop {
                 let response = async {
-                    let mut value: serde_json::Value = Box::pin(self.send_json_with_timeout(
-                        reqwest::Method::POST,
-                        path,
-                        protocol,
-                        Some(body),
-                        timeout,
-                        &observation,
-                    ))
-                    .await?;
+                    let mut value: serde_json::Value = match &multiplexed {
+                        Some(multiplexed) => {
+                            Box::pin(self.send_json_with_timeout(
+                                reqwest::Method::POST,
+                                path,
+                                protocol,
+                                Some(multiplexed),
+                                timeout,
+                                &observation,
+                            ))
+                            .await?
+                        }
+                        None => {
+                            Box::pin(self.send_json_with_timeout(
+                                reqwest::Method::POST,
+                                path,
+                                protocol,
+                                Some(body),
+                                timeout,
+                                &observation,
+                            ))
+                            .await?
+                        }
+                    };
                     if resolve {
                         self.resolve_runtime_payloads(
                             &mut value,
@@ -341,11 +358,14 @@ impl Client {
                 match response {
                     Err(Error::Transport(_)) if retries < max_retries => retries += 1,
                     response => {
-                        let value = crate::worker_poll_response(response)?;
+                        let mut value = crate::worker_poll_response(response)?;
                         if value.get("task").is_some_and(|task| !task.is_null()) {
                             if let Some(slot) = &self.worker_task_slot {
                                 slot.claimed();
                             }
+                        }
+                        if multiplexed.is_some() {
+                            self.park_update_validation_task(&mut value)?;
                         }
                         return Ok(serde_json::from_value(value)?);
                     }

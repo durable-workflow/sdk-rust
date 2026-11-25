@@ -90,8 +90,8 @@ ordinary worker registration does not enable it.
 
 - `Client` starts, signals, queries, updates, cancels, terminates, describes,
   and awaits workflow executions.
-- `Worker` registers workflow, activity, query and update handlers, declares
-  workflow signals, and long-polls task queues.
+- `Worker` registers workflow, activity, query and update handlers and update
+  validators, declares workflow signals, and long-polls task queues.
 - `WorkflowContext` provides durable activities, timers, conditions, child
   workflows, side effects, version markers, parallel operations, selection,
   sagas, message streams, memo, search attributes, and continue-as-new.
@@ -195,6 +195,99 @@ let result = match client
     other => other?,
 };
 # let _ = result;
+# Ok(())
+# }
+```
+
+### Update validators
+
+Register a validator next to an update handler to reject a bad request before
+the update is accepted. The Server runs the validator first; nothing is
+accepted until it approves. Returning an `UpdateRejection` rejects the update
+with reason `update_validator_rejected`: the handler never runs, workflow code
+never sees the update and no acceptance is recorded. The Server records only
+the rejected update. `Ok(())` approves it, and the update is then accepted and
+handled as usual.
+
+```rust,no_run
+# use std::sync::Arc;
+# use durable_workflow::{json, UpdateRejection, Value, Worker};
+# #[derive(Clone, Default)]
+# struct Order { limit: u64 }
+# fn configure(worker: &mut Worker) {
+worker.register_update("orders", "approve", |_ctx, args| async move { Ok(args) });
+
+// Reads only the arguments and the committed history in the QueryContext.
+worker.register_update_validator("orders", "approve", |_ctx, args: Value| {
+    if args[0].as_u64().unwrap_or_default() == 0 {
+        return Err(UpdateRejection::new("amount must be positive")
+            .with_validation_error("amount", "must be positive"));
+    }
+    Ok(())
+});
+
+// Or read the replayed state of a workflow registered with
+// `register_replayed_workflow::<Order, _, _, _>`.
+worker.register_replayed_update_validator(
+    "orders",
+    "increase",
+    |_ctx, order: Arc<Order>, args: Value| {
+        if args[0].as_u64().unwrap_or_default() > order.limit {
+            return Err(UpdateRejection::new("amount exceeds the order limit"));
+        }
+        Ok(())
+    },
+);
+# }
+```
+
+Validators are read-only and replay-stable. They receive the update's
+arguments and a `QueryContext` over the run's committed history; the replayed
+variant also gets a detached snapshot of the workflow's state, reconstructed as
+for a replayed query. A validator has no way to schedule durable work, and if
+one adds a workflow command through a context kept in state, the update is
+rejected with failure type `UpdateValidatorCommandRefused` and nothing is
+scheduled. State changes are discarded. Validators are not part of workflow
+history, so they never run during replay. A validator that panics, or that the
+worker cannot run (for example because replay fails), reports
+`update_validation_worker_failed`, which is distinct from a rejection.
+
+Each validator needs a registered update handler for the same workflow type
+and update name, and a replayed validator needs the workflow registered with
+`register_replayed_workflow` and the same state type; registration checks both. A worker with validators advertises them in its workflow
+command contract (`update_validators`) and the `update_validation_tasks`
+capability. `Worker::register` refuses a Server that does not advertise
+synchronous update validation with multiplexed polling
+(`Error::UpdateValidationUnavailable`); native Server already serves update
+validation tasks. The worker's workflow long poll then also leases validation
+tasks, under the same `max_concurrent_workflow_tasks` capacity, and answers each
+one with an approval or a rejection, also while the worker is stopping. A
+completion the Server fences because the lease moved on is logged, not retried.
+Worker task metrics use `task_kind` `update_validation` with outcome `approved`,
+`rejected`, `failed` or `expired`. Inside the worker a validator's refusal is
+`Error::UpdateRejection`; callers never see that variant.
+
+Callers tell a rejection from a failed update without parsing messages.
+`Error::update_validator_rejection()` returns the message, validation errors and
+ids of an update the validator rejected; `Error::is_update_validation_failed()`
+is true when no validator answered in time or the worker could not run it.
+Updates to a validated workflow need a `request_id`, which `update_workflow`
+always sends.
+
+```rust,no_run
+# async fn approve(client: &durable_workflow::Client) -> durable_workflow::Result<()> {
+match client
+    .update_workflow("order-1", "approve", [0], Some("approve-order-1"))
+    .await
+{
+    Err(error) if error.is_update_validator_rejected() => {
+        let rejection = error.update_validator_rejection().expect("rejection");
+        eprintln!("rejected: {} {:?}", rejection.message, rejection.validation_errors);
+    }
+    other => {
+        other?;
+    }
+}
 # Ok(())
 # }
 ```

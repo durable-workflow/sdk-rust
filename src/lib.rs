@@ -40,10 +40,15 @@ mod terminal_failure_detail;
 mod timeout_cleanup;
 mod tls;
 mod update_outcome;
+mod update_validation;
 mod worker_capacity;
 mod worker_session;
 mod workflow_hydration;
 mod workflow_logging;
+pub use update_validation::{
+    UpdateRejection, UpdateValidatorRejected, UPDATE_VALIDATION_WORKER_FAILED,
+    UPDATE_VALIDATOR_REJECTED,
+};
 pub use workflow_logging::{WorkflowLogger, WorkflowReplayState};
 
 pub use activity_checkpoint::{ActivityHeartbeatCheckpoint, ActivityHeartbeatResumeUnavailable};
@@ -94,7 +99,7 @@ use std::{
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value as AvroDatum, Schema};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
-use futures_util::{future::OptionFuture, task::noop_waker_ref};
+use futures_util::{future::OptionFuture, task::noop_waker_ref, FutureExt as _};
 pub use local_activity::LocalActivityOptions;
 pub use raw_request::{
     worker_protocol_compatible, HttpRefusal, RawMethod, RawRequest, RawResponse,
@@ -155,6 +160,8 @@ pub const QUERY_TASKS_CAPABILITY: &str = "query_tasks";
 pub const TYPED_SEARCH_ATTRIBUTES_CAPABILITY: &str = "typed_search_attributes";
 /// Worker-registration capability for synchronous workflow updates.
 pub const WORKFLOW_UPDATES_CAPABILITY: &str = "workflow_updates";
+/// Worker-registration capability for synchronous pre-accept update validation.
+pub const UPDATE_VALIDATION_TASKS_CAPABILITY: &str = "update_validation_tasks";
 /// Worker-registration capability for durable named input streams.
 pub const MESSAGE_STREAMS_CAPABILITY: &str = "message_streams";
 /// Worker-registration capability for persisted first-completion selection.
@@ -445,10 +452,24 @@ pub enum Error {
     },
     #[error("worker loop error: {0}")]
     WorkerLoop(String),
+    /// A low-level workflow command contract declared `update_validators`
+    /// that is not a list of non-empty update names.
     #[error(
-        "workflow command contract for {workflow_type:?} declares update validators, but this Rust SDK cannot execute synchronous pre-accept update validation"
+        "workflow command contract for {workflow_type:?} declares malformed update validators: expected a list of non-empty update names"
     )]
     UnsupportedUpdateValidators { workflow_type: String },
+    /// Worker side: an update validator returned this [`UpdateRejection`].
+    /// The worker reports it to the Server as `update_validator_rejected`.
+    /// A caller reads the Server's answer with
+    /// [`Error::update_validator_rejection`] instead.
+    #[error(transparent)]
+    UpdateRejection(UpdateRejection),
+    /// The worker declares update validators, but registration cannot safely
+    /// run them: a validator names an update the workflow does not handle, or
+    /// the Server does not advertise synchronous pre-accept update validation
+    /// with multiplexed workflow/update-validation polling.
+    #[error("update validation unavailable: {0}")]
+    UpdateValidationUnavailable(String),
     #[error("{primary}; worker deregistration also failed: {deregistration}")]
     WorkerShutdown {
         primary: Box<Error>,
@@ -3532,6 +3553,9 @@ pub struct Client {
     max_response_bytes: usize,
     worker_storage_admission: Option<WorkerStorageAdmission>,
     worker_task_slot: Option<Arc<worker_capacity::TaskSlotMarker>>,
+    /// Set on a validator worker's per-poll Client: the multiplexed workflow
+    /// poll asks for update-validation tasks and parks a leased one here.
+    update_validation_slot: Option<update_validation::Slot>,
     cooperative_worker_protocol: bool,
     worker_protocol_version: WorkerProtocolVersion,
     local_activities_enabled: bool,
@@ -4614,10 +4638,13 @@ impl Client {
 
     /// Register a worker and advertise its named query and update handlers.
     ///
-    /// This Rust SDK cannot execute synchronous pre-accept update validation,
-    /// so a workflow contract with a non-empty or malformed
-    /// `update_validators` declaration returns
-    /// [`Error::UnsupportedUpdateValidators`] before registration transport.
+    /// A workflow contract may list `update_validators`, the update names
+    /// whose validators this worker runs on the Server's update-validation
+    /// tasks. A malformed `update_validators` declaration (not a list of
+    /// non-empty names) returns [`Error::UnsupportedUpdateValidators`] before
+    /// registration transport. A low-level caller that declares validators
+    /// must also advertise [`UPDATE_VALIDATION_TASKS_CAPABILITY`] and poll and
+    /// complete the validation tasks itself; [`Worker`] does this for you.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_worker_with_command_contracts(
         &self,
@@ -4666,10 +4693,11 @@ impl Client {
                 let Some(update_validators) = contract.get("update_validators") else {
                     continue;
                 };
-                if !update_validators
-                    .as_array()
-                    .is_some_and(|validators| validators.is_empty())
-                {
+                if !update_validators.as_array().is_some_and(|validators| {
+                    validators
+                        .iter()
+                        .all(|name| name.as_str().is_some_and(|name| !name.trim().is_empty()))
+                }) {
                     return Err(Error::UnsupportedUpdateValidators {
                         workflow_type: workflow_type.clone(),
                     });
@@ -7284,6 +7312,7 @@ impl ClientBuilder {
             max_response_bytes: self.max_response_bytes,
             worker_storage_admission: None,
             worker_task_slot: None,
+            update_validation_slot: None,
             cooperative_worker_protocol: false,
             worker_protocol_version: self.worker_protocol_version,
             local_activities_enabled: false,
@@ -8698,6 +8727,8 @@ pub struct Worker {
     queries: HashMap<String, HashMap<String, RegisteredQuery>>,
     signals: HashMap<String, Vec<String>>,
     updates: HashMap<String, HashMap<String, UpdateHandler>>,
+    update_validators: HashMap<String, HashMap<String, RegisteredQuery>>,
+    update_validation_confirmed: Arc<AtomicBool>,
     registration_definitions:
         HashMap<(RegistrationKind, Option<String>, String), HandlerRegistration>,
     registration_error: Option<DuplicateRegistrationError>,
@@ -8753,6 +8784,8 @@ impl Worker {
             queries: HashMap::new(),
             signals: HashMap::new(),
             updates: HashMap::new(),
+            update_validators: HashMap::new(),
+            update_validation_confirmed: Arc::new(AtomicBool::new(false)),
             registration_definitions: HashMap::new(),
             registration_error: None,
             max_concurrent_workflow_tasks: 10,
@@ -8806,6 +8839,7 @@ impl Worker {
         self.session_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.sticky_registration_confirmed = Arc::new(AtomicBool::new(false));
         self.query_authority_confirmed = Arc::new(AtomicBool::new(false));
+        self.update_validation_confirmed = Arc::new(AtomicBool::new(false));
         self.client.reset_sticky_cache();
         self.sessions = Arc::new(Mutex::new(HashMap::new()));
         self
@@ -9778,6 +9812,11 @@ impl Worker {
                 ));
             }
         }
+        self.update_validation_confirmed
+            .store(false, Ordering::SeqCst);
+        if self.has_update_validators() {
+            self.require_update_validation_support().await?;
+        }
         self.sticky_registration_confirmed
             .store(false, Ordering::SeqCst);
         self.session_registration_confirmed
@@ -9807,6 +9846,12 @@ impl Worker {
                 .unwrap_or_default();
             updates.sort();
             let signals = self.signals.get(workflow_type).cloned().unwrap_or_default();
+            let mut update_validators = self
+                .update_validators
+                .get(workflow_type)
+                .map(|validators| validators.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            update_validators.sort();
             command_contracts.insert(
                 workflow_type.clone(),
                 json!({
@@ -9816,7 +9861,7 @@ impl Worker {
                     "signal_contracts": argument_vector_contracts(&signals),
                     "updates": updates,
                     "update_contracts": argument_vector_contracts(&updates),
-                    "update_validators": [],
+                    "update_validators": update_validators,
                 }),
             );
         }
@@ -9884,6 +9929,8 @@ impl Worker {
                         .then(|| "nexus_cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
                     (!self.updates.is_empty()).then(|| WORKFLOW_UPDATES_CAPABILITY.to_string()),
+                    self.has_update_validators()
+                        .then(|| UPDATE_VALIDATION_TASKS_CAPABILITY.to_string()),
                     Some(condition_input_order::CAPABILITY.to_string()),
                     worker_protocol_supports_message_streams(WORKER_PROTOCOL_VERSION)
                         .then(|| MESSAGE_STREAMS_CAPABILITY.to_string()),
@@ -9926,6 +9973,10 @@ impl Worker {
             self.sticky_registration_confirmed
                 .store(true, Ordering::SeqCst);
         }
+        self.update_validation_confirmed.store(
+            response.registered && self.has_update_validators(),
+            Ordering::SeqCst,
+        );
         self.query_authority_confirmed.store(
             response.registered
                 && self.client.worker_protocol_version == WorkerProtocolVersion::V120
@@ -11229,7 +11280,7 @@ impl Worker {
 
     async fn execute_query_task_inner(
         &self,
-        mut task: QueryTask,
+        task: QueryTask,
         authority: Option<&query_authority::Authority>,
     ) -> std::result::Result<AvroValue, QueryTaskExecutionFailure> {
         validate_query_task_payloads(&task).map_err(|error| {
@@ -11266,6 +11317,28 @@ impl Worker {
             ));
         };
 
+        self.run_registered_query(task, query, authority, false)
+            .await?
+            .map_err(|error| {
+                QueryTaskExecutionFailure::new("query_rejected", error.to_string(), "QueryFailed")
+            })
+    }
+
+    /// Reconstruct a query snapshot (and, for a replayed handler, the
+    /// workflow's instance state) and run one registered read-only handler.
+    ///
+    /// The outer error is a failure to reconstruct or run the handler; the
+    /// inner result is the handler's own outcome. With `read_only`, used for
+    /// update validators, a panic is an execution failure and a handler that
+    /// adds commands to the reconstructed workflow is refused with
+    /// [`Error::UpdateRejection`].
+    async fn run_registered_query(
+        &self,
+        mut task: QueryTask,
+        query: &RegisteredQuery,
+        authority: Option<&query_authority::Authority>,
+        read_only: bool,
+    ) -> std::result::Result<Result<AvroValue>, QueryTaskExecutionFailure> {
         let args = decode_task_avro_arguments(task.query_arguments.as_ref(), &task.payload_codec)
             .map_err(|error| {
             QueryTaskExecutionFailure::new(
@@ -11324,6 +11397,7 @@ impl Worker {
             signal_events: Arc::new(signal_events),
         };
 
+        let mut reconstructed: Option<(WorkflowContext, usize)> = None;
         let future = match query {
             RegisteredQuery::Snapshot(handler) => {
                 query_authority::before_handler(authority, &self.client).await?;
@@ -11483,6 +11557,19 @@ impl Worker {
                     })?
                     .replay_time()
                     .ok();
+                let before = workflow_context
+                    .state
+                    .lock()
+                    .map_err(|_| {
+                        QueryTaskExecutionFailure::new(
+                            "query_workflow_state_unavailable",
+                            "workflow state poisoned",
+                            "QueryWorkflowStateUnavailable",
+                        )
+                    })?
+                    .commands
+                    .len();
+                reconstructed = Some((workflow_context.clone(), before));
                 handler(context, state, args).map_err(|message| {
                     QueryTaskExecutionFailure::new(
                         "query_workflow_state_unavailable",
@@ -11493,9 +11580,39 @@ impl Worker {
             }
         };
 
-        future.await.map_err(|error| {
-            QueryTaskExecutionFailure::new("query_rejected", error.to_string(), "QueryFailed")
-        })
+        if !read_only {
+            return Ok(future.await);
+        }
+        let outcome = match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return Err(QueryTaskExecutionFailure::new(
+                    "update_validator_panicked",
+                    "the update validator panicked",
+                    "UpdateValidatorPanicked",
+                ))
+            }
+        };
+        if let Some((workflow_context, before)) = reconstructed {
+            let after = workflow_context
+                .state
+                .lock()
+                .map_err(|_| {
+                    QueryTaskExecutionFailure::new(
+                        "query_workflow_state_unavailable",
+                        "workflow state poisoned",
+                        "QueryWorkflowStateUnavailable",
+                    )
+                })?
+                .commands
+                .len();
+            if after > before {
+                return Ok(Err(Error::UpdateRejection(
+                    update_validation::scheduled_work_refusal(),
+                )));
+            }
+        }
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -21587,6 +21704,7 @@ mod tests {
     mod runtime_payloads;
     mod runtime_uploads;
     mod static_credentials;
+    mod update_validation;
     mod version_marker_contract;
     mod worker_capacity;
     mod worker_session;
@@ -34691,14 +34809,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn low_level_registration_rejects_update_validators_before_transport() {
+    async fn low_level_registration_rejects_malformed_update_validators_before_transport() {
         let server = MockWorkerServer::start();
         let client = Client::builder(server.base_url())
             .timeout(Duration::from_secs(2))
             .build()
             .expect("client");
 
-        for update_validators in [json!(["approve"]), json!("approve")] {
+        for update_validators in [json!("approve"), json!([""]), json!([1]), json!({})] {
             let error = client
                 .register_worker_with_command_contracts(
                     "validator-claiming-worker",
@@ -34717,14 +34835,36 @@ mod tests {
                     }),
                 )
                 .await
-                .expect_err("unsupported validator claims must fail before registration");
+                .expect_err("malformed validator claims must fail before registration");
 
             let Error::UnsupportedUpdateValidators { workflow_type } = error else {
-                panic!("expected typed unsupported-validator failure");
+                panic!("expected typed malformed-validator failure");
             };
             assert_eq!(workflow_type, "orders");
         }
         assert_eq!(server.request_count("/api/worker/register"), 0);
+
+        client
+            .register_worker_with_command_contracts(
+                "validator-worker",
+                "rust-workers",
+                vec!["orders".to_string()],
+                vec![],
+                1,
+                1,
+                vec![
+                    WORKFLOW_UPDATES_CAPABILITY.to_string(),
+                    UPDATE_VALIDATION_TASKS_CAPABILITY.to_string(),
+                ],
+                json!({"orders": {"updates": ["approve"], "update_validators": ["approve"]}}),
+            )
+            .await
+            .expect("a low-level caller may declare the validators it runs");
+        assert_eq!(
+            server.request_body("/api/worker/register")["workflow_command_contracts"]["orders"]
+                ["update_validators"],
+            json!(["approve"])
+        );
     }
 
     #[tokio::test]
