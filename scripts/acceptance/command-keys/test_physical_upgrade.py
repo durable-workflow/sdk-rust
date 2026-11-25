@@ -18,28 +18,71 @@ class PhysicalUpgradeTest(unittest.TestCase):
     def setUp(self):
         self.profile = physical.profile()
         self.started = datetime(2026,1,1,tzinfo=timezone.utc).timestamp()
+        before_version, after_version = self.profile['schema_before'], self.profile['schema_after']
         self.before = {'schema':[['table','business','business','CREATE TABLE business(id TEXT)']],
                        'tables':{'business':{'columns':['id'],'rows':[[['text','original']]]},
                                  'dw_server_schema':{'columns':['engine','version'],
-                                    'rows':[[['text','rust-development'],['integer',12]]]},
-                                 '_sqlx_migrations':{'columns':['version'],'rows':[[['integer',12]]]}}}
+                                    'rows':[[['text','rust-development'],['integer',before_version]]]},
+                                 '_sqlx_migrations':{'columns':['version'],'rows':[[['integer',before_version]]]}}}
+        for table in self.profile['added_columns']:
+            self.before['schema'].append(['table',table,table,'CREATE TABLE "'+table+'" ("id" varchar, primary key ("id"))'])
+            self.before['tables'][table] = {'columns':['id'],'rows':[[['text',table+'-row']]]}
         self.after = deepcopy(self.before)
-        self.after['tables']['dw_server_schema']['rows'][0][1] = ['integer',13]
-        self.after['tables']['dw_command_intents'] = {'columns':['command_id','namespace','intent_digest'],'rows':[]}
+        for row in self.after['schema']:
+            declared = self.profile['added_columns'].get(row[1],[])
+            row[3] = row[3].replace(', primary key',''.join(', '+definition for _,definition,_ in declared)+', primary key')
+            for name,_,default in declared:
+                self.after['tables'][row[1]]['columns'].append(name)
+                self.after['tables'][row[1]]['rows'][0].append(default)
+        self.after['tables']['dw_server_schema']['rows'][0][1] = ['integer',after_version]
+        for table in self.profile['added_tables']:
+            self.after['tables'][table] = {'columns':['id'],'rows':[]}
         self.after['tables']['_sqlx_migrations'] = {
             'columns':['version','description','installed_on','success','checksum','execution_time'],
-            'rows':[[['integer',13],['text',self.profile['journal_description']],
+            'rows':[[['integer',after_version],['text',self.profile['journal_description']],
                      ['text','2026-01-01 00:00:00'],['integer',1],
                      ['blob',self.profile['journal_checksum_sha384']],['integer',0]]]}
-        self.after['schema'] += [[('table' if name=='dw_command_intents' else 'index'),
-                                 name,'dw_command_intents',None] for name in self.profile['new_schema_objects']]
-        self.observed = {'backend':'sqlite','from_schema_version':12,'schema_version':13,'status':'upgraded'}
+        self.after['schema'] += [[('table' if name in self.profile['added_tables'] else 'index'),name,table,None]
+                                 for name,table in self.profile['new_schema_objects'].items()]
+        for snapshot in (self.before,self.after):snapshot['schema'].sort(key=lambda row:(row[0],row[1]))
+        self.observed = {'backend':'sqlite','from_schema_version':before_version,
+                         'schema_version':after_version,'status':'upgraded'}
 
     def validate(self, after):
         physical.validate_upgrade(self.before,after,self.observed,self.started,self.started+1,self.profile)
 
     def test_only_declared_version_journal_and_empty_intent_catalog_accept(self):
         self.validate(self.after)
+
+    def test_profile_binds_the_published_3_28_0_tuple(self):
+        self.assertEqual(('3.28.0',12,19),(self.profile['server_version'],self.profile['schema_before'],
+                                           self.profile['schema_after']))
+        self.assertIn('dw_command_intents',self.profile['added_tables'])
+
+    def test_declared_added_columns_must_hold_their_defaults(self):
+        for table,declared in self.profile['added_columns'].items():
+            changed=deepcopy(self.after)
+            changed['tables'][table]['rows'][0][-1]=['text','invented']
+            with self.subTest(table=table), self.assertRaises(AssertionError):self.validate(changed)
+
+    def test_undeclared_column_or_table_definition_change_refuses(self):
+        table=next(iter(self.profile['added_columns']))
+        changed=deepcopy(self.after)
+        [row]=[row for row in changed['schema'] if row[1]==table]
+        row[3]=row[3].replace(', primary key',', extra TEXT, primary key')
+        with self.assertRaises(AssertionError):self.validate(changed)
+        changed=deepcopy(self.after)
+        [row]=[row for row in changed['schema'] if row[1]==table]
+        row[3]=row[3].replace('varchar','text')
+        with self.assertRaises(AssertionError):self.validate(changed)
+        changed=deepcopy(self.after)
+        changed['tables'][table]['columns'].append('extra');changed['tables'][table]['rows'][0].append(['null'])
+        with self.assertRaises(AssertionError):self.validate(changed)
+
+    def test_every_new_table_stays_empty(self):
+        for table in self.profile['added_tables']:
+            changed=deepcopy(self.after);changed['tables'][table]['rows']=[[['text','row']]]
+            with self.subTest(table=table), self.assertRaises(AssertionError):self.validate(changed)
 
     def test_another_well_formed_handoff_sha_refuses_before_input_or_runtime_effects(self):
         self.assertEqual(self.profile,physical.require_handoff(self.profile['producer_contract_commit']))

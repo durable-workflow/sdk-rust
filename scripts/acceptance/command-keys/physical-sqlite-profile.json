@@ -1,4 +1,56 @@
 {
+  "added_columns": {
+    "runtime_external_payloads": [
+      [
+        "storage_binding",
+        "storage_binding TEXT NULL",
+        [
+          "null"
+        ]
+      ]
+    ],
+    "workflow_namespaces": [
+      [
+        "external_payload_storage_generation",
+        "external_payload_storage_generation INTEGER NOT NULL DEFAULT 0",
+        [
+          "integer",
+          0
+        ]
+      ]
+    ],
+    "workflow_schedules": [
+      [
+        "dispatch_summary",
+        "dispatch_summary TEXT NULL",
+        [
+          "null"
+        ]
+      ]
+    ],
+    "workflow_tasks": [
+      [
+        "lost_lease_count",
+        "lost_lease_count INTEGER NOT NULL DEFAULT 0",
+        [
+          "integer",
+          0
+        ]
+      ],
+      [
+        "last_lease_lost_at",
+        "last_lease_lost_at DATETIME",
+        [
+          "null"
+        ]
+      ]
+    ]
+  },
+  "added_tables": [
+    "dw_child_summary_checkpoints",
+    "dw_child_supervisions",
+    "dw_command_intents"
+  ],
   "baseline_index": "sha256:7988a23525d9e50e997a9f6f02e801300ed4f626de3cf6977033657ae7e9f58e",
   "baseline_seed_execution": {
     "backup_sha256": "7d1826f7681342bb3a5974509648e2e8d75e7a21d262f65f3ec1f58727ccbc0c",
@@ -10,21 +62,63 @@
   },
   "baseline_source": "28f084513235f6647e740c4b3d9e3aace7a323b7",
   "baseline_version": "3.8.0",
-  "journal_checksum_sha384": "53b752529a1f7addaefe62ab61160dd42b3990f805cfdc4ecd1b48927a6c2f7ce42526fc04522ac887a37208f343fc73",
-  "journal_description": "full frozen PHP schema, native worker incarnations, session holders, stream reclaim deadlines, service call deadlines, service admission counters and committed external payload deletions and task ready origins and poll expiry indexes and bound run command contracts and task queue activity dispatch pauses and keyed command intents",
-  "new_schema_objects": [
-    "dw_command_intents",
-    "dw_command_intents_namespace",
-    "sqlite_autoindex_dw_command_intents_1"
-  ],
+  "journal_checksum_sha384": "0f713e42aece67791ce98457135e900e7558f4e16f4790c26800f950ab7f808537c8b82867de412b858cbe7861dc48f5",
+  "journal_description": "full frozen PHP schema, native worker incarnations, session holders, stream reclaim deadlines, service call deadlines, service admission counters and committed external payload deletions and task ready origins and poll expiry indexes and bound run command contracts and task queue activity dispatch pauses and keyed command intents and bounded schedule dispatch summaries and immutable external storage bindings and child supervisions across continue-as-new and maintenance scan indexes and workflow task lease loss and child summary checkpoints",
+  "new_schema_objects": {
+    "dw_activity_executions_status": "activity_executions",
+    "dw_child_calls_run_status_sequence": "workflow_child_calls",
+    "dw_child_summary_call_delete": "workflow_child_calls",
+    "dw_child_summary_call_insert": "workflow_child_calls",
+    "dw_child_summary_call_update": "workflow_child_calls",
+    "dw_child_summary_checkpoints": "dw_child_summary_checkpoints",
+    "dw_child_summary_current_delete": "workflow_instances",
+    "dw_child_summary_current_insert": "workflow_instances",
+    "dw_child_summary_current_update": "workflow_instances",
+    "dw_child_summary_failure_delete": "workflow_failures",
+    "dw_child_summary_failure_insert": "workflow_failures",
+    "dw_child_summary_failure_update": "workflow_failures",
+    "dw_child_summary_history_delete": "workflow_history_events",
+    "dw_child_summary_history_insert": "workflow_history_events",
+    "dw_child_summary_history_update": "workflow_history_events",
+    "dw_child_summary_link_delete": "workflow_links",
+    "dw_child_summary_link_insert": "workflow_links",
+    "dw_child_summary_link_update": "workflow_links",
+    "dw_child_summary_run_delete": "workflow_runs",
+    "dw_child_summary_run_insert": "workflow_runs",
+    "dw_child_summary_run_update": "workflow_runs",
+    "dw_child_summary_signal_delete": "workflow_signal_records",
+    "dw_child_summary_signal_insert": "workflow_signal_records",
+    "dw_child_summary_signal_update": "workflow_signal_records",
+    "dw_child_summary_summary_delete": "workflow_run_summaries",
+    "dw_child_summary_summary_insert": "workflow_run_summaries",
+    "dw_child_summary_summary_update": "workflow_run_summaries",
+    "dw_child_summary_task_delete": "workflow_tasks",
+    "dw_child_summary_task_insert": "workflow_tasks",
+    "dw_child_summary_task_update": "workflow_tasks",
+    "dw_child_summary_wait_delete": "workflow_run_waits",
+    "dw_child_summary_wait_insert": "workflow_run_waits",
+    "dw_child_summary_wait_update": "workflow_run_waits",
+    "dw_child_supervisions": "dw_child_supervisions",
+    "dw_child_supervisions_child": "dw_child_supervisions",
+    "dw_child_supervisions_link": "dw_child_supervisions",
+    "dw_child_supervisions_namespace": "dw_child_supervisions",
+    "dw_child_supervisions_run_link": "dw_child_supervisions",
+    "dw_command_intents": "dw_command_intents",
+    "dw_command_intents_namespace": "dw_command_intents",
+    "dw_workflow_run_summaries_retention": "workflow_run_summaries",
+    "dw_workflow_runs_status_deadline": "workflow_runs",
+    "sqlite_autoindex_dw_child_summary_checkpoints_1": "dw_child_summary_checkpoints",
+    "sqlite_autoindex_dw_child_supervisions_1": "dw_child_supervisions",
+    "sqlite_autoindex_dw_command_intents_1": "dw_command_intents"
+  },
   "producer_contract_commit": "a09f156399416216d2f097c257a2164f83c7eda7",
   "producer_manifest_sha256": "ceb4695643e48c7bfe3f81eea380c6ab9aa0b973da830cb552d070344047319f",
   "schema": "durable-workflow.physical-sqlite-upgrade-profile.v1",
-  "schema_after": 13,
+  "schema_after": 19,
   "schema_before": 12,
-  "server_index": "sha256:8ffcdb2a36af3129a1987849aafe8715fe0d3bf9a9648467f0b5cb8eeef43ba9",
-  "server_source": "5614274d2629d03f92932a07dfee0fb10349ddd9",
-  "server_version": "3.9.2",
+  "server_index": "sha256:43242a89f4c376007c1e2114f7df100a92b6b1fd1f9d19b3317d1bbe21a83f80",
+  "server_source": "f86a2b0a27948df705b6d2bbb3f07d6278c89724",
+  "server_version": "3.28.0",
   "source_inputs": {
     "rust/migrations/sqlite/0003_full_schema.sql": {
       "git_blob": "3e58585408652a8e0622db183915f04e62349551",
@@ -70,9 +164,33 @@
       "git_blob": "295c7f89e281fd9a8275a4100d525d566687145b",
       "sha256": "fc3ad1730682c09704027dcbabc17cd6ded9c642a3ff20d7988d5f4b4a5726fd"
     },
+    "rust/migrations/sqlite/0014_schedule_dispatch_summary.sql": {
+      "git_blob": "09f93bdb9284d5489f7066c304fa9fd2eb837793",
+      "sha256": "fca1191ebbb5f5d363881541204e0d076857828859b7a79e7b79543344c6f333"
+    },
+    "rust/migrations/sqlite/0015_external_storage_bindings.sql": {
+      "git_blob": "8bc43cacfbec5a1f7d5fc9766c9b536e170d4028",
+      "sha256": "432380a4fa7f0597104c4fa22c9177d932b03a619fb4ffbf9e4fa944089d2745"
+    },
+    "rust/migrations/sqlite/0016_child_supervisions.sql": {
+      "git_blob": "07f07158e099e78d776878cfe064facf2e556063",
+      "sha256": "3887bae5e95d471413bf317fe9e4504c0619c4bd3e45dc5c8e09878a7c957552"
+    },
+    "rust/migrations/sqlite/0017_maintenance_scan_indexes.sql": {
+      "git_blob": "966e3b93a6c90c317fb704a69c8f0b3255008c11",
+      "sha256": "a98f9780b76d4fe0a17d9acf12df18962e2a5f922b62487a84f8006dc5bd61b8"
+    },
+    "rust/migrations/sqlite/0018_workflow_task_lease_loss.sql": {
+      "git_blob": "44b256c56abfad3b96ee3a947d7a8d3227ece449",
+      "sha256": "48d0f61a33c3b12015d0ca8d23ff98617d7e72f69837330b870425afb15af138"
+    },
+    "rust/migrations/sqlite/0019_child_summary_checkpoints.sql": {
+      "git_blob": "8ff5484d8c7033184912a21ef5d564635e3e2f51",
+      "sha256": "fcdce47f3db93f25303459a2102f14abbeb59a27503f5ddfbbb26d1f17a6d6cf"
+    },
     "rust/src/runtime/schema.rs": {
-      "git_blob": "78f4fc9f804f9c8b5130846db9cc9164c85179aa",
-      "sha256": "1575bb959f0abf3092da1c369bcd5ac8f13f621706f1f640da1d8e7cf2ddadd2"
+      "git_blob": "154338602ba418a385905ffb07cbbd21479a2a10",
+      "sha256": "0db03eb8b8bc54637a1c45ff72e2ac2ff6da0f5b02de863be6ec517d839d2a69"
     }
   }
 }

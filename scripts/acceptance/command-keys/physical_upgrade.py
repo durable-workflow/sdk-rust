@@ -14,7 +14,7 @@ import sqlite_legacy
 
 
 PROFILE = Path(__file__).with_name('physical-sqlite-profile.json')
-PROFILE_SHA256 = '8f9c4695b814a6c3f923885e51d1900506906138b7e0d27dc87b8df592a36e9e'
+PROFILE_SHA256 = '650f94305e9638dd164d853680f9ce5c3b8e5219dd5c12351652a99e29e194cd'
 
 
 def profile():
@@ -102,12 +102,31 @@ def copy_backup(raw, destination):
         output.write(raw)
 
 
+def _without_added_columns(table, before_sql, after_sql, value, declared):
+    """Strip one table's declared appended columns after checking their defaults."""
+    names = [name for name, _, _ in declared]
+    assert value['columns'][-len(names):] == names, (table, value['columns'])
+    for _, definition, _ in declared:
+        assert after_sql.count(', '+definition) == 1, (table, definition)
+        after_sql = after_sql.replace(', '+definition, '', 1)
+    assert after_sql == before_sql, 'physical upgrade altered undeclared columns of '+table
+    defaults = [default for _, _, default in declared]
+    for row in value['rows']:
+        assert row[-len(names):] == defaults, (table, row)
+    return {'columns':value['columns'][:-len(names)],
+            'rows':sorted((row[:-len(names)] for row in value['rows']), key=sqlite_legacy._json)}
+
+
 def validate_upgrade(before, after, observed, started, finished, selected):
     assert observed == {'backend':'sqlite','from_schema_version':selected['schema_before'],
                         'schema_version':selected['schema_after'],'status':'upgraded'}, observed
-    assert set(after['tables']) == set(before['tables']) | {'dw_command_intents'}
-    assert not after['tables']['dw_command_intents']['rows']
+    added_tables = set(selected['added_tables'])
+    assert not added_tables & set(before['tables'])
+    assert set(after['tables']) == set(before['tables']) | added_tables
+    for table in added_tables:
+        assert not after['tables'][table]['rows'], table
     expected = deepcopy(before)
+    expected['schema'] = [list(row) for row in before['schema']]
     version = expected['tables']['dw_server_schema']['columns'].index('version')
     assert len(expected['tables']['dw_server_schema']['rows']) == 1
     assert expected['tables']['dw_server_schema']['rows'][0][version] == ['integer',selected['schema_before']]
@@ -125,11 +144,26 @@ def validate_upgrade(before, after, observed, started, finished, selected):
     assert started - 1 <= installed <= finished + 1
     expected['tables']['_sqlx_migrations'] = journal
     projected = deepcopy(after)
-    del projected['tables']['dw_command_intents']
-    added = [row for row in projected['schema'] if row not in before['schema']]
-    assert {row[1] for row in added} == set(selected['new_schema_objects'])
-    assert all(row[2] == 'dw_command_intents' for row in added)
-    projected['schema'] = [row for row in projected['schema'] if row in before['schema']]
+    projected['schema'] = [list(row) for row in after['schema']]
+    for table in added_tables:
+        del projected['tables'][table]
+    declared_objects = selected['new_schema_objects']
+    original = expected['schema']
+    added = [row for row in projected['schema'] if row not in original]
+    altered = selected['added_columns']
+    before_sql = {row[1]:row[3] for row in original if row[0] == 'table'}
+    for row in added:
+        if row[0] == 'table' and row[1] in altered and [row[0],row[1],row[2],before_sql.get(row[1])] in original:
+            continue  # An ALTER TABLE ... ADD COLUMN rewrites the stored CREATE statement.
+        assert declared_objects.get(row[1]) == row[2], ('undeclared schema object', row[:3])
+    assert {row[1] for row in added if row[1] not in altered} == set(declared_objects)
+    for table, declared in altered.items():
+        [after_row] = [row for row in projected['schema'] if row[0] == 'table' and row[1] == table]
+        projected['tables'][table] = _without_added_columns(
+            table, before_sql[table], after_row[3], projected['tables'][table], declared)
+    projected['schema'] = [row for row in projected['schema'] if row in original] + [
+        [row[0],row[1],row[2],before_sql[row[1]]] for row in added if row[1] in altered]
+    projected['schema'].sort(key=lambda row:(row[0],row[1]))
     assert projected == expected, 'physical upgrade altered undeclared business rows/catalog'
 
 
