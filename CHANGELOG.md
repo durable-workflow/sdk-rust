@@ -8,13 +8,14 @@
   redrive successor's original start. The value is pinned to the run's stored
   rows, so every replay reads the same instant. A task without a valid carrier,
   or whose carrier names another run or disagrees with the history's start kind,
-  keeps entry unavailable as before. A replayed-instance query rebuilds the body
-  with its own query task's `replay_clock` attestation: the v1 object is used as
+  keeps entry unavailable as before. A replayed-instance query or replayed update
+  validator rebuilds the body with its own task's `replay_clock` attestation: the v1 object is used as
   on a workflow task, and an explicit `null` or a refused object keeps entry
   unavailable. When the
   query task omits the key (a Server before #1338) and the rebuilt body reads
   `replay_now()` at entry, the query fails with
-  `query_workflow_state_unavailable`, even if the body tolerated the
+  `query_workflow_state_unavailable` (a validation task reports a worker
+  failure), even if the body tolerated the
   unavailable result. `WorkflowHistory::replay_clock(carrier)` validates and
   supplies the carrier to offline replay. Update handler reads and the
   cancellation clock are unchanged.
@@ -45,11 +46,27 @@
   queue, namespace and task identity; workflow-task contexts also expose
   replay state. Workflow-task interceptors see a read-only view of the
   commands: the worker always submits the commands the workflow produced and
-  reports its own failure. An interceptor error after a successful task, or
+  reports its own failure, which interceptors see as a read-only
+  `WorkflowTaskFailure` (kind, message and debug text). An interceptor error after a successful task, or
   skipping `next`, fails the workflow task without recording anything.
   Activity interceptors may transform arguments and results. Built-in
   execution telemetry stays outermost. See `examples/audit_interceptor.rs`.
   ([Durable Workflow #226](https://github.com/durable-workflow/.github/issues/226))
+
+- Workers can register update validators with
+  `Worker::register_update_validator` (or the Avro and replayed-state
+  variants). The Server runs a validator before accepting the update; an
+  `UpdateRejection` rejects it with reason `update_validator_rejected`, so the
+  handler never runs and no acceptance is recorded. Validators are read-only:
+  one that adds a workflow command is refused. A worker with validators
+  advertises `update_validators` and `update_validation_tasks`, refuses a
+  Server without synchronous update validation, and leases validation tasks
+  through its multiplexed workflow poll, recorded as worker task metrics with
+  `task_kind` `update_validation`. Inside the worker a refusal is
+  `Error::UpdateRejection`. `Error::update_validator_rejection()`
+  and `Error::is_update_validation_failed()` tell a rejection from a failed
+  update. Low-level registration now accepts a list of validator names.
+  ([Durable Workflow #234](https://github.com/durable-workflow/.github/issues/234))
 
 ## 4.24.0
 

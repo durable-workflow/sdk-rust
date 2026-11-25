@@ -711,7 +711,7 @@ impl WorkflowContext {
     /// explicit redrive start anchor proved from history. Step times come
     /// from history; only the entry value comes from the task's carrier.
     ///
-    /// A replayed-instance query rebuilds the body with its own task's
+    /// A replayed-instance query or update validator rebuilds the body with its own task's
     /// `replay_clock` attestation. When the query task omits that key (a
     /// Server before #1338) and the body reads this clock at entry, the
     /// query fails with `query_workflow_state_unavailable`, even if the body

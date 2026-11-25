@@ -1,4 +1,5 @@
 use super::*;
+use crate::interceptors::CoreProgress;
 use std::collections::BTreeSet;
 
 const CONTROL_BUDGET: Duration = Duration::from_secs(5);
@@ -2105,15 +2106,22 @@ impl Worker {
         // an application failure or be published as a workflow-task decision.
         let context = self.workflow_task_interceptor_context(&claim.task);
         let decision = match self
-            .intercept_workflow_task(context, self.replay_cooperative_workflow_claim(&claim))
+            .intercept_workflow_task_tracked(
+                context,
+                self.replay_cooperative_workflow_claim(&claim),
+            )
             .await
         {
-            Ok(Some(decision)) => Ok(decision),
-            Ok(None) => return Ok(ManagedPollOutcome::Handled),
-            // An interceptor failure after a successful replay fails only this
-            // workflow task; nothing is recorded.
-            Err(error @ Error::WorkflowTaskInterceptor(_)) => Err(error),
-            Err(error) => return Err(error),
+            (Ok(Some(decision)), _) => Ok(decision),
+            (Ok(None), _) => return Ok(ManagedPollOutcome::Handled),
+            // An interceptor failure after a completed replay, or before the
+            // replay began, fails only this workflow task; nothing is recorded.
+            // A replay dropped partway through a delivery stays uncertain.
+            (
+                Err(error @ Error::WorkflowTaskInterceptor(_)),
+                CoreProgress::Completed | CoreProgress::NotStarted,
+            ) => Err(error),
+            (Err(error), _) => return Err(error),
         };
         let (owner, _) = cancellation_claim(&claim.task)?;
         let task_outcome = crate::metrics::workflow_task_outcome(decision.as_ref().ok());

@@ -569,3 +569,67 @@ async fn an_empty_group_keeps_the_entry_clock_and_its_attestation_rule() {
     assert_eq!(query(Some(Value::Null)).await.unwrap(), json!("none"));
     assert_eq!(query(Some(clock)).await.unwrap(), json!(ENTRY));
 }
+
+#[tokio::test]
+async fn update_validation_rebuild_follows_the_validation_tasks_attestation() {
+    use crate::update_validation::{UPDATE_VALIDATION_WORKER_FAILED, UPDATE_VALIDATOR_REJECTED};
+    let mut worker = Worker::new(Client::new("http://127.0.0.1:9").unwrap(), "clock-tests");
+    worker.register_replayed_workflow("clock", String::new, |ctx, _args, state| async move {
+        let entry = ctx.replay_now().map_or_else(
+            |_| "none".to_string(),
+            |time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        );
+        state.update(|value| *value = entry)?;
+        ctx.sleep(Duration::from_secs(3600)).await?;
+        Ok(Value::Null)
+    });
+    worker.register_update("clock", "inspect", |_ctx, args| async move { Ok(args) });
+    // The validator reports the state the rebuilt body computed.
+    worker.register_replayed_update_validator(
+        "clock",
+        "inspect",
+        |_ctx, entry: Arc<String>, _args| {
+            Err(crate::UpdateRejection::new(format!("entry {entry}")))
+        },
+    );
+    let task = |clock: Option<Value>| {
+        let mut task = json!({
+            "task_kind":"update_validation","update_validation_task_id":"v1","update_id":"v1",
+            "update_validation_attempt":1,"workflow_id":"entry-workflow","run_id":RUN,
+            "workflow_type":"clock","update_name":"inspect",
+            "update_arguments":encode_typed_envelope(&AvroValue::from_serialize(&json!([])).unwrap(), DEFAULT_CODEC).unwrap(),
+            "payload_codec":DEFAULT_CODEC,"run_status":"running",
+            "history_events":[{"sequence":1,"event_type":"WorkflowStarted","payload":{"workflow_run_id":RUN},"recorded_at":"2026-03-04T05:06:09Z"}],
+        });
+        if let Some(clock) = clock {
+            task["replay_clock"] = clock;
+        }
+        task
+    };
+    let (reason, rejection) = worker
+        .decide_update_validation(task(None))
+        .await
+        .unwrap_err();
+    assert_eq!(reason, UPDATE_VALIDATION_WORKER_FAILED);
+    assert!(
+        rejection.message.contains("does not attest"),
+        "{}",
+        rejection.message
+    );
+    let (reason, rejection) = worker
+        .decide_update_validation(task(Some(Value::Null)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (reason, rejection.message.as_str()),
+        (UPDATE_VALIDATOR_REJECTED, "entry none")
+    );
+    let (reason, rejection) = worker
+        .decide_update_validation(task(Some(carrier("run_started_at", ENTRY))))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (reason, rejection.message),
+        (UPDATE_VALIDATOR_REJECTED, format!("entry {ENTRY}"))
+    );
+}

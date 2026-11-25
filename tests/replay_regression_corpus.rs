@@ -33,6 +33,9 @@ mod redrive_successor_strictness;
 #[path = "replay_regression_corpus/workflow_logging.rs"]
 mod workflow_logging;
 
+#[path = "replay_regression_corpus/update_validation.rs"]
+mod update_validation;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TypedReplayContract {
     message: String,
@@ -211,6 +214,9 @@ fn handle_request(
         && task.get(HISTORY_LIMIT_REFUSAL).is_some();
     let body = match path.as_str() {
         _ if history_limit_refused => task[HISTORY_LIMIT_REFUSAL].to_string(),
+        "/api/cluster/info" if update_validation::validation_task(task) => {
+            update_validation::capable_cluster_info()
+        }
         "/api/cluster/info" => json!({"limits": {"max_payload_bytes": 2097152}}).to_string(),
         _ if storage_refused => json!({
             "reason": "storage_pressure",
@@ -293,6 +299,13 @@ fn handle_request(
             reply.to_string()
         }
         path if path.starts_with("/api/worker/query-tasks/") && (path.ends_with("/complete") || path.ends_with("/fail")) => json!({"recorded":true}).to_string(),
+        path if path.starts_with("/api/worker/update-validation-tasks/")
+            && (path.ends_with("/approve") || path.ends_with("/reject")) =>
+        {
+            json!({"update_validation_task_id": task["update_validation_task_id"],
+                "update_validation_attempt": task["update_validation_attempt"], "status": 200})
+            .to_string()
+        }
         path if path.starts_with("/api/worker/workflow-tasks/")
             && (path.ends_with("/complete") || path.ends_with("/fail")) =>
         {
@@ -503,6 +516,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     }
     if workflow_type == "corpus.history-limit-refusal" {
         return execute_history_limit_refusal_fixture(fixture).await;
+    }
+    if workflow_type == update_validation::WORKFLOW_TYPE {
+        return update_validation::execute(fixture).await;
     }
     if !matches!(
         workflow_type,

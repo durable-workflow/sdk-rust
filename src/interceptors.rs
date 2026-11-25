@@ -41,7 +41,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -274,6 +274,12 @@ pub struct WorkflowTaskOutcome {
 impl WorkflowTaskOutcome {
     /// The commands the worker will submit, in order. Empty when the lease
     /// was lost or the task only waits for more history.
+    ///
+    /// This is the view before built-in
+    /// [`ExecutionTelemetry`](crate::telemetry::ExecutionTelemetry) stamps its
+    /// observability fields: with telemetry enabled, the submitted commands
+    /// also carry those fields. Their order and content are otherwise the
+    /// same.
     pub fn commands(&self) -> &[Value] {
         self.commands.as_deref().map_or(&[], Vec::as_slice)
     }
@@ -284,29 +290,60 @@ impl WorkflowTaskOutcome {
     }
 }
 
-/// The workflow-task core's own error, as seen by interceptors.
+/// A read-only description of the workflow-task core's own error.
 ///
-/// [`WorkflowTaskNext::run`] returns it as [`Error::WorkflowTaskFailed`]. The
-/// worker reports the original error whatever an interceptor returns.
+/// [`WorkflowTaskNext::run`] returns it as [`Error::WorkflowTaskFailed`]. It
+/// does not own the error: the worker keeps the original and reports it
+/// whatever an interceptor returns or retains.
 #[derive(Clone)]
-pub struct WorkflowTaskFailure(Arc<Error>);
+pub struct WorkflowTaskFailure(Arc<FailureView>);
+
+struct FailureView {
+    kind: String,
+    message: String,
+    debug: String,
+}
 
 impl WorkflowTaskFailure {
-    /// The core's error.
-    pub fn error(&self) -> &Error {
-        &self.0
+    fn describe(error: &Error) -> Self {
+        let debug = format!("{error:?}");
+        let kind = debug
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        Self(Arc::new(FailureView {
+            kind,
+            message: error.to_string(),
+            debug,
+        }))
+    }
+
+    /// The [`Error`](enum@crate::Error) variant name, such as `"WorkflowNotRegistered"`.
+    pub fn kind(&self) -> &str {
+        &self.0.kind
+    }
+
+    /// The error's display text.
+    pub fn message(&self) -> &str {
+        &self.0.message
+    }
+
+    /// The error's debug text.
+    pub fn debug(&self) -> &str {
+        &self.0.debug
     }
 }
 
 impl fmt::Debug for WorkflowTaskFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&*self.0, f)
+        f.write_str(&self.0.debug)
     }
 }
 
 impl fmt::Display for WorkflowTaskFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&*self.0, f)
+        f.write_str(&self.0.message)
     }
 }
 
@@ -320,12 +357,24 @@ enum CoreRecord {
         commands: Arc<Vec<Value>>,
     },
     LeaseLost,
-    Failed(Arc<Error>),
+    Failed(Error),
 }
 
 struct WorkflowCore<'a> {
     future: InterceptorFuture<'a, WorkflowCoreResult>,
     record: &'a Mutex<Option<CoreRecord>>,
+    started: &'a AtomicBool,
+}
+
+/// How far the workflow-task core got inside the interceptor chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreProgress {
+    /// The core never began; nothing it does happened.
+    NotStarted,
+    /// The core began but an interceptor dropped it before it finished.
+    Abandoned,
+    /// The core finished and its result was recorded.
+    Completed,
 }
 
 /// Continues a workflow-task chain; the innermost `next` runs the task.
@@ -352,8 +401,13 @@ impl<'a> WorkflowTaskNext<'a> {
                 .interceptor
                 .execute_workflow_task(next.context, next);
         }
-        let WorkflowCore { future, record } = self.core;
+        let WorkflowCore {
+            future,
+            record,
+            started,
+        } = self.core;
         Box::pin(async move {
+            started.store(true, Ordering::SeqCst);
             let (stored, outcome) = match future.await {
                 Ok(Some(mut decision)) => {
                     let commands = Arc::new(std::mem::take(&mut decision.commands));
@@ -367,10 +421,10 @@ impl<'a> WorkflowTaskNext<'a> {
                     Ok(WorkflowTaskOutcome { commands: None }),
                 ),
                 Err(error) => {
-                    let error = Arc::new(error);
+                    let failure = WorkflowTaskFailure::describe(&error);
                     (
-                        CoreRecord::Failed(error.clone()),
-                        Err(Error::WorkflowTaskFailed(WorkflowTaskFailure(error))),
+                        CoreRecord::Failed(error),
+                        Err(Error::WorkflowTaskFailed(failure)),
                     )
                 }
             };
@@ -422,11 +476,24 @@ impl Worker {
     where
         F: Future<Output = WorkflowCoreResult> + Send,
     {
+        self.intercept_workflow_task_tracked(context, core).await.0
+    }
+
+    /// [`Self::intercept_workflow_task`], also reporting how far the core got.
+    pub(crate) async fn intercept_workflow_task_tracked<F>(
+        &self,
+        context: Option<WorkflowTaskInterceptorContext>,
+        core: F,
+    ) -> (WorkflowCoreResult, CoreProgress)
+    where
+        F: Future<Output = WorkflowCoreResult> + Send,
+    {
         let Some(context) = context else {
-            return core.await;
+            return (core.await, CoreProgress::Completed);
         };
         let record = Mutex::new(None);
         let reached = AtomicUsize::new(0);
+        let started = AtomicBool::new(false);
         let chain = WorkflowTaskNext {
             chain: &self.interceptors,
             index: 0,
@@ -435,32 +502,50 @@ impl Worker {
             core: WorkflowCore {
                 future: Box::pin(core),
                 record: &record,
+                started: &started,
             },
         }
         .run()
         .await
         .map(drop);
-        let record = record.into_inner().ok().flatten();
-        match record {
-            None => {
-                let skipped = reached
-                    .load(Ordering::SeqCst)
-                    .min(self.interceptors.len() - 1);
-                Err(Error::WorkflowTaskInterceptor(format!(
+        let Some(record) = record.into_inner().ok().flatten() else {
+            let error = match &chain {
+                Ok(()) => String::new(),
+                Err(error) => format!(": {error}"),
+            };
+            if started.load(Ordering::SeqCst) {
+                return (
+                    Err(Error::WorkflowTaskInterceptor(format!(
+                        "a workflow task interceptor dropped the workflow task before it completed{error}"
+                    ))),
+                    CoreProgress::Abandoned,
+                );
+            }
+            let skipped = &self.interceptors[reached
+                .load(Ordering::SeqCst)
+                .min(self.interceptors.len() - 1)];
+            let message = match chain {
+                Ok(()) => format!(
                     "workflow task interceptor {} returned without calling next",
-                    self.interceptors[skipped].name
-                )))
-            }
-            Some(CoreRecord::Failed(error)) => {
-                drop(chain);
-                Err(Arc::try_unwrap(error)
-                    .unwrap_or_else(|retained| Error::WorkerLoop(retained.to_string())))
-            }
-            Some(CoreRecord::LeaseLost) => Ok(None),
-            Some(CoreRecord::Completed {
+                    skipped.name
+                ),
+                Err(_) => format!(
+                    "workflow task interceptor {} failed without calling next{error}",
+                    skipped.name
+                ),
+            };
+            return (
+                Err(Error::WorkflowTaskInterceptor(message)),
+                CoreProgress::NotStarted,
+            );
+        };
+        let result = match record {
+            CoreRecord::Failed(error) => Err(error),
+            CoreRecord::LeaseLost => Ok(None),
+            CoreRecord::Completed {
                 mut decision,
                 commands,
-            }) => match chain {
+            } => match chain {
                 Ok(()) => {
                     decision.commands =
                         Arc::try_unwrap(commands).unwrap_or_else(|retained| (*retained).clone());
@@ -470,7 +555,8 @@ impl Worker {
                     "workflow task interceptor failed: {error}"
                 ))),
             },
-        }
+        };
+        (result, CoreProgress::Completed)
     }
 }
 
