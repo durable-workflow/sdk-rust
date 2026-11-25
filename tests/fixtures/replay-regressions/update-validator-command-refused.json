@@ -1,0 +1,72 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-update-validator-command-refused",
+  "protocol_version": "1.13",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.update-validation",
+    "input": [
+      5
+    ],
+    "payload_codec": "avro"
+  },
+  "worker_task": {
+    "task_kind": "update_validation",
+    "update_validation_task_id": "validation-command",
+    "update_id": "validation-command",
+    "update_validation_attempt": 1,
+    "lease_owner": "regression-corpus-worker",
+    "task_queue": "regression-corpus-queue",
+    "workflow_id": "validated-workflow",
+    "run_id": "validated-run",
+    "update_name": "approve-with-memo",
+    "update_input": [
+      1
+    ],
+    "payload_codec": "avro",
+    "run_status": "waiting"
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "payload": {}
+    },
+    {
+      "sequence": 2,
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "timer-1",
+        "delay_seconds": 3600
+      }
+    }
+  ],
+  "expected": {
+    "poll_task_kinds": [
+      [
+        "workflow",
+        "update_validation"
+      ]
+    ],
+    "validation_completions": [
+      {
+        "outcome": "reject",
+        "body": {
+          "lease_owner": "regression-corpus-worker",
+          "update_validation_attempt": 1,
+          "failure": {
+            "message": "update validators are read-only: the validator tried to schedule durable workflow work",
+            "reason": "update_validator_rejected",
+            "type": "UpdateValidatorCommandRefused"
+          }
+        }
+      }
+    ],
+    "workflow_task_reports": 0,
+    "handler_invocations": 0
+  }
+}
