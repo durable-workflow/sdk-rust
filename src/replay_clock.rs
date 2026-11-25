@@ -181,26 +181,36 @@ fn present(value: Option<&Value>) -> bool {
 }
 
 /// How a query or update-validation task attests the run's entry instant.
-/// Server #1338 always sends the `replay_clock` key on those tasks: the v1
-/// object when the start is provable, explicit `null` when it is not. An
-/// older Server omits the key, so the entry its workflow tasks carried is
-/// unknown to the rebuild.
+/// Server #1338 (in the next Server release) always sends the `replay_clock`
+/// key on those tasks: the v1 object when the start is provable, explicit
+/// `null` when it is not. An older Server omits the key, so the entry its
+/// workflow tasks carried is unknown to the rebuild.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Attestation {
     /// No key: the rebuild cannot know the entry its workflow tasks had.
     Unattested,
-    /// Explicit `null`, or an object this SDK refuses (as it refused the
-    /// same object on the run's workflow tasks): no entry was carried.
+    /// Explicit `null`, or an object this SDK refuses for its own shape,
+    /// schema, time or source (as it refused the same object on the run's
+    /// workflow tasks): no entry was carried.
     Unprovable,
     Entry(Entry),
 }
 
 pub(super) fn attestation(task: &Value) -> Attestation {
-    match task.get("replay_clock") {
-        None => Attestation::Unattested,
-        Some(Value::Null) => Attestation::Unprovable,
-        Some(_) => entry(task).map_or(Attestation::Unprovable, Attestation::Entry),
+    let carrier = match task.get("replay_clock") {
+        None => return Attestation::Unattested,
+        Some(Value::Null) => return Attestation::Unprovable,
+        Some(carrier) => carrier,
+    };
+    // Judge the object by itself first, against the run it names. Only a
+    // refusal that depends on the object alone matches the workflow task.
+    let named = carrier.get("workflow_run_id").and_then(Value::as_str);
+    if entry_for(Some(carrier), named).is_none() {
+        return Attestation::Unprovable;
     }
+    // A missing or different task run depends on this task, not the object:
+    // the run's workflow tasks may have accepted it, so fail closed.
+    entry(task).map_or(Attestation::Unattested, Attestation::Entry)
 }
 
 /// Whether this history declares a redrive start, whether or not it is proved.

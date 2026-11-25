@@ -699,8 +699,9 @@ impl Worker {
             ));
         };
         let (workflow_type, update_name) = (workflow_type.to_string(), update_name.to_string());
-        // Server #1338 attests the run's entry instant on validation tasks, as
-        // on query tasks; the rebuilt body follows the same rule.
+        // Server #1338 (in the next Server release) attests the run's entry
+        // instant on validation tasks, as on query tasks; the rebuilt body
+        // follows the same rule.
         let replay_entry = crate::replay_clock::attestation(&task);
         let mut envelope = json!({"task": task});
         self.client

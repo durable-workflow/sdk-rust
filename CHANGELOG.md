@@ -37,6 +37,12 @@
   code branches on that error at entry (for example with `.ok()` or
   `unwrap_or`) now takes the other branch on replay once its tasks carry the
   instant. Put such a change behind workflow versioning before upgrading.
+  Until Server #1338 (in the next Server release) sends `replay_clock` on
+  query and update-validation tasks, a query or validation of a workflow that
+  tolerates the unavailable result at entry now fails where it used to answer,
+  against every current Server release and against PHP Servers that send no
+  carrier. The public `execute_query_task`, which has no wire task, counts as
+  key-absent in the same way.
 
 - Workers with cooperative cancellation enabled advertise the
   `timeout_cleanup` capability, version 1. A native Server can then admit
