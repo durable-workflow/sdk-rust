@@ -64,7 +64,10 @@ shapes, and case-only keys. Run it as uid 1000 (the Server image user) with
 `.github/workflows/published-command-keys.yml` runs it on a hosted runner.
 
 The physical 3.8 upgrade cell (`--physical-*`) is not part of it: it needs the
-producer's frozen backup and seed receipts.
+producer's frozen backup and seed receipts. `physical-sqlite-profile.json` pins
+it to published native 3.28.0 (schema 12 to 19). The profile lists every table,
+index, trigger and defaulted column that upgrade adds; anything else that
+changes in the original rows or catalog fails the cell.
 
 Passing the direct test alone does not complete #216 or prove exactly-once
 activity side effects.
