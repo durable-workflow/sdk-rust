@@ -535,9 +535,13 @@ pub enum Error {
     /// receives it from `next`. The worker reports the original error.
     #[error("{0}")]
     WorkflowTaskFailed(WorkflowTaskFailure),
-    /// A workflow-task interceptor failed after the core succeeded, or
-    /// returned without running `next`. The worker fails the workflow task;
-    /// nothing is recorded and the Server retries it.
+    /// A workflow-task interceptor broke the chain: it failed after the core
+    /// succeeded, returned or failed without running `next` (a `next.run()`
+    /// future that is never polled has not run), or dropped the core partway.
+    /// The worker fails the workflow task; nothing is recorded and the Server
+    /// retries it. On the cooperative-cancellation poller a core dropped
+    /// partway is not settled: the poll returns this error and the task's
+    /// lease expires.
     #[error("{0}")]
     WorkflowTaskInterceptor(String),
     #[error(transparent)]
