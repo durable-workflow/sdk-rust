@@ -791,18 +791,18 @@ struct RecordedWaits;
 
 impl RecordedWaits {
     fn start() -> Self {
-        crate::retry_after::RECORDED.with(|waits| *waits.borrow_mut() = Some(Vec::new()));
+        crate::server_retry_after::RECORDED.with(|waits| *waits.borrow_mut() = Some(Vec::new()));
         Self
     }
 
     fn waits(&self) -> Vec<Duration> {
-        crate::retry_after::RECORDED.with(|waits| waits.borrow().clone().unwrap_or_default())
+        crate::server_retry_after::RECORDED.with(|waits| waits.borrow().clone().unwrap_or_default())
     }
 }
 
 impl Drop for RecordedWaits {
     fn drop(&mut self) {
-        crate::retry_after::RECORDED.with(|waits| *waits.borrow_mut() = None);
+        crate::server_retry_after::RECORDED.with(|waits| *waits.borrow_mut() = None);
     }
 }
 

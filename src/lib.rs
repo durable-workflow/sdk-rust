@@ -22,11 +22,11 @@ pub mod pagination;
 mod query_authority;
 mod raw_request;
 mod replay_clock;
-mod retry_after;
 mod run_activities;
 mod runtime_payloads;
 mod runtime_uploads;
 mod server_capabilities_digest;
+mod server_retry_after;
 mod signal_with_start;
 mod sticky_worker;
 mod sticky_workflow_cache;
@@ -3585,7 +3585,7 @@ pub struct Client {
     /// shared by this Client's clones.
     capabilities_digest: server_capabilities_digest::Digest,
     /// The Server's newest `Retry-After` advice, shared by this Client's clones.
-    retry_after: Arc<retry_after::Advice>,
+    retry_after: Arc<server_retry_after::Advice>,
     #[cfg(feature = "telemetry")]
     execution_telemetry: Option<telemetry::ExecutionTelemetry>,
     #[cfg(feature = "telemetry")]
@@ -3683,7 +3683,7 @@ impl Client {
                 "cluster info unavailable; retrying"
             );
             tokio::select! {
-                _ = retry_after::sleep(delay) => {}
+                _ = server_retry_after::sleep(delay) => {}
                 _ = wait_for_worker_stop(&admission.stop) => return Err(error),
             }
         }
@@ -6216,7 +6216,7 @@ impl Client {
             "transient failure reporting a workflow task; resending the same report"
         );
         tokio::select! {
-            _ = retry_after::sleep(delay) => !admission.stop.load(Ordering::SeqCst),
+            _ = server_retry_after::sleep(delay) => !admission.stop.load(Ordering::SeqCst),
             _ = wait_for_worker_stop(&admission.stop) => false,
         }
     }
@@ -10949,11 +10949,11 @@ impl Worker {
             match &self.run_stop {
                 Some(stop) => {
                     tokio::select! {
-                        _ = retry_after::sleep(delay) => {}
+                        _ = server_retry_after::sleep(delay) => {}
                         _ = wait_for_worker_stop(stop) => return Err(error),
                     }
                 }
-                None => retry_after::sleep(delay).await,
+                None => server_retry_after::sleep(delay).await,
             }
         }
     }
@@ -11265,7 +11265,7 @@ impl Worker {
             "transient Server failure; the worker keeps running"
         );
         tokio::select! {
-            _ = retry_after::sleep(delay) => true,
+            _ = server_retry_after::sleep(delay) => true,
             _ = wait_for_worker_stop(stop) => false,
         }
     }
@@ -11318,11 +11318,11 @@ impl Worker {
                         .honor(worker_poll_retry_delay(self.retry_policy, retries));
                     if let Some(stop) = &self.run_stop {
                         tokio::select! {
-                            _ = retry_after::sleep(delay) => {}
+                            _ = server_retry_after::sleep(delay) => {}
                             _ = wait_for_worker_stop(stop) => return Ok(None),
                         }
                     } else {
-                        retry_after::sleep(delay).await;
+                        server_retry_after::sleep(delay).await;
                     }
                 }
                 result => return result.map(Some),
