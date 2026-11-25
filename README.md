@@ -712,6 +712,116 @@ queue, so they do not stall the worker. Unwinding subscriber panics are isolated
 from the workflow result; aborting processes and blocking handlers remain the
 application's responsibility.
 
+## Worker interceptors
+
+Interceptors add cross-cutting behaviour, such as audit logging, metric tags
+or tenant context, once for every task a worker runs. Implement
+`WorkerInterceptor` and register it with `Worker::interceptor` (or several with
+`Worker::interceptors`). Every hook defaults to passing the call on, so
+implement only the hooks you need; `PassthroughWorkerInterceptor` is a no-op
+interceptor.
+
+| Hook | Runs around | Context | `next` |
+| --- | --- | --- | --- |
+| `execute_workflow_task` | one workflow task, including replay | `WorkflowTaskInterceptorContext` | `next.run()` returns a read-only `WorkflowTaskOutcome` |
+| `execute_activity` | one activity or local activity attempt | `ActivityInterceptorContext` | `next.run(context)` returns the activity result |
+| `execute_query_task` | one query task | `QueryTaskInterceptorContext` | `next.run()` returns the query result or `QueryTaskFailure` |
+
+Contexts are read-only. They carry the worker id, task queue, namespace and the
+task's identity: task id, workflow id, run id, workflow or activity type,
+attempt and, for workflow tasks, history length, the task's trace carrier and
+replay state. An activity context also exposes the decoded arguments, whether
+the attempt is a local activity, and the `ActivityContext` the handler receives.
+
+An audit log that records every workflow task outcome and activity attempt:
+
+```rust,no_run
+use durable_workflow::interceptors::{
+    ActivityInterceptorContext, ActivityNext, InterceptorFuture,
+    WorkflowTaskInterceptorContext, WorkflowTaskNext, WorkflowTaskOutcome,
+};
+use durable_workflow::{AvroValue, Client, Result, Worker, WorkerInterceptor};
+
+struct AuditLog;
+
+impl WorkerInterceptor for AuditLog {
+    fn execute_workflow_task<'a>(
+        &'a self,
+        context: &'a WorkflowTaskInterceptorContext,
+        next: WorkflowTaskNext<'a>,
+    ) -> InterceptorFuture<'a, Result<WorkflowTaskOutcome>> {
+        Box::pin(async move {
+            let outcome = next.run().await;
+            match &outcome {
+                // The commands are new for this task even when it replayed
+                // history first. A retry of a failed task has attempt > 1.
+                Ok(outcome) => tracing::info!(
+                    workflow_id = context.workflow_id(),
+                    task_id = context.task_id(),
+                    attempt = context.attempt(),
+                    commands = outcome.commands().len(),
+                    "workflow task completed"
+                ),
+                Err(error) => tracing::warn!(%error, "workflow task failed"),
+            }
+            outcome
+        })
+    }
+
+    fn execute_activity(
+        &self,
+        context: ActivityInterceptorContext,
+        next: ActivityNext,
+    ) -> InterceptorFuture<'_, Result<AvroValue>> {
+        Box::pin(async move {
+            let activity_type = context.activity_type().to_owned();
+            let attempt = context.attempt();
+            let result = next.run(context).await;
+            tracing::info!(%activity_type, attempt, ok = result.is_ok(), "activity attempt");
+            result
+        })
+    }
+}
+
+# fn configure(client: Client) {
+let worker = Worker::new(client, "orders").interceptor(AuditLog);
+# let _ = worker;
+# }
+```
+
+Interceptors run in registration order. The first one registered is the
+outermost: it runs first before the task and last after it. Each hook must call
+`next` to continue the chain; the innermost `next` runs the SDK's own handling.
+Errors from the task pass back out through every interceptor unchanged unless
+an activity or query interceptor deliberately handles them. Activity
+interceptors can change arguments with `context.with_args(..)` and transform
+results, and activity and query interceptors may answer without calling `next`.
+Built-in `ExecutionTelemetry` spans stay outermost around the whole chain.
+
+Workflow-task interceptors cannot change what a workflow records:
+
+- `next.run()` takes no input, so the task always runs as received.
+- The worker submits exactly the commands the workflow produced. The outcome is
+  a read-only view of them.
+- If the task fails, the worker reports that failure even when an interceptor
+  returns `Ok`. Interceptors see it as `Error::WorkflowTaskFailed`, with the
+  original error available from `.error()`.
+- An interceptor error after the task succeeded, or returning without running
+  `next`, fails the workflow task with `Error::WorkflowTaskInterceptor`.
+  Nothing is recorded and the Server retries the task. The workflow does not
+  fail.
+- Interceptors run on every workflow task. `context.replay_state()` is
+  `Replaying` when the task re-ran commands committed by earlier tasks before
+  new execution, and `Executing` for a task with no committed history. The
+  worker never resubmits replayed commands, so an outcome's commands are always
+  new for that task: audit every successful outcome, whatever the replay
+  state. If a task fails after an interceptor observed it, its retry can
+  repeat the same outcome; `context.attempt()` above 1 identifies a retry.
+
+The offline `WorkflowEnvironment` runs activity interceptors registered on the
+worker it wraps. It has no workflow or query tasks, so those hooks do not run
+there.
+
 ## Schedule origin
 
 A run started by a schedule can read the fire that started it with

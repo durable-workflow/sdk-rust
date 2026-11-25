@@ -41,9 +41,7 @@ caller type, ID and label. Timestamp helpers return immutable UTC dates.
 
 ## Timeout cleanup cause
 
-This parser support is experimental. Service-mode timeout-cleanup admission
-and execution require the upstream Core/native implementation and separate
-published-artifact qualification.
+This support is experimental. It is opt-in for each start and for each worker.
 
 A run that opted in to deadline-triggered cleanup receives its timeout-cleanup
 interruption as an ordinary cooperative cancellation request whose context has
@@ -59,6 +57,35 @@ other `cause` value is refused. The cause is never inherited: descendants
 cancelled under the request, scoped or not, carry no `cause`, so they are
 ordinary cancellations, even when a scoped child's origin root context carries
 `cause: "timeout"`.
+
+A worker with `.cooperative_cancellation(true)` advertises the
+`timeout_cleanup` capability, version 1
+([server#1201](https://github.com/durable-workflow/server/issues/1201)):
+`capabilities` lists `timeout_cleanup` and `capability_manifest.timeout_cleanup`
+is `{supported: true, minimum_protocol_version: "1.20", version: 1}`. The
+Server admits a start with `timeout_cleanup_seconds` only on a task queue where
+such a worker is live, and refuses it otherwise with
+`timeout_cleanup_not_supported`. A worker without cooperative cancellation does
+not advertise it, and `timeout_cleanup` cannot be added as a resource
+capability. Admission depends only on the worker: native Server does not yet
+advertise `timeout_cleanup` in its own capabilities.
+
+The run always ends timed out. How workflow code finishes cleanup sets the
+recorded cleanup outcome:
+
+- Returning, or letting the delivered `Error::CooperativeCancellationRequested`
+  escape (uncaught, returned unchanged, or returned by a saga whose
+  compensations all succeeded), records `completed`. For the escaped
+  interruption the worker adds `failure.interruption: "timeout_cleanup"` to its
+  `fail_workflow` command. The marker is sent only when the error is the exact
+  request and delivery this replay delivered, and that request is the run's
+  own root timeout request. An error the application builds with other
+  identity, an ordinary or explicit `cancellation` request, and a scoped or
+  descendant cancellation are never marked.
+- Returning any other error records `failed`, with the failure linked. This
+  includes `Error::SagaCompensationFailed` and any error that wraps the
+  interruption.
+- Running past the cleanup deadline records `expired`.
 
 A scoped child context preserves its complete immutable `scope_origin` alongside
 the local run lineage. `ScopedCancellationContext::root_context()` retains the
