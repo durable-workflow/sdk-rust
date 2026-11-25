@@ -666,6 +666,7 @@ pub(super) fn validate_resource_capability(value: &str) -> Result<()> {
                 | "worker_sessions"
                 | "sticky_execution"
                 | "cooperative_cancellation"
+                | "timeout_cleanup"
         )
     {
         return Err(invalid(

@@ -36,6 +36,7 @@ pub use pagination::{
     WorkflowIterator, WorkflowListOptions, WorkflowListPage, WorkflowSummary,
 };
 mod terminal_failure_detail;
+mod timeout_cleanup;
 mod tls;
 mod update_outcome;
 mod worker_capacity;
@@ -4688,6 +4689,16 @@ impl Client {
                 "supported":true, "minimum_protocol_version":"1.20",
                 "implementation":"owned_workflow_run_canonical_delivery", "binding_kinds":["workflow_run"],
             });
+        }
+        // Timeout cleanup is delivered through cooperative cancellation
+        // (Server #1201), so only a cooperative worker describes it.
+        if self.cooperative_worker_protocol
+            && capabilities
+                .iter()
+                .any(|capability| capability == timeout_cleanup::CAPABILITY)
+        {
+            body["capability_manifest"][timeout_cleanup::CAPABILITY] =
+                timeout_cleanup::manifest_entry();
         }
         if let Some(build_id) = &self.worker_build_id {
             if build_id.is_empty() || build_id.len() > 255 {
@@ -9832,6 +9843,8 @@ impl Worker {
                         .then(|| "sticky_history_suffix".to_string()),
                     self.cooperative_cancellation_enabled
                         .then(|| "cooperative_cancellation".to_string()),
+                    self.cooperative_cancellation_enabled
+                        .then(|| timeout_cleanup::CAPABILITY.to_string()),
                     self.nexus_cooperative_cancellation_enabled
                         .then(|| "nexus_cooperative_cancellation".to_string()),
                     (!self.queries.is_empty()).then(|| QUERY_TASKS_CAPABILITY.to_string()),
@@ -11691,10 +11704,18 @@ impl Worker {
                 // upgraded workflow code no longer consumes.
                 ctx.ensure_history_consumed()?;
                 let mut commands = ctx.take_commands()?;
-                commands.push(workflow_failure_command(
+                let mut command = workflow_failure_command(
                     &error,
                     recorded_activity_failure_boundary(ctx, &error),
-                ));
+                );
+                // Only a worker that advertised timeout_cleanup sends the marker.
+                if self.cooperative_cancellation_enabled {
+                    let state = ctx.state.lock().map_err(|_| Error::WorkflowStatePoisoned)?;
+                    if let Some(marker) = timeout_cleanup::failure_marker(&error, &state) {
+                        command["failure"] = marker;
+                    }
+                }
+                commands.push(command);
                 self.message_stream_decision(ctx, commands)
             }
             Poll::Pending => {
