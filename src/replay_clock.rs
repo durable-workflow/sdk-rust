@@ -181,7 +181,7 @@ fn present(value: Option<&Value>) -> bool {
 }
 
 /// How a query or update-validation task attests the run's entry instant.
-/// Server #1338 (in the next Server release) always sends the `replay_clock`
+/// Server 3.30.0 (server#1338) and later always send the `replay_clock`
 /// key on those tasks: the v1 object when the start is provable, explicit
 /// `null` when it is not. An older Server omits the key, so the entry its
 /// workflow tasks carried is unknown to the rebuild.
@@ -723,8 +723,8 @@ impl WorkflowContext {
     ///
     /// A replayed-instance query or update validator rebuilds the body with its own task's
     /// `replay_clock` attestation. When the query task omits that key (a
-    /// Server before #1338) and the body reads this clock at entry, the
-    /// query fails with `query_workflow_state_unavailable`, even if the body
+    /// Server before 3.30.0, without #1338) and the body reads this clock at
+    /// entry, the query fails with `query_workflow_state_unavailable`, even if the body
     /// tolerated the unavailable result: its rebuilt state is not proved to
     /// match the workflow task's. An explicit `null` keeps entry unavailable,
     /// as on the run's workflow tasks. Offline replay takes the carrier

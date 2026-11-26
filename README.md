@@ -621,9 +621,9 @@ Query handlers read the time of the rebuilt workflow prefix only when its final
 boundary is proved, and update handlers read their committed `UpdateAccepted`
 time; otherwise they are unavailable too. A query or replayed update validator
 that rebuilds the workflow body uses its own task's `replay_clock`. Server
-sends that key on query and update-validation tasks from the release that
-includes server#1338, with `null` meaning the run has no provable start. When
-the key is absent, as on older Servers, a rebuild in which the workflow reads
+3.30.0 and later (server#1338) send that key on query and update-validation
+tasks, with `null` meaning the run has no provable start. When the key is
+absent, as on older Servers, a rebuild in which the workflow reads
 the clock at entry fails instead of answering, even if the workflow handles the
 error: a query reports `query_workflow_state_unavailable`, and a replayed
 update validator reports `update_validation_worker_failed`. Neither answers

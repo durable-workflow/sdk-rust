@@ -699,7 +699,7 @@ impl Worker {
             ));
         };
         let (workflow_type, update_name) = (workflow_type.to_string(), update_name.to_string());
-        // Server #1338 (in the next Server release) attests the run's entry
+        // Server 3.30.0 (server#1338) and later attest the run's entry
         // instant on validation tasks, as on query tasks; the rebuilt body
         // follows the same rule.
         let replay_entry = crate::replay_clock::attestation(&task);

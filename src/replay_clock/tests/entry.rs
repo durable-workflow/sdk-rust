@@ -417,8 +417,9 @@ async fn query_rebuild_of_an_entry_read_follows_the_query_tasks_attestation() {
         }
     };
 
-    // A Server before #1338 omits the key: the tolerant body's "none" is not
-    // what the workflow task computed, so the query fails closed.
+    // A Server before 3.30.0 (without #1338) omits the key: the tolerant
+    // body's "none" is not what the workflow task computed, so the query
+    // fails closed.
     let failure = ask(query(None)).await.unwrap_err();
     assert_eq!(failure.reason, "query_workflow_state_unavailable");
     assert!(
