@@ -55,7 +55,7 @@ only the entry value comes from the carrier.
 
 A replayed-instance query, and a replayed update validator, rebuilds the
 workflow body with its own query or validation task's `replay_clock`
-attestation. Server #1338, in the next Server release, always sends that key
+attestation. Server 3.30.0 and later (server#1338) always send that key
 on query and update-validation tasks: the v1 object when the start is
 provable, explicit `null` when it is not. An object is validated and used as
 on a workflow task. `null`, or an object this SDK refuses for its own shape,

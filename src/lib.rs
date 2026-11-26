@@ -11078,7 +11078,7 @@ impl Worker {
             Err(_) => return Ok(ManagedPollOutcome::Handled),
             Ok(result) => result?,
         }
-        // Server #1338 (in the next Server release) attests the entry instant
+        // Server 3.30.0 (server#1338) and later attest the entry instant
         // on query tasks; an older Server omits the key and leaves the
         // rebuild's entry unattested.
         let replay_entry = replay_clock::attestation(&wire["task"]);
