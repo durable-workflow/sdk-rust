@@ -19,8 +19,7 @@
   queries and replayed-state update validations of workflows that read the
   clock at entry fail instead of answering, so upgrade the Server to 3.30.0
   alongside the SDK. The same applies on any Server when a query or
-  validation task's carrier names another run than the task, and to the
-  public `execute_query_task`, which has no wire task.
+  validation task's carrier names another run than the task.
 
 - **Upgrade note: timeout cleanup on mixed queues.** Server admits a start
   with `timeout_cleanup_seconds` when at least one live worker on its task
@@ -46,8 +45,8 @@
   for example because it is misconfigured, no longer makes `run` or
   `run_until` return: watch the worker's error logs, or call
   `.recover_transient_outages(false)` to keep the bounded behavior. A typed
-  refusal with another `reason`, `retryable: false`, 401, 403 and other 4xx
-  still stop the worker. Native Server 3.30.0 answers a runtime credential
+  refusal with another non-retryable `reason`, `retryable: false`, 401, 403
+  and other 4xx still stop the worker. Native Server 3.30.0 answers a runtime credential
   lookup that fails during a database failover with a retryable 503 and
   `Retry-After: 1`, which earlier SDK releases already retry.
 
