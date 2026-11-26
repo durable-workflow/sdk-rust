@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+## 4.25.0
+
+- **Upgrade note: replay clock at workflow entry.** `replay_now()` now
+  returns the run's start time when it is read at workflow entry, before any
+  durable step, whenever the Server sends the task's `replay_clock` entry
+  instant (Server 3.6.0 and later). Earlier SDK releases reported the clock as
+  unavailable there (`Error::ReplayClockUnavailable`). A running workflow whose
+  code catches that unavailable error at entry and branches on it (for example
+  with `.ok()` or `unwrap_or`) will take the other branch when it replays on
+  the new SDK, which can change its next commands. Before upgrading workers,
+  put such code behind workflow versioning (a version marker or a new workflow
+  type) or let those runs finish. Code that reads the clock only after a
+  durable step, or never catches the error, is unaffected. On Servers before
+  3.30.0 (without server#1338), and on PHP Servers that send no carrier,
+  queries and replayed-state update validations of workflows that read the
+  clock at entry fail instead of answering, so upgrade the Server to 3.30.0
+  alongside the SDK. The same applies on any Server when a query or
+  validation task's carrier names another run than the task.
+
+- **Upgrade note: timeout cleanup on mixed queues.** Server admits a start
+  with `timeout_cleanup_seconds` when at least one live worker on its task
+  queue advertises `timeout_cleanup`. It doesn't check the other workers, and
+  any of them can claim the cleanup turn. Server refuses the cleanup marker
+  from a worker that didn't advertise the capability, so an escaped
+  interruption there is recorded as `failed` or `expired`. But a worker
+  without timeout-cleanup support may never see the interruption: if its
+  workflow code returns, the run is recorded as cleanup `completed` although
+  no cleanup ran. Before starting opted-in runs on a queue, upgrade every
+  worker on it to a supporting SDK with cooperative cancellation enabled: PHP
+  SDK 3.31.0 or later (3.32.0 or later for the stricter marker rule), Rust SDK
+  4.25.0 or later, Python SDK 2.24.0 or later.
+
+- **Upgrade note: worker retries on HTTP 500.** A plain HTTP 500 from the
+  Server, or a 500, 502, 503 or 504 with reason `server_error`, is now retried
+  as transient instead of stopping the worker. With the default
+  `recover_transient_outages(true)`, polls, the worker heartbeat and
+  registration keep retrying past `WorkerRetryPolicy.max_retries` with the
+  jittered backoff, and log a `tracing` error once the outage has lasted 60 s
+  and every 5 minutes after. Retries wait at least as long as a 429 or 5xx
+  `Retry-After` header asks, up to 30 s. A Server that keeps answering 500,
+  for example because it is misconfigured, no longer makes `run` or
+  `run_until` return: watch the worker's error logs, or call
+  `.recover_transient_outages(false)` to keep the bounded behavior. A typed
+  refusal with another non-retryable `reason`, `retryable: false`, 401, 403
+  and other 4xx still stop the worker. Native Server 3.30.0 answers a runtime credential
+  lookup that fails during a database failover with a retryable 503 and
+  `Retry-After: 1`, which earlier SDK releases already retry.
+
 - Worker interceptors also wrap update-validation tasks through
   `WorkerInterceptor::execute_update_validation_task`, with an
   `UpdateValidationInterceptorContext` (validation task id, attempt, workflow
@@ -15,9 +63,9 @@
 - A running worker no longer exits when the Server answers HTTP 500 during a
   database failover ([cloud#752](https://github.com/durable-workflow/cloud/issues/752)).
   An untyped 500 (for example `{"message":"Server Error"}` or an empty or HTML
-  body) and a 500 or 503 with reason `server_error` (the Server's answer when
-  its database is unavailable to authenticate a request) are now transient,
-  like an untyped 502/503/504. Previously a 500 on a poll or the worker
+  body) and a 500, 502, 503 or 504 with reason `server_error` (the answer of
+  Servers before 3.30.0 when the database is unavailable to authenticate a
+  request) are now transient, like an untyped 502/503/504. Previously a 500 on a poll or the worker
   heartbeat was returned from `run`/`run_until` once `WorkerRetryPolicy.max_retries`
   was spent, and a 500 on an activity report was not resent. A typed 5xx
   refusal (another `reason`), `retryable: false`, 401, 403 and other 4xx stay
@@ -43,33 +91,21 @@
   object refused for its own shape, schema, time or source keeps entry
   unavailable. An object refused only because it names another run than the
   task, or because the task has no run, is treated as an absent key and fails
-  closed. When the query task omits the key (a Server before #1338), or its
-  object is treated as absent, and the rebuilt body reads `replay_now()` at
-  entry, the query fails with `query_workflow_state_unavailable` (a validation
+  closed. When the query task omits the key (a Server before 3.30.0, without
+  server#1338), or its object is treated as absent, and the rebuilt body reads
+  `replay_now()` at entry, the query fails with `query_workflow_state_unavailable` (a validation
   task reports a worker failure), even if the body tolerated the unavailable
   result. `WorkflowHistory::replay_clock(carrier)` validates and
   supplies the carrier to offline replay. Update handler reads and the
   cancellation clock are unchanged.
   ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))
 
-  Upgrade note: `replay_now()` shipped in 4.24.0 and returned
-  `Error::ReplayClockUnavailable` at ordinary entry. A running workflow whose
-  code branches on that error at entry (for example with `.ok()` or
-  `unwrap_or`) now takes the other branch on replay once its tasks carry the
-  instant. Put such a change behind workflow versioning before upgrading.
-  Until Server #1338 (in the next Server release) sends `replay_clock` on
-  query and update-validation tasks, a query or validation of a workflow that
-  tolerates the unavailable result at entry now fails where it used to answer,
-  against every current Server release and against PHP Servers that send no
-  carrier. The public `execute_query_task`, which has no wire task, counts as
-  key-absent in the same way.
-
 - Workers with cooperative cancellation enabled advertise the
   `timeout_cleanup` capability, version 1. A native Server can then admit
   starts that reserve time for deadline-triggered timeout cleanup on their
   queue. When workflow code lets the delivered timeout
   `Error::CooperativeCancellationRequested` escape, uncaught or returned
-  unchanged, the `fail_workflow` command carries
+  unchanged (also by a saga whose compensations succeeded), the `fail_workflow` command carries
   `failure.interruption: "timeout_cleanup"`, and the Server records the cleanup
   as completed. Other failures, including wrapped interruptions and saga
   compensation failures, still record failed cleanup. Workers without
