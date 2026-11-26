@@ -1949,6 +1949,11 @@ def _guard_matches(
             # change. Other production hunks in the same diff remain guarded.
             if test_module_indent is not None:
                 continue
+            # A changed line comment or doc comment cannot change how history
+            # is consumed. Commenting code out or back in still changes the
+            # code line on the other side of the diff, which stays guarded.
+            if line[1:].lstrip().startswith("//"):
+                continue
             # A request-header selection does not change history consumption.
             # Keep history/replay guards for every other change in the same
             # function, rather than requiring an unrelated replay fixture for

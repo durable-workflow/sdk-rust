@@ -772,6 +772,44 @@ diff --git a/src/lib.rs b/src/lib.rs
         with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
             self.assertTrue(self._guard_matches(REPLAY_GUARD))
 
+    def test_comment_only_edit_inside_replay_function_is_not_replay(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,6 +1,6 @@
+ /// Replays the history.
+-/// Server #1338 (in the next Server release) attests the entry.
++/// Server 3.30.0 (server#1338) and later attest the entry.
+ fn consume_history(history: &[Event]) {
+-    // Server #1338 (in the next Server release) sends the key.
++    // Server 3.30.0 and later send the key.
+     consume(history, 1);
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertFalse(self._guard_matches(REPLAY_GUARD))
+
+    def test_commenting_out_replay_code_stays_guarded(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,3 +1,3 @@
+ fn consume_history(history: &[Event]) {
+-    consume(history, 1);
++    // consume(history, 1);
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+        diff += """\
+@@ -10,3 +10,3 @@
+ fn consume_history_again(history: &[Event]) {
+-    // replay note
++    consume(history, 2); // replay note
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
     def test_removing_test_configuration_keeps_history_changes_guarded(self) -> None:
         diff = """\
 diff --git a/src/lib.rs b/src/lib.rs
