@@ -12,6 +12,24 @@
   the update is not accepted.
   ([Durable Workflow #234](https://github.com/durable-workflow/.github/issues/234),
   [#226](https://github.com/durable-workflow/.github/issues/226))
+- A running worker no longer exits when the Server answers HTTP 500 during a
+  database failover ([cloud#752](https://github.com/durable-workflow/cloud/issues/752)).
+  An untyped 500 (for example `{"message":"Server Error"}` or an empty or HTML
+  body) and a 500 or 503 with reason `server_error` (the Server's answer when
+  its database is unavailable to authenticate a request) are now transient,
+  like an untyped 502/503/504. Previously a 500 on a poll or the worker
+  heartbeat was returned from `run`/`run_until` once `WorkerRetryPolicy.max_retries`
+  was spent, and a 500 on an activity report was not resent. A typed 5xx
+  refusal (another `reason`), `retryable: false`, 401, 403 and other 4xx stay
+  fatal as before.
+  - Worker retries now honor the Server's `Retry-After` header on a 429 or 5xx,
+    as delta-seconds or an HTTP-date, capped at 30 s; the jittered backoff
+    applies when it is absent.
+  - A workflow-task completion or failure that hits a transient failure is
+    resent unchanged (same task, lease owner and attempt) within
+    `WorkerRetryPolicy.max_retries`, instead of being dropped until the task's
+    lease expired. A definitive refusal of a resend ends no worse than not
+    resending: the worker keeps running and the Server redelivers the task.
 
 - `WorkflowContext::replay_now()` is available at ordinary workflow entry,
   before any durable step. It returns the `replay_clock` instant (`WorkerReplayClock`

@@ -26,6 +26,7 @@ mod run_activities;
 mod runtime_payloads;
 mod runtime_uploads;
 mod server_capabilities_digest;
+mod server_retry_after;
 mod signal_with_start;
 mod sticky_worker;
 mod sticky_workflow_cache;
@@ -3583,6 +3584,8 @@ pub struct Client {
     /// server#1262: the newest capabilities digest learned from a tagged copy,
     /// shared by this Client's clones.
     capabilities_digest: server_capabilities_digest::Digest,
+    /// The Server's newest `Retry-After` advice, shared by this Client's clones.
+    retry_after: Arc<server_retry_after::Advice>,
     #[cfg(feature = "telemetry")]
     execution_telemetry: Option<telemetry::ExecutionTelemetry>,
     #[cfg(feature = "telemetry")]
@@ -3672,7 +3675,7 @@ impl Client {
             }
             failures = failures.saturating_add(1);
             outage.report("", "", &error);
-            let delay = worker_outage_delay(failures);
+            let delay = self.retry_after.honor(worker_outage_delay(failures));
             tracing::warn!(
                 target: "durable_workflow::worker",
                 error = %error,
@@ -3680,7 +3683,7 @@ impl Client {
                 "cluster info unavailable; retrying"
             );
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
+                _ = server_retry_after::sleep(delay) => {}
                 _ = wait_for_worker_stop(&admission.stop) => return Err(error),
             }
         }
@@ -5888,6 +5891,8 @@ impl Client {
             .map_or(0, |body| body.len() as u64);
         let mut storage_retries = 0_usize;
         let mut deferred_workflow_completion = false;
+        let mut report_resends = 0_usize;
+        let mut first_report_failure: Option<Error> = None;
 
         loop {
             // Keep the serialized body and lease/poll identity across admission pauses.
@@ -5901,7 +5906,13 @@ impl Client {
                     .await?;
                 let status = response.status();
                 observation.status(status);
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .cloned();
                 let body = read_capped_body(response, self.max_response_bytes).await?;
+                // Recorded with no await before the caller's retry decision.
+                self.retry_after.observe(status, retry_after.as_ref());
                 Ok::<_, Error>((status, body))
             };
             let retry_deadline = self
@@ -5921,13 +5932,26 @@ impl Client {
                     None => receive.await,
                 }
             };
-            let (status, bytes) = match self
+            let received = match self
                 .activity_lease_authority
                 .as_ref()
                 .filter(|authority| authority.governs(path))
             {
-                Some(authority) => authority.protect(received).await?,
-                None => received.await?,
+                Some(authority) => authority.protect(received).await,
+                None => received.await,
+            };
+            let (status, bytes) = match received {
+                Ok(received) => received,
+                Err(error) => {
+                    if self
+                        .resend_workflow_task_report(&error, path, &mut report_resends)
+                        .await
+                    {
+                        first_report_failure.get_or_insert(error);
+                        continue;
+                    }
+                    return Err(after_report_resends(error, first_report_failure));
+                }
             };
             // Restore elided capabilities before any reader, success or error.
             let bytes = match &capabilities {
@@ -6080,7 +6104,14 @@ impl Client {
                 {
                     continue;
                 }
-                return Err(error);
+                if self
+                    .resend_workflow_task_report(&error, path, &mut report_resends)
+                    .await
+                {
+                    first_report_failure.get_or_insert(error);
+                    continue;
+                }
+                return Err(after_report_resends(error, first_report_failure));
             }
 
             if bytes.is_empty() {
@@ -6141,6 +6172,53 @@ impl Client {
             return Ok(serde_json::from_value(info)?);
         }
         Ok(serde_json::from_slice(bytes)?)
+    }
+
+    /// A managed worker resends the identical workflow-task completion or
+    /// failure (same task, lease owner and attempt: the same serialized
+    /// request) after a transient failure, within its retry budget, honoring
+    /// the Server's `Retry-After`. The Server answers a copy it already
+    /// recorded with its duplicate receipt or a not-recorded `task_not_leased`
+    /// receipt, so the resend is idempotent. Activity reports are resent by
+    /// `Worker::settle_activity_report` instead.
+    async fn resend_workflow_task_report(
+        &self,
+        error: &Error,
+        path: &str,
+        resends: &mut usize,
+    ) -> bool {
+        let Some(admission) = self.worker_storage_admission.as_ref() else {
+            return false;
+        };
+        if !is_workflow_task_report(path)
+            || !worker_error_is_transient(error)
+            || *resends >= admission.policy.max_retries
+            || admission.stop.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        *resends += 1;
+        let delay = self
+            .retry_after
+            .honor(worker_retry_delay(admission.policy, *resends))
+            .max(Duration::from_millis(1));
+        if admission
+            .workflow_completion_retry_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() + delay >= deadline)
+        {
+            return false;
+        }
+        tracing::warn!(
+            target: "durable_workflow::worker",
+            path,
+            error = %error,
+            retry_in_ms = delay.as_millis() as u64,
+            "transient failure reporting a workflow task; resending the same report"
+        );
+        tokio::select! {
+            _ = server_retry_after::sleep(delay) => !admission.stop.load(Ordering::SeqCst),
+            _ = wait_for_worker_stop(&admission.stop) => false,
+        }
     }
 
     async fn wait_for_storage_admission(
@@ -6718,11 +6796,14 @@ fn worker_operation_is_retryable(error: &Error) -> bool {
     }
 }
 
-/// A failure a running worker outlives (sdk-php#448): a connection refused,
-/// reset or timed out; an upstream 502/503/504 without a protocol body; a 503
-/// whose reason is `storage_unavailable` or `backend_unavailable`; or any 5xx
-/// or 429 that says `retryable: true`. An explicit `retryable: false`, 401,
-/// 403 and every other protocol refusal stay fatal.
+/// A failure a running worker outlives (sdk-php#448, cloud#752): a connection
+/// refused, reset or timed out; a 500, 502, 503 or 504 without a typed reason
+/// (an upstream or framework error page, or an untyped JSON error) or with the
+/// generic reason `server_error` (the Server's answer when its database is
+/// unavailable during authentication, as in a failover); a 503 whose reason
+/// is `storage_unavailable` or `backend_unavailable`; or any 5xx or 429 that
+/// says `retryable: true`. An explicit `retryable: false`, 401, 403, every
+/// other 4xx and every other typed refusal stay fatal.
 pub(crate) fn worker_error_is_transient(error: &Error) -> bool {
     let (status, body) = match error {
         Error::Timeout => return true,
@@ -6745,7 +6826,8 @@ pub(crate) fn worker_error_is_transient(error: &Error) -> bool {
     }
     matches!(
         (status, field("reason").and_then(Value::as_str)),
-        (503, Some("storage_unavailable" | "backend_unavailable")) | (502..=504, None)
+        (503, Some("storage_unavailable" | "backend_unavailable"))
+            | (500 | 502..=504, None | Some("server_error"))
     )
 }
 
@@ -7100,6 +7182,27 @@ pub(crate) fn cluster_info_failure_is_transient(error: &Error) -> bool {
     (status >= 500 || status == 429) && !refused
 }
 
+/// `/worker/workflow-tasks/{task_id}/complete` or `/fail`.
+fn is_workflow_task_report(path: &str) -> bool {
+    path.strip_prefix("/worker/workflow-tasks/")
+        .and_then(|tail| {
+            tail.strip_suffix("/complete")
+                .or_else(|| tail.strip_suffix("/fail"))
+        })
+        .is_some_and(|task_id| !task_id.is_empty() && !task_id.contains('/'))
+}
+
+/// A workflow-task report that was resent ends no worse than one that was
+/// not: a definitive answer to a resend (for example a lease that expired
+/// meanwhile) is returned as the transient failure that started the resends,
+/// which a running worker outlives while the Server redelivers the task.
+fn after_report_resends(error: Error, first: Option<Error>) -> Error {
+    match first {
+        Some(first) if !worker_error_is_transient(&error) => first,
+        _ => error,
+    }
+}
+
 /// An activity report (completion or failure) whose payloads may be encoded
 /// again after a too-large refusal. Workflow-task completions keep their own
 /// typed size refusals unchanged.
@@ -7334,6 +7437,7 @@ impl ClientBuilder {
             signal_with_start_supported: Arc::new(AtomicBool::new(false)),
             activity_lease_discovery: Arc::new(activity_lease::Discovery::default()),
             capabilities_digest: server_capabilities_digest::Digest::default(),
+            retry_after: Arc::default(),
             activity_lease_authority: None,
             #[cfg(feature = "telemetry")]
             execution_telemetry: None,
@@ -8670,7 +8774,8 @@ pub struct WorkerHeartbeatObservation {
 /// [`Worker::recover_transient_outages`] (on by default) keeps a long-running
 /// worker retrying transient poll, heartbeat and registration failures beyond
 /// this budget. `run_once` stays bounded, and `max_retries = 0` disables
-/// ordinary retries in either mode.
+/// ordinary retries in either mode. A `Retry-After` header on a 429 or 5xx
+/// answer lengthens any retry delay to at least that long, capped at 30 s.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerRetryPolicy {
     /// Number of retries after the initial request fails.
@@ -10807,7 +10912,7 @@ impl Worker {
             }
             failures = failures.saturating_add(1);
             outage.report(&self.worker_id, &self.task_queue, &error);
-            let delay = worker_outage_delay(failures);
+            let delay = self.client.retry_after.honor(worker_outage_delay(failures));
             let lease_left = self
                 .client
                 .activity_lease_authority
@@ -10844,11 +10949,11 @@ impl Worker {
             match &self.run_stop {
                 Some(stop) => {
                     tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
+                        _ = server_retry_after::sleep(delay) => {}
                         _ = wait_for_worker_stop(stop) => return Err(error),
                     }
                 }
-                None => tokio::time::sleep(delay).await,
+                None => server_retry_after::sleep(delay).await,
             }
         }
     }
@@ -11147,7 +11252,10 @@ impl Worker {
         }
         outage.failures = outage.failures.saturating_add(1);
         outage.log.report(&self.worker_id, &self.task_queue, error);
-        let delay = worker_outage_delay(outage.failures);
+        let delay = self
+            .client
+            .retry_after
+            .honor(worker_outage_delay(outage.failures));
         tracing::warn!(
             target: "durable_workflow::worker",
             worker_id = %self.worker_id,
@@ -11157,7 +11265,7 @@ impl Worker {
             "transient Server failure; the worker keeps running"
         );
         tokio::select! {
-            _ = tokio::time::sleep(delay) => true,
+            _ = server_retry_after::sleep(delay) => true,
             _ = wait_for_worker_stop(stop) => false,
         }
     }
@@ -11203,14 +11311,18 @@ impl Worker {
                     // applies. Beyond it, every worker draws from the shared
                     // full-jitter schedule so a fleet does not retry in step
                     // when the Server comes back.
-                    let delay = worker_poll_retry_delay(self.retry_policy, retries);
+                    // The Server's Retry-After lengthens either delay.
+                    let delay = self
+                        .client
+                        .retry_after
+                        .honor(worker_poll_retry_delay(self.retry_policy, retries));
                     if let Some(stop) = &self.run_stop {
                         tokio::select! {
-                            _ = tokio::time::sleep(delay) => {}
+                            _ = server_retry_after::sleep(delay) => {}
                             _ = wait_for_worker_stop(stop) => return Ok(None),
                         }
                     } else {
-                        tokio::time::sleep(delay).await;
+                        server_retry_after::sleep(delay).await;
                     }
                 }
                 result => return result.map(Some),
