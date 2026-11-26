@@ -1853,6 +1853,40 @@ def _fresh_public_reexports(diff: str, base_source: str) -> set[int]:
     return ignored
 
 
+def _is_line_comment(content: str) -> bool:
+    # A changed line comment or doc comment cannot change how history or
+    # payloads are consumed. Commenting code out or back in still changes the
+    # code line on the other side of the diff, which stays guarded. The test
+    # is per line: a line inside a multi-line string literal or block comment
+    # that starts with // is also skipped, an accepted gap that no guarded
+    # source uses.
+    return content.lstrip().startswith("//")
+
+
+def _has_non_comment_change(root: Path, base_ref: str, matching: Sequence[str]) -> bool:
+    """Whether a pattern-free guard's paths changed anything but line comments.
+
+    A new file, a diff without text hunks (binary, mode or rename only) and
+    any changed line that is not a // comment all count as a change.
+    """
+    diff = _run(["git", "diff", "--no-ext-diff", "--no-color", base_ref, "--", *matching], root)
+    untracked = set(_run(["git", "ls-files", "--others", "--exclude-standard"], root).splitlines())
+    if any(path in untracked and (root / path).is_file() for path in matching):
+        return True
+    changed_lines = 0
+    inside_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            inside_hunk = False
+        elif line.startswith("@@"):
+            inside_hunk = True
+        elif inside_hunk and line.startswith(("+", "-")):
+            changed_lines += 1
+            if not _is_line_comment(line[1:]):
+                return True
+    return changed_lines == 0
+
+
 def _guard_matches(
     root: Path,
     base_ref: str,
@@ -1870,7 +1904,7 @@ def _guard_matches(
     patterns = guard.get("content_patterns")
     implementation_patterns = guard.get("implementation_patterns")
     if patterns is None and implementation_patterns is None:
-        return True
+        return _has_non_comment_change(root, base_ref, matching)
     diff = _run(
         [
             "git",
@@ -1949,10 +1983,7 @@ def _guard_matches(
             # change. Other production hunks in the same diff remain guarded.
             if test_module_indent is not None:
                 continue
-            # A changed line comment or doc comment cannot change how history
-            # is consumed. Commenting code out or back in still changes the
-            # code line on the other side of the diff, which stays guarded.
-            if line[1:].lstrip().startswith("//"):
+            if _is_line_comment(line[1:]):
                 continue
             # A request-header selection does not change history consumption.
             # Keep history/replay guards for every other change in the same

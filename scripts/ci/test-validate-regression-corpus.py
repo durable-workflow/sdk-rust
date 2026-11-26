@@ -800,7 +800,9 @@ diff --git a/src/lib.rs b/src/lib.rs
         with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
             self.assertTrue(self._guard_matches(REPLAY_GUARD))
 
-        diff += """\
+    def test_uncommenting_replay_code_with_a_trailing_comment_stays_guarded(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
 @@ -10,3 +10,3 @@
  fn consume_history_again(history: &[Event]) {
 -    // replay note
@@ -809,6 +811,52 @@ diff --git a/src/lib.rs b/src/lib.rs
 """
         with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
             self.assertTrue(self._guard_matches(REPLAY_GUARD))
+
+    def test_comment_only_edit_inside_codec_function_is_not_codec(self) -> None:
+        diff = """\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,4 +1,4 @@
+ fn encode_avro_value(value: &AvroValue) -> Vec<u8> {
+-    // Avro framing note
++    // Avro framing note, reworded
+     encode(value)
+ }
+"""
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertFalse(self._guard_matches())
+        diff = diff.replace("+    // Avro framing note, reworded", "+    encode(value); // Avro framing note")
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, ""]):
+            self.assertTrue(self._guard_matches())
+
+    def _pattern_free_guard_matches(self, diff: str, untracked: str = "") -> bool:
+        guard = {"glob": "src/replay_clock.rs"}
+        with mock.patch.object(VALIDATOR, "_run", side_effect=[diff, untracked]):
+            return VALIDATOR._guard_matches(self.root, "HEAD", {"src/replay_clock.rs"}, guard)
+
+    def test_pattern_free_guard_ignores_comment_only_edits(self) -> None:
+        diff = """\
+diff --git a/src/replay_clock.rs b/src/replay_clock.rs
+@@ -1,3 +1,3 @@
+-/// Server #1338 (in the next Server release) sends the key.
++/// Server 3.30.0 and later send the key.
+ pub(super) enum Attestation {
+"""
+        self.assertFalse(self._pattern_free_guard_matches(diff))
+
+    def test_pattern_free_guard_still_guards_code_new_files_and_hunkless_diffs(self) -> None:
+        code = """\
+diff --git a/src/replay_clock.rs b/src/replay_clock.rs
+@@ -1,3 +1,3 @@
+-/// Old note.
++/// New note.
+-const ENTRY: u8 = 1;
++const ENTRY: u8 = 2;
+"""
+        self.assertTrue(self._pattern_free_guard_matches(code))
+        rename = "diff --git a/src/replay_clock.rs b/src/replay_clock.rs\nsimilarity index 100%\n"
+        self.assertTrue(self._pattern_free_guard_matches(rename))
+        (self.root / "src/replay_clock.rs").write_text("// only a comment\n", encoding="utf-8")
+        self.assertTrue(self._pattern_free_guard_matches("", untracked="src/replay_clock.rs\n"))
 
     def test_removing_test_configuration_keeps_history_changes_guarded(self) -> None:
         diff = """\
