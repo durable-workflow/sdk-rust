@@ -565,6 +565,82 @@ share that budget across all pages. Lease renewals do not restart it. Low-level
 cooperative polls retain their long-poll timeout plus five seconds, and explicit
 canonical cancellation refreshes retain their five-second budget.
 
+### Workflow time and the replay clock
+
+`WorkflowContext::replay_now()` returns a replay-safe UTC
+`chrono::DateTime<Utc>` that advances with consumed history. Every replay of
+the same history returns the same values, so workflow code can use it for
+deadlines and elapsed time.
+
+- **At workflow entry**, before any durable step, it returns the run's start
+  from the workflow task's `replay_clock` carrier (`WorkerReplayClock` v1, sent
+  by Server 3.6.0 and later). A redrive successor whose history proves the
+  original start uses that start.
+- **After a supported durable step** (a remote activity, a plain timer, a child
+  workflow, a persisted signal delivery, a condition wait, or a validated
+  all-group of activities, timers or children) it returns that step's recorded
+  time.
+- **Repeated reads** between two durable steps return the same value.
+
+A deadline loop around a durable timer therefore terminates, and the difference
+between two reads taken after two durable steps is their recorded elapsed time:
+
+```rust,no_run
+use std::time::Duration;
+use durable_workflow::{json, Worker};
+# fn configure(worker: &mut Worker) {
+worker.register_workflow("orders.wait-ready", |ctx, args| async move {
+    let deadline = ctx.replay_now()? + chrono::Duration::hours(1);
+    while ctx.replay_now()? < deadline {
+        if ctx.activity("orders.poll", args.clone()).await? == json!(true) {
+            return Ok(json!("ready"));
+        }
+        ctx.sleep(Duration::from_secs(60)).await?;
+    }
+    Ok(json!("timed out"))
+});
+# }
+```
+
+Where the SDK cannot prove a time, `replay_now()` returns
+`Error::ReplayClockUnavailable` instead of using wall time or any other value.
+An unhandled `Error::ReplayClockUnavailable` fails the workflow like any other
+error. The clock is unavailable:
+
+- at entry when the task carries no valid `replay_clock` (Servers older than
+  3.6.0, a run whose start the Server cannot prove, or a `WorkflowTask` executed
+  directly without a poll);
+- after inline and local operations: side effects, version markers, local
+  activities and memo or search-attribute upserts. These stay unavailable until
+  the platform defines a persisted time for those steps;
+- after group modes other than the validated all-groups, and inside condition
+  predicates;
+- in cancellation callbacks.
+
+Query handlers read the time of the rebuilt workflow prefix only when its final
+boundary is proved, and update handlers read their committed `UpdateAccepted`
+time; otherwise they are unavailable too. A query or replayed update validator
+that rebuilds the workflow body uses its own task's `replay_clock`. Server
+sends that key on query and update-validation tasks from the release that
+includes server#1338, with `null` meaning the run has no provable start. When
+the key is absent, as on older Servers, a rebuild in which the workflow reads
+the clock at entry fails instead of answering, even if the workflow handles the
+error: a query reports `query_workflow_state_unavailable`, and a replayed
+update validator reports `update_validation_worker_failed`. Neither answers
+with state its workflow task did not compute.
+
+Do not use timestamps to order emitted events. Order them by stream offset,
+outbox sequence or a workflow-local counter.
+
+**Upgrading:** earlier releases reported `replay_now()` as unavailable at
+entry. A running workflow whose code branches on that, for example with
+`replay_now().ok()` at entry, takes the other branch when it replays on the
+new SDK, or when the Server is upgraded to 3.6.0 or later. Version such code or
+drain those runs before you upgrade.
+
+See [the replay-clock source notes](https://github.com/durable-workflow/sdk-rust/blob/main/docs/replay-clock-source.md)
+for the exact boundary rules.
+
 ## Testing without a Server
 
 `testing::WorkflowEnvironment` runs registered workflows and activities in the
@@ -628,6 +704,13 @@ assert!(report.completed); // A running snapshot can remain durably pending.
 # }
 ```
 
+A workflow that reads `replay_now()` at entry also needs the original workflow
+task's `replay_clock` object: pass it with
+`WorkflowHistory::from_export(export)?.replay_clock(carrier)?`. The builder
+refuses an invalid carrier or one for another run. `WorkflowHistory::export()`
+does not include it, and `WorkflowEnvironment::run_workflow` supplies none, so
+entry stays unavailable there.
+
 For the raw history API, combine **all** pages and call
 `WorkflowHistory::from_history("hello", original_input, response)?`.
 Set `.task_queue("original-queue")` if that context is absent. Exports must
@@ -656,7 +739,8 @@ Keep workflow command order deterministic:
 | Pattern | Durable replacement |
 | --- | --- |
 | Iterating a `HashMap` while scheduling | Sort keys first or use a `BTreeMap` |
-| Reading the system clock, randomness or a UUID | `ctx.side_effect(...)` for a recorded snapshot, or an activity |
+| Reading the system clock for a deadline or elapsed time | `ctx.replay_now()?` |
+| Reading randomness, a UUID or another wall-clock snapshot | `ctx.side_effect(...)` for a recorded snapshot, or an activity |
 | `tokio::time::sleep`, `std::thread::sleep` | `ctx.sleep(...)` / `ctx.start_timer(...)` |
 | `tokio::select!`, racing ordinary futures | `ctx.select(...)` / `ctx.select_keyed(...)` |
 | Untracked concurrent durable calls | SDK `ctx.parallel(...)` with stable input ordering |
@@ -1394,11 +1478,16 @@ ranges remain replay errors.
 
 ### Recovering from Server outages
 
-`run` and `run_until` outlive transient Server outages by default. A transient
-failure is a connection refused, reset or timed out; an upstream 502, 503 or
-504 without a protocol body; a 503 whose reason is `storage_unavailable` or
-`backend_unavailable` (for example while native Server warms up its storage);
-or any 5xx or 429 that says `retryable: true`. Poll and worker-heartbeat
+`run` and `run_until` outlive transient Server outages by default, such as a
+database failover. A transient failure is a connection refused, reset or timed
+out; a 500, 502, 503 or 504 without a typed reason (an upstream or framework
+error page, or an untyped JSON error such as `{"message":"Server Error"}`) or
+with the generic reason `server_error` (the Server's answer when its database
+is unavailable to authenticate a request); a 503 whose reason is
+`storage_unavailable` or `backend_unavailable` (for example while native Server
+warms up its storage); or any 5xx or 429 that says `retryable: true`. Every
+worker loop treats these the same way: workflow, activity and query polls, the
+worker heartbeat, registration, and task completion and failure reports. Poll and worker-heartbeat
 retries keep going past `WorkerRetryPolicy.max_retries` for these, and a
 retried poll keeps its original request ID. Within the budget they use the
 policy's delays; beyond it every worker draws from the shared full-jitter
@@ -1410,6 +1499,23 @@ and retried after a wait drawn uniformly from `[0, min(4 s, 0.25 s * 2^(n-1))]`
 for the n-th consecutive failure, the schedule shared by every Durable Workflow
 SDK. Shutdown interrupts every wait and settles any poll response already in
 flight.
+
+When a 429 or 5xx answer carries `Retry-After` (delta-seconds or an HTTP-date),
+every retry the worker schedules after it waits at least that long, capped at
+30 s, instead of its shorter backoff. The advice is shared by the worker's
+loops and cleared by the next successful answer.
+
+A workflow-task completion or failure that hits a transient failure is resent
+unchanged (the same serialized report, so the same task, lease owner and
+attempt) within `WorkerRetryPolicy.max_retries`, using the policy's delays and
+honoring `Retry-After`. If the Server had already recorded the first copy,
+native Server answers the resend with its duplicate receipt
+(`"recorded": false, "reason": "already_completed"`), or with the not-recorded
+`task_not_leased` receipt for this task and attempt, and the task is settled.
+Any other definitive refusal of a resend (for example a lease that expired
+meanwhile) is treated like the original transient failure: the worker keeps
+running and the Server redelivers the task when its lease ends. Task-offer 409
+refusals and lease fencing are unchanged.
 
 An activity completion, failure or `worker_lost` release that hits a
 transient failure is resent unchanged with the same backoff while the
@@ -1431,8 +1537,9 @@ limit, the worker rediscovers the policy, encodes the report again and resends
 it once. A result that is still too large, or cannot be externalized, fails the
 attempt as a non-retryable `ActivityResultTooLarge`; the worker keeps running.
 
-An explicit `retryable: false`, 401, 403 and other protocol refusals, codec
-and handler failures stop the worker: it emits a `tracing` error event and
+An explicit `retryable: false`, 401, 403, other 4xx and typed protocol
+refusals (including a 5xx with a specific `reason` other than those above),
+codec and handler failures stop the worker: it emits a `tracing` error event and
 returns the error. `.recover_transient_outages(false)` restores bounded retries,
 `run_once` remains bounded in either mode, and
 `WorkerRetryPolicy.max_retries = 0` disables retries. Keep a process supervisor
