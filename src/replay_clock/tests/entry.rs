@@ -443,18 +443,18 @@ async fn query_rebuild_of_an_entry_read_follows_the_query_tasks_attestation() {
     }
     // A query task without a run cannot match a valid carrier to its run,
     // which its workflow task accepted, so it fails closed.
-    let mut runless = json!({"query_task_id":"q1","workflow_type":"clock","query_name":"entry",
+    let runless = json!({"query_task_id":"q1","workflow_type":"clock","query_name":"entry",
         "payload_codec":DEFAULT_CODEC,"history_events":[started],"replay_clock":clock.clone()});
     let runless_attestation = attestation(&runless);
     assert_eq!(runless_attestation, Attestation::Unattested);
-    runless["run_id"] = json!(RUN);
     let runless_task: QueryTask = serde_json::from_value(runless).unwrap();
-    assert_eq!(
-        ask((runless_task, runless_attestation))
-            .await
-            .unwrap_err()
-            .reason,
-        "query_workflow_state_unavailable"
+    assert_eq!(runless_task.run_id, None);
+    let failure = ask((runless_task, runless_attestation)).await.unwrap_err();
+    assert_eq!(failure.reason, "query_workflow_state_unavailable");
+    assert!(
+        failure.message.contains("does not attest"),
+        "{}",
+        failure.message
     );
     // The public, wire-less path has no attestation.
     let (task, _) = query(Some(clock));

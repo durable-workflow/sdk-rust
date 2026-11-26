@@ -38,14 +38,16 @@
   rows, so every replay reads the same instant. A task without a valid carrier,
   or whose carrier names another run or disagrees with the history's start kind,
   keeps entry unavailable as before. A replayed-instance query or replayed update
-  validator rebuilds the body with its own task's `replay_clock` attestation: the v1 object is used as
-  on a workflow task, and an explicit `null` or a refused object keeps entry
-  unavailable. When the
-  query task omits the key (a Server before #1338) and the rebuilt body reads
-  `replay_now()` at entry, the query fails with
-  `query_workflow_state_unavailable` (a validation task reports a worker
-  failure), even if the body tolerated the
-  unavailable result. `WorkflowHistory::replay_clock(carrier)` validates and
+  validator rebuilds the body with its own task's `replay_clock` attestation:
+  the v1 object is used as on a workflow task, and an explicit `null` or an
+  object refused for its own shape, schema, time or source keeps entry
+  unavailable. An object refused only because it names another run than the
+  task, or because the task has no run, is treated as an absent key and fails
+  closed. When the query task omits the key (a Server before #1338), or its
+  object is treated as absent, and the rebuilt body reads `replay_now()` at
+  entry, the query fails with `query_workflow_state_unavailable` (a validation
+  task reports a worker failure), even if the body tolerated the unavailable
+  result. `WorkflowHistory::replay_clock(carrier)` validates and
   supplies the carrier to offline replay. Update handler reads and the
   cancellation clock are unchanged.
   ([Durable Workflow #215](https://github.com/durable-workflow/.github/issues/215))

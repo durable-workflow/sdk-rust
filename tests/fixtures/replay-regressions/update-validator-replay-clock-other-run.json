@@ -1,0 +1,78 @@
+{
+  "$schema": "https://raw.githubusercontent.com/durable-workflow/.github/main/regression-corpus/evidence-schema.json",
+  "fixture_schema": "durable-workflow.replay-regression/v1",
+  "id": "rust-update-validator-replay-clock-other-run",
+  "protocol_version": "1.20",
+  "bindings": [
+    "rust"
+  ],
+  "workflow": {
+    "type": "corpus.update-validation-entry-clock",
+    "input": [
+      5
+    ],
+    "payload_codec": "avro"
+  },
+  "worker_task": {
+    "task_kind": "update_validation",
+    "update_validation_task_id": "validation-other-run-clock",
+    "update_id": "validation-other-run-clock",
+    "update_validation_attempt": 1,
+    "lease_owner": "regression-corpus-worker",
+    "task_queue": "regression-corpus-queue",
+    "workflow_id": "validated-workflow",
+    "run_id": "validated-run",
+    "update_name": "approve",
+    "update_input": [
+      1
+    ],
+    "payload_codec": "avro",
+    "run_status": "waiting",
+    "replay_clock": {
+      "schema": "durable-workflow.worker-replay-clock/v1",
+      "workflow_run_id": "another-run",
+      "started_at": "2026-03-04T05:06:07.891234Z",
+      "source": "run_started_at"
+    }
+  },
+  "history": [
+    {
+      "sequence": 1,
+      "event_type": "WorkflowStarted",
+      "payload": {}
+    },
+    {
+      "sequence": 2,
+      "event_type": "TimerScheduled",
+      "payload": {
+        "sequence": 1,
+        "timer_id": "timer-1",
+        "delay_seconds": 3600
+      }
+    }
+  ],
+  "expected": {
+    "poll_task_kinds": [
+      [
+        "workflow",
+        "update_validation"
+      ]
+    ],
+    "validation_completions": [
+      {
+        "outcome": "reject",
+        "body": {
+          "lease_owner": "regression-corpus-worker",
+          "update_validation_attempt": 1,
+          "failure": {
+            "message": "the replayed workflow read replay_now() at entry, but this query task does not attest the run's replay_clock entry instant",
+            "reason": "update_validation_worker_failed",
+            "type": "QueryWorkflowStateUnavailable"
+          }
+        }
+      }
+    ],
+    "workflow_task_reports": 0,
+    "handler_invocations": 0
+  }
+}
