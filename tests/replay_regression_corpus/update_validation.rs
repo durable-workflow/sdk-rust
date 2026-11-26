@@ -9,6 +9,9 @@ use super::*;
 use durable_workflow::UpdateRejection;
 
 pub(super) const WORKFLOW_TYPE: &str = "corpus.update-validation";
+/// The same validated workflow, except that its body reads `replay_now()` at
+/// entry and tolerates the unavailable result (.github#215).
+pub(super) const ENTRY_CLOCK_WORKFLOW_TYPE: &str = "corpus.update-validation-entry-clock";
 
 #[derive(Clone, Default)]
 struct OrderLimit {
@@ -54,7 +57,12 @@ pub(super) async fn execute(fixture: &Value) -> Result<Value, String> {
         .as_object_mut()
         .and_then(|fields| fields.remove("update_input"))
         .unwrap_or_else(|| json!([]));
-    task["workflow_type"] = json!(WORKFLOW_TYPE);
+    let workflow_type = fixture["workflow"]["type"]
+        .as_str()
+        .filter(|kind| [WORKFLOW_TYPE, ENTRY_CLOCK_WORKFLOW_TYPE].contains(kind))
+        .ok_or("update validation fixture names an unregistered workflow type")?;
+    let reads_entry_clock = workflow_type == ENTRY_CLOCK_WORKFLOW_TYPE;
+    task["workflow_type"] = json!(workflow_type);
     task["workflow_arguments"] = envelope(&fixture["workflow"]["input"])?;
     task["update_arguments"] = envelope(&update_input)?;
     task["history_events"] = fixture["history"].clone();
@@ -70,9 +78,14 @@ pub(super) async fn execute(fixture: &Value) -> Result<Value, String> {
     let mut worker =
         Worker::new(client, "regression-corpus-queue").worker_id("regression-corpus-worker");
     worker.register_replayed_workflow(
-        WORKFLOW_TYPE,
+        workflow_type,
         OrderLimit::default,
-        |ctx, input, state| async move {
+        move |ctx, input, state| async move {
+            if reads_entry_clock {
+                // A tolerant entry read: the rebuild must not answer from it
+                // unless the task attests the run's entry instant.
+                let _entry = ctx.replay_now().ok();
+            }
             let limit = input[0].as_u64().unwrap_or_default();
             let kept = ctx.clone();
             state.update(move |order| {
@@ -86,13 +99,13 @@ pub(super) async fn execute(fixture: &Value) -> Result<Value, String> {
     let handler_calls = Arc::new(AtomicUsize::new(0));
     for name in ["approve", "approve-with-memo"] {
         let observed = Arc::clone(&handler_calls);
-        worker.register_update(WORKFLOW_TYPE, name, move |_ctx, args| {
+        worker.register_update(workflow_type, name, move |_ctx, args| {
             observed.fetch_add(1, Ordering::SeqCst);
             async move { Ok(args) }
         });
     }
     worker.register_replayed_update_validator(
-        WORKFLOW_TYPE,
+        workflow_type,
         "approve",
         |_ctx, order: Arc<OrderLimit>, args| {
             let amount = args[0].as_u64().unwrap_or_default();
@@ -108,7 +121,7 @@ pub(super) async fn execute(fixture: &Value) -> Result<Value, String> {
         },
     );
     worker.register_replayed_update_validator(
-        WORKFLOW_TYPE,
+        workflow_type,
         "approve-with-memo",
         |_ctx, order: Arc<OrderLimit>, _args| {
             let context = order

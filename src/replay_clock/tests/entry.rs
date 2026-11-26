@@ -119,6 +119,28 @@ fn query_attestation_distinguishes_absent_null_and_object_keys() {
         attestation(&task(carrier("run_started_at", ENTRY))),
         Attestation::Entry(_)
     ));
+    // A refusal that depends on the task's run, not the object, fails closed:
+    // the run's workflow tasks may have accepted the same object.
+    let valid = carrier("run_started_at", ENTRY);
+    assert_eq!(
+        attestation(&json!({"replay_clock":valid})),
+        Attestation::Unattested
+    );
+    assert_eq!(
+        attestation(&json!({"run_id":"","replay_clock":valid})),
+        Attestation::Unattested
+    );
+    assert_eq!(
+        attestation(&json!({"run_id":"other","replay_clock":valid})),
+        Attestation::Unattested
+    );
+    // An object refused for its own run field stays a matching refusal.
+    let mut unnamed = valid.clone();
+    unnamed["workflow_run_id"] = json!("");
+    assert_eq!(
+        attestation(&json!({"run_id":RUN,"replay_clock":unnamed})),
+        Attestation::Unprovable
+    );
 }
 
 #[test]
@@ -419,6 +441,21 @@ async fn query_rebuild_of_an_entry_read_follows_the_query_tasks_attestation() {
     for _ in 0..2 {
         assert_eq!(ask(query(Some(clock.clone()))).await.unwrap(), json!(ENTRY));
     }
+    // A query task without a run cannot match a valid carrier to its run,
+    // which its workflow task accepted, so it fails closed.
+    let runless = json!({"query_task_id":"q1","workflow_type":"clock","query_name":"entry",
+        "payload_codec":DEFAULT_CODEC,"history_events":[started],"replay_clock":clock.clone()});
+    let runless_attestation = attestation(&runless);
+    assert_eq!(runless_attestation, Attestation::Unattested);
+    let runless_task: QueryTask = serde_json::from_value(runless).unwrap();
+    assert_eq!(runless_task.run_id, None);
+    let failure = ask((runless_task, runless_attestation)).await.unwrap_err();
+    assert_eq!(failure.reason, "query_workflow_state_unavailable");
+    assert!(
+        failure.message.contains("does not attest"),
+        "{}",
+        failure.message
+    );
     // The public, wire-less path has no attestation.
     let (task, _) = query(Some(clock));
     assert_eq!(

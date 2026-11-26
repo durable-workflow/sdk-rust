@@ -55,17 +55,18 @@ only the entry value comes from the carrier.
 
 A replayed-instance query, and a replayed update validator, rebuilds the
 workflow body with its own query or validation task's `replay_clock`
-attestation. Server #1338 always sends that key on query and
-update-validation tasks: the v1 object when the start is provable, explicit
-`null` when it is not. An object is validated and used as on a workflow task.
-`null`, or an object this SDK refuses (as it refused the same object on the
-run's workflow tasks), keeps entry unavailable. When the key is absent (an
-older Server) and the rebuilt body reads `replay_now()` while the clock still
-holds its entry value (no boundary consumed, inline or durable; an empty group
-consumes none and keeps it), without a history-proved redrive anchor, the
-query fails with
-`query_workflow_state_unavailable` whatever the body did with the unavailable
-result. A tolerant body would otherwise answer from state its workflow task
+attestation. Server #1338, in the next Server release, always sends that key
+on query and update-validation tasks: the v1 object when the start is
+provable, explicit `null` when it is not. An object is validated and used as
+on a workflow task. `null`, or an object this SDK refuses for its own shape,
+schema, time or source (as it refused the same object on the run's workflow
+tasks), keeps entry unavailable. A valid object that names a different run
+than the task, or a task without a run, is treated like an absent key. When
+the key is absent (an older Server) and the rebuilt body reads `replay_now()`
+while the clock still holds its entry value (no boundary consumed, inline or
+durable; an empty group consumes none and keeps it), without a history-proved
+redrive anchor, the query fails with `query_workflow_state_unavailable`
+whatever the body did with the unavailable result. A tolerant body would otherwise answer from state its workflow task
 never computed. A replayed query handler's own `replay_now()` reads that
 rebuilt prefix. Rust update tasks run the update handler against history
 without rebuilding the body, and their handler time remains the committed

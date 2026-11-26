@@ -11078,8 +11078,9 @@ impl Worker {
             Err(_) => return Ok(ManagedPollOutcome::Handled),
             Ok(result) => result?,
         }
-        // Server #1338 attests the entry instant on query tasks; an older
-        // Server omits the key and leaves the rebuild's entry unattested.
+        // Server #1338 (in the next Server release) attests the entry instant
+        // on query tasks; an older Server omits the key and leaves the
+        // rebuild's entry unattested.
         let replay_entry = replay_clock::attestation(&wire["task"]);
         let response: PollQueryTaskResponse = serde_json::from_value(wire)?;
         if response.outcome().should_stop() {

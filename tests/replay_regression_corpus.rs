@@ -517,7 +517,9 @@ async fn execute_fixture_delivery(fixture: &Value, delivery_id: &str) -> Result<
     if workflow_type == "corpus.history-limit-refusal" {
         return execute_history_limit_refusal_fixture(fixture).await;
     }
-    if workflow_type == update_validation::WORKFLOW_TYPE {
+    if workflow_type == update_validation::WORKFLOW_TYPE
+        || workflow_type == update_validation::ENTRY_CLOCK_WORKFLOW_TYPE
+    {
         return update_validation::execute(fixture).await;
     }
     if !matches!(
